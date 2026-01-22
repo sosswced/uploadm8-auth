@@ -1,320 +1,400 @@
-# app.py  (Render Auth Service - Google + TikTok routes + Device Link)
-import os
-import time
-import json
 import base64
 import hashlib
+import hmac
+import json
+import os
 import secrets
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+import time
+from dataclasses import dataclass
+from typing import Optional
+from urllib.parse import urlencode
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from jose import jwt
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 import psycopg
+from psycopg.rows import dict_row
 
-APP = FastAPI()
 
-# ----------------------------
-# ENV
-# ----------------------------
+# ============================================================
+# Core config
+# ============================================================
+
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-BASE_URL = os.getenv("BASE_URL", "https://auth.uploadm8.com").rstrip("/")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
-JWT_ISSUER = os.getenv("JWT_ISSUER", "uploadm8-auth")
-
+TOKEN_ENC_KEYS = os.getenv("TOKEN_ENC_KEYS", "")  # format: v1:<b64>,v2:<b64> (last = active)
+META_APP_ID = os.getenv("META_APP_ID", "")
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")
+TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
-TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "")
-TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "")
+# FastAPI must expose variable named `app` for Render command `uvicorn app:app`
+app = FastAPI()
 
-# Google endpoints
-GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
-# TikTok endpoints (OAuth token)
-TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
+# ============================================================
+# Helpers: DB
+# ============================================================
 
-# ----------------------------
-# DB
-# ----------------------------
-SCHEMA_SQL = r"""
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL missing")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
+
+SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS device_codes (
   device_code TEXT PRIMARY KEY,
   user_code TEXT UNIQUE NOT NULL,
-  status TEXT NOT NULL,               -- PENDING or CLAIMED
-  jwt TEXT,
-  expires_at TIMESTAMPTZ NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  status TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS oauth_state (
+  state TEXT PRIMARY KEY,
+  device_code TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  expires_at BIGINT NOT NULL,
+  created_at BIGINT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS token_vault (
-  subject TEXT NOT NULL,              -- who owns the tokens (device user)
-  platform TEXT NOT NULL,             -- 'google' or 'tiktok'
-  blob JSONB NOT NULL,                -- raw token json for now (MVP)
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (subject, platform)
+  device_code TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  blob JSONB NOT NULL,
+  updated_at BIGINT NOT NULL,
+  PRIMARY KEY (device_code, platform)
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
   id BIGSERIAL PRIMARY KEY,
   event TEXT NOT NULL,
-  subject TEXT NULL,
   meta JSONB NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at BIGINT NOT NULL
 );
 """
 
-def db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    return psycopg.connect(DATABASE_URL)
 
-def init_db():
-    with db() as conn:
+@app.on_event("startup")
+def _startup():
+    # Initialize schema (idempotent)
+    if not DATABASE_URL:
+        # Allow boot without DB for troubleshooting; endpoints will error if used.
+        return
+    with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
         conn.commit()
 
-def now_utc():
-    return datetime.now(timezone.utc)
 
-def audit(event: str, subject: Optional[str] = None, meta: Optional[dict] = None):
-    try:
-        with db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO audit_log(event, subject, meta) VALUES (%s,%s,%s)",
-                    (event, subject, json.dumps(meta or {})),
-                )
-            conn.commit()
-    except Exception:
-        # audit must never break auth
-        pass
+# ============================================================
+# Helpers: Encryption (AES-GCM) with key rotation
+# ============================================================
 
-# ----------------------------
-# JWT
-# ----------------------------
-def require_jwt_secret():
-    if not JWT_SECRET or len(JWT_SECRET) < 16:
-        raise RuntimeError("JWT_SECRET not set or too short (need 16+ chars)")
+@dataclass
+class KeyRing:
+    active_kid: str
+    keys: dict  # kid -> raw bytes
 
-def mint_jwt(subject: str, minutes: int = 60 * 24 * 30) -> str:
-    require_jwt_secret()
-    exp = now_utc() + timedelta(minutes=minutes)
-    payload = {
-        "iss": JWT_ISSUER,
-        "sub": subject,
-        "exp": int(exp.timestamp()),
-        "iat": int(now_utc().timestamp()),
+
+def parse_keyring(raw: str) -> KeyRing:
+    """
+    TOKEN_ENC_KEYS format:
+      v1:<base64-32-bytes>,v2:<base64-32-bytes>
+    The LAST entry is the active key for new encryptions.
+    """
+    if not raw.strip():
+        raise RuntimeError("TOKEN_ENC_KEYS missing/blank")
+
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    keys = {}
+    for item in items:
+        if ":" not in item:
+            raise RuntimeError("TOKEN_ENC_KEYS entry missing ':'")
+        kid, b64 = item.split(":", 1)
+        key = base64.b64decode(b64.encode("utf-8"))
+        if len(key) != 32:
+            raise RuntimeError(f"Key {kid} must be 32 bytes after base64 decode")
+        keys[kid] = key
+
+    active_kid = items[-1].split(":", 1)[0]
+    return KeyRing(active_kid=active_kid, keys=keys)
+
+
+def encrypt_json(obj: dict) -> dict:
+    kr = parse_keyring(TOKEN_ENC_KEYS)
+    key = kr.keys[kr.active_kid]
+    aes = AESGCM(key)
+    nonce = secrets.token_bytes(12)
+    pt = json.dumps(obj).encode("utf-8")
+    ct = aes.encrypt(nonce, pt, None)
+    return {
+        "kid": kr.active_kid,
+        "nonce": base64.b64encode(nonce).decode("utf-8"),
+        "ct": base64.b64encode(ct).decode("utf-8"),
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def get_subject_from_auth(request: Request) -> str:
-    auth = request.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = auth.split(" ", 1)[1].strip()
+
+def decrypt_json(blob: dict) -> dict:
+    kr = parse_keyring(TOKEN_ENC_KEYS)
+    kid = blob.get("kid")
+    if kid not in kr.keys:
+        raise RuntimeError(f"Unknown kid: {kid}")
+    key = kr.keys[kid]
+    aes = AESGCM(key)
+    nonce = base64.b64decode(blob["nonce"].encode("utf-8"))
+    ct = base64.b64decode(blob["ct"].encode("utf-8"))
+    pt = aes.decrypt(nonce, ct, None)
+    return json.loads(pt.decode("utf-8"))
+
+
+# ============================================================
+# Helpers: Minimal JWT (HMAC-SHA256) for device sessions
+# ============================================================
+
+def b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
+
+
+def sign_jwt(payload: dict) -> str:
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET missing")
+    header = {"alg": "HS256", "typ": "JWT"}
+    h = b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    p = b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    msg = f"{h}.{p}".encode("utf-8")
+    sig = hmac.new(JWT_SECRET.encode("utf-8"), msg, hashlib.sha256).digest()
+    return f"{h}.{p}.{b64url(sig)}"
+
+
+def verify_jwt(token: str) -> dict:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], issuer=JWT_ISSUER)
-        return payload["sub"]
+        h, p, s = token.split(".")
+        msg = f"{h}.{p}".encode("utf-8")
+        sig = base64.urlsafe_b64decode(s + "==")
+        exp_sig = hmac.new(JWT_SECRET.encode("utf-8"), msg, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, exp_sig):
+            raise ValueError("bad signature")
+        payload = json.loads(base64.urlsafe_b64decode(p + "==").decode("utf-8"))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            raise ValueError("expired")
+        return payload
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# ----------------------------
-# Startup
-# ----------------------------
-@APP.on_event("startup")
-def _startup():
-    init_db()
-    audit("startup", meta={"base_url": BASE_URL})
 
-# ----------------------------
+def bearer_device_code(req: Request) -> str:
+    auth = req.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = auth.split(" ", 1)[1].strip()
+    payload = verify_jwt(token)
+    dc = payload.get("device_code")
+    if not dc:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    return dc
+
+
+# ============================================================
 # Health
-# ----------------------------
-@APP.get("/health")
-def health():
-    return {"status": "ok", "base_url": BASE_URL}
+# ============================================================
 
-# ----------------------------
-# Device Link (MVP)
-# ----------------------------
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "configured": bool(DATABASE_URL and BASE_URL and JWT_SECRET and TOKEN_ENC_KEYS),
+        "base_url": BASE_URL or None,
+    }
+
+
+# ============================================================
+# Device-link flow (MVP)
+# Desktop calls /device/code, user approves via /device, desktop polls /device/poll
+# ============================================================
+
 def gen_user_code() -> str:
-    # short human code like ABCD-EF
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    a = "".join(secrets.choice(alphabet) for _ in range(4))
-    b = "".join(secrets.choice(alphabet) for _ in range(2))
+    # readable code like ABCD-EFGH
+    a = secrets.token_hex(2).upper()
+    b = secrets.token_hex(2).upper()
     return f"{a}-{b}"
 
-@APP.post("/device/code")
-def device_code_create():
-    device_code = secrets.token_urlsafe(32)
-    user_code = gen_user_code()
-    expires_at = now_utc() + timedelta(minutes=15)
 
-    with db() as conn:
+@app.post("/device/code")
+def device_code_create():
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL missing")
+    device_code = secrets.token_urlsafe(24)
+    user_code = gen_user_code()
+    now = int(time.time())
+    exp = now + 15 * 60
+
+    with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO device_codes(device_code, user_code, status, expires_at) VALUES (%s,%s,%s,%s)",
-                (device_code, user_code, "PENDING", expires_at),
+                "INSERT INTO device_codes(device_code,user_code,status,expires_at,created_at) "
+                "VALUES(%s,%s,%s,%s,%s)",
+                (device_code, user_code, "PENDING", exp, now),
             )
         conn.commit()
-
-    verification_uri = f"{BASE_URL}/device"
-    verification_uri_complete = f"{BASE_URL}/device?user_code={user_code}"
-    audit("device_code_created", meta={"user_code": user_code})
 
     return {
         "device_code": device_code,
         "user_code": user_code,
-        "verification_uri": verification_uri,
-        "verification_uri_complete": verification_uri_complete,
-        "expires_in": 15 * 60,
-        "interval": 2,
+        "verification_uri": f"{BASE_URL}/device",
+        "expires_in": 900,
     }
 
-@APP.get("/device/poll")
-def device_poll(device_code: str):
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT status, jwt, expires_at FROM device_codes WHERE device_code=%s",
-                (device_code,),
-            )
-            row = cur.fetchone()
 
-    if not row:
-        raise HTTPException(status_code=404, detail="Unknown device_code")
-
-    status, jwt_token, expires_at = row
-    if now_utc() > expires_at:
-        raise HTTPException(status_code=400, detail="device_code expired")
-
-    if status != "CLAIMED" or not jwt_token:
-        return {"status": status}
-
-    return {"status": "CLAIMED", "auth_jwt": jwt_token}
-
-@APP.get("/device", response_class=HTMLResponse)
-def device_page(user_code: Optional[str] = None):
-    # Simple claim page
-    return f"""
-    <html>
-      <head><title>UploadM8 Device Link</title></head>
-      <body style="font-family: Arial; max-width: 720px; margin: 40px auto;">
-        <h2>UploadM8 Device Link</h2>
-        <p>Enter the code shown in your desktop app.</p>
-        <form method="post" action="/device/claim">
-          <input name="user_code" value="{user_code or ''}" placeholder="ABCD-EF"
-                 style="font-size: 18px; padding: 8px; width: 220px;" />
-          <button type="submit" style="font-size: 18px; padding: 8px 14px;">Continue</button>
-        </form>
-      </body>
-    </html>
+@app.get("/device", response_class=HTMLResponse)
+def device_page():
+    # dead-simple approval UI (no accounts yet)
+    html = f"""
+    <html><body style="font-family: Arial; padding: 24px;">
+      <h2>UploadM8 Device Link</h2>
+      <p>Enter the code shown in your desktop app.</p>
+      <form method="post" action="/device/claim">
+        <input name="user_code" placeholder="ABCD-EFGH" style="font-size:18px; padding:8px;" />
+        <button type="submit" style="font-size:18px; padding:8px 16px;">Approve</button>
+      </form>
+      <p style="margin-top:18px; color:#666;">This approves the desktop session so it can connect platforms.</p>
+    </body></html>
     """
+    return HTMLResponse(html)
 
-@APP.post("/device/claim")
+
+@app.post("/device/claim")
 async def device_claim(request: Request):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL missing")
+
     form = await request.form()
     user_code = (form.get("user_code") or "").strip().upper()
 
-    if not user_code:
-        raise HTTPException(status_code=400, detail="Missing user_code")
-
-    # Subject for this device-user (MVP): stable hash of user_code
-    subject = "dev_" + hashlib.sha256(user_code.encode("utf-8")).hexdigest()[:24]
-    jwt_token = mint_jwt(subject)
-
-    with db() as conn:
+    with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE device_codes SET status='CLAIMED', jwt=%s WHERE user_code=%s AND status='PENDING'",
-                (jwt_token, user_code),
-            )
-            if cur.rowcount != 1:
-                raise HTTPException(status_code=404, detail="Invalid or already used code")
-        conn.commit()
-
-    audit("device_claimed", subject=subject)
-    return HTMLResponse(f"""
-    <html>
-      <body style="font-family: Arial; max-width: 720px; margin: 40px auto;">
-        <h2>Device Linked</h2>
-        <p>You can close this tab and return to UploadM8 desktop.</p>
-        <p><a href="/connect">Connect Platforms</a></p>
-      </body>
-    </html>
-    """)
-
-# ----------------------------
-# Connect portal (simple)
-# ----------------------------
-@APP.get("/connect", response_class=HTMLResponse)
-def connect_home(request: Request):
-    # Must be logged in via Bearer token for real; MVP: let user paste token
-    return """
-    <html>
-      <body style="font-family: Arial; max-width: 860px; margin: 40px auto;">
-        <h2>UploadM8: Connect Platforms</h2>
-        <p>This is the MVP connect hub. In production this will be a real authenticated UI.</p>
-        <ol>
-          <li>Use the desktop app to device-link (it stores AUTH_JWT locally).</li>
-          <li>Then the desktop can open these links in your browser automatically.</li>
-        </ol>
-        <p>Google: <code>/oauth/google/start</code></p>
-        <p>TikTok: <code>/oauth/tiktok/start</code></p>
-      </body>
-    </html>
-    """
-
-# ----------------------------
-# OAuth helpers
-# ----------------------------
-def save_tokens(subject: str, platform: str, blob: Dict[str, Any]):
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO token_vault(subject, platform, blob)
-                VALUES (%s,%s,%s)
-                ON CONFLICT (subject, platform)
-                DO UPDATE SET blob=EXCLUDED.blob, updated_at=now()
-                """,
-                (subject, platform, json.dumps(blob)),
-            )
-        conn.commit()
-    audit("tokens_saved", subject=subject, meta={"platform": platform})
-
-def load_tokens(subject: str, platform: str) -> Optional[dict]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT blob FROM token_vault WHERE subject=%s AND platform=%s",
-                (subject, platform),
-            )
+            cur.execute("SELECT device_code, expires_at, status FROM device_codes WHERE user_code=%s", (user_code,))
             row = cur.fetchone()
-    return row[0] if row else None
+            if not row:
+                return HTMLResponse("<h3>Invalid code.</h3>", status_code=400)
+            if int(row["expires_at"]) < int(time.time()):
+                return HTMLResponse("<h3>Code expired.</h3>", status_code=400)
 
-# ----------------------------
-# Google OAuth (central)
-# ----------------------------
-@APP.get("/oauth/google/start")
+            cur.execute("UPDATE device_codes SET status='CLAIMED' WHERE user_code=%s", (user_code,))
+        conn.commit()
+
+    # redirect to success page
+    return HTMLResponse("<h3>Approved. You can close this tab and return to the desktop app.</h3>")
+
+
+@app.post("/device/poll")
+def device_poll(payload: dict):
+    """
+    Desktop sends: { "device_code": "..." }
+    If approved, return { status: "CLAIMED", jwt: "..." }
+    """
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="DATABASE_URL missing")
+
+    device_code = (payload.get("device_code") or "").strip()
+    if not device_code:
+        raise HTTPException(status_code=400, detail="Missing device_code")
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, expires_at FROM device_codes WHERE device_code=%s", (device_code,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Unknown device_code")
+            if int(row["expires_at"]) < int(time.time()):
+                raise HTTPException(status_code=400, detail="Expired device_code")
+
+    if row["status"] != "CLAIMED":
+        return {"status": "PENDING"}
+
+    jwt = sign_jwt({"device_code": device_code, "exp": int(time.time()) + 7 * 24 * 3600})
+    return {"status": "CLAIMED", "jwt": jwt}
+
+
+# ============================================================
+# OAuth state helpers
+# ============================================================
+
+def save_oauth_state(state: str, device_code: str, platform: str, payload: dict, ttl_sec: int = 900):
+    now = int(time.time())
+    exp = now + ttl_sec
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO oauth_state(state,device_code,platform,payload,expires_at,created_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s)",
+                (state, device_code, platform, json.dumps(payload), exp, now),
+            )
+        conn.commit()
+
+
+def pop_oauth_state(state: str) -> dict:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT device_code, platform, payload, expires_at FROM oauth_state WHERE state=%s", (state,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=400, detail="Invalid state")
+            if int(row["expires_at"]) < int(time.time()):
+                raise HTTPException(status_code=400, detail="State expired")
+            cur.execute("DELETE FROM oauth_state WHERE state=%s", (state,))
+        conn.commit()
+    return row
+
+
+def store_token(device_code: str, platform: str, token_obj: dict):
+    blob = encrypt_json(token_obj)
+    now = int(time.time())
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO token_vault(device_code,platform,blob,updated_at) "
+                "VALUES(%s,%s,%s,%s) "
+                "ON CONFLICT (device_code,platform) DO UPDATE SET blob=EXCLUDED.blob, updated_at=EXCLUDED.updated_at",
+                (device_code, platform, json.dumps(blob), now),
+            )
+        conn.commit()
+
+
+def read_token(device_code: str, platform: str) -> Optional[dict]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT blob FROM token_vault WHERE device_code=%s AND platform=%s", (device_code, platform))
+            row = cur.fetchone()
+            if not row:
+                return None
+    blob = row["blob"]
+    if isinstance(blob, str):
+        blob = json.loads(blob)
+    return decrypt_json(blob)
+
+
+# ============================================================
+# Google OAuth (YouTube upload scope)
+# ============================================================
+
+@app.get("/oauth/google/start")
 def google_start(request: Request):
-    subject = get_subject_from_auth(request)
+    device_code = bearer_device_code(request)
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        raise HTTPException(status_code=500, detail="Google env missing")
 
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="Google env not configured")
+    state = secrets.token_urlsafe(18)
+    save_oauth_state(state, device_code, "google", {})
 
     redirect_uri = f"{BASE_URL}/oauth/google/callback"
-    state = secrets.token_urlsafe(16)
-
-    # store state in audit only (MVP)
-    audit("google_start", subject=subject, meta={"state": state})
-
     params = {
         "response_type": "code",
         "client_id": GOOGLE_CLIENT_ID,
@@ -322,19 +402,24 @@ def google_start(request: Request):
         "scope": "https://www.googleapis.com/auth/youtube.upload",
         "access_type": "offline",
         "prompt": "consent",
-        "state": f"{subject}.{state}",
+        "state": state,
     }
-    url = requests.Request("GET", GOOGLE_AUTH_URL, params=params).prepare().url
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
     return RedirectResponse(url)
 
-@APP.get("/oauth/google/callback")
-def google_callback(code: str, state: str):
-    # state = "{subject}.{nonce}"
-    if "." not in state:
-        raise HTTPException(status_code=400, detail="Invalid state")
-    subject, _nonce = state.split(".", 1)
+
+@app.get("/oauth/google/callback")
+def google_callback(code: str = "", state: str = "", error: str = ""):
+    if error:
+        return JSONResponse({"ok": False, "error": error}, status_code=400)
+    if not code or not state:
+        return JSONResponse({"ok": False, "error": "Missing code/state"}, status_code=400)
+
+    st = pop_oauth_state(state)
+    device_code = st["device_code"]
 
     redirect_uri = f"{BASE_URL}/oauth/google/callback"
+    token_url = "https://oauth2.googleapis.com/token"
     data = {
         "code": code,
         "client_id": GOOGLE_CLIENT_ID,
@@ -342,129 +427,97 @@ def google_callback(code: str, state: str):
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
     }
+    r = requests.post(token_url, data=data, timeout=60)
+    payload = r.json()
+    if "access_token" not in payload:
+        return JSONResponse({"ok": False, "payload": payload}, status_code=400)
 
-    r = requests.post(GOOGLE_TOKEN_URL, data=data, timeout=30)
-    if r.status_code != 200:
-        audit("google_token_error", subject=subject, meta={"status": r.status_code, "body": r.text[:500]})
-        raise HTTPException(status_code=400, detail=f"Google token exchange failed: {r.text[:300]}")
+    store_token(device_code, "google", payload)
+    return HTMLResponse("<h3>Google connected. You can close this tab and return to the desktop app.</h3>")
 
-    tok = r.json()
-    save_tokens(subject, "google", tok)
 
-    return HTMLResponse("""
-    <html><body style="font-family: Arial; margin: 40px;">
-      <h2>Google connected</h2>
-      <p>You can close this tab and return to UploadM8.</p>
-    </body></html>
-    """)
+# ============================================================
+# TikTok OAuth (push_by_file: your PC bytes upload)
+# ============================================================
 
-@APP.get("/vault/google/access")
-def google_access(request: Request):
-    subject = get_subject_from_auth(request)
-    tok = load_tokens(subject, "google")
-    if not tok:
-        raise HTTPException(status_code=404, detail="Google not connected")
+def pkce_pair():
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    challenge = base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+    return verifier, challenge
 
-    # If token still valid, return it; else refresh
-    access_token = tok.get("access_token")
-    expires_in = tok.get("expires_in", 0)
-    obtained_at = tok.get("_obtained_at")  # we may add later
 
-    # MVP: always refresh if refresh_token exists to guarantee freshness
-    refresh_token = tok.get("refresh_token")
-    if not refresh_token:
-        # Some Google responses omit refresh_token if already granted.
-        # In that case we just return current access_token.
-        return {"access_token": access_token}
-
-    data = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token",
-    }
-    r = requests.post(GOOGLE_TOKEN_URL, data=data, timeout=30)
-    if r.status_code != 200:
-        audit("google_refresh_error", subject=subject, meta={"status": r.status_code, "body": r.text[:500]})
-        raise HTTPException(status_code=400, detail="Google refresh failed")
-
-    new_tok = r.json()
-    # keep refresh_token
-    new_tok["refresh_token"] = refresh_token
-    save_tokens(subject, "google", new_tok)
-    return {"access_token": new_tok.get("access_token")}
-
-# ----------------------------
-# TikTok OAuth (central)
-# ----------------------------
-@APP.get("/oauth/tiktok/start")
+@app.get("/oauth/tiktok/start")
 def tiktok_start(request: Request):
-    subject = get_subject_from_auth(request)
+    device_code = bearer_device_code(request)
+    if not (TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET):
+        raise HTTPException(status_code=500, detail="TikTok env missing")
 
-    if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="TikTok env not configured")
+    verifier, challenge = pkce_pair()
+    state = secrets.token_urlsafe(18)
+    save_oauth_state(state, device_code, "tiktok", {"verifier": verifier})
 
     redirect_uri = f"{BASE_URL}/oauth/tiktok/callback"
-    state = secrets.token_urlsafe(16)
-    audit("tiktok_start", subject=subject, meta={"state": state})
-
     params = {
         "client_key": TIKTOK_CLIENT_KEY,
         "response_type": "code",
-        "scope": "user.info.basic,video.upload",  # add video.publish later
+        "scope": "user.info.basic,video.upload",  # draft/inbox (push_by_file)
         "redirect_uri": redirect_uri,
-        "state": f"{subject}.{state}",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
     }
-    url = "https://www.tiktok.com/v2/auth/authorize/?" + requests.compat.urlencode(params)
+    url = "https://www.tiktok.com/v2/auth/authorize/?" + urlencode(params, safe=":/,")
     return RedirectResponse(url)
 
-@APP.get("/oauth/tiktok/callback")
-def tiktok_callback(code: str, state: str):
-    if "." not in state:
-        raise HTTPException(status_code=400, detail="Invalid state")
-    subject, _nonce = state.split(".", 1)
 
+@app.get("/oauth/tiktok/callback")
+def tiktok_callback(code: str = "", state: str = "", error: str = "", error_description: str = ""):
+    if error:
+        return JSONResponse({"ok": False, "error": error, "desc": error_description}, status_code=400)
+    if not code or not state:
+        return JSONResponse({"ok": False, "error": "Missing code/state"}, status_code=400)
+
+    st = pop_oauth_state(state)
+    device_code = st["device_code"]
+    payload = st["payload"]
+    verifier = payload.get("verifier")
+    if not verifier:
+        return JSONResponse({"ok": False, "error": "PKCE verifier missing"}, status_code=400)
+
+    token_url = "https://open.tiktokapis.com/v2/oauth/token/"
     redirect_uri = f"{BASE_URL}/oauth/tiktok/callback"
-
-    payload = {
+    data = {
         "client_key": TIKTOK_CLIENT_KEY,
         "client_secret": TIKTOK_CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
         "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
     }
-
-    r = requests.post(TIKTOK_TOKEN_URL, json=payload, timeout=30)
-    if r.status_code != 200:
-        audit("tiktok_token_error", subject=subject, meta={"status": r.status_code, "body": r.text[:500]})
-        raise HTTPException(status_code=400, detail=f"TikTok token exchange failed: {r.text[:300]}")
-
+    r = requests.post(token_url, data=data, timeout=60)
     tok = r.json()
-    # TikTok wraps tokens sometimes
-    save_tokens(subject, "tiktok", tok)
-    return HTMLResponse("""
-    <html><body style="font-family: Arial; margin: 40px;">
-      <h2>TikTok connected</h2>
-      <p>You can close this tab and return to UploadM8.</p>
-    </body></html>
-    """)
+    if "access_token" not in tok:
+        return JSONResponse({"ok": False, "payload": tok}, status_code=400)
 
-@APP.get("/vault/tiktok/access")
-def tiktok_access(request: Request):
-    subject = get_subject_from_auth(request)
-    tok = load_tokens(subject, "tiktok")
+    store_token(device_code, "tiktok", tok)
+    return HTMLResponse("<h3>TikTok connected. You can close this tab and return to the desktop app.</h3>")
+
+
+# ============================================================
+# Vault read (Desktop uses this after auth to get tokens)
+# ============================================================
+
+@app.get("/vault/token/{platform}")
+def vault_get(platform: str, request: Request):
+    platform = platform.lower().strip()
+    if platform not in ("google", "tiktok", "meta"):
+        raise HTTPException(status_code=400, detail="Unsupported platform")
+
+    device_code = bearer_device_code(request)
+    tok = read_token(device_code, platform)
     if not tok:
-        raise HTTPException(status_code=404, detail="TikTok not connected")
+        raise HTTPException(status_code=404, detail="No token stored")
 
-    # MVP: return access_token if present.
-    # Later: implement refresh using refresh_token + correct TikTok refresh grant.
-    data = tok.get("data") if isinstance(tok, dict) else None
-    access_token = None
-    if isinstance(data, dict):
-        access_token = data.get("access_token")
-    if not access_token:
-        access_token = tok.get("access_token")
-
-    if not access_token:
-        raise HTTPException(status_code=400, detail="TikTok token missing access_token")
-    return {"access_token": access_token}
+    # Return raw token JSON (desktop can extract access_token/refresh_token)
+    return {"ok": True, "platform": platform, "token": tok}

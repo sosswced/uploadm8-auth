@@ -20,15 +20,14 @@ from typing import Optional, List
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Request, Query, Header, BackgroundTasks
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import asyncpg
 import jwt
-from passlib.hash import bcrypt
+import bcrypt  # ✅ direct bcrypt (pyca) - replaces passlib
 import boto3
 from botocore.config import Config
 
@@ -38,8 +37,8 @@ from botocore.config import Config
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-me")
-TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "change-me")  # set in Render env
+TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")   # required for stable encryption
 
 # R2 Configuration
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
@@ -104,25 +103,52 @@ class SettingsUpdate(BaseModel):
     euphoria_mph: Optional[int] = None
 
 # ============================================
+# Password Hashing (bcrypt) ✅ stable on Python 3.13
+# ============================================
+
+def hash_password(password: str) -> str:
+    pw = password.encode("utf-8")
+    # bcrypt limit is 72 bytes
+    if len(pw) > 72:
+        raise HTTPException(400, "Password too long (max 72 bytes)")
+    hashed = bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12))
+    return hashed.decode("utf-8")
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+# ============================================
 # Encryption Helpers
 # ============================================
 
 def parse_enc_keys():
+    """
+    TOKEN_ENC_KEYS format (recommended):
+      v1:BASE64_32_BYTES_KEY,v2:BASE64_32_BYTES_KEY
+    """
     keys = {}
     if not TOKEN_ENC_KEYS:
-        keys["v1"] = secrets.token_bytes(32)
-        return keys
-    # Clean up the string (remove quotes and newlines)
-    clean_keys = TOKEN_ENC_KEYS.strip().strip('"').replace('\\n', '')
+        # ✅ Production safety: don't auto-generate keys (would break decrypt after restart)
+        # Set TOKEN_ENC_KEYS in Render env to a stable value.
+        raise RuntimeError("TOKEN_ENC_KEYS is required (do not leave blank in production)")
+
+    clean_keys = TOKEN_ENC_KEYS.strip().strip('"').replace("\\n", "")
     for part in clean_keys.split(","):
         if ":" in part:
             kid, b64key = part.split(":", 1)
             try:
-                keys[kid.strip()] = base64.b64decode(b64key.strip())
+                raw = base64.b64decode(b64key.strip())
+                if len(raw) != 32:
+                    raise ValueError("Key must decode to 32 bytes")
+                keys[kid.strip()] = raw
             except Exception as e:
                 print(f"Warning: Could not decode key {kid}: {e}")
+
     if not keys:
-        keys["v1"] = secrets.token_bytes(32)
+        raise RuntimeError("TOKEN_ENC_KEYS parsed empty/invalid; fix env var.")
     return keys
 
 ENC_KEYS = parse_enc_keys()
@@ -141,7 +167,7 @@ def encrypt_blob(data: dict) -> dict:
     }
 
 def decrypt_blob(blob: dict) -> dict:
-    kid = blob.get("kid", "v1")
+    kid = blob.get("kid", CURRENT_KEY_ID)
     if kid not in ENC_KEYS:
         raise ValueError(f"Unknown key ID: {kid}")
     key = ENC_KEYS[kid]
@@ -162,12 +188,15 @@ async def init_db():
     if not DATABASE_URL:
         print("WARNING: No DATABASE_URL configured")
         return
-    
+
     try:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-        
+
         async with db_pool.acquire() as conn:
             await conn.execute("""
+                -- ✅ required for gen_random_uuid()
+                CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
                 CREATE TABLE IF NOT EXISTS users (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     email TEXT UNIQUE NOT NULL,
@@ -181,7 +210,7 @@ async def init_db():
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
-                
+
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                     discord_webhook TEXT,
@@ -192,14 +221,14 @@ async def init_db():
                     euphoria_mph INTEGER DEFAULT 100,
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
-                
+
                 CREATE TABLE IF NOT EXISTS password_resets (
                     token_hash TEXT PRIMARY KEY,
                     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
                     expires_at TIMESTAMPTZ NOT NULL,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
-                
+
                 CREATE TABLE IF NOT EXISTS platform_tokens (
                     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
                     platform TEXT NOT NULL,
@@ -207,7 +236,7 @@ async def init_db():
                     updated_at TIMESTAMPTZ DEFAULT NOW(),
                     PRIMARY KEY (user_id, platform)
                 );
-                
+
                 CREATE TABLE IF NOT EXISTS uploads (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -226,7 +255,7 @@ async def init_db():
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     completed_at TIMESTAMPTZ
                 );
-                
+
                 CREATE TABLE IF NOT EXISTS analytics_events (
                     id BIGSERIAL PRIMARY KEY,
                     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -234,7 +263,7 @@ async def init_db():
                     event_data JSONB DEFAULT '{}',
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
-                
+
                 CREATE INDEX IF NOT EXISTS idx_uploads_user ON uploads(user_id);
                 CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
                 CREATE INDEX IF NOT EXISTS idx_analytics_user ON analytics_events(user_id);
@@ -275,26 +304,26 @@ def verify_jwt(token: str) -> Optional[str]:
 async def get_current_user(authorization: str = Header(None)) -> dict:
     if not authorization:
         raise HTTPException(401, "Missing authorization header")
-    
+
     token = authorization.replace("Bearer ", "")
     user_id = verify_jwt(token)
     if not user_id:
         raise HTTPException(401, "Invalid or expired token")
-    
+
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow(
-            """SELECT id, email, name, subscription_tier, upload_quota, 
+            """SELECT id, email, name, subscription_tier, upload_quota,
                       uploads_this_month, quota_reset_date
                FROM users WHERE id = $1""",
             user_id
         )
-    
+
     if not user:
         raise HTTPException(401, "User not found")
-    
+
     return dict(user)
 
 # ============================================
@@ -304,29 +333,25 @@ async def get_current_user(authorization: str = Header(None)) -> dict:
 def get_r2_client():
     if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
         return None
-    
+
     return boto3.client(
-        's3',
+        "s3",
         endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
         aws_access_key_id=R2_ACCESS_KEY_ID,
         aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}),
-        region_name='auto'
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        region_name="auto",
     )
 
 def generate_presigned_upload_url(key: str, content_type: str, expires: int = 3600) -> str:
     client = get_r2_client()
     if not client:
         raise HTTPException(500, "R2 storage not configured")
-    
+
     return client.generate_presigned_url(
-        'put_object',
-        Params={
-            'Bucket': R2_BUCKET_NAME,
-            'Key': key,
-            'ContentType': content_type
-        },
-        ExpiresIn=expires
+        "put_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type},
+        ExpiresIn=expires,
     )
 
 # ============================================
@@ -337,17 +362,12 @@ async def send_email(to: str, subject: str, html: str):
     if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
         print(f"Email not configured - would send to {to}: {subject}")
         return False
-    
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
             auth=("api", MAILGUN_API_KEY),
-            data={
-                "from": MAIL_FROM,
-                "to": to,
-                "subject": subject,
-                "html": html
-            }
+            data={"from": MAIL_FROM, "to": to, "subject": subject, "html": html},
         )
         return resp.status_code == 200
 
@@ -363,7 +383,9 @@ async def track_event(user_id: str, event_type: str, event_data: dict = None):
             await conn.execute(
                 """INSERT INTO analytics_events (user_id, event_type, event_data)
                    VALUES ($1, $2, $3)""",
-                user_id, event_type, json.dumps(event_data or {})
+                user_id,
+                event_type,
+                json.dumps(event_data or {}),
             )
     except Exception as e:
         print(f"Analytics tracking error: {e}")
@@ -378,15 +400,11 @@ async def lifespan(app: FastAPI):
     yield
     await close_db()
 
-app = FastAPI(
-    title="UploadM8 API",
-    version="1.0.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="UploadM8 API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
+    allow_origins=["*"],  # tighten in production once frontend domain is final
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -411,8 +429,8 @@ async def health():
         "platforms": {
             "tiktok": bool(TIKTOK_CLIENT_KEY),
             "youtube": bool(GOOGLE_CLIENT_ID),
-            "meta": bool(META_APP_ID)
-        }
+            "meta": bool(META_APP_ID),
+        },
     }
 
 # ============================================
@@ -423,27 +441,27 @@ async def health():
 async def register(data: UserCreate, background_tasks: BackgroundTasks):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
-    password_hash = bcrypt.hash(data.password)
-    
+
+    password_hash = hash_password(data.password)
+
     async with db_pool.acquire() as conn:
         try:
             row = await conn.fetchrow(
                 """INSERT INTO users (email, password_hash, name)
-                   VALUES ($1, $2, $3) RETURNING id, email, name, subscription_tier""",
-                data.email.lower(), password_hash, data.name
+                   VALUES ($1, $2, $3)
+                   RETURNING id, email, name, subscription_tier""",
+                data.email.lower(),
+                password_hash,
+                data.name,
             )
             user_id = str(row["id"])
-            
-            await conn.execute(
-                "INSERT INTO user_settings (user_id) VALUES ($1)",
-                user_id
-            )
+
+            await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
         except asyncpg.UniqueViolationError:
             raise HTTPException(400, "Email already registered")
-    
+
     background_tasks.add_task(track_event, user_id, "user_signup", {"email": data.email})
-    
+
     token = create_jwt(user_id)
     return {
         "access_token": token,
@@ -452,29 +470,29 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks):
             "id": user_id,
             "email": row["email"],
             "name": row["name"],
-            "subscription_tier": row["subscription_tier"]
-        }
+            "subscription_tier": row["subscription_tier"],
+        },
     }
 
 @app.post("/api/auth/login")
 async def login(data: UserLogin, background_tasks: BackgroundTasks):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT id, email, name, password_hash, subscription_tier, 
+            """SELECT id, email, name, password_hash, subscription_tier,
                       upload_quota, uploads_this_month
                FROM users WHERE email = $1""",
-            data.email.lower()
+            data.email.lower(),
         )
-    
-    if not row or not bcrypt.verify(data.password, row["password_hash"]):
+
+    if not row or not verify_password(data.password, row["password_hash"]):
         raise HTTPException(401, "Invalid email or password")
-    
+
     user_id = str(row["id"])
     background_tasks.add_task(track_event, user_id, "user_login")
-    
+
     token = create_jwt(user_id)
     return {
         "access_token": token,
@@ -485,36 +503,37 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
             "name": row["name"],
             "subscription_tier": row["subscription_tier"],
             "upload_quota": row["upload_quota"],
-            "uploads_this_month": row["uploads_this_month"]
-        }
+            "uploads_this_month": row["uploads_this_month"],
+        },
     }
 
 @app.post("/api/auth/forgot-password")
 async def forgot_password(data: PasswordReset, background_tasks: BackgroundTasks):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow(
-            "SELECT id, email, name FROM users WHERE email = $1",
-            data.email.lower()
+            "SELECT id, email, name FROM users WHERE email = $1", data.email.lower()
         )
-    
+
     if not user:
         return {"message": "If that email exists, we've sent a reset link"}
-    
+
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-    
+
     async with db_pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO password_resets (token_hash, user_id, expires_at)
                VALUES ($1, $2, $3)
                ON CONFLICT (token_hash) DO UPDATE SET expires_at = $3""",
-            token_hash, str(user["id"]), expires_at
+            token_hash,
+            str(user["id"]),
+            expires_at,
         )
-    
+
     reset_url = f"{BASE_URL}/reset-password?token={token}"
     html = f"""
     <h2>Reset Your UploadM8 Password</h2>
@@ -525,41 +544,39 @@ async def forgot_password(data: PasswordReset, background_tasks: BackgroundTasks
     <p>If you didn't request this, you can ignore this email.</p>
     <p>- The UploadM8 Team</p>
     """
-    
+
     background_tasks.add_task(send_email, user["email"], "Reset Your UploadM8 Password", html)
-    
+
     return {"message": "If that email exists, we've sent a reset link"}
 
 @app.post("/api/auth/reset-password")
 async def reset_password(data: PasswordResetConfirm):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     token_hash = hashlib.sha256(data.token.encode()).hexdigest()
-    
+
     async with db_pool.acquire() as conn:
         reset = await conn.fetchrow(
             "SELECT user_id, expires_at FROM password_resets WHERE token_hash = $1",
-            token_hash
+            token_hash,
         )
-        
+
         if not reset:
             raise HTTPException(400, "Invalid or expired reset token")
-        
+
         if reset["expires_at"] < datetime.now(timezone.utc):
             raise HTTPException(400, "Reset token has expired")
-        
-        new_hash = bcrypt.hash(data.new_password)
+
+        new_hash = hash_password(data.new_password)
         await conn.execute(
             "UPDATE users SET password_hash = $1 WHERE id = $2",
-            new_hash, reset["user_id"]
+            new_hash,
+            reset["user_id"],
         )
-        
-        await conn.execute(
-            "DELETE FROM password_resets WHERE token_hash = $1",
-            token_hash
-        )
-    
+
+        await conn.execute("DELETE FROM password_resets WHERE token_hash = $1", token_hash)
+
     return {"message": "Password updated successfully"}
 
 @app.get("/api/auth/me")
@@ -570,7 +587,7 @@ async def get_me(user: dict = Depends(get_current_user)):
         "name": user["name"],
         "subscription_tier": user["subscription_tier"],
         "upload_quota": user["upload_quota"],
-        "uploads_this_month": user["uploads_this_month"]
+        "uploads_this_month": user["uploads_this_month"],
     }
 
 # ============================================
@@ -581,13 +598,12 @@ async def get_me(user: dict = Depends(get_current_user)):
 async def get_settings(user: dict = Depends(get_current_user)):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     async with db_pool.acquire() as conn:
         settings = await conn.fetchrow(
-            "SELECT * FROM user_settings WHERE user_id = $1",
-            str(user["id"])
+            "SELECT * FROM user_settings WHERE user_id = $1", str(user["id"])
         )
-    
+
     if not settings:
         return {
             "telemetry_enabled": True,
@@ -595,26 +611,26 @@ async def get_settings(user: dict = Depends(get_current_user)):
             "hud_position": "bottom_right",
             "speeding_mph": 85,
             "euphoria_mph": 100,
-            "discord_webhook_configured": False
+            "discord_webhook_configured": False,
         }
-    
+
     return {
         "telemetry_enabled": settings["telemetry_enabled"],
         "hud_enabled": settings["hud_enabled"],
         "hud_position": settings["hud_position"],
         "speeding_mph": settings["speeding_mph"],
         "euphoria_mph": settings["euphoria_mph"],
-        "discord_webhook_configured": bool(settings["discord_webhook"])
+        "discord_webhook_configured": bool(settings["discord_webhook"]),
     }
 
 @app.put("/api/settings")
 async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current_user)):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled, 
+            """INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled,
                    hud_enabled, hud_position, speeding_mph, euphoria_mph)
                VALUES ($1, $2, $3, $4, $5, $6, $7)
                ON CONFLICT (user_id) DO UPDATE SET
@@ -631,9 +647,9 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
             data.hud_enabled,
             data.hud_position,
             data.speeding_mph,
-            data.euphoria_mph
+            data.euphoria_mph,
         )
-    
+
     return {"status": "updated"}
 
 # ============================================
@@ -644,83 +660,66 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
 async def create_presigned_upload(
     data: UploadInit,
     background_tasks: BackgroundTasks,
-    user: dict = Depends(get_current_user)
+    user: dict = Depends(get_current_user),
 ):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     user_id = str(user["id"])
-    
-    # Check quota
+
     if user["uploads_this_month"] >= user["upload_quota"]:
         raise HTTPException(403, "Monthly upload quota exceeded. Please upgrade your plan.")
-    
-    # Generate unique key
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_hash = secrets.token_hex(4)
     r2_key = f"uploads/{user_id}/{timestamp}_{file_hash}_{data.filename}"
-    
-    # Generate presigned URL
+
     presigned_url = generate_presigned_upload_url(r2_key, data.content_type)
-    
-    # Create upload record
+
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
             """INSERT INTO uploads (user_id, r2_key, filename, file_size, platforms,
                    title, caption, privacy, status, scheduled_time)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)
                RETURNING id""",
-            user_id, r2_key, data.filename, data.file_size,
+            user_id,
+            r2_key,
+            data.filename,
+            data.file_size,
             data.platforms,
-            data.title, data.caption, data.privacy, data.scheduled_time
+            data.title,
+            data.caption,
+            data.privacy,
+            data.scheduled_time,
         )
-    
+
     upload_id = str(upload["id"])
-    
+
     background_tasks.add_task(
-        track_event, user_id, "upload_initiated",
-        {"upload_id": upload_id, "platforms": data.platforms}
+        track_event, user_id, "upload_initiated", {"upload_id": upload_id, "platforms": data.platforms}
     )
-    
-    return {
-        "upload_id": upload_id,
-        "presigned_url": presigned_url,
-        "r2_key": r2_key,
-        "expires_in": 3600
-    }
+
+    return {"upload_id": upload_id, "presigned_url": presigned_url, "r2_key": r2_key, "expires_in": 3600}
 
 @app.post("/api/uploads/{upload_id}/complete")
-async def complete_upload(
-    upload_id: str,
-    background_tasks: BackgroundTasks,
-    user: dict = Depends(get_current_user)
-):
+async def complete_upload(upload_id: str, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     user_id = str(user["id"])
-    
+
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
-            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
-            upload_id, user_id
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user_id
         )
-        
+
         if not upload:
             raise HTTPException(404, "Upload not found")
-        
-        await conn.execute(
-            "UPDATE uploads SET status = 'processing' WHERE id = $1",
-            upload_id
-        )
-        
-        await conn.execute(
-            "UPDATE users SET uploads_this_month = uploads_this_month + 1 WHERE id = $1",
-            user_id
-        )
-    
+
+        await conn.execute("UPDATE uploads SET status = 'processing' WHERE id = $1", upload_id)
+        await conn.execute("UPDATE users SET uploads_this_month = uploads_this_month + 1 WHERE id = $1", user_id)
+
     background_tasks.add_task(track_event, user_id, "upload_complete", {"upload_id": upload_id})
-    
     return {"status": "processing", "upload_id": upload_id}
 
 @app.get("/api/uploads")
@@ -728,21 +727,24 @@ async def list_uploads(
     limit: int = 20,
     offset: int = 0,
     status: Optional[str] = None,
-    user: dict = Depends(get_current_user)
+    user: dict = Depends(get_current_user),
 ):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     user_id = str(user["id"])
-    
+
     async with db_pool.acquire() as conn:
         if status:
             uploads = await conn.fetch(
-                """SELECT id, filename, platforms, title, status, trill_score, 
+                """SELECT id, filename, platforms, title, status, trill_score,
                           created_at, completed_at
                    FROM uploads WHERE user_id = $1 AND status = $2
                    ORDER BY created_at DESC LIMIT $3 OFFSET $4""",
-                user_id, status, limit, offset
+                user_id,
+                status,
+                limit,
+                offset,
             )
         else:
             uploads = await conn.fetch(
@@ -750,29 +752,26 @@ async def list_uploads(
                           created_at, completed_at
                    FROM uploads WHERE user_id = $1
                    ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
-                user_id, limit, offset
+                user_id,
+                limit,
+                offset,
             )
-    
-    return {
-        "uploads": [dict(u) for u in uploads],
-        "limit": limit,
-        "offset": offset
-    }
+
+    return {"uploads": [dict(u) for u in uploads], "limit": limit, "offset": offset}
 
 @app.get("/api/uploads/{upload_id}")
 async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
-            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
-            upload_id, str(user["id"])
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2", upload_id, str(user["id"])
         )
-    
+
     if not upload:
         raise HTTPException(404, "Upload not found")
-    
+
     return dict(upload)
 
 # ============================================
@@ -783,22 +782,24 @@ async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
 async def get_platforms(user: dict = Depends(get_current_user)):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     user_id = str(user["id"])
-    
+
     async with db_pool.acquire() as conn:
         tokens = await conn.fetch(
-            "SELECT platform, updated_at FROM platform_tokens WHERE user_id = $1",
-            user_id
+            "SELECT platform, updated_at FROM platform_tokens WHERE user_id = $1", user_id
         )
-    
-    connected = {row["platform"]: {"connected": True, "updated_at": row["updated_at"].isoformat()} for row in tokens}
-    
+
+    connected = {
+        row["platform"]: {"connected": True, "updated_at": row["updated_at"].isoformat()}
+        for row in tokens
+    }
+
     return {
         "tiktok": connected.get("tiktok", {"connected": False}),
         "youtube": connected.get("google", {"connected": False}),
         "facebook": connected.get("meta", {"connected": False}),
-        "instagram": connected.get("meta", {"connected": False})
+        "instagram": connected.get("meta", {"connected": False}),
     }
 
 # ============================================
@@ -809,15 +810,13 @@ async def get_platforms(user: dict = Depends(get_current_user)):
 async def tiktok_oauth_start(user: dict = Depends(get_current_user)):
     if not TIKTOK_CLIENT_KEY:
         raise HTTPException(500, "TikTok OAuth not configured")
-    
+
     state = create_jwt(str(user["id"]), expires_hours=1)
     redirect_uri = f"{BASE_URL}/oauth/tiktok/callback"
-    
+
     code_verifier = secrets.token_urlsafe(43)
-    code_challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(code_verifier.encode()).digest()
-    ).rstrip(b'=').decode()
-    
+    code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).digest()).rstrip(b"=").decode()
+
     url = (
         f"https://www.tiktok.com/v2/auth/authorize?"
         f"client_key={TIKTOK_CLIENT_KEY}&"
@@ -828,7 +827,6 @@ async def tiktok_oauth_start(user: dict = Depends(get_current_user)):
         f"code_challenge={code_challenge}&"
         f"code_challenge_method=S256"
     )
-    
     return RedirectResponse(url)
 
 @app.get("/oauth/tiktok/callback")
@@ -836,23 +834,23 @@ async def tiktok_oauth_callback(
     code: str = Query(None),
     state: str = Query(None),
     error: str = Query(None),
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
 ):
     if error:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=tiktok_oauth_failed")
-    
+
     if not state or "|" not in state:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
-    
+
     parts = state.split("|")
     user_id = verify_jwt(parts[0])
     code_verifier = parts[1] if len(parts) > 1 else ""
-    
+
     if not user_id:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
-    
+
     redirect_uri = f"{BASE_URL}/oauth/tiktok/callback"
-    
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://open.tiktokapis.com/v2/oauth/token/",
@@ -862,29 +860,30 @@ async def tiktok_oauth_callback(
                 "code": code,
                 "grant_type": "authorization_code",
                 "redirect_uri": redirect_uri,
-                "code_verifier": code_verifier
-            }
+                "code_verifier": code_verifier,
+            },
         )
         token_data = resp.json()
-    
+
     if "error" in token_data:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=tiktok_token_failed")
-    
+
     token_blob = encrypt_blob(token_data)
-    
+
     if db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO platform_tokens (user_id, platform, token_blob)
                    VALUES ($1, 'tiktok', $2)
-                   ON CONFLICT (user_id, platform) DO UPDATE SET 
+                   ON CONFLICT (user_id, platform) DO UPDATE SET
                        token_blob = $2, updated_at = NOW()""",
-                user_id, json.dumps(token_blob)
+                user_id,
+                json.dumps(token_blob),
             )
-    
+
     if background_tasks:
         background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "tiktok"})
-    
+
     return RedirectResponse(f"{BASE_URL}/dashboard?success=tiktok_connected")
 
 # ============================================
@@ -895,10 +894,10 @@ async def tiktok_oauth_callback(
 async def google_oauth_start(user: dict = Depends(get_current_user)):
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(500, "Google OAuth not configured")
-    
+
     state = create_jwt(str(user["id"]), expires_hours=1)
     redirect_uri = f"{BASE_URL}/oauth/google/callback"
-    
+
     url = (
         f"https://accounts.google.com/o/oauth2/v2/auth?"
         f"client_id={GOOGLE_CLIENT_ID}&"
@@ -909,7 +908,6 @@ async def google_oauth_start(user: dict = Depends(get_current_user)):
         f"access_type=offline&"
         f"prompt=consent"
     )
-    
     return RedirectResponse(url)
 
 @app.get("/oauth/google/callback")
@@ -917,17 +915,17 @@ async def google_oauth_callback(
     code: str = Query(None),
     state: str = Query(None),
     error: str = Query(None),
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
 ):
     if error:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=google_oauth_failed")
-    
+
     user_id = verify_jwt(state)
     if not user_id:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
-    
+
     redirect_uri = f"{BASE_URL}/oauth/google/callback"
-    
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             "https://oauth2.googleapis.com/token",
@@ -936,29 +934,30 @@ async def google_oauth_callback(
                 "client_secret": GOOGLE_CLIENT_SECRET,
                 "code": code,
                 "grant_type": "authorization_code",
-                "redirect_uri": redirect_uri
-            }
+                "redirect_uri": redirect_uri,
+            },
         )
         token_data = resp.json()
-    
+
     if "error" in token_data:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=google_token_failed")
-    
+
     token_blob = encrypt_blob(token_data)
-    
+
     if db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO platform_tokens (user_id, platform, token_blob)
                    VALUES ($1, 'google', $2)
-                   ON CONFLICT (user_id, platform) DO UPDATE SET 
+                   ON CONFLICT (user_id, platform) DO UPDATE SET
                        token_blob = $2, updated_at = NOW()""",
-                user_id, json.dumps(token_blob)
+                user_id,
+                json.dumps(token_blob),
             )
-    
+
     if background_tasks:
         background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "youtube"})
-    
+
     return RedirectResponse(f"{BASE_URL}/dashboard?success=youtube_connected")
 
 # ============================================
@@ -969,10 +968,10 @@ async def google_oauth_callback(
 async def meta_oauth_start(user: dict = Depends(get_current_user)):
     if not META_APP_ID:
         raise HTTPException(500, "Meta OAuth not configured")
-    
+
     state = create_jwt(str(user["id"]), expires_hours=1)
     redirect_uri = f"{BASE_URL}/oauth/meta/callback"
-    
+
     url = (
         f"https://www.facebook.com/{META_API_VERSION}/dialog/oauth?"
         f"client_id={META_APP_ID}&"
@@ -981,7 +980,6 @@ async def meta_oauth_start(user: dict = Depends(get_current_user)):
         f"state={state}&"
         f"response_type=code"
     )
-    
     return RedirectResponse(url)
 
 @app.get("/oauth/meta/callback")
@@ -989,48 +987,48 @@ async def meta_oauth_callback(
     code: str = Query(None),
     state: str = Query(None),
     error: str = Query(None),
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
 ):
     if error:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=meta_oauth_failed")
-    
+
     user_id = verify_jwt(state)
     if not user_id:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
-    
+
     redirect_uri = f"{BASE_URL}/oauth/meta/callback"
-    
+
     async with httpx.AsyncClient() as client:
-        # Exchange code for token
         resp = await client.get(
             f"https://graph.facebook.com/{META_API_VERSION}/oauth/access_token",
             params={
                 "client_id": META_APP_ID,
                 "client_secret": META_APP_SECRET,
                 "redirect_uri": redirect_uri,
-                "code": code
-            }
+                "code": code,
+            },
         )
         token_data = resp.json()
-    
+
     if "error" in token_data:
         return RedirectResponse(f"{BASE_URL}/dashboard?error=meta_token_failed")
-    
+
     token_blob = encrypt_blob(token_data)
-    
+
     if db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO platform_tokens (user_id, platform, token_blob)
                    VALUES ($1, 'meta', $2)
-                   ON CONFLICT (user_id, platform) DO UPDATE SET 
+                   ON CONFLICT (user_id, platform) DO UPDATE SET
                        token_blob = $2, updated_at = NOW()""",
-                user_id, json.dumps(token_blob)
+                user_id,
+                json.dumps(token_blob),
             )
-    
+
     if background_tasks:
         background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "meta"})
-    
+
     return RedirectResponse(f"{BASE_URL}/dashboard?success=meta_connected")
 
 # ============================================
@@ -1038,48 +1036,40 @@ async def meta_oauth_callback(
 # ============================================
 
 @app.get("/api/analytics/overview")
-async def get_analytics_overview(
-    days: int = 30,
-    user: dict = Depends(get_current_user)
-):
+async def get_analytics_overview(days: int = 30, user: dict = Depends(get_current_user)):
     if not db_pool:
         raise HTTPException(500, "Database not available")
-    
+
     user_id = str(user["id"])
     since = datetime.now(timezone.utc) - timedelta(days=days)
-    
+
     async with db_pool.acquire() as conn:
-        total_uploads = await conn.fetchval(
-            "SELECT COUNT(*) FROM uploads WHERE user_id = $1",
-            user_id
-        )
-        
+        total_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE user_id = $1", user_id)
         period_uploads = await conn.fetchval(
-            "SELECT COUNT(*) FROM uploads WHERE user_id = $1 AND created_at >= $2",
-            user_id, since
+            "SELECT COUNT(*) FROM uploads WHERE user_id = $1 AND created_at >= $2", user_id, since
         )
-        
         successful = await conn.fetchval(
-            """SELECT COUNT(*) FROM uploads 
+            """SELECT COUNT(*) FROM uploads
                WHERE user_id = $1 AND status = 'complete' AND created_at >= $2""",
-            user_id, since
+            user_id,
+            since,
         )
-        
         avg_trill = await conn.fetchval(
-            """SELECT AVG(trill_score) FROM uploads 
+            """SELECT AVG(trill_score) FROM uploads
                WHERE user_id = $1 AND trill_score IS NOT NULL AND created_at >= $2""",
-            user_id, since
+            user_id,
+            since,
         )
-    
-    success_rate = (successful / period_uploads * 100) if period_uploads > 0 else 0
-    
+
+    success_rate = (successful / period_uploads * 100) if period_uploads else 0
+
     return {
         "total_uploads": total_uploads or 0,
         "period_uploads": period_uploads or 0,
         "success_rate": round(success_rate, 1),
         "avg_trill_score": round(avg_trill or 0, 1),
         "quota_used": user["uploads_this_month"],
-        "quota_total": user["upload_quota"]
+        "quota_total": user["upload_quota"],
     }
 
 # ============================================

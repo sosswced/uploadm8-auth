@@ -1,679 +1,1091 @@
-#!/usr/bin/env python3
 """
-UploadM8 Central Auth Service (Render)
-
-Render start command (recommended):
-  uvicorn app:app --host 0.0.0.0 --port $PORT
-
-CRITICAL: this module must expose a FastAPI instance named `app`.
-
-Desktop contract endpoints (auth_manager.py uses these):
-  POST /device/code
-  GET  /device/status?device_code=...
-  POST /device/jwt
-  GET  /api/token/{platform}              platform: google|tiktok|meta
-  GET  /api/meta/pages
-  POST /api/meta/select_page
-  GET  /api/meta/page_token
-
-OAuth routes (human UI + redirects):
-  GET  /device?device_code=...
-  POST /device/claim
-  GET  /oauth/google/start?device_code=...
-  GET  /oauth/google/callback
-  GET  /oauth/tiktok/start?device_code=...
-  GET  /oauth/tiktok/callback
-  GET  /oauth/meta/start?device_code=...
-  GET  /oauth/meta/callback
+UploadM8 Auth Service
+=====================
+Production-ready FastAPI backend for UploadM8 SaaS
+- User authentication (email/password)
+- Password reset via Mailgun
+- R2 presigned URLs for direct browser uploads
+- Multi-platform OAuth (TikTok, YouTube, Meta)
+- Upload tracking & analytics
+- Subscription management (Stripe)
 """
 
-from __future__ import annotations
-
-import base64
-import hashlib
-import json
 import os
+import json
 import secrets
-import time
-from dataclasses import dataclass
+import hashlib
+import base64
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, List
+from contextlib import asynccontextmanager
 
-import psycopg
-import requests
+import httpx
+from fastapi import FastAPI, HTTPException, Depends, Request, Query, Header, BackgroundTasks
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from jose import jwt
+import asyncpg
+import jwt
+from passlib.hash import bcrypt
+import boto3
+from botocore.config import Config
 
-# -----------------------------
-# Env / config
-# -----------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")  # e.g. https://auth.uploadm8.com
-JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
-TOKEN_ENC_KEYS = os.getenv("TOKEN_ENC_KEYS", "").strip()  # "v1:<b64 32 bytes>,v2:<b64 32 bytes>"
+# ============================================
+# Configuration from Environment
+# ============================================
 
-META_APP_ID = os.getenv("META_APP_ID", "").strip()
-META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
-META_VERSION = os.getenv("META_VERSION", "v23.0").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL")
+BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
+JWT_SECRET = os.environ.get("JWT_SECRET", "change-me")
+TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
 
-TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
-TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
+# R2 Configuration
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "uploadm8-media")
 
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+# Platform OAuth
+META_APP_ID = os.environ.get("META_APP_ID", "")
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
+META_API_VERSION = os.environ.get("META_API_VERSION", "v23.0")
+TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
-DEVICE_CODE_TTL_MIN = int(os.getenv("DEVICE_CODE_TTL_MIN", "20"))
-OAUTH_STATE_TTL_MIN = int(os.getenv("OAUTH_STATE_TTL_MIN", "20"))
+# Mailgun
+MAILGUN_API_KEY = os.environ.get("MAILGUN_API_KEY", "")
+MAILGUN_DOMAIN = os.environ.get("MAILGUN_DOMAIN", "")
+MAIL_FROM = os.environ.get("MAIL_FROM", "no-reply@auth.uploadm8.com")
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL missing in Render environment")
-if not BASE_URL:
-    raise RuntimeError("BASE_URL missing (must be your Render public URL, e.g. https://auth.uploadm8.com)")
-if not JWT_SECRET:
-    raise RuntimeError("JWT_SECRET missing in Render environment")
-if not TOKEN_ENC_KEYS:
-    raise RuntimeError("TOKEN_ENC_KEYS missing in Render environment")
+# Stripe (optional)
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+# ============================================
+# Pydantic Models
+# ============================================
 
-def b64e(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    name: str = Field(min_length=2)
 
-def b64d(s: str) -> bytes:
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
 
-# -----------------------------
-# Encryption (AES-GCM + rotation)
-# TOKEN_ENC_KEYS: "kid1:<b64 32 bytes>,kid2:<b64 32 bytes>"
-# last kid = active for new writes; any kid can decrypt
-# -----------------------------
-@dataclass
-class KeyRing:
-    keys: Dict[str, bytes]
-    active_kid: str
+class PasswordReset(BaseModel):
+    email: EmailStr
 
-def load_keyring() -> KeyRing:
-    parts = [p.strip() for p in TOKEN_ENC_KEYS.split(",") if p.strip()]
-    if not parts:
-        raise RuntimeError("TOKEN_ENC_KEYS empty")
-    keys: Dict[str, bytes] = {}
-    for part in parts:
-        if ":" not in part:
-            raise RuntimeError("TOKEN_ENC_KEYS invalid; expected kid:base64")
-        kid, b64 = part.split(":", 1)
-        raw = b64d(b64)
-        if len(raw) != 32:
-            raise RuntimeError(f"TOKEN_ENC_KEYS {kid} must decode to 32 bytes")
-        keys[kid] = raw
-    active_kid = parts[-1].split(":", 1)[0]
-    return KeyRing(keys=keys, active_kid=active_kid)
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str = Field(min_length=8)
 
-KEYRING = load_keyring()
+class UploadInit(BaseModel):
+    filename: str
+    file_size: int
+    content_type: str
+    platforms: List[str]
+    title: str = ""
+    caption: str = ""
+    privacy: str = "public"
+    scheduled_time: Optional[datetime] = None
 
-def encrypt_json(subject: str, platform: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    kid = KEYRING.active_kid
-    key = KEYRING.keys[kid]
-    aes = AESGCM(key)
+class SettingsUpdate(BaseModel):
+    discord_webhook: Optional[str] = None
+    telemetry_enabled: Optional[bool] = None
+    hud_enabled: Optional[bool] = None
+    hud_position: Optional[str] = None
+    speeding_mph: Optional[int] = None
+    euphoria_mph: Optional[int] = None
+
+# ============================================
+# Encryption Helpers
+# ============================================
+
+def parse_enc_keys():
+    keys = {}
+    if not TOKEN_ENC_KEYS:
+        keys["v1"] = secrets.token_bytes(32)
+        return keys
+    # Clean up the string (remove quotes and newlines)
+    clean_keys = TOKEN_ENC_KEYS.strip().strip('"').replace('\\n', '')
+    for part in clean_keys.split(","):
+        if ":" in part:
+            kid, b64key = part.split(":", 1)
+            try:
+                keys[kid.strip()] = base64.b64decode(b64key.strip())
+            except Exception as e:
+                print(f"Warning: Could not decode key {kid}: {e}")
+    if not keys:
+        keys["v1"] = secrets.token_bytes(32)
+    return keys
+
+ENC_KEYS = parse_enc_keys()
+CURRENT_KEY_ID = list(ENC_KEYS.keys())[-1]
+
+def encrypt_blob(data: dict) -> dict:
+    key = ENC_KEYS[CURRENT_KEY_ID]
+    aesgcm = AESGCM(key)
     nonce = secrets.token_bytes(12)
-    aad = f"{subject}:{platform}".encode("utf-8")
-    pt = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ct = aes.encrypt(nonce, pt, aad)
-    return {"kid": kid, "nonce": b64e(nonce), "ct": b64e(ct)}
+    plaintext = json.dumps(data).encode()
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    return {
+        "kid": CURRENT_KEY_ID,
+        "nonce": base64.b64encode(nonce).decode(),
+        "data": base64.b64encode(ciphertext).decode()
+    }
 
-def decrypt_json(subject: str, platform: str, blob: Dict[str, Any]) -> Dict[str, Any]:
-    kid = str(blob.get("kid", ""))
-    if kid not in KEYRING.keys:
-        raise RuntimeError("Unknown kid in token blob")
-    key = KEYRING.keys[kid]
-    aes = AESGCM(key)
-    nonce = b64d(str(blob["nonce"]))
-    ct = b64d(str(blob["ct"]))
-    aad = f"{subject}:{platform}".encode("utf-8")
-    pt = aes.decrypt(nonce, ct, aad)
-    return json.loads(pt.decode("utf-8"))
+def decrypt_blob(blob: dict) -> dict:
+    kid = blob.get("kid", "v1")
+    if kid not in ENC_KEYS:
+        raise ValueError(f"Unknown key ID: {kid}")
+    key = ENC_KEYS[kid]
+    aesgcm = AESGCM(key)
+    nonce = base64.b64decode(blob["nonce"])
+    ciphertext = base64.b64decode(blob["data"])
+    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    return json.loads(plaintext)
 
-# -----------------------------
-# JWT
-# -----------------------------
-def issue_jwt(subject: str) -> str:
-    now = int(time.time())
-    payload = {"sub": subject, "iat": now, "exp": now + 60 * 60 * 24 * 30}  # 30 days
+# ============================================
+# Database
+# ============================================
+
+db_pool: Optional[asyncpg.Pool] = None
+
+async def init_db():
+    global db_pool
+    if not DATABASE_URL:
+        print("WARNING: No DATABASE_URL configured")
+        return
+    
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+        
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    subscription_tier TEXT DEFAULT 'free',
+                    stripe_customer_id TEXT,
+                    upload_quota INTEGER DEFAULT 5,
+                    uploads_this_month INTEGER DEFAULT 0,
+                    quota_reset_date DATE DEFAULT CURRENT_DATE,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    discord_webhook TEXT,
+                    telemetry_enabled BOOLEAN DEFAULT true,
+                    hud_enabled BOOLEAN DEFAULT true,
+                    hud_position TEXT DEFAULT 'bottom_right',
+                    speeding_mph INTEGER DEFAULT 85,
+                    euphoria_mph INTEGER DEFAULT 100,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                
+                CREATE TABLE IF NOT EXISTS password_resets (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                
+                CREATE TABLE IF NOT EXISTS platform_tokens (
+                    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                    platform TEXT NOT NULL,
+                    token_blob JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (user_id, platform)
+                );
+                
+                CREATE TABLE IF NOT EXISTS uploads (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                    r2_key TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    file_size BIGINT,
+                    platforms TEXT[] NOT NULL,
+                    title TEXT,
+                    caption TEXT,
+                    privacy TEXT DEFAULT 'public',
+                    status TEXT DEFAULT 'pending',
+                    scheduled_time TIMESTAMPTZ,
+                    trill_score REAL,
+                    platform_results JSONB DEFAULT '{}',
+                    error_message TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ
+                );
+                
+                CREATE TABLE IF NOT EXISTS analytics_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    event_data JSONB DEFAULT '{}',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_uploads_user ON uploads(user_id);
+                CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
+                CREATE INDEX IF NOT EXISTS idx_analytics_user ON analytics_events(user_id);
+            """)
+        print("Database initialized successfully")
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+
+async def close_db():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+
+async def get_db():
+    if not db_pool:
+        raise HTTPException(500, "Database not configured")
+    return db_pool
+
+# ============================================
+# JWT Helpers
+# ============================================
+
+def create_jwt(user_id: str, expires_hours: int = 168) -> str:
+    payload = {
+        "sub": user_id,
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=expires_hours)
+    }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def require_subject(req: Request) -> str:
-    auth = req.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = auth.split(" ", 1)[1].strip()
+def verify_jwt(token: str) -> Optional[str]:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        sub = str(payload.get("sub", "")).strip()
-        if not sub:
-            raise ValueError("Missing sub")
-        return sub
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid Bearer token")
-
-# -----------------------------
-# DB
-# -----------------------------
-def db() -> psycopg.Connection:
-    return psycopg.connect(DATABASE_URL, autocommit=True)
-
-SCHEMA_SQL = r"""
-CREATE TABLE IF NOT EXISTS device_codes (
-  device_code TEXT PRIMARY KEY,
-  user_code TEXT UNIQUE NOT NULL,
-  status TEXT NOT NULL,            -- PENDING / CLAIMED
-  expires_at TIMESTAMPTZ NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS oauth_states (
-  state TEXT PRIMARY KEY,
-  device_code TEXT NOT NULL REFERENCES device_codes(device_code) ON DELETE CASCADE,
-  platform TEXT NOT NULL,
-  pkce_verifier TEXT NULL,
-  expires_at TIMESTAMPTZ NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS token_vault (
-  subject TEXT NOT NULL,
-  platform TEXT NOT NULL,          -- meta | tiktok | google | meta_page
-  blob JSONB NOT NULL,             -- encrypted token blob
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (subject, platform)
-);
-
-CREATE TABLE IF NOT EXISTS audit_log (
-  id BIGSERIAL PRIMARY KEY,
-  event TEXT NOT NULL,
-  subject TEXT NULL,
-  meta JSONB NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
-
-def init_db() -> None:
-    with db() as conn:
-        conn.execute(SCHEMA_SQL)
-
-def log_event(event: str, subject: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> None:
-    try:
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO audit_log(event, subject, meta) VALUES (%s, %s, %s)",
-                (event, subject, json.dumps(meta) if meta else None),
-            )
-    except Exception:
-        pass
-
-def get_device_row(device_code: str) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT device_code, user_code, status, expires_at FROM device_codes WHERE device_code=%s",
-            (device_code,),
-        ).fetchone()
-    if not row:
+        return payload.get("sub")
+    except jwt.InvalidTokenError:
         return None
-    return {"device_code": row[0], "user_code": row[1], "status": row[2], "expires_at": row[3]}
 
-def is_device_claimed(device_code: str) -> bool:
-    row = get_device_row(device_code)
-    if not row:
-        return False
-    if row["expires_at"] < utcnow():
-        return False
-    return row["status"] == "CLAIMED"
-
-def upsert_vault(subject: str, platform: str, blob: Dict[str, Any]) -> None:
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO token_vault(subject, platform, blob, updated_at)
-            VALUES (%s, %s, %s, now())
-            ON CONFLICT (subject, platform)
-            DO UPDATE SET blob=EXCLUDED.blob, updated_at=now()
-            """,
-            (subject, platform, json.dumps(blob)),
+async def get_current_user(authorization: str = Header(None)) -> dict:
+    if not authorization:
+        raise HTTPException(401, "Missing authorization header")
+    
+    token = authorization.replace("Bearer ", "")
+    user_id = verify_jwt(token)
+    if not user_id:
+        raise HTTPException(401, "Invalid or expired token")
+    
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            """SELECT id, email, name, subscription_tier, upload_quota, 
+                      uploads_this_month, quota_reset_date
+               FROM users WHERE id = $1""",
+            user_id
         )
+    
+    if not user:
+        raise HTTPException(401, "User not found")
+    
+    return dict(user)
 
-def get_vault_blob(subject: str, platform: str) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT blob FROM token_vault WHERE subject=%s AND platform=%s",
-            (subject, platform),
-        ).fetchone()
-    if not row:
+# ============================================
+# R2 Storage
+# ============================================
+
+def get_r2_client():
+    if not R2_ACCOUNT_ID or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
         return None
-    return row[0]
-
-# -----------------------------
-# OAuth state + PKCE
-# -----------------------------
-def pkce_pair() -> Tuple[str, str]:
-    verifier = b64e(secrets.token_bytes(32))
-    challenge = b64e(hashlib.sha256(verifier.encode("utf-8")).digest())
-    return verifier, challenge
-
-def create_oauth_state(device_code: str, platform: str, pkce_verifier: Optional[str]) -> str:
-    state = secrets.token_urlsafe(24)
-    expires_at = utcnow() + timedelta(minutes=OAUTH_STATE_TTL_MIN)
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO oauth_states(state, device_code, platform, pkce_verifier, expires_at) VALUES (%s,%s,%s,%s,%s)",
-            (state, device_code, platform, pkce_verifier, expires_at),
-        )
-    return state
-
-def pop_oauth_state(state: str) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT state, device_code, platform, pkce_verifier, expires_at FROM oauth_states WHERE state=%s",
-            (state,),
-        ).fetchone()
-        if not row:
-            return None
-        conn.execute("DELETE FROM oauth_states WHERE state=%s", (state,))
-    data = {"state": row[0], "device_code": row[1], "platform": row[2], "pkce_verifier": row[3], "expires_at": row[4]}
-    if data["expires_at"] < utcnow():
-        return None
-    return data
-
-# -----------------------------
-# FastAPI app
-# -----------------------------
-init_db()
-app = FastAPI(title="UploadM8 Auth", version="2.0")
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "base_url": BASE_URL, "meta_version": META_VERSION}
-
-# ===== Device link =====
-@app.post("/device/code")
-def device_code():
-    device_code = secrets.token_urlsafe(32)
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    user_code = "".join(secrets.choice(alphabet) for _ in range(8))
-    expires_at = utcnow() + timedelta(minutes=DEVICE_CODE_TTL_MIN)
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO device_codes(device_code, user_code, status, expires_at) VALUES (%s,%s,%s,%s)",
-            (device_code, user_code, "PENDING", expires_at),
-        )
-    verify_url = f"{BASE_URL}/device?device_code={device_code}"
-    log_event("device_code_issued", subject=device_code, meta={"user_code": user_code})
-    return {
-        "ok": True,
-        "device_code": device_code,
-        "user_code": user_code,
-        "verification_uri": f"{BASE_URL}/device",
-        "verification_uri_complete": verify_url,
-        "expires_in": DEVICE_CODE_TTL_MIN * 60,
-        "interval": 3,
-    }
-
-@app.get("/device", response_class=HTMLResponse)
-def device_page(device_code: str):
-    row = get_device_row(device_code)
-    if not row:
-        return HTMLResponse("<h3>Invalid device_code</h3>", status_code=404)
-    if row["expires_at"] < utcnow():
-        return HTMLResponse("<h3>Device code expired</h3>", status_code=400)
-
-    if row["status"] != "CLAIMED":
-        body = f"""
-        <h2>UploadM8 Device Link</h2>
-        <p>Code: <b>{row['user_code']}</b></p>
-        <form method="post" action="/device/claim">
-          <input type="hidden" name="device_code" value="{device_code}" />
-          <button type="submit">Link this device</button>
-        </form>
-        <p>After linking, return to the desktop app.</p>
-        """
-        return HTMLResponse(body)
-
-    body = f"""
-    <h2>UploadM8 Device Linked</h2>
-    <p>Device <b>{row['user_code']}</b> is linked.</p>
-    <h3>Connect platforms</h3>
-    <ul>
-      <li><a href="/oauth/google/start?device_code={device_code}">Connect Google/YouTube</a></li>
-      <li><a href="/oauth/tiktok/start?device_code={device_code}">Connect TikTok</a></li>
-      <li><a href="/oauth/meta/start?device_code={device_code}">Connect Facebook/Instagram</a></li>
-    </ul>
-    <p>You can close this tab after connecting.</p>
-    """
-    return HTMLResponse(body)
-
-@app.post("/device/claim")
-async def device_claim(req: Request):
-    form = await req.form()
-    device_code = str(form.get("device_code", "")).strip()
-    row = get_device_row(device_code)
-    if not row or row["expires_at"] < utcnow():
-        raise HTTPException(status_code=400, detail="Invalid or expired device_code")
-    with db() as conn:
-        conn.execute("UPDATE device_codes SET status='CLAIMED' WHERE device_code=%s", (device_code,))
-    log_event("device_claimed", subject=device_code)
-    return RedirectResponse(url=f"/device?device_code={device_code}", status_code=302)
-
-@app.get("/device/status")
-def device_status(device_code: str):
-    row = get_device_row(device_code)
-    if not row:
-        raise HTTPException(status_code=404, detail="Unknown device_code")
-    if row["expires_at"] < utcnow():
-        raise HTTPException(status_code=400, detail="Device code expired")
-    return {"ok": True, "device_code": device_code, "status": row["status"]}
-
-@app.post("/device/jwt")
-def device_jwt(payload: Dict[str, Any]):
-    device_code = str(payload.get("device_code", "")).strip()
-    row = get_device_row(device_code)
-    if not row or row["expires_at"] < utcnow():
-        raise HTTPException(status_code=400, detail="Invalid or expired device_code")
-    if row["status"] != "CLAIMED":
-        raise HTTPException(status_code=400, detail="Device not claimed yet")
-    token = issue_jwt(device_code)
-    log_event("device_jwt_issued", subject=device_code)
-    return {"ok": True, "jwt": token}
-
-# ===== Token endpoints for desktop =====
-@app.get("/api/token/{platform}")
-def api_token(platform: str, req: Request):
-    subject = require_subject(req)
-    platform = platform.lower()
-    if platform not in ("google", "tiktok", "meta"):
-        raise HTTPException(status_code=400, detail="Invalid platform")
-
-    blob = get_vault_blob(subject, platform)
-    if not blob:
-        return JSONResponse(
-            status_code=404,
-            content={"ok": False, "missing": True, "platform": platform, "connect_url": f"{BASE_URL}/device?device_code={subject}"},
-        )
-
-    data = decrypt_json(subject, platform, blob)
-
-    # Legacy client expects "token" for these
-    if platform in ("tiktok", "meta"):
-        return {"ok": True, "token": data.get("access_token")}
-
-    return {"ok": True, "token": data.get("access_token"), "payload": data}
-
-# ===== Meta helper endpoints =====
-@app.get("/api/meta/pages")
-def meta_pages(req: Request):
-    subject = require_subject(req)
-    blob = get_vault_blob(subject, "meta")
-    if not blob:
-        raise HTTPException(status_code=404, detail="Meta not connected")
-
-    tok = decrypt_json(subject, "meta", blob).get("access_token")
-    if not tok:
-        raise HTTPException(status_code=400, detail="Meta token missing")
-
-    url = f"https://graph.facebook.com/{META_VERSION}/me/accounts"
-    r = requests.get(url, params={"access_token": tok}, timeout=30)
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Graph error: {r.status_code} {r.text[:500]}")
-    pages = [{"id": p.get("id"), "name": p.get("name")} for p in r.json().get("data", [])]
-    return {"ok": True, "pages": pages}
-
-@app.post("/api/meta/select_page")
-def meta_select_page(payload: Dict[str, Any], req: Request):
-    subject = require_subject(req)
-    page_id = str(payload.get("page_id", "")).strip()
-    if not page_id:
-        raise HTTPException(status_code=400, detail="page_id required")
-
-    blob = get_vault_blob(subject, "meta")
-    if not blob:
-        raise HTTPException(status_code=404, detail="Meta not connected")
-
-    user_token = decrypt_json(subject, "meta", blob).get("access_token")
-
-    # Pull page token + IG user id
-    url = f"https://graph.facebook.com/{META_VERSION}/{page_id}"
-    r = requests.get(
-        url,
-        params={"fields": "name,access_token,instagram_business_account", "access_token": user_token},
-        timeout=30,
+    
+    return boto3.client(
+        's3',
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version='s3v4', s3={'addressing_style': 'path'}),
+        region_name='auto'
     )
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Graph error: {r.status_code} {r.text[:500]}")
-    page = r.json()
-    page_token = page.get("access_token")
-    if not page_token:
-        raise HTTPException(status_code=400, detail="Could not retrieve page access_token (check scopes/review).")
 
-    ig_user_id = None
-    if isinstance(page.get("instagram_business_account"), dict):
-        ig_user_id = page["instagram_business_account"].get("id")
-
-    page_payload = {
-        "page_id": page_id,
-        "page_name": page.get("name"),
-        "page_access_token": page_token,
-        "ig_user_id": ig_user_id,
-    }
-    upsert_vault(subject, "meta_page", encrypt_json(subject, "meta_page", page_payload))
-    log_event("meta_page_selected", subject=subject, meta={"page_id": page_id, "ig_user_id": ig_user_id})
-    return {"ok": True, **page_payload}
-
-@app.get("/api/meta/page_token")
-def meta_page_token(req: Request):
-    subject = require_subject(req)
-    blob = get_vault_blob(subject, "meta_page")
-    if not blob:
-        raise HTTPException(status_code=404, detail="No page selected")
-    data = decrypt_json(subject, "meta_page", blob)
-    return {"ok": True, **data}
-
-# ===== OAuth flows =====
-@app.get("/oauth/google/start")
-def google_start(device_code: str):
-    if not is_device_claimed(device_code):
-        raise HTTPException(status_code=400, detail="Device not linked yet")
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID/SECRET not configured on server")
-
-    redirect_uri = f"{BASE_URL}/oauth/google/callback"
-    state = create_oauth_state(device_code, "google", pkce_verifier=None)
-    scope = "https://www.googleapis.com/auth/youtube.upload"
-
-    auth_url = (
-        "https://accounts.google.com/o/oauth2/v2/auth"
-        f"?response_type=code&client_id={requests.utils.quote(GOOGLE_CLIENT_ID)}"
-        f"&redirect_uri={requests.utils.quote(redirect_uri, safe='')}"
-        f"&scope={requests.utils.quote(scope)}"
-        f"&access_type=offline&prompt=consent"
-        f"&state={requests.utils.quote(state)}"
-    )
-    return RedirectResponse(auth_url, status_code=302)
-
-@app.get("/oauth/google/callback", response_class=HTMLResponse)
-def google_callback(code: str = "", state: str = "", error: str = ""):
-    if error:
-        return HTMLResponse(f"<h3>Google OAuth error</h3><pre>{error}</pre>", status_code=400)
-    st = pop_oauth_state(state)
-    if not st or st["platform"] != "google":
-        return HTMLResponse("<h3>Invalid/expired state</h3>", status_code=400)
-
-    device_code = st["device_code"]
-    redirect_uri = f"{BASE_URL}/oauth/google/callback"
-
-    r = requests.post(
-        "https://oauth2.googleapis.com/token",
-        data={
-            "code": code,
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": redirect_uri,
-            "grant_type": "authorization_code",
+def generate_presigned_upload_url(key: str, content_type: str, expires: int = 3600) -> str:
+    client = get_r2_client()
+    if not client:
+        raise HTTPException(500, "R2 storage not configured")
+    
+    return client.generate_presigned_url(
+        'put_object',
+        Params={
+            'Bucket': R2_BUCKET_NAME,
+            'Key': key,
+            'ContentType': content_type
         },
-        timeout=30,
+        ExpiresIn=expires
     )
-    if r.status_code != 200:
-        log_event("google_token_exchange_failed", subject=device_code, meta={"status": r.status_code, "body": r.text[:500]})
-        return HTMLResponse(f"<h3>Token exchange failed</h3><pre>{r.status_code} {r.text}</pre>", status_code=400)
 
-    tok = r.json()
-    payload = {
-        "access_token": tok.get("access_token"),
-        "refresh_token": tok.get("refresh_token"),
-        "expires_in": tok.get("expires_in"),
-        "token_type": tok.get("token_type"),
-        "scope": tok.get("scope"),
-        "obtained_at": int(time.time()),
+# ============================================
+# Email (Mailgun)
+# ============================================
+
+async def send_email(to: str, subject: str, html: str):
+    if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
+        print(f"Email not configured - would send to {to}: {subject}")
+        return False
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
+            auth=("api", MAILGUN_API_KEY),
+            data={
+                "from": MAIL_FROM,
+                "to": to,
+                "subject": subject,
+                "html": html
+            }
+        )
+        return resp.status_code == 200
+
+# ============================================
+# Analytics Tracking
+# ============================================
+
+async def track_event(user_id: str, event_type: str, event_data: dict = None):
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO analytics_events (user_id, event_type, event_data)
+                   VALUES ($1, $2, $3)""",
+                user_id, event_type, json.dumps(event_data or {})
+            )
+    except Exception as e:
+        print(f"Analytics tracking error: {e}")
+
+# ============================================
+# FastAPI App
+# ============================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+    await close_db()
+
+app = FastAPI(
+    title="UploadM8 API",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================
+# Health & Status
+# ============================================
+
+@app.get("/")
+async def root():
+    return {"message": "UploadM8 Auth Service", "status": "running"}
+
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "database": db_pool is not None,
+        "r2_configured": bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID),
+        "mailgun_configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN),
+        "platforms": {
+            "tiktok": bool(TIKTOK_CLIENT_KEY),
+            "youtube": bool(GOOGLE_CLIENT_ID),
+            "meta": bool(META_APP_ID)
+        }
     }
-    upsert_vault(device_code, "google", encrypt_json(device_code, "google", payload))
-    log_event("google_connected", subject=device_code, meta={"scope": payload.get("scope")})
-    return HTMLResponse("<h2>Google/YouTube connected.</h2><p>You can close this tab.</p>")
+
+# ============================================
+# Authentication Routes
+# ============================================
+
+@app.post("/api/auth/register")
+async def register(data: UserCreate, background_tasks: BackgroundTasks):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    password_hash = bcrypt.hash(data.password)
+    
+    async with db_pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """INSERT INTO users (email, password_hash, name)
+                   VALUES ($1, $2, $3) RETURNING id, email, name, subscription_tier""",
+                data.email.lower(), password_hash, data.name
+            )
+            user_id = str(row["id"])
+            
+            await conn.execute(
+                "INSERT INTO user_settings (user_id) VALUES ($1)",
+                user_id
+            )
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(400, "Email already registered")
+    
+    background_tasks.add_task(track_event, user_id, "user_signup", {"email": data.email})
+    
+    token = create_jwt(user_id)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user_id,
+            "email": row["email"],
+            "name": row["name"],
+            "subscription_tier": row["subscription_tier"]
+        }
+    }
+
+@app.post("/api/auth/login")
+async def login(data: UserLogin, background_tasks: BackgroundTasks):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, email, name, password_hash, subscription_tier, 
+                      upload_quota, uploads_this_month
+               FROM users WHERE email = $1""",
+            data.email.lower()
+        )
+    
+    if not row or not bcrypt.verify(data.password, row["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    
+    user_id = str(row["id"])
+    background_tasks.add_task(track_event, user_id, "user_login")
+    
+    token = create_jwt(user_id)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user_id,
+            "email": row["email"],
+            "name": row["name"],
+            "subscription_tier": row["subscription_tier"],
+            "upload_quota": row["upload_quota"],
+            "uploads_this_month": row["uploads_this_month"]
+        }
+    }
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(data: PasswordReset, background_tasks: BackgroundTasks):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT id, email, name FROM users WHERE email = $1",
+            data.email.lower()
+        )
+    
+    if not user:
+        return {"message": "If that email exists, we've sent a reset link"}
+    
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO password_resets (token_hash, user_id, expires_at)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (token_hash) DO UPDATE SET expires_at = $3""",
+            token_hash, str(user["id"]), expires_at
+        )
+    
+    reset_url = f"{BASE_URL}/reset-password?token={token}"
+    html = f"""
+    <h2>Reset Your UploadM8 Password</h2>
+    <p>Hi {user['name']},</p>
+    <p>Click the link below to reset your password:</p>
+    <p><a href="{reset_url}" style="background:#3B82F6;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;">Reset Password</a></p>
+    <p>This link expires in 1 hour.</p>
+    <p>If you didn't request this, you can ignore this email.</p>
+    <p>- The UploadM8 Team</p>
+    """
+    
+    background_tasks.add_task(send_email, user["email"], "Reset Your UploadM8 Password", html)
+    
+    return {"message": "If that email exists, we've sent a reset link"}
+
+@app.post("/api/auth/reset-password")
+async def reset_password(data: PasswordResetConfirm):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    token_hash = hashlib.sha256(data.token.encode()).hexdigest()
+    
+    async with db_pool.acquire() as conn:
+        reset = await conn.fetchrow(
+            "SELECT user_id, expires_at FROM password_resets WHERE token_hash = $1",
+            token_hash
+        )
+        
+        if not reset:
+            raise HTTPException(400, "Invalid or expired reset token")
+        
+        if reset["expires_at"] < datetime.now(timezone.utc):
+            raise HTTPException(400, "Reset token has expired")
+        
+        new_hash = bcrypt.hash(data.new_password)
+        await conn.execute(
+            "UPDATE users SET password_hash = $1 WHERE id = $2",
+            new_hash, reset["user_id"]
+        )
+        
+        await conn.execute(
+            "DELETE FROM password_resets WHERE token_hash = $1",
+            token_hash
+        )
+    
+    return {"message": "Password updated successfully"}
+
+@app.get("/api/auth/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    return {
+        "id": str(user["id"]),
+        "email": user["email"],
+        "name": user["name"],
+        "subscription_tier": user["subscription_tier"],
+        "upload_quota": user["upload_quota"],
+        "uploads_this_month": user["uploads_this_month"]
+    }
+
+# ============================================
+# Settings Routes
+# ============================================
+
+@app.get("/api/settings")
+async def get_settings(user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        settings = await conn.fetchrow(
+            "SELECT * FROM user_settings WHERE user_id = $1",
+            str(user["id"])
+        )
+    
+    if not settings:
+        return {
+            "telemetry_enabled": True,
+            "hud_enabled": True,
+            "hud_position": "bottom_right",
+            "speeding_mph": 85,
+            "euphoria_mph": 100,
+            "discord_webhook_configured": False
+        }
+    
+    return {
+        "telemetry_enabled": settings["telemetry_enabled"],
+        "hud_enabled": settings["hud_enabled"],
+        "hud_position": settings["hud_position"],
+        "speeding_mph": settings["speeding_mph"],
+        "euphoria_mph": settings["euphoria_mph"],
+        "discord_webhook_configured": bool(settings["discord_webhook"])
+    }
+
+@app.put("/api/settings")
+async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled, 
+                   hud_enabled, hud_position, speeding_mph, euphoria_mph)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (user_id) DO UPDATE SET
+                   discord_webhook = COALESCE($2, user_settings.discord_webhook),
+                   telemetry_enabled = COALESCE($3, user_settings.telemetry_enabled),
+                   hud_enabled = COALESCE($4, user_settings.hud_enabled),
+                   hud_position = COALESCE($5, user_settings.hud_position),
+                   speeding_mph = COALESCE($6, user_settings.speeding_mph),
+                   euphoria_mph = COALESCE($7, user_settings.euphoria_mph),
+                   updated_at = NOW()""",
+            str(user["id"]),
+            data.discord_webhook,
+            data.telemetry_enabled,
+            data.hud_enabled,
+            data.hud_position,
+            data.speeding_mph,
+            data.euphoria_mph
+        )
+    
+    return {"status": "updated"}
+
+# ============================================
+# Upload Routes (R2 Direct Upload)
+# ============================================
+
+@app.post("/api/uploads/presign")
+async def create_presigned_upload(
+    data: UploadInit,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user)
+):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    # Check quota
+    if user["uploads_this_month"] >= user["upload_quota"]:
+        raise HTTPException(403, "Monthly upload quota exceeded. Please upgrade your plan.")
+    
+    # Generate unique key
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_hash = secrets.token_hex(4)
+    r2_key = f"uploads/{user_id}/{timestamp}_{file_hash}_{data.filename}"
+    
+    # Generate presigned URL
+    presigned_url = generate_presigned_upload_url(r2_key, data.content_type)
+    
+    # Create upload record
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow(
+            """INSERT INTO uploads (user_id, r2_key, filename, file_size, platforms,
+                   title, caption, privacy, status, scheduled_time)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)
+               RETURNING id""",
+            user_id, r2_key, data.filename, data.file_size,
+            data.platforms,
+            data.title, data.caption, data.privacy, data.scheduled_time
+        )
+    
+    upload_id = str(upload["id"])
+    
+    background_tasks.add_task(
+        track_event, user_id, "upload_initiated",
+        {"upload_id": upload_id, "platforms": data.platforms}
+    )
+    
+    return {
+        "upload_id": upload_id,
+        "presigned_url": presigned_url,
+        "r2_key": r2_key,
+        "expires_in": 3600
+    }
+
+@app.post("/api/uploads/{upload_id}/complete")
+async def complete_upload(
+    upload_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user)
+):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow(
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user_id
+        )
+        
+        if not upload:
+            raise HTTPException(404, "Upload not found")
+        
+        await conn.execute(
+            "UPDATE uploads SET status = 'processing' WHERE id = $1",
+            upload_id
+        )
+        
+        await conn.execute(
+            "UPDATE users SET uploads_this_month = uploads_this_month + 1 WHERE id = $1",
+            user_id
+        )
+    
+    background_tasks.add_task(track_event, user_id, "upload_complete", {"upload_id": upload_id})
+    
+    return {"status": "processing", "upload_id": upload_id}
+
+@app.get("/api/uploads")
+async def list_uploads(
+    limit: int = 20,
+    offset: int = 0,
+    status: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        if status:
+            uploads = await conn.fetch(
+                """SELECT id, filename, platforms, title, status, trill_score, 
+                          created_at, completed_at
+                   FROM uploads WHERE user_id = $1 AND status = $2
+                   ORDER BY created_at DESC LIMIT $3 OFFSET $4""",
+                user_id, status, limit, offset
+            )
+        else:
+            uploads = await conn.fetch(
+                """SELECT id, filename, platforms, title, status, trill_score,
+                          created_at, completed_at
+                   FROM uploads WHERE user_id = $1
+                   ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
+                user_id, limit, offset
+            )
+    
+    return {
+        "uploads": [dict(u) for u in uploads],
+        "limit": limit,
+        "offset": offset
+    }
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow(
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, str(user["id"])
+        )
+    
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+    
+    return dict(upload)
+
+# ============================================
+# Platform Connection Routes
+# ============================================
+
+@app.get("/api/platforms")
+async def get_platforms(user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        tokens = await conn.fetch(
+            "SELECT platform, updated_at FROM platform_tokens WHERE user_id = $1",
+            user_id
+        )
+    
+    connected = {row["platform"]: {"connected": True, "updated_at": row["updated_at"].isoformat()} for row in tokens}
+    
+    return {
+        "tiktok": connected.get("tiktok", {"connected": False}),
+        "youtube": connected.get("google", {"connected": False}),
+        "facebook": connected.get("meta", {"connected": False}),
+        "instagram": connected.get("meta", {"connected": False})
+    }
+
+# ============================================
+# OAuth Routes - TikTok
+# ============================================
 
 @app.get("/oauth/tiktok/start")
-def tiktok_start(device_code: str):
-    if not is_device_claimed(device_code):
-        raise HTTPException(status_code=400, detail="Device not linked yet")
-    if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="TIKTOK_CLIENT_KEY/SECRET not configured on server")
-
+async def tiktok_oauth_start(user: dict = Depends(get_current_user)):
+    if not TIKTOK_CLIENT_KEY:
+        raise HTTPException(500, "TikTok OAuth not configured")
+    
+    state = create_jwt(str(user["id"]), expires_hours=1)
     redirect_uri = f"{BASE_URL}/oauth/tiktok/callback"
-    verifier, challenge = pkce_pair()
-    state = create_oauth_state(device_code, "tiktok", pkce_verifier=verifier)
-    scope = "user.info.basic,video.upload,video.publish"
-
-    auth_url = (
-        "https://www.tiktok.com/v2/auth/authorize/"
-        f"?client_key={requests.utils.quote(TIKTOK_CLIENT_KEY)}"
-        f"&response_type=code"
-        f"&scope={requests.utils.quote(scope)}"
-        f"&redirect_uri={requests.utils.quote(redirect_uri, safe='')}"
-        f"&state={requests.utils.quote(state)}"
-        f"&code_challenge={requests.utils.quote(challenge)}"
-        f"&code_challenge_method=S256"
-        f"&prompt=consent"
+    
+    code_verifier = secrets.token_urlsafe(43)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b'=').decode()
+    
+    url = (
+        f"https://www.tiktok.com/v2/auth/authorize?"
+        f"client_key={TIKTOK_CLIENT_KEY}&"
+        f"redirect_uri={redirect_uri}&"
+        f"scope=user.info.basic,video.upload,video.publish&"
+        f"state={state}|{code_verifier}&"
+        f"response_type=code&"
+        f"code_challenge={code_challenge}&"
+        f"code_challenge_method=S256"
     )
-    return RedirectResponse(auth_url, status_code=302)
+    
+    return RedirectResponse(url)
 
-@app.get("/oauth/tiktok/callback", response_class=HTMLResponse)
-def tiktok_callback(code: str = "", state: str = "", error: str = ""):
+@app.get("/oauth/tiktok/callback")
+async def tiktok_oauth_callback(
+    code: str = Query(None),
+    state: str = Query(None),
+    error: str = Query(None),
+    background_tasks: BackgroundTasks = None
+):
     if error:
-        return HTMLResponse(f"<h3>TikTok OAuth error</h3><pre>{error}</pre>", status_code=400)
-    st = pop_oauth_state(state)
-    if not st or st["platform"] != "tiktok":
-        return HTMLResponse("<h3>Invalid/expired state</h3>", status_code=400)
-
-    device_code = st["device_code"]
-    verifier = st.get("pkce_verifier") or ""
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=tiktok_oauth_failed")
+    
+    if not state or "|" not in state:
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
+    
+    parts = state.split("|")
+    user_id = verify_jwt(parts[0])
+    code_verifier = parts[1] if len(parts) > 1 else ""
+    
+    if not user_id:
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
+    
     redirect_uri = f"{BASE_URL}/oauth/tiktok/callback"
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://open.tiktokapis.com/v2/oauth/token/",
+            data={
+                "client_key": TIKTOK_CLIENT_KEY,
+                "client_secret": TIKTOK_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier
+            }
+        )
+        token_data = resp.json()
+    
+    if "error" in token_data:
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=tiktok_token_failed")
+    
+    token_blob = encrypt_blob(token_data)
+    
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO platform_tokens (user_id, platform, token_blob)
+                   VALUES ($1, 'tiktok', $2)
+                   ON CONFLICT (user_id, platform) DO UPDATE SET 
+                       token_blob = $2, updated_at = NOW()""",
+                user_id, json.dumps(token_blob)
+            )
+    
+    if background_tasks:
+        background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "tiktok"})
+    
+    return RedirectResponse(f"{BASE_URL}/dashboard?success=tiktok_connected")
 
-    r = requests.post(
-        "https://open.tiktokapis.com/v2/oauth/token/",
-        data={
-            "client_key": TIKTOK_CLIENT_KEY,
-            "client_secret": TIKTOK_CLIENT_SECRET,
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": redirect_uri,
-            "code_verifier": verifier,
-        },
-        timeout=30,
+# ============================================
+# OAuth Routes - Google/YouTube
+# ============================================
+
+@app.get("/oauth/google/start")
+async def google_oauth_start(user: dict = Depends(get_current_user)):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(500, "Google OAuth not configured")
+    
+    state = create_jwt(str(user["id"]), expires_hours=1)
+    redirect_uri = f"{BASE_URL}/oauth/google/callback"
+    
+    url = (
+        f"https://accounts.google.com/o/oauth2/v2/auth?"
+        f"client_id={GOOGLE_CLIENT_ID}&"
+        f"redirect_uri={redirect_uri}&"
+        f"scope=https://www.googleapis.com/auth/youtube.upload&"
+        f"state={state}&"
+        f"response_type=code&"
+        f"access_type=offline&"
+        f"prompt=consent"
     )
-    if r.status_code != 200:
-        log_event("tiktok_token_exchange_failed", subject=device_code, meta={"status": r.status_code, "body": r.text[:500]})
-        return HTMLResponse(f"<h3>Token exchange failed</h3><pre>{r.status_code} {r.text}</pre>", status_code=400)
+    
+    return RedirectResponse(url)
 
-    data = r.json()
-    tok = data.get("data") if isinstance(data, dict) else None
-    if not isinstance(tok, dict):
-        tok = data
+@app.get("/oauth/google/callback")
+async def google_oauth_callback(
+    code: str = Query(None),
+    state: str = Query(None),
+    error: str = Query(None),
+    background_tasks: BackgroundTasks = None
+):
+    if error:
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=google_oauth_failed")
+    
+    user_id = verify_jwt(state)
+    if not user_id:
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
+    
+    redirect_uri = f"{BASE_URL}/oauth/google/callback"
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri
+            }
+        )
+        token_data = resp.json()
+    
+    if "error" in token_data:
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=google_token_failed")
+    
+    token_blob = encrypt_blob(token_data)
+    
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO platform_tokens (user_id, platform, token_blob)
+                   VALUES ($1, 'google', $2)
+                   ON CONFLICT (user_id, platform) DO UPDATE SET 
+                       token_blob = $2, updated_at = NOW()""",
+                user_id, json.dumps(token_blob)
+            )
+    
+    if background_tasks:
+        background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "youtube"})
+    
+    return RedirectResponse(f"{BASE_URL}/dashboard?success=youtube_connected")
 
-    payload = {
-        "access_token": tok.get("access_token"),
-        "refresh_token": tok.get("refresh_token"),
-        "expires_in": tok.get("expires_in"),
-        "token_type": tok.get("token_type"),
-        "scope": tok.get("scope"),
-        "open_id": tok.get("open_id"),
-        "obtained_at": int(time.time()),
-    }
-    upsert_vault(device_code, "tiktok", encrypt_json(device_code, "tiktok", payload))
-    log_event("tiktok_connected", subject=device_code, meta={"scope": payload.get("scope")})
-    return HTMLResponse("<h2>TikTok connected.</h2><p>You can close this tab.</p>")
+# ============================================
+# OAuth Routes - Meta (Facebook/Instagram)
+# ============================================
 
 @app.get("/oauth/meta/start")
-def meta_start(device_code: str):
-    if not is_device_claimed(device_code):
-        raise HTTPException(status_code=400, detail="Device not linked yet")
-    if not META_APP_ID or not META_APP_SECRET:
-        raise HTTPException(status_code=500, detail="META_APP_ID/SECRET not configured on server")
-
+async def meta_oauth_start(user: dict = Depends(get_current_user)):
+    if not META_APP_ID:
+        raise HTTPException(500, "Meta OAuth not configured")
+    
+    state = create_jwt(str(user["id"]), expires_hours=1)
     redirect_uri = f"{BASE_URL}/oauth/meta/callback"
-    state = create_oauth_state(device_code, "meta", pkce_verifier=None)
-
-    scope = ",".join([
-        "public_profile",
-        "pages_show_list",
-        "pages_read_engagement",
-        "pages_manage_posts",
-        "instagram_basic",
-        "instagram_content_publish",
-        "business_management",
-    ])
-
-    dialog = f"https://www.facebook.com/{META_VERSION}/dialog/oauth"
-    auth_url = (
-        f"{dialog}?client_id={requests.utils.quote(META_APP_ID)}"
-        f"&redirect_uri={requests.utils.quote(redirect_uri, safe='')}"
-        f"&state={requests.utils.quote(state)}"
-        f"&response_type=code"
-        f"&scope={requests.utils.quote(scope)}"
+    
+    url = (
+        f"https://www.facebook.com/{META_API_VERSION}/dialog/oauth?"
+        f"client_id={META_APP_ID}&"
+        f"redirect_uri={redirect_uri}&"
+        f"scope=pages_show_list,pages_manage_posts,instagram_basic,instagram_content_publish&"
+        f"state={state}&"
+        f"response_type=code"
     )
-    return RedirectResponse(auth_url, status_code=302)
+    
+    return RedirectResponse(url)
 
-@app.get("/oauth/meta/callback", response_class=HTMLResponse)
-def meta_callback(code: str = "", state: str = "", error: str = "", error_description: str = ""):
+@app.get("/oauth/meta/callback")
+async def meta_oauth_callback(
+    code: str = Query(None),
+    state: str = Query(None),
+    error: str = Query(None),
+    background_tasks: BackgroundTasks = None
+):
     if error:
-        return HTMLResponse(f"<h3>Meta OAuth error</h3><pre>{error}: {error_description}</pre>", status_code=400)
-    st = pop_oauth_state(state)
-    if not st or st["platform"] != "meta":
-        return HTMLResponse("<h3>Invalid/expired state</h3>", status_code=400)
-
-    device_code = st["device_code"]
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=meta_oauth_failed")
+    
+    user_id = verify_jwt(state)
+    if not user_id:
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
+    
     redirect_uri = f"{BASE_URL}/oauth/meta/callback"
+    
+    async with httpx.AsyncClient() as client:
+        # Exchange code for token
+        resp = await client.get(
+            f"https://graph.facebook.com/{META_API_VERSION}/oauth/access_token",
+            params={
+                "client_id": META_APP_ID,
+                "client_secret": META_APP_SECRET,
+                "redirect_uri": redirect_uri,
+                "code": code
+            }
+        )
+        token_data = resp.json()
+    
+    if "error" in token_data:
+        return RedirectResponse(f"{BASE_URL}/dashboard?error=meta_token_failed")
+    
+    token_blob = encrypt_blob(token_data)
+    
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO platform_tokens (user_id, platform, token_blob)
+                   VALUES ($1, 'meta', $2)
+                   ON CONFLICT (user_id, platform) DO UPDATE SET 
+                       token_blob = $2, updated_at = NOW()""",
+                user_id, json.dumps(token_blob)
+            )
+    
+    if background_tasks:
+        background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "meta"})
+    
+    return RedirectResponse(f"{BASE_URL}/dashboard?success=meta_connected")
 
-    r = requests.get(
-        f"https://graph.facebook.com/{META_VERSION}/oauth/access_token",
-        params={
-            "client_id": META_APP_ID,
-            "client_secret": META_APP_SECRET,
-            "redirect_uri": redirect_uri,
-            "code": code,
-        },
-        timeout=30,
-    )
-    if r.status_code != 200:
-        log_event("meta_token_exchange_failed", subject=device_code, meta={"status": r.status_code, "body": r.text[:500]})
-        return HTMLResponse(f"<h3>Token exchange failed</h3><pre>{r.status_code} {r.text}</pre>", status_code=400)
+# ============================================
+# Analytics Routes
+# ============================================
 
-    tok = r.json()
-    payload = {
-        "access_token": tok.get("access_token"),
-        "token_type": tok.get("token_type"),
-        "expires_in": tok.get("expires_in"),
-        "obtained_at": int(time.time()),
+@app.get("/api/analytics/overview")
+async def get_analytics_overview(
+    days: int = 30,
+    user: dict = Depends(get_current_user)
+):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    
+    async with db_pool.acquire() as conn:
+        total_uploads = await conn.fetchval(
+            "SELECT COUNT(*) FROM uploads WHERE user_id = $1",
+            user_id
+        )
+        
+        period_uploads = await conn.fetchval(
+            "SELECT COUNT(*) FROM uploads WHERE user_id = $1 AND created_at >= $2",
+            user_id, since
+        )
+        
+        successful = await conn.fetchval(
+            """SELECT COUNT(*) FROM uploads 
+               WHERE user_id = $1 AND status = 'complete' AND created_at >= $2""",
+            user_id, since
+        )
+        
+        avg_trill = await conn.fetchval(
+            """SELECT AVG(trill_score) FROM uploads 
+               WHERE user_id = $1 AND trill_score IS NOT NULL AND created_at >= $2""",
+            user_id, since
+        )
+    
+    success_rate = (successful / period_uploads * 100) if period_uploads > 0 else 0
+    
+    return {
+        "total_uploads": total_uploads or 0,
+        "period_uploads": period_uploads or 0,
+        "success_rate": round(success_rate, 1),
+        "avg_trill_score": round(avg_trill or 0, 1),
+        "quota_used": user["uploads_this_month"],
+        "quota_total": user["upload_quota"]
     }
-    upsert_vault(device_code, "meta", encrypt_json(device_code, "meta", payload))
-    log_event("meta_connected", subject=device_code)
-    return HTMLResponse("<h2>Facebook/Instagram connected.</h2><p>Next: pick your Facebook Page in the desktop app.</p>")
+
+# ============================================
+# Run
+# ============================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

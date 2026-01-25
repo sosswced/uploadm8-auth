@@ -11,6 +11,10 @@ FastAPI backend for UploadM8 SaaS
 - Observability + security headers + request IDs + JSON errors
 - Locked /api/admin/db-info (schema + applied migrations)
 - Baseline rate limiting (in-memory)
+
+NOTE (tell it like it is):
+- ADMIN_API_KEY is acceptable for bootstrapping, but NOT for a browser-based admin console.
+  When you build the admin/master page, switch to role-based admin via JWT + users.role.
 """
 
 import os
@@ -67,8 +71,11 @@ ALLOWED_ORIGINS = os.environ.get(
     "https://app.uploadm8.com,https://uploadm8.com",
 )
 
-# Admin
+# Admin (bootstrap only; do NOT expose to frontend)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
+
+# Optional: promote a specific email to admin during boot (one-time)
+BOOTSTRAP_ADMIN_EMAIL = os.environ.get("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
 
 # R2 Configuration
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
@@ -165,7 +172,6 @@ def validate_env():
     if missing:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
-    # Validate enc keys are parseable
     _ = parse_enc_keys()
 
 # ============================================================
@@ -329,7 +335,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
 
-        -- If a legacy user_settings exists with missing cols, safely add.
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS user_id UUID;
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS discord_webhook TEXT;
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS telemetry_enabled BOOLEAN DEFAULT true;
@@ -339,7 +344,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS euphoria_mph INTEGER DEFAULT 100;
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
-        -- Uniqueness + FK (idempotent).
         DO $$
         BEGIN
             IF NOT EXISTS (
@@ -425,10 +429,14 @@ MIGRATIONS: List[Tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
         CREATE INDEX IF NOT EXISTS idx_refresh_hash ON refresh_tokens(token_hash);
     """),
+    (6, """
+        -- Role for future admin console (bootstrap-friendly)
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user';
+        UPDATE users SET role = COALESCE(role, 'user') WHERE role IS NULL;
+    """),
 ]
 
 async def apply_migrations(conn: asyncpg.Connection):
-    # Ensure baseline
     await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -448,6 +456,19 @@ async def apply_migrations(conn: asyncpg.Connection):
         await conn.execute("INSERT INTO schema_migrations(version) VALUES($1)", version)
         logger.info(f"[MIGRATION] Applied v{version}")
 
+async def bootstrap_promote_admin(conn: asyncpg.Connection):
+    """
+    Optional one-time promotion controlled by BOOTSTRAP_ADMIN_EMAIL.
+    Safe/idempotent. Once done, remove env var.
+    """
+    if not BOOTSTRAP_ADMIN_EMAIL:
+        return
+    await conn.execute(
+        "UPDATE users SET role='admin' WHERE lower(email)=lower($1)",
+        BOOTSTRAP_ADMIN_EMAIL
+    )
+    logger.info(f"[BOOTSTRAP] Promote admin attempted for {BOOTSTRAP_ADMIN_EMAIL}")
+
 async def init_db():
     global db_pool
     validate_env()
@@ -464,6 +485,7 @@ async def init_db():
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             await apply_migrations(conn)
+            await bootstrap_promote_admin(conn)
 
     logger.info("Database initialized and migrations applied")
 
@@ -520,10 +542,7 @@ async def create_refresh_token(conn: asyncpg.Connection, user_id: str) -> str:
 
 async def revoke_refresh_token(conn: asyncpg.Connection, refresh_token: str):
     th = hash_token(refresh_token)
-    await conn.execute(
-        "UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1",
-        th
-    )
+    await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1", th)
 
 async def rotate_refresh_token(conn: asyncpg.Connection, refresh_token: str) -> Tuple[str, str]:
     th = hash_token(refresh_token)
@@ -559,7 +578,7 @@ async def get_current_user(authorization: str = Header(None)) -> dict:
 
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow(
-            """SELECT id, email, name, subscription_tier, upload_quota,
+            """SELECT id, email, name, subscription_tier, role, upload_quota,
                       uploads_this_month, quota_reset_date
                FROM users WHERE id = $1""",
             user_id,
@@ -634,7 +653,7 @@ async def track_event(user_id: str, event_type: str, event_data: dict = None):
         logger.warning(f"[ANALYTICS] error: {e}")
 
 # ============================================================
-# Admin Auth Dependency
+# Admin Auth Dependency (Bootstrap)
 # ============================================================
 
 def require_admin(x_admin_key: str = Header(None)):
@@ -656,7 +675,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="UploadM8 API", version="1.1.0", lifespan=lifespan)
 
-# CORS hardened
 origins = _split_origins(ALLOWED_ORIGINS)
 app.add_middleware(
     CORSMiddleware,
@@ -695,11 +713,8 @@ async def request_id_security_and_logging(request: Request, call_next):
     finally:
         duration_ms = int((time.time() - start) * 1000)
         ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else "unknown")
-        logger.info(
-            f"rid={rid} ip={ip} {request.method} {request.url.path} status={status_code} dur_ms={duration_ms}"
-        )
+        logger.info(f"rid={rid} ip={ip} {request.method} {request.url.path} status={status_code} dur_ms={duration_ms}")
 
-    # Security headers
     response.headers["X-Request-ID"] = rid
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -725,11 +740,7 @@ async def health():
         "allowed_origins": origins,
         "r2_configured": bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY),
         "mailgun_configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN),
-        "platforms": {
-            "tiktok": bool(TIKTOK_CLIENT_KEY),
-            "youtube": bool(GOOGLE_CLIENT_ID),
-            "meta": bool(META_APP_ID),
-        },
+        "platforms": {"tiktok": bool(TIKTOK_CLIENT_KEY), "youtube": bool(GOOGLE_CLIENT_ID), "meta": bool(META_APP_ID)},
     }
 
 # ============================================================
@@ -792,7 +803,7 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
                 row = await conn.fetchrow(
                     """INSERT INTO users (email, password_hash, name)
                        VALUES ($1, $2, $3)
-                       RETURNING id, email, name, subscription_tier""",
+                       RETURNING id, email, name, subscription_tier, role""",
                     data.email.lower(),
                     password_hash,
                     data.name,
@@ -802,7 +813,6 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
 
             user_id = str(row["id"])
 
-            # Idempotent settings insert
             try:
                 await conn.execute(
                     """INSERT INTO user_settings (user_id)
@@ -811,7 +821,6 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
                     user_id,
                 )
             except Exception as e:
-                # Do not block signup; log for cleanup
                 logger.warning(f"Settings insert failed for user {user_id}: {e}")
 
             access_token = create_access_jwt(user_id)
@@ -828,6 +837,7 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
             "email": row["email"],
             "name": row["name"],
             "subscription_tier": row["subscription_tier"],
+            "role": row["role"],
         },
     }
 
@@ -840,7 +850,7 @@ async def login(request: Request, data: UserLogin, background_tasks: BackgroundT
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT id, email, name, password_hash, subscription_tier,
+            """SELECT id, email, name, password_hash, subscription_tier, role,
                       upload_quota, uploads_this_month
                FROM users WHERE email = $1""",
             data.email.lower(),
@@ -864,6 +874,7 @@ async def login(request: Request, data: UserLogin, background_tasks: BackgroundT
             "email": row["email"],
             "name": row["name"],
             "subscription_tier": row["subscription_tier"],
+            "role": row["role"],
             "upload_quota": row["upload_quota"],
             "uploads_this_month": row["uploads_this_month"],
         },
@@ -959,6 +970,7 @@ async def get_me(user: dict = Depends(get_current_user)):
         "email": user["email"],
         "name": user["name"],
         "subscription_tier": user["subscription_tier"],
+        "role": user.get("role", "user"),
         "upload_quota": user["upload_quota"],
         "uploads_this_month": user["uploads_this_month"],
     }
@@ -1178,7 +1190,7 @@ async def tiktok_oauth_start(user: dict = Depends(get_current_user)):
     if not TIKTOK_CLIENT_KEY or not TIKTOK_CLIENT_SECRET:
         raise HTTPException(500, "TikTok OAuth not configured")
 
-    state = create_access_jwt(str(user["id"]))  # short-lived state token
+    state = create_access_jwt(str(user["id"]))
     redirect_uri = f"{BASE_URL}/oauth/tiktok/callback"
 
     code_verifier = secrets.token_urlsafe(43)

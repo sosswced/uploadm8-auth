@@ -27,7 +27,7 @@ from pydantic import BaseModel, EmailStr, Field
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import asyncpg
 import jwt
-import bcrypt  # ✅ direct bcrypt (pyca) - replaces passlib
+import bcrypt
 import boto3
 from botocore.config import Config
 
@@ -103,12 +103,11 @@ class SettingsUpdate(BaseModel):
     euphoria_mph: Optional[int] = None
 
 # ============================================
-# Password Hashing (bcrypt) ✅ stable on Python 3.13
+# Password Hashing (bcrypt)
 # ============================================
 
 def hash_password(password: str) -> str:
     pw = password.encode("utf-8")
-    # bcrypt limit is 72 bytes
     if len(pw) > 72:
         raise HTTPException(400, "Password too long (max 72 bytes)")
     hashed = bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12))
@@ -131,8 +130,6 @@ def parse_enc_keys():
     """
     keys = {}
     if not TOKEN_ENC_KEYS:
-        # ✅ Production safety: don't auto-generate keys (would break decrypt after restart)
-        # Set TOKEN_ENC_KEYS in Render env to a stable value.
         raise RuntimeError("TOKEN_ENC_KEYS is required (do not leave blank in production)")
 
     clean_keys = TOKEN_ENC_KEYS.strip().strip('"').replace("\\n", "")
@@ -163,7 +160,7 @@ def encrypt_blob(data: dict) -> dict:
     return {
         "kid": CURRENT_KEY_ID,
         "nonce": base64.b64encode(nonce).decode(),
-        "data": base64.b64encode(ciphertext).decode()
+        "data": base64.b64encode(ciphertext).decode(),
     }
 
 def decrypt_blob(blob: dict) -> dict:
@@ -193,10 +190,11 @@ async def init_db():
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
 
         async with db_pool.acquire() as conn:
-            await conn.execute("""
-                -- ✅ required for gen_random_uuid()
-                CREATE EXTENSION IF NOT EXISTS pgcrypto;
+            # UUID generator
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
 
+            # Create users table if missing
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     email TEXT UNIQUE NOT NULL,
@@ -210,7 +208,25 @@ async def init_db():
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
+            """)
 
+            # ✅ Migrate older schemas (table exists but missing columns)
+            await conn.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT DEFAULT 'free';
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS upload_quota INTEGER DEFAULT 5;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS uploads_this_month INTEGER DEFAULT 0;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS quota_reset_date DATE DEFAULT CURRENT_DATE;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+                UPDATE users SET name = COALESCE(name, 'User') WHERE name IS NULL;
+                ALTER TABLE users ALTER COLUMN name SET NOT NULL;
+            """)
+
+            # Other tables + indexes
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                     discord_webhook TEXT,
@@ -268,6 +284,7 @@ async def init_db():
                 CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
                 CREATE INDEX IF NOT EXISTS idx_analytics_user ON analytics_events(user_id);
             """)
+
         print("Database initialized successfully")
     except Exception as e:
         print(f"Database initialization error: {e}")
@@ -290,7 +307,7 @@ def create_jwt(user_id: str, expires_hours: int = 168) -> str:
     payload = {
         "sub": user_id,
         "iat": datetime.now(timezone.utc),
-        "exp": datetime.now(timezone.utc) + timedelta(hours=expires_hours)
+        "exp": datetime.now(timezone.utc) + timedelta(hours=expires_hours),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
@@ -318,7 +335,7 @@ async def get_current_user(authorization: str = Header(None)) -> dict:
             """SELECT id, email, name, subscription_tier, upload_quota,
                       uploads_this_month, quota_reset_date
                FROM users WHERE id = $1""",
-            user_id
+            user_id,
         )
 
     if not user:
@@ -404,7 +421,7 @@ app = FastAPI(title="UploadM8 API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production once frontend domain is final
+    allow_origins=["*"],  # tighten later to app.uploadm8.com
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -455,7 +472,6 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks):
                 data.name,
             )
             user_id = str(row["id"])
-
             await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
         except asyncpg.UniqueViolationError:
             raise HTTPException(400, "Email already registered")
@@ -546,7 +562,6 @@ async def forgot_password(data: PasswordReset, background_tasks: BackgroundTasks
     """
 
     background_tasks.add_task(send_email, user["email"], "Reset Your UploadM8 Password", html)
-
     return {"message": "If that email exists, we've sent a reset link"}
 
 @app.post("/api/auth/reset-password")
@@ -574,7 +589,6 @@ async def reset_password(data: PasswordResetConfirm):
             new_hash,
             reset["user_id"],
         )
-
         await conn.execute("DELETE FROM password_resets WHERE token_hash = $1", token_hash)
 
     return {"message": "Password updated successfully"}
@@ -666,7 +680,6 @@ async def create_presigned_upload(
         raise HTTPException(500, "Database not available")
 
     user_id = str(user["id"])
-
     if user["uploads_this_month"] >= user["upload_quota"]:
         raise HTTPException(403, "Monthly upload quota exceeded. Please upgrade your plan.")
 
@@ -694,10 +707,7 @@ async def create_presigned_upload(
         )
 
     upload_id = str(upload["id"])
-
-    background_tasks.add_task(
-        track_event, user_id, "upload_initiated", {"upload_id": upload_id, "platforms": data.platforms}
-    )
+    background_tasks.add_task(track_event, user_id, "upload_initiated", {"upload_id": upload_id, "platforms": data.platforms})
 
     return {"upload_id": upload_id, "presigned_url": presigned_url, "r2_key": r2_key, "expires_in": 3600}
 
@@ -707,12 +717,10 @@ async def complete_upload(upload_id: str, background_tasks: BackgroundTasks, use
         raise HTTPException(500, "Database not available")
 
     user_id = str(user["id"])
-
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
             "SELECT * FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user_id
         )
-
         if not upload:
             raise HTTPException(404, "Upload not found")
 
@@ -733,7 +741,6 @@ async def list_uploads(
         raise HTTPException(500, "Database not available")
 
     user_id = str(user["id"])
-
     async with db_pool.acquire() as conn:
         if status:
             uploads = await conn.fetch(
@@ -741,10 +748,7 @@ async def list_uploads(
                           created_at, completed_at
                    FROM uploads WHERE user_id = $1 AND status = $2
                    ORDER BY created_at DESC LIMIT $3 OFFSET $4""",
-                user_id,
-                status,
-                limit,
-                offset,
+                user_id, status, limit, offset
             )
         else:
             uploads = await conn.fetch(
@@ -752,9 +756,7 @@ async def list_uploads(
                           created_at, completed_at
                    FROM uploads WHERE user_id = $1
                    ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
-                user_id,
-                limit,
-                offset,
+                user_id, limit, offset
             )
 
     return {"uploads": [dict(u) for u in uploads], "limit": limit, "offset": offset}
@@ -766,7 +768,8 @@ async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
 
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
-            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2", upload_id, str(user["id"])
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, str(user["id"])
         )
 
     if not upload:
@@ -784,17 +787,12 @@ async def get_platforms(user: dict = Depends(get_current_user)):
         raise HTTPException(500, "Database not available")
 
     user_id = str(user["id"])
-
     async with db_pool.acquire() as conn:
         tokens = await conn.fetch(
             "SELECT platform, updated_at FROM platform_tokens WHERE user_id = $1", user_id
         )
 
-    connected = {
-        row["platform"]: {"connected": True, "updated_at": row["updated_at"].isoformat()}
-        for row in tokens
-    }
-
+    connected = {row["platform"]: {"connected": True, "updated_at": row["updated_at"].isoformat()} for row in tokens}
     return {
         "tiktok": connected.get("tiktok", {"connected": False}),
         "youtube": connected.get("google", {"connected": False}),
@@ -1045,20 +1043,16 @@ async def get_analytics_overview(days: int = 30, user: dict = Depends(get_curren
 
     async with db_pool.acquire() as conn:
         total_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE user_id = $1", user_id)
-        period_uploads = await conn.fetchval(
-            "SELECT COUNT(*) FROM uploads WHERE user_id = $1 AND created_at >= $2", user_id, since
-        )
+        period_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE user_id = $1 AND created_at >= $2", user_id, since)
         successful = await conn.fetchval(
             """SELECT COUNT(*) FROM uploads
                WHERE user_id = $1 AND status = 'complete' AND created_at >= $2""",
-            user_id,
-            since,
+            user_id, since
         )
         avg_trill = await conn.fetchval(
             """SELECT AVG(trill_score) FROM uploads
                WHERE user_id = $1 AND trill_score IS NOT NULL AND created_at >= $2""",
-            user_id,
-            since,
+            user_id, since
         )
 
     success_rate = (successful / period_uploads * 100) if period_uploads else 0

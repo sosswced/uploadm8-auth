@@ -39,7 +39,10 @@ import boto3
 from botocore.config import Config
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request
+import stripe
+import redis.asyncio as redis
+
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request, Response
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
@@ -90,6 +93,186 @@ R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "uploadm8-media")
+
+
+# Redis (queue + distributed rate limiting)
+REDIS_URL = os.environ.get("REDIS_URL", "")  # e.g. redis://:pass@host:6379/0
+UPLOAD_JOB_QUEUE = os.environ.get("UPLOAD_JOB_QUEUE", "uploadm8:jobs")
+
+# Stripe Billing
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_DEFAULT_LOOKUP_KEY = os.environ.get("STRIPE_DEFAULT_LOOKUP_KEY", "")  # e.g. "uploadm8_pro_monthly"
+STRIPE_LOOKUP_KEYS = os.environ.get("STRIPE_LOOKUP_KEYS", STRIPE_DEFAULT_LOOKUP_KEY)  # comma-separated
+STRIPE_SUCCESS_URL = os.environ.get("STRIPE_SUCCESS_URL", f"{FRONTEND_URL}/billing-success.html?session_id={{CHECKOUT_SESSION_ID}}")
+STRIPE_CANCEL_URL = os.environ.get("STRIPE_CANCEL_URL", f"{FRONTEND_URL}/pricing.html")
+STRIPE_PORTAL_RETURN_URL = os.environ.get("STRIPE_PORTAL_RETURN_URL", f"{FRONTEND_URL}/dashboard.html")
+STRIPE_TRIAL_DAYS_DEFAULT = int(os.environ.get("STRIPE_TRIAL_DAYS_DEFAULT", "0"))
+STRIPE_AUTOMATIC_TAX = os.environ.get("STRIPE_AUTOMATIC_TAX", "1")  # 1/0
+
+# Admin notifications
+ADMIN_DISCORD_WEBHOOK_URL = os.environ.get("ADMIN_DISCORD_WEBHOOK_URL", "")
+
+
+# ============================================================
+# Token Vault Helpers (auto-refresh lifecycle)
+# ============================================================
+
+TOKEN_REFRESH_SKEW_SEC = int(os.environ.get("TOKEN_REFRESH_SKEW_SEC", "300"))  # refresh 5 min early
+
+async def _get_platform_token_row(user_id: str, platform: str):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, user_id, platform, token_blob, expires_at FROM platform_tokens WHERE user_id=$1 AND platform=$2",
+            user_id, platform
+        )
+
+async def _save_platform_token(user_id: str, platform: str, token_data: dict, expires_at: Optional[datetime] = None):
+    blob = encrypt_blob(token_data)
+    exp = expires_at
+    if exp is None and isinstance(token_data, dict):
+        # Prefer explicit _expires_at (epoch seconds) if present
+        ea = token_data.get("_expires_at")
+        if ea:
+            try:
+                exp = datetime.fromtimestamp(float(ea), tz=timezone.utc)
+            except Exception:
+                exp = None
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO platform_tokens (user_id, platform, token_blob, expires_at, updated_at)
+                 VALUES ($1,$2,$3,$4,NOW())
+                 ON CONFLICT (user_id, platform) DO UPDATE SET
+                   token_blob=EXCLUDED.token_blob,
+                   expires_at=EXCLUDED.expires_at,
+                   updated_at=NOW()""",
+            user_id, platform, blob, exp
+        )
+
+async def refresh_google_token(token_data: dict) -> dict:
+    rt = token_data.get("refresh_token")
+    if not rt:
+        raise HTTPException(401, "Google refresh_token missing; reconnect required")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": rt,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if r.status_code >= 400:
+            raise HTTPException(401, f"Google refresh failed: {r.text[:200]}")
+        newt = r.json()
+    # merge
+    token_data["access_token"] = newt.get("access_token", token_data.get("access_token"))
+    token_data["expires_in"] = newt.get("expires_in", token_data.get("expires_in"))
+    token_data["_obtained_at"] = time.time()
+    token_data["_expires_at"] = time.time() + float(token_data.get("expires_in", 0) or 0) - 60
+    return token_data
+
+async def refresh_tiktok_token(token_data: dict) -> dict:
+    rt = token_data.get("refresh_token")
+    if not rt:
+        raise HTTPException(401, "TikTok refresh_token missing; reconnect required")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            "https://open.tiktokapis.com/v2/oauth/token/",
+            data={
+                "client_key": TIKTOK_CLIENT_KEY,
+                "client_secret": TIKTOK_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": rt,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if r.status_code >= 400:
+            raise HTTPException(401, f"TikTok refresh failed: {r.text[:200]}")
+        newt = r.json()
+    # TikTok wraps tokens under "data" sometimes. Normalize.
+    data = newt.get("data") if isinstance(newt, dict) else None
+    if isinstance(data, dict):
+        newt = data
+    token_data["access_token"] = newt.get("access_token", token_data.get("access_token"))
+    token_data["refresh_token"] = newt.get("refresh_token", token_data.get("refresh_token"))
+    token_data["expires_in"] = newt.get("expires_in", token_data.get("expires_in"))
+    token_data["_obtained_at"] = time.time()
+    token_data["_expires_at"] = time.time() + float(token_data.get("expires_in", 0) or 0) - 60
+    return token_data
+
+async def refresh_meta_token(token_data: dict) -> dict:
+    at = token_data.get("access_token")
+    if not at:
+        raise HTTPException(401, "Meta access_token missing; reconnect required")
+    # Exchange for a long-lived token
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            "https://graph.facebook.com/v19.0/oauth/access_token",
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": META_APP_ID,
+                "client_secret": META_APP_SECRET,
+                "fb_exchange_token": at,
+            },
+        )
+        if r.status_code >= 400:
+            raise HTTPException(401, f"Meta token exchange failed: {r.text[:200]}")
+        newt = r.json()
+    token_data["access_token"] = newt.get("access_token", token_data.get("access_token"))
+    token_data["expires_in"] = newt.get("expires_in", token_data.get("expires_in"))
+    token_data["_obtained_at"] = time.time()
+    token_data["_expires_at"] = time.time() + float(token_data.get("expires_in", 0) or 0) - 60
+    return token_data
+
+async def get_valid_platform_token(user_id: str, platform: str) -> dict:
+    row = await _get_platform_token_row(user_id, platform)
+    if not row:
+        raise HTTPException(404, f"No token for platform: {platform}")
+    token_data = decrypt_blob(row["token_blob"])
+    expires_at = row["expires_at"]
+
+    # Determine expiry from db or embedded metadata
+    exp_epoch = None
+    if isinstance(token_data, dict) and token_data.get("_expires_at"):
+        try:
+            exp_epoch = float(token_data["_expires_at"])
+        except Exception:
+            exp_epoch = None
+
+    now_epoch = time.time()
+    needs_refresh = False
+    if exp_epoch is not None:
+        needs_refresh = (exp_epoch - now_epoch) <= TOKEN_REFRESH_SKEW_SEC
+    elif expires_at:
+        needs_refresh = (expires_at - _now_utc()) <= timedelta(seconds=TOKEN_REFRESH_SKEW_SEC)
+
+    if not needs_refresh:
+        return token_data
+
+    # Refresh based on platform
+    if platform == "google":
+        token_data = await refresh_google_token(token_data)
+    elif platform == "tiktok":
+        token_data = await refresh_tiktok_token(token_data)
+    elif platform == "meta":
+        token_data = await refresh_meta_token(token_data)
+    else:
+        return token_data
+
+    await _save_platform_token(user_id, platform, token_data)
+    return token_data
+
+@app.get("/api/vault/token")
+async def vault_token(platform: str = Query(...), user: dict = Depends(get_current_user)):
+    """Returns a valid access_token for the platform. Auto-refreshes when close to expiry."""
+    platform = platform.lower().strip()
+    td = await get_valid_platform_token(str(user["id"]), platform)
+    return {"platform": platform, "access_token": td.get("access_token"), "expires_in": td.get("expires_in"), "scope": td.get("scope")}
 
 # Platform OAuth
 META_APP_ID = os.environ.get("META_APP_ID", "")
@@ -222,6 +405,10 @@ class SettingsUpdate(BaseModel):
     fb_user_id: Optional[str] = None
     selected_page_id: Optional[str] = None
     selected_page_name: Optional[str] = None
+    hud_speed_unit: Optional[str] = None  # mph | kmh
+    hud_color: Optional[str] = None        # e.g. '#FFFFFF'
+    hud_font_family: Optional[str] = None
+    hud_font_size: Optional[int] = None
 
 class RefreshRequest(BaseModel):
     refresh_token: str
@@ -256,6 +443,37 @@ def check_rate_limit(key: str):
         raise HTTPException(429, "Too many requests")
     arr.append(now)
     _rate_state[key] = arr
+# ============================================================
+# Distributed Rate Limiting (Redis-backed) — safe fallback
+# ============================================================
+
+async def check_rate_limit_any(key: str):
+    """Redis-backed sliding window when Redis is configured; fallback to in-memory."""
+    if redis_client is None:
+        return check_rate_limit(key)
+
+    now = int(time.time())
+    window = RATE_LIMIT_WINDOW_SEC
+
+    # Sliding window via sorted set
+    zkey = f"ratelimit:{key}"
+    try:
+        pipe = redis_client.pipeline()
+        pipe.zremrangebyscore(zkey, 0, now - window)
+        pipe.zadd(zkey, {str(now): now})
+        pipe.zcard(zkey)
+        pipe.expire(zkey, window + 5)
+        _, _, count, _ = await pipe.execute()
+        if int(count) > RATE_LIMIT_MAX:
+            raise HTTPException(429, "Too many requests")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Fail-open to preserve uptime; fallback to in-memory
+        logger.warning(f"Redis rate limiter error (fallback to memory): {e}")
+        return check_rate_limit(key)
+
+
 
 # ============================================================
 # Password Hashing (bcrypt)
@@ -615,6 +833,29 @@ MIGRATIONS: List[Tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_admin_audit_actor ON admin_audit(actor_user_id);
         CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at);
     """),
+    (9, """
+        -- Billing / processing / KPI support (additive)
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'inactive';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMPTZ;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS unlimited_uploads BOOLEAN DEFAULT false;
+
+        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS processed_r2_key TEXT;
+        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMPTZ;
+        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS processing_finished_at TIMESTAMPTZ;
+        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS error_code TEXT;
+        ALTER TABLE uploads ADD COLUMN IF NOT EXISTS error_detail TEXT;
+
+        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_speed_unit TEXT DEFAULT 'mph';
+        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_color TEXT DEFAULT '#FFFFFF';
+        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_font_family TEXT DEFAULT 'Inter';
+        ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_font_size INTEGER DEFAULT 28;
+
+        CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
+        CREATE INDEX IF NOT EXISTS idx_uploads_created ON uploads(created_at);
+        CREATE INDEX IF NOT EXISTS idx_uploads_user_status ON uploads(user_id, status);
+    """),
+
 ]
 
 async def apply_migrations(conn: asyncpg.Connection):
@@ -655,10 +896,51 @@ async def bootstrap_promote_admin(conn: asyncpg.Connection):
     )
     logger.info(f"[BOOTSTRAP] Promoted {BOOTSTRAP_ADMIN_EMAIL} to admin")
 
+
+# ============================================================
+# Redis clients (queue + distributed rate limiting)
+# ============================================================
+
+redis_client: Optional[redis.Redis] = None
+
+async def init_redis():
+    """Initialize Redis if REDIS_URL is configured. Safe no-op otherwise."""
+    global redis_client
+    if not REDIS_URL:
+        redis_client = None
+        return
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        # Ping to validate connectivity early
+        await redis_client.ping()
+        logger.info("Redis initialized")
+    except Exception as e:
+        redis_client = None
+        logger.error(f"Redis init failed (continuing without Redis): {e}")
+
+async def close_redis():
+    global redis_client
+    try:
+        if redis_client is not None:
+            await redis_client.close()
+    finally:
+        redis_client = None
+
+async def enqueue_job(job: dict):
+    """Enqueue a job to Redis list. If Redis is not available, raise 503."""
+    if redis_client is None:
+        raise HTTPException(503, "Queue not available (Redis not configured)")
+    payload = json.dumps(job, separators=(",", ":"))
+    await redis_client.lpush(UPLOAD_JOB_QUEUE, payload)
+
 async def init_db():
     global db_pool
     validate_env()
     init_enc_keys()
+    await init_redis()
+
+    if STRIPE_SECRET_KEY:
+        stripe.api_key = STRIPE_SECRET_KEY
 
     db_pool = await asyncpg.create_pool(
         DATABASE_URL,
@@ -677,8 +959,11 @@ async def init_db():
 
 async def close_db():
     global db_pool
-    if db_pool:
-        await db_pool.close()
+    try:
+        if db_pool:
+            await db_pool.close()
+    finally:
+        await close_redis()
 
 # ============================================================
 # JWT Helpers (iss/aud/jti)
@@ -814,6 +1099,17 @@ def generate_presigned_upload_url(key: str, content_type: str, expires: int = 36
         Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type},
         ExpiresIn=expires,
     )
+
+def generate_presigned_get_url(key: str, ttl_seconds: int = 3600) -> str:
+    client = get_r2_client()
+    if not client:
+        raise HTTPException(500, "R2 storage not configured")
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": key},
+        ExpiresIn=ttl_seconds,
+    )
+
 
 # ============================================================
 # Email (Mailgun)
@@ -958,6 +1254,11 @@ async def health():
 # ============================================================
 # Admin: DB Info (locked via ADMIN_API_KEY)
 # ============================================================
+@app.get("/health")
+async def health_alias():
+    return {"status": "ok"}
+
+
 
 @app.get("/api/admin/db-info")
 async def admin_db_info(_: bool = Depends(require_admin_api_key)):
@@ -1189,7 +1490,7 @@ async def admin_search_users(q: str = "", limit: int = 25, admin: dict = Depends
 
 @app.post("/api/auth/register")
 async def register(request: Request, data: UserCreate, background_tasks: BackgroundTasks):
-    check_rate_limit(rate_limit_key(request, "register"))
+    await check_rate_limit_any(rate_limit_key(request, "register"))
 
     password_hash = hash_password(data.password)
 
@@ -1241,7 +1542,7 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
 
 @app.post("/api/auth/login")
 async def login(request: Request, data: UserLogin, background_tasks: BackgroundTasks):
-    check_rate_limit(rate_limit_key(request, "login"))
+    await check_rate_limit_any(rate_limit_key(request, "login"))
 
     if not db_pool:
         raise HTTPException(500, "Database not available")
@@ -1296,7 +1597,7 @@ async def logout(data: RefreshRequest):
 
 @app.post("/api/auth/forgot-password")
 async def forgot_password(request: Request, data: PasswordReset, background_tasks: BackgroundTasks):
-    check_rate_limit(rate_limit_key(request, "forgot_password"))
+    await check_rate_limit_any(rate_limit_key(request, "forgot_password"))
 
     if not db_pool:
         raise HTTPException(500, "Database not available")
@@ -1398,6 +1699,10 @@ async def get_settings(user: dict = Depends(get_current_user)):
             "telemetry_enabled": True,
             "hud_enabled": True,
             "hud_position": "bottom_right",
+            "hud_speed_unit": "mph",
+            "hud_color": "#FFFFFF",
+            "hud_font_family": "Inter",
+            "hud_font_size": 28,
             "speeding_mph": 85,
             "euphoria_mph": 100,
             "discord_webhook_configured": False,
@@ -1410,6 +1715,10 @@ async def get_settings(user: dict = Depends(get_current_user)):
         "telemetry_enabled": settings.get("telemetry_enabled", True),
         "hud_enabled": settings.get("hud_enabled", True),
         "hud_position": settings.get("hud_position", "bottom_right"),
+        "hud_speed_unit": settings.get("hud_speed_unit", "mph"),
+        "hud_color": settings.get("hud_color", "#FFFFFF"),
+        "hud_font_family": settings.get("hud_font_family", "Inter"),
+        "hud_font_size": settings.get("hud_font_size", 28),
         "speeding_mph": settings.get("speeding_mph", 85),
         "euphoria_mph": settings.get("euphoria_mph", 100),
         "discord_webhook_configured": bool(settings.get("discord_webhook")),
@@ -1426,24 +1735,33 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
     async with db_pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled,
-                   hud_enabled, hud_position, speeding_mph, euphoria_mph, fb_user_id, selected_page_id, selected_page_name)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                   hud_enabled, hud_position, hud_speed_unit, hud_color, hud_font_family, hud_font_size,
+                   speeding_mph, euphoria_mph, fb_user_id, selected_page_id, selected_page_name)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                ON CONFLICT (user_id) DO UPDATE SET
                    discord_webhook = COALESCE($2, user_settings.discord_webhook),
                    telemetry_enabled = COALESCE($3, user_settings.telemetry_enabled),
                    hud_enabled = COALESCE($4, user_settings.hud_enabled),
                    hud_position = COALESCE($5, user_settings.hud_position),
-                   speeding_mph = COALESCE($6, user_settings.speeding_mph),
-                   euphoria_mph = COALESCE($7, user_settings.euphoria_mph),
-                   fb_user_id = COALESCE($8, user_settings.fb_user_id),
-                   selected_page_id = COALESCE($9, user_settings.selected_page_id),
-                   selected_page_name = COALESCE($10, user_settings.selected_page_name),
+                   hud_speed_unit = COALESCE($6, user_settings.hud_speed_unit),
+                   hud_color = COALESCE($7, user_settings.hud_color),
+                   hud_font_family = COALESCE($8, user_settings.hud_font_family),
+                   hud_font_size = COALESCE($9, user_settings.hud_font_size),
+                   speeding_mph = COALESCE($10, user_settings.speeding_mph),
+                   euphoria_mph = COALESCE($11, user_settings.euphoria_mph),
+                   fb_user_id = COALESCE($12, user_settings.fb_user_id),
+                   selected_page_id = COALESCE($13, user_settings.selected_page_id),
+                   selected_page_name = COALESCE($14, user_settings.selected_page_name),
                    updated_at = NOW()""",
             str(user["id"]),
             data.discord_webhook,
             data.telemetry_enabled,
             data.hud_enabled,
             data.hud_position,
+            data.hud_speed_unit,
+            data.hud_color,
+            data.hud_font_family,
+            data.hud_font_size,
             data.speeding_mph,
             data.euphoria_mph,
             data.fb_user_id,
@@ -1452,6 +1770,235 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
         )
 
     return {"status": "updated"}
+
+
+# ============================================================
+# Billing (Stripe) — Checkout + Customer Portal + Webhooks
+# ============================================================
+
+class CheckoutRequest(BaseModel):
+    lookup_key: Optional[str] = None
+    trial_days: Optional[int] = None
+
+class PortalRequest(BaseModel):
+    return_url: Optional[str] = None
+
+async def _discord_notify_admin(event: str, meta: dict):
+    url = ADMIN_DISCORD_WEBHOOK_URL
+    if not url:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json={"content": f"[BILLING] {event}", "embeds": [{"title": event, "fields": [{"name": k, "value": str(v)[:900], "inline": False} for k,v in meta.items()]}]})
+    except Exception as e:
+        logger.warning(f"Admin Discord notify failed: {e}")
+
+def _tier_from_lookup_key(lookup_key: str) -> str:
+    lk = (lookup_key or "").lower()
+    if "enterprise" in lk:
+        return "enterprise"
+    if "pro" in lk:
+        return "pro"
+    if "starter" in lk:
+        return "starter"
+    return "free"
+
+def _entitlements_for_tier(tier: str) -> dict:
+    # Tell-it-like-it-is defaults. Adjust later via env-backed mapping once pricing is final.
+    if tier == "enterprise":
+        return {"tier": tier, "upload_quota": 10_000, "unlimited_uploads": True}
+    if tier == "pro":
+        return {"tier": tier, "upload_quota": 1_000, "unlimited_uploads": True}
+    if tier == "starter":
+        return {"tier": tier, "upload_quota": 100, "unlimited_uploads": False}
+    return {"tier": "free", "upload_quota": 5, "unlimited_uploads": False}
+
+@app.get("/api/billing/prices")
+async def list_prices():
+    if not STRIPE_SECRET_KEY:
+        return {"configured": False, "prices": []}
+    keys = [k.strip() for k in (STRIPE_LOOKUP_KEYS or "").split(",") if k.strip()]
+    out = []
+    try:
+        # Stripe lookup_key resolves to Price objects
+        for lk in keys:
+            prices = stripe.Price.list(lookup_keys=[lk], expand=["data.product"], active=True, limit=5)
+            for p in prices.data:
+                out.append({
+                    "id": p.id,
+                    "lookup_key": lk,
+                    "currency": p.currency,
+                    "unit_amount": p.unit_amount,
+                    "recurring": (p.recurring or {}),
+                    "product": {"id": p.product.id if hasattr(p.product, "id") else p.product,
+                                "name": p.product.name if hasattr(p.product, "name") else None},
+                })
+        return {"configured": True, "prices": out}
+    except Exception as e:
+        logger.error(f"Stripe list prices failed: {e}")
+        raise HTTPException(500, "Stripe error")
+
+@app.post("/api/billing/checkout")
+async def create_checkout_session(data: CheckoutRequest, user: dict = Depends(get_current_user)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(500, "Stripe not configured")
+
+    lookup_key = (data.lookup_key or STRIPE_DEFAULT_LOOKUP_KEY or "").strip()
+    if not lookup_key:
+        raise HTTPException(400, "Missing lookup_key")
+
+    trial_days = data.trial_days if data.trial_days is not None else STRIPE_TRIAL_DAYS_DEFAULT
+    if trial_days is not None:
+        trial_days = max(0, min(int(trial_days), 60))
+
+    try:
+        prices = stripe.Price.list(lookup_keys=[lookup_key], active=True, limit=1)
+        if not prices.data:
+            raise HTTPException(400, "Invalid lookup_key")
+        price_id = prices.data[0].id
+
+        customer_id = user.get("stripe_customer_id")
+        if not customer_id:
+            cust = stripe.Customer.create(email=user["email"], metadata={"user_id": str(user["id"])})
+            customer_id = cust.id
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    await conn.execute("UPDATE users SET stripe_customer_id=$1, updated_at=NOW() WHERE id=$2", customer_id, str(user["id"]))
+
+        params = {
+            "mode": "subscription",
+            "customer": customer_id,
+            "line_items": [{"price": price_id, "quantity": 1}],
+            "success_url": STRIPE_SUCCESS_URL,
+            "cancel_url": STRIPE_CANCEL_URL,
+            "allow_promotion_codes": True,
+            "client_reference_id": str(user["id"]),
+            "subscription_data": {},
+            "metadata": {"user_id": str(user["id"]), "lookup_key": lookup_key},
+        }
+        if STRIPE_AUTOMATIC_TAX == "1":
+            params["automatic_tax"] = {"enabled": True}
+        if trial_days and trial_days > 0:
+            params["subscription_data"]["trial_period_days"] = trial_days
+
+        session = stripe.checkout.Session.create(**params)
+
+        await _discord_notify_admin("checkout_session_created", {"user": user["email"], "lookup_key": lookup_key, "session": session.id})
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO analytics_events(user_id,event_type,event_data) VALUES ($1,'billing_checkout_created',$2)",
+                    str(user["id"]),
+                    json.dumps({"lookup_key": lookup_key, "session_id": session.id}),
+                )
+
+        return {"url": session.url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Stripe checkout failed: {e}")
+        raise HTTPException(500, "Stripe checkout failed")
+
+@app.post("/api/billing/portal")
+async def create_portal_session(data: PortalRequest, user: dict = Depends(get_current_user)):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(500, "Stripe not configured")
+
+    customer_id = user.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(400, "No Stripe customer on file")
+
+    return_url = (data.return_url or STRIPE_PORTAL_RETURN_URL or FRONTEND_URL).strip()
+    try:
+        sess = stripe.billing_portal.Session.create(customer=customer_id, return_url=return_url)
+        return {"url": sess.url}
+    except Exception as e:
+        logger.error(f"Stripe portal failed: {e}")
+        raise HTTPException(500, "Stripe portal failed")
+
+async def _apply_subscription_entitlements(user_id: str, subscription: dict, lookup_key: Optional[str]):
+    tier = _tier_from_lookup_key(lookup_key or "")
+    ent = _entitlements_for_tier(tier)
+    status = subscription.get("status") if isinstance(subscription, dict) else None
+    sub_id = subscription.get("id") if isinstance(subscription, dict) else None
+    current_period_end = subscription.get("current_period_end") if isinstance(subscription, dict) else None
+
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE users SET
+                       subscription_tier=$1,
+                       upload_quota=$2,
+                       unlimited_uploads=$3,
+                       stripe_subscription_id=COALESCE($4, stripe_subscription_id),
+                       subscription_status=COALESCE($5, subscription_status),
+                       current_period_end=COALESCE(to_timestamp($6), current_period_end),
+                       updated_at=NOW()
+                   WHERE id=$7""",
+                ent["tier"],
+                ent["upload_quota"],
+                ent["unlimited_uploads"],
+                sub_id,
+                status,
+                current_period_end,
+                user_id,
+            )
+            await conn.execute(
+                "INSERT INTO analytics_events(user_id,event_type,event_data) VALUES ($1,'billing_entitlements_applied',$2)",
+                user_id,
+                json.dumps({"tier": ent["tier"], "status": status, "subscription_id": sub_id}),
+            )
+
+@app.post("/api/billing/webhook")
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        # If webhook isn't configured, treat as 204 to avoid noisy retries in early dev
+        return Response(status_code=204)
+
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        logger.warning(f"Stripe webhook signature verification failed: {e}")
+        return Response(status_code=400)
+
+    etype = event.get("type")
+    obj = (event.get("data") or {}).get("object") or {}
+
+    # Resolve user_id via metadata (preferred), else via customer lookup.
+    user_id = (obj.get("metadata") or {}).get("user_id")
+    lookup_key = (obj.get("metadata") or {}).get("lookup_key")
+
+    try:
+        if not user_id and obj.get("customer") and db_pool:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT id FROM users WHERE stripe_customer_id=$1", obj.get("customer"))
+                if row:
+                    user_id = str(row["id"])
+
+        if user_id and db_pool:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO analytics_events(user_id,event_type,event_data) VALUES ($1,$2,$3)",
+                    user_id,
+                    f"stripe_{etype}",
+                    json.dumps({"id": event.get("id"), "type": etype}),
+                )
+
+        # Source of truth: subscription.* events
+        if etype in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+            await _apply_subscription_entitlements(user_id, obj, lookup_key)
+            await _discord_notify_admin(etype, {"user_id": user_id, "status": obj.get("status"), "sub": obj.get("id")})
+
+        if etype == "checkout.session.completed":
+            await _discord_notify_admin(etype, {"user_id": user_id, "session": obj.get("id"), "customer": obj.get("customer")})
+
+        return {"received": True}
+    except Exception as e:
+        logger.error(f"Stripe webhook handling failed: {e}")
+        return Response(status_code=500)
 
 # ============================================================
 # Upload Routes (R2 Direct Upload)
@@ -1509,11 +2056,12 @@ async def complete_upload(upload_id: str, background_tasks: BackgroundTasks, use
             if not upload:
                 raise HTTPException(404, "Upload not found")
 
-            await conn.execute("UPDATE uploads SET status = 'processing' WHERE id = $1", upload_id)
+            await conn.execute("UPDATE uploads SET status = 'queued' WHERE id = $1", upload_id)
             await conn.execute("UPDATE users SET uploads_this_month = uploads_this_month + 1, updated_at = NOW() WHERE id = $1", user_id)
 
+        background_tasks.add_task(enqueue_job, {"type": "publish", "upload_id": upload_id, "user_id": user_id})
     background_tasks.add_task(track_event, user_id, "upload_complete", {"upload_id": upload_id})
-    return {"status": "processing", "upload_id": upload_id}
+    return {"status": "queued", "upload_id": upload_id}
 
 @app.get("/api/uploads")
 async def list_uploads(
@@ -1559,6 +2107,32 @@ async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
     if not upload:
         raise HTTPException(404, "Upload not found")
     return dict(upload)
+
+
+@app.get("/api/uploads/{upload_id}/presign-get")
+async def presign_get_for_upload(
+    upload_id: str,
+    ttl: int = 3600,
+    user: dict = Depends(get_current_user),
+):
+    """Publicly readable URL for IG/Facebook ingest (pull_by_url), generated server-side."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
+    ttl = max(60, min(int(ttl), 24 * 3600))
+
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow(
+            "SELECT id, user_id, r2_key, processed_r2_key FROM uploads WHERE id=$1 AND user_id=$2",
+            upload_id,
+            str(user["id"]),
+        )
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+
+    key = upload.get("processed_r2_key") or upload.get("r2_key")
+    url = generate_presigned_get_url(key, ttl_seconds=ttl)
+    return {"url": url, "expires_in": ttl, "r2_key": key}
 
 # ============================================================
 # Platform Connection Routes
@@ -1641,6 +2215,12 @@ async def tiktok_oauth_callback(
             },
         )
         token_data = resp.json()
+        if isinstance(token_data, dict) and token_data.get('expires_in') is not None:
+            token_data['_obtained_at'] = time.time()
+            try:
+                token_data['_expires_at'] = time.time() + float(token_data.get('expires_in') or 0) - 60
+            except Exception:
+                pass
 
     if "error" in token_data:
         return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=tiktok_token_failed")
@@ -1712,6 +2292,12 @@ async def google_oauth_callback(
             },
         )
         token_data = resp.json()
+        if isinstance(token_data, dict) and token_data.get('expires_in') is not None:
+            token_data['_obtained_at'] = time.time()
+            try:
+                token_data['_expires_at'] = time.time() + float(token_data.get('expires_in') or 0) - 60
+            except Exception:
+                pass
 
     if "error" in token_data:
         return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=google_token_failed")
@@ -1780,6 +2366,12 @@ async def meta_oauth_callback(
             },
         )
         token_data = resp.json()
+        if isinstance(token_data, dict) and token_data.get('expires_in') is not None:
+            token_data['_obtained_at'] = time.time()
+            try:
+                token_data['_expires_at'] = time.time() + float(token_data.get('expires_in') or 0) - 60
+            except Exception:
+                pass
 
     if "error" in token_data:
         return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=meta_token_failed")
@@ -1880,6 +2472,346 @@ async def analytics_timeseries(days: int = 30, user: dict = Depends(get_current_
         "uploads_daily": [{"day": r["day"].date().isoformat(), "count": r["c"]} for r in uploads_daily],
         "events_daily": [{"day": r["day"].date().isoformat(), "event_type": r["event_type"], "count": r["c"]} for r in events_daily],
     }
+
+
+# ============================================================
+# KPI (Commercial-grade) — Summary + Raw Extract + HTML UI
+# ============================================================
+
+@app.get("/api/kpi/summary")
+async def kpi_summary(days: int = 30, platform: Optional[str] = None, status: Optional[str] = None, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    days = max(1, min(days, 365))
+    user_id = str(user["id"])
+    since = _now_utc() - timedelta(days=days)
+
+    filters = ["user_id=$1", "created_at >= $2"]
+    args = [user_id, since]
+    argn = 3
+    if platform:
+        filters.append(f"$%d = ANY(platforms)" % argn)
+        args.append(platform)
+        argn += 1
+    if status:
+        filters.append(f"status = $%d" % argn)
+        args.append(status)
+        argn += 1
+    where = " AND ".join(filters)
+
+    async with db_pool.acquire() as conn:
+        totals = await conn.fetchrow(
+            f"""SELECT
+                    COUNT(*)::int AS total,
+                    SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END)::int AS completed,
+                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END)::int AS failed,
+                    SUM(CASE WHEN status IN ('queued','processing') THEN 1 ELSE 0 END)::int AS backlog
+                 FROM uploads
+                 WHERE {where}""",
+            *args
+        )
+
+        latency = await conn.fetchrow(
+            f"""SELECT
+                    AVG(EXTRACT(EPOCH FROM (COALESCE(processing_finished_at, completed_at, NOW()) - COALESCE(processing_started_at, created_at)))) AS avg_s,
+                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (COALESCE(processing_finished_at, completed_at, NOW()) - COALESCE(processing_started_at, created_at)))) AS p95_s
+                 FROM uploads
+                 WHERE {where} AND (processing_started_at IS NOT NULL OR completed_at IS NOT NULL)""",
+            *args
+        )
+
+        mix = await conn.fetch(
+            f"""SELECT p AS platform, COUNT(*)::int AS c
+                 FROM uploads, UNNEST(platforms) AS p
+                 WHERE {where}
+                 GROUP BY p
+                 ORDER BY c DESC""",
+            *args
+        )
+
+    total = int(totals["total"] or 0)
+    completed = int(totals["completed"] or 0)
+    failed = int(totals["failed"] or 0)
+    backlog = int(totals["backlog"] or 0)
+
+    success_rate = (completed / total) if total else 0.0
+    failure_rate = (failed / total) if total else 0.0
+
+    avg_s = float(latency["avg_s"]) if latency and latency["avg_s"] is not None else None
+    p95_s = float(latency["p95_s"]) if latency and latency["p95_s"] is not None else None
+
+    mix_list = [{"platform": r["platform"], "count": r["c"]} for r in mix]
+    top_share = (mix_list[0]["count"] / total) if (mix_list and total) else 0.0
+
+    return {
+        "window_days": days,
+        "filters": {"platform": platform, "status": status},
+        "throughput": {
+            "uploads_total": total,
+            "uploads_per_day": round(total / days, 3) if days else 0,
+            "uploads_per_month_equiv": round((total / days) * 30, 3) if days else 0,
+        },
+        "reliability": {"success_rate": success_rate, "failure_rate": failure_rate, "completed": completed, "failed": failed},
+        "latency": {"avg_processing_s": avg_s, "p95_processing_s": p95_s},
+        "backlog": {"queued_processing": backlog},
+        "platform_mix": mix_list,
+        "platform_concentration": {"top_platform_share": top_share},
+        "finance": {"mrr": None, "churn": None, "arpa": None, "gross_margin": None, "cac_payback": None},
+    }
+
+@app.get("/api/kpi/raw")
+async def kpi_raw(days: int = 30, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    days = max(1, min(days, 365))
+    user_id = str(user["id"])
+    since = _now_utc() - timedelta(days=days)
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, filename, title, status, platforms, r2_key, processed_r2_key,
+                      created_at, scheduled_time, processing_started_at, processing_finished_at, completed_at,
+                      error_code, error_detail
+                 FROM uploads
+                 WHERE user_id=$1 AND created_at >= $2
+                 ORDER BY created_at DESC
+                 LIMIT 5000""",
+            user_id, since
+        )
+
+    def _row(r):
+        return {
+            "id": str(r["id"]),
+            "filename": r["filename"],
+            "title": r["title"],
+            "status": r["status"],
+            "platforms": r["platforms"],
+            "r2_key": r["r2_key"],
+            "processed_r2_key": r["processed_r2_key"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "scheduled_time": r["scheduled_time"].isoformat() if r["scheduled_time"] else None,
+            "processing_started_at": r["processing_started_at"].isoformat() if r["processing_started_at"] else None,
+            "processing_finished_at": r["processing_finished_at"].isoformat() if r["processing_finished_at"] else None,
+            "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+            "error_code": r["error_code"],
+            "error_detail": r["error_detail"],
+        }
+
+    return {"window_days": days, "rows": [_row(r) for r in rows]}
+
+@app.get("/kpi.html")
+async def kpi_html():
+    # Single-file KPI dashboard. Pulls data from /api/kpi/* endpoints.
+    html = """<!doctype html>
+<html>
+<head>
+  <meta charset='utf-8'/>
+  <meta name='viewport' content='width=device-width, initial-scale=1'/>
+  <title>UploadM8 KPI</title>
+  <script src='https://cdn.jsdelivr.net/npm/chart.js'></script>
+  <script src='https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js'></script>
+  <style>
+    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:20px;}
+    .row{display:flex; gap:12px; flex-wrap:wrap;}
+    .card{border:1px solid #2223; border-radius:12px; padding:12px; min-width:220px;}
+    .grid{display:grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap:12px;}
+    .k{font-size:12px; opacity:.7}
+    .v{font-size:24px; font-weight:700}
+    .btn{padding:10px 12px; border:1px solid #2223; border-radius:10px; background:#fff; cursor:pointer}
+    input,select{padding:10px; border-radius:10px; border:1px solid #2223}
+    canvas{max-height:320px}
+  </style>
+</head>
+<body>
+  <h2>UploadM8 KPI Dashboard</h2>
+  <div class='row'>
+    <label>Days <input id='days' type='number' min='1' max='365' value='30'/></label>
+    <label>Platform
+      <select id='platform'>
+        <option value=''>All</option>
+        <option value='tiktok'>TikTok</option>
+        <option value='instagram'>Instagram</option>
+        <option value='facebook'>Facebook</option>
+        <option value='youtube'>YouTube</option>
+      </select>
+    </label>
+    <label>Status
+      <select id='status'>
+        <option value=''>All</option>
+        <option value='queued'>Queued</option>
+        <option value='processing'>Processing</option>
+        <option value='completed'>Completed</option>
+        <option value='failed'>Failed</option>
+      </select>
+    </label>
+    <button class='btn' id='refresh'>Refresh</button>
+    <button class='btn' id='export'>Export Excel</button>
+  </div>
+
+  <div class='grid' style='margin-top:14px'>
+    <div class='card'><div class='k'>Uploads/day</div><div class='v' id='u_day'>—</div></div>
+    <div class='card'><div class='k'>Success rate</div><div class='v' id='succ'>—</div></div>
+    <div class='card'><div class='k'>Avg processing (s)</div><div class='v' id='avg'>—</div></div>
+    <div class='card'><div class='k'>P95 processing (s)</div><div class='v' id='p95'>—</div></div>
+    <div class='card'><div class='k'>Backlog</div><div class='v' id='backlog'>—</div></div>
+    <div class='card'><div class='k'>Top platform share</div><div class='v' id='topshare'>—</div></div>
+  </div>
+
+  <div class='grid' style='margin-top:14px'>
+    <div class='card'><div class='k'>Throughput trend</div><canvas id='trend'></canvas></div>
+    <div class='card'><div class='k'>Platform mix</div><canvas id='mix'></canvas></div>
+  </div>
+
+<script>
+async function api(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
+  const r = await fetch(path, opts);
+  if(!r.ok){ throw new Error(await r.text()); }
+  return await r.json();
+}
+function pct(x){ return (x*100).toFixed(1)+'%'; }
+
+let trendChart=null, mixChart=null, rawCache=null;
+
+async function refresh(){
+  const days = document.getElementById('days').value;
+  const platform = document.getElementById('platform').value;
+  const status = document.getElementById('status').value;
+
+  const q = new URLSearchParams({days});
+  if(platform) q.set('platform', platform);
+  if(status) q.set('status', status);
+
+  const sum = await api('/api/kpi/summary?'+q.toString());
+  document.getElementById('u_day').textContent = sum.throughput.uploads_per_day;
+  document.getElementById('succ').textContent = pct(sum.reliability.success_rate);
+  document.getElementById('avg').textContent = sum.latency.avg_processing_s==null?'—':sum.latency.avg_processing_s.toFixed(1);
+  document.getElementById('p95').textContent = sum.latency.p95_processing_s==null?'—':sum.latency.p95_processing_s.toFixed(1);
+  document.getElementById('backlog').textContent = sum.backlog.queued_processing;
+  document.getElementById('topshare').textContent = pct(sum.platform_concentration.top_platform_share);
+
+  const ts = await api('/api/analytics/timeseries?days='+days);
+  const labels = ts.uploads_daily.map(x=>x.day);
+  const values = ts.uploads_daily.map(x=>x.count);
+  if(trendChart) trendChart.destroy();
+  trendChart = new Chart(document.getElementById('trend'), {type:'line', data:{labels, datasets:[{label:'Uploads/day', data:values}]} });
+
+  const mixLabels = sum.platform_mix.map(x=>x.platform);
+  const mixValues = sum.platform_mix.map(x=>x.count);
+  if(mixChart) mixChart.destroy();
+  mixChart = new Chart(document.getElementById('mix'), {type:'doughnut', data:{labels:mixLabels, datasets:[{label:'Mix', data:mixValues}]} });
+
+  rawCache = await api('/api/kpi/raw?days='+days);
+}
+
+async function exportExcel(){
+  if(!rawCache){ await refresh(); }
+  const wb = XLSX.utils.book_new();
+
+  // KPI sheet
+  const days = document.getElementById('days').value;
+  const platform = document.getElementById('platform').value;
+  const status = document.getElementById('status').value;
+  const sum = await api('/api/kpi/summary?'+new URLSearchParams({days,platform,status}).toString());
+
+  const kpiRows = [
+    ['Window (days)', sum.window_days],
+    ['Uploads/day', sum.throughput.uploads_per_day],
+    ['Uploads/month equiv', sum.throughput.uploads_per_month_equiv],
+    ['Success rate', sum.reliability.success_rate],
+    ['Failure rate', sum.reliability.failure_rate],
+    ['Avg processing (s)', sum.latency.avg_processing_s],
+    ['P95 processing (s)', sum.latency.p95_processing_s],
+    ['Backlog', sum.backlog.queued_processing],
+    ['Top platform share', sum.platform_concentration.top_platform_share],
+  ];
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(kpiRows), 'KPI');
+
+  // Raw extract
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rawCache.rows), 'Uploads');
+
+  XLSX.writeFile(wb, 'uploadm8_kpi.xlsx');
+}
+
+document.getElementById('refresh').onclick = ()=>refresh().catch(e=>alert(e));
+document.getElementById('export').onclick = ()=>exportExcel().catch(e=>alert(e));
+refresh().catch(e=>alert(e));
+</script>
+</body></html>"""
+    return Response(content=html, media_type="text/html")
+
+@app.get("/pricing.html")
+async def pricing_page():
+    html = """<!doctype html>
+<html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width, initial-scale=1'/>
+<title>UploadM8 Pricing</title>
+<style>
+  body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:20px;}
+  .card{border:1px solid #2223; border-radius:12px; padding:14px; max-width:520px;}
+  .btn{padding:10px 12px; border:1px solid #2223; border-radius:10px; background:#fff; cursor:pointer}
+  select,input{padding:10px; border-radius:10px; border:1px solid #2223; width:100%;}
+</style>
+</head>
+<body>
+<h2>UploadM8 Pricing</h2>
+<div class='card'>
+  <div style='margin-bottom:10px'>Select plan</div>
+  <select id='plan'></select>
+  <div style='margin:12px 0'>
+    <label>Trial days (optional)<input id='trial' type='number' min='0' max='60' value='0'/></label>
+  </div>
+  <button class='btn' id='checkout'>Checkout</button>
+  <div id='msg' style='margin-top:10px; opacity:.75'></div>
+</div>
+<script>
+async function api(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{});
+  const r = await fetch(path, opts);
+  if(!r.ok){ throw new Error(await r.text()); }
+  return await r.json();
+}
+async function load(){
+  const data = await api('/api/billing/prices');
+  const sel = document.getElementById('plan');
+  sel.innerHTML = '';
+  if(!data.configured || !data.prices.length){
+    document.getElementById('msg').textContent = 'Stripe not configured or no prices.';
+    return;
+  }
+  data.prices.forEach(p=>{
+    const amt = (p.unit_amount/100).toFixed(2);
+    const interval = (p.recurring && p.recurring.interval) ? p.recurring.interval : '';
+    const opt = document.createElement('option');
+    opt.value = p.lookup_key;
+    opt.textContent = (p.product && p.product.name ? p.product.name : p.lookup_key) + ' — $' + amt + '/' + interval;
+    sel.appendChild(opt);
+  });
+}
+document.getElementById('checkout').onclick = async ()=>{
+  const lookup_key = document.getElementById('plan').value;
+  const trial_days = parseInt(document.getElementById('trial').value || '0',10);
+  const s = await api('/api/billing/checkout', {method:'POST', body: JSON.stringify({lookup_key, trial_days})});
+  window.location = s.url;
+};
+load().catch(e=>document.getElementById('msg').textContent = e.toString());
+</script>
+</body></html>"""
+    return Response(content=html, media_type="text/html")
+
+@app.get("/billing-success.html")
+async def billing_success_page(session_id: str = ""):
+    html = f"""<!doctype html>
+<html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width, initial-scale=1'/>
+<title>Subscription Active</title></head>
+<body style='font-family:system-ui; margin:20px'>
+  <h2>Subscription confirmed</h2>
+  <p>Session: <code>{session_id}</code></p>
+  <p>You can now return to your dashboard.</p>
+  <a href='{FRONTEND_URL}/dashboard.html'>Go to Dashboard</a>
+</body></html>"""
+    return Response(content=html, media_type="text/html")
 
 # ============================================================
 # Run

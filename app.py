@@ -28,9 +28,8 @@ import base64
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta, timezone, date
-from typing import Optional, List, Dict, Tuple, Any
-from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Tuple
 
 import httpx
 import asyncpg
@@ -44,6 +43,7 @@ from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTa
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
+from contextlib import asynccontextmanager
 
 # ============================================================
 # Logging
@@ -59,6 +59,11 @@ logger = logging.getLogger("uploadm8-auth")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
+
+# ------------------------------------------------------------
+# FRONTEND base URL (where dashboard lives)
+# ------------------------------------------------------------
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "https://auth.uploadm8.com")
@@ -116,9 +121,6 @@ def _now_utc() -> datetime:
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def _iso(d: Optional[datetime]) -> Optional[str]:
-    return d.isoformat() if d else None
 
 # ============================================================
 # Env Validation (fail fast)
@@ -217,7 +219,6 @@ class SettingsUpdate(BaseModel):
     hud_position: Optional[str] = None
     speeding_mph: Optional[int] = None
     euphoria_mph: Optional[int] = None
-    # optional meta selections
     fb_user_id: Optional[str] = None
     selected_page_id: Optional[str] = None
     selected_page_name: Optional[str] = None
@@ -451,18 +452,15 @@ MIGRATIONS: List[Tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_refresh_hash ON refresh_tokens(token_hash);
     """),
     (6, """
-        -- Role for future admin console (bootstrap-friendly)
         ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user';
         UPDATE users SET role = COALESCE(role, 'user') WHERE role IS NULL;
     """),
     (7, """
-        -- v7: normalize user_settings; rebuild if legacy PK uses fb_user_id
         DO $$
         DECLARE
             pk_cols text[];
             has_fb_pk boolean := false;
         BEGIN
-            -- If user_settings doesn't exist, create it cleanly.
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.tables
                 WHERE table_schema = 'public' AND table_name = 'user_settings'
@@ -483,7 +481,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
                 RETURN;
             END IF;
 
-            -- Detect primary key columns on user_settings.
             SELECT array_agg(a.attname ORDER BY a.attnum)
             INTO pk_cols
             FROM pg_constraint c
@@ -497,7 +494,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
                 has_fb_pk := true;
             END IF;
 
-            -- Ensure columns exist (safe adds)
             ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS user_id UUID;
             ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS discord_webhook TEXT;
             ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS telemetry_enabled BOOLEAN DEFAULT true;
@@ -510,7 +506,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
             ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS selected_page_name TEXT;
             ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
-            -- If legacy PK uses fb_user_id, rebuild the table cleanly.
             IF has_fb_pk THEN
                 CREATE TABLE IF NOT EXISTS user_settings_v2 (
                     user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -562,7 +557,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
                 RETURN;
             END IF;
 
-            -- Non-legacy path: enforce uniqueness + FK on user_id (needed for ON CONFLICT(user_id))
             DO $inner$
             BEGIN
                 IF NOT EXISTS (
@@ -594,7 +588,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
         END $$;
     """),
     (8, """
-        -- v8: entitlements + admin audit for friends/family/lifetime grants
         CREATE TABLE IF NOT EXISTS entitlements (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -645,10 +638,6 @@ async def apply_migrations(conn: asyncpg.Connection):
         logger.info(f"[MIGRATION] Applied v{version}")
 
 async def bootstrap_promote_admin(conn: asyncpg.Connection):
-    """
-    One-time promotion controlled by BOOTSTRAP_ADMIN_EMAIL.
-    Safe/idempotent. Set env var -> deploy once -> remove env var.
-    """
     if not BOOTSTRAP_ADMIN_EMAIL:
         return
 
@@ -896,7 +885,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="UploadM8 API", version="1.2.0", lifespan=lifespan)
 
-# CORS hardened
 origins = _split_origins(ALLOWED_ORIGINS)
 app.add_middleware(
     CORSMiddleware,
@@ -937,7 +925,6 @@ async def request_id_security_and_logging(request: Request, call_next):
         ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else "unknown")
         logger.info(f"rid={rid} ip={ip} {request.method} {request.url.path} status={status_code} dur_ms={duration_ms}")
 
-    # Security headers
     response.headers["X-Request-ID"] = rid
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -965,6 +952,7 @@ async def health():
         "mailgun_configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN),
         "platforms": {"tiktok": bool(TIKTOK_CLIENT_KEY), "youtube": bool(GOOGLE_CLIENT_ID), "meta": bool(META_APP_ID)},
         "bootstrap_admin_email_set": bool(BOOTSTRAP_ADMIN_EMAIL),
+        "frontend_url": FRONTEND_URL,
     }
 
 # ============================================================
@@ -1016,7 +1004,16 @@ async def admin_db_info(_: bool = Depends(require_admin_api_key)):
     }
 
 # ============================================================
-# Admin: KPI + entitlements (ROLE-based for master/admin page)
+# Admin: Role check endpoint (for frontend gating)
+# ============================================================
+
+@app.get("/api/admin/user-role")
+async def admin_user_role(user: dict = Depends(get_current_user)):
+    role = (user.get("role") or "user").lower()
+    return {"role": role, "is_admin": role == "admin"}
+
+# ============================================================
+# Admin: KPI + entitlements (ROLE-based)
 # ============================================================
 
 @app.get("/api/admin/overview")
@@ -1113,7 +1110,10 @@ async def admin_grant_entitlement(payload: AdminGrantEntitlement, admin: dict = 
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            target = await conn.fetchrow("SELECT id, email, subscription_tier, upload_quota FROM users WHERE lower(email)=lower($1)", payload.email)
+            target = await conn.fetchrow(
+                "SELECT id, email, subscription_tier, upload_quota FROM users WHERE lower(email)=lower($1)",
+                payload.email
+            )
             if not target:
                 raise HTTPException(404, "User not found")
 
@@ -1129,9 +1129,6 @@ async def admin_grant_entitlement(payload: AdminGrantEntitlement, admin: dict = 
                 admin["id"],
             )
 
-            # Enforce the entitlement onto users table (single source of truth for app logic)
-            # - subscription_tier drives UI + feature gating
-            # - upload_quota override supports "unlimited" / higher caps for pioneers
             if payload.upload_quota is not None:
                 await conn.execute(
                     "UPDATE users SET subscription_tier=$1, upload_quota=$2, updated_at=NOW() WHERE id=$3",
@@ -1215,7 +1212,6 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
 
             user_id = str(row["id"])
 
-            # After v7, user_settings is guaranteed keyed by user_id (no legacy fb_user_id PK).
             await conn.execute(
                 """INSERT INTO user_settings (user_id)
                    VALUES ($1)
@@ -1325,7 +1321,11 @@ async def forgot_password(request: Request, data: PasswordReset, background_task
             token_hash, str(user["id"]), expires_at,
         )
 
-    reset_url = f"{BASE_URL}/reset-password?token={token}"
+    # ------------------------------------------------------------
+    # Redirect users to frontend reset page (not backend domain)
+    # ------------------------------------------------------------
+    reset_url = f"{FRONTEND_URL}/forgot-password.html?token={token}"
+
     html = f"""
 <h2>Reset Your UploadM8 Password</h2>
 <p>Hi {user['name']},</p>
@@ -1616,15 +1616,15 @@ async def tiktok_oauth_callback(
     background_tasks: BackgroundTasks = None,
 ):
     if error:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=tiktok_oauth_failed")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=tiktok_oauth_failed")
     if not state or "|" not in state:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=invalid_state")
 
     parts = state.split("|")
     user_id = verify_access_jwt(parts[0])
     code_verifier = parts[1] if len(parts) > 1 else ""
     if not user_id:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=invalid_state")
 
     redirect_uri = f"{BASE_URL}/oauth/tiktok/callback"
 
@@ -1643,7 +1643,7 @@ async def tiktok_oauth_callback(
         token_data = resp.json()
 
     if "error" in token_data:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=tiktok_token_failed")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=tiktok_token_failed")
 
     token_blob = encrypt_blob(token_data)
 
@@ -1658,7 +1658,7 @@ async def tiktok_oauth_callback(
 
     if background_tasks:
         background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "tiktok"})
-    return RedirectResponse(f"{BASE_URL}/dashboard?success=tiktok_connected")
+    return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?success=tiktok_connected")
 
 # ============================================================
 # OAuth Routes - Google/YouTube
@@ -1692,11 +1692,11 @@ async def google_oauth_callback(
     background_tasks: BackgroundTasks = None,
 ):
     if error:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=google_oauth_failed")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=google_oauth_failed")
 
     user_id = verify_access_jwt(state)
     if not user_id:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=invalid_state")
 
     redirect_uri = f"{BASE_URL}/oauth/google/callback"
 
@@ -1714,7 +1714,7 @@ async def google_oauth_callback(
         token_data = resp.json()
 
     if "error" in token_data:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=google_token_failed")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=google_token_failed")
 
     token_blob = encrypt_blob(token_data)
 
@@ -1729,7 +1729,7 @@ async def google_oauth_callback(
 
     if background_tasks:
         background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "youtube"})
-    return RedirectResponse(f"{BASE_URL}/dashboard?success=youtube_connected")
+    return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?success=youtube_connected")
 
 # ============================================================
 # OAuth Routes - Meta (Facebook/Instagram)
@@ -1761,11 +1761,11 @@ async def meta_oauth_callback(
     background_tasks: BackgroundTasks = None,
 ):
     if error:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=meta_oauth_failed")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=meta_oauth_failed")
 
     user_id = verify_access_jwt(state)
     if not user_id:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=invalid_state")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=invalid_state")
 
     redirect_uri = f"{BASE_URL}/oauth/meta/callback"
 
@@ -1782,7 +1782,7 @@ async def meta_oauth_callback(
         token_data = resp.json()
 
     if "error" in token_data:
-        return RedirectResponse(f"{BASE_URL}/dashboard?error=meta_token_failed")
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=meta_token_failed")
 
     token_blob = encrypt_blob(token_data)
 
@@ -1797,7 +1797,7 @@ async def meta_oauth_callback(
 
     if background_tasks:
         background_tasks.add_task(track_event, user_id, "platform_connected", {"platform": "meta"})
-    return RedirectResponse(f"{BASE_URL}/dashboard?success=meta_connected")
+    return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?success=meta_connected")
 
 # ============================================================
 # Analytics Routes (User KPI)

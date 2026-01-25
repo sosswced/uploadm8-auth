@@ -267,12 +267,7 @@ async def get_valid_platform_token(user_id: str, platform: str) -> dict:
     await _save_platform_token(user_id, platform, token_data)
     return token_data
 
-@app.get("/api/vault/token")
-async def vault_token(platform: str = Query(...), user: dict = Depends(get_current_user)):
-    """Returns a valid access_token for the platform. Auto-refreshes when close to expiry."""
-    platform = platform.lower().strip()
-    td = await get_valid_platform_token(str(user["id"]), platform)
-    return {"platform": platform, "access_token": td.get("access_token"), "expires_in": td.get("expires_in"), "scope": td.get("scope")}
+
 
 # Platform OAuth
 META_APP_ID = os.environ.get("META_APP_ID", "")
@@ -1190,6 +1185,15 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Request-ID"],
 )
+
+@app.get("/api/vault/token")
+async def vault_token(platform: str = Query(...), user: dict = Depends(get_current_user)):
+    """Returns a valid access_token for the platform. Auto-refreshes when close to expiry."""
+    platform = platform.lower().strip()
+    td = await get_valid_platform_token(str(user["id"]), platform)
+    return {"platform": platform, "access_token": td.get("access_token"), "expires_in": td.get("expires_in"), "scope": td.get("scope")}
+
+
 
 @app.middleware("http")
 async def request_id_security_and_logging(request: Request, call_next):

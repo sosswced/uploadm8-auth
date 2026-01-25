@@ -1,6 +1,12 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-requests==2.32.3
-python-jose[cryptography]==3.3.0
-cryptography==43.0.3
-psycopg[binary]==3.2.3
+# UploadM8 Auth Service Dependencies
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+asyncpg>=0.29.0
+PyJWT>=2.8.0
+passlib[bcrypt]>=1.7.4
+cryptography>=41.0.0
+httpx>=0.26.0
+pydantic>=2.5.0
+email-validator>=2.1.0
+boto3>=1.34.0

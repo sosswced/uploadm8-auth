@@ -1,20 +1,23 @@
 """
-UploadM8 Auth Service (Production Hardened)
-===========================================
+UploadM8 Auth Service (Production Hardened) — Updated (Bootstrap + KPI + Admin foundations)
+========================================================================================
 FastAPI backend for UploadM8 SaaS
-- Auth (email/password) + refresh tokens
+- Auth (email/password) + refresh tokens (rotation)
 - Password reset via Mailgun
 - R2 presigned URLs for direct browser uploads
 - Multi-platform OAuth (TikTok, YouTube, Meta)
-- Upload tracking & analytics
-- Schema migrations (no more drift 500s)
+- Upload tracking & analytics + KPI time series
+- Schema migrations (no more drift 500s) + legacy user_settings normalization (fb_user_id PK rebuild)
 - Observability + security headers + request IDs + JSON errors
-- Locked /api/admin/db-info (schema + applied migrations)
-- Baseline rate limiting (in-memory)
+- Locked /api/admin/db-info (schema + applied migrations) via ADMIN_API_KEY
+- Role-based admin (JWT) for future browser admin console
+- Admin endpoints for lifetime/friends-and-family entitlements + KPI rollups (role-based)
 
-NOTE (tell it like it is):
-- ADMIN_API_KEY is acceptable for bootstrapping, but NOT for a browser-based admin console.
-  When you build the admin/master page, switch to role-based admin via JWT + users.role.
+Tell it like it is:
+Note #1: ADMIN_API_KEY is fine for bootstrap/ops endpoints, not for a browser admin console.
+         Your future admin/master page should use role-based JWT (users.role='admin') + CSRF protection on frontend.
+Note #2: Your production DB already had a legacy user_settings primary key using fb_user_id.
+         v7 migration below detects that and rebuilds user_settings into a clean user_id primary key table.
 """
 
 import os
@@ -25,21 +28,22 @@ import base64
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Tuple
+from datetime import datetime, timedelta, timezone, date
+from typing import Optional, List, Dict, Tuple, Any
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request
-from fastapi.responses import RedirectResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import asyncpg
 import jwt
 import bcrypt
 import boto3
 from botocore.config import Config
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr, Field
 
 # ============================================================
 # Logging
@@ -65,16 +69,15 @@ REFRESH_TOKEN_DAYS = int(os.environ.get("REFRESH_TOKEN_DAYS", "30"))
 
 TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")  # required for stable encryption
 
-# CORS
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "https://app.uploadm8.com,https://uploadm8.com",
 )
 
-# Admin (bootstrap only; do NOT expose to frontend)
+# Admin (ops key for locked endpoints)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
-# Optional: promote a specific email to admin during boot (one-time)
+# One-time bootstrap promotion (set in Render env vars, deploy once, then remove)
 BOOTSTRAP_ADMIN_EMAIL = os.environ.get("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
 
 # R2 Configuration
@@ -97,7 +100,7 @@ MAILGUN_API_KEY = os.environ.get("MAILGUN_API_KEY", "")
 MAILGUN_DOMAIN = os.environ.get("MAILGUN_DOMAIN", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", "no-reply@auth.uploadm8.com")
 
-# Stripe (optional)
+# Stripe (optional placeholder)
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
@@ -113,6 +116,9 @@ def _now_utc() -> datetime:
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _iso(d: Optional[datetime]) -> Optional[str]:
+    return d.isoformat() if d else None
 
 # ============================================================
 # Env Validation (fail fast)
@@ -211,9 +217,23 @@ class SettingsUpdate(BaseModel):
     hud_position: Optional[str] = None
     speeding_mph: Optional[int] = None
     euphoria_mph: Optional[int] = None
+    # optional meta selections
+    fb_user_id: Optional[str] = None
+    selected_page_id: Optional[str] = None
+    selected_page_name: Optional[str] = None
 
 class RefreshRequest(BaseModel):
     refresh_token: str
+
+class AdminGrantEntitlement(BaseModel):
+    email: EmailStr
+    tier: str = Field(default="lifetime")  # lifetime | friends_family | pro | etc
+    upload_quota: Optional[int] = None     # override quota
+    note: Optional[str] = None
+
+class AdminSetRole(BaseModel):
+    email: EmailStr
+    role: str = Field(default="admin")  # admin | user
 
 # ============================================================
 # Baseline Rate Limiting (in-memory)
@@ -283,7 +303,7 @@ def decrypt_blob(blob: dict) -> dict:
     return json.loads(plaintext)
 
 # ============================================================
-# Database + Migrations (no more schema drift)
+# Database + Migrations
 # ============================================================
 
 db_pool: Optional[asyncpg.Pool] = None
@@ -416,6 +436,7 @@ MIGRATIONS: List[Tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_uploads_user ON uploads(user_id);
         CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
         CREATE INDEX IF NOT EXISTS idx_analytics_user ON analytics_events(user_id);
+        CREATE INDEX IF NOT EXISTS idx_analytics_type ON analytics_events(event_type);
     """),
     (5, """
         CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -433,6 +454,173 @@ MIGRATIONS: List[Tuple[int, str]] = [
         -- Role for future admin console (bootstrap-friendly)
         ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user';
         UPDATE users SET role = COALESCE(role, 'user') WHERE role IS NULL;
+    """),
+    (7, """
+        -- v7: normalize user_settings; rebuild if legacy PK uses fb_user_id
+        DO $$
+        DECLARE
+            pk_cols text[];
+            has_fb_pk boolean := false;
+        BEGIN
+            -- If user_settings doesn't exist, create it cleanly.
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'user_settings'
+            ) THEN
+                CREATE TABLE user_settings (
+                    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    discord_webhook TEXT,
+                    telemetry_enabled BOOLEAN DEFAULT true,
+                    hud_enabled BOOLEAN DEFAULT true,
+                    hud_position TEXT DEFAULT 'bottom_right',
+                    speeding_mph INTEGER DEFAULT 85,
+                    euphoria_mph INTEGER DEFAULT 100,
+                    fb_user_id TEXT,
+                    selected_page_id TEXT,
+                    selected_page_name TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                RETURN;
+            END IF;
+
+            -- Detect primary key columns on user_settings.
+            SELECT array_agg(a.attname ORDER BY a.attnum)
+            INTO pk_cols
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN unnest(c.conkey) WITH ORDINALITY AS ck(attnum, ord) ON TRUE
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ck.attnum
+            WHERE n.nspname='public' AND t.relname='user_settings' AND c.contype='p';
+
+            IF pk_cols IS NOT NULL AND 'fb_user_id' = ANY(pk_cols) THEN
+                has_fb_pk := true;
+            END IF;
+
+            -- Ensure columns exist (safe adds)
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS user_id UUID;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS discord_webhook TEXT;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS telemetry_enabled BOOLEAN DEFAULT true;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_enabled BOOLEAN DEFAULT true;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_position TEXT DEFAULT 'bottom_right';
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS speeding_mph INTEGER DEFAULT 85;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS euphoria_mph INTEGER DEFAULT 100;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS fb_user_id TEXT;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS selected_page_id TEXT;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS selected_page_name TEXT;
+            ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+            -- If legacy PK uses fb_user_id, rebuild the table cleanly.
+            IF has_fb_pk THEN
+                CREATE TABLE IF NOT EXISTS user_settings_v2 (
+                    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    discord_webhook TEXT,
+                    telemetry_enabled BOOLEAN DEFAULT true,
+                    hud_enabled BOOLEAN DEFAULT true,
+                    hud_position TEXT DEFAULT 'bottom_right',
+                    speeding_mph INTEGER DEFAULT 85,
+                    euphoria_mph INTEGER DEFAULT 100,
+                    fb_user_id TEXT,
+                    selected_page_id TEXT,
+                    selected_page_name TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                INSERT INTO user_settings_v2 (
+                    user_id, discord_webhook, telemetry_enabled, hud_enabled, hud_position,
+                    speeding_mph, euphoria_mph, fb_user_id, selected_page_id, selected_page_name, updated_at
+                )
+                SELECT
+                    us.user_id,
+                    us.discord_webhook,
+                    COALESCE(us.telemetry_enabled, true),
+                    COALESCE(us.hud_enabled, true),
+                    COALESCE(us.hud_position, 'bottom_right'),
+                    COALESCE(us.speeding_mph, 85),
+                    COALESCE(us.euphoria_mph, 100),
+                    us.fb_user_id,
+                    us.selected_page_id,
+                    us.selected_page_name,
+                    COALESCE(us.updated_at, NOW())
+                FROM user_settings us
+                WHERE us.user_id IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM users u WHERE u.id = us.user_id)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    discord_webhook = EXCLUDED.discord_webhook,
+                    telemetry_enabled = EXCLUDED.telemetry_enabled,
+                    hud_enabled = EXCLUDED.hud_enabled,
+                    hud_position = EXCLUDED.hud_position,
+                    speeding_mph = EXCLUDED.speeding_mph,
+                    euphoria_mph = EXCLUDED.euphoria_mph,
+                    fb_user_id = EXCLUDED.fb_user_id,
+                    selected_page_id = EXCLUDED.selected_page_id,
+                    selected_page_name = EXCLUDED.selected_page_name,
+                    updated_at = NOW();
+
+                DROP TABLE user_settings;
+                ALTER TABLE user_settings_v2 RENAME TO user_settings;
+                RETURN;
+            END IF;
+
+            -- Non-legacy path: enforce uniqueness + FK on user_id (needed for ON CONFLICT(user_id))
+            DO $inner$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'user_settings'::regclass
+                      AND contype = 'u'
+                      AND conname = 'user_settings_user_id_uniq'
+                ) THEN
+                    ALTER TABLE user_settings ADD CONSTRAINT user_settings_user_id_uniq UNIQUE (user_id);
+                END IF;
+            END
+            $inner$;
+
+            DO $inner2$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'user_settings'::regclass
+                      AND contype = 'f'
+                      AND conname = 'user_settings_user_fk'
+                ) THEN
+                    ALTER TABLE user_settings
+                    ADD CONSTRAINT user_settings_user_fk
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+                END IF;
+            END
+            $inner2$;
+
+        END $$;
+    """),
+    (8, """
+        -- v8: entitlements + admin audit for friends/family/lifetime grants
+        CREATE TABLE IF NOT EXISTS entitlements (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+            tier TEXT NOT NULL,
+            upload_quota_override INTEGER,
+            is_lifetime BOOLEAN DEFAULT false,
+            note TEXT,
+            granted_by UUID,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            expires_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_entitlements_user ON entitlements(user_id);
+        CREATE INDEX IF NOT EXISTS idx_entitlements_tier ON entitlements(tier);
+
+        CREATE TABLE IF NOT EXISTS admin_audit (
+            id BIGSERIAL PRIMARY KEY,
+            actor_user_id UUID,
+            actor_email TEXT,
+            action TEXT NOT NULL,
+            target_user_id UUID,
+            target_email TEXT,
+            meta JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_admin_audit_actor ON admin_audit(actor_user_id);
+        CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at);
     """),
 ]
 
@@ -458,16 +646,25 @@ async def apply_migrations(conn: asyncpg.Connection):
 
 async def bootstrap_promote_admin(conn: asyncpg.Connection):
     """
-    Optional one-time promotion controlled by BOOTSTRAP_ADMIN_EMAIL.
-    Safe/idempotent. Once done, remove env var.
+    One-time promotion controlled by BOOTSTRAP_ADMIN_EMAIL.
+    Safe/idempotent. Set env var -> deploy once -> remove env var.
     """
     if not BOOTSTRAP_ADMIN_EMAIL:
         return
-    await conn.execute(
-        "UPDATE users SET role='admin' WHERE lower(email)=lower($1)",
+
+    row = await conn.fetchrow(
+        "SELECT id, email, role FROM users WHERE lower(email)=lower($1)",
         BOOTSTRAP_ADMIN_EMAIL
     )
-    logger.info(f"[BOOTSTRAP] Promote admin attempted for {BOOTSTRAP_ADMIN_EMAIL}")
+    if not row:
+        logger.warning(f"[BOOTSTRAP] No user found for {BOOTSTRAP_ADMIN_EMAIL}. Register that email, then redeploy once with BOOTSTRAP_ADMIN_EMAIL.")
+        return
+
+    await conn.execute(
+        "UPDATE users SET role='admin', updated_at=NOW() WHERE id=$1",
+        row["id"]
+    )
+    logger.info(f"[BOOTSTRAP] Promoted {BOOTSTRAP_ADMIN_EMAIL} to admin")
 
 async def init_db():
     global db_pool
@@ -586,7 +783,20 @@ async def get_current_user(authorization: str = Header(None)) -> dict:
 
     if not user:
         raise HTTPException(401, "User not found")
+
     return dict(user)
+
+def require_admin_api_key(x_admin_key: str = Header(None)):
+    if not ADMIN_API_KEY:
+        raise HTTPException(500, "ADMIN_API_KEY not configured")
+    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(403, "Forbidden")
+    return True
+
+async def require_admin_role(user: dict = Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin role required")
+    return user
 
 # ============================================================
 # R2 Storage
@@ -652,16 +862,27 @@ async def track_event(user_id: str, event_type: str, event_data: dict = None):
     except Exception as e:
         logger.warning(f"[ANALYTICS] error: {e}")
 
-# ============================================================
-# Admin Auth Dependency (Bootstrap)
-# ============================================================
-
-def require_admin(x_admin_key: str = Header(None)):
-    if not ADMIN_API_KEY:
-        raise HTTPException(500, "ADMIN_API_KEY not configured")
-    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
-        raise HTTPException(403, "Forbidden")
-    return True
+async def admin_audit_log(
+    conn: asyncpg.Connection,
+    actor_user: Optional[dict],
+    action: str,
+    target_user_id: Optional[str] = None,
+    target_email: Optional[str] = None,
+    meta: Optional[dict] = None,
+):
+    try:
+        await conn.execute(
+            """INSERT INTO admin_audit(actor_user_id, actor_email, action, target_user_id, target_email, meta)
+               VALUES($1, $2, $3, $4, $5, $6)""",
+            actor_user.get("id") if actor_user else None,
+            actor_user.get("email") if actor_user else None,
+            action,
+            target_user_id,
+            target_email,
+            json.dumps(meta or {}),
+        )
+    except Exception as e:
+        logger.warning(f"[ADMIN_AUDIT] failed: {e}")
 
 # ============================================================
 # FastAPI App + Middleware
@@ -673,8 +894,9 @@ async def lifespan(app: FastAPI):
     yield
     await close_db()
 
-app = FastAPI(title="UploadM8 API", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="UploadM8 API", version="1.2.0", lifespan=lifespan)
 
+# CORS hardened
 origins = _split_origins(ALLOWED_ORIGINS)
 app.add_middleware(
     CORSMiddleware,
@@ -715,6 +937,7 @@ async def request_id_security_and_logging(request: Request, call_next):
         ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else "unknown")
         logger.info(f"rid={rid} ip={ip} {request.method} {request.url.path} status={status_code} dur_ms={duration_ms}")
 
+    # Security headers
     response.headers["X-Request-ID"] = rid
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -735,20 +958,21 @@ async def root():
 async def health():
     return {
         "status": "ok",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "database": db_pool is not None,
         "allowed_origins": origins,
         "r2_configured": bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY),
         "mailgun_configured": bool(MAILGUN_API_KEY and MAILGUN_DOMAIN),
         "platforms": {"tiktok": bool(TIKTOK_CLIENT_KEY), "youtube": bool(GOOGLE_CLIENT_ID), "meta": bool(META_APP_ID)},
+        "bootstrap_admin_email_set": bool(BOOTSTRAP_ADMIN_EMAIL),
     }
 
 # ============================================================
-# Admin: DB Info (locked)
+# Admin: DB Info (locked via ADMIN_API_KEY)
 # ============================================================
 
 @app.get("/api/admin/db-info")
-async def admin_db_info(_: bool = Depends(require_admin)):
+async def admin_db_info(_: bool = Depends(require_admin_api_key)):
     if not db_pool:
         raise HTTPException(500, "Database not available")
 
@@ -767,6 +991,12 @@ async def admin_db_info(_: bool = Depends(require_admin)):
             WHERE table_name='user_settings'
             ORDER BY ordinal_position
         """)
+        ent_cols = await conn.fetch("""
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name='entitlements'
+            ORDER BY ordinal_position
+        """)
         refresh_cols = await conn.fetch("""
             SELECT column_name, data_type, is_nullable
             FROM information_schema.columns
@@ -780,9 +1010,181 @@ async def admin_db_info(_: bool = Depends(require_admin)):
         "tables": {
             "users": [dict(c) for c in users_cols],
             "user_settings": [dict(c) for c in settings_cols],
+            "entitlements": [dict(c) for c in ent_cols],
             "refresh_tokens": [dict(c) for c in refresh_cols],
         },
     }
+
+# ============================================================
+# Admin: KPI + entitlements (ROLE-based for master/admin page)
+# ============================================================
+
+@app.get("/api/admin/overview")
+async def admin_overview(days: int = 30, admin: dict = Depends(require_admin_role)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
+    since = _now_utc() - timedelta(days=days)
+    since7 = _now_utc() - timedelta(days=7)
+    since30 = _now_utc() - timedelta(days=30)
+
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
+        admins = await conn.fetchval("SELECT COUNT(*) FROM users WHERE role='admin'")
+        lifetime = await conn.fetchval("SELECT COUNT(*) FROM entitlements WHERE tier='lifetime' OR is_lifetime=true")
+
+        uploads_total = await conn.fetchval("SELECT COUNT(*) FROM uploads")
+        uploads_period = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since)
+        uploads_by_status = await conn.fetch(
+            """SELECT status, COUNT(*)::int AS c
+               FROM uploads WHERE created_at >= $1
+               GROUP BY status ORDER BY c DESC""",
+            since
+        )
+
+        active_7d = await conn.fetchval(
+            """SELECT COUNT(DISTINCT user_id) FROM analytics_events
+               WHERE created_at >= $1""",
+            since7
+        )
+        active_30d = await conn.fetchval(
+            """SELECT COUNT(DISTINCT user_id) FROM analytics_events
+               WHERE created_at >= $1""",
+            since30
+        )
+
+        platform_connected = await conn.fetch(
+            """SELECT platform, COUNT(DISTINCT user_id)::int AS c
+               FROM platform_tokens GROUP BY platform ORDER BY c DESC"""
+        )
+
+    return {
+        "window_days": days,
+        "users": {
+            "total": int(total_users or 0),
+            "new_in_window": int(new_users or 0),
+            "admins": int(admins or 0),
+            "lifetime_entitlements": int(lifetime or 0),
+            "active_users_7d": int(active_7d or 0),
+            "active_users_30d": int(active_30d or 0),
+        },
+        "uploads": {
+            "total": int(uploads_total or 0),
+            "in_window": int(uploads_period or 0),
+            "by_status": {r["status"]: r["c"] for r in uploads_by_status},
+        },
+        "platforms_connected": {r["platform"]: r["c"] for r in platform_connected},
+    }
+
+@app.post("/api/admin/users/role")
+async def admin_set_user_role(payload: AdminSetRole, admin: dict = Depends(require_admin_role)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    role = payload.role.strip().lower()
+    if role not in ("admin", "user"):
+        raise HTTPException(400, "role must be 'admin' or 'user'")
+
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT id, email, role FROM users WHERE lower(email)=lower($1)", payload.email)
+        if not target:
+            raise HTTPException(404, "User not found")
+
+        await conn.execute("UPDATE users SET role=$1, updated_at=NOW() WHERE id=$2", role, target["id"])
+        await admin_audit_log(
+            conn,
+            admin,
+            action="set_role",
+            target_user_id=str(target["id"]),
+            target_email=target["email"],
+            meta={"role": role},
+        )
+
+    return {"status": "ok", "email": payload.email.lower(), "role": role}
+
+@app.post("/api/admin/entitlements/grant")
+async def admin_grant_entitlement(payload: AdminGrantEntitlement, admin: dict = Depends(require_admin_role)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
+    tier = payload.tier.strip().lower()
+    if tier not in ("lifetime", "friends_family", "pro", "free"):
+        raise HTTPException(400, "tier must be one of: lifetime, friends_family, pro, free")
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            target = await conn.fetchrow("SELECT id, email, subscription_tier, upload_quota FROM users WHERE lower(email)=lower($1)", payload.email)
+            if not target:
+                raise HTTPException(404, "User not found")
+
+            is_lifetime = tier == "lifetime"
+            await conn.execute(
+                """INSERT INTO entitlements(user_id, tier, upload_quota_override, is_lifetime, note, granted_by)
+                   VALUES($1, $2, $3, $4, $5, $6)""",
+                target["id"],
+                tier,
+                payload.upload_quota,
+                is_lifetime,
+                payload.note,
+                admin["id"],
+            )
+
+            # Enforce the entitlement onto users table (single source of truth for app logic)
+            # - subscription_tier drives UI + feature gating
+            # - upload_quota override supports "unlimited" / higher caps for pioneers
+            if payload.upload_quota is not None:
+                await conn.execute(
+                    "UPDATE users SET subscription_tier=$1, upload_quota=$2, updated_at=NOW() WHERE id=$3",
+                    tier,
+                    payload.upload_quota,
+                    target["id"],
+                )
+            else:
+                await conn.execute(
+                    "UPDATE users SET subscription_tier=$1, updated_at=NOW() WHERE id=$2",
+                    tier,
+                    target["id"],
+                )
+
+            await admin_audit_log(
+                conn,
+                admin,
+                action="grant_entitlement",
+                target_user_id=str(target["id"]),
+                target_email=target["email"],
+                meta={"tier": tier, "upload_quota_override": payload.upload_quota, "note": payload.note},
+            )
+
+    return {"status": "ok", "email": payload.email.lower(), "tier": tier, "upload_quota_override": payload.upload_quota}
+
+@app.get("/api/admin/users/search")
+async def admin_search_users(q: str = "", limit: int = 25, admin: dict = Depends(require_admin_role)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    limit = max(1, min(limit, 100))
+    q = (q or "").strip().lower()
+
+    async with db_pool.acquire() as conn:
+        if q:
+            rows = await conn.fetch(
+                """SELECT id, email, name, role, subscription_tier, upload_quota, uploads_this_month, created_at
+                   FROM users
+                   WHERE lower(email) LIKE $1 OR lower(name) LIKE $1
+                   ORDER BY created_at DESC
+                   LIMIT $2""",
+                f"%{q}%",
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT id, email, name, role, subscription_tier, upload_quota, uploads_this_month, created_at
+                   FROM users
+                   ORDER BY created_at DESC
+                   LIMIT $1""",
+                limit,
+            )
+
+    return {"users": [dict(r) for r in rows]}
 
 # ============================================================
 # Authentication Routes
@@ -803,7 +1205,7 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
                 row = await conn.fetchrow(
                     """INSERT INTO users (email, password_hash, name)
                        VALUES ($1, $2, $3)
-                       RETURNING id, email, name, subscription_tier, role""",
+                       RETURNING id, email, name, subscription_tier, role, upload_quota, uploads_this_month""",
                     data.email.lower(),
                     password_hash,
                     data.name,
@@ -813,15 +1215,13 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
 
             user_id = str(row["id"])
 
-            try:
-                await conn.execute(
-                    """INSERT INTO user_settings (user_id)
-                       VALUES ($1)
-                       ON CONFLICT (user_id) DO NOTHING""",
-                    user_id,
-                )
-            except Exception as e:
-                logger.warning(f"Settings insert failed for user {user_id}: {e}")
+            # After v7, user_settings is guaranteed keyed by user_id (no legacy fb_user_id PK).
+            await conn.execute(
+                """INSERT INTO user_settings (user_id)
+                   VALUES ($1)
+                   ON CONFLICT (user_id) DO NOTHING""",
+                user_id,
+            )
 
             access_token = create_access_jwt(user_id)
             refresh_token = await create_refresh_token(conn, user_id)
@@ -838,6 +1238,8 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
             "name": row["name"],
             "subscription_tier": row["subscription_tier"],
             "role": row["role"],
+            "upload_quota": row["upload_quota"],
+            "uploads_this_month": row["uploads_this_month"],
         },
     }
 
@@ -851,7 +1253,7 @@ async def login(request: Request, data: UserLogin, background_tasks: BackgroundT
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """SELECT id, email, name, password_hash, subscription_tier, role,
-                      upload_quota, uploads_this_month
+                      upload_quota, uploads_this_month, quota_reset_date
                FROM users WHERE email = $1""",
             data.email.lower(),
         )
@@ -864,7 +1266,6 @@ async def login(request: Request, data: UserLogin, background_tasks: BackgroundT
         refresh_token = await create_refresh_token(conn, user_id)
 
     background_tasks.add_task(track_event, user_id, "user_login")
-
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -877,6 +1278,7 @@ async def login(request: Request, data: UserLogin, background_tasks: BackgroundT
             "role": row["role"],
             "upload_quota": row["upload_quota"],
             "uploads_this_month": row["uploads_this_month"],
+            "quota_reset_date": str(row["quota_reset_date"]) if row["quota_reset_date"] else None,
         },
     }
 
@@ -925,14 +1327,14 @@ async def forgot_password(request: Request, data: PasswordReset, background_task
 
     reset_url = f"{BASE_URL}/reset-password?token={token}"
     html = f"""
-    <h2>Reset Your UploadM8 Password</h2>
-    <p>Hi {user['name']},</p>
-    <p>Click the link below to reset your password:</p>
-    <p><a href="{reset_url}" style="background:#3B82F6;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;">Reset Password</a></p>
-    <p>This link expires in 1 hour.</p>
-    <p>If you didn't request this, you can ignore this email.</p>
-    <p>- The UploadM8 Team</p>
-    """
+<h2>Reset Your UploadM8 Password</h2>
+<p>Hi {user['name']},</p>
+<p>Click the link below to reset your password:</p>
+<p><a href="{reset_url}" style="background:#3B82F6;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block;">Reset Password</a></p>
+<p>This link expires in 1 hour.</p>
+<p>If you didn't request this, you can ignore this email.</p>
+<p>- The UploadM8 Team</p>
+"""
     background_tasks.add_task(send_email, user["email"], "Reset Your UploadM8 Password", html)
     return {"message": "If that email exists, we've sent a reset link"}
 
@@ -973,6 +1375,7 @@ async def get_me(user: dict = Depends(get_current_user)):
         "role": user.get("role", "user"),
         "upload_quota": user["upload_quota"],
         "uploads_this_month": user["uploads_this_month"],
+        "quota_reset_date": str(user["quota_reset_date"]) if user.get("quota_reset_date") else None,
     }
 
 # ============================================================
@@ -998,15 +1401,21 @@ async def get_settings(user: dict = Depends(get_current_user)):
             "speeding_mph": 85,
             "euphoria_mph": 100,
             "discord_webhook_configured": False,
+            "fb_user_id": None,
+            "selected_page_id": None,
+            "selected_page_name": None,
         }
 
     return {
-        "telemetry_enabled": settings["telemetry_enabled"],
-        "hud_enabled": settings["hud_enabled"],
-        "hud_position": settings["hud_position"],
-        "speeding_mph": settings["speeding_mph"],
-        "euphoria_mph": settings["euphoria_mph"],
-        "discord_webhook_configured": bool(settings["discord_webhook"]),
+        "telemetry_enabled": settings.get("telemetry_enabled", True),
+        "hud_enabled": settings.get("hud_enabled", True),
+        "hud_position": settings.get("hud_position", "bottom_right"),
+        "speeding_mph": settings.get("speeding_mph", 85),
+        "euphoria_mph": settings.get("euphoria_mph", 100),
+        "discord_webhook_configured": bool(settings.get("discord_webhook")),
+        "fb_user_id": settings.get("fb_user_id"),
+        "selected_page_id": settings.get("selected_page_id"),
+        "selected_page_name": settings.get("selected_page_name"),
     }
 
 @app.put("/api/settings")
@@ -1017,8 +1426,8 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
     async with db_pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled,
-                   hud_enabled, hud_position, speeding_mph, euphoria_mph)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   hud_enabled, hud_position, speeding_mph, euphoria_mph, fb_user_id, selected_page_id, selected_page_name)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                ON CONFLICT (user_id) DO UPDATE SET
                    discord_webhook = COALESCE($2, user_settings.discord_webhook),
                    telemetry_enabled = COALESCE($3, user_settings.telemetry_enabled),
@@ -1026,6 +1435,9 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
                    hud_position = COALESCE($5, user_settings.hud_position),
                    speeding_mph = COALESCE($6, user_settings.speeding_mph),
                    euphoria_mph = COALESCE($7, user_settings.euphoria_mph),
+                   fb_user_id = COALESCE($8, user_settings.fb_user_id),
+                   selected_page_id = COALESCE($9, user_settings.selected_page_id),
+                   selected_page_name = COALESCE($10, user_settings.selected_page_name),
                    updated_at = NOW()""",
             str(user["id"]),
             data.discord_webhook,
@@ -1034,6 +1446,9 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
             data.hud_position,
             data.speeding_mph,
             data.euphoria_mph,
+            data.fb_user_id,
+            data.selected_page_id,
+            data.selected_page_name,
         )
 
     return {"status": "updated"}
@@ -1079,13 +1494,7 @@ async def create_presigned_upload(
         )
 
     upload_id = str(upload["id"])
-    background_tasks.add_task(
-        track_event,
-        user_id,
-        "upload_initiated",
-        {"upload_id": upload_id, "platforms": data.platforms},
-    )
-
+    background_tasks.add_task(track_event, user_id, "upload_initiated", {"upload_id": upload_id, "platforms": data.platforms})
     return {"upload_id": upload_id, "presigned_url": presigned_url, "r2_key": r2_key, "expires_in": 3600}
 
 @app.post("/api/uploads/{upload_id}/complete")
@@ -1096,18 +1505,12 @@ async def complete_upload(upload_id: str, background_tasks: BackgroundTasks, use
     user_id = str(user["id"])
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            upload = await conn.fetchrow(
-                "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
-                upload_id, user_id
-            )
+            upload = await conn.fetchrow("SELECT * FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user_id)
             if not upload:
                 raise HTTPException(404, "Upload not found")
 
             await conn.execute("UPDATE uploads SET status = 'processing' WHERE id = $1", upload_id)
-            await conn.execute(
-                "UPDATE users SET uploads_this_month = uploads_this_month + 1, updated_at = NOW() WHERE id = $1",
-                user_id
-            )
+            await conn.execute("UPDATE users SET uploads_this_month = uploads_this_month + 1, updated_at = NOW() WHERE id = $1", user_id)
 
     background_tasks.add_task(track_event, user_id, "upload_complete", {"upload_id": upload_id})
     return {"status": "processing", "upload_id": upload_id}
@@ -1123,6 +1526,9 @@ async def list_uploads(
         raise HTTPException(500, "Database not available")
 
     user_id = str(user["id"])
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+
     async with db_pool.acquire() as conn:
         if status:
             uploads = await conn.fetch(
@@ -1149,10 +1555,7 @@ async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(500, "Database not available")
 
     async with db_pool.acquire() as conn:
-        upload = await conn.fetchrow(
-            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
-            upload_id, str(user["id"])
-        )
+        upload = await conn.fetchrow("SELECT * FROM uploads WHERE id = $1 AND user_id = $2", upload_id, str(user["id"]))
     if not upload:
         raise HTTPException(404, "Upload not found")
     return dict(upload)
@@ -1168,10 +1571,7 @@ async def get_platforms(user: dict = Depends(get_current_user)):
 
     user_id = str(user["id"])
     async with db_pool.acquire() as conn:
-        tokens = await conn.fetch(
-            "SELECT platform, updated_at FROM platform_tokens WHERE user_id = $1",
-            user_id
-        )
+        tokens = await conn.fetch("SELECT platform, updated_at FROM platform_tokens WHERE user_id = $1", user_id)
 
     connected = {row["platform"]: {"connected": True, "updated_at": row["updated_at"].isoformat()} for row in tokens}
     return {
@@ -1400,7 +1800,7 @@ async def meta_oauth_callback(
     return RedirectResponse(f"{BASE_URL}/dashboard?success=meta_connected")
 
 # ============================================================
-# Analytics Routes
+# Analytics Routes (User KPI)
 # ============================================================
 
 @app.get("/api/analytics/overview")
@@ -1408,15 +1808,13 @@ async def get_analytics_overview(days: int = 30, user: dict = Depends(get_curren
     if not db_pool:
         raise HTTPException(500, "Database not available")
 
+    days = max(1, min(days, 365))
     user_id = str(user["id"])
     since = _now_utc() - timedelta(days=days)
 
     async with db_pool.acquire() as conn:
         total_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE user_id = $1", user_id)
-        period_uploads = await conn.fetchval(
-            "SELECT COUNT(*) FROM uploads WHERE user_id = $1 AND created_at >= $2",
-            user_id, since
-        )
+        period_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE user_id = $1 AND created_at >= $2", user_id, since)
         successful = await conn.fetchval(
             """SELECT COUNT(*) FROM uploads
                WHERE user_id = $1 AND status = 'complete' AND created_at >= $2""",
@@ -1428,14 +1826,59 @@ async def get_analytics_overview(days: int = 30, user: dict = Depends(get_curren
             user_id, since
         )
 
-    success_rate = (successful / period_uploads * 100) if period_uploads else 0
+        uploads_by_status = await conn.fetch(
+            """SELECT status, COUNT(*)::int AS c
+               FROM uploads WHERE user_id=$1 AND created_at >= $2
+               GROUP BY status ORDER BY c DESC""",
+            user_id, since
+        )
+
+    success_rate = (float(successful) / float(period_uploads) * 100.0) if period_uploads else 0.0
     return {
-        "total_uploads": total_uploads or 0,
-        "period_uploads": period_uploads or 0,
+        "window_days": days,
+        "total_uploads": int(total_uploads or 0),
+        "period_uploads": int(period_uploads or 0),
         "success_rate": round(success_rate, 1),
-        "avg_trill_score": round(avg_trill or 0, 1),
-        "quota_used": user["uploads_this_month"],
-        "quota_total": user["upload_quota"],
+        "avg_trill_score": round(float(avg_trill or 0), 1),
+        "uploads_by_status": {r["status"]: r["c"] for r in uploads_by_status},
+        "quota_used": int(user["uploads_this_month"]),
+        "quota_total": int(user["upload_quota"]),
+    }
+
+@app.get("/api/analytics/timeseries")
+async def analytics_timeseries(days: int = 30, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    days = max(1, min(days, 365))
+    user_id = str(user["id"])
+    since = _now_utc() - timedelta(days=days)
+
+    async with db_pool.acquire() as conn:
+        uploads_daily = await conn.fetch(
+            """
+            SELECT date_trunc('day', created_at) AS day, COUNT(*)::int AS c
+            FROM uploads
+            WHERE user_id=$1 AND created_at >= $2
+            GROUP BY day
+            ORDER BY day ASC
+            """,
+            user_id, since
+        )
+        events_daily = await conn.fetch(
+            """
+            SELECT date_trunc('day', created_at) AS day, event_type, COUNT(*)::int AS c
+            FROM analytics_events
+            WHERE user_id=$1 AND created_at >= $2
+            GROUP BY day, event_type
+            ORDER BY day ASC
+            """,
+            user_id, since
+        )
+
+    return {
+        "window_days": days,
+        "uploads_daily": [{"day": r["day"].date().isoformat(), "count": r["c"]} for r in uploads_daily],
+        "events_daily": [{"day": r["day"].date().isoformat(), "event_type": r["event_type"], "count": r["c"]} for r in events_daily],
     }
 
 # ============================================================
@@ -1444,4 +1887,4 @@ async def get_analytics_overview(days: int = 30, user: dict = Depends(get_curren
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

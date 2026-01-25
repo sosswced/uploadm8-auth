@@ -8,7 +8,9 @@ FastAPI backend for UploadM8 SaaS
 - Multi-platform OAuth (TikTok, YouTube, Meta)
 - Upload tracking & analytics
 - Schema migrations (no more drift 500s)
-- Observability + security headers + request IDs
+- Observability + security headers + request IDs + JSON errors
+- Locked /api/admin/db-info (schema + applied migrations)
+- Baseline rate limiting (in-memory)
 """
 
 import os
@@ -18,6 +20,7 @@ import hashlib
 import base64
 import logging
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Tuple
 from contextlib import asynccontextmanager
@@ -39,10 +42,7 @@ from botocore.config import Config
 # ============================================================
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("uploadm8-auth")
 
 # ============================================================
@@ -66,6 +66,9 @@ ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "https://app.uploadm8.com,https://uploadm8.com",
 )
+
+# Admin
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
 # R2 Configuration
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
@@ -92,25 +95,77 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
 # ============================================================
-# Env Validation (fail fast)
+# Helpers
 # ============================================================
 
 def _split_origins(raw: str) -> List[str]:
     return [o.strip() for o in raw.split(",") if o.strip()]
 
-def validate_env():
-    required = []
-    if not DATABASE_URL:
-        required.append("DATABASE_URL")
-    if not JWT_SECRET or JWT_SECRET == "change-me":
-        required.append("JWT_SECRET")
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+# ============================================================
+# Env Validation (fail fast)
+# ============================================================
+
+def parse_enc_keys() -> Dict[str, bytes]:
+    """
+    TOKEN_ENC_KEYS format:
+      v1:BASE64_32_BYTES_KEY,v2:BASE64_32_BYTES_KEY
+    Newest should be last. Old keys remain to decrypt.
+    """
     if not TOKEN_ENC_KEYS:
-        required.append("TOKEN_ENC_KEYS")
+        raise RuntimeError("TOKEN_ENC_KEYS is required")
 
-    if required:
-        raise RuntimeError(f"Missing required env vars: {', '.join(required)}")
+    keys: Dict[str, bytes] = {}
+    clean = TOKEN_ENC_KEYS.strip().strip('"').replace("\\n", "")
+    parts = [p.strip() for p in clean.split(",") if p.strip()]
 
-    # Optional: validate TOKEN_ENC_KEYS parseable and 32-byte keys
+    for part in parts:
+        if ":" not in part:
+            continue
+        kid, b64key = part.split(":", 1)
+        raw = base64.b64decode(b64key.strip())
+        if len(raw) != 32:
+            raise RuntimeError(f"TOKEN_ENC_KEYS invalid: {kid} must decode to 32 bytes")
+        keys[kid.strip()] = raw
+
+    if not keys:
+        raise RuntimeError("TOKEN_ENC_KEYS parsed empty/invalid; fix env var.")
+
+    def _ver(k: str) -> int:
+        try:
+            return int(k.lstrip("v"))
+        except Exception:
+            return 0
+
+    ordered = sorted(keys.keys(), key=_ver)
+    return {k: keys[k] for k in ordered}
+
+ENC_KEYS: Dict[str, bytes] = {}
+CURRENT_KEY_ID = "v1"
+
+def init_enc_keys():
+    global ENC_KEYS, CURRENT_KEY_ID
+    ENC_KEYS = parse_enc_keys()
+    CURRENT_KEY_ID = list(ENC_KEYS.keys())[-1]  # newest = encrypt key
+
+def validate_env():
+    missing = []
+    if not DATABASE_URL:
+        missing.append("DATABASE_URL")
+    if not JWT_SECRET or JWT_SECRET == "change-me":
+        missing.append("JWT_SECRET")
+    if not TOKEN_ENC_KEYS:
+        missing.append("TOKEN_ENC_KEYS")
+
+    if missing:
+        raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+
+    # Validate enc keys are parseable
     _ = parse_enc_keys()
 
 # ============================================================
@@ -155,8 +210,7 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 # ============================================================
-# Basic Rate Limiting (baseline)
-# NOTE: For real production, add Cloudflare/WAF or Redis-based limiter.
+# Baseline Rate Limiting (in-memory)
 # ============================================================
 
 _rate_state: Dict[str, List[float]] = {}
@@ -164,13 +218,12 @@ RATE_LIMIT_WINDOW_SEC = int(os.environ.get("RATE_LIMIT_WINDOW_SEC", "60"))
 RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "60"))
 
 def rate_limit_key(request: Request, bucket: str) -> str:
-    ip = request.headers.get("CF-Connecting-IP") or request.client.host or "unknown"
+    ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else "unknown")
     return f"{bucket}:{ip}"
 
 def check_rate_limit(key: str):
     now = time.time()
     arr = _rate_state.get(key, [])
-    # keep only recent
     arr = [t for t in arr if now - t < RATE_LIMIT_WINDOW_SEC]
     if len(arr) >= RATE_LIMIT_MAX:
         raise HTTPException(429, "Too many requests")
@@ -185,7 +238,6 @@ def hash_password(password: str) -> str:
     pw = password.encode("utf-8")
     if len(pw) > 72:
         raise HTTPException(400, "Password too long (max 72 bytes)")
-    # Optional simple policy: disallow leading/trailing spaces
     if password.strip() != password:
         raise HTTPException(400, "Password cannot start/end with spaces")
     hashed = bcrypt.hashpw(pw, bcrypt.gensalt(rounds=12))
@@ -201,43 +253,16 @@ def verify_password(password: str, hashed: str) -> bool:
 # Encryption Helpers
 # ============================================================
 
-def parse_enc_keys():
-    """
-    TOKEN_ENC_KEYS format (recommended):
-      v1:BASE64_32_BYTES_KEY,v2:BASE64_32_BYTES_KEY
-    """
-    keys = {}
-    clean = TOKEN_ENC_KEYS.strip().strip('"').replace("\\n", "")
-    for part in [p.strip() for p in clean.split(",") if p.strip()]:
-        if ":" not in part:
-            continue
-        kid, b64key = part.split(":", 1)
-        raw = base64.b64decode(b64key.strip())
-        if len(raw) != 32:
-            raise RuntimeError(f"TOKEN_ENC_KEYS invalid: {kid} must decode to 32 bytes")
-        keys[kid.strip()] = raw
-    if not keys:
-        raise RuntimeError("TOKEN_ENC_KEYS parsed empty/invalid; fix env var.")
-    return keys
-
-ENC_KEYS = {}
-CURRENT_KEY_ID = "v1"
-
-def init_enc_keys():
-    global ENC_KEYS, CURRENT_KEY_ID
-    ENC_KEYS = parse_enc_keys()
-    CURRENT_KEY_ID = list(ENC_KEYS.keys())[-1]
-
 def encrypt_blob(data: dict) -> dict:
     key = ENC_KEYS[CURRENT_KEY_ID]
     aesgcm = AESGCM(key)
     nonce = secrets.token_bytes(12)
-    plaintext = json.dumps(data).encode()
+    plaintext = json.dumps(data).encode("utf-8")
     ciphertext = aesgcm.encrypt(nonce, plaintext, None)
     return {
         "kid": CURRENT_KEY_ID,
-        "nonce": base64.b64encode(nonce).decode(),
-        "data": base64.b64encode(ciphertext).decode(),
+        "nonce": base64.b64encode(nonce).decode("utf-8"),
+        "data": base64.b64encode(ciphertext).decode("utf-8"),
     }
 
 def decrypt_blob(blob: dict) -> dict:
@@ -280,7 +305,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
 
-        -- Backfill/migrate columns if table exists
         ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT;
         ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_tier TEXT DEFAULT 'free';
         ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
@@ -305,7 +329,7 @@ MIGRATIONS: List[Tuple[int, str]] = [
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
 
-        -- Migrate legacy user_settings safely
+        -- If a legacy user_settings exists with missing cols, safely add.
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS user_id UUID;
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS discord_webhook TEXT;
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS telemetry_enabled BOOLEAN DEFAULT true;
@@ -315,7 +339,7 @@ MIGRATIONS: List[Tuple[int, str]] = [
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS euphoria_mph INTEGER DEFAULT 100;
         ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
-        -- Ensure user_id is unique even if PK is elsewhere
+        -- Uniqueness + FK (idempotent).
         DO $$
         BEGIN
             IF NOT EXISTS (
@@ -328,7 +352,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
             END IF;
         END $$;
 
-        -- Ensure FK exists (avoid duplicate FK errors)
         DO $$
         BEGIN
             IF NOT EXISTS (
@@ -391,7 +414,6 @@ MIGRATIONS: List[Tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_analytics_user ON analytics_events(user_id);
     """),
     (5, """
-        -- Refresh token store (hashed)
         CREATE TABLE IF NOT EXISTS refresh_tokens (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -406,8 +428,7 @@ MIGRATIONS: List[Tuple[int, str]] = [
 ]
 
 async def apply_migrations(conn: asyncpg.Connection):
-    # Ensure schema_migrations exists (migration #1 contains it)
-    # Apply in order; record each applied version.
+    # Ensure baseline
     await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto;")
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -424,10 +445,7 @@ async def apply_migrations(conn: asyncpg.Connection):
             continue
         logger.info(f"[MIGRATION] Applying v{version}")
         await conn.execute(sql)
-        await conn.execute(
-            "INSERT INTO schema_migrations(version) VALUES($1)",
-            version
-        )
+        await conn.execute("INSERT INTO schema_migrations(version) VALUES($1)", version)
         logger.info(f"[MIGRATION] Applied v{version}")
 
 async def init_db():
@@ -454,17 +472,12 @@ async def close_db():
     if db_pool:
         await db_pool.close()
 
-async def get_db():
-    if not db_pool:
-        raise HTTPException(500, "Database not configured")
-    return db_pool
-
 # ============================================================
 # JWT Helpers (iss/aud/jti)
 # ============================================================
 
 def create_access_jwt(user_id: str) -> str:
-    now = datetime.now(timezone.utc)
+    now = _now_utc()
     payload = {
         "sub": user_id,
         "iss": JWT_ISSUER,
@@ -492,12 +505,12 @@ def verify_access_jwt(token: str) -> Optional[str]:
         return None
 
 def hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return _sha256_hex(token)
 
 async def create_refresh_token(conn: asyncpg.Connection, user_id: str) -> str:
     token = secrets.token_urlsafe(48)
     th = hash_token(token)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_DAYS)
+    expires_at = _now_utc() + timedelta(days=REFRESH_TOKEN_DAYS)
     await conn.execute(
         """INSERT INTO refresh_tokens(user_id, token_hash, expires_at)
            VALUES($1, $2, $3)""",
@@ -513,7 +526,6 @@ async def revoke_refresh_token(conn: asyncpg.Connection, refresh_token: str):
     )
 
 async def rotate_refresh_token(conn: asyncpg.Connection, refresh_token: str) -> Tuple[str, str]:
-    # Validate existing, revoke it, mint new
     th = hash_token(refresh_token)
     row = await conn.fetchrow(
         """SELECT user_id, expires_at, revoked_at
@@ -524,13 +536,10 @@ async def rotate_refresh_token(conn: asyncpg.Connection, refresh_token: str) -> 
         raise HTTPException(401, "Invalid refresh token")
     if row["revoked_at"] is not None:
         raise HTTPException(401, "Refresh token revoked")
-    if row["expires_at"] < datetime.now(timezone.utc):
+    if row["expires_at"] < _now_utc():
         raise HTTPException(401, "Refresh token expired")
 
-    await conn.execute(
-        "UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1",
-        th
-    )
+    await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1", th)
     user_id = str(row["user_id"])
     new_refresh = await create_refresh_token(conn, user_id)
     new_access = create_access_jwt(user_id)
@@ -545,6 +554,9 @@ async def get_current_user(authorization: str = Header(None)) -> dict:
     if not user_id:
         raise HTTPException(401, "Invalid or expired token")
 
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow(
             """SELECT id, email, name, subscription_tier, upload_quota,
@@ -552,6 +564,7 @@ async def get_current_user(authorization: str = Header(None)) -> dict:
                FROM users WHERE id = $1""",
             user_id,
         )
+
     if not user:
         raise HTTPException(401, "User not found")
     return dict(user)
@@ -621,6 +634,17 @@ async def track_event(user_id: str, event_type: str, event_data: dict = None):
         logger.warning(f"[ANALYTICS] error: {e}")
 
 # ============================================================
+# Admin Auth Dependency
+# ============================================================
+
+def require_admin(x_admin_key: str = Header(None)):
+    if not ADMIN_API_KEY:
+        raise HTTPException(500, "ADMIN_API_KEY not configured")
+    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(403, "Forbidden")
+    return True
+
+# ============================================================
 # FastAPI App + Middleware
 # ============================================================
 
@@ -644,13 +668,18 @@ app.add_middleware(
 )
 
 @app.middleware("http")
-async def request_id_and_security_headers(request: Request, call_next):
-    rid = request.headers.get("X-Request-ID") or secrets.token_hex(12)
+async def request_id_security_and_logging(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
     request.state.request_id = rid
+
+    start = time.time()
+    status_code = 500
+
     try:
         response = await call_next(request)
+        status_code = response.status_code
     except HTTPException as e:
-        # Let FastAPI handle HTTPException elsewhere; just ensure request id is present
+        status_code = e.status_code
         return JSONResponse(
             status_code=e.status_code,
             content={"error": e.detail, "request_id": rid},
@@ -663,6 +692,12 @@ async def request_id_and_security_headers(request: Request, call_next):
             content={"error": "internal_error", "request_id": rid},
             headers={"X-Request-ID": rid},
         )
+    finally:
+        duration_ms = int((time.time() - start) * 1000)
+        ip = request.headers.get("CF-Connecting-IP") or (request.client.host if request.client else "unknown")
+        logger.info(
+            f"rid={rid} ip={ip} {request.method} {request.url.path} status={status_code} dur_ms={duration_ms}"
+        )
 
     # Security headers
     response.headers["X-Request-ID"] = rid
@@ -670,7 +705,6 @@ async def request_id_and_security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-    # HSTS only if behind HTTPS (Render custom domains are HTTPS)
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
@@ -699,6 +733,47 @@ async def health():
     }
 
 # ============================================================
+# Admin: DB Info (locked)
+# ============================================================
+
+@app.get("/api/admin/db-info")
+async def admin_db_info(_: bool = Depends(require_admin)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
+    async with db_pool.acquire() as conn:
+        migrations = await conn.fetch("SELECT version, applied_at FROM schema_migrations ORDER BY version ASC")
+
+        users_cols = await conn.fetch("""
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name='users'
+            ORDER BY ordinal_position
+        """)
+        settings_cols = await conn.fetch("""
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name='user_settings'
+            ORDER BY ordinal_position
+        """)
+        refresh_cols = await conn.fetch("""
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name='refresh_tokens'
+            ORDER BY ordinal_position
+        """)
+
+    return {
+        "database_configured": True,
+        "migrations": [{"version": m["version"], "applied_at": m["applied_at"].isoformat()} for m in migrations],
+        "tables": {
+            "users": [dict(c) for c in users_cols],
+            "user_settings": [dict(c) for c in settings_cols],
+            "refresh_tokens": [dict(c) for c in refresh_cols],
+        },
+    }
+
+# ============================================================
 # Authentication Routes
 # ============================================================
 
@@ -707,6 +782,9 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
     check_rate_limit(rate_limit_key(request, "register"))
 
     password_hash = hash_password(data.password)
+
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
@@ -724,16 +802,16 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
 
             user_id = str(row["id"])
 
-            # Idempotent settings insert even if table constraints differ
+            # Idempotent settings insert
             try:
                 await conn.execute(
                     """INSERT INTO user_settings (user_id)
                        VALUES ($1)
                        ON CONFLICT (user_id) DO NOTHING""",
-                    user_id
+                    user_id,
                 )
             except Exception as e:
-                # Do not block signup if settings insert fails; track for remediation
+                # Do not block signup; log for cleanup
                 logger.warning(f"Settings insert failed for user {user_id}: {e}")
 
             access_token = create_access_jwt(user_id)
@@ -756,6 +834,9 @@ async def register(request: Request, data: UserCreate, background_tasks: Backgro
 @app.post("/api/auth/login")
 async def login(request: Request, data: UserLogin, background_tasks: BackgroundTasks):
     check_rate_limit(rate_limit_key(request, "login"))
+
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -790,12 +871,16 @@ async def login(request: Request, data: UserLogin, background_tasks: BackgroundT
 
 @app.post("/api/auth/refresh")
 async def refresh_token(data: RefreshRequest):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
     async with db_pool.acquire() as conn:
         new_access, new_refresh = await rotate_refresh_token(conn, data.refresh_token)
     return {"access_token": new_access, "refresh_token": new_refresh, "token_type": "bearer"}
 
 @app.post("/api/auth/logout")
 async def logout(data: RefreshRequest):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
     async with db_pool.acquire() as conn:
         await revoke_refresh_token(conn, data.refresh_token)
     return {"status": "ok"}
@@ -804,24 +889,27 @@ async def logout(data: RefreshRequest):
 async def forgot_password(request: Request, data: PasswordReset, background_tasks: BackgroundTasks):
     check_rate_limit(rate_limit_key(request, "forgot_password"))
 
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow(
             "SELECT id, email, name FROM users WHERE email = $1",
-            data.email.lower()
+            data.email.lower(),
         )
 
         if not user:
             return {"message": "If that email exists, we've sent a reset link"}
 
         token = secrets.token_urlsafe(32)
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        token_hash = _sha256_hex(token)
+        expires_at = _now_utc() + timedelta(hours=1)
 
         await conn.execute(
             """INSERT INTO password_resets (token_hash, user_id, expires_at)
                VALUES ($1, $2, $3)
                ON CONFLICT (token_hash) DO UPDATE SET expires_at = $3""",
-            token_hash, str(user["id"]), expires_at
+            token_hash, str(user["id"]), expires_at,
         )
 
     reset_url = f"{BASE_URL}/reset-password?token={token}"
@@ -835,33 +923,32 @@ async def forgot_password(request: Request, data: PasswordReset, background_task
     <p>- The UploadM8 Team</p>
     """
     background_tasks.add_task(send_email, user["email"], "Reset Your UploadM8 Password", html)
-
     return {"message": "If that email exists, we've sent a reset link"}
 
 @app.post("/api/auth/reset-password")
 async def reset_password(data: PasswordResetConfirm):
-    token_hash = hashlib.sha256(data.token.encode()).hexdigest()
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
+    token_hash = _sha256_hex(data.token)
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             reset = await conn.fetchrow(
                 "SELECT user_id, expires_at FROM password_resets WHERE token_hash = $1",
-                token_hash
+                token_hash,
             )
             if not reset:
                 raise HTTPException(400, "Invalid or expired reset token")
-            if reset["expires_at"] < datetime.now(timezone.utc):
+            if reset["expires_at"] < _now_utc():
                 raise HTTPException(400, "Reset token has expired")
 
             new_hash = hash_password(data.new_password)
             await conn.execute(
                 "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
-                new_hash, reset["user_id"]
+                new_hash, reset["user_id"],
             )
-            await conn.execute(
-                "DELETE FROM password_resets WHERE token_hash = $1",
-                token_hash
-            )
+            await conn.execute("DELETE FROM password_resets WHERE token_hash = $1", token_hash)
 
     return {"message": "Password updated successfully"}
 
@@ -882,10 +969,13 @@ async def get_me(user: dict = Depends(get_current_user)):
 
 @app.get("/api/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     async with db_pool.acquire() as conn:
         settings = await conn.fetchrow(
             "SELECT * FROM user_settings WHERE user_id = $1",
-            str(user["id"])
+            str(user["id"]),
         )
 
     if not settings:
@@ -909,6 +999,9 @@ async def get_settings(user: dict = Depends(get_current_user)):
 
 @app.put("/api/settings")
 async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     async with db_pool.acquire() as conn:
         await conn.execute(
             """INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled,
@@ -930,6 +1023,7 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
             data.speeding_mph,
             data.euphoria_mph,
         )
+
     return {"status": "updated"}
 
 # ============================================================
@@ -942,6 +1036,9 @@ async def create_presigned_upload(
     background_tasks: BackgroundTasks,
     user: dict = Depends(get_current_user),
 ):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     user_id = str(user["id"])
     if user["uploads_this_month"] >= user["upload_quota"]:
         raise HTTPException(403, "Monthly upload quota exceeded. Please upgrade your plan.")
@@ -981,6 +1078,9 @@ async def create_presigned_upload(
 
 @app.post("/api/uploads/{upload_id}/complete")
 async def complete_upload(upload_id: str, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     user_id = str(user["id"])
     async with db_pool.acquire() as conn:
         async with conn.transaction():
@@ -1007,6 +1107,9 @@ async def list_uploads(
     status: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     user_id = str(user["id"])
     async with db_pool.acquire() as conn:
         if status:
@@ -1025,10 +1128,14 @@ async def list_uploads(
                    ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
                 user_id, limit, offset
             )
+
     return {"uploads": [dict(u) for u in uploads], "limit": limit, "offset": offset}
 
 @app.get("/api/uploads/{upload_id}")
 async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
             "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
@@ -1044,12 +1151,16 @@ async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
 
 @app.get("/api/platforms")
 async def get_platforms(user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     user_id = str(user["id"])
     async with db_pool.acquire() as conn:
         tokens = await conn.fetch(
             "SELECT platform, updated_at FROM platform_tokens WHERE user_id = $1",
             user_id
         )
+
     connected = {row["platform"]: {"connected": True, "updated_at": row["updated_at"].isoformat()} for row in tokens}
     return {
         "tiktok": connected.get("tiktok", {"connected": False}),
@@ -1282,8 +1393,11 @@ async def meta_oauth_callback(
 
 @app.get("/api/analytics/overview")
 async def get_analytics_overview(days: int = 30, user: dict = Depends(get_current_user)):
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+
     user_id = str(user["id"])
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = _now_utc() - timedelta(days=days)
 
     async with db_pool.acquire() as conn:
         total_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE user_id = $1", user_id)

@@ -471,17 +471,187 @@ def _tier_from_lookup_key(lookup_key: str) -> str:
     return mapping.get(lookup_key.strip().lower(), "starter")
 
 def _entitlements_for_tier(tier: str) -> dict:
+    """
+    Complete tier configuration with ALL advertised features.
+    
+    Features per tier:
+    - upload_quota: Monthly upload limit
+    - max_accounts: Number of connected platform accounts
+    - can_generate_captions: Trill-based auto captions
+    - can_burn_hud: Speed HUD overlay on video
+    - can_use_ai_captions: AI-powered caption generation
+    - team_seats: Number of team members allowed
+    - priority_processing: Priority job queue
+    - history_days: Upload history retention
+    """
     tiers = {
-        "starter": {"tier": "starter", "upload_quota": 10, "unlimited_uploads": False},
-        "solo": {"tier": "solo", "upload_quota": 60, "unlimited_uploads": False},
-        "creator": {"tier": "creator", "upload_quota": 200, "unlimited_uploads": False},
-        "growth": {"tier": "growth", "upload_quota": 500, "unlimited_uploads": False},
-        "studio": {"tier": "studio", "upload_quota": 1500, "unlimited_uploads": False},
-        "agency": {"tier": "agency", "upload_quota": 5000, "unlimited_uploads": False},
-        "lifetime": {"tier": "lifetime", "upload_quota": 999999, "unlimited_uploads": True},
-        "friends_family": {"tier": "friends_family", "upload_quota": 999999, "unlimited_uploads": True},
+        "starter": {
+            "tier": "starter",
+            "upload_quota": 10,
+            "unlimited_uploads": False,
+            "max_accounts": 1,
+            "can_generate_captions": False,
+            "can_burn_hud": False,
+            "can_use_ai_captions": False,
+            "team_seats": 1,
+            "priority_processing": False,
+            "history_days": 7,
+            "can_schedule": False,
+            "can_use_templates": False,
+            "can_export": False,
+            "can_use_webhooks": False,
+            "support_tier": "basic",
+        },
+        "solo": {
+            "tier": "solo",
+            "upload_quota": 60,
+            "unlimited_uploads": False,
+            "max_accounts": 2,
+            "can_generate_captions": False,
+            "can_burn_hud": True,
+            "can_use_ai_captions": False,
+            "team_seats": 1,
+            "priority_processing": False,
+            "history_days": 14,
+            "can_schedule": True,
+            "can_use_templates": False,
+            "can_export": False,
+            "can_use_webhooks": False,
+            "support_tier": "basic",
+        },
+        "creator": {
+            "tier": "creator",
+            "upload_quota": 200,
+            "unlimited_uploads": False,
+            "max_accounts": 4,
+            "can_generate_captions": True,
+            "can_burn_hud": True,
+            "can_use_ai_captions": False,
+            "team_seats": 1,
+            "priority_processing": True,
+            "history_days": 30,
+            "can_schedule": True,
+            "can_use_templates": True,
+            "can_export": False,
+            "can_use_webhooks": False,
+            "support_tier": "standard",
+        },
+        "growth": {
+            "tier": "growth",
+            "upload_quota": 500,
+            "unlimited_uploads": False,
+            "max_accounts": 8,
+            "can_generate_captions": True,
+            "can_burn_hud": True,
+            "can_use_ai_captions": True,
+            "team_seats": 1,
+            "priority_processing": True,
+            "history_days": 30,
+            "can_schedule": True,
+            "can_use_templates": True,
+            "can_export": True,
+            "can_use_webhooks": True,
+            "support_tier": "standard",
+        },
+        "studio": {
+            "tier": "studio",
+            "upload_quota": 1500,
+            "unlimited_uploads": False,
+            "max_accounts": 15,
+            "can_generate_captions": True,
+            "can_burn_hud": True,
+            "can_use_ai_captions": True,
+            "team_seats": 3,
+            "priority_processing": True,
+            "history_days": 90,
+            "can_schedule": True,
+            "can_use_templates": True,
+            "can_export": True,
+            "can_use_webhooks": True,
+            "support_tier": "priority",
+        },
+        "agency": {
+            "tier": "agency",
+            "upload_quota": 5000,
+            "unlimited_uploads": False,
+            "max_accounts": 40,
+            "can_generate_captions": True,
+            "can_burn_hud": True,
+            "can_use_ai_captions": True,
+            "team_seats": 10,
+            "priority_processing": True,
+            "history_days": 365,
+            "can_schedule": True,
+            "can_use_templates": True,
+            "can_export": True,
+            "can_use_webhooks": True,
+            "support_tier": "sla",
+        },
+        "lifetime": {
+            "tier": "lifetime",
+            "upload_quota": 999999,
+            "unlimited_uploads": True,
+            "max_accounts": 100,
+            "can_generate_captions": True,
+            "can_burn_hud": True,
+            "can_use_ai_captions": True,
+            "team_seats": 5,
+            "priority_processing": True,
+            "history_days": 365,
+            "can_schedule": True,
+            "can_use_templates": True,
+            "can_export": True,
+            "can_use_webhooks": True,
+            "support_tier": "priority",
+        },
+        "friends_family": {
+            "tier": "friends_family",
+            "upload_quota": 999999,
+            "unlimited_uploads": True,
+            "max_accounts": 100,
+            "can_generate_captions": True,
+            "can_burn_hud": True,
+            "can_use_ai_captions": True,
+            "team_seats": 5,
+            "priority_processing": True,
+            "history_days": 365,
+            "can_schedule": True,
+            "can_use_templates": True,
+            "can_export": True,
+            "can_use_webhooks": True,
+            "support_tier": "priority",
+        },
     }
     return tiers.get(tier.lower(), tiers["starter"])
+
+
+async def check_can_connect_platform(user_id: str, platform: str) -> tuple:
+    """
+    Check if user can connect another platform based on tier's max_accounts.
+    Returns (can_connect: bool, message: str)
+    """
+    if not db_pool:
+        return True, "ok"
+    
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
+        if not user:
+            return False, "User not found"
+        
+        tier = user["subscription_tier"] or "starter"
+        ent = _entitlements_for_tier(tier)
+        max_accounts = ent.get("max_accounts", 1)
+        
+        # Count current connections (excluding the platform being reconnected)
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1 AND platform != $2",
+            user_id, platform
+        )
+        
+        if count >= max_accounts:
+            return False, f"Account limit reached ({count}/{max_accounts}). Upgrade to connect more."
+        
+        return True, "ok"
 
 # ============================================================
 # Billing Kill Switch
@@ -833,6 +1003,19 @@ async def refresh_token(data: RefreshRequest):
 
 @app.get("/api/auth/me")
 async def get_me(user: dict = Depends(get_current_user)):
+    # Get full entitlements for user's tier
+    ent = _entitlements_for_tier(user.get("subscription_tier", "starter"))
+    
+    # Count connected platforms
+    connected_platforms = 0
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) as count FROM platform_tokens WHERE user_id = $1",
+                str(user["id"])
+            )
+            connected_platforms = row["count"] if row else 0
+    
     return {
         "id": str(user["id"]),
         "email": user["email"],
@@ -843,6 +1026,25 @@ async def get_me(user: dict = Depends(get_current_user)):
         "uploads_this_month": user["uploads_this_month"],
         "unlimited_uploads": user["unlimited_uploads"],
         "stripe_customer_id": user.get("stripe_customer_id"),
+        # Full entitlements
+        "entitlements": {
+            "tier": ent["tier"],
+            "upload_quota": ent["upload_quota"],
+            "unlimited_uploads": ent["unlimited_uploads"],
+            "max_accounts": ent["max_accounts"],
+            "connected_accounts": connected_platforms,
+            "can_generate_captions": ent["can_generate_captions"],
+            "can_burn_hud": ent["can_burn_hud"],
+            "can_use_ai_captions": ent["can_use_ai_captions"],
+            "team_seats": ent["team_seats"],
+            "priority_processing": ent["priority_processing"],
+            "history_days": ent["history_days"],
+            "can_schedule": ent["can_schedule"],
+            "can_use_templates": ent["can_use_templates"],
+            "can_export": ent["can_export"],
+            "can_use_webhooks": ent["can_use_webhooks"],
+            "support_tier": ent["support_tier"],
+        }
     }
 
 @app.post("/api/auth/logout")
@@ -1257,6 +1459,11 @@ async def tiktok_oauth_callback(code: str = Query(None), state: str = Query(None
     if "error" in token_data:
         return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=tiktok_token_failed")
     
+    # Check max_accounts limit
+    can_connect, msg = await check_can_connect_platform(user_id, "tiktok")
+    if not can_connect:
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=account_limit_reached")
+    
     token_blob = encrypt_blob(token_data)
     
     async with db_pool.acquire() as conn:
@@ -1319,6 +1526,11 @@ async def google_oauth_callback(code: str = Query(None), state: str = Query(None
     if "error" in token_data:
         return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=google_token_failed")
     
+    # Check max_accounts limit
+    can_connect, msg = await check_can_connect_platform(user_id, "google")
+    if not can_connect:
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=account_limit_reached")
+    
     token_blob = encrypt_blob(token_data)
     
     async with db_pool.acquire() as conn:
@@ -1377,6 +1589,11 @@ async def meta_oauth_callback(code: str = Query(None), state: str = Query(None),
     
     if "error" in token_data:
         return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=meta_token_failed")
+    
+    # Check max_accounts limit
+    can_connect, msg = await check_can_connect_platform(user_id, "meta")
+    if not can_connect:
+        return RedirectResponse(f"{FRONTEND_URL}/dashboard.html?error=account_limit_reached")
     
     token_blob = encrypt_blob(token_data)
     

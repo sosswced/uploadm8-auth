@@ -1,238 +1,260 @@
-# UploadM8 Backend
+# UploadM8 - Multi-Platform Video Upload SaaS
 
-Production-ready FastAPI backend for the UploadM8 multi-platform video upload SaaS.
+## Overview
 
-## Features
+UploadM8 is a SaaS platform that allows content creators to upload videos once and distribute them simultaneously to TikTok, YouTube Shorts, Instagram Reels, and Facebook Reels.
 
-- **Authentication**: Email/password + JWT access/refresh tokens with rotation
-- **Stripe Billing**: Checkout sessions, customer portal, webhooks, trials, auto-tax
-- **Multi-Platform OAuth**: TikTok, YouTube, Instagram, Facebook
-- **R2 Storage**: Cloudflare R2 presigned URLs for direct uploads
-- **Redis Job Queue**: Async video processing with telemetry HUD overlay
-- **Distributed Rate Limiting**: Redis-backed sliding window
-- **Commercial KPIs**: Throughput, reliability, latency, platform mix, error analysis
-- **Admin Dashboard**: Role-based admin panel with user management
+## Features by Tier
+
+| Feature | Starter | Creator | Growth | Studio | Agency |
+|---------|---------|---------|--------|--------|--------|
+| **Monthly Uploads** | 10 | 200 | 500 | 1,500 | 5,000 |
+| **Connected Accounts** | 1 | 4 | 8 | 15 | 40 |
+| **Auto Captions** | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **HUD Overlay** | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **AI Captions** | ❌ | ❌ | ✅ | ✅ | ✅ |
+| **Priority Processing** | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Team Seats** | 1 | 1 | 1 | 3 | 10 |
+| **History Retention** | 7 days | 30 days | 30 days | 90 days | 365 days |
+| **Support** | Basic | Standard | Standard | Priority | SLA |
 
 ## Architecture
 
 ```
-┌─────────────────────┐     ┌─────────────────────┐
-│   Frontend (HTML)   │────▶│    FastAPI API      │
-│  app.uploadm8.com   │     │  auth.uploadm8.com  │
-└─────────────────────┘     └──────────┬──────────┘
-                                       │
-         ┌─────────────────────────────┼─────────────────────────────┐
-         │                             │                             │
-         ▼                             ▼                             ▼
-┌─────────────────┐         ┌─────────────────────┐       ┌─────────────────┐
-│   PostgreSQL    │         │       Redis         │       │  Cloudflare R2  │
-│   (Neon/Supabase)         │   (Queue + Cache)   │       │   (Video Store) │
-└─────────────────┘         └──────────┬──────────┘       └─────────────────┘
-                                       │
-                                       ▼
-                            ┌─────────────────────┐
-                            │    Worker Service   │
-                            │   (worker.py)       │
-                            │  - Telemetry/HUD    │
-                            │  - Platform Publish │
-                            └─────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    app.uploadm8.com (Frontend)                  │
+│                    Render Static Site                           │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   auth.uploadm8.com (API)                       │
+│                   Render Web Service                            │
+│                        app.py                                   │
+├─────────────────────────────────────────────────────────────────┤
+│  • Authentication (JWT + OAuth)                                 │
+│  • Upload management                                            │
+│  • Stripe billing                                               │
+│  • Admin APIs                                                   │
+└─────────────────────────────────────────────────────────────────┘
+         │              │               │               │
+         ▼              ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  PostgreSQL  │ │    Redis     │ │ Cloudflare   │ │   Stripe     │
+│   (Render)   │ │  (Upstash)   │ │     R2       │ │  Payments    │
+└──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   Background Worker                             │
+│                   Render Worker Service                         │
+│                       worker.py                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Stages:                                                        │
+│  1. Telemetry parsing (.map files)                              │
+│  2. Caption generation (Trill-based)                            │
+│  3. HUD overlay (FFmpeg)                                        │
+│  4. Platform publishing (TikTok, YouTube, Instagram, Facebook)  │
+│  5. Discord notifications                                       │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+## Deployment on Render
+
+### 1. Create PostgreSQL Database
+
+1. Dashboard → New → PostgreSQL
+2. Name: `uploadm8-db`
+3. Copy the **Internal Database URL**
+
+### 2. Create Redis (Upstash)
+
+1. Go to [upstash.com](https://upstash.com)
+2. Create Redis database
+3. Copy the Redis URL
+
+### 3. Create Web Service (API)
+
+1. Dashboard → New → Web Service
+2. Connect your GitHub repo
+3. **Settings:**
+   - Name: `uploadm8-auth`
+   - Runtime: Python 3
+   - Build Command: `pip install -r requirements.txt`
+   - Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+   - Custom Domain: `auth.uploadm8.com`
+
+### 4. Create Background Worker
+
+1. Dashboard → New → Background Worker
+2. Connect same repo
+3. **Settings:**
+   - Name: `uploadm8-worker`
+   - Runtime: Python 3
+   - Build Command: `pip install -r requirements.txt && apt-get update && apt-get install -y ffmpeg`
+   - Start Command: `python worker.py`
+
+### 5. Create Static Site (Frontend)
+
+1. Dashboard → New → Static Site
+2. Connect repo (or upload `static/` folder)
+3. **Settings:**
+   - Name: `uploadm8-app`
+   - Publish Directory: `static`
+   - Custom Domain: `app.uploadm8.com`
 
 ## Environment Variables
 
-### Required
+### Required for API (app.py)
 
-```bash
-# Database (PostgreSQL)
-DATABASE_URL=postgres://user:pass@host:5432/dbname
+```env
+# Database
+DATABASE_URL=postgresql://...
 
-# JWT Authentication
-JWT_SECRET=your-256-bit-secret-key
+# JWT
+JWT_SECRET=your-64-char-random-string
+JWT_ISSUER=https://auth.uploadm8.com
+JWT_AUDIENCE=uploadm8-app
 
-# Token Encryption (for OAuth tokens)
-# Format: version:base64_32_byte_key (comma-separated for key rotation)
-TOKEN_ENC_KEYS=v1:BASE64_ENCODED_32_BYTE_KEY
-```
+# Token Encryption (generate with: python -c "import secrets,base64; print('v1:' + base64.b64encode(secrets.token_bytes(32)).decode())")
+TOKEN_ENC_KEYS=v1:base64-encoded-32-byte-key
 
-### R2 Storage
-
-```bash
-R2_ACCOUNT_ID=your-cloudflare-account-id
-R2_ACCESS_KEY_ID=your-r2-access-key
-R2_SECRET_ACCESS_KEY=your-r2-secret-key
-R2_BUCKET_NAME=uploadm8-media
-R2_ENDPOINT_URL=https://ACCOUNT_ID.r2.cloudflarestorage.com
-```
-
-### Redis (Job Queue)
-
-```bash
-REDIS_URL=redis://:password@host:6379/0
-UPLOAD_JOB_QUEUE=uploadm8:jobs
-TELEMETRY_JOB_QUEUE=uploadm8:telemetry
-```
-
-### Stripe Billing
-
-```bash
-STRIPE_SECRET_KEY=sk_live_or_test_xxx
-STRIPE_WEBHOOK_SECRET=whsec_xxx
-STRIPE_LOOKUP_KEYS=uploadm8_starter_monthly,uploadm8_solo_monthly,uploadm8_creator_monthly,uploadm8_growth_monthly,uploadm8_studio_monthly,uploadm8_agency_monthly
-STRIPE_DEFAULT_LOOKUP_KEY=uploadm8_creator_monthly
-STRIPE_SUCCESS_URL=https://app.uploadm8.com/billing-success.html?session_id={CHECKOUT_SESSION_ID}
-STRIPE_CANCEL_URL=https://app.uploadm8.com/index.html#pricing
-STRIPE_PORTAL_RETURN_URL=https://app.uploadm8.com/dashboard.html
-STRIPE_TRIAL_DAYS_DEFAULT=0
-STRIPE_AUTOMATIC_TAX=0
-```
-
-### Platform OAuth
-
-```bash
-# TikTok
-TIKTOK_CLIENT_KEY=your-tiktok-client-key
-TIKTOK_CLIENT_SECRET=your-tiktok-client-secret
-
-# Google/YouTube
-GOOGLE_CLIENT_ID=your-google-client-id
-GOOGLE_CLIENT_SECRET=your-google-client-secret
-
-# Meta (Facebook/Instagram)
-META_APP_ID=your-meta-app-id
-META_APP_SECRET=your-meta-app-secret
-META_API_VERSION=v23.0
-```
-
-### Mailgun (Email)
-
-```bash
-MAILGUN_API_KEY=your-mailgun-api-key
-MAILGUN_DOMAIN=your-mailgun-domain
-MAIL_FROM=no-reply@uploadm8.com
-```
-
-### Admin & Notifications
-
-```bash
-ADMIN_API_KEY=your-admin-api-key
-ADMIN_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxx
-BOOTSTRAP_ADMIN_EMAIL=your-email@example.com
-```
-
-### Application URLs
-
-```bash
+# URLs
 BASE_URL=https://auth.uploadm8.com
 FRONTEND_URL=https://app.uploadm8.com
+
+# Redis
+REDIS_URL=redis://...
+
+# R2 Storage
+R2_ACCOUNT_ID=your-account-id
+R2_ACCESS_KEY_ID=your-access-key
+R2_SECRET_ACCESS_KEY=your-secret-key
+R2_BUCKET_NAME=uploadm8-media
+R2_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
+
+# Stripe
+STRIPE_SECRET_KEY=sk_live_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+
+# OAuth (TikTok)
+TIKTOK_CLIENT_KEY=your-key
+TIKTOK_CLIENT_SECRET=your-secret
+
+# OAuth (Google/YouTube)
+GOOGLE_CLIENT_ID=your-id
+GOOGLE_CLIENT_SECRET=your-secret
+
+# OAuth (Meta/Instagram/Facebook)
+META_APP_ID=your-app-id
+META_APP_SECRET=your-secret
+
+# Admin
+BOOTSTRAP_ADMIN_EMAIL=your@email.com
+ADMIN_API_KEY=your-admin-key
+
+# Billing (set to "test" initially)
+BILLING_MODE=test
+BILLING_LIVE_ALLOWED=0
+PRODUCTION_HOSTS=auth.uploadm8.com,app.uploadm8.com
+
+# CORS
 ALLOWED_ORIGINS=https://app.uploadm8.com,https://uploadm8.com
 ```
 
-### Optional Tuning
+### Required for Worker
 
-```bash
-LOG_LEVEL=INFO
-ACCESS_TOKEN_MINUTES=15
-REFRESH_TOKEN_DAYS=30
-RATE_LIMIT_WINDOW_SEC=60
-RATE_LIMIT_MAX=60
-WORKER_CONCURRENCY=1
-JOB_TIMEOUT_SECONDS=600
+Same as API, plus:
+```env
+UPLOAD_JOB_QUEUE=uploadm8:jobs
+ADMIN_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 ```
 
-## Deployment
+## Stripe Setup
 
-### API Service (Render)
+### Create Products
 
-1. Create new **Web Service**
-2. Connect your GitHub repo
-3. **Build Command**: `pip install -r requirements.txt`
-4. **Start Command**: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-5. Add all environment variables
-6. Set custom domain: `auth.uploadm8.com`
+1. Go to Stripe Dashboard → Products
+2. Create products with these **lookup keys**:
+   - `uploadm8_creator_monthly` - $19.99/month
+   - `uploadm8_growth_monthly` - $29.99/month
+   - `uploadm8_studio_monthly` - $49.99/month
+   - `uploadm8_agency_monthly` - $99.99/month
 
-### Worker Service (Render)
+### Configure Webhook
 
-1. Create new **Background Worker**
-2. Connect same GitHub repo
-3. **Build Command**: `pip install -r requirements.txt`
-4. **Start Command**: `python worker.py`
-5. Add same environment variables
-6. Set instance type based on video processing needs
+1. Stripe Dashboard → Developers → Webhooks
+2. Add endpoint: `https://auth.uploadm8.com/api/billing/webhook`
+3. Events to send:
+   - `checkout.session.completed`
+   - `customer.subscription.updated`
+   - `customer.subscription.deleted`
+   - `invoice.paid`
+   - `invoice.payment_failed`
 
-### Redis (Upstash/Redis Cloud)
+## Admin Access
 
-1. Create Redis instance
-2. Copy connection URL to `REDIS_URL`
+### Restore Admin (if locked out)
 
-## API Endpoints
+```bash
+curl -X POST https://auth.uploadm8.com/api/admin/restore \
+  -H "Content-Type: application/json" \
+  -d '{"secret_key": "YOUR_ADMIN_API_KEY", "email": "your@email.com"}'
+```
 
-### Authentication
-- `POST /api/auth/register` - Create account
-- `POST /api/auth/login` - Login
-- `POST /api/auth/refresh` - Refresh token
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
-- `POST /api/auth/password-reset` - Request reset
-- `POST /api/auth/password-reset/confirm` - Confirm reset
+### Grant Entitlements (via Admin Panel)
 
-### Uploads
-- `POST /api/uploads/presign` - Get presigned upload URL
-- `POST /api/uploads/{id}/complete` - Mark upload complete
-- `POST /api/uploads/{id}/cancel` - Cancel upload
-- `GET /api/uploads` - List uploads
-- `GET /api/uploads/{id}` - Get upload details
-- `POST /api/uploads/{id}/telemetry` - Get telemetry presigned URL
-- `POST /api/uploads/{id}/telemetry/complete` - Complete telemetry upload
+```bash
+curl -X POST https://auth.uploadm8.com/api/admin/entitlements/grant \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "tier": "growth", "upload_quota": 500}'
+```
 
-### Billing
-- `GET /api/billing/prices` - Get Stripe prices
-- `POST /api/billing/checkout` - Create checkout session
-- `POST /api/billing/portal` - Create customer portal session
-- `POST /api/billing/webhook` - Stripe webhook handler
+## File Structure
 
-### Analytics & KPI
-- `GET /api/analytics/overview` - User analytics
-- `GET /api/analytics/timeseries` - Time series data
-- `GET /api/kpi/summary` - Commercial KPI summary
-- `GET /api/kpi/raw` - Raw upload data for export
+```
+uploadm8-final/
+├── app.py              # FastAPI backend
+├── worker.py           # Background job processor
+├── requirements.txt    # Python dependencies
+├── runtime.txt         # Python version for Render
+├── stages/             # Worker processing stages
+│   ├── __init__.py
+│   ├── entitlements.py # Tier configuration
+│   ├── context.py      # Job context
+│   ├── errors.py       # Error codes
+│   ├── db.py           # Database operations
+│   ├── r2.py           # R2 storage operations
+│   ├── telemetry_stage.py
+│   ├── caption_stage.py
+│   ├── hud_stage.py
+│   ├── publish_stage.py
+│   └── notify_stage.py
+└── static/             # Frontend files
+    ├── index.html      # Landing page
+    ├── dashboard.html  # Main app
+    ├── admin.html      # Admin panel
+    ├── login.html
+    ├── signup.html
+    └── images/
+        └── logo.svg
+```
 
-### Platforms
-- `GET /api/platforms` - Get connected platforms
-- `GET /oauth/{platform}/start` - Start OAuth flow
-- `GET /oauth/{platform}/callback` - OAuth callback
+## Going Live Checklist
 
-### Settings
-- `GET /api/settings` - Get user settings
-- `PUT /api/settings` - Update settings
+- [ ] Deploy API to Render
+- [ ] Deploy Worker to Render
+- [ ] Deploy Frontend to Render
+- [ ] Configure custom domains
+- [ ] Set up SSL certificates (automatic on Render)
+- [ ] Configure Stripe products
+- [ ] Configure Stripe webhook
+- [ ] Set up OAuth apps (TikTok, Google, Meta)
+- [ ] Test full flow in test mode
+- [ ] Set `BILLING_MODE=live` and `BILLING_LIVE_ALLOWED=1`
+- [ ] Monitor first real transactions
 
-### Admin
-- `GET /api/admin/overview` - Admin dashboard data
-- `GET /api/admin/kpi/global` - Global KPIs
-- `GET /api/admin/users/search` - Search users
-- `POST /api/admin/users/role` - Set user role
-- `POST /api/admin/entitlements/grant` - Grant entitlement
+## Support
 
-## Tier Structure
-
-| Tier | Price | Uploads/mo | Accounts | Features |
-|------|-------|------------|----------|----------|
-| Starter | $0 | 10 | 1 | Manual queue, community support |
-| Solo | $9.99 | 60 | 2 | Basic scheduling, Discord alerts |
-| Creator | $19.99 | 200 | 4 | Smart scheduling, auto-transcode, resumable |
-| Growth | $29.99 | 500 | 8 | Caption templates, advanced alerts, exports |
-| Studio | $49.99 | 1,500 | 15 | 3 team seats, approval workflows, webhooks |
-| Agency | $99.99 | 5,000 | 40 | 10 team seats, audit logs, SLA support |
-
-## Setting Up Stripe Products
-
-Create products in Stripe Dashboard with these lookup keys:
-- `uploadm8_starter_monthly`
-- `uploadm8_solo_monthly`
-- `uploadm8_creator_monthly`
-- `uploadm8_growth_monthly`
-- `uploadm8_studio_monthly`
-- `uploadm8_agency_monthly`
-
-## License
-
-Proprietary - UploadM8 © 2026
+For issues, contact support@uploadm8.com

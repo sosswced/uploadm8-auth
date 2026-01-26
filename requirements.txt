@@ -28,10 +28,10 @@ bcrypt==4.1.2
 cryptography==42.0.2
 
 # Stripe Billing
-stripe==8.2.0
+stripe==10.0.0
 
 # Data Validation
-pydantic[email]==2.6.1
+pydantic[email]==2.10.6
 
 # Utilities
 python-dotenv==1.0.1

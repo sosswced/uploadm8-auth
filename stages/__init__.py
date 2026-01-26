@@ -14,12 +14,27 @@ Stage Execution Order:
 Each stage receives a JobContext and returns an updated context.
 """
 
-from .errors import StageError, SkipStage
+from .errors import StageError, SkipStage, ErrorCode
 from .context import JobContext, create_context
+from .entitlements import (
+    Entitlements,
+    TIER_CONFIG,
+    get_entitlements_for_tier,
+    get_entitlements_from_user,
+    can_user_upload,
+    can_user_connect_platform,
+)
 
 __all__ = [
     'StageError',
-    'SkipStage', 
+    'SkipStage',
+    'ErrorCode',
     'JobContext',
     'create_context',
+    'Entitlements',
+    'TIER_CONFIG',
+    'get_entitlements_for_tier',
+    'get_entitlements_from_user',
+    'can_user_upload',
+    'can_user_connect_platform',
 ]

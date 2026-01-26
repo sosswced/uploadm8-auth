@@ -55,20 +55,6 @@ class PlatformResult:
 
 
 @dataclass
-class Entitlements:
-    """User's tier entitlements."""
-    tier: str = "starter"
-    can_generate_captions: bool = False
-    can_burn_hud: bool = False
-    can_use_ai_captions: bool = False
-    max_uploads_per_month: int = 10
-    max_accounts: int = 1
-    priority_processing: bool = False
-    can_schedule: bool = False
-    can_export: bool = False
-
-
-@dataclass
 class JobContext:
     """
     Context object passed through all processing stages.
@@ -103,8 +89,8 @@ class JobContext:
     user_settings: Dict[str, Any] = field(default_factory=dict)
     discord_webhook: Optional[str] = None
     
-    # Entitlements
-    entitlements: Entitlements = field(default_factory=Entitlements)
+    # Entitlements (use Any type to avoid circular import, set via create_context)
+    entitlements: Any = None
     
     # Stage results
     telemetry: Optional[TelemetryData] = None
@@ -181,7 +167,7 @@ def create_context(
     job_data: dict,
     upload_record: dict,
     user_settings: dict,
-    entitlements: Entitlements
+    entitlements: Any
 ) -> JobContext:
     """Create a JobContext from job payload and database records."""
     return JobContext(

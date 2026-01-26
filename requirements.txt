@@ -1,33 +1,33 @@
-# Core API
+# UploadM8 Backend Dependencies
+# Install with: pip install -r requirements.txt
+
+# Web Framework
 fastapi==0.109.2
-uvicorn==0.32.0
-gunicorn==21.2.0
-python-multipart==0.0.9
+uvicorn[standard]==0.27.1
+pydantic[email]==2.6.1
 
-# DB
-asyncpg==0.30.0
+# Database
+asyncpg==0.29.0
 
-# Auth/Security
-PyJWT==2.8.0
-bcrypt==4.1.2
-cryptography==42.0.2
+# Redis
+redis==5.0.1
 
-# HTTP client
-httpx==0.26.0
-
-# Validation
-pydantic[email]>=2.8.0,<3.0.0
-email-validator>=2.1.0
-
-# Cloudflare R2 (S3-compatible)
+# AWS S3/R2
 boto3==1.34.34
 botocore==1.34.34
 
-# Redis (queue + distributed rate limit)
-redis==5.0.1
+# Authentication
+pyjwt==2.8.0
+bcrypt==4.1.2
+cryptography==42.0.2
 
-# Stripe Billing (Track A)
-stripe>=14.2.0
+# HTTP Client
+httpx==0.26.0
 
-# Env
-python-dotenv==1.0.1
+# Stripe Billing
+stripe==8.2.0
+
+# Video Processing (Worker)
+# Note: FFmpeg must be installed separately on the system
+# apt-get install ffmpeg (Ubuntu/Debian)
+# brew install ffmpeg (macOS)

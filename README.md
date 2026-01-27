@@ -1,260 +1,168 @@
-# UploadM8 - Multi-Platform Video Upload SaaS
+# UploadM8 v3.1 - Production Ready
 
-## Overview
+**Multi-Platform Video Upload SaaS**
 
-UploadM8 is a SaaS platform that allows content creators to upload videos once and distribute them simultaneously to TikTok, YouTube Shorts, Instagram Reels, and Facebook Reels.
+Upload once, publish everywhere. TikTok, YouTube Shorts, Instagram Reels, Facebook Reels.
 
-## Features by Tier
+## What's New in v3.1
 
-| Feature | Starter | Creator | Growth | Studio | Agency |
-|---------|---------|---------|--------|--------|--------|
-| **Monthly Uploads** | 10 | 200 | 500 | 1,500 | 5,000 |
-| **Connected Accounts** | 1 | 4 | 8 | 15 | 40 |
-| **Auto Captions** | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **HUD Overlay** | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **AI Captions** | ❌ | ❌ | ✅ | ✅ | ✅ |
-| **Priority Processing** | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **Team Seats** | 1 | 1 | 1 | 3 | 10 |
-| **History Retention** | 7 days | 30 days | 30 days | 90 days | 365 days |
-| **Support** | Basic | Standard | Standard | Priority | SLA |
+### Critical Fixes
+- **Auth Flow Fixed**: Hard auth gate on all protected pages, no more login loops
+- **Session Expiry Handling**: Graceful redirect with message when session expires
+- **Logout Fixed**: Properly clears tokens and redirects
+- **Server-Authoritative Cancel**: Cancel in-progress uploads reliably
 
-## Architecture
+### New Features
+- **Dark/Light Mode Toggle**: Theme persists across sessions
+- **Admin KPI Dashboard**: Time-range selector (30m to 1y + custom), leaderboard, analytics
+- **Request ID Tracking**: Every API call tagged for debugging
+- **Professional Landing Page**: Trust indicators, security badges, pricing tiers
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    app.uploadm8.com (Frontend)                  │
-│                    Render Static Site                           │
-└─────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   auth.uploadm8.com (API)                       │
-│                   Render Web Service                            │
-│                        app.py                                   │
-├─────────────────────────────────────────────────────────────────┤
-│  • Authentication (JWT + OAuth)                                 │
-│  • Upload management                                            │
-│  • Stripe billing                                               │
-│  • Admin APIs                                                   │
-└─────────────────────────────────────────────────────────────────┘
-         │              │               │               │
-         ▼              ▼               ▼               ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│  PostgreSQL  │ │    Redis     │ │ Cloudflare   │ │   Stripe     │
-│   (Render)   │ │  (Upstash)   │ │     R2       │ │  Payments    │
-└──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Background Worker                             │
-│                   Render Worker Service                         │
-│                       worker.py                                 │
-├─────────────────────────────────────────────────────────────────┤
-│  Stages:                                                        │
-│  1. Telemetry parsing (.map files)                              │
-│  2. Caption generation (Trill-based)                            │
-│  3. HUD overlay (FFmpeg)                                        │
-│  4. Platform publishing (TikTok, YouTube, Instagram, Facebook)  │
-│  5. Discord notifications                                       │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Pages
+- `index.html` - Landing page with pricing
+- `login.html` - Sign in with password toggle, remember me
+- `signup.html` - Registration with password strength indicator
+- `forgot-password.html` - Password reset request
+- `dashboard.html` - User dashboard with stats
+- `upload.html` - Drag-drop upload with progress
+- `queue.html` - Upload queue with cancel/retry
+- `scheduled.html` - Scheduled uploads management
+- `platforms.html` - Connected account management
+- `groups.html` - Account group management
+- `analytics.html` - Upload performance analytics
+- `settings.html` - User settings and billing
+- `admin.html` - Admin panel
+- `admin-users.html` - User management
+- `admin-kpi.html` - KPI dashboard
+- `terms.html` - Terms of Service
+- `privacy.html` - Privacy Policy
+- `support.html` - Support/FAQ
 
-## Deployment on Render
+## Pricing Tiers
 
-### 1. Create PostgreSQL Database
+| Tier | Price | Uploads/mo | Accounts | Features |
+|------|-------|------------|----------|----------|
+| Free | $0 | 5 | 1 | Basic scheduling |
+| Starter | $19/mo | 50 | 5 | Smart scheduling, basic captions |
+| Pro | $49/mo | 500 | 15 | AI captions, thumbnails, analytics, no watermark |
+| Agency | $149/mo | Unlimited | 50 | Team collab, white-label, API access |
+| Lifetime | $499 | Unlimited | 100 | Everything in Pro, forever |
 
-1. Dashboard → New → PostgreSQL
-2. Name: `uploadm8-db`
-3. Copy the **Internal Database URL**
+## Tech Stack
 
-### 2. Create Redis (Upstash)
+**Frontend:**
+- Vanilla JS (no framework dependencies)
+- CSS with CSS variables for theming
+- Font Awesome icons
+- Inter font family
 
-1. Go to [upstash.com](https://upstash.com)
-2. Create Redis database
-3. Copy the Redis URL
+**Backend (FastAPI):**
+- PostgreSQL (Neon)
+- Redis (Upstash)
+- Cloudflare R2 storage
+- Stripe billing
+- JWT authentication
 
-### 3. Create Web Service (API)
+## Deployment
 
-1. Dashboard → New → Web Service
-2. Connect your GitHub repo
-3. **Settings:**
-   - Name: `uploadm8-auth`
-   - Runtime: Python 3
-   - Build Command: `pip install -r requirements.txt`
-   - Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-   - Custom Domain: `auth.uploadm8.com`
+### Frontend (Cloudflare Pages)
+1. Connect to git repo or drag-drop upload
+2. Set build command: (none, static files)
+3. Set output directory: `/`
+4. Deploy to `app.uploadm8.com`
 
-### 4. Create Background Worker
-
-1. Dashboard → New → Background Worker
-2. Connect same repo
-3. **Settings:**
-   - Name: `uploadm8-worker`
-   - Runtime: Python 3
-   - Build Command: `pip install -r requirements.txt && apt-get update && apt-get install -y ffmpeg`
-   - Start Command: `python worker.py`
-
-### 5. Create Static Site (Frontend)
-
-1. Dashboard → New → Static Site
-2. Connect repo (or upload `static/` folder)
-3. **Settings:**
-   - Name: `uploadm8-app`
-   - Publish Directory: `static`
-   - Custom Domain: `app.uploadm8.com`
+### Backend (Render)
+1. Connect to git repo
+2. Set Python 3.11 runtime
+3. Set start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+4. Add environment variables
+5. Deploy to `auth.uploadm8.com`
 
 ## Environment Variables
 
-### Required for API (app.py)
-
-```env
-# Database
+```
 DATABASE_URL=postgresql://...
-
-# JWT
-JWT_SECRET=your-64-char-random-string
-JWT_ISSUER=https://auth.uploadm8.com
-JWT_AUDIENCE=uploadm8-app
-
-# Token Encryption (generate with: python -c "import secrets,base64; print('v1:' + base64.b64encode(secrets.token_bytes(32)).decode())")
-TOKEN_ENC_KEYS=v1:base64-encoded-32-byte-key
-
-# URLs
-BASE_URL=https://auth.uploadm8.com
-FRONTEND_URL=https://app.uploadm8.com
-
-# Redis
+JWT_SECRET=your-secret-key
 REDIS_URL=redis://...
-
-# R2 Storage
-R2_ACCOUNT_ID=your-account-id
-R2_ACCESS_KEY_ID=your-access-key
-R2_SECRET_ACCESS_KEY=your-secret-key
+R2_ACCOUNT_ID=...
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
 R2_BUCKET_NAME=uploadm8-media
-R2_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
-
-# Stripe
-STRIPE_SECRET_KEY=sk_live_...
+STRIPE_SECRET_KEY=sk_...
 STRIPE_WEBHOOK_SECRET=whsec_...
-
-# OAuth (TikTok)
-TIKTOK_CLIENT_KEY=your-key
-TIKTOK_CLIENT_SECRET=your-secret
-
-# OAuth (Google/YouTube)
-GOOGLE_CLIENT_ID=your-id
-GOOGLE_CLIENT_SECRET=your-secret
-
-# OAuth (Meta/Instagram/Facebook)
-META_APP_ID=your-app-id
-META_APP_SECRET=your-secret
-
-# Admin
-BOOTSTRAP_ADMIN_EMAIL=your@email.com
-ADMIN_API_KEY=your-admin-key
-
-# Billing (set to "test" initially)
-BILLING_MODE=test
-BILLING_LIVE_ALLOWED=0
-PRODUCTION_HOSTS=auth.uploadm8.com,app.uploadm8.com
-
-# CORS
-ALLOWED_ORIGINS=https://app.uploadm8.com,https://uploadm8.com
-```
-
-### Required for Worker
-
-Same as API, plus:
-```env
-UPLOAD_JOB_QUEUE=uploadm8:jobs
-ADMIN_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-```
-
-## Stripe Setup
-
-### Create Products
-
-1. Go to Stripe Dashboard → Products
-2. Create products with these **lookup keys**:
-   - `uploadm8_creator_monthly` - $19.99/month
-   - `uploadm8_growth_monthly` - $29.99/month
-   - `uploadm8_studio_monthly` - $49.99/month
-   - `uploadm8_agency_monthly` - $99.99/month
-
-### Configure Webhook
-
-1. Stripe Dashboard → Developers → Webhooks
-2. Add endpoint: `https://auth.uploadm8.com/api/billing/webhook`
-3. Events to send:
-   - `checkout.session.completed`
-   - `customer.subscription.updated`
-   - `customer.subscription.deleted`
-   - `invoice.paid`
-   - `invoice.payment_failed`
-
-## Admin Access
-
-### Restore Admin (if locked out)
-
-```bash
-curl -X POST https://auth.uploadm8.com/api/admin/restore \
-  -H "Content-Type: application/json" \
-  -d '{"secret_key": "YOUR_ADMIN_API_KEY", "email": "your@email.com"}'
-```
-
-### Grant Entitlements (via Admin Panel)
-
-```bash
-curl -X POST https://auth.uploadm8.com/api/admin/entitlements/grant \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"email": "user@example.com", "tier": "growth", "upload_quota": 500}'
+FRONTEND_URL=https://app.uploadm8.com
+BASE_URL=https://auth.uploadm8.com
 ```
 
 ## File Structure
 
 ```
-uploadm8-final/
-├── app.py              # FastAPI backend
-├── worker.py           # Background job processor
-├── requirements.txt    # Python dependencies
-├── runtime.txt         # Python version for Render
-├── stages/             # Worker processing stages
-│   ├── __init__.py
-│   ├── entitlements.py # Tier configuration
-│   ├── context.py      # Job context
-│   ├── errors.py       # Error codes
-│   ├── db.py           # Database operations
-│   ├── r2.py           # R2 storage operations
-│   ├── telemetry_stage.py
-│   ├── caption_stage.py
-│   ├── hud_stage.py
-│   ├── publish_stage.py
-│   └── notify_stage.py
-└── static/             # Frontend files
-    ├── index.html      # Landing page
-    ├── dashboard.html  # Main app
-    ├── admin.html      # Admin panel
-    ├── login.html
-    ├── signup.html
-    └── images/
-        └── logo.svg
+uploadm8-complete-v3/
+├── index.html          # Landing page
+├── login.html          # Auth
+├── signup.html         # Registration
+├── forgot-password.html
+├── dashboard.html      # Main app
+├── upload.html
+├── queue.html
+├── scheduled.html
+├── platforms.html
+├── groups.html
+├── analytics.html
+├── settings.html
+├── admin.html          # Admin
+├── admin-users.html
+├── admin-kpi.html
+├── terms.html          # Legal
+├── privacy.html
+├── support.html
+├── app.js              # Core JS
+├── styles.css          # Styles
+├── logo.png
+├── logo.svg
+└── backend/
+    ├── app.py          # FastAPI (3200+ lines)
+    ├── worker.py       # Background jobs
+    ├── requirements.txt
+    └── stages/         # Pipeline stages
 ```
 
-## Going Live Checklist
+## API Endpoints (65+)
 
-- [ ] Deploy API to Render
-- [ ] Deploy Worker to Render
-- [ ] Deploy Frontend to Render
-- [ ] Configure custom domains
-- [ ] Set up SSL certificates (automatic on Render)
-- [ ] Configure Stripe products
-- [ ] Configure Stripe webhook
-- [ ] Set up OAuth apps (TikTok, Google, Meta)
-- [ ] Test full flow in test mode
-- [ ] Set `BILLING_MODE=live` and `BILLING_LIVE_ALLOWED=1`
-- [ ] Monitor first real transactions
+### Auth
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `POST /api/auth/logout`
+- `POST /api/auth/refresh`
+- `POST /api/auth/forgot-password`
+- `GET /api/me`
 
-## Support
+### Uploads
+- `POST /api/uploads/presign`
+- `POST /api/uploads/{id}/complete`
+- `POST /api/uploads/{id}/cancel` - Server-authoritative cancel
+- `POST /api/uploads/{id}/retry`
+- `GET /api/uploads`
+- `GET /api/uploads/{id}`
+- `DELETE /api/uploads/{id}`
 
-For issues, contact support@uploadm8.com
+### Platforms
+- `GET /api/accounts`
+- `POST /api/accounts`
+- `DELETE /api/accounts/{id}`
+- `GET /api/oauth/{platform}/start`
+- `GET /api/oauth/{platform}/callback`
+
+### Admin
+- `GET /api/admin/users`
+- `GET /api/admin/kpis`
+- `GET /api/admin/leaderboard`
+- `GET /api/admin/countries`
+
+## Contact
+
+Earl @ uploadm8.com
+
+---
+
+© 2025 UploadM8. All rights reserved.

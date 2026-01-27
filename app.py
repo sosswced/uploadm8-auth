@@ -1425,6 +1425,7 @@ async def complete_upload(upload_id: str, background_tasks: BackgroundTasks, dat
 
 @app.post("/api/uploads/{upload_id}/cancel")
 async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """Server-authoritative cancel - sets cancel_requested flag for in-progress jobs."""
     if not db_pool:
         raise HTTPException(500, "Database not available")
     
@@ -1435,17 +1436,38 @@ async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
         if not upload:
             raise HTTPException(404, "Upload not found")
         
-        # Allow cancellation of pending, queued, and processing
-        if upload["status"] in ("completed", "failed", "cancelled"):
-            raise HTTPException(400, f"Cannot cancel upload with status: {upload['status']}")
+        current_status = upload["status"]
         
+        # Already in terminal state
+        if current_status in ("completed", "failed", "cancelled"):
+            raise HTTPException(400, f"Cannot cancel upload with status: {current_status}")
+        
+        # Already cancel requested
+        if current_status == "cancel_requested":
+            return {"status": "cancel_requested", "upload_id": upload_id, "message": "Cancel already requested"}
+        
+        # For processing jobs, set cancel_requested - worker will honor it
+        if current_status == "processing":
+            await conn.execute(
+                "UPDATE uploads SET status = 'cancel_requested', updated_at = NOW() WHERE id = $1",
+                upload_id
+            )
+            # Also set flag in Redis for worker to check
+            if redis_pool:
+                try:
+                    await redis_pool.set(f"cancel:{upload_id}", "1", ex=3600)
+                except Exception as e:
+                    logger.warning(f"Failed to set cancel flag in Redis: {e}")
+            return {"status": "cancel_requested", "upload_id": upload_id, "message": "Cancel requested, worker will stop"}
+        
+        # For queued/pending, cancel immediately
         await conn.execute(
             "UPDATE uploads SET status = 'cancelled', updated_at = NOW(), error_code = 'user_cancelled' WHERE id = $1",
             upload_id
         )
         
         # Refund quota if was counted
-        if upload["status"] == "queued":
+        if current_status == "queued":
             await conn.execute(
                 "UPDATE users SET uploads_this_month = GREATEST(uploads_this_month - 1, 0), updated_at = NOW() WHERE id = $1",
                 user_id
@@ -3084,17 +3106,96 @@ async def admin_impersonate(target_user_id: str, user: dict = Depends(require_ad
     }
 
 @app.get("/api/admin/kpis")
-async def admin_kpis(range: str = "30d", user: dict = Depends(require_admin)):
-    """Get KPI data for admin dashboard."""
+async def admin_kpis(
+    range: str = "30d", 
+    start: Optional[str] = None, 
+    end: Optional[str] = None,
+    user: dict = Depends(require_admin)
+):
+    """Get comprehensive KPI data for admin dashboard."""
     if not db_pool:
         raise HTTPException(500, "Database not available")
     
-    # Parse range
-    days_map = {"7d": 7, "30d": 30, "90d": 90, "12m": 365, "all": 3650}
-    days = days_map.get(range, 30)
-    since = _now_utc() - timedelta(days=days)
+    # Parse time range
+    if start and end:
+        try:
+            since = datetime.fromisoformat(start.replace('Z', '+00:00'))
+            until = datetime.fromisoformat(end.replace('Z', '+00:00'))
+        except:
+            raise HTTPException(400, "Invalid date format")
+    else:
+        range_minutes = {
+            "30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440,
+            "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600
+        }
+        minutes = range_minutes.get(range, 43200)
+        since = _now_utc() - timedelta(minutes=minutes)
+        until = _now_utc()
+    
+    # Previous period for comparison
+    period_duration = until - since
+    prev_since = since - period_duration
+    prev_until = since
     
     async with db_pool.acquire() as conn:
+        # Current period metrics
+        new_users = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM users WHERE created_at BETWEEN $1 AND $2", since, until
+        ) or 0
+        
+        prev_new_users = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM users WHERE created_at BETWEEN $1 AND $2", prev_since, prev_until
+        ) or 0
+        
+        total_uploads = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM uploads WHERE created_at BETWEEN $1 AND $2", since, until
+        ) or 0
+        
+        prev_uploads = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM uploads WHERE created_at BETWEEN $1 AND $2", prev_since, prev_until
+        ) or 0
+        
+        completed_uploads = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM uploads WHERE created_at BETWEEN $1 AND $2 AND status = 'completed'", since, until
+        ) or 0
+        
+        active_users = await conn.fetchval("""
+            SELECT COUNT(DISTINCT user_id)::int FROM uploads WHERE created_at BETWEEN $1 AND $2
+        """, since, until) or 0
+        
+        # Total views/likes (if tracked)
+        views_likes = await conn.fetchrow("""
+            SELECT COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes
+            FROM uploads WHERE created_at BETWEEN $1 AND $2
+        """, since, until)
+        
+        # Tier breakdown
+        tier_counts = await conn.fetch("""
+            SELECT subscription_tier, COUNT(*)::int AS count FROM users GROUP BY subscription_tier
+        """)
+        tier_breakdown = {row["subscription_tier"] or "free": row["count"] for row in tier_counts}
+        
+        # Platform breakdown
+        platform_counts = await conn.fetch("""
+            SELECT unnest(platforms) AS platform, COUNT(*)::int AS count
+            FROM uploads WHERE created_at BETWEEN $1 AND $2
+            GROUP BY platform
+        """, since, until)
+        platform_breakdown = {row["platform"]: row["count"] for row in platform_counts}
+        
+        # MRR calculation (simplified)
+        mrr_data = await conn.fetchrow("""
+            SELECT 
+                SUM(CASE 
+                    WHEN subscription_tier = 'starter' THEN 19
+                    WHEN subscription_tier = 'pro' THEN 49
+                    WHEN subscription_tier = 'agency' THEN 149
+                    ELSE 0
+                END)::decimal AS mrr
+            FROM users WHERE subscription_tier NOT IN ('free', 'lifetime', 'friends_family')
+        """)
+        mrr = float(mrr_data["mrr"] or 0)
+        
         # User metrics
         user_metrics = await conn.fetchrow("""
             SELECT 
@@ -3105,7 +3206,7 @@ async def admin_kpis(range: str = "30d", user: dict = Depends(require_admin)):
             FROM users
         """)
         
-        # Monthly cohort data (simplified)
+        # Monthly cohort data
         cohorts = await conn.fetch("""
             SELECT DATE_TRUNC('month', created_at) AS cohort_month,
                 COUNT(*)::int AS users
@@ -3123,7 +3224,27 @@ async def admin_kpis(range: str = "30d", user: dict = Depends(require_admin)):
             ORDER BY date ASC
         """, since)
     
+    # Calculate changes
+    new_users_change = ((new_users - prev_new_users) / max(prev_new_users, 1)) * 100
+    uploads_change = ((total_uploads - prev_uploads) / max(prev_uploads, 1)) * 100
+    success_rate = (completed_uploads / max(total_uploads, 1)) * 100
+    avg_uploads = total_uploads / max(active_users, 1)
+    
     return {
+        "new_users": new_users,
+        "new_users_change": new_users_change,
+        "total_uploads": total_uploads,
+        "uploads_change": uploads_change,
+        "completed": completed_uploads,
+        "success_rate": success_rate,
+        "active_users": active_users,
+        "total_views": views_likes["views"] if views_likes else 0,
+        "total_likes": views_likes["likes"] if views_likes else 0,
+        "mrr": mrr,
+        "mrr_change": 0,  # Would need historical data
+        "avg_uploads_per_user": avg_uploads,
+        "tier_breakdown": tier_breakdown,
+        "platform_breakdown": platform_breakdown,
         "users": {
             "total": user_metrics["total_users"] or 0,
             "active_30d": user_metrics["active_30d"] or 0,
@@ -3139,6 +3260,80 @@ async def admin_kpis(range: str = "30d", user: dict = Depends(require_admin)):
             for t in upload_trends
         ],
     }
+
+
+@app.get("/api/admin/leaderboard")
+async def admin_leaderboard(
+    range: str = "30d", 
+    sort: str = "uploads",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    user: dict = Depends(require_admin)
+):
+    """Get user leaderboard by uploads, views, or likes."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    # Parse time range
+    if start and end:
+        try:
+            since = datetime.fromisoformat(start.replace('Z', '+00:00'))
+            until = datetime.fromisoformat(end.replace('Z', '+00:00'))
+        except:
+            raise HTTPException(400, "Invalid date format")
+    else:
+        range_minutes = {
+            "30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440,
+            "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600
+        }
+        minutes = range_minutes.get(range, 43200)
+        since = _now_utc() - timedelta(minutes=minutes)
+        until = _now_utc()
+    
+    sort_column = {"uploads": "upload_count", "views": "total_views", "likes": "total_likes"}.get(sort, "upload_count")
+    
+    async with db_pool.acquire() as conn:
+        # Get top users by uploads in period
+        leaderboard = await conn.fetch(f"""
+            SELECT 
+                u.id, u.name, u.email, u.subscription_tier,
+                COUNT(up.id)::int AS upload_count,
+                COALESCE(SUM(up.views), 0)::bigint AS total_views,
+                COALESCE(SUM(up.likes), 0)::bigint AS total_likes
+            FROM users u
+            LEFT JOIN uploads up ON up.user_id = u.id::text AND up.created_at BETWEEN $1 AND $2
+            GROUP BY u.id, u.name, u.email, u.subscription_tier
+            HAVING COUNT(up.id) > 0
+            ORDER BY {sort_column} DESC
+            LIMIT 50
+        """, since, until)
+    
+    return [
+        {
+            "id": str(row["id"]),
+            "name": row["name"],
+            "email": row["email"],
+            "tier": row["subscription_tier"],
+            "uploads": row["upload_count"],
+            "views": row["total_views"],
+            "likes": row["total_likes"]
+        }
+        for row in leaderboard
+    ]
+
+
+@app.get("/api/admin/countries")
+async def admin_countries(range: str = "30d", user: dict = Depends(require_admin)):
+    """Get top countries by views (placeholder - needs analytics integration)."""
+    # This would require integration with platform analytics APIs
+    # For now, return placeholder data
+    return [
+        {"code": "US", "name": "United States", "views": 0, "uploads": 0},
+        {"code": "GB", "name": "United Kingdom", "views": 0, "uploads": 0},
+        {"code": "CA", "name": "Canada", "views": 0, "uploads": 0},
+        {"code": "AU", "name": "Australia", "views": 0, "uploads": 0},
+        {"code": "DE", "name": "Germany", "views": 0, "uploads": 0},
+    ]
 
 
 if __name__ == "__main__":

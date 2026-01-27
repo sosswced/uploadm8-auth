@@ -286,6 +286,49 @@ class AdminRestoreRequest(BaseModel):
     secret_key: str
     email: EmailStr
 
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    timezone: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+class PreferencesUpdate(BaseModel):
+    auto_captions: Optional[bool] = None
+    auto_thumbnails: Optional[bool] = None
+    notification_uploads: Optional[bool] = None
+    notification_weekly: Optional[bool] = None
+    discord_webhook: Optional[str] = None
+    timezone: Optional[str] = None
+    theme: Optional[str] = None
+
+class GroupCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    account_ids: List[str] = []
+    color: Optional[str] = None
+    icon: Optional[str] = None
+
+class GroupUpdate(BaseModel):
+    name: Optional[str] = None
+    account_ids: Optional[List[str]] = None
+    color: Optional[str] = None
+    icon: Optional[str] = None
+
+class ScheduledUpdate(BaseModel):
+    scheduled_time: Optional[datetime] = None
+    title: Optional[str] = None
+    caption: Optional[str] = None
+    platforms: Optional[List[str]] = None
+
+class AdminUserUpdate(BaseModel):
+    subscription_tier: Optional[str] = None
+    role: Optional[str] = None
+    upload_quota: Optional[int] = None
+    status: Optional[str] = None
+    note: Optional[str] = None
+
 # ============================================================
 # Rate Limiting (Redis-backed with memory fallback)
 # ============================================================
@@ -857,6 +900,64 @@ async def run_migrations():
             """),
             (8, "CREATE INDEX IF NOT EXISTS idx_uploads_user_status ON uploads(user_id, status)"),
             (9, "CREATE INDEX IF NOT EXISTS idx_uploads_created ON uploads(created_at DESC)"),
+            (10, """
+                CREATE TABLE IF NOT EXISTS account_groups (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                    name VARCHAR(100) NOT NULL,
+                    account_ids TEXT[] DEFAULT '{}',
+                    color VARCHAR(20) DEFAULT '#3b82f6',
+                    icon VARCHAR(50) DEFAULT 'folder',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """),
+            (11, """
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                    token_hash VARCHAR(255) NOT NULL,
+                    device_info VARCHAR(512),
+                    ip_address VARCHAR(45),
+                    last_active_at TIMESTAMPTZ DEFAULT NOW(),
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """),
+            (12, """
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone VARCHAR(100) DEFAULT 'UTC'
+            """),
+            (13, """
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(512)
+            """),
+            (14, """
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'active'
+            """),
+            (15, """
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ DEFAULT NOW()
+            """),
+            (16, """
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    auto_captions BOOLEAN DEFAULT FALSE,
+                    auto_thumbnails BOOLEAN DEFAULT FALSE,
+                    notification_uploads BOOLEAN DEFAULT TRUE,
+                    notification_weekly BOOLEAN DEFAULT TRUE,
+                    theme VARCHAR(20) DEFAULT 'dark',
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """),
+            (17, """
+                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS account_name VARCHAR(255)
+            """),
+            (18, """
+                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS account_username VARCHAR(255)
+            """),
+            (19, """
+                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS account_avatar VARCHAR(512)
+            """),
+            (20, "CREATE INDEX IF NOT EXISTS idx_groups_user ON account_groups(user_id)"),
+            (21, "CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions(user_id)"),
+            (22, "CREATE INDEX IF NOT EXISTS idx_uploads_scheduled ON uploads(scheduled_time) WHERE schedule_mode = 'scheduled'"),
         ]
         
         for version, sql in migrations:
@@ -1817,6 +1918,1227 @@ async def test_notification(data: dict, user: dict = Depends(get_current_user)):
         raise
     except Exception as e:
         raise HTTPException(400, f"Webhook test failed: {e}")
+
+
+# ============================================================
+# Profile & User Management
+# ============================================================
+
+@app.get("/api/me")
+async def get_profile(user: dict = Depends(get_current_user)):
+    """Get current user profile with entitlements."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    entitlements = _entitlements_for_tier(user.get("subscription_tier", "starter"))
+    
+    async with db_pool.acquire() as conn:
+        prefs = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", user_id)
+        settings = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id = $1", user_id)
+        
+        # Count connected accounts
+        accounts = await conn.fetch("SELECT platform FROM platform_tokens WHERE user_id = $1", user_id)
+    
+    return {
+        "id": str(user["id"]),
+        "email": user["email"],
+        "name": user["name"],
+        "role": user.get("role", "user"),
+        "avatar_url": user.get("avatar_url"),
+        "timezone": user.get("timezone", "UTC"),
+        "created_at": user["created_at"].isoformat() if user.get("created_at") else None,
+        "subscription": {
+            "tier": user.get("subscription_tier", "starter"),
+            "status": user.get("subscription_status", "active"),
+            "uploads_used": user.get("uploads_this_month", 0),
+            "uploads_limit": entitlements.get("upload_quota", 10),
+            "unlimited": entitlements.get("unlimited_uploads", False),
+            "accounts_used": len(accounts),
+            "accounts_limit": entitlements.get("max_accounts", 1),
+            "current_period_end": user.get("current_period_end").isoformat() if user.get("current_period_end") else None,
+        },
+        "entitlements": entitlements,
+        "preferences": dict(prefs) if prefs else {
+            "auto_captions": False,
+            "auto_thumbnails": False,
+            "notification_uploads": True,
+            "notification_weekly": True,
+            "theme": "dark",
+        },
+        "settings": {
+            "discord_webhook": settings.get("discord_webhook") if settings else None,
+            "hud_enabled": settings.get("hud_enabled", True) if settings else True,
+            "hud_position": settings.get("hud_position", "bottom-left") if settings else "bottom-left",
+        } if settings else {},
+    }
+
+@app.patch("/api/me")
+async def update_profile(data: ProfileUpdate, user: dict = Depends(get_current_user)):
+    """Update user profile."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    updates = []
+    values = []
+    idx = 1
+    
+    if data.name is not None:
+        updates.append(f"name = ${idx}")
+        values.append(data.name)
+        idx += 1
+    if data.timezone is not None:
+        updates.append(f"timezone = ${idx}")
+        values.append(data.timezone)
+        idx += 1
+    if data.avatar_url is not None:
+        updates.append(f"avatar_url = ${idx}")
+        values.append(data.avatar_url)
+        idx += 1
+    
+    if not updates:
+        return {"status": "ok", "message": "No changes"}
+    
+    updates.append("updated_at = NOW()")
+    values.append(user_id)
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE users SET {', '.join(updates)} WHERE id = ${idx}",
+            *values
+        )
+    
+    return {"status": "ok"}
+
+@app.post("/api/me/avatar")
+async def upload_avatar(user: dict = Depends(get_current_user)):
+    """Generate presigned URL for avatar upload."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    avatar_key = f"avatars/{user_id}/{secrets.token_urlsafe(8)}.jpg"
+    
+    upload_url = generate_presigned_upload_url(avatar_key, "image/jpeg", ttl=300)
+    
+    # Public URL for the avatar
+    public_url = f"https://{R2_BUCKET_NAME}.{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{avatar_key}"
+    
+    return {
+        "upload_url": upload_url,
+        "avatar_key": avatar_key,
+        "public_url": public_url,
+    }
+
+@app.delete("/api/me/avatar")
+async def delete_avatar(user: dict = Depends(get_current_user)):
+    """Remove avatar."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET avatar_url = NULL, updated_at = NOW() WHERE id = $1", user_id)
+    
+    return {"status": "ok"}
+
+@app.put("/api/me/preferences")
+async def update_preferences(data: PreferencesUpdate, user: dict = Depends(get_current_user)):
+    """Update user preferences."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        # Upsert preferences
+        await conn.execute("""
+            INSERT INTO user_preferences (user_id, auto_captions, auto_thumbnails, 
+                notification_uploads, notification_weekly, theme, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                auto_captions = COALESCE($2, user_preferences.auto_captions),
+                auto_thumbnails = COALESCE($3, user_preferences.auto_thumbnails),
+                notification_uploads = COALESCE($4, user_preferences.notification_uploads),
+                notification_weekly = COALESCE($5, user_preferences.notification_weekly),
+                theme = COALESCE($6, user_preferences.theme),
+                updated_at = NOW()
+        """, user_id, data.auto_captions, data.auto_thumbnails, 
+            data.notification_uploads, data.notification_weekly, data.theme)
+        
+        # Update discord webhook in settings if provided
+        if data.discord_webhook is not None:
+            await conn.execute("""
+                INSERT INTO user_settings (user_id, discord_webhook, updated_at)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    discord_webhook = $2, updated_at = NOW()
+            """, user_id, data.discord_webhook)
+        
+        # Update timezone on user if provided
+        if data.timezone is not None:
+            await conn.execute("UPDATE users SET timezone = $1, updated_at = NOW() WHERE id = $2",
+                             data.timezone, user_id)
+    
+    return {"status": "ok"}
+
+@app.put("/api/me/password")
+async def change_password(data: PasswordChange, user: dict = Depends(get_current_user)):
+    """Change password."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT password_hash FROM users WHERE id = $1", user_id)
+        if not row or not verify_password(data.current_password, row["password_hash"]):
+            raise HTTPException(400, "Current password is incorrect")
+        
+        new_hash = hash_password(data.new_password)
+        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                          new_hash, user_id)
+        
+        # Revoke all refresh tokens except current
+        await conn.execute("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1", user_id)
+    
+    return {"status": "ok"}
+
+@app.delete("/api/me")
+async def delete_account(user: dict = Depends(get_current_user)):
+    """Delete user account."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    user_email = user["email"]
+    
+    # Cancel Stripe subscription if exists
+    if user.get("stripe_subscription_id") and stripe.api_key:
+        try:
+            stripe.Subscription.delete(user["stripe_subscription_id"])
+        except Exception as e:
+            logger.warning(f"Failed to cancel Stripe subscription: {e}")
+    
+    async with db_pool.acquire() as conn:
+        # Delete user (cascades to related tables)
+        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+    
+    await _discord_notify_admin("user_deleted", {"email": user_email})
+    return {"status": "ok"}
+
+# ============================================================
+# Session Management
+# ============================================================
+
+@app.get("/api/sessions")
+async def list_sessions(user: dict = Depends(get_current_user)):
+    """List active sessions."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        sessions = await conn.fetch("""
+            SELECT id, device_info, ip_address, last_active_at, created_at
+            FROM user_sessions WHERE user_id = $1
+            ORDER BY last_active_at DESC
+        """, user_id)
+    
+    return {
+        "sessions": [
+            {
+                "id": str(s["id"]),
+                "device": s["device_info"] or "Unknown device",
+                "ip": s["ip_address"],
+                "last_active": s["last_active_at"].isoformat() if s["last_active_at"] else None,
+                "created_at": s["created_at"].isoformat() if s["created_at"] else None,
+            }
+            for s in sessions
+        ]
+    }
+
+@app.post("/api/auth/logout-all")
+async def logout_all_sessions(user: dict = Depends(get_current_user)):
+    """Logout all sessions."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM user_sessions WHERE user_id = $1", user_id)
+    
+    return {"status": "ok"}
+
+@app.delete("/api/sessions/{session_id}")
+async def revoke_session(session_id: str, user: dict = Depends(get_current_user)):
+    """Revoke a specific session."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM user_sessions WHERE id = $1 AND user_id = $2",
+            session_id, user_id
+        )
+    
+    return {"status": "ok"}
+
+# ============================================================
+# Password Reset
+# ============================================================
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(data: PasswordReset, request: Request):
+    """Send password reset email."""
+    await check_rate_limit(rate_limit_key(request, "forgot"))
+    
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT id, name FROM users WHERE LOWER(email) = $1", data.email.lower())
+        
+        if user:
+            # Generate reset token
+            token_raw = secrets.token_urlsafe(32)
+            token_hash = _sha256_hex(token_raw)
+            expires_at = _now_utc() + timedelta(hours=1)
+            
+            await conn.execute("""
+                INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+                VALUES ($1, $2, $3)
+            """, user["id"], token_hash, expires_at)
+            
+            # Send email (if Mailgun configured)
+            reset_url = f"{FRONTEND_URL}/reset-password.html?token={token_raw}"
+            if MAILGUN_API_KEY and MAILGUN_DOMAIN:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.post(
+                            f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
+                            auth=("api", MAILGUN_API_KEY),
+                            data={
+                                "from": MAIL_FROM,
+                                "to": data.email,
+                                "subject": "Reset your UploadM8 password",
+                                "html": f"""
+                                    <h2>Password Reset</h2>
+                                    <p>Hi {user['name']},</p>
+                                    <p>Click the link below to reset your password:</p>
+                                    <p><a href="{reset_url}">Reset Password</a></p>
+                                    <p>This link expires in 1 hour.</p>
+                                    <p>If you didn't request this, you can ignore this email.</p>
+                                """,
+                            }
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to send reset email: {e}")
+    
+    # Always return success (don't reveal if email exists)
+    return {"status": "ok", "message": "If that email exists, you'll receive reset instructions."}
+
+@app.post("/api/auth/reset-password")
+async def reset_password(data: PasswordResetConfirm, request: Request):
+    """Reset password with token."""
+    await check_rate_limit(rate_limit_key(request, "reset"))
+    
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    token_hash = _sha256_hex(data.token)
+    
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, user_id, expires_at, used FROM password_reset_tokens
+            WHERE token_hash = $1
+        """, token_hash)
+        
+        if not row:
+            raise HTTPException(400, "Invalid or expired reset token")
+        if row["used"]:
+            raise HTTPException(400, "This reset link has already been used")
+        if row["expires_at"] < _now_utc():
+            raise HTTPException(400, "This reset link has expired")
+        
+        # Update password
+        new_hash = hash_password(data.new_password)
+        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+                          new_hash, row["user_id"])
+        
+        # Mark token as used
+        await conn.execute("UPDATE password_reset_tokens SET used = TRUE WHERE id = $1", row["id"])
+        
+        # Revoke all refresh tokens
+        await conn.execute("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1", row["user_id"])
+    
+    return {"status": "ok"}
+
+# ============================================================
+# Upload Management (Extended)
+# ============================================================
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload_detail(upload_id: str, user: dict = Depends(get_current_user)):
+    """Get single upload details."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow("""
+            SELECT * FROM uploads WHERE id = $1 AND user_id = $2
+        """, upload_id, user_id)
+    
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+    
+    return {
+        "id": str(upload["id"]),
+        "filename": upload["filename"],
+        "file_size": upload["file_size"],
+        "platforms": upload["platforms"],
+        "title": upload["title"],
+        "caption": upload["caption"],
+        "privacy": upload["privacy"],
+        "status": upload["status"],
+        "trill_score": upload["trill_score"],
+        "scheduled_time": upload["scheduled_time"].isoformat() if upload["scheduled_time"] else None,
+        "schedule_mode": upload["schedule_mode"],
+        "error_code": upload["error_code"],
+        "error_detail": upload["error_detail"],
+        "created_at": upload["created_at"].isoformat() if upload["created_at"] else None,
+        "completed_at": upload["completed_at"].isoformat() if upload["completed_at"] else None,
+    }
+
+@app.delete("/api/uploads/{upload_id}")
+async def delete_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """Delete an upload."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        # Get upload to delete R2 files
+        upload = await conn.fetchrow(
+            "SELECT r2_key, telemetry_r2_key, processed_r2_key FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user_id
+        )
+        
+        if not upload:
+            raise HTTPException(404, "Upload not found")
+        
+        # Delete from database
+        await conn.execute("DELETE FROM uploads WHERE id = $1", upload_id)
+        
+        # Delete from R2 (background)
+        try:
+            s3 = get_s3_client()
+            for key in [upload["r2_key"], upload["telemetry_r2_key"], upload["processed_r2_key"]]:
+                if key:
+                    try:
+                        s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"Failed to delete R2 objects: {e}")
+    
+    return {"status": "ok"}
+
+@app.post("/api/uploads/{upload_id}/retry")
+async def retry_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """Retry a failed upload."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow("""
+            SELECT * FROM uploads WHERE id = $1 AND user_id = $2 AND status = 'failed'
+        """, upload_id, user_id)
+        
+        if not upload:
+            raise HTTPException(404, "Failed upload not found")
+        
+        # Reset status to queued
+        await conn.execute("""
+            UPDATE uploads SET status = 'queued', error_code = NULL, error_detail = NULL, 
+                updated_at = NOW() WHERE id = $1
+        """, upload_id)
+        
+        # Re-enqueue job
+        job_data = {
+            "upload_id": upload_id,
+            "user_id": user_id,
+            "r2_key": upload["r2_key"],
+            "platforms": upload["platforms"],
+            "title": upload["title"],
+            "caption": upload["caption"],
+            "privacy": upload["privacy"],
+        }
+        await enqueue_job(job_data)
+    
+    return {"status": "ok", "upload_id": upload_id}
+
+# ============================================================
+# Scheduled Uploads
+# ============================================================
+
+@app.get("/api/scheduled")
+async def list_scheduled(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
+    """List scheduled uploads."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    query = """
+        SELECT id, filename, title, caption, platforms, scheduled_time, status, created_at
+        FROM uploads 
+        WHERE user_id = $1 AND schedule_mode = 'scheduled'
+    """
+    params = [user_id]
+    
+    if start:
+        try:
+            start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+            query += f" AND scheduled_time >= ${len(params) + 1}"
+            params.append(start_dt)
+        except:
+            pass
+    
+    if end:
+        try:
+            end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+            query += f" AND scheduled_time <= ${len(params) + 1}"
+            params.append(end_dt)
+        except:
+            pass
+    
+    query += " ORDER BY scheduled_time ASC"
+    
+    async with db_pool.acquire() as conn:
+        uploads = await conn.fetch(query, *params)
+    
+    return {
+        "scheduled": [
+            {
+                "id": str(u["id"]),
+                "filename": u["filename"],
+                "title": u["title"],
+                "caption": u["caption"],
+                "platforms": u["platforms"],
+                "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None,
+                "status": u["status"],
+                "created_at": u["created_at"].isoformat() if u["created_at"] else None,
+            }
+            for u in uploads
+        ]
+    }
+
+@app.put("/api/scheduled/{upload_id}")
+async def update_scheduled(upload_id: str, data: ScheduledUpdate, user: dict = Depends(get_current_user)):
+    """Update a scheduled upload."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    updates = []
+    values = []
+    idx = 1
+    
+    if data.scheduled_time is not None:
+        updates.append(f"scheduled_time = ${idx}")
+        values.append(data.scheduled_time)
+        idx += 1
+    if data.title is not None:
+        updates.append(f"title = ${idx}")
+        values.append(data.title)
+        idx += 1
+    if data.caption is not None:
+        updates.append(f"caption = ${idx}")
+        values.append(data.caption)
+        idx += 1
+    if data.platforms is not None:
+        updates.append(f"platforms = ${idx}")
+        values.append(data.platforms)
+        idx += 1
+    
+    if not updates:
+        return {"status": "ok", "message": "No changes"}
+    
+    updates.append("updated_at = NOW()")
+    values.extend([upload_id, user_id])
+    
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(f"""
+            UPDATE uploads SET {', '.join(updates)}
+            WHERE id = ${idx} AND user_id = ${idx + 1} AND schedule_mode = 'scheduled'
+        """, *values)
+    
+    return {"status": "ok"}
+
+@app.delete("/api/scheduled/{upload_id}")
+async def cancel_scheduled(upload_id: str, user: dict = Depends(get_current_user)):
+    """Cancel a scheduled upload."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        result = await conn.execute("""
+            UPDATE uploads SET status = 'cancelled', schedule_mode = 'cancelled', updated_at = NOW()
+            WHERE id = $1 AND user_id = $2 AND schedule_mode = 'scheduled' AND status IN ('pending', 'queued')
+        """, upload_id, user_id)
+    
+    return {"status": "ok"}
+
+# ============================================================
+# Platform Accounts
+# ============================================================
+
+@app.get("/api/accounts")
+async def list_accounts(user: dict = Depends(get_current_user)):
+    """List connected platform accounts."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        accounts = await conn.fetch("""
+            SELECT id, platform, account_name, account_username, account_avatar, created_at, updated_at
+            FROM platform_tokens WHERE user_id = $1
+        """, user_id)
+    
+    return {
+        "accounts": [
+            {
+                "id": str(a["id"]),
+                "platform": a["platform"],
+                "name": a["account_name"] or a["platform"].title(),
+                "username": a["account_username"],
+                "avatar": a["account_avatar"],
+                "connected_at": a["created_at"].isoformat() if a["created_at"] else None,
+                "last_refresh": a["updated_at"].isoformat() if a["updated_at"] else None,
+            }
+            for a in accounts
+        ]
+    }
+
+@app.delete("/api/accounts/{account_id}")
+async def disconnect_account(account_id: str, user: dict = Depends(get_current_user)):
+    """Disconnect a platform account."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM platform_tokens WHERE id = $1 AND user_id = $2",
+            account_id, user_id
+        )
+    
+    return {"status": "ok"}
+
+# ============================================================
+# Account Groups
+# ============================================================
+
+@app.get("/api/groups")
+async def list_groups(user: dict = Depends(get_current_user)):
+    """List account groups."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        groups = await conn.fetch("""
+            SELECT id, name, account_ids, color, icon, created_at
+            FROM account_groups WHERE user_id = $1
+            ORDER BY created_at ASC
+        """, user_id)
+    
+    return {
+        "groups": [
+            {
+                "id": str(g["id"]),
+                "name": g["name"],
+                "account_ids": g["account_ids"] or [],
+                "color": g["color"],
+                "icon": g["icon"],
+                "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+            }
+            for g in groups
+        ]
+    }
+
+@app.post("/api/groups")
+async def create_group(data: GroupCreate, user: dict = Depends(get_current_user)):
+    """Create an account group."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        # Check group limit (max 20 groups)
+        count = await conn.fetchval("SELECT COUNT(*) FROM account_groups WHERE user_id = $1", user_id)
+        if count >= 20:
+            raise HTTPException(400, "Maximum 20 groups allowed")
+        
+        group_id = str(uuid.uuid4())
+        await conn.execute("""
+            INSERT INTO account_groups (id, user_id, name, account_ids, color, icon)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        """, group_id, user_id, data.name, data.account_ids, data.color or "#3b82f6", data.icon or "folder")
+    
+    return {"status": "ok", "id": group_id}
+
+@app.put("/api/groups/{group_id}")
+async def update_group(group_id: str, data: GroupUpdate, user: dict = Depends(get_current_user)):
+    """Update an account group."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    updates = []
+    values = []
+    idx = 1
+    
+    if data.name is not None:
+        updates.append(f"name = ${idx}")
+        values.append(data.name)
+        idx += 1
+    if data.account_ids is not None:
+        updates.append(f"account_ids = ${idx}")
+        values.append(data.account_ids)
+        idx += 1
+    if data.color is not None:
+        updates.append(f"color = ${idx}")
+        values.append(data.color)
+        idx += 1
+    if data.icon is not None:
+        updates.append(f"icon = ${idx}")
+        values.append(data.icon)
+        idx += 1
+    
+    if not updates:
+        return {"status": "ok", "message": "No changes"}
+    
+    updates.append("updated_at = NOW()")
+    values.extend([group_id, user_id])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"""
+            UPDATE account_groups SET {', '.join(updates)}
+            WHERE id = ${idx} AND user_id = ${idx + 1}
+        """, *values)
+    
+    return {"status": "ok"}
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
+    """Delete an account group."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM account_groups WHERE id = $1 AND user_id = $2", group_id, user_id)
+    
+    return {"status": "ok"}
+
+# ============================================================
+# Analytics
+# ============================================================
+
+@app.get("/api/analytics")
+async def get_analytics(days: int = 30, user: dict = Depends(get_current_user)):
+    """Get analytics data."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    days = max(1, min(days, 365))
+    since = _now_utc() - timedelta(days=days)
+    
+    async with db_pool.acquire() as conn:
+        # Overall stats
+        stats = await conn.fetchrow("""
+            SELECT 
+                COUNT(*)::int AS total_uploads,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
+                AVG(CASE WHEN trill_score IS NOT NULL THEN trill_score ELSE NULL END) AS avg_trill
+            FROM uploads WHERE user_id = $1 AND created_at >= $2
+        """, user_id, since)
+        
+        # Daily breakdown
+        daily = await conn.fetch("""
+            SELECT DATE(created_at) AS date, COUNT(*)::int AS count,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed
+            FROM uploads WHERE user_id = $1 AND created_at >= $2
+            GROUP BY DATE(created_at)
+            ORDER BY date ASC
+        """, user_id, since)
+        
+        # Platform breakdown
+        platforms = await conn.fetch("""
+            SELECT p AS platform, COUNT(*)::int AS count
+            FROM uploads, UNNEST(platforms) AS p
+            WHERE user_id = $1 AND created_at >= $2
+            GROUP BY p ORDER BY count DESC
+        """, user_id, since)
+        
+        # Status breakdown
+        status_breakdown = await conn.fetch("""
+            SELECT status, COUNT(*)::int AS count
+            FROM uploads WHERE user_id = $1 AND created_at >= $2
+            GROUP BY status
+        """, user_id, since)
+    
+    return {
+        "period_days": days,
+        "total_uploads": stats["total_uploads"] or 0,
+        "completed": stats["completed"] or 0,
+        "failed": stats["failed"] or 0,
+        "success_rate": round((stats["completed"] / stats["total_uploads"] * 100) if stats["total_uploads"] else 0, 1),
+        "avg_trill_score": round(float(stats["avg_trill"] or 0), 1),
+        "daily": [
+            {"date": str(d["date"]), "total": d["count"], "completed": d["completed"]}
+            for d in daily
+        ],
+        "by_platform": {p["platform"]: p["count"] for p in platforms},
+        "by_status": {s["status"]: s["count"] for s in status_breakdown},
+    }
+
+@app.get("/api/analytics/export")
+async def export_analytics(days: int = 30, user: dict = Depends(get_current_user)):
+    """Export analytics data as CSV."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    user_id = str(user["id"])
+    tier = user.get("subscription_tier", "starter")
+    entitlements = _entitlements_for_tier(tier)
+    
+    if not entitlements.get("can_export"):
+        raise HTTPException(403, "Export requires Pro plan or higher")
+    
+    days = max(1, min(days, 365))
+    since = _now_utc() - timedelta(days=days)
+    
+    async with db_pool.acquire() as conn:
+        uploads = await conn.fetch("""
+            SELECT id, filename, title, platforms, status, trill_score, 
+                created_at, completed_at
+            FROM uploads WHERE user_id = $1 AND created_at >= $2
+            ORDER BY created_at DESC
+        """, user_id, since)
+    
+    # Generate CSV
+    import io
+    import csv
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Filename", "Title", "Platforms", "Status", "Trill Score", "Created", "Completed"])
+    
+    for u in uploads:
+        writer.writerow([
+            str(u["id"]),
+            u["filename"],
+            u["title"],
+            ",".join(u["platforms"] or []),
+            u["status"],
+            u["trill_score"] or "",
+            u["created_at"].isoformat() if u["created_at"] else "",
+            u["completed_at"].isoformat() if u["completed_at"] else "",
+        ])
+    
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=uploadm8-analytics-{days}d.csv"}
+    )
+
+# ============================================================
+# Billing
+# ============================================================
+
+@app.get("/api/billing")
+async def get_billing(user: dict = Depends(get_current_user)):
+    """Get billing information."""
+    tier = user.get("subscription_tier", "starter")
+    entitlements = _entitlements_for_tier(tier)
+    
+    billing_info = {
+        "tier": tier,
+        "status": user.get("subscription_status", "active"),
+        "uploads_used": user.get("uploads_this_month", 0),
+        "uploads_limit": entitlements.get("upload_quota", 10),
+        "unlimited": entitlements.get("unlimited_uploads", False),
+        "current_period_end": user.get("current_period_end").isoformat() if user.get("current_period_end") else None,
+        "stripe_customer_id": user.get("stripe_customer_id"),
+        "has_payment_method": False,
+    }
+    
+    # Check Stripe for payment method
+    if user.get("stripe_customer_id") and stripe.api_key:
+        try:
+            customer = stripe.Customer.retrieve(user["stripe_customer_id"])
+            billing_info["has_payment_method"] = bool(customer.get("default_source") or customer.get("invoice_settings", {}).get("default_payment_method"))
+        except Exception:
+            pass
+    
+    return billing_info
+
+# ============================================================
+# Admin - Extended
+# ============================================================
+
+@app.get("/api/admin/stats")
+async def admin_stats(user: dict = Depends(require_admin)):
+    """Get admin overview stats."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        # User counts
+        users = await conn.fetchrow("""
+            SELECT 
+                COUNT(*)::int AS total,
+                SUM(CASE WHEN created_at >= NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END)::int AS new_7d,
+                SUM(CASE WHEN created_at >= NOW() - INTERVAL '30 days' THEN 1 ELSE 0 END)::int AS new_30d,
+                SUM(CASE WHEN subscription_tier NOT IN ('starter', 'free') THEN 1 ELSE 0 END)::int AS paid
+            FROM users
+        """)
+        
+        # Upload counts
+        uploads = await conn.fetchrow("""
+            SELECT 
+                COUNT(*)::int AS total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
+                SUM(CASE WHEN created_at >= NOW() - INTERVAL '24 hours' THEN 1 ELSE 0 END)::int AS last_24h
+            FROM uploads
+        """)
+        
+        # MRR calculation (approximate)
+        mrr = await conn.fetchrow("""
+            SELECT 
+                SUM(CASE WHEN subscription_tier = 'starter' AND subscription_status = 'active' THEN 9 ELSE 0 END) +
+                SUM(CASE WHEN subscription_tier = 'solo' AND subscription_status = 'active' THEN 19 ELSE 0 END) +
+                SUM(CASE WHEN subscription_tier = 'creator' AND subscription_status = 'active' THEN 29 ELSE 0 END) +
+                SUM(CASE WHEN subscription_tier = 'growth' AND subscription_status = 'active' THEN 49 ELSE 0 END) +
+                SUM(CASE WHEN subscription_tier = 'studio' AND subscription_status = 'active' THEN 79 ELSE 0 END) +
+                SUM(CASE WHEN subscription_tier = 'agency' AND subscription_status = 'active' THEN 99 ELSE 0 END)
+                AS estimated_mrr
+            FROM users
+        """)
+    
+    return {
+        "users": {
+            "total": users["total"] or 0,
+            "new_7d": users["new_7d"] or 0,
+            "new_30d": users["new_30d"] or 0,
+            "paid": users["paid"] or 0,
+        },
+        "uploads": {
+            "total": uploads["total"] or 0,
+            "completed": uploads["completed"] or 0,
+            "failed": uploads["failed"] or 0,
+            "last_24h": uploads["last_24h"] or 0,
+        },
+        "revenue": {
+            "estimated_mrr": float(mrr["estimated_mrr"] or 0),
+        },
+    }
+
+@app.get("/api/admin/users")
+async def admin_list_users(
+    search: Optional[str] = None,
+    tier: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    limit: int = 20,
+    user: dict = Depends(require_admin)
+):
+    """List users with filtering."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    page = max(1, page)
+    limit = max(1, min(limit, 100))
+    offset = (page - 1) * limit
+    
+    query = "SELECT * FROM users WHERE 1=1"
+    count_query = "SELECT COUNT(*) FROM users WHERE 1=1"
+    params = []
+    idx = 1
+    
+    if search:
+        query += f" AND (LOWER(email) LIKE ${idx} OR LOWER(name) LIKE ${idx})"
+        count_query += f" AND (LOWER(email) LIKE ${idx} OR LOWER(name) LIKE ${idx})"
+        params.append(f"%{search.lower()}%")
+        idx += 1
+    
+    if tier:
+        query += f" AND subscription_tier = ${idx}"
+        count_query += f" AND subscription_tier = ${idx}"
+        params.append(tier)
+        idx += 1
+    
+    if status:
+        query += f" AND status = ${idx}"
+        count_query += f" AND status = ${idx}"
+        params.append(status)
+        idx += 1
+    
+    query += f" ORDER BY created_at DESC LIMIT ${idx} OFFSET ${idx + 1}"
+    params.extend([limit, offset])
+    
+    async with db_pool.acquire() as conn:
+        users_list = await conn.fetch(query, *params[:-2] if len(params) > 2 else [], limit, offset)
+        total = await conn.fetchval(count_query, *params[:-2] if len(params) > 2 else [])
+        
+        # Get upload counts
+        user_ids = [str(u["id"]) for u in users_list]
+        if user_ids:
+            upload_counts = await conn.fetch("""
+                SELECT user_id, COUNT(*)::int AS count, 
+                    SUM(CASE WHEN created_at >= DATE_TRUNC('month', NOW()) THEN 1 ELSE 0 END)::int AS this_month
+                FROM uploads WHERE user_id = ANY($1::uuid[])
+                GROUP BY user_id
+            """, user_ids)
+            upload_map = {str(u["user_id"]): u for u in upload_counts}
+        else:
+            upload_map = {}
+    
+    return {
+        "users": [
+            {
+                "id": str(u["id"]),
+                "email": u["email"],
+                "name": u["name"],
+                "role": u.get("role", "user"),
+                "tier": u.get("subscription_tier", "starter"),
+                "status": u.get("status", "active"),
+                "uploads_this_month": upload_map.get(str(u["id"]), {}).get("this_month", 0),
+                "total_uploads": upload_map.get(str(u["id"]), {}).get("count", 0),
+                "stripe_customer_id": u.get("stripe_customer_id"),
+                "created_at": u["created_at"].isoformat() if u.get("created_at") else None,
+            }
+            for u in users_list
+        ],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total or 0,
+            "pages": (total or 0) // limit + (1 if (total or 0) % limit else 0),
+        },
+    }
+
+@app.get("/api/admin/users/{target_user_id}")
+async def admin_get_user(target_user_id: str, user: dict = Depends(require_admin)):
+    """Get detailed user info."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT * FROM users WHERE id = $1", target_user_id)
+        if not target:
+            raise HTTPException(404, "User not found")
+        
+        # Get connected accounts
+        accounts = await conn.fetch(
+            "SELECT platform, account_name, account_username FROM platform_tokens WHERE user_id = $1",
+            target_user_id
+        )
+        
+        # Get upload stats
+        stats = await conn.fetchrow("""
+            SELECT COUNT(*)::int AS total,
+                SUM(CASE WHEN created_at >= DATE_TRUNC('month', NOW()) THEN 1 ELSE 0 END)::int AS this_month
+            FROM uploads WHERE user_id = $1
+        """, target_user_id)
+    
+    return {
+        "id": str(target["id"]),
+        "email": target["email"],
+        "name": target["name"],
+        "role": target.get("role", "user"),
+        "tier": target.get("subscription_tier", "starter"),
+        "status": target.get("status", "active"),
+        "timezone": target.get("timezone", "UTC"),
+        "avatar_url": target.get("avatar_url"),
+        "stripe_customer_id": target.get("stripe_customer_id"),
+        "stripe_subscription_id": target.get("stripe_subscription_id"),
+        "subscription_status": target.get("subscription_status"),
+        "uploads_this_month": stats["this_month"] or 0,
+        "total_uploads": stats["total"] or 0,
+        "upload_quota": target.get("upload_quota", 10),
+        "connected_accounts": [
+            {"platform": a["platform"], "name": a["account_name"], "username": a["account_username"]}
+            for a in accounts
+        ],
+        "created_at": target["created_at"].isoformat() if target.get("created_at") else None,
+        "updated_at": target["updated_at"].isoformat() if target.get("updated_at") else None,
+    }
+
+@app.patch("/api/admin/users/{target_user_id}")
+async def admin_update_user(target_user_id: str, data: AdminUserUpdate, user: dict = Depends(require_admin)):
+    """Update user (tier, status, quota)."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    updates = []
+    values = []
+    idx = 1
+    
+    if data.subscription_tier is not None:
+        updates.append(f"subscription_tier = ${idx}")
+        values.append(data.subscription_tier)
+        # Update quota based on tier
+        entitlements = _entitlements_for_tier(data.subscription_tier)
+        updates.append(f"upload_quota = ${idx + 1}")
+        values.append(entitlements.get("upload_quota", 10))
+        updates.append(f"unlimited_uploads = ${idx + 2}")
+        values.append(entitlements.get("unlimited_uploads", False))
+        idx += 3
+    
+    if data.role is not None:
+        updates.append(f"role = ${idx}")
+        values.append(data.role)
+        idx += 1
+    
+    if data.upload_quota is not None:
+        updates.append(f"upload_quota = ${idx}")
+        values.append(data.upload_quota)
+        idx += 1
+    
+    if data.status is not None:
+        updates.append(f"status = ${idx}")
+        values.append(data.status)
+        idx += 1
+    
+    if not updates:
+        return {"status": "ok", "message": "No changes"}
+    
+    updates.append("updated_at = NOW()")
+    values.append(target_user_id)
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ${idx}", *values)
+    
+    await _discord_notify_admin("admin_user_updated", {
+        "target_id": target_user_id,
+        "admin_email": user["email"],
+        "changes": data.dict(exclude_none=True),
+    })
+    
+    return {"status": "ok"}
+
+@app.post("/api/admin/users/{target_user_id}/impersonate")
+async def admin_impersonate(target_user_id: str, user: dict = Depends(require_admin)):
+    """Generate impersonation token for a user."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT id, email FROM users WHERE id = $1", target_user_id)
+        if not target:
+            raise HTTPException(404, "User not found")
+    
+    # Create short-lived access token (1 hour)
+    impersonate_token = create_access_jwt(target_user_id)
+    
+    await _discord_notify_admin("admin_impersonation", {
+        "admin_email": user["email"],
+        "target_email": target["email"],
+    })
+    
+    return {
+        "token": impersonate_token,
+        "expires_in": ACCESS_TOKEN_MINUTES * 60,
+    }
+
+@app.get("/api/admin/kpis")
+async def admin_kpis(range: str = "30d", user: dict = Depends(require_admin)):
+    """Get KPI data for admin dashboard."""
+    if not db_pool:
+        raise HTTPException(500, "Database not available")
+    
+    # Parse range
+    days_map = {"7d": 7, "30d": 30, "90d": 90, "12m": 365, "all": 3650}
+    days = days_map.get(range, 30)
+    since = _now_utc() - timedelta(days=days)
+    
+    async with db_pool.acquire() as conn:
+        # User metrics
+        user_metrics = await conn.fetchrow("""
+            SELECT 
+                COUNT(*)::int AS total_users,
+                SUM(CASE WHEN last_active_at >= NOW() - INTERVAL '30 days' THEN 1 ELSE 0 END)::int AS active_30d,
+                SUM(CASE WHEN subscription_tier NOT IN ('starter', 'free') THEN 1 ELSE 0 END)::int AS paid,
+                SUM(CASE WHEN created_at >= NOW() - INTERVAL '7 days' THEN 1 ELSE 0 END)::int AS new_7d
+            FROM users
+        """)
+        
+        # Monthly cohort data (simplified)
+        cohorts = await conn.fetch("""
+            SELECT DATE_TRUNC('month', created_at) AS cohort_month,
+                COUNT(*)::int AS users
+            FROM users
+            WHERE created_at >= NOW() - INTERVAL '6 months'
+            GROUP BY DATE_TRUNC('month', created_at)
+            ORDER BY cohort_month ASC
+        """)
+        
+        # Upload trends
+        upload_trends = await conn.fetch("""
+            SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads
+            FROM uploads WHERE created_at >= $1
+            GROUP BY DATE(created_at)
+            ORDER BY date ASC
+        """, since)
+    
+    return {
+        "users": {
+            "total": user_metrics["total_users"] or 0,
+            "active_30d": user_metrics["active_30d"] or 0,
+            "paid": user_metrics["paid"] or 0,
+            "new_7d": user_metrics["new_7d"] or 0,
+        },
+        "cohorts": [
+            {"month": c["cohort_month"].strftime("%Y-%m"), "users": c["users"]}
+            for c in cohorts
+        ],
+        "upload_trends": [
+            {"date": str(t["date"]), "uploads": t["uploads"]}
+            for t in upload_trends
+        ],
+    }
 
 
 if __name__ == "__main__":

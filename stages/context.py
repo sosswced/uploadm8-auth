@@ -1,190 +1,259 @@
 """
 UploadM8 Job Context
 ====================
-Single context object passed through all stages.
+Carries all state through the processing pipeline.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, List, Dict, Any
 
-
-@dataclass
-class TelemetryData:
-    """Parsed telemetry data from .map file."""
-    data_points: List[Dict[str, float]] = field(default_factory=list)
-    max_speed: float = 0.0
-    avg_speed: float = 0.0
-    total_duration: float = 0.0
-    distance_miles: float = 0.0
-
-
-@dataclass
-class TrillScore:
-    """Trill score calculation results."""
-    score: int = 0
-    bucket: str = "chill"  # chill, spirited, sendIt, euphoric, gloryBoy
-    speed_score: float = 0.0
-    speeding_score: float = 0.0
-    euphoria_score: float = 0.0
-    consistency_score: float = 0.0
-    excessive_speed: bool = False
-    title_modifier: str = ""
-    hashtags: List[str] = field(default_factory=list)
-
-
-@dataclass
-class CaptionResult:
-    """Generated caption and title."""
-    title: str = ""
-    caption: str = ""
-    hashtags: List[str] = field(default_factory=list)
-    generated_by: str = "manual"  # manual, trill, ai
+from .entitlements import Entitlements
 
 
 @dataclass
 class PlatformResult:
-    """Result of publishing to a single platform."""
-    platform: str = ""
-    success: bool = False
-    publish_id: Optional[str] = None
-    video_id: Optional[str] = None
-    url: Optional[str] = None
-    error: Optional[str] = None
+    """Result of uploading to a single platform."""
+    platform: str
+    success: bool
+    platform_video_id: Optional[str] = None
+    platform_url: Optional[str] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    views: int = 0
+    likes: int = 0
 
 
-@dataclass
+@dataclass 
 class JobContext:
     """
-    Context object passed through all processing stages.
-    Each stage reads and augments this context.
-    """
-    # Identity
-    job_id: str = ""
-    upload_id: str = ""
-    user_id: str = ""
+    Processing context that flows through all pipeline stages.
     
-    # Source files
+    Contains:
+    - Job identification
+    - User info and entitlements
+    - File paths
+    - Processing outputs
+    - Platform results
+    - Timestamps
+    """
+    
+    # Job identification
+    job_id: str
+    upload_id: str
+    user_id: str
+    idempotency_key: str = ""
+    
+    # Job state tracking (server-authoritative)
+    state: str = "queued"  # queued | processing | cancel_requested | cancelled | failed | succeeded
+    stage: str = "init"    # init | download | telemetry | captions | hud | watermark | thumbnail | uploading | notify | done
+    attempt_count: int = 1
+    max_attempts: int = 3
+    
+    # Source info
     source_r2_key: str = ""
     telemetry_r2_key: Optional[str] = None
     filename: str = ""
     file_size: int = 0
-    
-    # Local temp paths (populated by download stage)
-    temp_dir: Optional[Path] = None
-    local_video_path: Optional[Path] = None
-    local_telemetry_path: Optional[Path] = None
-    processed_video_path: Optional[Path] = None
+    content_type: str = "video/mp4"
     
     # Upload metadata
     platforms: List[str] = field(default_factory=list)
-    original_title: str = ""
-    original_caption: str = ""
+    title: str = ""
+    caption: str = ""
+    hashtags: List[str] = field(default_factory=list)
     privacy: str = "public"
     scheduled_time: Optional[datetime] = None
-    schedule_mode: str = "immediate"
+    schedule_mode: str = "immediate"  # immediate | smart | manual
     
-    # User preferences
+    # User settings (from user_settings table)
     user_settings: Dict[str, Any] = field(default_factory=dict)
-    discord_webhook: Optional[str] = None
     
-    # Entitlements (use Any type to avoid circular import, set via create_context)
-    entitlements: Any = None
+    # Entitlements (loaded from user tier)
+    entitlements: Optional[Entitlements] = None
     
-    # Stage results
-    telemetry: Optional[TelemetryData] = None
-    trill: Optional[TrillScore] = None
-    caption: Optional[CaptionResult] = None
+    # Temp directory and local paths
+    temp_dir: Optional[Path] = None
+    local_video_path: Optional[Path] = None
+    local_telemetry_path: Optional[Path] = None
     
-    # Processing state
+    # Processing outputs
+    processed_video_path: Optional[Path] = None
     processed_r2_key: Optional[str] = None
-    hud_applied: bool = False
-    transcoded: bool = False
+    thumbnail_path: Optional[Path] = None
+    thumbnail_r2_key: Optional[str] = None
     
-    # Publish results
+    # AI generated content
+    ai_title: Optional[str] = None
+    ai_caption: Optional[str] = None
+    ai_hashtags: List[str] = field(default_factory=list)
+    
+    # Telemetry data (parsed from .map file)
+    telemetry_data: Optional[Dict[str, Any]] = None
+    max_speed_mph: Optional[float] = None
+    
+    # Output artifacts (R2 keys)
+    output_artifacts: Dict[str, str] = field(default_factory=dict)
+    
+    # Platform results
     platform_results: List[PlatformResult] = field(default_factory=list)
-    
-    # Status
-    status: str = "pending"
-    error_code: Optional[str] = None
-    error_detail: Optional[str] = None
     
     # Timing
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     
-    @property
-    def has_telemetry(self) -> bool:
-        return bool(self.telemetry_r2_key)
+    # Error tracking
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    errors: List[Dict[str, Any]] = field(default_factory=list)
     
-    @property
-    def final_title(self) -> str:
-        """Get the final title (generated or original)."""
-        if self.caption and self.caption.title:
-            return self.caption.title
-        return self.original_title or self.filename
+    # Cancel flag
+    cancel_requested: bool = False
     
-    @property
-    def final_caption(self) -> str:
-        """Get the final caption with hashtags."""
-        base = ""
-        if self.caption and self.caption.caption:
-            base = self.caption.caption
-        else:
-            base = self.original_caption
-        
-        hashtags = []
-        if self.caption and self.caption.hashtags:
-            hashtags.extend(self.caption.hashtags)
-        if self.trill and self.trill.hashtags:
-            hashtags.extend(self.trill.hashtags)
-        
-        if hashtags:
-            unique_tags = list(dict.fromkeys(hashtags))
-            base = f"{base}\n\n{' '.join(unique_tags)}".strip()
-        
-        return base
+    def mark_stage(self, stage: str):
+        """Update current stage."""
+        self.stage = stage
     
-    @property
-    def all_succeeded(self) -> bool:
+    def mark_error(self, code: str, message: str, details: dict = None):
+        """Record an error."""
+        self.error_code = code
+        self.error_message = message
+        self.errors.append({
+            "code": code,
+            "message": message,
+            "details": details or {},
+            "stage": self.stage,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    
+    def add_platform_result(self, result: PlatformResult):
+        """Add a platform upload result."""
+        self.platform_results.append(result)
+    
+    def get_final_video_path(self) -> Optional[Path]:
+        """Get the final video path (processed or original)."""
+        return self.processed_video_path or self.local_video_path
+    
+    def get_final_r2_key(self) -> str:
+        """Get the final R2 key (processed or original)."""
+        return self.processed_r2_key or self.source_r2_key
+    
+    def get_effective_title(self) -> str:
+        """Get title, falling back to AI-generated or filename."""
+        return self.title or self.ai_title or Path(self.filename).stem
+    
+    def get_effective_caption(self) -> str:
+        """Get caption, falling back to AI-generated."""
+        return self.caption or self.ai_caption or ""
+    
+    def get_effective_hashtags(self) -> List[str]:
+        """Get hashtags, combining user-provided and AI-generated."""
+        combined = list(self.hashtags) + list(self.ai_hashtags)
+        # Dedupe while preserving order
+        seen = set()
+        result = []
+        for h in combined:
+            h_lower = h.lower().strip().lstrip('#')
+            if h_lower and h_lower not in seen:
+                seen.add(h_lower)
+                result.append(h_lower)
+        
+        # Apply limit from entitlements
+        max_tags = 9999
+        if self.entitlements:
+            max_tags = self.entitlements.max_hashtags if not self.entitlements.unlimited_hashtags else 9999
+        
+        return result[:max_tags]
+    
+    def is_success(self) -> bool:
+        """Check if job completed successfully."""
         if not self.platform_results:
             return False
-        return all(r.success for r in self.platform_results)
-    
-    @property
-    def any_succeeded(self) -> bool:
         return any(r.success for r in self.platform_results)
     
+    def is_partial_success(self) -> bool:
+        """Check if some platforms succeeded but not all."""
+        if not self.platform_results:
+            return False
+        successes = sum(1 for r in self.platform_results if r.success)
+        return 0 < successes < len(self.platform_results)
+    
+    def get_success_platforms(self) -> List[str]:
+        """Get list of platforms that succeeded."""
+        return [r.platform for r in self.platform_results if r.success]
+    
     def get_failed_platforms(self) -> List[str]:
+        """Get list of platforms that failed."""
         return [r.platform for r in self.platform_results if not r.success]
     
-    def get_succeeded_platforms(self) -> List[str]:
-        return [r.platform for r in self.platform_results if r.success]
+    def to_summary_dict(self) -> dict:
+        """Convert to summary for database storage."""
+        return {
+            "job_id": self.job_id,
+            "upload_id": self.upload_id,
+            "state": self.state,
+            "stage": self.stage,
+            "attempt_count": self.attempt_count,
+            "platforms": self.platforms,
+            "platform_results": [
+                {
+                    "platform": r.platform,
+                    "success": r.success,
+                    "video_id": r.platform_video_id,
+                    "url": r.platform_url,
+                    "error": r.error_message,
+                }
+                for r in self.platform_results
+            ],
+            "output_artifacts": self.output_artifacts,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+        }
 
 
 def create_context(
     job_data: dict,
     upload_record: dict,
     user_settings: dict,
-    entitlements: Any
+    entitlements: Entitlements
 ) -> JobContext:
-    """Create a JobContext from job payload and database records."""
-    return JobContext(
+    """Create a JobContext from job queue data and database records."""
+    
+    ctx = JobContext(
         job_id=job_data.get("job_id", ""),
         upload_id=job_data.get("upload_id", ""),
         user_id=job_data.get("user_id", ""),
-        source_r2_key=upload_record.get("r2_key", ""),
-        telemetry_r2_key=upload_record.get("telemetry_r2_key"),
-        filename=upload_record.get("filename", ""),
-        file_size=upload_record.get("file_size", 0),
-        platforms=upload_record.get("platforms", []) or [],
-        original_title=upload_record.get("title", ""),
-        original_caption=upload_record.get("caption", ""),
-        privacy=upload_record.get("privacy", "public"),
-        scheduled_time=upload_record.get("scheduled_time"),
-        schedule_mode=upload_record.get("schedule_mode", "immediate"),
-        user_settings=user_settings,
-        discord_webhook=user_settings.get("discord_webhook"),
-        entitlements=entitlements,
+        idempotency_key=job_data.get("idempotency_key", ""),
+        attempt_count=job_data.get("attempt_count", 1),
     )
+    
+    # From upload record
+    if upload_record:
+        ctx.source_r2_key = upload_record.get("r2_key", "")
+        ctx.telemetry_r2_key = upload_record.get("telemetry_r2_key")
+        ctx.filename = upload_record.get("filename", "")
+        ctx.file_size = upload_record.get("file_size", 0)
+        ctx.platforms = upload_record.get("platforms", [])
+        ctx.title = upload_record.get("title", "")
+        ctx.caption = upload_record.get("caption", "")
+        ctx.privacy = upload_record.get("privacy", "public")
+        ctx.scheduled_time = upload_record.get("scheduled_time")
+        ctx.schedule_mode = upload_record.get("schedule_mode", "immediate")
+        
+        # Parse hashtags from caption if present
+        caption = ctx.caption or ""
+        if '#' in caption:
+            import re
+            tags = re.findall(r'#(\w+)', caption)
+            ctx.hashtags = tags
+    
+    # User settings
+    ctx.user_settings = user_settings or {}
+    
+    # Entitlements
+    ctx.entitlements = entitlements
+    
+    return ctx

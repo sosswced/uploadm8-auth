@@ -1,40 +1,52 @@
 """
-UploadM8 Worker Stages
-======================
-Modular processing pipeline for video uploads.
+UploadM8 Processing Stages
+==========================
+Modular pipeline stages for video processing.
 
-Stage Execution Order:
-1. telemetry_stage - Parse .map files, calculate Trill score
-2. caption_stage - Generate AI captions/titles (tier-gated)
-3. transcode_stage - Standardize video format
-4. hud_stage - Burn speed HUD overlay
-5. publish_stage - Distribute to platforms
-6. notify_stage - Send Discord notifications
-
-Each stage receives a JobContext and returns an updated context.
+Stages:
+1. download - Download files from R2
+2. telemetry - Parse .map telemetry files
+3. thumbnail - Generate thumbnails (FFmpeg + AI)
+4. caption - Generate AI captions/titles/hashtags
+5. hud - Burn speed HUD overlay
+6. watermark - Apply tier-based watermark
+7. upload - Upload processed video to R2
+8. publish - Publish to platforms
+9. notify - Send notifications
 """
 
-from .errors import StageError, SkipStage, ErrorCode
-from .context import JobContext, create_context
+from .errors import StageError, SkipStage, ErrorCode, CancelRequested
+from .context import JobContext, PlatformResult, create_context
 from .entitlements import (
     Entitlements,
-    TIER_CONFIG,
     get_entitlements_for_tier,
     get_entitlements_from_user,
+    entitlements_to_dict,
     can_user_upload,
     can_user_connect_platform,
+    get_tier_display_name,
+    get_tier_from_lookup_key,
+    TIER_CONFIG,
 )
 
 __all__ = [
-    'StageError',
-    'SkipStage',
-    'ErrorCode',
-    'JobContext',
-    'create_context',
-    'Entitlements',
-    'TIER_CONFIG',
-    'get_entitlements_for_tier',
-    'get_entitlements_from_user',
-    'can_user_upload',
-    'can_user_connect_platform',
+    # Errors
+    "StageError",
+    "SkipStage",
+    "ErrorCode",
+    "CancelRequested",
+    # Context
+    "JobContext",
+    "PlatformResult",
+    "create_context",
+    # Entitlements
+    "Entitlements",
+    "get_entitlements_for_tier",
+    "get_entitlements_from_user",
+    "entitlements_to_dict",
+    "can_user_upload",
+    "can_user_connect_platform",
+    "get_tier_display_name",
+    "get_tier_from_lookup_key",
+    "TIER_CONFIG",
 ]

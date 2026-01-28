@@ -1,7 +1,7 @@
 """
 UploadM8 R2 Storage Stage
 =========================
-Cloudflare R2 (S3-compatible) operations.
+Cloudflare R2 (S3-compatible) file operations.
 """
 
 import os
@@ -12,11 +12,9 @@ from typing import Optional
 import boto3
 from botocore.config import Config
 
-from .errors import R2Error, ErrorCode
-
+from .errors import StageError, ErrorCode
 
 logger = logging.getLogger("uploadm8-worker")
-
 
 # Configuration
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
@@ -39,117 +37,156 @@ def get_s3_client():
     )
 
 
-async def download_file(key: str, local_path: Path) -> Path:
+async def download_file(r2_key: str, local_path: Path) -> Path:
     """
-    Download file from R2 to local path.
+    Download a file from R2 to local path.
     
     Args:
-        key: R2 object key
-        local_path: Local destination path
+        r2_key: Key in R2 bucket
+        local_path: Local path to save file
         
     Returns:
         Path to downloaded file
         
     Raises:
-        R2Error: If download fails
+        StageError: If download fails
     """
     try:
+        logger.info(f"Downloading {r2_key} to {local_path}")
         s3 = get_s3_client()
-        s3.download_file(R2_BUCKET_NAME, key, str(local_path))
-        logger.info(f"Downloaded {key} to {local_path}")
-        return local_path
-    except Exception as e:
-        error_msg = str(e)
-        if "404" in error_msg or "NoSuchKey" in error_msg:
-            raise R2Error(
-                f"File not found: {key}",
-                code=ErrorCode.R2_NOT_FOUND,
-                detail=error_msg
+        
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        s3.download_file(R2_BUCKET_NAME, r2_key, str(local_path))
+        
+        if not local_path.exists():
+            raise StageError(
+                ErrorCode.DOWNLOAD_FAILED,
+                f"Downloaded file not found at {local_path}",
+                stage="download"
             )
-        raise R2Error(
-            f"Failed to download {key}",
-            code=ErrorCode.R2_DOWNLOAD_FAILED,
-            detail=error_msg
+        
+        logger.info(f"Downloaded {local_path.stat().st_size} bytes")
+        return local_path
+        
+    except StageError:
+        raise
+    except Exception as e:
+        raise StageError(
+            ErrorCode.DOWNLOAD_FAILED,
+            f"Failed to download {r2_key}: {str(e)}",
+            stage="download",
+            retryable=True
         )
 
 
-async def upload_file(
-    local_path: Path,
-    key: str,
-    content_type: str = "video/mp4"
-) -> str:
+async def upload_file(local_path: Path, r2_key: str, content_type: str = None) -> str:
     """
-    Upload file from local path to R2.
+    Upload a file from local path to R2.
     
     Args:
-        local_path: Local source path
-        key: R2 destination key
-        content_type: MIME type
+        local_path: Local file path
+        r2_key: Target key in R2 bucket
+        content_type: Optional content type
         
     Returns:
-        R2 object key
+        R2 key of uploaded file
         
     Raises:
-        R2Error: If upload fails
+        StageError: If upload fails
     """
     try:
+        if not local_path.exists():
+            raise StageError(
+                ErrorCode.UPLOAD_FAILED,
+                f"Local file not found: {local_path}",
+                stage="upload"
+            )
+        
+        logger.info(f"Uploading {local_path} to {r2_key}")
         s3 = get_s3_client()
-        s3.upload_file(
-            str(local_path),
-            R2_BUCKET_NAME,
-            key,
-            ExtraArgs={"ContentType": content_type}
-        )
-        logger.info(f"Uploaded {local_path} to {key}")
-        return key
+        
+        extra_args = {}
+        if content_type:
+            extra_args["ContentType"] = content_type
+        
+        s3.upload_file(str(local_path), R2_BUCKET_NAME, r2_key, ExtraArgs=extra_args or None)
+        
+        logger.info(f"Uploaded {local_path.stat().st_size} bytes to {r2_key}")
+        return r2_key
+        
+    except StageError:
+        raise
     except Exception as e:
-        raise R2Error(
-            f"Failed to upload to {key}",
-            code=ErrorCode.R2_UPLOAD_FAILED,
-            detail=str(e)
+        raise StageError(
+            ErrorCode.UPLOAD_FAILED,
+            f"Failed to upload to {r2_key}: {str(e)}",
+            stage="upload",
+            retryable=True
         )
 
 
-async def delete_file(key: str) -> bool:
+async def delete_file(r2_key: str):
+    """Delete a file from R2."""
+    try:
+        s3 = get_s3_client()
+        s3.delete_object(Bucket=R2_BUCKET_NAME, Key=r2_key)
+        logger.info(f"Deleted {r2_key}")
+    except Exception as e:
+        logger.warning(f"Failed to delete {r2_key}: {e}")
+
+
+async def file_exists(r2_key: str) -> bool:
+    """Check if a file exists in R2."""
+    try:
+        s3 = get_s3_client()
+        s3.head_object(Bucket=R2_BUCKET_NAME, Key=r2_key)
+        return True
+    except:
+        return False
+
+
+async def get_file_size(r2_key: str) -> Optional[int]:
+    """Get size of a file in R2."""
+    try:
+        s3 = get_s3_client()
+        response = s3.head_object(Bucket=R2_BUCKET_NAME, Key=r2_key)
+        return response.get("ContentLength")
+    except:
+        return None
+
+
+def generate_presigned_url(r2_key: str, ttl: int = 3600, for_upload: bool = False, content_type: str = None) -> str:
     """
-    Delete file from R2.
+    Generate a presigned URL for R2.
     
     Args:
-        key: R2 object key
+        r2_key: Key in R2 bucket
+        ttl: Time to live in seconds
+        for_upload: If True, generate PUT URL; otherwise GET
+        content_type: Content type for upload
         
     Returns:
-        True if deleted, False if not found
+        Presigned URL
     """
-    try:
-        s3 = get_s3_client()
-        s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
-        logger.info(f"Deleted {key}")
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to delete {key}: {e}")
-        return False
-
-
-async def file_exists(key: str) -> bool:
-    """Check if file exists in R2."""
-    try:
-        s3 = get_s3_client()
-        s3.head_object(Bucket=R2_BUCKET_NAME, Key=key)
-        return True
-    except Exception:
-        return False
-
-
-def get_processed_key(source_key: str) -> str:
-    """Generate key for processed video."""
-    return source_key.replace("uploads/", "processed/", 1)
-
-
-def generate_presigned_url(key: str, expires_in: int = 3600) -> str:
-    """Generate presigned URL for download."""
     s3 = get_s3_client()
-    return s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": R2_BUCKET_NAME, "Key": key},
-        ExpiresIn=expires_in
-    )
+    
+    if for_upload:
+        params = {"Bucket": R2_BUCKET_NAME, "Key": r2_key}
+        if content_type:
+            params["ContentType"] = content_type
+        return s3.generate_presigned_url("put_object", Params=params, ExpiresIn=ttl)
+    else:
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": R2_BUCKET_NAME, "Key": r2_key},
+            ExpiresIn=ttl
+        )
+
+
+def get_public_url(r2_key: str) -> str:
+    """Get public URL for an R2 object (if bucket is public)."""
+    public_domain = os.environ.get("R2_PUBLIC_DOMAIN")
+    if public_domain:
+        return f"https://{public_domain}/{r2_key}"
+    return generate_presigned_url(r2_key, ttl=86400)

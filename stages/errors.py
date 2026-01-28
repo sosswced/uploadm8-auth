@@ -176,3 +176,101 @@ ERROR_HTTP_STATUS = {
 def get_http_status(code: ErrorCode) -> int:
     """Get HTTP status code for an error code."""
     return ERROR_HTTP_STATUS.get(code, 500)
+
+
+# --------------------------------------------------------------------------------------
+# APPENDED COMPATIBILITY + QUALITY-OF-LIFE ERRORS (NO BASE LOGIC REMOVED)
+# These wrappers fix ImportError issues like:
+#   from .errors import TelemetryError, SkipStage, ErrorCode
+# while keeping your StageError model as the single source of truth.
+# --------------------------------------------------------------------------------------
+
+class TelemetryError(StageError):
+    """Telemetry-stage error wrapper (backwards-compatible)."""
+    def __init__(
+        self,
+        message: str,
+        details: Optional[dict] = None,
+        retryable: bool = False,
+        stage: str = "telemetry",
+        code: ErrorCode = ErrorCode.TELEMETRY_PARSE_FAILED,
+    ):
+        super().__init__(code=code, message=message, details=details, retryable=retryable, stage=stage)
+
+
+class HUDError(StageError):
+    """HUD-stage error wrapper (backwards-compatible)."""
+    def __init__(
+        self,
+        message: str,
+        details: Optional[dict] = None,
+        retryable: bool = False,
+        stage: str = "hud",
+        code: ErrorCode = ErrorCode.HUD_FAILED,
+    ):
+        super().__init__(code=code, message=message, details=details, retryable=retryable, stage=stage)
+
+
+class WatermarkError(StageError):
+    """Watermark-stage error wrapper."""
+    def __init__(
+        self,
+        message: str,
+        details: Optional[dict] = None,
+        retryable: bool = False,
+        stage: str = "watermark",
+        code: ErrorCode = ErrorCode.WATERMARK_FAILED,
+    ):
+        super().__init__(code=code, message=message, details=details, retryable=retryable, stage=stage)
+
+
+class ThumbnailError(StageError):
+    """Thumbnail-stage error wrapper."""
+    def __init__(
+        self,
+        message: str,
+        details: Optional[dict] = None,
+        retryable: bool = False,
+        stage: str = "thumbnail",
+        code: ErrorCode = ErrorCode.THUMBNAIL_FAILED,
+    ):
+        super().__init__(code=code, message=message, details=details, retryable=retryable, stage=stage)
+
+
+class OpenAIError(StageError):
+    """OpenAI/AI-stage error wrapper with sensible defaults."""
+    def __init__(
+        self,
+        message: str,
+        details: Optional[dict] = None,
+        retryable: bool = True,
+        stage: str = "ai",
+        code: ErrorCode = ErrorCode.OPENAI_ERROR,
+    ):
+        super().__init__(code=code, message=message, details=details, retryable=retryable, stage=stage)
+
+
+class OpenAIRateLimit(StageError):
+    """OpenAI rate limit wrapper."""
+    def __init__(
+        self,
+        message: str = "OpenAI rate limited",
+        details: Optional[dict] = None,
+        retryable: bool = True,
+        stage: str = "ai",
+        code: ErrorCode = ErrorCode.OPENAI_RATE_LIMIT,
+    ):
+        super().__init__(code=code, message=message, details=details, retryable=retryable, stage=stage)
+
+
+class PlatformError(StageError):
+    """Generic platform publish/upload wrapper."""
+    def __init__(
+        self,
+        message: str,
+        details: Optional[dict] = None,
+        retryable: bool = True,
+        stage: str = "platform",
+        code: ErrorCode = ErrorCode.PLATFORM_UPLOAD_FAILED,
+    ):
+        super().__init__(code=code, message=message, details=details, retryable=retryable, stage=stage)

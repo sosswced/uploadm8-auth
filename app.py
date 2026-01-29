@@ -408,6 +408,10 @@ class CheckoutRequest(BaseModel):
     lookup_key: str
     kind: str = "subscription"  # subscription | topup | addon
 
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
 class TransferRequest(BaseModel):
     from_platform: str
     to_platform: str
@@ -841,6 +845,25 @@ async def update_me(data: ProfileUpdate, user: dict = Depends(get_current_user))
         async with db_pool.acquire() as conn:
             await conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", *params)
     return {"status": "updated"}
+
+@app.post("/api/auth/change-password")
+async def change_password(data: PasswordChange, user: dict = Depends(get_current_user)):
+    """Change user password"""
+    async with db_pool.acquire() as conn:
+        # Verify current password
+        user_row = await conn.fetchrow("SELECT password_hash FROM users WHERE id = $1", user["id"])
+        if not user_row or not verify_password(data.current_password, user_row["password_hash"]):
+            raise HTTPException(401, "Current password is incorrect")
+        
+        # Update to new password
+        new_hash = hash_password(data.new_password)
+        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", new_hash, user["id"])
+        
+        # Optionally invalidate other sessions (refresh tokens)
+        await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
+    
+    logger.info(f"Password changed for user {user['id']}")
+    return {"status": "password_changed"}
 
 @app.get("/api/wallet")
 async def get_wallet_endpoint(user: dict = Depends(get_current_user)):

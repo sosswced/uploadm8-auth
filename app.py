@@ -865,6 +865,28 @@ async def change_password(data: PasswordChange, user: dict = Depends(get_current
     logger.info(f"Password changed for user {user['id']}")
     return {"status": "password_changed"}
 
+@app.delete("/api/me")
+async def delete_account(user: dict = Depends(get_current_user)):
+    """Permanently delete user account and all associated data"""
+    user_id = user["id"]
+    
+    # Prevent admin from deleting themselves accidentally
+    if user.get("role") == "master_admin":
+        raise HTTPException(403, "Master admin accounts cannot be deleted via API")
+    
+    async with db_pool.acquire() as conn:
+        # Delete in order to respect foreign key constraints
+        await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM token_ledger WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM wallets WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM user_settings WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM platform_tokens WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM uploads WHERE user_id = $1", user_id)
+        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+    
+    logger.info(f"Account deleted for user {user_id}")
+    return {"status": "account_deleted"}
+
 @app.get("/api/wallet")
 async def get_wallet_endpoint(user: dict = Depends(get_current_user)):
     wallet = user.get("wallet", {})

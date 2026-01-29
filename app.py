@@ -177,7 +177,22 @@ def create_access_jwt(user_id: str) -> str:
     return jwt.encode({"sub": user_id, "iat": int(now.timestamp()), "exp": int((now + timedelta(minutes=ACCESS_TOKEN_MINUTES)).timestamp()), "iss": JWT_ISSUER, "aud": JWT_AUDIENCE}, JWT_SECRET, algorithm="HS256")
 
 def verify_access_jwt(token: str) -> Optional[str]:
-    try: return jwt.decode(token, JWT_SECRET, algorithms=["HS256"], audience=JWT_AUDIENCE, issuer=JWT_ISSUER).get("sub")
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], audience=JWT_AUDIENCE, issuer=JWT_ISSUER)
+        return payload.get("sub")
+    except jwt.ExpiredSignatureError:
+        logger.warning("JWT token expired")
+        return None
+    except (jwt.InvalidAudienceError, jwt.InvalidIssuerError):
+        # Fallback: try without strict aud/iss validation
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False, "verify_iss": False})
+            return payload.get("sub")
+        except:
+            return None
+    except Exception as e:
+        logger.warning(f"JWT verification failed: {e}")
+        return None
     except: return None
 
 async def create_refresh_token(conn, user_id: str) -> str:

@@ -179,3 +179,10 @@ def get_http_status(code: ErrorCode) -> int:
 
 # Backward compatibility alias
 TelemetryError = StageError
+
+# Backward compatibility aliases for stage-specific errors
+HUDError = StageError
+PublishError = StageError
+CaptionError = StageError
+ThumbnailError = StageError
+WatermarkError = StageError

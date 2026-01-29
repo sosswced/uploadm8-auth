@@ -391,9 +391,10 @@ class UploadInit(BaseModel):
     hashtags: List[str] = []
     privacy: str = "public"
     scheduled_time: Optional[datetime] = None
-    schedule_mode: str = "immediate"
+    schedule_mode: str = "immediate"  # immediate | scheduled | smart
     has_telemetry: bool = False
     use_ai: bool = False
+    smart_schedule_days: int = 7  # How many days to spread uploads across
 
 class SettingsUpdate(BaseModel):
     discord_webhook: Optional[str] = None
@@ -428,6 +429,147 @@ class AdminUserUpdate(BaseModel):
     flex_enabled: Optional[bool] = None
 
 # ============================================================
+# Smart Upload Scheduling
+# ============================================================
+# Platform-specific optimal posting times (in UTC)
+# Based on general social media engagement research
+PLATFORM_OPTIMAL_TIMES = {
+    "tiktok": [
+        {"hour": 7, "minute": 0, "weight": 0.8},   # 7 AM - morning scroll
+        {"hour": 12, "minute": 0, "weight": 0.9},  # 12 PM - lunch break
+        {"hour": 15, "minute": 0, "weight": 0.7},  # 3 PM - afternoon break
+        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - evening prime time
+        {"hour": 21, "minute": 0, "weight": 0.95}, # 9 PM - night engagement
+        {"hour": 23, "minute": 0, "weight": 0.6},  # 11 PM - late night
+    ],
+    "youtube": [
+        {"hour": 12, "minute": 0, "weight": 0.7},  # 12 PM - lunch views
+        {"hour": 14, "minute": 0, "weight": 0.8},  # 2 PM - afternoon
+        {"hour": 17, "minute": 0, "weight": 0.9},  # 5 PM - after work/school
+        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
+        {"hour": 21, "minute": 0, "weight": 0.95}, # 9 PM - evening viewing
+    ],
+    "instagram": [
+        {"hour": 6, "minute": 0, "weight": 0.7},   # 6 AM - early morning
+        {"hour": 11, "minute": 0, "weight": 0.85}, # 11 AM - mid-morning
+        {"hour": 13, "minute": 0, "weight": 0.9},  # 1 PM - lunch
+        {"hour": 17, "minute": 0, "weight": 0.8},  # 5 PM - commute
+        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
+        {"hour": 21, "minute": 0, "weight": 0.9},  # 9 PM - evening
+    ],
+    "facebook": [
+        {"hour": 9, "minute": 0, "weight": 0.8},   # 9 AM - morning check
+        {"hour": 11, "minute": 0, "weight": 0.7},  # 11 AM - mid-morning
+        {"hour": 13, "minute": 0, "weight": 0.9},  # 1 PM - lunch break
+        {"hour": 16, "minute": 0, "weight": 0.85}, # 4 PM - afternoon
+        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
+        {"hour": 20, "minute": 0, "weight": 0.9},  # 8 PM - evening
+    ],
+}
+
+# Best days for each platform (0=Monday, 6=Sunday)
+PLATFORM_OPTIMAL_DAYS = {
+    "tiktok": [1, 2, 3, 4],      # Tue, Wed, Thu, Fri - highest engagement
+    "youtube": [3, 4, 5],        # Thu, Fri, Sat - weekend viewing prep
+    "instagram": [0, 1, 2, 4],   # Mon, Tue, Wed, Fri - weekday engagement
+    "facebook": [0, 1, 2, 3],    # Mon, Tue, Wed, Thu - business days
+}
+
+import random
+
+def calculate_smart_schedule(platforms: List[str], num_days: int = 7, user_timezone: str = "UTC") -> Dict[str, datetime]:
+    """
+    Calculate optimal upload times for each platform.
+    Ensures uploads are spread across different days.
+    Returns a dict mapping platform -> scheduled datetime
+    """
+    now = _now_utc()
+    schedule = {}
+    used_days = set()
+    
+    # Sort platforms to ensure consistent ordering
+    platforms_sorted = sorted(platforms)
+    
+    for platform in platforms_sorted:
+        optimal_times = PLATFORM_OPTIMAL_TIMES.get(platform, PLATFORM_OPTIMAL_TIMES["tiktok"])
+        optimal_days = PLATFORM_OPTIMAL_DAYS.get(platform, [0, 1, 2, 3, 4])
+        
+        # Find an available day that hasn't been used
+        available_days = []
+        for day_offset in range(1, num_days + 1):
+            target_date = now + timedelta(days=day_offset)
+            weekday = target_date.weekday()
+            
+            # Prefer optimal days for this platform, but allow any day if needed
+            if day_offset not in used_days:
+                priority = 2 if weekday in optimal_days else 1
+                available_days.append((day_offset, priority, weekday))
+        
+        if not available_days:
+            # All days used, pick a random future day
+            day_offset = random.randint(1, num_days)
+        else:
+            # Sort by priority (optimal days first), then randomize within priority
+            available_days.sort(key=lambda x: (-x[1], random.random()))
+            day_offset = available_days[0][0]
+        
+        used_days.add(day_offset)
+        
+        # Pick an optimal time slot with weighted randomization
+        weights = [t["weight"] for t in optimal_times]
+        total_weight = sum(weights)
+        rand_val = random.uniform(0, total_weight)
+        
+        cumulative = 0
+        selected_time = optimal_times[0]
+        for t in optimal_times:
+            cumulative += t["weight"]
+            if rand_val <= cumulative:
+                selected_time = t
+                break
+        
+        # Add randomization to the time (±30 minutes)
+        minute_offset = random.randint(-30, 30)
+        
+        # Calculate the final datetime
+        target_date = now + timedelta(days=day_offset)
+        scheduled_dt = target_date.replace(
+            hour=selected_time["hour"],
+            minute=max(0, min(59, selected_time["minute"] + minute_offset)),
+            second=0,
+            microsecond=0
+        )
+        
+        # Make sure it's in the future
+        if scheduled_dt <= now:
+            scheduled_dt += timedelta(days=1)
+        
+        schedule[platform] = scheduled_dt
+    
+    return schedule
+
+async def get_existing_scheduled_days(conn, user_id: str, num_days: int = 7) -> set:
+    """Get days that already have scheduled uploads for this user"""
+    now = _now_utc()
+    end_date = now + timedelta(days=num_days)
+    
+    existing = await conn.fetch("""
+        SELECT DISTINCT DATE(scheduled_time) as sched_date 
+        FROM uploads 
+        WHERE user_id = $1 
+        AND scheduled_time >= $2 
+        AND scheduled_time <= $3 
+        AND status IN ('pending', 'queued', 'scheduled')
+    """, user_id, now, end_date)
+    
+    used_days = set()
+    for row in existing:
+        if row["sched_date"]:
+            day_diff = (row["sched_date"] - now.date()).days
+            if day_diff > 0:
+                used_days.add(day_diff)
+    
+    return used_days
 # App Lifespan & Migrations
 # ============================================================
 @asynccontextmanager
@@ -618,31 +760,87 @@ async def logout(user: dict = Depends(get_current_user)):
 async def get_me(user: dict = Depends(get_current_user)):
     plan = get_plan(user.get("subscription_tier", "free"))
     wallet = user.get("wallet", {})
+    role = user.get("role", "user")
+    tier = user.get("subscription_tier", "free")
+    
+    # Check if user is internal (admin/special tiers) - don't show low token warnings
+    is_internal = role in ("admin", "master_admin") or tier in ("master_admin", "friends_family", "lifetime")
+    
     put_available = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
     aic_available = wallet.get("aic_balance", 0) - wallet.get("aic_reserved", 0)
-    put_pct = (put_available / max(plan.get("put_monthly", 30), 1)) * 100
+    put_monthly = plan.get("put_monthly", 30)
+    put_pct = (put_available / max(put_monthly, 1)) * 100 if not is_internal else 100
     
-    # Compute banners
+    # Compute banners - but not for internal users with high token counts
     banners = []
-    if put_pct <= 0:
-        banners.append({"type": "blocking", "message": "You're out of PUT tokens!", "cta": "top-up"})
-    elif put_pct <= 10:
-        banners.append({"type": "urgent", "message": f"Only {put_available} PUT left!", "cta": "top-up"})
-    elif put_pct <= 30:
-        banners.append({"type": "warning", "message": f"{put_available} PUT remaining this period", "cta": "upgrade"})
+    if not is_internal:
+        if put_pct <= 0:
+            banners.append({"type": "blocking", "message": "You're out of PUT tokens!", "cta": "top-up"})
+        elif put_pct <= 10:
+            banners.append({"type": "urgent", "message": f"Only {put_available} PUT left!", "cta": "top-up"})
+        elif put_pct <= 30:
+            banners.append({"type": "warning", "message": f"{put_available} PUT remaining this period", "cta": "upgrade"})
+        
+        if plan.get("ai") and aic_available <= 5:
+            banners.append({"type": "warning", "message": "Low AI credits!", "cta": "buy-aic"})
     
-    if plan.get("ai") and aic_available <= 5:
-        banners.append({"type": "warning", "message": "Low AI credits!", "cta": "buy-aic"})
+    # Get connected accounts count
+    async with db_pool.acquire() as conn:
+        accounts_count = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", user["id"])
+    
+    max_accounts = plan.get("max_accounts", 1)
     
     return {
-        "id": str(user["id"]), "email": user["email"], "name": user["name"], "role": user["role"],
-        "subscription_tier": user.get("subscription_tier", "free"), "subscription_status": user.get("subscription_status"),
-        "plan": plan, "wallet": {"put_balance": wallet.get("put_balance", 0), "put_reserved": wallet.get("put_reserved", 0),
-            "put_available": put_available, "aic_balance": wallet.get("aic_balance", 0), "aic_reserved": wallet.get("aic_reserved", 0),
-            "aic_available": aic_available},
-        "banners": banners, "flex_enabled": user.get("flex_enabled", False),
+        "id": str(user["id"]), 
+        "email": user["email"], 
+        "name": user["name"], 
+        "role": role,
+        "subscription_tier": tier, 
+        "subscription_status": user.get("subscription_status"),
+        "timezone": user.get("timezone", "UTC"),
+        "avatar_url": user.get("avatar_url"),
+        "plan": plan, 
+        "wallet": {
+            "put_balance": wallet.get("put_balance", 0), 
+            "put_reserved": wallet.get("put_reserved", 0),
+            "put_available": put_available, 
+            "aic_balance": wallet.get("aic_balance", 0), 
+            "aic_reserved": wallet.get("aic_reserved", 0),
+            "aic_available": aic_available
+        },
+        "banners": banners, 
+        "flex_enabled": user.get("flex_enabled", False),
         "created_at": user["created_at"].isoformat() if user.get("created_at") else None,
+        "accounts_connected": accounts_count,
+        "max_accounts": max_accounts,
+        "entitlements": {
+            "max_accounts": max_accounts,
+            "max_hashtags": 30 if is_internal else (10 if tier in ("creator_pro", "studio", "agency") else 5),
+            "show_ads": plan.get("ads", True) and not is_internal,
+            "show_watermark": plan.get("watermark", True) and not is_internal,
+            "scheduling": plan.get("scheduling", False) or is_internal,
+            "ai": plan.get("ai", False) or is_internal,
+        }
     }
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    timezone: Optional[str] = None
+
+@app.put("/api/me")
+async def update_me(data: ProfileUpdate, user: dict = Depends(get_current_user)):
+    """Update user profile"""
+    updates, params = [], [user["id"]]
+    if data.name:
+        updates.append(f"name = ${len(params)+1}")
+        params.append(data.name)
+    if data.timezone:
+        updates.append(f"timezone = ${len(params)+1}")
+        params.append(data.timezone)
+    if updates:
+        async with db_pool.acquire() as conn:
+            await conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", *params)
+    return {"status": "updated"}
 
 @app.get("/api/wallet")
 async def get_wallet_endpoint(user: dict = Depends(get_current_user)):
@@ -711,6 +909,37 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
             await conn.execute(f"UPDATE user_settings SET {', '.join(updates)}, updated_at = NOW() WHERE user_id = $1", *params)
     return {"status": "updated"}
 
+@app.get("/api/me/preferences")
+async def get_preferences(user: dict = Depends(get_current_user)):
+    """Get user preferences including hashtag settings"""
+    async with db_pool.acquire() as conn:
+        prefs = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
+    if prefs and prefs["preferences"]:
+        return json.loads(prefs["preferences"]) if isinstance(prefs["preferences"], str) else prefs["preferences"]
+    return {}
+
+@app.put("/api/me/preferences")
+async def update_preferences(request: Request, user: dict = Depends(get_current_user)):
+    """Update user preferences including hashtag settings"""
+    prefs = await request.json()
+    
+    # Validate and sanitize hashtag data
+    if "alwaysHashtags" in prefs:
+        prefs["alwaysHashtags"] = [str(h).lower().strip()[:50] for h in prefs["alwaysHashtags"][:100]]
+    if "blockedHashtags" in prefs:
+        prefs["blockedHashtags"] = [str(h).lower().strip()[:50] for h in prefs["blockedHashtags"][:100]]
+    if "platformHashtags" in prefs:
+        for platform in ["tiktok", "youtube", "instagram", "facebook"]:
+            if platform in prefs["platformHashtags"]:
+                prefs["platformHashtags"][platform] = [str(h).lower().strip()[:50] for h in prefs["platformHashtags"][platform][:50]]
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
+            json.dumps(prefs), user["id"]
+        )
+    return {"status": "updated"}
+
 # ============================================================
 # Uploads
 # ============================================================
@@ -740,17 +969,56 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
     upload_id = str(uuid.uuid4())
     r2_key = f"uploads/{user['id']}/{upload_id}/{data.filename}"
     
+    # Handle smart scheduling - create separate upload records per platform with different times
+    smart_schedule = None
+    if data.schedule_mode == "smart":
+        smart_schedule = calculate_smart_schedule(
+            data.platforms, 
+            num_days=data.smart_schedule_days
+        )
+    
     async with db_pool.acquire() as conn:
+        # Check for existing scheduled uploads to avoid day conflicts
+        if data.schedule_mode == "smart":
+            existing_days = await get_existing_scheduled_days(conn, user["id"], data.smart_schedule_days)
+            # Recalculate if there are conflicts
+            if existing_days:
+                smart_schedule = calculate_smart_schedule(
+                    data.platforms, 
+                    num_days=data.smart_schedule_days
+                )
+        
+        # For smart scheduling, we create one upload but store the schedule in metadata
+        scheduled_time = data.scheduled_time
+        schedule_metadata = None
+        
+        if data.schedule_mode == "smart" and smart_schedule:
+            # Store the per-platform schedule as JSON metadata
+            schedule_metadata = {p: dt.isoformat() for p, dt in smart_schedule.items()}
+            # Use the earliest time as the main scheduled_time
+            scheduled_time = min(smart_schedule.values())
+        
         await conn.execute("""
-            INSERT INTO uploads (id, user_id, r2_key, filename, file_size, platforms, title, caption, hashtags, privacy, status, scheduled_time, schedule_mode, put_reserved, aic_reserved)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14)
-        """, upload_id, user["id"], r2_key, data.filename, data.file_size, data.platforms, data.title, data.caption, data.hashtags, data.privacy, data.scheduled_time, data.schedule_mode, put_cost, aic_cost)
+            INSERT INTO uploads (id, user_id, r2_key, filename, file_size, platforms, title, caption, hashtags, privacy, status, scheduled_time, schedule_mode, put_reserved, aic_reserved, schedule_metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15)
+        """, upload_id, user["id"], r2_key, data.filename, data.file_size, data.platforms, data.title, data.caption, data.hashtags, data.privacy, scheduled_time, data.schedule_mode, put_cost, aic_cost, json.dumps(schedule_metadata) if schedule_metadata else None)
         
         # Reserve tokens
         await reserve_tokens(conn, user["id"], put_cost, aic_cost, upload_id)
     
     presigned_url = generate_presigned_upload_url(r2_key, data.content_type)
-    result = {"upload_id": upload_id, "presigned_url": presigned_url, "r2_key": r2_key, "put_cost": put_cost, "aic_cost": aic_cost}
+    result = {
+        "upload_id": upload_id, 
+        "presigned_url": presigned_url, 
+        "r2_key": r2_key, 
+        "put_cost": put_cost, 
+        "aic_cost": aic_cost,
+        "schedule_mode": data.schedule_mode
+    }
+    
+    # Include smart schedule info in response
+    if smart_schedule:
+        result["smart_schedule"] = {p: dt.isoformat() for p, dt in smart_schedule.items()}
     
     if data.has_telemetry:
         telem_key = f"uploads/{user['id']}/{upload_id}/telemetry.map"
@@ -758,6 +1026,27 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
         result["telemetry_r2_key"] = telem_key
     
     return result
+
+# Endpoint to preview smart schedule without creating upload
+@app.post("/api/uploads/smart-schedule/preview")
+async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = Query(7), user: dict = Depends(get_current_user)):
+    """Preview what the smart schedule would look like for given platforms"""
+    if not platforms:
+        raise HTTPException(400, "At least one platform required")
+    
+    schedule = calculate_smart_schedule(platforms, num_days=days)
+    
+    return {
+        "schedule": {p: dt.isoformat() for p, dt in schedule.items()},
+        "explanation": {
+            p: {
+                "date": dt.strftime("%A, %B %d"),
+                "time": dt.strftime("%I:%M %p"),
+                "reason": f"Optimal posting time for {p.title()}"
+            }
+            for p, dt in schedule.items()
+        }
+    }
 
 @app.post("/api/uploads/{upload_id}/complete")
 async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)):
@@ -792,6 +1081,16 @@ async def get_uploads(status: Optional[str] = None, limit: int = 50, offset: int
             uploads = await conn.fetch("SELECT * FROM uploads WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3", user["id"], limit, offset)
     return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "put_cost": u["put_reserved"], "aic_cost": u["aic_reserved"]} for u in uploads]
 
+@app.get("/api/scheduled")
+async def get_scheduled(user: dict = Depends(get_current_user)):
+    """Get scheduled uploads"""
+    async with db_pool.acquire() as conn:
+        uploads = await conn.fetch("""
+            SELECT * FROM uploads WHERE user_id = $1 AND schedule_mode = 'scheduled' AND status IN ('pending', 'queued', 'scheduled')
+            ORDER BY scheduled_time ASC
+        """, user["id"])
+    return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None} for u in uploads]
+
 @app.delete("/api/uploads/{upload_id}")
 async def delete_upload(upload_id: str, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
@@ -800,6 +1099,45 @@ async def delete_upload(upload_id: str, user: dict = Depends(get_current_user)):
         if upload["status"] in ("pending", "queued"):
             await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
         await conn.execute("DELETE FROM uploads WHERE id = $1", upload_id)
+    return {"status": "deleted"}
+
+# ============================================================
+# Account Groups
+# ============================================================
+@app.get("/api/groups")
+async def get_groups(user: dict = Depends(get_current_user)):
+    async with db_pool.acquire() as conn:
+        groups = await conn.fetch("SELECT * FROM account_groups WHERE user_id = $1 ORDER BY created_at DESC", user["id"])
+    return [{"id": str(g["id"]), "name": g["name"], "account_ids": g["account_ids"] or [], "color": g["color"], "created_at": g["created_at"].isoformat() if g["created_at"] else None} for g in groups]
+
+@app.post("/api/groups")
+async def create_group(name: str = Query(...), color: str = Query("#3b82f6"), user: dict = Depends(get_current_user)):
+    async with db_pool.acquire() as conn:
+        group_id = str(uuid.uuid4())
+        await conn.execute("INSERT INTO account_groups (id, user_id, name, color) VALUES ($1, $2, $3, $4)", group_id, user["id"], name, color)
+    return {"id": group_id, "name": name, "color": color, "account_ids": []}
+
+@app.put("/api/groups/{group_id}")
+async def update_group(group_id: str, name: str = Query(None), color: str = Query(None), account_ids: List[str] = Query(None), user: dict = Depends(get_current_user)):
+    updates, params = [], [group_id, user["id"]]
+    if name:
+        updates.append(f"name = ${len(params)+1}")
+        params.append(name)
+    if color:
+        updates.append(f"color = ${len(params)+1}")
+        params.append(color)
+    if account_ids is not None:
+        updates.append(f"account_ids = ${len(params)+1}")
+        params.append(account_ids)
+    if updates:
+        async with db_pool.acquire() as conn:
+            await conn.execute(f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2", *params)
+    return {"status": "updated"}
+
+@app.delete("/api/groups/{group_id}")
+async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM account_groups WHERE id = $1 AND user_id = $2", group_id, user["id"])
     return {"status": "deleted"}
 
 # ============================================================
@@ -814,17 +1152,299 @@ async def get_platforms(user: dict = Depends(get_current_user)):
     for acc in accounts:
         p = acc["platform"]
         if p not in platforms: platforms[p] = []
-        platforms[p].append({"id": str(acc["id"]), "account_id": acc["account_id"], "name": acc["account_name"], "username": acc["account_username"], "avatar": acc["account_avatar"], "is_primary": acc["is_primary"]})
+        platforms[p].append({"id": str(acc["id"]), "account_id": acc["account_id"], "name": acc["account_name"], "username": acc["account_username"], "avatar": acc["account_avatar"], "is_primary": acc["is_primary"], "status": "active", "connected_at": acc["created_at"].isoformat() if acc["created_at"] else None})
     
     plan = get_plan(user.get("subscription_tier", "free"))
     total = sum(len(v) for v in platforms.values())
     return {"platforms": platforms, "total_accounts": total, "max_accounts": plan.get("max_accounts", 1), "can_add_more": total < plan.get("max_accounts", 1)}
+
+# Alias endpoint for frontend compatibility
+@app.get("/api/platform-accounts")
+async def get_platform_accounts(user: dict = Depends(get_current_user)):
+    """Returns flat list of accounts for frontend compatibility"""
+    async with db_pool.acquire() as conn:
+        accounts = await conn.fetch("SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at FROM platform_tokens WHERE user_id = $1 ORDER BY platform, created_at", user["id"])
+    
+    result = []
+    for acc in accounts:
+        result.append({
+            "id": str(acc["id"]),
+            "platform": acc["platform"],
+            "account_id": acc["account_id"],
+            "account_name": acc["account_name"],
+            "account_username": acc["account_username"],
+            "account_avatar_url": acc["account_avatar"],
+            "is_primary": acc["is_primary"],
+            "status": "active",
+            "connected_at": acc["created_at"].isoformat() if acc["created_at"] else None,
+        })
+    return {"accounts": result}
+
+@app.get("/api/accounts")
+async def get_accounts_simple(user: dict = Depends(get_current_user)):
+    """Simple accounts list for dashboard"""
+    async with db_pool.acquire() as conn:
+        accounts = await conn.fetch("SELECT id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1", user["id"])
+    return [{"id": str(a["id"]), "platform": a["platform"], "name": a["account_name"], "username": a["account_username"], "avatar": a["account_avatar"], "status": "active"} for a in accounts]
 
 @app.delete("/api/platforms/{platform}/accounts/{account_id}")
 async def disconnect_account(platform: str, account_id: str, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM platform_tokens WHERE id = $1 AND user_id = $2", account_id, user["id"])
     return {"status": "disconnected"}
+
+@app.delete("/api/platform-accounts/{account_id}")
+async def disconnect_account_by_id(account_id: str, user: dict = Depends(get_current_user)):
+    """Delete account by ID only"""
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM platform_tokens WHERE id = $1 AND user_id = $2", account_id, user["id"])
+    return {"status": "disconnected"}
+
+# ============================================================
+# OAuth Platform Connections
+# ============================================================
+OAUTH_CONFIG = {
+    "tiktok": {
+        "auth_url": "https://www.tiktok.com/v2/auth/authorize/",
+        "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
+        "scope": "user.info.basic,video.publish,video.upload",
+    },
+    "youtube": {
+        "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "scope": "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly",
+    },
+    "instagram": {
+        "auth_url": "https://api.instagram.com/oauth/authorize",
+        "token_url": "https://api.instagram.com/oauth/access_token",
+        "scope": "user_profile,user_media",
+    },
+    "facebook": {
+        "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
+        "token_url": "https://graph.facebook.com/v18.0/oauth/access_token",
+        "scope": "pages_manage_posts,pages_read_engagement,publish_video",
+    },
+}
+
+# OAuth state storage (in production, use Redis)
+oauth_states: Dict[str, dict] = {}
+
+# OAuth credentials from environment
+TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
+TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
+YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
+YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+INSTAGRAM_CLIENT_ID = os.environ.get("INSTAGRAM_CLIENT_ID", "")
+INSTAGRAM_CLIENT_SECRET = os.environ.get("INSTAGRAM_CLIENT_SECRET", "")
+FACEBOOK_CLIENT_ID = os.environ.get("FACEBOOK_CLIENT_ID", "")
+FACEBOOK_CLIENT_SECRET = os.environ.get("FACEBOOK_CLIENT_SECRET", "")
+
+def get_oauth_redirect_uri(platform: str) -> str:
+    return f"{BASE_URL}/api/oauth/{platform}/callback"
+
+@app.get("/api/oauth/{platform}/start")
+async def oauth_start(platform: str, user: dict = Depends(get_current_user)):
+    """Start OAuth flow for a platform"""
+    if platform not in OAUTH_CONFIG:
+        raise HTTPException(400, f"Unsupported platform: {platform}")
+    
+    # Check account limits
+    plan = get_plan(user.get("subscription_tier", "free"))
+    async with db_pool.acquire() as conn:
+        current_count = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", user["id"])
+    
+    if current_count >= plan.get("max_accounts", 1):
+        raise HTTPException(403, f"Account limit reached ({plan.get('max_accounts', 1)}). Upgrade to add more.")
+    
+    config = OAUTH_CONFIG[platform]
+    state = secrets.token_urlsafe(32)
+    
+    # Store state with user info
+    oauth_states[state] = {
+        "user_id": str(user["id"]),
+        "platform": platform,
+        "created_at": _now_utc().isoformat()
+    }
+    
+    redirect_uri = get_oauth_redirect_uri(platform)
+    
+    if platform == "tiktok":
+        params = {
+            "client_key": TIKTOK_CLIENT_KEY,
+            "scope": config["scope"],
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "state": state,
+        }
+    elif platform == "youtube":
+        params = {
+            "client_id": YOUTUBE_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": config["scope"],
+            "state": state,
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+    elif platform == "instagram":
+        params = {
+            "client_id": INSTAGRAM_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "scope": config["scope"],
+            "response_type": "code",
+            "state": state,
+        }
+    elif platform == "facebook":
+        params = {
+            "client_id": FACEBOOK_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "scope": config["scope"],
+            "response_type": "code",
+            "state": state,
+        }
+    
+    auth_url = f"{config['auth_url']}?{urlencode(params)}"
+    return {"auth_url": auth_url, "state": state}
+
+@app.get("/api/oauth/{platform}/callback")
+async def oauth_callback(platform: str, code: str = Query(None), state: str = Query(None), error: str = Query(None)):
+    """Handle OAuth callback"""
+    from urllib.parse import quote
+    
+    if error:
+        return RedirectResponse(f"{FRONTEND_URL}/platforms.html?error={quote(error)}")
+    
+    if not state or state not in oauth_states:
+        return RedirectResponse(f"{FRONTEND_URL}/platforms.html?error=invalid_state")
+    
+    state_data = oauth_states.pop(state)
+    user_id = state_data["user_id"]
+    
+    if not code:
+        return RedirectResponse(f"{FRONTEND_URL}/platforms.html?error=no_code")
+    
+    config = OAUTH_CONFIG[platform]
+    redirect_uri = get_oauth_redirect_uri(platform)
+    
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Exchange code for tokens based on platform
+            if platform == "tiktok":
+                token_response = await client.post(config["token_url"], data={
+                    "client_key": TIKTOK_CLIENT_KEY,
+                    "client_secret": TIKTOK_CLIENT_SECRET,
+                    "code": code,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri,
+                })
+                token_data = token_response.json()
+                access_token = token_data.get("access_token")
+                account_id = token_data.get("open_id", secrets.token_hex(8))
+                account_name = "TikTok User"
+                account_username = ""
+                account_avatar = ""
+                
+            elif platform == "youtube":
+                token_response = await client.post(config["token_url"], data={
+                    "client_id": YOUTUBE_CLIENT_ID,
+                    "client_secret": YOUTUBE_CLIENT_SECRET,
+                    "code": code,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri,
+                })
+                token_data = token_response.json()
+                access_token = token_data.get("access_token")
+                
+                # Get channel info
+                user_response = await client.get(
+                    "https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true",
+                    headers={"Authorization": f"Bearer {access_token}"}
+                )
+                channels = user_response.json().get("items", [])
+                if channels:
+                    channel = channels[0]
+                    snippet = channel.get("snippet", {})
+                    account_id = channel.get("id")
+                    account_name = snippet.get("title", "YouTube Channel")
+                    account_username = snippet.get("customUrl", "")
+                    account_avatar = snippet.get("thumbnails", {}).get("default", {}).get("url", "")
+                else:
+                    account_id = secrets.token_hex(8)
+                    account_name = "YouTube Channel"
+                    account_username = ""
+                    account_avatar = ""
+                    
+            elif platform == "instagram":
+                token_response = await client.post(config["token_url"], data={
+                    "client_id": INSTAGRAM_CLIENT_ID,
+                    "client_secret": INSTAGRAM_CLIENT_SECRET,
+                    "code": code,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri,
+                })
+                token_data = token_response.json()
+                access_token = token_data.get("access_token")
+                account_id = str(token_data.get("user_id", secrets.token_hex(8)))
+                
+                # Get user info
+                user_response = await client.get(
+                    f"https://graph.instagram.com/me?fields=id,username&access_token={access_token}"
+                )
+                user_data = user_response.json()
+                account_name = user_data.get("username", "Instagram User")
+                account_username = user_data.get("username", "")
+                account_avatar = ""
+                
+            elif platform == "facebook":
+                token_response = await client.get(config["token_url"], params={
+                    "client_id": FACEBOOK_CLIENT_ID,
+                    "client_secret": FACEBOOK_CLIENT_SECRET,
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                })
+                token_data = token_response.json()
+                access_token = token_data.get("access_token")
+                
+                # Get user info
+                user_response = await client.get(
+                    f"https://graph.facebook.com/me?fields=id,name,picture&access_token={access_token}"
+                )
+                user_data = user_response.json()
+                account_id = user_data.get("id", secrets.token_hex(8))
+                account_name = user_data.get("name", "Facebook User")
+                account_username = ""
+                account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
+            
+            # Store the token
+            token_blob = encrypt_blob({
+                "access_token": access_token,
+                "refresh_token": token_data.get("refresh_token"),
+                "expires_at": token_data.get("expires_in"),
+            })
+            
+            async with db_pool.acquire() as conn:
+                # Check if account already connected
+                existing = await conn.fetchrow(
+                    "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND account_id = $3",
+                    user_id, platform, account_id
+                )
+                
+                if existing:
+                    await conn.execute("""
+                        UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3, 
+                        account_avatar = $4, updated_at = NOW() WHERE id = $5
+                    """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
+                else:
+                    await conn.execute("""
+                        INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
+            
+            return RedirectResponse(f"{FRONTEND_URL}/platforms.html?success=1&platform={platform}")
+    
+    except Exception as e:
+        logger.error(f"OAuth callback error for {platform}: {e}")
+        return RedirectResponse(f"{FRONTEND_URL}/platforms.html?error={quote(str(e))}")
 
 # ============================================================
 # Billing

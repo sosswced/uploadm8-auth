@@ -1,0 +1,61 @@
+# UploadM8 Render Blueprint
+# Deploy both services with: render blueprint sync
+
+services:
+  # API Web Service (no Docker needed)
+  - type: web
+    name: uploadm8-api
+    env: python
+    runtime: python311
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        value: uploadm8-media
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: FRONTEND_URL
+        value: https://app.uploadm8.com
+      - key: BASE_URL
+        value: https://auth.uploadm8.com
+      - key: TOKEN_ENC_KEYS
+        sync: false
+
+  # Background Worker (needs Docker for FFmpeg)
+  - type: worker
+    name: uploadm8-worker
+    env: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        value: uploadm8-media
+      - key: TOKEN_ENC_KEYS
+        sync: false
+      - key: UPLOAD_JOB_QUEUE
+        value: uploadm8:jobs
+      - key: PRIORITY_JOB_QUEUE
+        value: uploadm8:priority

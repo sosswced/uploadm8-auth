@@ -21,6 +21,7 @@ from stages.entitlements import get_entitlements_from_user
 from stages import db as db_stage
 from stages import r2 as r2_stage
 from stages.telemetry_stage import run_telemetry_stage
+from stages.transcode_stage import run_transcode_stage
 from stages.thumbnail_stage import run_thumbnail_stage
 from stages.caption_stage import run_caption_stage
 from stages.hud_stage import run_hud_stage
@@ -105,6 +106,16 @@ async def run_pipeline(job_data: dict) -> bool:
                 logger.warning(f"Telemetry download failed: {e}")
         
         await maybe_cancel(ctx, "download")
+        
+        # Transcode - Convert video to platform-specific formats
+        try:
+            ctx = await run_transcode_stage(ctx)
+        except SkipStage as e:
+            logger.info(f"Transcode skipped: {e.reason}")
+        except StageError as e:
+            logger.warning(f"Transcode error: {e.message}")
+            # Continue anyway - some platforms might still work with original
+        await maybe_cancel(ctx, "transcode")
         
         # Telemetry
         try:

@@ -85,6 +85,12 @@ class JobContext:
     processed_video_path: Optional[Path] = None
     thumbnail_path: Optional[Path] = None
     
+    # Platform-specific transcoded videos (platform -> Path)
+    platform_videos: Dict[str, Path] = field(default_factory=dict)
+    
+    # Video metadata from ffprobe
+    video_info: Dict[str, Any] = field(default_factory=dict)
+    
     ai_title: Optional[str] = None
     ai_caption: Optional[str] = None
     ai_hashtags: List[str] = field(default_factory=list)
@@ -112,6 +118,17 @@ class JobContext:
     
     def get_final_video_path(self) -> Optional[Path]:
         return self.processed_video_path or self.local_video_path
+    
+    def get_video_for_platform(self, platform: str) -> Optional[Path]:
+        """Get the best video file for a specific platform"""
+        # First check platform-specific transcoded versions
+        if platform in self.platform_videos:
+            return self.platform_videos[platform]
+        # Fall back to processed video
+        if self.processed_video_path and self.processed_video_path.exists():
+            return self.processed_video_path
+        # Fall back to original
+        return self.local_video_path
     
     def get_effective_title(self) -> str:
         return self.ai_title or self.title or self.filename

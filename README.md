@@ -1,8 +1,30 @@
-# UploadM8 v3.1 - Production Ready
+# UploadM8 v3.2 - Production Ready
 
 **Multi-Platform Video Upload SaaS**
 
 Upload once, publish everywhere. TikTok, YouTube Shorts, Instagram Reels, Facebook Reels.
+
+## What's New in v3.2
+
+### Smart Upload Scheduling
+- **AI-Powered Scheduling**: Automatically picks optimal posting times for each platform
+- **Platform-Specific Hot Times**: Uses engagement data to schedule during peak hours
+- **Different Days**: Spreads uploads across multiple days (no same-day posts)
+- **Configurable Range**: Choose 7, 14, 21, or 30 day scheduling windows
+
+### Always Hashtags Feature
+- **Static Hashtags**: Set hashtags that are added to every upload
+- **AI-Generated Hashtags**: Optionally generate relevant hashtags using AI
+- **Platform-Specific Hashtags**: Different hashtags for TikTok, YouTube, Instagram, Facebook
+- **Blocked Hashtags**: Prevent certain hashtags from ever being used
+- **Hashtag Position**: Choose start, end, or first comment placement
+
+### FFmpeg Video Transcoding
+- **Automatic Format Conversion**: Converts videos to platform-required formats
+- **YouTube Shorts Optimization**: H.264 codec, AAC audio, max 60 seconds
+- **TikTok Optimization**: H.264 codec, proper aspect ratio, up to 10 minutes
+- **Instagram Reels**: H.264 codec, max 90 seconds, proper dimensions
+- **Smart Analysis**: Only transcodes when necessary (saves processing time)
 
 ## What's New in v3.1
 
@@ -24,13 +46,13 @@ Upload once, publish everywhere. TikTok, YouTube Shorts, Instagram Reels, Facebo
 - `signup.html` - Registration with password strength indicator
 - `forgot-password.html` - Password reset request
 - `dashboard.html` - User dashboard with stats
-- `upload.html` - Drag-drop upload with progress
+- `upload.html` - Drag-drop upload with progress, smart scheduling
 - `queue.html` - Upload queue with cancel/retry
 - `scheduled.html` - Scheduled uploads management
 - `platforms.html` - Connected account management
 - `groups.html` - Account group management
 - `analytics.html` - Upload performance analytics
-- `settings.html` - User settings and billing
+- `settings.html` - User settings, hashtag settings, and billing
 - `admin.html` - Admin panel
 - `admin-users.html` - User management
 - `admin-kpi.html` - KPI dashboard
@@ -63,6 +85,40 @@ Upload once, publish everywhere. TikTok, YouTube Shorts, Instagram Reels, Facebo
 - Stripe billing
 - JWT authentication
 
+**Worker:**
+- FFmpeg for video transcoding
+- Platform-specific video optimization
+- Background job processing
+
+## System Requirements
+
+### FFmpeg Installation (Required for Worker)
+
+The worker requires FFmpeg to be installed for video transcoding.
+
+**Ubuntu/Debian:**
+```bash
+sudo apt update
+sudo apt install ffmpeg
+```
+
+**macOS:**
+```bash
+brew install ffmpeg
+```
+
+**Docker (Render/Railway):**
+Add to your Dockerfile:
+```dockerfile
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+```
+
+**Verify installation:**
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
 ## Deployment
 
 ### Frontend (Cloudflare Pages)
@@ -76,7 +132,8 @@ Upload once, publish everywhere. TikTok, YouTube Shorts, Instagram Reels, Facebo
 2. Set Python 3.11 runtime
 3. Set start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
 4. Add environment variables
-5. Deploy to `auth.uploadm8.com`
+5. **Ensure FFmpeg is installed** (use Docker or apt-get in build)
+6. Deploy to `auth.uploadm8.com`
 
 ## Environment Variables
 
@@ -92,7 +149,28 @@ STRIPE_SECRET_KEY=sk_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 FRONTEND_URL=https://app.uploadm8.com
 BASE_URL=https://auth.uploadm8.com
+TOKEN_ENC_KEYS=v1:base64key...
 ```
+
+## Video Processing Pipeline
+
+1. **Download** - Fetch video from R2 storage
+2. **Transcode** - Convert to platform-specific formats (H.264/AAC)
+3. **Telemetry** - Parse driving data if provided
+4. **Thumbnail** - Extract thumbnail frames
+5. **Caption** - Generate AI captions (if enabled)
+6. **HUD** - Add speed/telemetry overlay (if enabled)
+7. **Watermark** - Add branding (free tier)
+8. **Publish** - Upload to each platform with optimized video
+
+## Platform Video Requirements
+
+| Platform | Max Duration | Codec | Max Resolution | Max FPS |
+|----------|--------------|-------|----------------|---------|
+| YouTube Shorts | 60s | H.264 | 1080x1920 | 60 |
+| TikTok | 10min | H.264 | 1080x1920 | 60 |
+| Instagram Reels | 90s | H.264 | 1080x1920 | 30 |
+| Facebook Reels | 90s | H.264 | 1080x1920 | 30 |
 
 ## File Structure
 
@@ -103,13 +181,13 @@ uploadm8-complete-v3/
 ├── signup.html         # Registration
 ├── forgot-password.html
 ├── dashboard.html      # Main app
-├── upload.html
+├── upload.html         # Smart scheduling
 ├── queue.html
 ├── scheduled.html
 ├── platforms.html
 ├── groups.html
 ├── analytics.html
-├── settings.html
+├── settings.html       # Hashtag settings
 ├── admin.html          # Admin
 ├── admin-users.html
 ├── admin-kpi.html
@@ -121,13 +199,16 @@ uploadm8-complete-v3/
 ├── logo.png
 ├── logo.svg
 └── backend/
-    ├── app.py          # FastAPI (3200+ lines)
+    ├── app.py          # FastAPI
     ├── worker.py       # Background jobs
     ├── requirements.txt
     └── stages/         # Pipeline stages
+        ├── transcode_stage.py  # FFmpeg video conversion
+        ├── publish_stage.py    # Platform publishing
+        └── ...
 ```
 
-## API Endpoints (65+)
+## API Endpoints (70+)
 
 ### Auth
 - `POST /api/auth/register`
@@ -136,9 +217,11 @@ uploadm8-complete-v3/
 - `POST /api/auth/refresh`
 - `POST /api/auth/forgot-password`
 - `GET /api/me`
+- `PUT /api/me/preferences` - Hashtag and upload settings
 
 ### Uploads
 - `POST /api/uploads/presign`
+- `POST /api/uploads/smart-schedule/preview` - Preview smart schedule
 - `POST /api/uploads/{id}/complete`
 - `POST /api/uploads/{id}/cancel` - Server-authoritative cancel
 - `POST /api/uploads/{id}/retry`

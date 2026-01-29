@@ -332,12 +332,12 @@ async def run_publish_stage(
         logger.warning(f"No platforms specified for upload {ctx.upload_id}")
         return ctx
     
-    # Determine which video file to use
-    video_path = ctx.processed_video_path or ctx.local_video_path
-    if not video_path or not video_path.exists():
+    # Check we have at least one video
+    default_video = ctx.processed_video_path or ctx.local_video_path
+    if not default_video or not default_video.exists():
         raise PublishError(
             "No video file to publish",
-            code=ErrorCode.PUBLISH_ALL_FAILED
+            code=ErrorCode.UPLOAD_FAILED
         )
     
     logger.info(f"Publishing to platforms: {ctx.platforms}")
@@ -356,13 +356,21 @@ async def run_publish_stage(
     for platform in ctx.platforms:
         db_key = platform_to_db_key.get(platform, platform)
         
+        # Get the best video file for this platform
+        # This uses the platform-specific transcoded version if available
+        video_path = ctx.get_video_for_platform(platform)
+        if not video_path or not video_path.exists():
+            video_path = default_video
+        
+        logger.info(f"Using video for {platform}: {video_path.name}")
+        
         # Load token
         token_blob = await token_loader(ctx.user_id, db_key)
         if not token_blob:
             ctx.platform_results.append(PlatformResult(
                 platform=platform,
                 success=False,
-                error="Platform not connected"
+                error_message="Platform not connected"
             ))
             continue
         
@@ -373,29 +381,33 @@ async def run_publish_stage(
             ctx.platform_results.append(PlatformResult(
                 platform=platform,
                 success=False,
-                error=f"Token decrypt failed: {e}"
+                error_message=f"Token decrypt failed: {e}"
             ))
             continue
+        
+        # Get final title and caption
+        final_title = ctx.get_effective_title()
+        final_caption = ctx.get_effective_caption()
         
         # Publish based on platform
         if platform == "tiktok":
             result = await publish_to_tiktok(
                 video_path,
-                ctx.final_title,
+                final_title,
                 token_data
             )
         elif platform == "youtube":
             result = await publish_to_youtube(
                 video_path,
-                ctx.final_title,
-                ctx.final_caption,
+                final_title,
+                final_caption,
                 token_data
             )
         elif platform == "instagram":
             page_id = ctx.user_settings.get("selected_page_id")
             result = await publish_to_instagram(
                 video_path,
-                ctx.final_caption,
+                final_caption,
                 token_data,
                 page_id
             )
@@ -403,7 +415,7 @@ async def run_publish_stage(
             page_id = ctx.user_settings.get("selected_page_id")
             result = await publish_to_facebook(
                 video_path,
-                ctx.final_caption,
+                final_caption,
                 token_data,
                 page_id
             )
@@ -411,14 +423,14 @@ async def run_publish_stage(
             result = PlatformResult(
                 platform=platform,
                 success=False,
-                error=f"Unknown platform: {platform}"
+                error_message=f"Unknown platform: {platform}"
             )
         
         ctx.platform_results.append(result)
         
         if result.success:
-            logger.info(f"Published to {platform}: {result.video_id or result.publish_id}")
+            logger.info(f"Published to {platform}: {result.platform_video_id}")
         else:
-            logger.warning(f"Failed to publish to {platform}: {result.error}")
+            logger.warning(f"Failed to publish to {platform}: {result.error_message}")
     
     return ctx

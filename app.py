@@ -2202,6 +2202,220 @@ async def post_announcements(data: AnnouncementRequest, background_tasks: Backgr
     return await send_announcement(data, background_tasks, user)
 
 
+# ============================================================
+# DISCORD NOTIFICATION SETTINGS
+# ============================================================
+
+class NotificationSettings(BaseModel):
+    notify_mrr_charge: bool = False
+    notify_topup: bool = False
+    notify_upgrade: bool = False
+    notify_downgrade: bool = False
+    notify_cancel: bool = False
+    notify_refund: bool = False
+    notify_openai_cost: bool = False
+    notify_storage_cost: bool = False
+    notify_compute_cost: bool = False
+    notify_weekly_report: bool = False
+    notify_stripe_payout: bool = False
+    notify_cloud_billing: bool = False
+    notify_render_renewal: bool = False
+    stripe_payout_day: int = 15
+    cloud_billing_day: int = 1
+    render_renewal_day: int = 7
+    admin_webhook_url: str = ""
+
+
+@app.get("/api/admin/notification-settings")
+async def get_notification_settings(user: dict = Depends(require_admin)):
+    """Get Discord notification settings"""
+    settings = admin_settings_cache.get("notifications", {})
+    return {
+        "notify_mrr_charge": settings.get("notify_mrr_charge", True),
+        "notify_topup": settings.get("notify_topup", True),
+        "notify_upgrade": settings.get("notify_upgrade", True),
+        "notify_downgrade": settings.get("notify_downgrade", True),
+        "notify_cancel": settings.get("notify_cancel", True),
+        "notify_refund": settings.get("notify_refund", True),
+        "notify_openai_cost": settings.get("notify_openai_cost", True),
+        "notify_storage_cost": settings.get("notify_storage_cost", True),
+        "notify_compute_cost": settings.get("notify_compute_cost", True),
+        "notify_weekly_report": settings.get("notify_weekly_report", True),
+        "notify_stripe_payout": settings.get("notify_stripe_payout", True),
+        "notify_cloud_billing": settings.get("notify_cloud_billing", True),
+        "notify_render_renewal": settings.get("notify_render_renewal", True),
+        "stripe_payout_day": settings.get("stripe_payout_day", 15),
+        "cloud_billing_day": settings.get("cloud_billing_day", 1),
+        "render_renewal_day": settings.get("render_renewal_day", 7),
+        "admin_webhook_url": settings.get("admin_webhook_url", ADMIN_DISCORD_WEBHOOK_URL or ""),
+    }
+
+
+@app.put("/api/admin/notification-settings")
+async def update_notification_settings(settings: NotificationSettings, user: dict = Depends(require_admin)):
+    """Update Discord notification settings"""
+    global admin_settings_cache
+    notif_settings = {
+        "notify_mrr_charge": settings.notify_mrr_charge,
+        "notify_topup": settings.notify_topup,
+        "notify_upgrade": settings.notify_upgrade,
+        "notify_downgrade": settings.notify_downgrade,
+        "notify_cancel": settings.notify_cancel,
+        "notify_refund": settings.notify_refund,
+        "notify_openai_cost": settings.notify_openai_cost,
+        "notify_storage_cost": settings.notify_storage_cost,
+        "notify_compute_cost": settings.notify_compute_cost,
+        "notify_weekly_report": settings.notify_weekly_report,
+        "notify_stripe_payout": settings.notify_stripe_payout,
+        "notify_cloud_billing": settings.notify_cloud_billing,
+        "notify_render_renewal": settings.notify_render_renewal,
+        "stripe_payout_day": settings.stripe_payout_day,
+        "cloud_billing_day": settings.cloud_billing_day,
+        "render_renewal_day": settings.render_renewal_day,
+        "admin_webhook_url": settings.admin_webhook_url,
+    }
+    admin_settings_cache["notifications"] = notif_settings
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1", json.dumps(admin_settings_cache))
+    return {"status": "updated", "settings": notif_settings}
+
+
+@app.post("/api/admin/test-webhook")
+async def test_webhook(data: dict, user: dict = Depends(require_admin)):
+    """Send a test message to the provided Discord webhook"""
+    webhook_url = data.get("webhook_url", "").strip()
+    if not webhook_url:
+        raise HTTPException(400, "Webhook URL required")
+    if not webhook_url.startswith("https://discord.com/api/webhooks/"):
+        raise HTTPException(400, "Invalid Discord webhook URL")
+    test_embed = {
+        "title": "🔔 UploadM8 Webhook Test",
+        "description": "If you see this message, your webhook is configured correctly!",
+        "color": 0x22c55e,
+        "fields": [
+            {"name": "Status", "value": "✅ Connected", "inline": True},
+            {"name": "Tested By", "value": user.get("email", "Admin"), "inline": True},
+        ],
+        "footer": {"text": "UploadM8 Admin Notifications"},
+        "timestamp": _now_utc().isoformat()
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(webhook_url, json={"embeds": [test_embed]})
+            if r.status_code not in (200, 204):
+                raise HTTPException(400, f"Discord returned status {r.status_code}")
+    except httpx.TimeoutException:
+        raise HTTPException(400, "Webhook request timed out")
+    except Exception as e:
+        raise HTTPException(400, f"Failed to send: {str(e)}")
+    return {"status": "sent"}
+
+
+# ============================================================
+# DISCORD NOTIFICATION HELPERS
+# ============================================================
+
+def get_notif_settings():
+    return admin_settings_cache.get("notifications", {})
+
+def get_admin_webhook():
+    settings = get_notif_settings()
+    return settings.get("admin_webhook_url") or ADMIN_DISCORD_WEBHOOK_URL
+
+def mask_email(email: str) -> str:
+    if not email or "@" not in email: return email
+    local, domain = email.split("@", 1)
+    return f"{local[:2]}***@{domain}" if len(local) > 2 else f"{local[0]}***@{domain}"
+
+
+async def notify_revenue_event(event_type: str, email: str, tier: str, amount: float, stripe_id: str = None, extra_fields: list = None):
+    """Send revenue event notification to Discord"""
+    settings = get_notif_settings()
+    webhook = get_admin_webhook()
+    if not webhook: return
+    setting_map = {"mrr_charge": "notify_mrr_charge", "topup": "notify_topup", "upgrade": "notify_upgrade", "downgrade": "notify_downgrade", "cancel": "notify_cancel", "refund": "notify_refund"}
+    if setting_map.get(event_type) and not settings.get(setting_map[event_type], True): return
+    event_config = {
+        "mrr_charge": {"emoji": "💰", "color": 0x22c55e, "title": "MRR Charge"},
+        "topup": {"emoji": "💳", "color": 0x8b5cf6, "title": "Top-up Purchase"},
+        "upgrade": {"emoji": "⬆️", "color": 0x3b82f6, "title": "Plan Upgrade"},
+        "downgrade": {"emoji": "⬇️", "color": 0xf59e0b, "title": "Plan Downgrade"},
+        "cancel": {"emoji": "❌", "color": 0xef4444, "title": "Subscription Cancelled"},
+        "refund": {"emoji": "↩️", "color": 0xf97316, "title": "Refund Processed"},
+    }
+    cfg = event_config.get(event_type, {"emoji": "📊", "color": 0x6b7280, "title": event_type.title()})
+    fields = [{"name": "User", "value": mask_email(email), "inline": True}, {"name": "Tier", "value": tier.title(), "inline": True}, {"name": "Amount", "value": f"${amount:.2f}", "inline": True}]
+    if stripe_id: fields.append({"name": "Stripe ID", "value": f"`{stripe_id[:20]}...`" if len(stripe_id) > 20 else f"`{stripe_id}`", "inline": False})
+    if extra_fields: fields.extend(extra_fields)
+    await discord_notify(webhook, embeds=[{"title": f"{cfg['emoji']} {cfg['title']}", "color": cfg["color"], "fields": fields, "footer": {"text": "UploadM8 Revenue Alert"}, "timestamp": _now_utc().isoformat()}])
+
+
+async def notify_cost_report(report_type: str, costs: dict, period: str = "Weekly"):
+    """Send cost report notification to Discord"""
+    settings = get_notif_settings()
+    webhook = get_admin_webhook()
+    if not webhook: return
+    setting_map = {"openai": "notify_openai_cost", "storage": "notify_storage_cost", "compute": "notify_compute_cost", "weekly": "notify_weekly_report"}
+    if setting_map.get(report_type) and not settings.get(setting_map[report_type], True): return
+    if report_type == "weekly":
+        total_cost = costs.get("openai", 0) + costs.get("storage", 0) + costs.get("compute", 0)
+        revenue = costs.get("revenue", 0)
+        margin = revenue - total_cost
+        margin_pct = (margin / max(revenue, 1)) * 100
+        embed = {"title": "📊 Weekly Cost Report", "color": 0x3b82f6, "fields": [
+            {"name": "OpenAI", "value": f"${costs.get('openai', 0):.2f}", "inline": True},
+            {"name": "Storage", "value": f"${costs.get('storage', 0):.2f}", "inline": True},
+            {"name": "Compute", "value": f"${costs.get('compute', 0):.2f}", "inline": True},
+            {"name": "Total COGS", "value": f"${total_cost:.2f}", "inline": True},
+            {"name": "Revenue", "value": f"${revenue:.2f}", "inline": True},
+            {"name": "Margin", "value": f"${margin:.2f} ({margin_pct:.1f}%)", "inline": True},
+        ], "footer": {"text": f"UploadM8 {period} Report"}, "timestamp": _now_utc().isoformat()}
+    else:
+        titles = {"openai": "🤖 OpenAI Cost", "storage": "💾 Storage Cost", "compute": "⚡ Compute Cost"}
+        embed = {"title": titles.get(report_type, "📈 Cost Report"), "color": 0xef4444, "fields": [
+            {"name": "Cost", "value": f"${costs.get('amount', 0):.2f}", "inline": True},
+            {"name": "Units", "value": str(costs.get("units", "N/A")), "inline": True},
+            {"name": "vs Last Week", "value": f"{costs.get('change', 0):+.1f}%", "inline": True},
+        ], "footer": {"text": f"UploadM8 {period} Report"}, "timestamp": _now_utc().isoformat()}
+    await discord_notify(webhook, embeds=[embed])
+
+
+async def notify_billing_reminder(reminder_type: str, date: str, amount: float = None, service: str = None):
+    """Send billing calendar reminder to Discord"""
+    settings = get_notif_settings()
+    webhook = get_admin_webhook()
+    if not webhook: return
+    setting_map = {"stripe_payout": "notify_stripe_payout", "cloud_billing": "notify_cloud_billing", "render_renewal": "notify_render_renewal"}
+    if setting_map.get(reminder_type) and not settings.get(setting_map[reminder_type], True): return
+    config = {"stripe_payout": {"emoji": "💸", "color": 0x6366f1, "title": "Stripe Payout Coming"}, "cloud_billing": {"emoji": "☁️", "color": 0xf97316, "title": "Cloud Billing Reminder"}, "render_renewal": {"emoji": "🚀", "color": 0x06b6d4, "title": "Render Renewal Reminder"}}
+    cfg = config.get(reminder_type, {"emoji": "📅", "color": 0x6b7280, "title": "Billing Reminder"})
+    fields = [{"name": "Date", "value": date, "inline": True}]
+    if service: fields.append({"name": "Service", "value": service, "inline": True})
+    if amount: fields.append({"name": "Est. Amount", "value": f"${amount:.2f}", "inline": True})
+    await discord_notify(webhook, embeds=[{"title": f"{cfg['emoji']} {cfg['title']}", "description": "Upcoming billing event in 2 days", "color": cfg["color"], "fields": fields, "footer": {"text": "UploadM8 Billing Calendar"}, "timestamp": _now_utc().isoformat()}])
+
+
+@app.post("/api/admin/check-billing-reminders")
+async def check_billing_reminders(user: dict = Depends(require_admin)):
+    """Check and send billing reminders for upcoming dates"""
+    settings = get_notif_settings()
+    today = _now_utc().day
+    reminders_sent = []
+    stripe_day = settings.get("stripe_payout_day", 15)
+    cloud_day = settings.get("cloud_billing_day", 1)
+    render_day = settings.get("render_renewal_day", 7)
+    if (stripe_day - 2) == today or (stripe_day - 2 + 28) % 28 == today:
+        await notify_billing_reminder("stripe_payout", f"Day {stripe_day} of this month", service="Stripe Payouts")
+        reminders_sent.append("stripe_payout")
+    if (cloud_day - 2) == today or (cloud_day - 2 + 28) % 28 == today:
+        await notify_billing_reminder("cloud_billing", f"Day {cloud_day} of this month", service="AWS/Cloudflare")
+        reminders_sent.append("cloud_billing")
+    if (render_day - 2) == today or (render_day - 2 + 28) % 28 == today:
+        await notify_billing_reminder("render_renewal", f"Day {render_day} of this month", service="Render Hosting")
+        reminders_sent.append("render_renewal")
+    return {"status": "checked", "reminders_sent": reminders_sent}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from io import BytesIO
 
 import httpx
@@ -35,7 +35,7 @@ import stripe
 import redis.asyncio as aioredis
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from contextlib import asynccontextmanager
@@ -1275,14 +1275,19 @@ OAUTH_CONFIG = {
 oauth_states: Dict[str, dict] = {}
 
 # OAuth credentials from environment
+# TikTok
 TIKTOK_CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "")
 TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
-YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
-YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
-INSTAGRAM_CLIENT_ID = os.environ.get("INSTAGRAM_CLIENT_ID", "")
-INSTAGRAM_CLIENT_SECRET = os.environ.get("INSTAGRAM_CLIENT_SECRET", "")
-FACEBOOK_CLIENT_ID = os.environ.get("FACEBOOK_CLIENT_ID", "")
-FACEBOOK_CLIENT_SECRET = os.environ.get("FACEBOOK_CLIENT_SECRET", "")
+# YouTube/Google
+YOUTUBE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "") or os.environ.get("YOUTUBE_CLIENT_ID", "")
+YOUTUBE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "") or os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+# Meta (Facebook & Instagram share credentials)
+META_APP_ID = os.environ.get("META_APP_ID", "")
+META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
+INSTAGRAM_CLIENT_ID = META_APP_ID or os.environ.get("INSTAGRAM_CLIENT_ID", "")
+INSTAGRAM_CLIENT_SECRET = META_APP_SECRET or os.environ.get("INSTAGRAM_CLIENT_SECRET", "")
+FACEBOOK_CLIENT_ID = META_APP_ID or os.environ.get("FACEBOOK_CLIENT_ID", "")
+FACEBOOK_CLIENT_SECRET = META_APP_SECRET or os.environ.get("FACEBOOK_CLIENT_SECRET", "")
 
 def get_oauth_redirect_uri(platform: str) -> str:
     return f"{BASE_URL}/api/oauth/{platform}/callback"
@@ -1329,7 +1334,7 @@ async def oauth_start(platform: str, user: dict = Depends(get_current_user)):
             "scope": config["scope"],
             "state": state,
             "access_type": "offline",
-            "prompt": "consent",
+            "prompt": "select_account consent",  # Forces account picker + fresh consent
         }
     elif platform == "instagram":
         params = {
@@ -1338,6 +1343,7 @@ async def oauth_start(platform: str, user: dict = Depends(get_current_user)):
             "scope": config["scope"],
             "response_type": "code",
             "state": state,
+            "auth_type": "rerequest",  # Force re-authentication
         }
     elif platform == "facebook":
         params = {
@@ -1346,6 +1352,7 @@ async def oauth_start(platform: str, user: dict = Depends(get_current_user)):
             "scope": config["scope"],
             "response_type": "code",
             "state": state,
+            "auth_type": "rerequest",  # Force re-authentication
         }
     
     auth_url = f"{config['auth_url']}?{urlencode(params)}"
@@ -1353,20 +1360,46 @@ async def oauth_start(platform: str, user: dict = Depends(get_current_user)):
 
 @app.get("/api/oauth/{platform}/callback")
 async def oauth_callback(platform: str, code: str = Query(None), state: str = Query(None), error: str = Query(None)):
-    """Handle OAuth callback"""
-    from urllib.parse import quote
+    """Handle OAuth callback - returns HTML that communicates with parent window"""
+    
+    def popup_response(success: bool, platform: str, error_msg: str = None):
+        """Generate HTML that posts message to parent window and closes popup"""
+        if success:
+            message = f'{{"type": "oauth_success", "platform": "{platform}"}}'
+        else:
+            safe_error = (error_msg or "Unknown error").replace('"', '\\"').replace('\n', ' ')[:200]
+            message = f'{{"type": "oauth_error", "platform": "{platform}", "error": "{safe_error}"}}'
+        
+        return HTMLResponse(f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Connecting...</title></head>
+        <body style="font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1a1a2e; color: white;">
+            <div style="text-align: center;">
+                <p>{"✓ Connected successfully!" if success else "✗ Connection failed"}</p>
+                <p style="color: #888; font-size: 14px;">This window will close automatically...</p>
+            </div>
+            <script>
+                if (window.opener) {{
+                    window.opener.postMessage({message}, '{FRONTEND_URL}');
+                }}
+                setTimeout(() => window.close(), 1500);
+            </script>
+        </body>
+        </html>
+        """)
     
     if error:
-        return RedirectResponse(f"{FRONTEND_URL}/platforms.html?error={quote(error)}")
+        return popup_response(False, platform, error)
     
     if not state or state not in oauth_states:
-        return RedirectResponse(f"{FRONTEND_URL}/platforms.html?error=invalid_state")
+        return popup_response(False, platform, "Invalid or expired session. Please try again.")
     
     state_data = oauth_states.pop(state)
     user_id = state_data["user_id"]
     
     if not code:
-        return RedirectResponse(f"{FRONTEND_URL}/platforms.html?error=no_code")
+        return popup_response(False, platform, "No authorization code received")
     
     config = OAUTH_CONFIG[platform]
     redirect_uri = get_oauth_redirect_uri(platform)
@@ -1485,11 +1518,11 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                         VALUES ($1, $2, $3, $4, $5, $6, $7)
                     """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
             
-            return RedirectResponse(f"{FRONTEND_URL}/platforms.html?success=1&platform={platform}")
+            return popup_response(True, platform)
     
     except Exception as e:
         logger.error(f"OAuth callback error for {platform}: {e}")
-        return RedirectResponse(f"{FRONTEND_URL}/platforms.html?error={quote(str(e))}")
+        return popup_response(False, platform, str(e))
 
 # ============================================================
 # Billing

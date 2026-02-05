@@ -18,7 +18,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Literal, Optional
 from decimal import Decimal
 from urllib.parse import urlencode, quote
 from io import BytesIO
@@ -54,11 +54,14 @@ class UserPreferencesUpdate(BaseModel):
     auto_captions: bool = False
     auto_thumbnails: bool = False
     thumbnail_interval: int = Field(5, ge=1, le=60)
-    default_privacy: str = Field("public", regex="^(public|private|unlisted)$")
+
+    default_privacy: Literal["public", "private", "unlisted"] = "public"
+
     ai_hashtags_enabled: bool = False
     ai_hashtag_count: int = Field(5, ge=1, le=30)
-    ai_hashtag_style: str = Field("mixed", regex="^(lowercase|capitalized|camelcase|mixed)$")
-    hashtag_position: str = Field("end", regex="^(start|end|caption)$")
+    ai_hashtag_style: Literal["lowercase", "capitalized", "camelcase", "mixed"] = "mixed"
+    hashtag_position: Literal["start", "end", "caption"] = "end"
+
     max_hashtags: int = Field(30, ge=1, le=50)
     always_hashtags: List[str] = Field(default_factory=list)
     blocked_hashtags: List[str] = Field(default_factory=list)

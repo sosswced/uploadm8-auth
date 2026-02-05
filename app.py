@@ -432,6 +432,21 @@ class AdminUserUpdate(BaseModel):
     status: Optional[str] = None
     flex_enabled: Optional[bool] = None
 
+class ScheduledUploadUpdate(BaseModel):
+    title: Optional[str] = None
+    scheduled_time: Optional[datetime] = None
+    timezone: Optional[str] = None
+    platforms: Optional[List[str]] = None
+    caption: Optional[str] = None
+    hashtags: Optional[List[str]] = None
+
+class ColorPreferencesUpdate(BaseModel):
+    tiktok_color: Optional[str] = None
+    youtube_color: Optional[str] = None
+    instagram_color: Optional[str] = None
+    facebook_color: Optional[str] = None
+    accent_color: Optional[str] = None
+
 # ============================================================
 # Smart Upload Scheduling
 # ============================================================
@@ -663,6 +678,17 @@ async def run_migrations():
             (15, "CREATE INDEX IF NOT EXISTS idx_uploads_user_status ON uploads(user_id, status)"),
             (16, "CREATE INDEX IF NOT EXISTS idx_ledger_user ON token_ledger(user_id, created_at)"),
             (17, "CREATE INDEX IF NOT EXISTS idx_cost_tracking_date ON cost_tracking(created_at)"),
+            (18, """CREATE TABLE IF NOT EXISTS user_color_preferences (
+                user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                tiktok_color VARCHAR(20) DEFAULT '#000000',
+                youtube_color VARCHAR(20) DEFAULT '#FF0000',
+                instagram_color VARCHAR(20) DEFAULT '#E4405F',
+                facebook_color VARCHAR(20) DEFAULT '#1877F2',
+                accent_color VARCHAR(20) DEFAULT '#F97316',
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW())"""),
+            (19, "CREATE INDEX IF NOT EXISTS idx_uploads_scheduled ON uploads(user_id, scheduled_time) WHERE scheduled_time IS NOT NULL"),
+            (20, "CREATE INDEX IF NOT EXISTS idx_uploads_user_scheduled_status ON uploads(user_id, status, scheduled_time)"),
         ]
         
         for version, sql in migrations:
@@ -1145,6 +1171,346 @@ async def delete_upload(upload_id: str, user: dict = Depends(get_current_user)):
             await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
         await conn.execute("DELETE FROM uploads WHERE id = $1", upload_id)
     return {"status": "deleted"}
+
+# ============================================================
+# Scheduled Uploads Management
+# ============================================================
+@app.get("/api/scheduled/stats")
+async def get_scheduled_stats(user: dict = Depends(get_current_user)):
+    """Get scheduled upload statistics for the current user"""
+    async with db_pool.acquire() as conn:
+        now = _now_utc()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start + timedelta(days=1)
+        week_end = now + timedelta(days=7)
+        
+        # Count pending uploads
+        pending_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM uploads 
+            WHERE user_id = $1 
+            AND scheduled_time IS NOT NULL 
+            AND scheduled_time > $2
+            AND status IN ('pending', 'scheduled', 'queued')
+        """, user["id"], now)
+        
+        # Count uploads today
+        today_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM uploads 
+            WHERE user_id = $1 
+            AND scheduled_time >= $2 
+            AND scheduled_time < $3
+            AND status IN ('pending', 'scheduled', 'queued')
+        """, user["id"], today_start, today_end)
+        
+        # Count uploads this week
+        week_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM uploads 
+            WHERE user_id = $1 
+            AND scheduled_time >= $2 
+            AND scheduled_time < $3
+            AND status IN ('pending', 'scheduled', 'queued')
+        """, user["id"], now, week_end)
+        
+    return {
+        "pending": pending_count or 0,
+        "today": today_count or 0,
+        "week": week_count or 0
+    }
+
+@app.get("/api/scheduled/list")
+async def get_scheduled_list(user: dict = Depends(get_current_user)):
+    """Get list of all scheduled uploads for the current user"""
+    async with db_pool.acquire() as conn:
+        now = _now_utc()
+        
+        uploads = await conn.fetch("""
+            SELECT 
+                id, title, scheduled_time, platforms, 
+                thumbnail_r2_key, caption, status, 
+                created_at, timezone
+            FROM uploads 
+            WHERE user_id = $1 
+            AND scheduled_time IS NOT NULL 
+            AND scheduled_time > $2
+            AND status IN ('pending', 'scheduled', 'queued')
+            ORDER BY scheduled_time ASC
+        """, user["id"], now)
+        
+    result = []
+    for upload in uploads:
+        thumbnail_url = None
+        if upload["thumbnail_r2_key"]:
+            # Generate presigned URL for thumbnail
+            try:
+                s3 = get_s3_client()
+                thumbnail_url = s3.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': R2_BUCKET_NAME, 'Key': upload["thumbnail_r2_key"]},
+                    ExpiresIn=3600
+                )
+            except:
+                pass
+        
+        result.append({
+            "id": str(upload["id"]),
+            "title": upload["title"] or "Untitled",
+            "scheduled_time": upload["scheduled_time"].isoformat() if upload["scheduled_time"] else None,
+            "timezone": upload["timezone"] or "UTC",
+            "platforms": list(upload["platforms"]) if upload["platforms"] else [],
+            "thumbnail": thumbnail_url,
+            "caption": upload["caption"],
+            "status": upload["status"],
+            "created_at": upload["created_at"].isoformat() if upload["created_at"] else None
+        })
+    
+    return result
+
+@app.get("/api/scheduled/{upload_id}")
+async def get_scheduled_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """Get details of a specific scheduled upload"""
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow("""
+            SELECT 
+                id, title, scheduled_time, platforms, timezone,
+                thumbnail_r2_key, caption, hashtags, privacy,
+                status, created_at
+            FROM uploads 
+            WHERE id = $1 AND user_id = $2
+        """, upload_id, user["id"])
+        
+        if not upload:
+            raise HTTPException(404, "Scheduled upload not found")
+        
+        thumbnail_url = None
+        if upload["thumbnail_r2_key"]:
+            try:
+                s3 = get_s3_client()
+                thumbnail_url = s3.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': R2_BUCKET_NAME, 'Key': upload["thumbnail_r2_key"]},
+                    ExpiresIn=3600
+                )
+            except:
+                pass
+        
+    return {
+        "id": str(upload["id"]),
+        "title": upload["title"] or "Untitled",
+        "scheduled_time": upload["scheduled_time"].isoformat() if upload["scheduled_time"] else None,
+        "timezone": upload["timezone"] or "UTC",
+        "platforms": list(upload["platforms"]) if upload["platforms"] else [],
+        "thumbnail": thumbnail_url,
+        "caption": upload["caption"],
+        "hashtags": list(upload["hashtags"]) if upload["hashtags"] else [],
+        "privacy": upload["privacy"],
+        "status": upload["status"],
+        "created_at": upload["created_at"].isoformat() if upload["created_at"] else None
+    }
+
+@app.patch("/api/scheduled/{upload_id}")
+async def update_scheduled_upload(
+    upload_id: str, 
+    update_data: ScheduledUploadUpdate, 
+    user: dict = Depends(get_current_user)
+):
+    """Update a scheduled upload's details"""
+    async with db_pool.acquire() as conn:
+        # Verify ownership
+        upload = await conn.fetchrow(
+            "SELECT id, status FROM uploads WHERE id = $1 AND user_id = $2", 
+            upload_id, user["id"]
+        )
+        
+        if not upload:
+            raise HTTPException(404, "Scheduled upload not found")
+        
+        if upload["status"] not in ['pending', 'scheduled', 'queued']:
+            raise HTTPException(400, "Cannot edit upload that is already processing or completed")
+        
+        # Build update query dynamically
+        updates = []
+        params = [upload_id, user["id"]]
+        param_count = 2
+        
+        if update_data.title is not None:
+            param_count += 1
+            updates.append(f"title = ${param_count}")
+            params.append(update_data.title)
+        
+        if update_data.scheduled_time is not None:
+            param_count += 1
+            updates.append(f"scheduled_time = ${param_count}")
+            params.append(update_data.scheduled_time)
+        
+        if update_data.timezone is not None:
+            param_count += 1
+            updates.append(f"timezone = ${param_count}")
+            params.append(update_data.timezone)
+        
+        if update_data.caption is not None:
+            param_count += 1
+            updates.append(f"caption = ${param_count}")
+            params.append(update_data.caption)
+        
+        if update_data.hashtags is not None:
+            param_count += 1
+            updates.append(f"hashtags = ${param_count}")
+            params.append(update_data.hashtags)
+        
+        if update_data.platforms is not None:
+            param_count += 1
+            updates.append(f"platforms = ${param_count}")
+            params.append(update_data.platforms)
+        
+        if not updates:
+            raise HTTPException(400, "No updates provided")
+        
+        # Always update updated_at
+        param_count += 1
+        updates.append(f"updated_at = ${param_count}")
+        params.append(_now_utc())
+        
+        query = f"""
+            UPDATE uploads 
+            SET {', '.join(updates)}
+            WHERE id = $1 AND user_id = $2
+        """
+        
+        await conn.execute(query, *params)
+    
+    return {"status": "updated", "id": upload_id}
+
+@app.delete("/api/scheduled/{upload_id}")
+async def cancel_scheduled_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """Cancel/delete a scheduled upload"""
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow("""
+            SELECT id, put_reserved, aic_reserved, status 
+            FROM uploads 
+            WHERE id = $1 AND user_id = $2
+        """, upload_id, user["id"])
+        
+        if not upload:
+            raise HTTPException(404, "Scheduled upload not found")
+        
+        if upload["status"] not in ['pending', 'scheduled', 'queued']:
+            raise HTTPException(400, "Cannot cancel upload that is already processing or completed")
+        
+        # Refund reserved tokens if any
+        if upload["put_reserved"] > 0 or upload["aic_reserved"] > 0:
+            await refund_tokens(
+                conn, 
+                user["id"], 
+                upload["put_reserved"], 
+                upload["aic_reserved"], 
+                upload_id
+            )
+        
+        # Delete the upload
+        await conn.execute("DELETE FROM uploads WHERE id = $1", upload_id)
+    
+    return {"status": "cancelled", "id": upload_id}
+
+# ============================================================
+# User Color Preferences
+# ============================================================
+@app.get("/api/colors")
+async def get_color_preferences(user: dict = Depends(get_current_user)):
+    """Get user's custom color preferences for platforms"""
+    async with db_pool.acquire() as conn:
+        prefs = await conn.fetchrow("""
+            SELECT 
+                tiktok_color, youtube_color, instagram_color, 
+                facebook_color, accent_color
+            FROM user_color_preferences 
+            WHERE user_id = $1
+        """, user["id"])
+        
+        if not prefs:
+            # Return defaults
+            return {
+                "tiktok_color": "#000000",
+                "youtube_color": "#FF0000",
+                "instagram_color": "#E4405F",
+                "facebook_color": "#1877F2",
+                "accent_color": "#F97316"
+            }
+        
+    return {
+        "tiktok_color": prefs["tiktok_color"],
+        "youtube_color": prefs["youtube_color"],
+        "instagram_color": prefs["instagram_color"],
+        "facebook_color": prefs["facebook_color"],
+        "accent_color": prefs["accent_color"]
+    }
+
+@app.put("/api/colors")
+async def update_color_preferences(
+    colors: ColorPreferencesUpdate, 
+    user: dict = Depends(get_current_user)
+):
+    """Update user's custom color preferences"""
+    async with db_pool.acquire() as conn:
+        # Check if preferences exist
+        exists = await conn.fetchval(
+            "SELECT 1 FROM user_color_preferences WHERE user_id = $1", 
+            user["id"]
+        )
+        
+        if not exists:
+            # Create default preferences
+            await conn.execute("""
+                INSERT INTO user_color_preferences (user_id) 
+                VALUES ($1)
+            """, user["id"])
+        
+        # Build update query
+        updates = []
+        params = [user["id"]]
+        param_count = 1
+        
+        if colors.tiktok_color is not None:
+            param_count += 1
+            updates.append(f"tiktok_color = ${param_count}")
+            params.append(colors.tiktok_color)
+        
+        if colors.youtube_color is not None:
+            param_count += 1
+            updates.append(f"youtube_color = ${param_count}")
+            params.append(colors.youtube_color)
+        
+        if colors.instagram_color is not None:
+            param_count += 1
+            updates.append(f"instagram_color = ${param_count}")
+            params.append(colors.instagram_color)
+        
+        if colors.facebook_color is not None:
+            param_count += 1
+            updates.append(f"facebook_color = ${param_count}")
+            params.append(colors.facebook_color)
+        
+        if colors.accent_color is not None:
+            param_count += 1
+            updates.append(f"accent_color = ${param_count}")
+            params.append(colors.accent_color)
+        
+        if not updates:
+            raise HTTPException(400, "No color updates provided")
+        
+        # Always update updated_at
+        param_count += 1
+        updates.append(f"updated_at = ${param_count}")
+        params.append(_now_utc())
+        
+        query = f"""
+            UPDATE user_color_preferences 
+            SET {', '.join(updates)}
+            WHERE user_id = $1
+        """
+        
+        await conn.execute(query, *params)
+    
+    return {"status": "updated"}
 
 # ============================================================
 # Account Groups

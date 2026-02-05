@@ -40,6 +40,33 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from contextlib import asynccontextmanager
 
+# ============================================================
+# USER PREFERENCES SYSTEM
+# ============================================================
+
+class PlatformHashtags(BaseModel):
+    tiktok: List[str] = Field(default_factory=list)
+    youtube: List[str] = Field(default_factory=list)
+    instagram: List[str] = Field(default_factory=list)
+    facebook: List[str] = Field(default_factory=list)
+
+class UserPreferencesUpdate(BaseModel):
+    auto_captions: bool = False
+    auto_thumbnails: bool = False
+    thumbnail_interval: int = Field(5, ge=1, le=60)
+    default_privacy: str = Field("public", regex="^(public|private|unlisted)$")
+    ai_hashtags_enabled: bool = False
+    ai_hashtag_count: int = Field(5, ge=1, le=30)
+    ai_hashtag_style: str = Field("mixed", regex="^(lowercase|capitalized|camelcase|mixed)$")
+    hashtag_position: str = Field("end", regex="^(start|end|caption)$")
+    max_hashtags: int = Field(30, ge=1, le=50)
+    always_hashtags: List[str] = Field(default_factory=list)
+    blocked_hashtags: List[str] = Field(default_factory=list)
+    platform_hashtags: PlatformHashtags = Field(default_factory=PlatformHashtags)
+    email_notifications: bool = True
+    discord_webhook: Optional[str] = None
+
+
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("uploadm8-api")
@@ -1227,89 +1254,135 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
 # ============================================================
 @app.post("/api/uploads/presign")
 async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user)):
+    """Create upload with user preferences applied"""
     plan = get_plan(user.get("subscription_tier", "free"))
     wallet = user.get("wallet", {})
-    
-    # Calculate PUT cost (1 per platform, 2x for large files)
-    put_cost = len(data.platforms)
-    if data.file_size > 100 * 1024 * 1024:  # >100MB
-        put_cost *= 2
-    
-    # Calculate AIC cost if using AI
-    aic_cost = 0
-    if data.use_ai and plan.get("ai"):
-        aic_cost = 1  # 1 AIC per AI generation
-    
-    # Check balance
-    put_avail = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
-    aic_avail = wallet.get("aic_balance", 0) - wallet.get("aic_reserved", 0)
-    if put_avail < put_cost:
-        raise HTTPException(429, f"Insufficient PUT tokens ({put_avail} available, {put_cost} needed)")
-    if aic_cost > 0 and aic_avail < aic_cost:
-        raise HTTPException(429, f"Insufficient AIC credits ({aic_avail} available, {aic_cost} needed)")
-    
-    upload_id = str(uuid.uuid4())
-    r2_key = f"uploads/{user['id']}/{upload_id}/{data.filename}"
-    
-    # Handle smart scheduling - create separate upload records per platform with different times
-    smart_schedule = None
-    if data.schedule_mode == "smart":
-        smart_schedule = calculate_smart_schedule(
-            data.platforms, 
-            num_days=data.smart_schedule_days
-        )
-    
+
+    # Normalize optional fields coming from the client
+    if getattr(data, "hashtags", None) is None:
+        data.hashtags = []
+    if getattr(data, "platforms", None) is None:
+        data.platforms = []
+
     async with db_pool.acquire() as conn:
-        # Check for existing scheduled uploads to avoid day conflicts
-        if data.schedule_mode == "smart":
-            existing_days = await get_existing_scheduled_days(conn, user["id"], data.smart_schedule_days)
-            # Recalculate if there are conflicts
+        # Fetch user preferences to apply defaults
+        user_prefs = await get_user_prefs_for_upload(conn, user["id"])
+
+        # Apply preference defaults if user didn't specify
+        if not getattr(data, "privacy", None):
+            data.privacy = user_prefs["default_privacy"]
+
+        # Apply hashtag rules (only when plan allows AI features)
+        if user_prefs["ai_hashtags_enabled"] and plan.get("ai"):
+            combined = list(data.hashtags) + list(user_prefs.get("always_hashtags", []))
+
+            # Apply platform-specific hashtags
+            platform_hashtags = user_prefs.get("platform_hashtags") or {}
+            for platform in data.platforms:
+                tags = platform_hashtags.get(platform) if isinstance(platform_hashtags, dict) else None
+                if tags:
+                    combined.extend(tags)
+
+            # Deduplicate, remove blocked, and limit
+            blocked = set(user_prefs.get("blocked_hashtags", []) or [])
+            combined = [h for h in combined if h and h not in blocked]
+            data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
+
+        # Calculate PUT cost
+        put_cost = len(data.platforms)
+        if data.file_size > 100 * 1024 * 1024:
+            put_cost *= 2
+
+        # Calculate AIC cost
+        aic_cost = 0
+        if getattr(data, "use_ai", False) and plan.get("ai"):
+            aic_cost = 1
+            if user_prefs.get("auto_captions"):
+                aic_cost += 1
+            if user_prefs.get("auto_thumbnails"):
+                aic_cost += 1
+            if user_prefs.get("ai_hashtags_enabled"):
+                aic_cost += 1
+
+        # Check balance
+        put_avail = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
+        aic_avail = wallet.get("aic_balance", 0) - wallet.get("aic_reserved", 0)
+
+        if put_avail < put_cost:
+            raise HTTPException(429, f"Insufficient PUT tokens ({put_avail} available, {put_cost} needed)")
+        if aic_cost > 0 and aic_avail < aic_cost:
+            raise HTTPException(429, f"Insufficient AIC credits ({aic_avail} available, {aic_cost} needed)")
+
+        upload_id = str(uuid.uuid4())
+        r2_key = f"uploads/{user['id']}/{upload_id}/{data.filename}"
+
+        # Smart scheduling logic
+        smart_schedule = None
+        if getattr(data, "schedule_mode", None) == "smart":
+            smart_schedule = calculate_smart_schedule(
+                data.platforms,
+                num_days=getattr(data, "smart_schedule_days", 7)
+            )
+            existing_days = await get_existing_scheduled_days(conn, user["id"], getattr(data, "smart_schedule_days", 7))
             if existing_days:
                 smart_schedule = calculate_smart_schedule(
-                    data.platforms, 
-                    num_days=data.smart_schedule_days
+                    data.platforms,
+                    num_days=getattr(data, "smart_schedule_days", 7)
                 )
-        
-        # For smart scheduling, we create one upload but store the schedule in metadata
-        scheduled_time = data.scheduled_time
+
+        scheduled_time = getattr(data, "scheduled_time", None)
         schedule_metadata = None
-        
-        if data.schedule_mode == "smart" and smart_schedule:
-            # Store the per-platform schedule as JSON metadata
+
+        if getattr(data, "schedule_mode", None) == "smart" and smart_schedule:
             schedule_metadata = {p: dt.isoformat() for p, dt in smart_schedule.items()}
-            # Use the earliest time as the main scheduled_time
             scheduled_time = min(smart_schedule.values())
-        
+
+        # Store upload with preferences metadata
         await conn.execute("""
-            INSERT INTO uploads (id, user_id, r2_key, filename, file_size, platforms, title, caption, hashtags, privacy, status, scheduled_time, schedule_mode, put_reserved, aic_reserved, schedule_metadata)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15)
-        """, upload_id, user["id"], r2_key, data.filename, data.file_size, data.platforms, data.title, data.caption, data.hashtags, data.privacy, scheduled_time, data.schedule_mode, put_cost, aic_cost, json.dumps(schedule_metadata) if schedule_metadata else None)
-        
+            INSERT INTO uploads (
+                id, user_id, r2_key, filename, file_size, platforms,
+                title, caption, hashtags, privacy, status, scheduled_time,
+                schedule_mode, put_reserved, aic_reserved, schedule_metadata,
+                user_preferences
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15, $16)
+        """,
+            upload_id, user["id"], r2_key, data.filename, data.file_size,
+            data.platforms, data.title, data.caption, data.hashtags,
+            data.privacy, scheduled_time, data.schedule_mode, put_cost,
+            aic_cost, json.dumps(schedule_metadata) if schedule_metadata else None,
+            json.dumps(user_prefs)
+        )
+
         # Reserve tokens
         await reserve_tokens(conn, user["id"], put_cost, aic_cost, upload_id)
-    
+
     presigned_url = generate_presigned_upload_url(r2_key, data.content_type)
     result = {
-        "upload_id": upload_id, 
-        "presigned_url": presigned_url, 
-        "r2_key": r2_key, 
-        "put_cost": put_cost, 
+        "upload_id": upload_id,
+        "presigned_url": presigned_url,
+        "r2_key": r2_key,
+        "put_cost": put_cost,
         "aic_cost": aic_cost,
-        "schedule_mode": data.schedule_mode
+        "schedule_mode": data.schedule_mode,
+        "preferences_applied": {
+            "auto_captions": bool(user_prefs.get("auto_captions")),
+            "auto_thumbnails": bool(user_prefs.get("auto_thumbnails")),
+            "ai_hashtags": bool(user_prefs.get("ai_hashtags_enabled"))
+        }
     }
-    
-    # Include smart schedule info in response
+
     if smart_schedule:
         result["smart_schedule"] = {p: dt.isoformat() for p, dt in smart_schedule.items()}
-    
-    if data.has_telemetry:
+
+    if getattr(data, "has_telemetry", False):
         telem_key = f"uploads/{user['id']}/{upload_id}/telemetry.map"
         result["telemetry_presigned_url"] = generate_presigned_upload_url(telem_key, "application/octet-stream")
         result["telemetry_r2_key"] = telem_key
-    
+
     return result
 
-# Endpoint to preview smart schedule without creating upload
+
 @app.post("/api/uploads/smart-schedule/preview")
 async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = Query(7), user: dict = Depends(get_current_user)):
     """Preview what the smart schedule would look like for given platforms"""
@@ -1332,14 +1405,48 @@ async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = 
 
 @app.post("/api/uploads/{upload_id}/complete")
 async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """Complete upload and enqueue with preferences"""
     async with db_pool.acquire() as conn:
-        upload = await conn.fetchrow("SELECT * FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user["id"])
-        if not upload: raise HTTPException(404, "Upload not found")
-        await conn.execute("UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1", upload_id)
-    
+        upload = await conn.fetchrow(
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"]
+        )
+        if not upload:
+            raise HTTPException(404, "Upload not found")
+
+        # Fetch preferences again (in case they changed)
+        user_prefs = await get_user_prefs_for_upload(conn, user["id"])
+
+        await conn.execute(
+            "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
+            upload_id
+        )
+
     plan = get_plan(user.get("subscription_tier", "free"))
-    await enqueue_job({"upload_id": upload_id, "user_id": str(user["id"])}, priority=plan.get("priority", False))
-    return {"status": "queued", "upload_id": upload_id}
+
+    job_data = {
+        "upload_id": upload_id,
+        "user_id": str(user["id"]),
+        "preferences": user_prefs,
+        "plan_features": {
+            "ai": plan.get("ai", False),
+            "priority": plan.get("priority", False),
+            "watermark": plan.get("watermark", True)
+        }
+    }
+
+    await enqueue_job(job_data, priority=plan.get("priority", False))
+
+    return {
+        "status": "queued",
+        "upload_id": upload_id,
+        "processing_features": {
+            "auto_captions": bool(user_prefs.get("auto_captions")) if plan.get("ai") else False,
+            "auto_thumbnails": bool(user_prefs.get("auto_thumbnails")) if plan.get("ai") else False,
+            "ai_hashtags": bool(user_prefs.get("ai_hashtags_enabled")) if plan.get("ai") else False
+        }
+    }
+
 
 @app.post("/api/uploads/{upload_id}/cancel")
 async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
@@ -1726,6 +1833,142 @@ async def update_color_preferences(
 # ============================================================
 # Account Groups
 # ============================================================
+@app.get("/api/settings/preferences")
+async def get_user_preferences(user: dict = Depends(get_current_user)):
+    """GET user content preferences - used by settings page AND upload workflow"""
+    async with db_pool.acquire() as conn:
+        prefs = await conn.fetchrow(
+            "SELECT * FROM user_preferences WHERE user_id = $1",
+            user["id"]
+        )
+
+        # Create default if doesn't exist
+        if not prefs:
+            await conn.execute(
+                "INSERT INTO user_preferences (user_id) VALUES ($1)",
+                user["id"]
+            )
+            prefs = await conn.fetchrow(
+                "SELECT * FROM user_preferences WHERE user_id = $1",
+                user["id"]
+            )
+
+        return {
+            "autoCaptions": prefs["auto_captions"],
+            "autoThumbnails": prefs["auto_thumbnails"],
+            "thumbnailInterval": str(prefs["thumbnail_interval"]),
+            "defaultPrivacy": prefs["default_privacy"],
+            "aiHashtagsEnabled": prefs["ai_hashtags_enabled"],
+            "aiHashtagCount": str(prefs["ai_hashtag_count"]),
+            "aiHashtagStyle": prefs["ai_hashtag_style"],
+            "hashtagPosition": prefs["hashtag_position"],
+            "maxHashtags": str(prefs["max_hashtags"]),
+            "alwaysHashtags": prefs["always_hashtags"] or [],
+            "blockedHashtags": prefs["blocked_hashtags"] or [],
+            "platformHashtags": prefs["platform_hashtags"] or {
+                "tiktok": [], "youtube": [], "instagram": [], "facebook": []
+            },
+            "emailNotifications": prefs["email_notifications"],
+            "discordWebhook": prefs["discord_webhook"]
+        }
+
+@app.post("/api/settings/preferences")
+async def save_user_preferences(
+    prefs: UserPreferencesUpdate,
+    user: dict = Depends(get_current_user)
+):
+    """SAVE user content preferences"""
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM user_preferences WHERE user_id = $1",
+            user["id"]
+        )
+        if not exists:
+            await conn.execute(
+                "INSERT INTO user_preferences (user_id) VALUES ($1)",
+                user["id"]
+            )
+
+        await conn.execute("""
+            UPDATE user_preferences SET
+                auto_captions = $1,
+                auto_thumbnails = $2,
+                thumbnail_interval = $3,
+                default_privacy = $4,
+                ai_hashtags_enabled = $5,
+                ai_hashtag_count = $6,
+                ai_hashtag_style = $7,
+                hashtag_position = $8,
+                max_hashtags = $9,
+                always_hashtags = $10,
+                blocked_hashtags = $11,
+                platform_hashtags = $12,
+                email_notifications = $13,
+                discord_webhook = $14,
+                updated_at = NOW()
+            WHERE user_id = $15
+        """,
+            prefs.auto_captions,
+            prefs.auto_thumbnails,
+            prefs.thumbnail_interval,
+            prefs.default_privacy,
+            prefs.ai_hashtags_enabled,
+            prefs.ai_hashtag_count,
+            prefs.ai_hashtag_style,
+            prefs.hashtag_position,
+            prefs.max_hashtags,
+            prefs.always_hashtags,
+            prefs.blocked_hashtags,
+            prefs.platform_hashtags.dict(),
+            prefs.email_notifications,
+            prefs.discord_webhook,
+            user["id"]
+        )
+
+    return {"success": True, "message": "Preferences saved successfully"}
+
+async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
+    """Helper to fetch user preferences for upload processing"""
+    prefs = await conn.fetchrow(
+        "SELECT * FROM user_preferences WHERE user_id = $1",
+        user_id
+    )
+
+    if not prefs:
+        return {
+            "auto_captions": False,
+            "auto_thumbnails": False,
+            "thumbnail_interval": 5,
+            "default_privacy": "public",
+            "ai_hashtags_enabled": False,
+            "ai_hashtag_count": 5,
+            "ai_hashtag_style": "mixed",
+            "hashtag_position": "end",
+            "max_hashtags": 30,
+            "always_hashtags": [],
+            "blocked_hashtags": [],
+            "platform_hashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
+            "email_notifications": True,
+            "discord_webhook": None
+        }
+
+    return {
+        "auto_captions": prefs["auto_captions"],
+        "auto_thumbnails": prefs["auto_thumbnails"],
+        "thumbnail_interval": prefs["thumbnail_interval"],
+        "default_privacy": prefs["default_privacy"],
+        "ai_hashtags_enabled": prefs["ai_hashtags_enabled"],
+        "ai_hashtag_count": prefs["ai_hashtag_count"],
+        "ai_hashtag_style": prefs["ai_hashtag_style"],
+        "hashtag_position": prefs["hashtag_position"],
+        "max_hashtags": prefs["max_hashtags"],
+        "always_hashtags": prefs["always_hashtags"] or [],
+        "blocked_hashtags": prefs["blocked_hashtags"] or [],
+        "platform_hashtags": prefs["platform_hashtags"] or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
+        "email_notifications": prefs["email_notifications"],
+        "discord_webhook": prefs["discord_webhook"]
+    }
+
 @app.get("/api/groups")
 async def get_groups(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:

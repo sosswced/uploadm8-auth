@@ -412,6 +412,25 @@ class PasswordChange(BaseModel):
     current_password: str
     new_password: str = Field(min_length=8)
 
+class ProfileUpdateSettings(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+class PreferencesUpdate(BaseModel):
+    emailNotifs: Optional[bool] = None
+    uploadCompleteNotifs: Optional[bool] = None
+    marketingEmails: Optional[bool] = None
+    theme: Optional[str] = None
+    accentColor: Optional[str] = None
+    defaultPrivacy: Optional[str] = None
+    autoPublish: Optional[bool] = None
+    alwaysHashtags: Optional[List[str]] = None
+    blockedHashtags: Optional[List[str]] = None
+    tiktokHashtags: Optional[str] = None
+    youtubeHashtags: Optional[str] = None
+    instagramHashtags: Optional[str] = None
+    facebookHashtags: Optional[str] = None
+
 class TransferRequest(BaseModel):
     from_platform: str
     to_platform: str
@@ -689,6 +708,9 @@ async def run_migrations():
                 updated_at TIMESTAMPTZ DEFAULT NOW())"""),
             (19, "CREATE INDEX IF NOT EXISTS idx_uploads_scheduled ON uploads(user_id, scheduled_time) WHERE scheduled_time IS NOT NULL"),
             (20, "CREATE INDEX IF NOT EXISTS idx_uploads_user_scheduled_status ON uploads(user_id, status, scheduled_time)"),
+            (21, "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(255)"),
+            (22, "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(255)"),
+            (23, "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS preferences_json JSONB DEFAULT '{}'"),
         ]
         
         for version, sql in migrations:
@@ -823,7 +845,10 @@ async def get_me(user: dict = Depends(get_current_user)):
     return {
         "id": str(user["id"]), 
         "email": user["email"], 
-        "name": user["name"], 
+        "name": user["name"],
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "tier_name": plan.get("name", "Free"),
         "role": role,
         "subscription_tier": tier, 
         "subscription_status": user.get("subscription_status"),
@@ -890,6 +915,145 @@ async def change_password(data: PasswordChange, user: dict = Depends(get_current
     
     logger.info(f"Password changed for user {user['id']}")
     return {"status": "password_changed"}
+
+# ============================================================
+# Settings Endpoints
+# ============================================================
+@app.put("/api/settings/profile")
+async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depends(get_current_user)):
+    """Update user profile (first name, last name)"""
+    updates, params = [], [user["id"]]
+    
+    if data.first_name is not None:
+        updates.append(f"first_name = ${len(params)+1}")
+        params.append(data.first_name.strip())
+    
+    if data.last_name is not None:
+        updates.append(f"last_name = ${len(params)+1}")
+        params.append(data.last_name.strip())
+    
+    # Also update the combined name field for backwards compatibility
+    if data.first_name is not None or data.last_name is not None:
+        first = data.first_name.strip() if data.first_name else user.get("first_name", "")
+        last = data.last_name.strip() if data.last_name else user.get("last_name", "")
+        full_name = f"{first} {last}".strip() or user.get("name", "User")
+        updates.append(f"name = ${len(params)+1}")
+        params.append(full_name)
+    
+    if updates:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", 
+                *params
+            )
+        logger.info(f"Profile updated for user {user['id']}")
+        return {"status": "success", "message": "Profile updated successfully"}
+    
+    return {"status": "success", "message": "No changes made"}
+
+@app.put("/api/settings/preferences")
+async def update_preferences(data: PreferencesUpdate, user: dict = Depends(get_current_user)):
+    """Update user preferences (notifications, theme, hashtags, etc.)"""
+    async with db_pool.acquire() as conn:
+        # Ensure user_settings row exists
+        await conn.execute(
+            "INSERT INTO user_settings (user_id, preferences_json) VALUES ($1, '{}') ON CONFLICT (user_id) DO NOTHING",
+            user["id"]
+        )
+        
+        # Get current preferences
+        current_prefs = await conn.fetchval(
+            "SELECT preferences_json FROM user_settings WHERE user_id = $1",
+            user["id"]
+        )
+        
+        # Parse current preferences
+        prefs = current_prefs if current_prefs else {}
+        if isinstance(prefs, str):
+            prefs = json.loads(prefs)
+        
+        # Update with new values (only update fields that are provided)
+        if data.emailNotifs is not None:
+            prefs["emailNotifs"] = data.emailNotifs
+        if data.uploadCompleteNotifs is not None:
+            prefs["uploadCompleteNotifs"] = data.uploadCompleteNotifs
+        if data.marketingEmails is not None:
+            prefs["marketingEmails"] = data.marketingEmails
+        if data.theme is not None:
+            prefs["theme"] = data.theme
+        if data.accentColor is not None:
+            prefs["accentColor"] = data.accentColor
+        if data.defaultPrivacy is not None:
+            prefs["defaultPrivacy"] = data.defaultPrivacy
+        if data.autoPublish is not None:
+            prefs["autoPublish"] = data.autoPublish
+        if data.alwaysHashtags is not None:
+            prefs["alwaysHashtags"] = data.alwaysHashtags
+        if data.blockedHashtags is not None:
+            prefs["blockedHashtags"] = data.blockedHashtags
+        if data.tiktokHashtags is not None:
+            prefs["tiktokHashtags"] = data.tiktokHashtags
+        if data.youtubeHashtags is not None:
+            prefs["youtubeHashtags"] = data.youtubeHashtags
+        if data.instagramHashtags is not None:
+            prefs["instagramHashtags"] = data.instagramHashtags
+        if data.facebookHashtags is not None:
+            prefs["facebookHashtags"] = data.facebookHashtags
+        
+        # Save back to database
+        await conn.execute(
+            "UPDATE user_settings SET preferences_json = $1, updated_at = NOW() WHERE user_id = $2",
+            json.dumps(prefs),
+            user["id"]
+        )
+    
+    logger.info(f"Preferences updated for user {user['id']}")
+    return {"status": "success", "message": "Preferences saved successfully", "preferences": prefs}
+
+@app.get("/api/settings/preferences")
+async def get_preferences(user: dict = Depends(get_current_user)):
+    """Get user preferences"""
+    async with db_pool.acquire() as conn:
+        # Ensure user_settings row exists
+        await conn.execute(
+            "INSERT INTO user_settings (user_id, preferences_json) VALUES ($1, '{}') ON CONFLICT (user_id) DO NOTHING",
+            user["id"]
+        )
+        
+        # Get preferences
+        prefs_json = await conn.fetchval(
+            "SELECT preferences_json FROM user_settings WHERE user_id = $1",
+            user["id"]
+        )
+        
+        prefs = prefs_json if prefs_json else {}
+        if isinstance(prefs, str):
+            prefs = json.loads(prefs)
+    
+    return {"preferences": prefs}
+
+@app.put("/api/settings/password")
+async def update_password_settings(data: PasswordChange, user: dict = Depends(get_current_user)):
+    """Change user password (settings endpoint version)"""
+    async with db_pool.acquire() as conn:
+        # Verify current password
+        user_row = await conn.fetchrow("SELECT password_hash FROM users WHERE id = $1", user["id"])
+        if not user_row or not verify_password(data.current_password, user_row["password_hash"]):
+            raise HTTPException(401, "Current password is incorrect")
+        
+        # Update to new password
+        new_hash = hash_password(data.new_password)
+        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", new_hash, user["id"])
+        
+        # Optionally invalidate other sessions (refresh tokens)
+        await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
+    
+    logger.info(f"Password changed via settings for user {user['id']}")
+    return {"status": "success", "message": "Password changed successfully"}
+
+# ============================================================
+# End Settings Endpoints
+# ============================================================
 
 @app.delete("/api/me")
 async def delete_account(user: dict = Depends(get_current_user)):

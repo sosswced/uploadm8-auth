@@ -1260,9 +1260,10 @@ OAUTH_CONFIG = {
         "scope": "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly",
     },
     "instagram": {
-        "auth_url": "https://api.instagram.com/oauth/authorize",
-        "token_url": "https://api.instagram.com/oauth/access_token",
-        "scope": "user_profile,user_media",
+        # Instagram Graph API uses Facebook OAuth (for publishing Reels)
+        "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
+        "token_url": "https://graph.facebook.com/v18.0/oauth/access_token",
+        "scope": "instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement,business_management",
     },
     "facebook": {
         "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
@@ -1285,9 +1286,9 @@ YOUTUBE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "") or os.environ
 # Meta (Facebook & Instagram have SEPARATE credentials)
 META_APP_ID = os.environ.get("META_APP_ID", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
-# Instagram Basic Display uses its own App ID (completely separate from Facebook)
-INSTAGRAM_CLIENT_ID = os.environ.get("INSTAGRAM_CLIENT_ID", "")
-INSTAGRAM_CLIENT_SECRET = os.environ.get("INSTAGRAM_CLIENT_SECRET", "")
+# Instagram Graph API authenticates via Facebook OAuth (uses META credentials)
+INSTAGRAM_CLIENT_ID = META_APP_ID
+INSTAGRAM_CLIENT_SECRET = META_APP_SECRET
 # Facebook uses the main Meta App ID
 FACEBOOK_CLIENT_ID = os.environ.get("FACEBOOK_CLIENT_ID", "") or META_APP_ID
 FACEBOOK_CLIENT_SECRET = os.environ.get("FACEBOOK_CLIENT_SECRET", "") or META_APP_SECRET
@@ -1456,25 +1457,64 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     account_avatar = ""
                     
             elif platform == "instagram":
-                token_response = await client.post(config["token_url"], data={
+                # Instagram Graph API: authenticate via Facebook, get Instagram Business Account
+                token_response = await client.get(config["token_url"], params={
                     "client_id": INSTAGRAM_CLIENT_ID,
                     "client_secret": INSTAGRAM_CLIENT_SECRET,
                     "code": code,
-                    "grant_type": "authorization_code",
                     "redirect_uri": redirect_uri,
                 })
                 token_data = token_response.json()
-                access_token = token_data.get("access_token")
-                account_id = str(token_data.get("user_id", secrets.token_hex(8)))
+                user_access_token = token_data.get("access_token")
                 
-                # Get user info
-                user_response = await client.get(
-                    f"https://graph.instagram.com/me?fields=id,username&access_token={access_token}"
+                if not user_access_token:
+                    raise Exception(f"No access token: {token_data}")
+                
+                # Get Facebook Pages the user manages
+                pages_response = await client.get(
+                    f"https://graph.facebook.com/v18.0/me/accounts?access_token={user_access_token}"
                 )
-                user_data = user_response.json()
-                account_name = user_data.get("username", "Instagram User")
-                account_username = user_data.get("username", "")
-                account_avatar = ""
+                pages_data = pages_response.json()
+                pages = pages_data.get("data", [])
+                
+                if not pages:
+                    raise Exception("No Facebook Pages found. You need a Facebook Page connected to an Instagram Business account.")
+                
+                # Find Instagram Business Account connected to any page
+                instagram_account = None
+                page_access_token = None
+                
+                for page in pages:
+                    page_id = page.get("id")
+                    page_token = page.get("access_token")
+                    
+                    # Check if this page has an Instagram Business Account
+                    ig_response = await client.get(
+                        f"https://graph.facebook.com/v18.0/{page_id}?fields=instagram_business_account&access_token={page_token}"
+                    )
+                    ig_data = ig_response.json()
+                    
+                    if "instagram_business_account" in ig_data:
+                        ig_account_id = ig_data["instagram_business_account"]["id"]
+                        
+                        # Get Instagram account details
+                        ig_details_response = await client.get(
+                            f"https://graph.facebook.com/v18.0/{ig_account_id}?fields=id,username,name,profile_picture_url&access_token={page_token}"
+                        )
+                        ig_details = ig_details_response.json()
+                        
+                        instagram_account = ig_details
+                        page_access_token = page_token
+                        break
+                
+                if not instagram_account:
+                    raise Exception("No Instagram Business account found connected to your Facebook Pages. Connect your Instagram Business/Creator account to a Facebook Page first.")
+                
+                account_id = instagram_account.get("id")
+                account_name = instagram_account.get("name") or instagram_account.get("username", "Instagram Account")
+                account_username = instagram_account.get("username", "")
+                account_avatar = instagram_account.get("profile_picture_url", "")
+                access_token = page_access_token  # Use Page token for API calls
                 
             elif platform == "facebook":
                 token_response = await client.get(config["token_url"], params={

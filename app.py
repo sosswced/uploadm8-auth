@@ -34,7 +34,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import stripe
 import redis.asyncio as aioredis
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request, UploadFile, File
 from fastapi.responses import RedirectResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
@@ -1050,6 +1050,53 @@ async def update_password_settings(data: PasswordChange, user: dict = Depends(ge
     
     logger.info(f"Password changed via settings for user {user['id']}")
     return {"status": "success", "message": "Password changed successfully"}
+
+@app.post("/api/settings/avatar")
+async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    """Upload profile picture"""
+    # Validate file type
+    allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(400, f"Invalid file type. Allowed: {', '.join(allowed_types)}")
+    
+    # Validate file size (max 5MB)
+    contents = await file.read()
+    file_size = len(contents)
+    if file_size > 5 * 1024 * 1024:  # 5MB
+        raise HTTPException(400, "File size must be less than 5MB")
+    
+    # Generate unique filename
+    file_ext = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+    r2_key = f"avatars/{user['id']}/{uuid.uuid4()}.{file_ext}"
+    
+    # Upload to R2
+    try:
+        s3 = get_s3_client()
+        s3.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=r2_key,
+            Body=contents,
+            ContentType=file.content_type,
+            CacheControl="public, max-age=31536000"  # Cache for 1 year
+        )
+        
+        # Generate public URL (adjust based on your R2 public domain setup)
+        avatar_url = f"https://{R2_BUCKET_NAME}.r2.dev/{r2_key}"
+        
+        # Update user's avatar_url in database
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET avatar_url = $1, updated_at = NOW() WHERE id = $2",
+                avatar_url,
+                user["id"]
+            )
+        
+        logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
+        return {"status": "success", "avatar_url": avatar_url}
+        
+    except Exception as e:
+        logger.error(f"Avatar upload failed for user {user['id']}: {e}")
+        raise HTTPException(500, "Failed to upload avatar")
 
 # ============================================================
 # End Settings Endpoints

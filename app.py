@@ -1282,12 +1282,15 @@ TIKTOK_CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "")
 YOUTUBE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "") or os.environ.get("YOUTUBE_CLIENT_ID", "")
 YOUTUBE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "") or os.environ.get("YOUTUBE_CLIENT_SECRET", "")
 # Meta (Facebook & Instagram share credentials)
+# Meta (Facebook & Instagram have SEPARATE credentials)
 META_APP_ID = os.environ.get("META_APP_ID", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
-INSTAGRAM_CLIENT_ID = META_APP_ID or os.environ.get("INSTAGRAM_CLIENT_ID", "")
-INSTAGRAM_CLIENT_SECRET = META_APP_SECRET or os.environ.get("INSTAGRAM_CLIENT_SECRET", "")
-FACEBOOK_CLIENT_ID = META_APP_ID or os.environ.get("FACEBOOK_CLIENT_ID", "")
-FACEBOOK_CLIENT_SECRET = META_APP_SECRET or os.environ.get("FACEBOOK_CLIENT_SECRET", "")
+# Instagram Basic Display uses its own App ID (completely separate from Facebook)
+INSTAGRAM_CLIENT_ID = os.environ.get("INSTAGRAM_CLIENT_ID", "")
+INSTAGRAM_CLIENT_SECRET = os.environ.get("INSTAGRAM_CLIENT_SECRET", "")
+# Facebook uses the main Meta App ID
+FACEBOOK_CLIENT_ID = os.environ.get("FACEBOOK_CLIENT_ID", "") or META_APP_ID
+FACEBOOK_CLIENT_SECRET = os.environ.get("FACEBOOK_CLIENT_SECRET", "") or META_APP_SECRET
 
 def get_oauth_redirect_uri(platform: str) -> str:
     return f"{BASE_URL}/api/oauth/{platform}/callback"

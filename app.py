@@ -810,6 +810,32 @@ async def run_migrations():
                 WHERE 
                     (always_hashtags::text LIKE '%\\\\%' OR always_hashtags::text LIKE '%["%')
                     OR (blocked_hashtags::text LIKE '%\\\\%' OR blocked_hashtags::text LIKE '%["%');"""),
+
+            (27, '''
+                -- Queue / analytics fields
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS duration INT;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS progress INT DEFAULT 0;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS comments BIGINT DEFAULT 0;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS shares BIGINT DEFAULT 0;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS account_name VARCHAR(255);
+
+                -- Telemetry flags
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS telemetry_processed BOOLEAN DEFAULT FALSE;
+
+                -- Performance indexes
+                CREATE INDEX IF NOT EXISTS idx_uploads_user_status_created
+                ON uploads(user_id, status, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_uploads_platforms
+                ON uploads USING GIN(platforms);
+            '''),
+
+            (28, '''
+                -- Playback + platform ids/urls
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS video_url VARCHAR(1024);
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS platform_video_id VARCHAR(255);
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS platform_url VARCHAR(1024);
+            '''),
         ]
         
         for version, sql in migrations:
@@ -1590,27 +1616,541 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
     }
 
 
+# ============================================================
+# ENHANCED UPLOAD + QUEUE MANAGEMENT ENDPOINTS
+# (Queue.html compatibility + retry/cancel semantics)
+# ============================================================
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Get detailed information about a specific upload.
+    Used by queue.html for upload detail modal.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT 
+                id, user_id, r2_key, filename, file_size, platforms,
+                title, caption, hashtags, privacy, status, cancel_requested,
+                scheduled_time, schedule_mode, processing_started_at, 
+                processing_finished_at, completed_at, error_code, error_detail,
+                put_reserved, put_spent, aic_reserved, aic_spent,
+                views, likes, comments, shares,
+                thumbnail_r2_key, video_url, platform_results,
+                created_at, updated_at, duration, account_name
+            FROM uploads 
+            WHERE id = $1 AND user_id = $2
+        """, upload_id, user["id"])
+
+        if not row:
+            raise HTTPException(404, "Upload not found")
+
+        upload = dict(row)
+
+        # Generate thumbnail URL if available
+        thumbnail_url = None
+        if upload.get("thumbnail_r2_key"):
+            try:
+                s3 = get_s3_client()
+                thumbnail_url = s3.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': R2_BUCKET_NAME, 'Key': upload["thumbnail_r2_key"]},
+                    ExpiresIn=3600
+                )
+            except Exception as e:
+                logger.warning(f"Failed to generate thumbnail URL: {e}")
+
+        # Parse platform results if available
+        platform_results = None
+        if upload.get("platform_results"):
+            try:
+                platform_results = json.loads(upload["platform_results"]) if isinstance(upload["platform_results"], str) else upload["platform_results"]
+            except Exception:
+                platform_results = None
+
+        return {
+            "id": str(upload["id"]),
+            "filename": upload.get("filename"),
+            "file_size": upload.get("file_size"),
+            "platforms": list(upload["platforms"]) if upload.get("platforms") else [],
+            "title": upload.get("title"),
+            "caption": upload.get("caption"),
+            "hashtags": list(upload["hashtags"]) if upload.get("hashtags") else [],
+            "privacy": upload.get("privacy"),
+            "status": upload.get("status"),
+            "cancel_requested": upload.get("cancel_requested"),
+            "scheduled_time": upload["scheduled_time"].isoformat() if upload.get("scheduled_time") else None,
+            "schedule_mode": upload.get("schedule_mode"),
+            "processing_started_at": upload["processing_started_at"].isoformat() if upload.get("processing_started_at") else None,
+            "processing_finished_at": upload["processing_finished_at"].isoformat() if upload.get("processing_finished_at") else None,
+            "completed_at": upload["completed_at"].isoformat() if upload.get("completed_at") else None,
+            "error": upload.get("error_detail") or upload.get("error_code"),
+            "error_code": upload.get("error_code"),
+            "error_detail": upload.get("error_detail"),
+            "put_reserved": upload.get("put_reserved"),
+            "put_spent": upload.get("put_spent"),
+            "aic_reserved": upload.get("aic_reserved"),
+            "aic_spent": upload.get("aic_spent"),
+            "views": upload.get("views") or 0,
+            "likes": upload.get("likes") or 0,
+            "comments": upload.get("comments") or 0,
+            "shares": upload.get("shares") or 0,
+            "thumbnail_url": thumbnail_url,
+            "video_url": upload.get("video_url"),
+            "platform_results": platform_results,
+            "created_at": upload["created_at"].isoformat() if upload.get("created_at") else None,
+            "updated_at": upload["updated_at"].isoformat() if upload.get("updated_at") else None,
+            "duration": upload.get("duration"),
+            "account_name": upload.get("account_name") or "Unknown"
+        }
+
+
+@app.post("/api/uploads/{upload_id}/retry")
+async def retry_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Retry a failed upload.
+    Used by queue.html retry button.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, user_id, status, put_reserved, aic_reserved, put_spent, aic_spent
+            FROM uploads 
+            WHERE id = $1 AND user_id = $2
+        """, upload_id, user["id"])
+
+        if not row:
+            raise HTTPException(404, "Upload not found")
+
+        upload = dict(row)
+
+        if upload["status"] != "failed":
+            raise HTTPException(400, "Only failed uploads can be retried")
+
+        # Reset upload status to pending
+        await conn.execute("""
+            UPDATE uploads 
+            SET status = 'pending',
+                cancel_requested = FALSE,
+                error_code = NULL,
+                error_detail = NULL,
+                processing_started_at = NULL,
+                processing_finished_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+        """, upload_id)
+
+        # If tokens were already spent, we need to re-reserve them
+        wallet = await get_wallet(conn, str(upload["user_id"]))
+        put_available = wallet["put_balance"] - wallet["put_reserved"]
+        aic_available = wallet["aic_balance"] - wallet["aic_reserved"]
+
+        # Tokens needed (already spent previously)
+        put_needed = (upload.get("put_reserved") or 0) - (upload.get("put_spent") or 0)
+        aic_needed = (upload.get("aic_reserved") or 0) - (upload.get("aic_spent") or 0)
+
+        if put_needed > 0 and put_available < put_needed:
+            raise HTTPException(429, f"Insufficient PUT tokens. Need {put_needed}, have {put_available}")
+
+        if aic_needed > 0 and aic_available < aic_needed:
+            raise HTTPException(429, f"Insufficient AIC credits. Need {aic_needed}, have {aic_available}")
+
+        if put_needed > 0 or aic_needed > 0:
+            await reserve_tokens(conn, str(upload["user_id"]), put_needed, aic_needed, upload_id)
+
+        # Re-enqueue the job
+        plan = get_plan(user.get("subscription_tier", "free"))
+        job_data = {"upload_id": upload_id, "user_id": str(upload["user_id"]), "retry": True}
+        await enqueue_job(job_data, priority=plan.get("priority", False))
+
+        logger.info(f"Upload {upload_id} queued for retry by user {user['id']}")
+
+    return {"status": "queued", "upload_id": upload_id, "message": "Upload queued for retry"}
+
+
+# REPLACE your existing GET /api/uploads endpoint with this enhanced version:
+@app.get("/api/uploads")
+async def list_uploads(
+    status: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    limit: int = Query(200, le=500),
+    offset: int = Query(0),
+    user: dict = Depends(get_current_user)
+):
+    """
+    Enhanced list endpoint with queue.html field mapping + platform filtering.
+    """
+    async with db_pool.acquire() as conn:
+        query = """
+            SELECT 
+                id, filename, file_size, platforms, title, caption,
+                hashtags, privacy, status, cancel_requested,
+                scheduled_time, processing_started_at, completed_at,
+                error_code, error_detail, put_reserved, put_spent,
+                aic_reserved, aic_spent, views, likes, comments, shares,
+                thumbnail_r2_key, video_url, created_at, updated_at,
+                duration, account_name
+            FROM uploads 
+            WHERE user_id = $1
+        """
+        params = [user["id"]]
+
+        if status:
+            params.append(status)
+            query += f" AND status = ${len(params)}"
+
+        if platform:
+            params.append(platform)
+            query += f" AND ${len(params)} = ANY(platforms)"
+
+        query += " ORDER BY created_at DESC"
+        params.extend([limit, offset])
+        query += f" LIMIT ${len(params)-1} OFFSET ${len(params)}"
+
+        rows = await conn.fetch(query, *params)
+
+        count_query = "SELECT COUNT(*) FROM uploads WHERE user_id = $1"
+        count_params = [user["id"]]
+        if status:
+            count_params.append(status)
+            count_query += f" AND status = ${len(count_params)}"
+        if platform:
+            count_params.append(platform)
+            count_query += f" AND ${len(count_params)} = ANY(platforms)"
+
+        total = await conn.fetchval(count_query, *count_params)
+
+    formatted = []
+    for r in rows:
+        u = dict(r)
+
+        progress = 0
+        if u.get("status") == "processing":
+            if u.get("processing_started_at"):
+                elapsed = (_now_utc() - u["processing_started_at"]).total_seconds()
+                progress = min(int((elapsed / 120) * 100), 95)
+        elif u.get("status") == "completed":
+            progress = 100
+
+        thumbnail_url = None
+        if u.get("thumbnail_r2_key"):
+            try:
+                s3 = get_s3_client()
+                thumbnail_url = s3.generate_presigned_url(
+                    'get_object',
+                    Params={'Bucket': R2_BUCKET_NAME, 'Key': u["thumbnail_r2_key"]},
+                    ExpiresIn=3600
+                )
+            except Exception:
+                pass
+
+        account_name = u.get("account_name") or "Unknown"
+        if account_name == "Unknown" and u.get("platforms"):
+            try:
+                async with db_pool.acquire() as conn:
+                    account = await conn.fetchrow("""
+                        SELECT account_name, account_username 
+                        FROM platform_tokens 
+                        WHERE user_id = $1 AND platform = ANY($2)
+                        LIMIT 1
+                    """, user["id"], u["platforms"])
+                    if account:
+                        account_name = account.get("account_username") or account.get("account_name") or "Unknown"
+            except Exception:
+                pass
+
+        formatted.append({
+            "id": str(u["id"]),
+            "title": u.get("title") or "Untitled",
+            "filename": u.get("filename"),
+            "platform": (u["platforms"][0] if u.get("platforms") else "unknown"),
+            "platforms": list(u["platforms"]) if u.get("platforms") else [],
+            "account_name": account_name,
+            "status": u.get("status"),
+            "progress": progress,
+            "error": u.get("error_detail") or u.get("error_code"),
+            "created_at": u["created_at"].isoformat() if u.get("created_at") else None,
+            "updated_at": u["updated_at"].isoformat() if u.get("updated_at") else None,
+            "completed_at": u["completed_at"].isoformat() if u.get("completed_at") else None,
+            "scheduled_time": u["scheduled_time"].isoformat() if u.get("scheduled_time") else None,
+            "file_size": u.get("file_size"),
+            "duration": u.get("duration"),
+            "thumbnail_url": thumbnail_url,
+            "video_url": u.get("video_url"),
+            "views": u.get("views") or 0,
+            "likes": u.get("likes") or 0,
+            "comments": u.get("comments") or 0,
+            "shares": u.get("shares") or 0,
+            "put_cost": u.get("put_reserved"),
+            "aic_cost": u.get("aic_reserved"),
+        })
+
+    return {"uploads": formatted, "total": total, "limit": limit, "offset": offset}
+
+
+# REPLACE your existing POST /api/uploads/{upload_id}/cancel with this enhanced version:
 @app.post("/api/uploads/{upload_id}/cancel")
 async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Cancel endpoint with proper status handling:
+    - processing: mark cancel_requested only
+    - pending/queued: cancel immediately + refund reserved tokens
+    """
     async with db_pool.acquire() as conn:
-        upload = await conn.fetchrow("SELECT put_reserved, aic_reserved, status FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user["id"])
-        if not upload: raise HTTPException(404, "Upload not found")
+        row = await conn.fetchrow("""
+            SELECT id, put_reserved, aic_reserved, status 
+            FROM uploads 
+            WHERE id = $1 AND user_id = $2
+        """, upload_id, user["id"])
+
+        if not row:
+            raise HTTPException(404, "Upload not found")
+
+        upload = dict(row)
+
         if upload["status"] in ("completed", "cancelled", "failed"):
             raise HTTPException(400, "Cannot cancel this upload")
-        
-        await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1", upload_id)
-        # Refund reserved tokens
-        await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
-    return {"status": "cancelled"}
 
-@app.get("/api/uploads")
-async def get_uploads(status: Optional[str] = None, limit: int = 50, offset: int = 0, user: dict = Depends(get_current_user)):
-    async with db_pool.acquire() as conn:
-        if status:
-            uploads = await conn.fetch("SELECT * FROM uploads WHERE user_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4", user["id"], status, limit, offset)
+        if upload["status"] == "processing":
+            await conn.execute("""
+                UPDATE uploads 
+                SET cancel_requested = TRUE, updated_at = NOW() 
+                WHERE id = $1
+            """, upload_id)
+            new_status = "cancel_requested"
         else:
-            uploads = await conn.fetch("SELECT * FROM uploads WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3", user["id"], limit, offset)
-    return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "put_cost": u.get("put_reserved", 0), "aic_cost": u.get("aic_reserved", 0)} for u in uploads]
+            await conn.execute("""
+                UPDATE uploads 
+                SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() 
+                WHERE id = $1
+            """, upload_id)
+            new_status = "cancelled"
+
+            await refund_tokens(
+                conn,
+                user["id"],
+                upload.get("put_reserved") or 0,
+                upload.get("aic_reserved") or 0,
+                upload_id
+            )
+
+        logger.info(f"Upload {upload_id} cancel requested by user {user['id']}, new status: {new_status}")
+
+    return {
+        "status": new_status,
+        "message": "Cancel requested" if new_status == "cancel_requested" else "Cancelled",
+        "upload_id": upload_id
+    }
+# ============================================================
+# AI CONTENT GENERATION + ENHANCED UPLOAD SUPPORT
+# ============================================================
+
+class AIGenerationRequest(BaseModel):
+    type: str  # title | caption | hashtags
+    context: dict = {}
+    platform: Optional[str] = None
+
+
+@app.post("/api/ai/generate")
+async def generate_ai_content(data: AIGenerationRequest, user: dict = Depends(get_current_user)):
+    """
+    Generate AI content for uploads using OpenAI (or mock until wired).
+    Deducts 1 AIC credit per generation.
+    """
+    plan = get_plan(user.get("subscription_tier", "free"))
+    if not plan.get("ai"):
+        raise HTTPException(403, "AI features require Creator Pro or higher")
+
+    wallet = user.get("wallet", {})
+    aic_available = (wallet.get("aic_balance", 0) or 0) - (wallet.get("aic_reserved", 0) or 0)
+    if aic_available < 1:
+        raise HTTPException(429, "Insufficient AIC credits. Please top up your AIC balance.")
+
+    try:
+        # Pull preference defaults (safe fallbacks)
+        async with db_pool.acquire() as conn:
+            prefs = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", user["id"])
+            prefs = dict(prefs) if prefs else {}
+
+        ai_style = (prefs.get("ai_hashtag_style") or "mixed").lower()
+        hashtag_count = int(prefs.get("ai_hashtag_count") or 5)
+
+        if data.type == "title":
+            system_prompt = "You are an expert social media content creator who writes viral video titles."
+            user_prompt = f"""Generate an engaging, attention-grabbing video title.
+Context: {data.context.get('caption', 'General content')}
+Platform: {data.platform or 'all platforms'}
+
+Requirements:
+- Keep it under 100 characters
+- Make it viral-worthy and clickable
+- Use emojis sparingly (1-2 max)
+- Create curiosity or promise value
+- NO clickbait lies
+
+Return only the title, nothing else."""
+        elif data.type == "caption":
+            system_prompt = "You are an expert social media content creator who writes engaging video captions."
+            user_prompt = f"""Write a compelling video caption for social media.
+Title: {data.context.get('title', 'Untitled')}
+Platform: {data.platform or 'all platforms'}
+
+Requirements:
+- Keep it under 250 characters
+- Make it engaging and conversational
+- Include a call-to-action
+- Use 1-2 emojis max
+- Write in first person
+- Ask a question or encourage engagement
+
+Return only the caption, nothing else."""
+        elif data.type == "hashtags":
+            system_prompt = "You are an expert at creating viral social media hashtags."
+            user_prompt = f"""Generate {hashtag_count} relevant hashtags for this video content.
+Title: {data.context.get('title', '')}
+Caption: {data.context.get('caption', '')}
+Platform: {data.platform or 'all platforms'}
+Style: {ai_style}
+
+Requirements:
+- Generate exactly {hashtag_count} hashtags
+- Mix popular and niche tags
+- Include platform-specific viral tags
+- Format: space-separated with # symbols
+
+Return only the hashtags separated by spaces, nothing else."""
+        else:
+            raise HTTPException(400, "Invalid generation type. Use: title, caption, or hashtags")
+
+        # NOTE: keep mock until OpenAI wired
+        mock = {
+            "title": {
+                "tiktok": "This Changed My Life FOREVER 😱",
+                "youtube": "I Tried This For 30 Days — The Results Shocked Me",
+                "instagram": "✨ You NEED to see this transformation!",
+                "facebook": "Watch What Happened When I Did This..."
+            },
+            "caption": {
+                "tiktok": "I was NOT prepared for this 😳 Watch til the end. What would you do? Comment 👇",
+                "youtube": "Tried this for a month and the results speak for themselves. What should I try next?",
+                "instagram": "Best thing I’ve discovered this year ✨ Want a full tutorial? Drop a ❤️",
+                "facebook": "I couldn’t believe this worked 🤯 Tag someone who needs to see this."
+            },
+            "hashtags": {
+                "trending": "#viral #fyp #trending #foryou #explore #foryoupage",
+                "niche": "#contentcreator #smallbusiness #entrepreneur #howto #tutorial",
+                "mixed": "#viral #trending #contentcreator #fyp #tutorial #entrepreneur"
+            }
+        }
+
+        if data.type in ("title", "caption"):
+            platform_key = (data.platform or "tiktok").lower()
+            generated = mock[data.type].get(platform_key, mock[data.type]["tiktok"])
+        else:
+            generated = mock["hashtags"].get(ai_style, mock["hashtags"]["mixed"])
+
+        tokens_used = 150  # mock accounting until OpenAI wired
+
+        async with db_pool.acquire() as conn:
+            await spend_tokens(conn, user["id"], 0, 1, None, [data.platform] if data.platform else None)
+
+            cost_usd = tokens_used * COST_PER_OPENAI_TOKEN
+            await conn.execute(
+                "INSERT INTO cost_tracking (user_id, category, operation, tokens, cost_usd) VALUES ($1, 'openai', $2, $3, $4)",
+                user["id"], f"ai_generation_{data.type}", tokens_used, cost_usd
+            )
+
+        logger.info(f"AI generation for user {user['id']}: {data.type} ({tokens_used} tokens)")
+        return {"success": True, "generated": generated, "type": data.type, "aic_used": 1, "tokens_used": tokens_used}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"AI generation failed for user {user['id']}: {e}")
+        raise HTTPException(500, f"AI generation failed: {str(e)}")
+
+
+@app.post("/api/uploads/process-telemetry")
+async def process_telemetry(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Process telemetry .map file for video overlay.
+    Currently marks telemetry as processed (FFmpeg overlay TODO).
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"]
+        )
+        if not row:
+            raise HTTPException(404, "Upload not found")
+
+        upload = dict(row)
+        telemetry_key = upload.get("telemetry_r2_key")
+        if not telemetry_key:
+            raise HTTPException(400, "No telemetry data found for this upload")
+
+        try:
+            s3 = get_s3_client()
+            telemetry_obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=telemetry_key)
+            _telemetry_data = telemetry_obj["Body"].read()  # reserved for future parsing
+
+            await conn.execute(
+                "UPDATE uploads SET telemetry_processed = TRUE, updated_at = NOW() WHERE id = $1",
+                upload_id
+            )
+            logger.info(f"Telemetry processed for upload {upload_id}")
+            return {"status": "processed", "upload_id": upload_id}
+
+        except Exception as e:
+            logger.error(f"Telemetry processing failed: {e}")
+            raise HTTPException(500, f"Telemetry processing failed: {str(e)}")
+
+
+@app.get("/api/uploads/{upload_id}/preview")
+async def get_upload_preview(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Get a preview/thumbnail of an uploaded video.
+    If thumbnail key missing, assigns a derived key (FFmpeg generation TODO).
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"]
+        )
+        if not row:
+            raise HTTPException(404, "Upload not found")
+
+        upload = dict(row)
+        thumbnail_key = upload.get("thumbnail_r2_key")
+
+        if not thumbnail_key:
+            try:
+                video_key = upload.get("r2_key")
+                if not video_key:
+                    raise HTTPException(400, "Upload missing r2_key")
+                thumbnail_key = f"{video_key.rsplit('.', 1)[0]}_thumb.jpg"
+
+                await conn.execute(
+                    "UPDATE uploads SET thumbnail_r2_key = $1, updated_at = NOW() WHERE id = $2",
+                    thumbnail_key, upload_id
+                )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Thumbnail key assignment failed: {e}")
+                raise HTTPException(500, "Thumbnail generation failed")
+
+        try:
+            s3 = get_s3_client()
+            preview_url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": R2_BUCKET_NAME, "Key": thumbnail_key},
+                ExpiresIn=3600
+            )
+            return {"preview_url": preview_url}
+        except Exception as e:
+            logger.error(f"Failed to generate preview URL: {e}")
+            raise HTTPException(500, "Failed to generate preview URL")
+
 
 @app.get("/api/scheduled")
 async def get_scheduled(user: dict = Depends(get_current_user)):

@@ -238,13 +238,13 @@ async def create_refresh_token(conn, user_id: str) -> str:
 
 async def rotate_refresh_token(conn, old_token: str):
     h = _sha256_hex(old_token)
-    row = await conn.fetchrow("SELECT id, user_id, expires_at, revoked FROM refresh_tokens WHERE token_hash=$1", h)
+    row = await conn.fetchrow("SELECT id, user_id, expires_at, revoked_at FROM refresh_tokens WHERE token_hash=$1", h)
     if not row: raise HTTPException(401, "Invalid")
-    if row["revoked"]:
-        await conn.execute("UPDATE refresh_tokens SET revoked=TRUE WHERE user_id=$1", row["user_id"])
+    if row["revoked_at"]:
+        await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL", row["user_id"])
         raise HTTPException(401, "Reuse detected")
     if row["expires_at"] < _now_utc(): raise HTTPException(401, "Expired")
-    await conn.execute("UPDATE refresh_tokens SET revoked=TRUE WHERE id=$1", row["id"])
+    await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE id=$1", row["id"])
     return create_access_jwt(row["user_id"]), await create_refresh_token(conn, row["user_id"])
 
 # ============================================================
@@ -703,7 +703,7 @@ async def run_migrations():
                 current_period_end TIMESTAMPTZ, flex_enabled BOOLEAN DEFAULT FALSE, timezone VARCHAR(100) DEFAULT 'UTC',
                 avatar_url VARCHAR(512), status VARCHAR(50) DEFAULT 'active', last_active_at TIMESTAMPTZ DEFAULT NOW(),
                 created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"""),
-            (2, "CREATE TABLE IF NOT EXISTS refresh_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, token_hash VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, revoked BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW())"),
+            (2, "CREATE TABLE IF NOT EXISTS refresh_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, token_hash VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())"),
             (3, "CREATE TABLE IF NOT EXISTS platform_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, platform VARCHAR(50) NOT NULL, account_id VARCHAR(255), account_name VARCHAR(255), account_username VARCHAR(255), account_avatar VARCHAR(512), token_blob JSONB NOT NULL, is_primary BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"),
             (4, """CREATE TABLE IF NOT EXISTS uploads (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -848,7 +848,7 @@ async def refresh(data: RefreshRequest):
 @app.post("/api/auth/logout")
 async def logout(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1", user["id"])
+        await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", user["id"])
     return {"status": "logged_out"}
 
 
@@ -911,7 +911,7 @@ async def reset_password(payload: ResetPasswordRequest):
         await conn.execute("UPDATE password_resets SET used_at=NOW() WHERE id=$1", pr["id"])
 
         # Force logout across devices/sessions
-        await conn.execute("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id=$1", pr["user_id"])
+        await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id=$1 AND revoked_at IS NULL", pr["user_id"])
 
     return {"ok": True}
 
@@ -1531,7 +1531,7 @@ async def get_uploads(status: Optional[str] = None, limit: int = 50, offset: int
             uploads = await conn.fetch("SELECT * FROM uploads WHERE user_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4", user["id"], status, limit, offset)
         else:
             uploads = await conn.fetch("SELECT * FROM uploads WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3", user["id"], limit, offset)
-    return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "put_cost": u["put_reserved"], "aic_cost": u["aic_reserved"]} for u in uploads]
+    return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "put_cost": u.get("put_reserved", 0), "aic_cost": u.get("aic_reserved", 0)} for u in uploads]
 
 @app.get("/api/scheduled")
 async def get_scheduled(user: dict = Depends(get_current_user)):

@@ -476,6 +476,12 @@ class PreferencesUpdate(BaseModel):
     youtubeHashtags: Optional[str] = None
     instagramHashtags: Optional[str] = None
     facebookHashtags: Optional[str] = None
+    hashtagPosition: Optional[str] = None
+    maxHashtags: Optional[int] = None
+    aiHashtagsEnabled: Optional[bool] = None
+    aiHashtagCount: Optional[int] = None
+    aiHashtagStyle: Optional[str] = None
+    platformHashtags: Optional[dict] = None
 
 class TransferRequest(BaseModel):
     from_platform: str
@@ -757,6 +763,24 @@ async def run_migrations():
             (21, "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(255)"),
             (22, "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(255)"),
             (23, "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS preferences_json JSONB DEFAULT '{}'"),
+            (24, """CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                auto_captions BOOLEAN DEFAULT FALSE,
+                auto_thumbnails BOOLEAN DEFAULT FALSE,
+                thumbnail_interval INT DEFAULT 5,
+                default_privacy VARCHAR(50) DEFAULT 'public',
+                ai_hashtags_enabled BOOLEAN DEFAULT FALSE,
+                ai_hashtag_count INT DEFAULT 5,
+                ai_hashtag_style VARCHAR(50) DEFAULT 'mixed',
+                hashtag_position VARCHAR(50) DEFAULT 'end',
+                max_hashtags INT DEFAULT 15,
+                always_hashtags TEXT[] DEFAULT '{}',
+                blocked_hashtags TEXT[] DEFAULT '{}',
+                platform_hashtags JSONB DEFAULT '{"tiktok":[],"youtube":[],"instagram":[],"facebook":[]}',
+                email_notifications BOOLEAN DEFAULT TRUE,
+                discord_webhook VARCHAR(512),
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW())"""),
         ]
         
         for version, sql in migrations:
@@ -1109,6 +1133,18 @@ async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depend
             prefs["instagramHashtags"] = data.instagramHashtags
         if data.facebookHashtags is not None:
             prefs["facebookHashtags"] = data.facebookHashtags
+        if data.hashtagPosition is not None:
+            prefs["hashtagPosition"] = data.hashtagPosition
+        if data.maxHashtags is not None:
+            prefs["maxHashtags"] = data.maxHashtags
+        if data.aiHashtagsEnabled is not None:
+            prefs["aiHashtagsEnabled"] = data.aiHashtagsEnabled
+        if data.aiHashtagCount is not None:
+            prefs["aiHashtagCount"] = data.aiHashtagCount
+        if data.aiHashtagStyle is not None:
+            prefs["aiHashtagStyle"] = data.aiHashtagStyle
+        if data.platformHashtags is not None:
+            prefs["platformHashtags"] = data.platformHashtags
         
         # Save back to database
         await conn.execute(
@@ -1304,6 +1340,20 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
         for platform in ["tiktok", "youtube", "instagram", "facebook"]:
             if platform in prefs["platformHashtags"]:
                 prefs["platformHashtags"][platform] = [str(h).lower().strip()[:50] for h in prefs["platformHashtags"][platform][:50]]
+    
+    # Validate numeric hashtag settings
+    if "maxHashtags" in prefs:
+        prefs["maxHashtags"] = max(1, min(50, int(prefs["maxHashtags"])))
+    if "aiHashtagCount" in prefs:
+        prefs["aiHashtagCount"] = max(1, min(30, int(prefs["aiHashtagCount"])))
+    
+    # Validate hashtag position
+    if "hashtagPosition" in prefs and prefs["hashtagPosition"] not in ["start", "end", "caption", "comment"]:
+        prefs["hashtagPosition"] = "end"
+    
+    # Validate AI hashtag style
+    if "aiHashtagStyle" in prefs and prefs["aiHashtagStyle"] not in ["lowercase", "capitalized", "camelcase", "mixed"]:
+        prefs["aiHashtagStyle"] = "mixed"
     
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -2115,45 +2165,51 @@ async def save_user_preferences_put(
 
 async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     """Helper to fetch user preferences for upload processing"""
-    prefs = await conn.fetchrow(
-        "SELECT * FROM user_preferences WHERE user_id = $1",
+    # Try user_settings.preferences_json first (new location)
+    prefs_row = await conn.fetchrow(
+        "SELECT preferences_json FROM user_settings WHERE user_id = $1",
         user_id
     )
+    
+    # Fallback to users.preferences (legacy location)
+    if not prefs_row or not prefs_row["preferences_json"]:
+        prefs_row = await conn.fetchrow(
+            "SELECT preferences FROM users WHERE id = $1",
+            user_id
+        )
+        if prefs_row and prefs_row["preferences"]:
+            prefs_data = prefs_row["preferences"]
+            if isinstance(prefs_data, str):
+                prefs = json.loads(prefs_data)
+            else:
+                prefs = prefs_data
+        else:
+            prefs = {}
+    else:
+        prefs_data = prefs_row["preferences_json"]
+        if isinstance(prefs_data, str):
+            prefs = json.loads(prefs_data)
+        else:
+            prefs = prefs_data
 
-    if not prefs:
-        return {
-            "auto_captions": False,
-            "auto_thumbnails": False,
-            "thumbnail_interval": 5,
-            "default_privacy": "public",
-            "ai_hashtags_enabled": False,
-            "ai_hashtag_count": 5,
-            "ai_hashtag_style": "mixed",
-            "hashtag_position": "end",
-            "max_hashtags": 30,
-            "always_hashtags": [],
-            "blocked_hashtags": [],
-            "platform_hashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
-            "email_notifications": True,
-            "discord_webhook": None
-        }
-
+    # Return preferences with defaults (frontend uses camelCase)
     return {
-        "auto_captions": prefs["auto_captions"],
-        "auto_thumbnails": prefs["auto_thumbnails"],
-        "thumbnail_interval": prefs["thumbnail_interval"],
-        "default_privacy": prefs["default_privacy"],
-        "ai_hashtags_enabled": prefs["ai_hashtags_enabled"],
-        "ai_hashtag_count": prefs["ai_hashtag_count"],
-        "ai_hashtag_style": prefs["ai_hashtag_style"],
-        "hashtag_position": prefs["hashtag_position"],
-        "max_hashtags": prefs["max_hashtags"],
-        "always_hashtags": prefs["always_hashtags"] or [],
-        "blocked_hashtags": prefs["blocked_hashtags"] or [],
-        "platform_hashtags": prefs["platform_hashtags"] or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
-        "email_notifications": prefs["email_notifications"],
-        "discord_webhook": prefs["discord_webhook"]
+        "auto_captions": prefs.get("autoCaptions", False),
+        "auto_thumbnails": prefs.get("autoThumbnails", False),
+        "thumbnail_interval": prefs.get("thumbnailInterval", 5),
+        "default_privacy": prefs.get("defaultPrivacy", "public"),
+        "ai_hashtags_enabled": prefs.get("aiHashtagsEnabled", False),
+        "ai_hashtag_count": prefs.get("aiHashtagCount", 5),
+        "ai_hashtag_style": prefs.get("aiHashtagStyle", "mixed"),
+        "hashtag_position": prefs.get("hashtagPosition", "end"),
+        "max_hashtags": prefs.get("maxHashtags", 30),
+        "always_hashtags": prefs.get("alwaysHashtags", []),
+        "blocked_hashtags": prefs.get("blockedHashtags", []),
+        "platform_hashtags": prefs.get("platformHashtags", {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}),
+        "email_notifications": prefs.get("emailNotifications", True),
+        "discord_webhook": prefs.get("discordWebhook", None)
     }
+
 
 @app.get("/api/groups")
 async def get_groups(user: dict = Depends(get_current_user)):
@@ -2899,13 +2955,13 @@ async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
         revenue = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM revenue_tracking WHERE created_at >= $1", since)
         
         tier_data = await conn.fetch("""
-            SELECT u.subscription_tier, COUNT(up.id)::int AS uploads, COALESCE(SUM(up.cost_attributed), 0)::decimal AS cost
+            SELECT u.subscription_tier, COUNT(up.id)::int AS uploads, 0::decimal AS cost
             FROM users u LEFT JOIN uploads up ON up.user_id = u.id AND up.created_at >= $1
             GROUP BY u.subscription_tier
         """, since)
         
         platform_data = await conn.fetch("""
-            SELECT unnest(platforms) AS platform, COUNT(*)::int AS uploads, COALESCE(SUM(cost_attributed), 0)::decimal AS cost
+            SELECT unnest(platforms) AS platform, COUNT(*)::int AS uploads, 0::decimal AS cost
             FROM uploads WHERE created_at >= $1 GROUP BY platform
         """, since)
     

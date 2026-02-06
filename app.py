@@ -803,6 +803,13 @@ async def run_migrations():
                         USING array_to_json(blocked_hashtags)::jsonb;
                     END IF;
                 END $$;"""),
+            (26, """-- Clean up corrupted hashtag data
+                UPDATE user_preferences 
+                SET always_hashtags = '[]'::jsonb,
+                    blocked_hashtags = '[]'::jsonb
+                WHERE 
+                    (always_hashtags::text LIKE '%\\\\%' OR always_hashtags::text LIKE '%["%')
+                    OR (blocked_hashtags::text LIKE '%\\\\%' OR blocked_hashtags::text LIKE '%["%');"""),
         ]
         
         for version, sql in migrations:
@@ -2065,45 +2072,24 @@ async def save_user_preferences(
         if v is None:
             return []
         if isinstance(v, list):
-            # If it's already a list, flatten and clean it
+            # Simple flatten - just convert each item to string and filter
             result = []
             for item in v:
-                if isinstance(item, str):
-                    # If string starts with [, it might be JSON - parse it
-                    if item.strip().startswith('['):
-                        try:
-                            parsed = json.loads(item)
-                            if isinstance(parsed, list):
-                                result.extend(parsed)
-                            else:
-                                result.append(str(item).strip())
-                        except:
-                            result.append(str(item).strip())
-                    else:
-                        result.append(str(item).strip())
-                elif isinstance(item, list):
-                    # Recursive flatten
-                    result.extend(_coerce_hashtag_list(item))
-                else:
-                    result.append(str(item).strip())
-            return [x for x in result if x]
+                if isinstance(item, str) and item and not item.startswith('[') and not item.startswith('"'):
+                    # Only add if it's a simple string, not JSON garbage
+                    clean = item.strip().lower().replace('#', '')
+                    if clean and len(clean) < 50:  # Reasonable hashtag length
+                        result.append(clean)
+            return result
         if isinstance(v, str):
-            # Accept comma / newline separated input; preserve leading '#'
+            # Simple comma-separated string
             s = v.strip()
-            if not s:
+            if not s or s.startswith('[') or s.startswith('"'):
+                # Looks like JSON garbage, ignore it
                 return []
-            # Check if it's a JSON array string
-            if s.startswith('['):
-                try:
-                    parsed = json.loads(s)
-                    return _coerce_hashtag_list(parsed)
-                except:
-                    pass
             # Normal comma-separated
-            raw = s.replace("\n", ",").replace("\r", ",")
-            parts = [p.strip() for p in raw.split(",")]
-            return [p for p in parts if p]
-        # Anything else: drop to empty to avoid 500s
+            parts = [p.strip().lower().replace('#', '') for p in s.split(',')]
+            return [p for p in parts if p and len(p) < 50]
         return []
 
     def _coerce_platform_map(v):

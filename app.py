@@ -51,23 +51,29 @@ class PlatformHashtags(BaseModel):
     facebook: List[str] = Field(default_factory=list)
 
 class UserPreferencesUpdate(BaseModel):
-    auto_captions: bool = False
-    auto_thumbnails: bool = False
-    thumbnail_interval: int = Field(5, ge=1, le=60)
+    # Accept both snake_case (backend) and camelCase (frontend) keys.
+    auto_captions: bool = Field(False, alias="autoCaptions")
+    auto_thumbnails: bool = Field(False, alias="autoThumbnails")
+    thumbnail_interval: int = Field(5, ge=1, le=60, alias="thumbnailInterval")
 
-    default_privacy: Literal["public", "private", "unlisted"] = "public"
+    default_privacy: Literal["public", "private", "unlisted"] = Field("public", alias="defaultPrivacy")
 
-    ai_hashtags_enabled: bool = False
-    ai_hashtag_count: int = Field(5, ge=1, le=30)
-    ai_hashtag_style: Literal["lowercase", "capitalized", "camelcase", "mixed"] = "mixed"
-    hashtag_position: Literal["start", "end", "caption"] = "end"
+    ai_hashtags_enabled: bool = Field(False, alias="aiHashtagsEnabled")
+    ai_hashtag_count: int = Field(5, ge=1, le=30, alias="aiHashtagCount")
+    ai_hashtag_style: Literal["lowercase", "capitalized", "camelcase", "mixed"] = Field("mixed", alias="aiHashtagStyle")
+    hashtag_position: Literal["start", "end", "caption"] = Field("end", alias="hashtagPosition")
 
-    max_hashtags: int = Field(30, ge=1, le=50)
-    always_hashtags: List[str] = Field(default_factory=list)
-    blocked_hashtags: List[str] = Field(default_factory=list)
-    platform_hashtags: PlatformHashtags = Field(default_factory=PlatformHashtags)
-    email_notifications: bool = True
-    discord_webhook: Optional[str] = None
+    max_hashtags: int = Field(15, ge=1, le=50, alias="maxHashtags")
+    always_hashtags: List[str] = Field(default_factory=list, alias="alwaysHashtags")
+    blocked_hashtags: List[str] = Field(default_factory=list, alias="blockedHashtags")
+    platform_hashtags: PlatformHashtags = Field(default_factory=PlatformHashtags, alias="platformHashtags")
+    email_notifications: bool = Field(True, alias="emailNotifications")
+    discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
+
+    class Config:
+        populate_by_name = True
+        extra = "ignore"
+
 
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()

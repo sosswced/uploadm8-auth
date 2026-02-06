@@ -411,6 +411,15 @@ class UserLogin(BaseModel):
 class RefreshRequest(BaseModel):
     refresh_token: str
 
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=16)
+    new_password: str = Field(min_length=8)
+
+
 class UploadInit(BaseModel):
     filename: str
     file_size: int
@@ -836,6 +845,70 @@ async def logout(user: dict = Depends(get_current_user)):
         await conn.execute("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1", user["id"])
     return {"status": "logged_out"}
 
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest, background: BackgroundTasks):
+    """Initiate password reset. Always returns OK to prevent account enumeration."""
+    email = payload.email.lower()
+    async with db_pool.acquire() as conn:
+        user_row = await conn.fetchrow("SELECT id, email, status FROM users WHERE LOWER(email)=$1", email)
+        if user_row and user_row["status"] != "disabled":
+            token = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+
+            # Invalidate prior unused tokens for this user
+            await conn.execute(
+                "UPDATE password_resets SET used_at = NOW() WHERE user_id=$1 AND used_at IS NULL",
+                user_row["id"],
+            )
+            await conn.execute(
+                "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1,$2,$3)",
+                user_row["id"], token_hash, expires_at
+            )
+
+            reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password?token={quote(token)}"
+            html = f"""
+                <p>You requested a password reset for UploadM8.</p>
+                <p><a href="{reset_link}">Reset your password</a></p>
+                <p>This link expires in 60 minutes. If you did not request this, ignore this email.</p>
+            """
+            background.add_task(send_email, user_row["email"], "Reset your UploadM8 password", html)
+
+    return {"ok": True}
+
+@app.post("/api/auth/reset-password")
+async def reset_password(payload: ResetPasswordRequest):
+    token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
+    async with db_pool.acquire() as conn:
+        pr = await conn.fetchrow(
+            """
+            SELECT id, user_id, expires_at, used_at
+            FROM password_resets
+            WHERE token_hash=$1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            token_hash
+        )
+        if not pr or pr["used_at"] is not None:
+            raise HTTPException(status_code=400, detail="Invalid or used reset token")
+        if pr["expires_at"] < datetime.now(timezone.utc):
+            raise HTTPException(status_code=400, detail="Reset token expired")
+
+        new_hash = hash_password(payload.new_password)
+
+        await conn.execute(
+            "UPDATE users SET password_hash=$1, updated_at=NOW() WHERE id=$2",
+            new_hash, pr["user_id"]
+        )
+        await conn.execute("UPDATE password_resets SET used_at=NOW() WHERE id=$1", pr["id"])
+
+        # Force logout across devices/sessions
+        await conn.execute("UPDATE refresh_tokens SET revoked = TRUE WHERE user_id=$1", pr["user_id"])
+
+    return {"ok": True}
+
 # ============================================================
 # User Profile & Wallet
 # ============================================================
@@ -952,7 +1025,7 @@ async def change_password(data: PasswordChange, user: dict = Depends(get_current
 # ============================================================
 @app.put("/api/settings/profile")
 async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depends(get_current_user)):
-    """Update user profile (first name, last name, timezone)"""
+    """Update user profile (first name, last name)"""
     updates, params = [], [user["id"]]
     
     if data.first_name is not None:
@@ -962,10 +1035,6 @@ async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depe
     if data.last_name is not None:
         updates.append(f"last_name = ${len(params)+1}")
         params.append(data.last_name.strip())
-
-    if data.timezone is not None:
-        updates.append(f"timezone = ${len(params)+1}")
-        params.append(data.timezone)
     
     # Also update the combined name field for backwards compatibility
     if data.first_name is not None or data.last_name is not None:
@@ -985,6 +1054,87 @@ async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depe
         return {"status": "success", "message": "Profile updated successfully"}
     
     return {"status": "success", "message": "No changes made"}
+
+@app.put("/api/settings/preferences/legacy")
+async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depends(get_current_user)):
+    """Update user preferences (notifications, theme, hashtags, etc.)"""
+    async with db_pool.acquire() as conn:
+        # Ensure user_settings row exists
+        await conn.execute(
+            "INSERT INTO user_settings (user_id, preferences_json) VALUES ($1, '{}') ON CONFLICT (user_id) DO NOTHING",
+            user["id"]
+        )
+        
+        # Get current preferences
+        current_prefs = await conn.fetchval(
+            "SELECT preferences_json FROM user_settings WHERE user_id = $1",
+            user["id"]
+        )
+        
+        # Parse current preferences
+        prefs = current_prefs if current_prefs else {}
+        if isinstance(prefs, str):
+            prefs = json.loads(prefs)
+        
+        # Update with new values (only update fields that are provided)
+        if data.emailNotifs is not None:
+            prefs["emailNotifs"] = data.emailNotifs
+        if data.uploadCompleteNotifs is not None:
+            prefs["uploadCompleteNotifs"] = data.uploadCompleteNotifs
+        if data.marketingEmails is not None:
+            prefs["marketingEmails"] = data.marketingEmails
+        if data.theme is not None:
+            prefs["theme"] = data.theme
+        if data.accentColor is not None:
+            prefs["accentColor"] = data.accentColor
+        if data.defaultPrivacy is not None:
+            prefs["defaultPrivacy"] = data.defaultPrivacy
+        if data.autoPublish is not None:
+            prefs["autoPublish"] = data.autoPublish
+        if data.alwaysHashtags is not None:
+            prefs["alwaysHashtags"] = data.alwaysHashtags
+        if data.blockedHashtags is not None:
+            prefs["blockedHashtags"] = data.blockedHashtags
+        if data.tiktokHashtags is not None:
+            prefs["tiktokHashtags"] = data.tiktokHashtags
+        if data.youtubeHashtags is not None:
+            prefs["youtubeHashtags"] = data.youtubeHashtags
+        if data.instagramHashtags is not None:
+            prefs["instagramHashtags"] = data.instagramHashtags
+        if data.facebookHashtags is not None:
+            prefs["facebookHashtags"] = data.facebookHashtags
+        
+        # Save back to database
+        await conn.execute(
+            "UPDATE user_settings SET preferences_json = $1, updated_at = NOW() WHERE user_id = $2",
+            json.dumps(prefs),
+            user["id"]
+        )
+    
+    logger.info(f"Preferences updated for user {user['id']}")
+    return {"status": "success", "message": "Preferences saved successfully", "preferences": prefs}
+
+@app.get("/api/settings/preferences")
+async def get_preferences(user: dict = Depends(get_current_user)):
+    """Get user preferences"""
+    async with db_pool.acquire() as conn:
+        # Ensure user_settings row exists
+        await conn.execute(
+            "INSERT INTO user_settings (user_id, preferences_json) VALUES ($1, '{}') ON CONFLICT (user_id) DO NOTHING",
+            user["id"]
+        )
+        
+        # Get preferences
+        prefs_json = await conn.fetchval(
+            "SELECT preferences_json FROM user_settings WHERE user_id = $1",
+            user["id"]
+        )
+        
+        prefs = prefs_json if prefs_json else {}
+        if isinstance(prefs, str):
+            prefs = json.loads(prefs)
+    
+    return {"preferences": prefs}
 
 @app.put("/api/settings/password")
 async def update_password_settings(data: PasswordChange, user: dict = Depends(get_current_user)):
@@ -1760,6 +1910,7 @@ async def update_color_preferences(
 # ============================================================
 # Account Groups
 # ============================================================
+
 @app.get("/api/settings/preferences")
 async def get_user_preferences(user: dict = Depends(get_current_user)):
     """GET user content preferences - used by settings page AND upload workflow"""
@@ -1769,37 +1920,34 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             user["id"]
         )
 
-        # Create default if doesn't exist
         if not prefs:
-            await conn.execute(
-                "INSERT INTO user_preferences (user_id) VALUES ($1)",
-                user["id"]
-            )
+            await conn.execute("INSERT INTO user_preferences (user_id) VALUES ($1)", user["id"])
             prefs = await conn.fetchrow(
                 "SELECT * FROM user_preferences WHERE user_id = $1",
                 user["id"]
             )
 
+        d = dict(prefs) if prefs else {}
+
         return {
-            "autoCaptions": prefs["auto_captions"],
-            "autoThumbnails": prefs["auto_thumbnails"],
-            "thumbnailInterval": str(prefs["thumbnail_interval"]),
-            "defaultPrivacy": prefs["default_privacy"],
-            "aiHashtagsEnabled": prefs["ai_hashtags_enabled"],
-            "aiHashtagCount": str(prefs["ai_hashtag_count"]),
-            "aiHashtagStyle": prefs["ai_hashtag_style"],
-            "hashtagPosition": prefs["hashtag_position"],
-            "maxHashtags": str(prefs["max_hashtags"]),
-            "alwaysHashtags": prefs["always_hashtags"] or [],
-            "blockedHashtags": prefs["blocked_hashtags"] or [],
-            "platformHashtags": prefs["platform_hashtags"] or {
-                "tiktok": [], "youtube": [], "instagram": [], "facebook": []
-            },
-            "emailNotifications": prefs["email_notifications"],
-            "discordWebhook": prefs["discord_webhook"]
+            "autoCaptions": d.get("auto_captions", False),
+            "autoThumbnails": d.get("auto_thumbnails", False),
+            "thumbnailInterval": str(d.get("thumbnail_interval", 5)),
+            "defaultPrivacy": d.get("default_privacy", "public"),
+            "aiHashtagsEnabled": d.get("ai_hashtags_enabled", False),
+            "aiHashtagCount": str(d.get("ai_hashtag_count", 5)),
+            "aiHashtagStyle": d.get("ai_hashtag_style", "mixed"),
+            "hashtagPosition": d.get("hashtag_position", "end"),
+            "maxHashtags": str(d.get("max_hashtags", 15)),
+            "alwaysHashtags": d.get("always_hashtags") or [],
+            "blockedHashtags": d.get("blocked_hashtags") or [],
+            "platformHashtags": d.get("platform_hashtags") or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
+            "emailNotifications": d.get("email_notifications", True),
+            "discordWebhook": d.get("discord_webhook")
         }
 
 @app.post("/api/settings/preferences")
+
 async def save_user_preferences(
     prefs: UserPreferencesUpdate,
     user: dict = Depends(get_current_user)
@@ -1854,6 +2002,7 @@ async def save_user_preferences(
 
     return {"success": True, "message": "Preferences saved successfully"}
 
+
 @app.put("/api/settings/preferences")
 async def save_user_preferences_put(
     prefs: UserPreferencesUpdate,
@@ -1861,7 +2010,6 @@ async def save_user_preferences_put(
 ):
     """Backward-compatible alias for clients that still call PUT"""
     return await save_user_preferences(prefs, user)
-
 
 async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     """Helper to fetch user preferences for upload processing"""

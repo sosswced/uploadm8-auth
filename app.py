@@ -2004,11 +2004,22 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
         logger.info(f"always_hashtags from DB: {always_tags} (type: {type(always_tags)})")
         logger.info(f"blocked_hashtags from DB: {blocked_tags} (type: {type(blocked_tags)})")
         
-        # Convert to lists if needed
-        if always_tags and not isinstance(always_tags, list):
-            always_tags = list(always_tags) if hasattr(always_tags, '__iter__') else []
-        if blocked_tags and not isinstance(blocked_tags, list):
-            blocked_tags = list(blocked_tags) if hasattr(blocked_tags, '__iter__') else []
+        # Parse JSON strings if needed (JSONB might come back as strings)
+        if isinstance(always_tags, str):
+            try:
+                always_tags = json.loads(always_tags)
+            except:
+                always_tags = []
+        if isinstance(blocked_tags, str):
+            try:
+                blocked_tags = json.loads(blocked_tags)
+            except:
+                blocked_tags = []
+        if isinstance(platform_tags, str):
+            try:
+                platform_tags = json.loads(platform_tags)
+            except:
+                platform_tags = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
 
         return {
             "autoCaptions": d.get("auto_captions", False),

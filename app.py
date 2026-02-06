@@ -445,6 +445,7 @@ class PasswordChange(BaseModel):
 class ProfileUpdateSettings(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
+    timezone: Optional[str] = None
 
 class PreferencesUpdate(BaseModel):
     emailNotifs: Optional[bool] = None
@@ -951,7 +952,7 @@ async def change_password(data: PasswordChange, user: dict = Depends(get_current
 # ============================================================
 @app.put("/api/settings/profile")
 async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depends(get_current_user)):
-    """Update user profile (first name, last name)"""
+    """Update user profile (first name, last name, timezone)"""
     updates, params = [], [user["id"]]
     
     if data.first_name is not None:
@@ -961,6 +962,10 @@ async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depe
     if data.last_name is not None:
         updates.append(f"last_name = ${len(params)+1}")
         params.append(data.last_name.strip())
+
+    if data.timezone is not None:
+        updates.append(f"timezone = ${len(params)+1}")
+        params.append(data.timezone)
     
     # Also update the combined name field for backwards compatibility
     if data.first_name is not None or data.last_name is not None:
@@ -980,87 +985,6 @@ async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depe
         return {"status": "success", "message": "Profile updated successfully"}
     
     return {"status": "success", "message": "No changes made"}
-
-@app.put("/api/settings/preferences")
-async def update_preferences(data: PreferencesUpdate, user: dict = Depends(get_current_user)):
-    """Update user preferences (notifications, theme, hashtags, etc.)"""
-    async with db_pool.acquire() as conn:
-        # Ensure user_settings row exists
-        await conn.execute(
-            "INSERT INTO user_settings (user_id, preferences_json) VALUES ($1, '{}') ON CONFLICT (user_id) DO NOTHING",
-            user["id"]
-        )
-        
-        # Get current preferences
-        current_prefs = await conn.fetchval(
-            "SELECT preferences_json FROM user_settings WHERE user_id = $1",
-            user["id"]
-        )
-        
-        # Parse current preferences
-        prefs = current_prefs if current_prefs else {}
-        if isinstance(prefs, str):
-            prefs = json.loads(prefs)
-        
-        # Update with new values (only update fields that are provided)
-        if data.emailNotifs is not None:
-            prefs["emailNotifs"] = data.emailNotifs
-        if data.uploadCompleteNotifs is not None:
-            prefs["uploadCompleteNotifs"] = data.uploadCompleteNotifs
-        if data.marketingEmails is not None:
-            prefs["marketingEmails"] = data.marketingEmails
-        if data.theme is not None:
-            prefs["theme"] = data.theme
-        if data.accentColor is not None:
-            prefs["accentColor"] = data.accentColor
-        if data.defaultPrivacy is not None:
-            prefs["defaultPrivacy"] = data.defaultPrivacy
-        if data.autoPublish is not None:
-            prefs["autoPublish"] = data.autoPublish
-        if data.alwaysHashtags is not None:
-            prefs["alwaysHashtags"] = data.alwaysHashtags
-        if data.blockedHashtags is not None:
-            prefs["blockedHashtags"] = data.blockedHashtags
-        if data.tiktokHashtags is not None:
-            prefs["tiktokHashtags"] = data.tiktokHashtags
-        if data.youtubeHashtags is not None:
-            prefs["youtubeHashtags"] = data.youtubeHashtags
-        if data.instagramHashtags is not None:
-            prefs["instagramHashtags"] = data.instagramHashtags
-        if data.facebookHashtags is not None:
-            prefs["facebookHashtags"] = data.facebookHashtags
-        
-        # Save back to database
-        await conn.execute(
-            "UPDATE user_settings SET preferences_json = $1, updated_at = NOW() WHERE user_id = $2",
-            json.dumps(prefs),
-            user["id"]
-        )
-    
-    logger.info(f"Preferences updated for user {user['id']}")
-    return {"status": "success", "message": "Preferences saved successfully", "preferences": prefs}
-
-@app.get("/api/settings/preferences")
-async def get_preferences(user: dict = Depends(get_current_user)):
-    """Get user preferences"""
-    async with db_pool.acquire() as conn:
-        # Ensure user_settings row exists
-        await conn.execute(
-            "INSERT INTO user_settings (user_id, preferences_json) VALUES ($1, '{}') ON CONFLICT (user_id) DO NOTHING",
-            user["id"]
-        )
-        
-        # Get preferences
-        prefs_json = await conn.fetchval(
-            "SELECT preferences_json FROM user_settings WHERE user_id = $1",
-            user["id"]
-        )
-        
-        prefs = prefs_json if prefs_json else {}
-        if isinstance(prefs, str):
-            prefs = json.loads(prefs)
-    
-    return {"preferences": prefs}
 
 @app.put("/api/settings/password")
 async def update_password_settings(data: PasswordChange, user: dict = Depends(get_current_user)):
@@ -1929,6 +1853,15 @@ async def save_user_preferences(
         )
 
     return {"success": True, "message": "Preferences saved successfully"}
+
+@app.put("/api/settings/preferences")
+async def save_user_preferences_put(
+    prefs: UserPreferencesUpdate,
+    user: dict = Depends(get_current_user)
+):
+    """Backward-compatible alias for clients that still call PUT"""
+    return await save_user_preferences(prefs, user)
+
 
 async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     """Helper to fetch user preferences for upload processing"""

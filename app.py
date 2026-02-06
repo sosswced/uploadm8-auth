@@ -1975,9 +1975,9 @@ async def save_user_preferences(
                 ai_hashtag_style = $7,
                 hashtag_position = $8,
                 max_hashtags = $9,
-                always_hashtags = $10,
-                blocked_hashtags = $11,
-                platform_hashtags = $12,
+                always_hashtags = $10::jsonb,
+                blocked_hashtags = $11::jsonb,
+                platform_hashtags = $12::jsonb,
                 email_notifications = $13,
                 discord_webhook = $14,
                 updated_at = NOW()
@@ -1992,9 +1992,9 @@ async def save_user_preferences(
             prefs.ai_hashtag_style,
             prefs.hashtag_position,
             prefs.max_hashtags,
-            prefs.always_hashtags,
-            prefs.blocked_hashtags,
-            prefs.platform_hashtags.dict(),
+            json.dumps(prefs.always_hashtags),
+            json.dumps(prefs.blocked_hashtags),
+            json.dumps(prefs.platform_hashtags.dict()),
             prefs.email_notifications,
             prefs.discord_webhook,
             user["id"]
@@ -2584,12 +2584,24 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
-        stats = await conn.fetchrow("""
+        try:
+            stats = await conn.fetchrow("""
             SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
             COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes,
             COALESCE(SUM(put_spent), 0)::int AS put_used, COALESCE(SUM(aic_spent), 0)::int AS aic_used
             FROM uploads WHERE user_id = $1 AND created_at >= $2
-        """, user["id"], since)
+            """, user["id"], since)
+        except Exception as e:
+            # Schema drift guard: older DBs may not have engagement / spend columns yet
+            if e.__class__.__name__ != "UndefinedColumnError":
+                raise
+            stats = await conn.fetchrow("""
+            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+            0::bigint AS views, 0::bigint AS likes,
+            0::int AS put_used, 0::int AS aic_used
+            FROM uploads WHERE user_id = $1 AND created_at >= $2
+            """, user["id"], since)
+
         
         daily = await conn.fetch("SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads FROM uploads WHERE user_id = $1 AND created_at >= $2 GROUP BY DATE(created_at) ORDER BY date", user["id"], since)
         platforms = await conn.fetch("SELECT unnest(platforms) AS platform, COUNT(*)::int AS count FROM uploads WHERE user_id = $1 AND created_at >= $2 GROUP BY platform", user["id"], since)

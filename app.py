@@ -2023,13 +2023,46 @@ async def save_user_preferences(
 
     # defaults / coercions (frontend may send strings from text inputs)
     def _coerce_hashtag_list(v):
+        """Normalize hashtag input to flat list of strings"""
         if v is None:
             return []
         if isinstance(v, list):
-            return [str(x).strip() for x in v if str(x).strip()]
+            # If it's already a list, flatten and clean it
+            result = []
+            for item in v:
+                if isinstance(item, str):
+                    # If string starts with [, it might be JSON - parse it
+                    if item.strip().startswith('['):
+                        try:
+                            parsed = json.loads(item)
+                            if isinstance(parsed, list):
+                                result.extend(parsed)
+                            else:
+                                result.append(str(item).strip())
+                        except:
+                            result.append(str(item).strip())
+                    else:
+                        result.append(str(item).strip())
+                elif isinstance(item, list):
+                    # Recursive flatten
+                    result.extend(_coerce_hashtag_list(item))
+                else:
+                    result.append(str(item).strip())
+            return [x for x in result if x]
         if isinstance(v, str):
             # Accept comma / newline separated input; preserve leading '#'
-            raw = v.replace("\n", ",").replace("\r", ",")
+            s = v.strip()
+            if not s:
+                return []
+            # Check if it's a JSON array string
+            if s.startswith('['):
+                try:
+                    parsed = json.loads(s)
+                    return _coerce_hashtag_list(parsed)
+                except:
+                    pass
+            # Normal comma-separated
+            raw = s.replace("\n", ",").replace("\r", ",")
             parts = [p.strip() for p in raw.split(",")]
             return [p for p in parts if p]
         # Anything else: drop to empty to avoid 500s

@@ -34,7 +34,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import stripe
 import redis.asyncio as aioredis
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request, UploadFile, File, Body
 from fastapi.responses import RedirectResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
@@ -1120,27 +1120,7 @@ async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depend
     logger.info(f"Preferences updated for user {user['id']}")
     return {"status": "success", "message": "Preferences saved successfully", "preferences": prefs}
 
-@app.get("/api/settings/preferences")
-async def get_preferences(user: dict = Depends(get_current_user)):
-    """Get user preferences"""
-    async with db_pool.acquire() as conn:
-        # Ensure user_settings row exists
-        await conn.execute(
-            "INSERT INTO user_settings (user_id, preferences_json) VALUES ($1, '{}') ON CONFLICT (user_id) DO NOTHING",
-            user["id"]
-        )
-        
-        # Get preferences
-        prefs_json = await conn.fetchval(
-            "SELECT preferences_json FROM user_settings WHERE user_id = $1",
-            user["id"]
-        )
-        
-        prefs = prefs_json if prefs_json else {}
-        if isinstance(prefs, str):
-            prefs = json.loads(prefs)
-    
-    return {"preferences": prefs}
+# (removed) obsolete /api/settings/preferences handler (used user_settings.preferences_json)
 
 @app.put("/api/settings/password")
 async def update_password_settings(data: PasswordChange, user: dict = Depends(get_current_user)):
@@ -1953,24 +1933,97 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
         }
 
 @app.post("/api/settings/preferences")
-
 async def save_user_preferences(
-    prefs: UserPreferencesUpdate,
-    user: dict = Depends(get_current_user)
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user),
 ):
-    """SAVE user content preferences"""
-    async with db_pool.acquire() as conn:
-        exists = await conn.fetchval(
-            "SELECT 1 FROM user_preferences WHERE user_id = $1",
-            user["id"]
-        )
-        if not exists:
-            await conn.execute(
-                "INSERT INTO user_preferences (user_id) VALUES ($1)",
-                user["id"]
-            )
+    """
+    SAVE user content preferences.
 
-        await conn.execute("""
+    Contract:
+    - Frontend sends camelCase keys.
+    - DB stores snake_case columns in user_preferences.
+    - JSON columns are stored as jsonb (always_hashtags, blocked_hashtags, platform_hashtags).
+    """
+
+    CAMEL_TO_SNAKE = {
+        "autoCaptions": "auto_captions",
+        "autoThumbnails": "auto_thumbnails",
+        "thumbnailInterval": "thumbnail_interval",
+        "defaultPrivacy": "default_privacy",
+        "aiHashtagsEnabled": "ai_hashtags_enabled",
+        "aiHashtagCount": "ai_hashtag_count",
+        "aiHashtagStyle": "ai_hashtag_style",
+        "hashtagPosition": "hashtag_position",
+        "maxHashtags": "max_hashtags",
+        "alwaysHashtags": "always_hashtags",
+        "blockedHashtags": "blocked_hashtags",
+        "platformHashtags": "platform_hashtags",
+        "emailNotifications": "email_notifications",
+        "discordWebhook": "discord_webhook",
+    }
+
+    def normalize_prefs_payload(p: dict) -> dict:
+        out: dict = {}
+        for k, v in (p or {}).items():
+            out[CAMEL_TO_SNAKE.get(k, k)] = v
+        return out
+
+    p = normalize_prefs_payload(payload)
+
+    # defaults / coercions
+    always = p.get("always_hashtags") or []
+    blocked = p.get("blocked_hashtags") or []
+    platform = p.get("platform_hashtags") or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+
+    if not isinstance(always, list) or not isinstance(blocked, list) or not isinstance(platform, dict):
+        raise HTTPException(status_code=400, detail="Invalid preferences payload types.")
+
+    # core scalar coercions
+    auto_captions = bool(p.get("auto_captions", False))
+    auto_thumbnails = bool(p.get("auto_thumbnails", False))
+
+    try:
+        thumbnail_interval = int(p.get("thumbnail_interval", 5))
+    except Exception:
+        thumbnail_interval = 5
+
+    default_privacy = str(p.get("default_privacy", "public") or "public").lower()
+    if default_privacy not in ("public", "unlisted", "private"):
+        default_privacy = "public"
+
+    ai_hashtags_enabled = bool(p.get("ai_hashtags_enabled", False))
+
+    try:
+        ai_hashtag_count = int(p.get("ai_hashtag_count", 5))
+    except Exception:
+        ai_hashtag_count = 5
+
+    ai_hashtag_style = str(p.get("ai_hashtag_style", "mixed") or "mixed").lower()
+    if ai_hashtag_style not in ("trending", "niche", "mixed"):
+        ai_hashtag_style = "mixed"
+
+    hashtag_position = str(p.get("hashtag_position", "end") or "end").lower()
+    if hashtag_position not in ("start", "end"):
+        hashtag_position = "end"
+
+    try:
+        max_hashtags = int(p.get("max_hashtags", 15))
+    except Exception:
+        max_hashtags = 15
+
+    email_notifications = bool(p.get("email_notifications", True))
+    discord_webhook = p.get("discord_webhook")
+
+    async with db_pool.acquire() as conn:
+        # ensure row exists
+        await conn.execute(
+            "INSERT INTO user_preferences (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user["id"],
+        )
+
+        await conn.execute(
+            """
             UPDATE user_preferences SET
                 auto_captions = $1,
                 auto_thumbnails = $2,
@@ -1988,25 +2041,32 @@ async def save_user_preferences(
                 discord_webhook = $14,
                 updated_at = NOW()
             WHERE user_id = $15
-        """,
-            prefs.auto_captions,
-            prefs.auto_thumbnails,
-            prefs.thumbnail_interval,
-            prefs.default_privacy,
-            prefs.ai_hashtags_enabled,
-            prefs.ai_hashtag_count,
-            prefs.ai_hashtag_style,
-            prefs.hashtag_position,
-            prefs.max_hashtags,
-            json.dumps(prefs.always_hashtags),
-            json.dumps(prefs.blocked_hashtags),
-            json.dumps(prefs.platform_hashtags.dict()),
-            prefs.email_notifications,
-            prefs.discord_webhook,
-            user["id"]
+            """,
+            auto_captions,
+            auto_thumbnails,
+            thumbnail_interval,
+            default_privacy,
+            ai_hashtags_enabled,
+            ai_hashtag_count,
+            ai_hashtag_style,
+            hashtag_position,
+            max_hashtags,
+            json.dumps(always),
+            json.dumps(blocked),
+            json.dumps(platform),
+            email_notifications,
+            discord_webhook,
+            user["id"],
         )
 
-    return {"success": True, "message": "Preferences saved successfully"}
+        # immediate read-after-write to validate persistence (helps front-end debugging)
+        row = await conn.fetchrow(
+            "SELECT updated_at FROM user_preferences WHERE user_id = $1",
+            user["id"],
+        )
+
+    return {"ok": True, "updatedAt": (row["updated_at"].isoformat() if row and row.get("updated_at") else None)}
+
 
 
 @app.put("/api/settings/preferences")

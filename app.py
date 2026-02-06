@@ -2003,14 +2003,94 @@ async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
         await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
     return {"status": "cancelled"}
 
+
 @app.get("/api/uploads")
-async def get_uploads(status: Optional[str] = None, limit: int = 50, offset: int = 0, user: dict = Depends(get_current_user)):
+async def get_uploads(
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    trill_only: bool = False,
+    meta: bool = False,
+    user: dict = Depends(get_current_user),
+):
+    """Get uploads with optional Trill filter. Set meta=true for total/limit/offset wrapper."""
     async with db_pool.acquire() as conn:
+        where_clauses = ["user_id = $1"]
+        params = [user["id"]]
+
         if status:
-            uploads = await conn.fetch("SELECT * FROM uploads WHERE user_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4", user["id"], status, limit, offset)
-        else:
-            uploads = await conn.fetch("SELECT * FROM uploads WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3", user["id"], limit, offset)
-    return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "put_cost": u.get("put_reserved", 0), "aic_cost": u.get("aic_reserved", 0)} for u in uploads]
+            params.append(status)
+            where_clauses.append(f"status = ${len(params)}")
+
+        if trill_only:
+            where_clauses.append("trill_score IS NOT NULL")
+
+        where_sql = " AND ".join(where_clauses)
+
+        # Prefer explicit column list; if schema is older, fall back to SELECT *
+        select_sql = f"""
+            SELECT
+                id, filename, title, caption, platforms, status,
+                scheduled_time, created_at,
+                put_reserved, aic_reserved,
+                views, likes,
+                trill_score, speed_bucket, max_speed_mph, avg_speed_mph, distance_miles, duration_seconds,
+                ai_title, ai_caption
+            FROM uploads
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+        """
+
+        try:
+            rows = await conn.fetch(select_sql, *params, limit, offset)
+        except Exception as e:
+            if e.__class__.__name__ != "UndefinedColumnError":
+                raise
+            # Legacy schema fallback
+            legacy_sql = f"""
+                SELECT *
+                FROM uploads
+                WHERE {where_sql}
+                ORDER BY created_at DESC
+                LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+            """
+            rows = await conn.fetch(legacy_sql, *params, limit, offset)
+
+        def _row_to_public(u):
+            d = dict(u)
+            return {
+                "id": str(d.get("id")),
+                "filename": d.get("filename"),
+                "platforms": d.get("platforms"),
+                "status": d.get("status"),
+                "title": d.get("title"),
+                "caption": d.get("caption"),
+                "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
+                "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
+                "put_cost": d.get("put_reserved", 0),
+                "aic_cost": d.get("aic_reserved", 0),
+                "views": d.get("views", 0) or 0,
+                "likes": d.get("likes", 0) or 0,
+                # Trill (optional)
+                "trill_score": d.get("trill_score"),
+                "speed_bucket": d.get("speed_bucket"),
+                "max_speed_mph": d.get("max_speed_mph"),
+                "avg_speed_mph": d.get("avg_speed_mph"),
+                "distance_miles": d.get("distance_miles"),
+                "duration_seconds": d.get("duration_seconds"),
+                "ai_title": d.get("ai_title"),
+                "ai_caption": d.get("ai_caption"),
+            }
+
+        uploads = [_row_to_public(u) for u in rows]
+
+        if not meta:
+            return uploads
+
+        total = await conn.fetchval(f"SELECT COUNT(*) FROM uploads WHERE {where_sql}", *params)
+        return {"uploads": uploads, "total": int(total or 0), "limit": limit, "offset": offset}
+
 
 @app.get("/api/scheduled")
 async def get_scheduled(user: dict = Depends(get_current_user)):

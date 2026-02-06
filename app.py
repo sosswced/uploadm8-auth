@@ -1971,13 +1971,51 @@ async def save_user_preferences(
 
     p = normalize_prefs_payload(payload)
 
-    # defaults / coercions
-    always = p.get("always_hashtags") or []
-    blocked = p.get("blocked_hashtags") or []
-    platform = p.get("platform_hashtags") or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+    # defaults / coercions (frontend may send strings from text inputs)
+    def _coerce_hashtag_list(v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        if isinstance(v, str):
+            # Accept comma / newline separated input; preserve leading '#'
+            raw = v.replace("
+", ",").replace("
+", ",")
+            parts = [p.strip() for p in raw.split(",")]
+            return [p for p in parts if p]
+        # Anything else: drop to empty to avoid 500s
+        return []
 
-    if not isinstance(always, list) or not isinstance(blocked, list) or not isinstance(platform, dict):
-        raise HTTPException(status_code=400, detail="Invalid preferences payload types.")
+    def _coerce_platform_map(v):
+        default_map = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+        if v is None:
+            return default_map
+        if isinstance(v, dict):
+            # Ensure each platform value is a list of strings
+            out = {}
+            for k, val in v.items():
+                out[str(k)] = _coerce_hashtag_list(val)
+            # Ensure all expected keys exist
+            for k in default_map.keys():
+                out.setdefault(k, [])
+            return out
+        if isinstance(v, str):
+            # Try JSON string first, else treat as a global hashtag list applied to all
+            s = v.strip()
+            if not s:
+                return default_map
+            try:
+                obj = json.loads(s)
+                return _coerce_platform_map(obj)
+            except Exception:
+                lst = _coerce_hashtag_list(s)
+                return {k: lst[:] for k in default_map.keys()}
+        return default_map
+
+    always = _coerce_hashtag_list(p.get("always_hashtags"))
+    blocked = _coerce_hashtag_list(p.get("blocked_hashtags"))
+    platform = _coerce_platform_map(p.get("platform_hashtags"))
 
     # core scalar coercions
     auto_captions = bool(p.get("auto_captions", False))

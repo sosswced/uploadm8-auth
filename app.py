@@ -245,7 +245,7 @@ async def rotate_refresh_token(conn, old_token: str):
         raise HTTPException(401, "Reuse detected")
     if row["expires_at"] < _now_utc(): raise HTTPException(401, "Expired")
     await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE id=$1", row["id"])
-    return create_access_jwt(row["user_id"]), await create_refresh_token(conn, row["user_id"])
+    return create_access_jwt(str(row["user_id"])), await create_refresh_token(conn, row["user_id"])
 
 # ============================================================
 # Discord & Email Notifications
@@ -2165,14 +2165,46 @@ async def save_user_preferences_put(
 
 async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     """Helper to fetch user preferences for upload processing"""
-    # Try user_settings.preferences_json first (new location)
+    # Read from user_preferences table (primary source)
+    prefs_row = await conn.fetchrow(
+        "SELECT * FROM user_preferences WHERE user_id = $1",
+        user_id
+    )
+    
+    if prefs_row:
+        # User has preferences in the table
+        return {
+            "auto_captions": prefs_row["auto_captions"],
+            "auto_thumbnails": prefs_row["auto_thumbnails"],
+            "thumbnail_interval": prefs_row["thumbnail_interval"],
+            "default_privacy": prefs_row["default_privacy"],
+            "ai_hashtags_enabled": prefs_row["ai_hashtags_enabled"],
+            "ai_hashtag_count": prefs_row["ai_hashtag_count"],
+            "ai_hashtag_style": prefs_row["ai_hashtag_style"],
+            "hashtag_position": prefs_row["hashtag_position"],
+            "max_hashtags": prefs_row["max_hashtags"],
+            "always_hashtags": prefs_row["always_hashtags"] or [],
+            "blocked_hashtags": prefs_row["blocked_hashtags"] or [],
+            "platform_hashtags": prefs_row["platform_hashtags"] or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
+            "email_notifications": prefs_row["email_notifications"],
+            "discord_webhook": prefs_row["discord_webhook"]
+        }
+    
+    # Fallback: Try legacy JSONB locations
+    # Try user_settings.preferences_json first
     prefs_row = await conn.fetchrow(
         "SELECT preferences_json FROM user_settings WHERE user_id = $1",
         user_id
     )
     
-    # Fallback to users.preferences (legacy location)
-    if not prefs_row or not prefs_row["preferences_json"]:
+    if prefs_row and prefs_row["preferences_json"]:
+        prefs_data = prefs_row["preferences_json"]
+        if isinstance(prefs_data, str):
+            prefs = json.loads(prefs_data)
+        else:
+            prefs = prefs_data
+    else:
+        # Try users.preferences (oldest fallback)
         prefs_row = await conn.fetchrow(
             "SELECT preferences FROM users WHERE id = $1",
             user_id
@@ -2185,14 +2217,8 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
                 prefs = prefs_data
         else:
             prefs = {}
-    else:
-        prefs_data = prefs_row["preferences_json"]
-        if isinstance(prefs_data, str):
-            prefs = json.loads(prefs_data)
-        else:
-            prefs = prefs_data
-
-    # Return preferences with defaults (frontend uses camelCase)
+    
+    # Return preferences with defaults (convert camelCase to snake_case for internal use)
     return {
         "auto_captions": prefs.get("autoCaptions", False),
         "auto_thumbnails": prefs.get("autoThumbnails", False),

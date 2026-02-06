@@ -2120,8 +2120,8 @@ async def save_user_preferences(
                 ai_hashtag_style = $7,
                 hashtag_position = $8,
                 max_hashtags = $9,
-                always_hashtags = $10::jsonb,
-                blocked_hashtags = $11::jsonb,
+                always_hashtags = $10,
+                blocked_hashtags = $11,
                 platform_hashtags = $12::jsonb,
                 email_notifications = $13,
                 discord_webhook = $14,
@@ -2137,9 +2137,9 @@ async def save_user_preferences(
             ai_hashtag_style,
             hashtag_position,
             max_hashtags,
-            json.dumps(always),
-            json.dumps(blocked),
-            json.dumps(platform),
+            always,  # Pass as Python list, asyncpg handles TEXT[] conversion
+            blocked,  # Pass as Python list, asyncpg handles TEXT[] conversion
+            json.dumps(platform),  # JSONB needs json.dumps
             email_notifications,
             discord_webhook,
             user["id"],

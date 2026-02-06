@@ -774,13 +774,35 @@ async def run_migrations():
                 ai_hashtag_style VARCHAR(50) DEFAULT 'mixed',
                 hashtag_position VARCHAR(50) DEFAULT 'end',
                 max_hashtags INT DEFAULT 15,
-                always_hashtags TEXT[] DEFAULT ARRAY[]::TEXT[],
-                blocked_hashtags TEXT[] DEFAULT ARRAY[]::TEXT[],
+                always_hashtags JSONB DEFAULT '[]'::jsonb,
+                blocked_hashtags JSONB DEFAULT '[]'::jsonb,
                 platform_hashtags JSONB DEFAULT '{"tiktok":[],"youtube":[],"instagram":[],"facebook":[]}'::jsonb,
                 email_notifications BOOLEAN DEFAULT TRUE,
                 discord_webhook VARCHAR(512),
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW())"""),
+            (25, """DO $$ 
+                BEGIN
+                    -- Convert always_hashtags from TEXT[] to JSONB if it exists
+                    IF EXISTS (SELECT 1 FROM information_schema.columns 
+                              WHERE table_name = 'user_preferences' 
+                              AND column_name = 'always_hashtags' 
+                              AND data_type = 'ARRAY') THEN
+                        ALTER TABLE user_preferences 
+                        ALTER COLUMN always_hashtags TYPE JSONB 
+                        USING array_to_json(always_hashtags)::jsonb;
+                    END IF;
+                    
+                    -- Convert blocked_hashtags from TEXT[] to JSONB if it exists
+                    IF EXISTS (SELECT 1 FROM information_schema.columns 
+                              WHERE table_name = 'user_preferences' 
+                              AND column_name = 'blocked_hashtags' 
+                              AND data_type = 'ARRAY') THEN
+                        ALTER TABLE user_preferences 
+                        ALTER COLUMN blocked_hashtags TYPE JSONB 
+                        USING array_to_json(blocked_hashtags)::jsonb;
+                    END IF;
+                END $$;"""),
         ]
         
         for version, sql in migrations:
@@ -1964,6 +1986,22 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             )
 
         d = dict(prefs) if prefs else {}
+        
+        # Ensure arrays are properly formatted as lists
+        always_tags = d.get("always_hashtags")
+        blocked_tags = d.get("blocked_hashtags")
+        platform_tags = d.get("platform_hashtags")
+        
+        # DEBUG: Log what we loaded from database
+        logger.info(f"Loading preferences for user {user['id']}")
+        logger.info(f"always_hashtags from DB: {always_tags} (type: {type(always_tags)})")
+        logger.info(f"blocked_hashtags from DB: {blocked_tags} (type: {type(blocked_tags)})")
+        
+        # Convert to lists if needed
+        if always_tags and not isinstance(always_tags, list):
+            always_tags = list(always_tags) if hasattr(always_tags, '__iter__') else []
+        if blocked_tags and not isinstance(blocked_tags, list):
+            blocked_tags = list(blocked_tags) if hasattr(blocked_tags, '__iter__') else []
 
         return {
             "autoCaptions": d.get("auto_captions", False),
@@ -1975,9 +2013,9 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             "aiHashtagStyle": d.get("ai_hashtag_style", "mixed"),
             "hashtagPosition": d.get("hashtag_position", "end"),
             "maxHashtags": str(d.get("max_hashtags", 15)),
-            "alwaysHashtags": d.get("always_hashtags") or [],
-            "blockedHashtags": d.get("blocked_hashtags") or [],
-            "platformHashtags": d.get("platform_hashtags") or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
+            "alwaysHashtags": always_tags or [],
+            "blockedHashtags": blocked_tags or [],
+            "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": d.get("email_notifications", True),
             "discordWebhook": d.get("discord_webhook")
         }
@@ -2097,6 +2135,12 @@ async def save_user_preferences(
     always = _coerce_hashtag_list(p.get("always_hashtags"))
     blocked = _coerce_hashtag_list(p.get("blocked_hashtags"))
     platform = _coerce_platform_map(p.get("platform_hashtags"))
+    
+    # DEBUG: Log what we're about to save
+    logger.info(f"Saving preferences for user {user['id']}")
+    logger.info(f"always_hashtags: {always} (type: {type(always)})")
+    logger.info(f"blocked_hashtags: {blocked} (type: {type(blocked)})")
+    logger.info(f"platform_hashtags: {platform} (type: {type(platform)})")
 
     # core scalar coercions
     auto_captions = bool(p.get("auto_captions", False))
@@ -2153,8 +2197,8 @@ async def save_user_preferences(
                 ai_hashtag_style = $7,
                 hashtag_position = $8,
                 max_hashtags = $9,
-                always_hashtags = $10,
-                blocked_hashtags = $11,
+                always_hashtags = $10::jsonb,
+                blocked_hashtags = $11::jsonb,
                 platform_hashtags = $12::jsonb,
                 email_notifications = $13,
                 discord_webhook = $14,
@@ -2170,9 +2214,9 @@ async def save_user_preferences(
             ai_hashtag_style,
             hashtag_position,
             max_hashtags,
-            always,  # Pass as Python list, asyncpg handles TEXT[] conversion
-            blocked,  # Pass as Python list, asyncpg handles TEXT[] conversion
-            json.dumps(platform),  # JSONB needs json.dumps
+            json.dumps(always),  # Always use json.dumps for JSONB
+            json.dumps(blocked),  # Always use json.dumps for JSONB
+            json.dumps(platform),  # Always use json.dumps for JSONB
             email_notifications,
             discord_webhook,
             user["id"],

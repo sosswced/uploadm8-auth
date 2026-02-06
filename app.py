@@ -1979,9 +1979,7 @@ async def save_user_preferences(
             return [str(x).strip() for x in v if str(x).strip()]
         if isinstance(v, str):
             # Accept comma / newline separated input; preserve leading '#'
-            raw = v.replace("
-", ",").replace("
-", ",")
+            raw = v.replace("\n", ",").replace("\r", ",")
             parts = [p.strip() for p in raw.split(",")]
             return [p for p in parts if p]
         # Anything else: drop to empty to avoid 500s

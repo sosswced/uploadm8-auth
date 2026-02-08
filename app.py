@@ -3757,7 +3757,6 @@ async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Q
     headers = {"Content-Disposition": f'attachment; filename="uploadm8-analytics-{days}d.csv"'}
     return Response(content=csv_bytes, media_type="text/csv", headers=headers)
 
-====================
 class SupportContactRequest(BaseModel):
     name: Optional[str] = None
     email: Optional[str] = None

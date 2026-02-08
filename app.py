@@ -102,6 +102,37 @@ R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "uploadm8-media")
+
+
+def _normalize_r2_key(key: str) -> str:
+    """Normalize object keys to prevent bucket/bucket/... poisoning and signature mismatches."""
+    if not key:
+        return ""
+    k = str(key).lstrip("/")
+    bucket = (R2_BUCKET_NAME or "").strip()
+    if bucket:
+        prefix = bucket + "/"
+        # Strip duplicated bucket prefixes (e.g., bucket/bucket/key or bucket/key)
+        while k.startswith(prefix):
+            k = k[len(prefix):]
+    # Collapse accidental double slashes
+    while "//" in k:
+        k = k.replace("//", "/")
+    return k
+
+def generate_presigned_download_url(key: str, ttl: int = 3600) -> str:
+    """Generate a short-lived signed GET URL for a private R2 object."""
+    k = _normalize_r2_key(key)
+    if not k:
+        return ""
+    if not R2_BUCKET_NAME:
+        raise RuntimeError("Missing R2_BUCKET_NAME env var")
+    s3 = get_s3_client()
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": R2_BUCKET_NAME, "Key": k},
+        ExpiresIn=int(ttl),
+    )
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
 
 # Redis
@@ -422,18 +453,12 @@ def get_s3_client():
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME") or os.getenv("R2_BUCKET") or os.getenv("R2_BUCKET_NAME".lower())
 
 def r2_presign_get_url(r2_key: str, expires_in: int = 3600) -> str:
+
     """Generate a short-lived signed URL for a private R2 object."""
-    if not r2_key:
-        return ""
-    if not R2_BUCKET_NAME:
-        raise RuntimeError("Missing R2_BUCKET_NAME env var")
-    s3 = get_s3_client()
-    return s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": R2_BUCKET_NAME, "Key": r2_key},
-        ExpiresIn=int(expires_in),
-    )
+    return generate_presigned_download_url(r2_key, ttl=int(expires_in))
+
 def generate_presigned_upload_url(key: str, content_type: str, ttl: int = 3600) -> str:
+    key = _normalize_r2_key(key)
     s3 = get_s3_client()
     return s3.generate_presigned_url("put_object", Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type}, ExpiresIn=ttl)
 
@@ -615,7 +640,6 @@ PLATFORM_OPTIMAL_DAYS = {
 }
 
 import random
-
 def calculate_smart_schedule(platforms: List[str], num_days: int = 7, user_timezone: str = "UTC") -> Dict[str, datetime]:
     """
     Calculate optimal upload times for each platform.

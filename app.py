@@ -2647,7 +2647,13 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
                 platform_tags = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
 
         # DEBUG: Log normalized types after coercion
-        logger.info(f"Normalized preferences for user {user['id']}: always_hashtags={always_tags} ({type(always_tags)}), blocked_hashtags={blocked_tags} ({type(blocked_tags)}))\n
+        logger.info(
+            f"Normalized preferences for user {user['id']}: "
+            f"always_hashtags={always_tags} ({type(always_tags)}), "
+            f"blocked_hashtags={blocked_tags} ({type(blocked_tags)}), "
+            f"platform_hashtags={platform_tags} ({type(platform_tags)})"
+        )
+
         return {
             "autoCaptions": d.get("auto_captions", False),
             "autoThumbnails": d.get("auto_thumbnails", False),

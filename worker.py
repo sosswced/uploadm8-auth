@@ -66,8 +66,9 @@ async def run_pipeline(job_data: dict) -> bool:
     upload_id = job_data.get("upload_id")
     user_id = job_data.get("user_id")
     job_id = job_data.get("job_id", "unknown")
+    action = job_data.get("action") or "process"
     
-    logger.info(f"Starting pipeline: upload={upload_id}, job={job_id}")
+    logger.info(f"Starting pipeline: upload={upload_id}, job={job_id}, action={action}")
     ctx = None
     temp_dir = None
     

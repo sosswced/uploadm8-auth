@@ -10,6 +10,8 @@ Complete implementation with:
 """
 
 import os
+import csv
+import io
 import json
 import secrets
 import hashlib
@@ -885,7 +887,18 @@ async def run_migrations():
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_ai_enhance BOOLEAN DEFAULT TRUE;
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_openai_model VARCHAR(50) DEFAULT 'gpt-4o-mini';
             """),
-        ]
+        
+(103, """CREATE TABLE IF NOT EXISTS support_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    name VARCHAR(255),
+    email VARCHAR(255),
+    subject VARCHAR(255),
+    message TEXT NOT NULL,
+    status VARCHAR(50) DEFAULT 'open',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+)"""),
+]
         
         for version, sql in migrations:
             if version not in applied:
@@ -1278,6 +1291,17 @@ async def logout(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", user["id"])
     return {"status": "logged_out"}
+
+@app.post("/api/auth/logout-all")
+async def logout_all(user: dict = Depends(get_current_user)):
+    """Revoke all refresh tokens for current user (log out all devices)."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+            user["id"],
+        )
+    return {"status": "logged_out_all"}
+
 
 
 @app.post("/api/auth/forgot-password")
@@ -2410,6 +2434,59 @@ async def cancel_scheduled_upload(upload_id: str, user: dict = Depends(get_curre
     
     return {"status": "cancelled", "id": upload_id}
 
+@app.post("/api/uploads/{upload_id}/retry")
+async def retry_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """Reset a failed/cancelled upload and re-queue it for processing."""
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow(
+            "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"]
+        )
+        if not upload:
+            raise HTTPException(404, "Upload not found")
+
+        # Only allow retry for terminal states
+        if upload["status"] not in ("failed", "cancelled"):
+            raise HTTPException(400, "Only failed or cancelled uploads can be retried")
+
+        # Reset processing state (keep engagement + cost fields intact)
+        await conn.execute(
+            """
+            UPDATE uploads
+            SET status = 'pending',
+                error_code = NULL,
+                error_detail = NULL,
+                processing_started_at = NULL,
+                processing_finished_at = NULL,
+                completed_at = NULL,
+                cancel_requested = FALSE,
+                updated_at = NOW()
+            WHERE id = $1 AND user_id = $2
+            """,
+            upload_id, user["id"]
+        )
+
+        # Pull latest preferences (and respect plan entitlements)
+        user_prefs = await get_user_prefs_for_upload(conn, user["id"])
+        plan = get_plan(user.get("subscription_tier", "free"))
+
+    job_data = {
+        "job_id": str(uuid.uuid4()),
+        "upload_id": upload_id,
+        "user_id": str(user["id"]),
+        "preferences": user_prefs,
+        "plan_features": {
+            "ai": plan.get("ai", False),
+            "priority": plan.get("priority", False),
+            "watermark": plan.get("watermark", True),
+        },
+        "action": "retry",
+    }
+
+    await enqueue_job(job_data, priority=plan.get("priority", False))
+    return {"status": "requeued", "upload_id": upload_id}
+
+
 # ============================================================
 # User Color Preferences
 # ============================================================
@@ -3513,7 +3590,214 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
 
 # ============================================================
 # Admin Endpoints
-# ============================================================
+# ========================================@app.get("/api/analytics/overview")
+async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = Depends(get_current_user)):
+    """High-level KPI summary for analytics dashboard."""
+    since = _now_utc() - timedelta(days=days)
+
+    async with db_pool.acquire() as conn:
+        # Upload KPIs (defensive against older schemas)
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*)::int AS uploads_total,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS uploads_completed,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS uploads_failed,
+                    COALESCE(AVG(EXTRACT(EPOCH FROM (processing_finished_at - processing_started_at))), 0)::double precision AS avg_processing_seconds,
+                    COALESCE(SUM(views), 0)::bigint AS views_total,
+                    COALESCE(SUM(likes), 0)::bigint AS likes_total,
+                    COALESCE(SUM(cost_attributed), 0)::double precision AS cost_total
+                FROM uploads
+                WHERE user_id = $1 AND created_at >= $2
+                """,
+                user["id"], since
+            )
+        except Exception as e:
+            if e.__class__.__name__ != "UndefinedColumnError":
+                raise
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*)::int AS uploads_total,
+                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS uploads_completed,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS uploads_failed,
+                    0::double precision AS avg_processing_seconds,
+                    0::bigint AS views_total,
+                    0::bigint AS likes_total,
+                    0::double precision AS cost_total
+                FROM uploads
+                WHERE user_id = $1 AND created_at >= $2
+                """,
+                user["id"], since
+            )
+
+        # Revenue (optional)
+        revenue_total = 0.0
+        try:
+            rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(amount), 0)::decimal FROM revenue_tracking WHERE user_id = $1 AND created_at >= $2",
+                user["id"], since
+            )
+            revenue_total = float(rev or 0)
+        except Exception as e:
+            if e.__class__.__name__ != "UndefinedTableError":
+                raise
+
+    return {
+        "range_days": days,
+        "since": since.isoformat(),
+        "uploads": {
+            "total": int(row["uploads_total"] or 0),
+            "completed": int(row["uploads_completed"] or 0),
+            "failed": int(row["uploads_failed"] or 0),
+            "avg_processing_seconds": float(row["avg_processing_seconds"] or 0),
+        },
+        "engagement": {
+            "views": int(row["views_total"] or 0),
+            "likes": int(row["likes_total"] or 0),
+        },
+        "costs": {
+            "cost_total": float(row["cost_total"] or 0),
+        },
+        "revenue": {
+            "revenue_total": revenue_total,
+        },
+    }
+
+
+@app.get("/api/analytics/export")
+async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Query("csv"), user: dict = Depends(get_current_user)):
+    """Export analytics for the last N days as CSV (default) or JSON."""
+    since = _now_utc() - timedelta(days=days)
+
+    async with db_pool.acquire() as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, filename, title, caption, platforms, privacy, status,
+                    created_at, completed_at,
+                    COALESCE(views, 0)::bigint AS views,
+                    COALESCE(likes, 0)::bigint AS likes,
+                    COALESCE(comments, 0)::bigint AS comments,
+                    COALESCE(shares, 0)::bigint AS shares,
+                    COALESCE(cost_attributed, 0)::double precision AS cost_attributed,
+                    video_url
+                FROM uploads
+                WHERE user_id = $1 AND created_at >= $2
+                ORDER BY created_at DESC
+                """,
+                user["id"], since
+            )
+        except Exception as e:
+            if e.__class__.__name__ != "UndefinedColumnError":
+                raise
+            # Older schema fallback
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, filename, title, caption, platforms, privacy, status,
+                    created_at, completed_at,
+                    0::bigint AS views,
+                    0::bigint AS likes,
+                    0::bigint AS comments,
+                    0::bigint AS shares,
+                    0::double precision AS cost_attributed,
+                    video_url
+                FROM uploads
+                WHERE user_id = $1 AND created_at >= $2
+                ORDER BY created_at DESC
+                """,
+                user["id"], since
+            )
+
+    data = [
+        {
+            "id": str(r["id"]),
+            "filename": r["filename"],
+            "title": r["title"],
+            "caption": r["caption"],
+            "platforms": list(r["platforms"]) if r["platforms"] else [],
+            "privacy": r["privacy"],
+            "status": r["status"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+            "views": int(r["views"] or 0),
+            "likes": int(r["likes"] or 0),
+            "comments": int(r["comments"] or 0),
+            "shares": int(r["shares"] or 0),
+            "cost_attributed": float(r["cost_attributed"] or 0),
+            "video_url": r.get("video_url"),
+        }
+        for r in rows
+    ]
+
+    if format.lower() == "json":
+        return {"range_days": days, "since": since.isoformat(), "rows": data}
+
+    # CSV default
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "id","filename","title","caption","platforms","privacy","status",
+            "created_at","completed_at",
+            "views","likes","comments","shares",
+            "cost_attributed","video_url",
+        ],
+    )
+    writer.writeheader()
+    for item in data:
+        item = dict(item)
+        item["platforms"] = ",".join(item.get("platforms") or [])
+        writer.writerow(item)
+
+    csv_bytes = output.getvalue().encode("utf-8")
+    headers = {"Content-Disposition": f'attachment; filename="uploadm8-analytics-{days}d.csv"'}
+    return Response(content=csv_bytes, media_type="text/csv", headers=headers)
+
+====================
+class SupportContactRequest(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    subject: str
+    message: str
+
+
+@app.post("/api/support/contact")
+async def support_contact(payload: SupportContactRequest, user: dict = Depends(get_current_user)):
+    """Create a support ticket/message from the app."""
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO support_messages (user_id, name, email, subject, message)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            user["id"],
+            (payload.name or user.get("name") or "").strip() or None,
+            (payload.email or user.get("email") or "").strip() or None,
+            payload.subject.strip(),
+            payload.message.strip(),
+        )
+
+    # Optional admin notification
+    if ADMIN_DISCORD_WEBHOOK_URL:
+        await discord_notify(
+            ADMIN_DISCORD_WEBHOOK_URL,
+            embeds=[{
+                "title": "🆘 Support Message",
+                "color": 0xf97316,
+                "fields": [
+                    {"name": "User", "value": f"{user.get('email','')} ({user.get('id','')})"},
+                    {"name": "Subject", "value": payload.subject[:256]},
+                    {"name": "Message", "value": (payload.message[:900] + "…") if len(payload.message) > 900 else payload.message},
+                ],
+            }],
+        )
+
+    return {"status": "received"}
+
 @app.get("/api/admin/users")
 async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = None, limit: int = 50, offset: int = 0, user: dict = Depends(require_admin)):
     query = "SELECT id, email, name, role, subscription_tier, subscription_status, status, created_at, last_active_at FROM users WHERE 1=1"

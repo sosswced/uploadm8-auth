@@ -1857,48 +1857,16 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
 
 @app.get("/api/me/preferences")
 async def get_preferences(user: dict = Depends(get_current_user)):
-    """Get user preferences including hashtag settings"""
-    async with db_pool.acquire() as conn:
-        prefs = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
-    if prefs and prefs["preferences"]:
-        return json.loads(prefs["preferences"]) if isinstance(prefs["preferences"], str) else prefs["preferences"]
-    return {}
+    """Deprecated alias: use GET /api/settings/preferences."""
+    return await get_user_preferences(user)
+
 
 @app.put("/api/me/preferences")
 async def update_preferences(request: Request, user: dict = Depends(get_current_user)):
-    """Update user preferences including hashtag settings"""
-    prefs = await request.json()
-    
-    # Validate and sanitize hashtag data
-    if "alwaysHashtags" in prefs:
-        prefs["alwaysHashtags"] = [str(h).lower().strip()[:50] for h in prefs["alwaysHashtags"][:100]]
-    if "blockedHashtags" in prefs:
-        prefs["blockedHashtags"] = [str(h).lower().strip()[:50] for h in prefs["blockedHashtags"][:100]]
-    if "platformHashtags" in prefs:
-        for platform in ["tiktok", "youtube", "instagram", "facebook"]:
-            if platform in prefs["platformHashtags"]:
-                prefs["platformHashtags"][platform] = [str(h).lower().strip()[:50] for h in prefs["platformHashtags"][platform][:50]]
-    
-    # Validate numeric hashtag settings
-    if "maxHashtags" in prefs:
-        prefs["maxHashtags"] = max(1, min(50, int(prefs["maxHashtags"])))
-    if "aiHashtagCount" in prefs:
-        prefs["aiHashtagCount"] = max(1, min(30, int(prefs["aiHashtagCount"])))
-    
-    # Validate hashtag position
-    if "hashtagPosition" in prefs and prefs["hashtagPosition"] not in ["start", "end", "caption", "comment"]:
-        prefs["hashtagPosition"] = "end"
-    
-    # Validate AI hashtag style
-    if "aiHashtagStyle" in prefs and prefs["aiHashtagStyle"] not in ["lowercase", "capitalized", "camelcase", "mixed"]:
-        prefs["aiHashtagStyle"] = "mixed"
-    
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
-            json.dumps(prefs), user["id"]
-        )
-    return {"status": "updated"}
+    """Deprecated alias: use POST /api/settings/preferences. Accepts camelCase + snake_case."""
+    payload = await request.json()
+    return await _save_user_preferences_impl(payload, user)
+
 
 # ============================================================
 # Uploads
@@ -2272,10 +2240,25 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         now = _now_utc()
         
-        uploads = await conn.fetch("""
+        try:
+            uploads = await conn.fetch("""
             SELECT 
                 id, title, scheduled_time, platforms, 
                 thumbnail_r2_key, caption, status, 
+                created_at, timezone
+            FROM uploads 
+            WHERE user_id = $1 
+            AND scheduled_time IS NOT NULL 
+            AND scheduled_time > $2
+            AND status IN ('pending', 'scheduled', 'queued')
+            ORDER BY scheduled_time ASC
+        """, user["id"], now)
+        except asyncpg.exceptions.UndefinedColumnError:
+            # Backward compatibility: schema may not yet include thumbnail_r2_key
+            uploads = await conn.fetch("""
+            SELECT 
+                id, title, scheduled_time, platforms, 
+                NULL::text as thumbnail_r2_key, caption, status, 
                 created_at, timezone
             FROM uploads 
             WHERE user_id = $1 
@@ -2663,6 +2646,8 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             except:
                 platform_tags = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
 
+        # DEBUG: Log normalized types after coercion
+        logger.info(f"Normalized preferences for user {user['id']}: always_hashtags={always_tags} ({type(always_tags)}), blocked_hashtags={blocked_tags} ({type(blocked_tags)}))\n
         return {
             "autoCaptions": d.get("auto_captions", False),
             "autoThumbnails": d.get("auto_thumbnails", False),
@@ -2690,6 +2675,10 @@ async def save_user_preferences(
     payload: dict = Body(...),
     user: dict = Depends(get_current_user),
 ):
+    """API endpoint wrapper (kept for routing)."""
+    return await _save_user_preferences_impl(payload, user)
+
+async def _save_user_preferences_impl(payload: dict, user: dict):
     """
     SAVE user content preferences.
 
@@ -2786,6 +2775,15 @@ async def save_user_preferences(
     always = _coerce_hashtag_list(p.get("always_hashtags"))
     blocked = _coerce_hashtag_list(p.get("blocked_hashtags"))
     platform = _coerce_platform_map(p.get("platform_hashtags"))
+
+    # Integrity rule: a hashtag cannot be both "always include" and "blocked"
+    conflicts = sorted(set(always) & set(blocked))
+    if conflicts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Hashtags cannot be in BOTH Always Include and Blocked: {', '.join(conflicts)}. Remove from one list."
+        )
+
     
     # DEBUG: Log what we're about to save
     logger.info(f"Saving preferences for user {user['id']}")

@@ -1,6 +1,6 @@
 """
 UploadM8 API Server - Production Build v4
-==========================================
+# ====================
 Complete implementation with:
 - PUT/AIC wallet system with ledger
 - Announcements system
@@ -72,12 +72,6 @@ class UserPreferencesUpdate(BaseModel):
     email_notifications: bool = Field(True, alias="emailNotifications")
     discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
 
-    # Trill telemetry preferences
-    trill_enabled: bool = Field(False, alias="trillEnabled")
-    trill_min_score: int = Field(60, ge=0, le=100, alias="trillMinScore")
-    trill_hud_enabled: bool = Field(False, alias="trillHudEnabled")
-    trill_ai_enhance: bool = Field(True, alias="trillAiEnhance")
-    trill_openai_model: str = Field("gpt-4o-mini", alias="trillOpenaiModel")
     class Config:
         populate_by_name = True
         extra = "ignore"
@@ -109,8 +103,6 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "uploadm8-media")
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
-
-R2_PUBLIC_BASE = os.environ.get("R2_PUBLIC_BASE", "")  # Public base URL for R2 objects (e.g. https://cdn.uploadm8.com)
 
 # Redis
 REDIS_URL = os.environ.get("REDIS_URL", "")
@@ -420,24 +412,6 @@ async def daily_refill(conn, user_id: str, tier: str):
 # ============================================================
 # R2 Storage
 # ============================================================
-
-def public_r2_url(key_or_url: str) -> str:
-    """
-    Convert an R2 object key (e.g. avatars/<user>/<id>.png) into a publicly fetchable URL.
-    If the value is already an absolute URL, return as-is.
-    Requires R2_PUBLIC_BASE to be set for non-URL keys.
-    """
-    if not key_or_url:
-        return key_or_url
-    v = str(key_or_url)
-    if v.startswith("http://") or v.startswith("https://"):
-        return v
-    base = (R2_PUBLIC_BASE or "").strip()
-    if not base:
-        # Fallback to Cloudflare's r2.dev if user has public access enabled
-        return f"https://{R2_BUCKET_NAME}.r2.dev/{v.lstrip('/')}"
-    return f"{base.rstrip('/')}/{v.lstrip('/')}"
-
 def get_s3_client():
     endpoint = R2_ENDPOINT_URL or f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=Config(signature_version="s3v4"), region_name="auto")
@@ -518,7 +492,11 @@ class PasswordChange(BaseModel):
 class ProfileUpdateSettings(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    timezone: Optional[str] = None
+    # Avatar (private in R2; we store object key in DB)
+    avatar_r2_key: Optional[str] = None
+    avatarUrl: Optional[str] = None
+    avatar_url: Optional[str] = None
+
 
 class PreferencesUpdate(BaseModel):
     emailNotifs: Optional[bool] = None
@@ -624,6 +602,16 @@ PLATFORM_OPTIMAL_DAYS = {
 }
 
 import random
+def generate_presigned_download_url(key: str, expires: int = 3600) -> str:
+    """Generate a presigned GET URL for a private object in R2/S3."""
+    client = get_s3_client()
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": R2_BUCKET, "Key": key},
+        ExpiresIn=expires,
+    )
+
+
 
 def calculate_smart_schedule(platforms: List[str], num_days: int = 7, user_timezone: str = "UTC") -> Dict[str, datetime]:
     """
@@ -1429,7 +1417,13 @@ async def get_me(user: dict = Depends(get_current_user)):
         accounts_count = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", user["id"])
     
     max_accounts = plan.get("max_accounts", 1)
-    
+
+    avatar_signed_url = None
+    if user.get("avatar_r2_key"):
+        avatar_signed_url = generate_presigned_download_url(user["avatar_r2_key"], expires=3600)
+    elif user.get("avatar_url"):
+        avatar_signed_url = user.get("avatar_url")
+
     return {
         "id": str(user["id"]), 
         "email": user["email"], 
@@ -1440,9 +1434,7 @@ async def get_me(user: dict = Depends(get_current_user)):
         "role": role,
         "subscription_tier": tier, 
         "subscription_status": user.get("subscription_status"),
-        "timezone": user.get("timezone", "UTC"),
-        "avatar_url": public_r2_url(user.get("avatar_url")),
-        "plan": plan, 
+        "timezone": user.get("timezone", "UTC"),        "plan": plan, 
         "wallet": {
             "put_balance": wallet.get("put_balance", 0), 
             "put_reserved": wallet.get("put_reserved", 0),
@@ -1519,6 +1511,12 @@ async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depe
     if data.last_name is not None:
         updates.append(f"last_name = ${len(params)+1}")
         params.append(data.last_name.strip())
+
+    # Avatar key (store in users.avatar_r2_key). Accept multiple field names for frontend stability.
+    avatar_key = data.avatar_r2_key or data.avatarUrl or data.avatar_url
+    if avatar_key is not None:
+        updates.append(f"avatar_r2_key = ${len(params)+1}")
+        params.append(avatar_key.strip())
     
     # Also update the combined name field for backwards compatibility
     if data.first_name is not None or data.last_name is not None:
@@ -1675,19 +1673,19 @@ async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_c
                 CacheControl="public, max-age=31536000"  # Cache for 1 year
             )
             
-            # Persist the object key in DB (stable), and return a public URL for the frontend
-            avatar_key = r2_key
-            avatar_url = public_r2_url(avatar_key)
-
-            # Update user's avatar_url in database (store key, not full URL)
+            # Generate public URL (adjust based on your R2 public domain setup)
+            avatar_url = f"https://{R2_BUCKET_NAME}.r2.dev/{r2_key}"
+            
+            # Update user's avatar_url in database
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE users SET avatar_url = $1, updated_at = NOW() WHERE id = $2",
-                    avatar_key,
+                    avatar_url,
                     user["id"]
                 )
+            
             logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
-            return JSONResponse(status_code=200, content={"status": "success", "avatar_url": avatar_url})
+            return {"status": "success", "avatar_url": avatar_url}
             
         except Exception as e:
             logger.error(f"Avatar upload failed for user {user['id']}: {str(e)}")
@@ -1818,7 +1816,11 @@ async def get_settings(user: dict = Depends(get_current_user)):
 @app.put("/api/settings")
 async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current_user)):
     """Update user settings including Trill thresholds"""
-    updates, params = [], [user["id"]]
+    updates, params = [], [user["id"]        (104, """
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS avatar_r2_key VARCHAR(512);
+        """),
+]
 
     # All possible settings fields
     fields = [
@@ -1857,16 +1859,48 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
 
 @app.get("/api/me/preferences")
 async def get_preferences(user: dict = Depends(get_current_user)):
-    """Deprecated alias: use GET /api/settings/preferences."""
-    return await get_user_preferences(user)
-
+    """Get user preferences including hashtag settings"""
+    async with db_pool.acquire() as conn:
+        prefs = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
+    if prefs and prefs["preferences"]:
+        return json.loads(prefs["preferences"]) if isinstance(prefs["preferences"], str) else prefs["preferences"]
+    return {}
 
 @app.put("/api/me/preferences")
 async def update_preferences(request: Request, user: dict = Depends(get_current_user)):
-    """Deprecated alias: use POST /api/settings/preferences. Accepts camelCase + snake_case."""
-    payload = await request.json()
-    return await _save_user_preferences_impl(payload, user)
-
+    """Update user preferences including hashtag settings"""
+    prefs = await request.json()
+    
+    # Validate and sanitize hashtag data
+    if "alwaysHashtags" in prefs:
+        prefs["alwaysHashtags"] = [str(h).lower().strip()[:50] for h in prefs["alwaysHashtags"][:100]]
+    if "blockedHashtags" in prefs:
+        prefs["blockedHashtags"] = [str(h).lower().strip()[:50] for h in prefs["blockedHashtags"][:100]]
+    if "platformHashtags" in prefs:
+        for platform in ["tiktok", "youtube", "instagram", "facebook"]:
+            if platform in prefs["platformHashtags"]:
+                prefs["platformHashtags"][platform] = [str(h).lower().strip()[:50] for h in prefs["platformHashtags"][platform][:50]]
+    
+    # Validate numeric hashtag settings
+    if "maxHashtags" in prefs:
+        prefs["maxHashtags"] = max(1, min(50, int(prefs["maxHashtags"])))
+    if "aiHashtagCount" in prefs:
+        prefs["aiHashtagCount"] = max(1, min(30, int(prefs["aiHashtagCount"])))
+    
+    # Validate hashtag position
+    if "hashtagPosition" in prefs and prefs["hashtagPosition"] not in ["start", "end", "caption", "comment"]:
+        prefs["hashtagPosition"] = "end"
+    
+    # Validate AI hashtag style
+    if "aiHashtagStyle" in prefs and prefs["aiHashtagStyle"] not in ["lowercase", "capitalized", "camelcase", "mixed"]:
+        prefs["aiHashtagStyle"] = "mixed"
+    
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
+            json.dumps(prefs), user["id"]
+        )
+    return {"status": "updated"}
 
 # ============================================================
 # Uploads
@@ -2240,25 +2274,10 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         now = _now_utc()
         
-        try:
-            uploads = await conn.fetch("""
+        uploads = await conn.fetch("""
             SELECT 
                 id, title, scheduled_time, platforms, 
                 thumbnail_r2_key, caption, status, 
-                created_at, timezone
-            FROM uploads 
-            WHERE user_id = $1 
-            AND scheduled_time IS NOT NULL 
-            AND scheduled_time > $2
-            AND status IN ('pending', 'scheduled', 'queued')
-            ORDER BY scheduled_time ASC
-        """, user["id"], now)
-        except asyncpg.exceptions.UndefinedColumnError:
-            # Backward compatibility: schema may not yet include thumbnail_r2_key
-            uploads = await conn.fetch("""
-            SELECT 
-                id, title, scheduled_time, platforms, 
-                NULL::text as thumbnail_r2_key, caption, status, 
                 created_at, timezone
             FROM uploads 
             WHERE user_id = $1 
@@ -2646,14 +2665,6 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             except:
                 platform_tags = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
 
-        # DEBUG: Log normalized types after coercion
-        logger.info(
-            f"Normalized preferences for user {user['id']}: "
-            f"always_hashtags={always_tags} ({type(always_tags)}), "
-            f"blocked_hashtags={blocked_tags} ({type(blocked_tags)}), "
-            f"platform_hashtags={platform_tags} ({type(platform_tags)})"
-        )
-
         return {
             "autoCaptions": d.get("auto_captions", False),
             "autoThumbnails": d.get("auto_thumbnails", False),
@@ -2668,12 +2679,7 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             "blockedHashtags": blocked_tags or [],
             "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": d.get("email_notifications", True),
-            "discordWebhook": d.get("discord_webhook"),
-            "trillEnabled": d.get("trill_enabled", False),
-            "trillMinScore": int(d.get("trill_min_score", 60) or 60),
-            "trillHudEnabled": d.get("trill_hud_enabled", False),
-            "trillAiEnhance": d.get("trill_ai_enhance", True),
-            "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini")
+            "discordWebhook": d.get("discord_webhook")
         }
 
 @app.post("/api/settings/preferences")
@@ -2681,10 +2687,6 @@ async def save_user_preferences(
     payload: dict = Body(...),
     user: dict = Depends(get_current_user),
 ):
-    """API endpoint wrapper (kept for routing)."""
-    return await _save_user_preferences_impl(payload, user)
-
-async def _save_user_preferences_impl(payload: dict, user: dict):
     """
     SAVE user content preferences.
 
@@ -2709,13 +2711,6 @@ async def _save_user_preferences_impl(payload: dict, user: dict):
         "platformHashtags": "platform_hashtags",
         "emailNotifications": "email_notifications",
         "discordWebhook": "discord_webhook",
-
-        # Trill
-        "trillEnabled": "trill_enabled",
-        "trillMinScore": "trill_min_score",
-        "trillHudEnabled": "trill_hud_enabled",
-        "trillAiEnhance": "trill_ai_enhance",
-        "trillOpenaiModel": "trill_openai_model",
     }
 
     def normalize_prefs_payload(p: dict) -> dict:
@@ -2781,15 +2776,6 @@ async def _save_user_preferences_impl(payload: dict, user: dict):
     always = _coerce_hashtag_list(p.get("always_hashtags"))
     blocked = _coerce_hashtag_list(p.get("blocked_hashtags"))
     platform = _coerce_platform_map(p.get("platform_hashtags"))
-
-    # Integrity rule: a hashtag cannot be both "always include" and "blocked"
-    conflicts = sorted(set(always) & set(blocked))
-    if conflicts:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Hashtags cannot be in BOTH Always Include and Blocked: {', '.join(conflicts)}. Remove from one list."
-        )
-
     
     # DEBUG: Log what we're about to save
     logger.info(f"Saving preferences for user {user['id']}")
@@ -2833,17 +2819,6 @@ async def _save_user_preferences_impl(payload: dict, user: dict):
     email_notifications = bool(p.get("email_notifications", True))
     discord_webhook = p.get("discord_webhook")
 
-    # Trill
-    trill_enabled = bool(p.get("trill_enabled", p.get("trillEnabled", False)))
-    try:
-        trill_min_score = int(p.get("trill_min_score", p.get("trillMinScore", 60)))
-    except Exception:
-        trill_min_score = 60
-    trill_min_score = max(0, min(100, trill_min_score))
-    trill_hud_enabled = bool(p.get("trill_hud_enabled", p.get("trillHudEnabled", False)))
-    trill_ai_enhance = bool(p.get("trill_ai_enhance", p.get("trillAiEnhance", True)))
-    trill_openai_model = str(p.get("trill_openai_model", p.get("trillOpenaiModel", "gpt-4o-mini")) or "gpt-4o-mini")
-
     async with db_pool.acquire() as conn:
         # ensure row exists
         await conn.execute(
@@ -2868,16 +2843,8 @@ async def _save_user_preferences_impl(payload: dict, user: dict):
                 platform_hashtags = $12::jsonb,
                 email_notifications = $13,
                 discord_webhook = $14,
-
-                -- Trill
-                trill_enabled = $15,
-                trill_min_score = $16,
-                trill_hud_enabled = $17,
-                trill_ai_enhance = $18,
-                trill_openai_model = $19,
-
                 updated_at = NOW()
-            WHERE user_id = $20
+            WHERE user_id = $15
             """,
             auto_captions,
             auto_thumbnails,
@@ -2893,11 +2860,6 @@ async def _save_user_preferences_impl(payload: dict, user: dict):
             json.dumps(platform),  # Always use json.dumps for JSONB
             email_notifications,
             discord_webhook,
-            trill_enabled,
-            trill_min_score,
-            trill_hud_enabled,
-            trill_ai_enhance,
-            trill_openai_model,
             user["id"],
         )
 
@@ -3822,7 +3784,7 @@ async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Q
     csv_bytes = output.getvalue().encode("utf-8")
     headers = {"Content-Disposition": f'attachment; filename="uploadm8-analytics-{days}d.csv"'}
     return Response(content=csv_bytes, media_type="text/csv", headers=headers)
-
+# ====================
 class SupportContactRequest(BaseModel):
     name: Optional[str] = None
     email: Optional[str] = None

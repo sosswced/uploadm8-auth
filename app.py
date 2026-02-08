@@ -500,6 +500,12 @@ class ProfileUpdateSettings(BaseModel):
     last_name: Optional[str] = None
     timezone: Optional[str] = None
 
+
+class ProfileUpdate(BaseModel):
+    """Minimal profile update payload used by /api/me endpoints."""
+    name: Optional[str] = None
+    timezone: Optional[str] = None
+
 class PreferencesUpdate(BaseModel):
     emailNotifs: Optional[bool] = None
     uploadCompleteNotifs: Optional[bool] = None
@@ -4672,5 +4678,6 @@ async def commit_avatar_upload(payload: dict, user: dict = Depends(get_current_u
 
     signed_url = generate_presigned_download_url(key, ttl=3600)
     return {"avatar_r2_key": key, "avatar_url": signed_url, "avatarUrl": signed_url}
+
 
 

@@ -389,6 +389,45 @@ async def run_publish_stage(
         final_title = ctx.get_effective_title()
         final_caption = ctx.get_effective_caption()
         
+        # Apply platform-specific hashtags
+        platform_specific_tags = ctx.user_settings.get("platform_hashtags", {}).get(platform, [])
+        base_hashtags = ctx.ai_hashtags or ctx.hashtags or []
+        
+        # Combine base hashtags with platform-specific ones
+        all_hashtags = list(base_hashtags) + list(platform_specific_tags)
+        
+        # Deduplicate (case-insensitive)
+        seen = set()
+        unique_hashtags = []
+        for tag in all_hashtags:
+            tag_lower = tag.lower()
+            if tag_lower not in seen:
+                seen.add(tag_lower)
+                unique_hashtags.append(tag)
+        
+        # Apply max hashtag limit
+        max_hashtags = ctx.user_settings.get("max_hashtags", 15)
+        final_hashtags = unique_hashtags[:max_hashtags]
+        
+        # Format hashtags with # symbol
+        hashtag_str = " ".join(f"#{tag}" for tag in final_hashtags) if final_hashtags else ""
+        
+        # Combine caption with hashtags based on position preference
+        hashtag_position = ctx.user_settings.get("hashtag_position", "end")
+        if hashtag_str:
+            if hashtag_position == "start":
+                final_caption_with_tags = f"{hashtag_str}\n\n{final_caption}".strip()
+            elif hashtag_position == "end":
+                final_caption_with_tags = f"{final_caption}\n\n{hashtag_str}".strip()
+            else:  # caption - hashtags inline in caption
+                final_caption_with_tags = final_caption
+        else:
+            final_caption_with_tags = final_caption
+        
+        logger.info(f"{platform} - Hashtags: {final_hashtags}")
+        
+        # Use final_caption_with_tags for publishing instead of final_caption
+        
         # Publish based on platform
         if platform == "tiktok":
             result = await publish_to_tiktok(
@@ -400,14 +439,14 @@ async def run_publish_stage(
             result = await publish_to_youtube(
                 video_path,
                 final_title,
-                final_caption,
+                final_caption_with_tags,  # Use caption with hashtags
                 token_data
             )
         elif platform == "instagram":
             page_id = ctx.user_settings.get("selected_page_id")
             result = await publish_to_instagram(
                 video_path,
-                final_caption,
+                final_caption_with_tags,  # Use caption with hashtags
                 token_data,
                 page_id
             )
@@ -415,7 +454,7 @@ async def run_publish_stage(
             page_id = ctx.user_settings.get("selected_page_id")
             result = await publish_to_facebook(
                 video_path,
-                final_caption,
+                final_caption_with_tags,  # Use caption with hashtags
                 token_data,
                 page_id
             )

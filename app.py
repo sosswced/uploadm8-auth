@@ -1392,74 +1392,48 @@ async def get_me(user: dict = Depends(get_current_user)):
     plan = get_plan(user.get("subscription_tier", "free"))
     wallet = user.get("wallet", {})
     role = user.get("role", "user")
-    tier = user.get("subscription_tier", "free")
-    
-    # Check if user is internal (admin/special tiers) - don't show low token warnings
-    is_internal = role in ("admin", "master_admin") or tier in ("master_admin", "friends_family", "lifetime")
-    
-    put_available = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
-    aic_available = wallet.get("aic_balance", 0) - wallet.get("aic_reserved", 0)
-    put_monthly = plan.get("put_monthly", 30)
-    put_pct = (put_available / max(put_monthly, 1)) * 100 if not is_internal else 100
-    
-    # Compute banners - but not for internal users with high token counts
-    banners = []
-    if not is_internal:
-        if put_pct <= 0:
-            banners.append({"type": "blocking", "message": "You're out of PUT tokens!", "cta": "top-up"})
-        elif put_pct <= 10:
-            banners.append({"type": "urgent", "message": f"Only {put_available} PUT left!", "cta": "top-up"})
-        elif put_pct <= 30:
-            banners.append({"type": "warning", "message": f"{put_available} PUT remaining this period", "cta": "upgrade"})
-        
-        if plan.get("ai") and aic_available <= 5:
-            banners.append({"type": "warning", "message": "Low AI credits!", "cta": "buy-aic"})
-    
-    # Get connected accounts count
-    async with db_pool.acquire() as conn:
-        accounts_count = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", user["id"])
-    
-    max_accounts = plan.get("max_accounts", 1)
-    
-    # Avatar (private R2): return both snake_case + camelCase during stabilization
+
+    # Avatar: single source of truth = users.avatar_r2_key (private bucket -> signed URL)
     avatar_r2_key = user.get("avatar_r2_key")
-    signed_avatar = r2_presign_get_url(avatar_r2_key) if avatar_r2_key else None
-    
+    avatar_signed_url = None
+    if avatar_r2_key:
+        try:
+            avatar_signed_url = generate_presigned_download_url(avatar_r2_key)
+        except Exception as e:
+            logger.warning(f"Failed to presign avatar for user {user.get('id')}: {e}")
+
+    # Stabilization window: return both snake_case + camelCase keys
     return {
-        "id": str(user["id"]), 
-        "email": user["email"], 
-        "name": user["name"],
-        "first_name": user.get("first_name"),
-        "last_name": user.get("last_name"),
-        "tier_name": plan.get("name", "Free"),
+        "id": user["id"],
+        "email": user["email"],
+        "name": user.get("name"),
         "role": role,
-        "subscription_tier": tier, 
-        "subscription_status": user.get("subscription_status"),
-        "timezone": user.get("timezone", "UTC"),
-        "avatar_url": user.get("avatar_url"),
-        "plan": plan, 
+        "timezone": user.get("timezone") or "America/Chicago",
+
+        # Avatar outputs (private, signed)
+        "avatar_r2_key": avatar_r2_key,
+        "avatar_url": avatar_signed_url,
+        "avatarUrl": avatar_signed_url,
+        "avatar_signed_url": avatar_signed_url,
+        "avatarSignedUrl": avatar_signed_url,
+
+        "subscription_tier": user.get("subscription_tier", "free"),
         "wallet": {
-            "put_balance": wallet.get("put_balance", 0), 
-            "put_reserved": wallet.get("put_reserved", 0),
-            "put_available": put_available, 
-            "aic_balance": wallet.get("aic_balance", 0), 
-            "aic_reserved": wallet.get("aic_reserved", 0),
-            "aic_available": aic_available
+            "put_balance": float(wallet.get("put_balance", 0.0) or 0.0),
+            "aic_balance": float(wallet.get("aic_balance", 0.0) or 0.0),
+            "updated_at": wallet.get("updated_at"),
         },
-        "banners": banners, 
-        "flex_enabled": user.get("flex_enabled", False),
-        "created_at": user["created_at"].isoformat() if user.get("created_at") else None,
-        "accounts_connected": accounts_count,
-        "max_accounts": max_accounts,
-        "entitlements": {
-            "max_accounts": max_accounts,
-            "max_hashtags": 30 if is_internal else (10 if tier in ("creator_pro", "studio", "agency") else 5),
-            "show_ads": plan.get("ads", True) and not is_internal,
-            "show_watermark": plan.get("watermark", True) and not is_internal,
-            "scheduling": plan.get("scheduling", False) or is_internal,
-            "ai": plan.get("ai", False) or is_internal,
+        "plan": plan,
+        "features": {
+            "uploads": plan.get("uploads", False),
+            "scheduler": plan.get("scheduler", False),
+            "analytics": plan.get("analytics", False),
+            "watermark": plan.get("watermark", False),
+            "white_label": plan.get("white_label", False),
+            "support": plan.get("support", False),
         }
     }
+
 
 class ProfileUpdate(BaseModel):
     name: Optional[str] = None

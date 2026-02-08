@@ -126,8 +126,47 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
             logger.info(f"AI caption: {ctx.ai_caption[:50]}...")
         
         if result.get("hashtags") and generate_hashtags:
-            ctx.ai_hashtags = result["hashtags"][:max_hashtags]
-            logger.info(f"AI hashtags: {ctx.ai_hashtags}")
+            # Get AI generated tags
+            ai_tags = result["hashtags"]
+            
+            # Apply user hashtag preferences
+            # 1. Add always-include hashtags
+            always_tags = ctx.user_settings.get("always_hashtags", [])
+            combined_tags = list(ai_tags) + list(always_tags)
+            
+            # 2. Remove blocked hashtags
+            blocked_tags = set(ctx.user_settings.get("blocked_hashtags", []))
+            # Normalize for comparison (lowercase)
+            combined_tags = [
+                tag for tag in combined_tags 
+                if tag.lower() not in {b.lower() for b in blocked_tags}
+            ]
+            
+            # 3. Apply hashtag style preference
+            hashtag_style = ctx.user_settings.get("ai_hashtag_style", "mixed")
+            if hashtag_style == "lowercase":
+                combined_tags = [tag.lower() for tag in combined_tags]
+            elif hashtag_style == "capitalized":
+                combined_tags = [tag.capitalize() for tag in combined_tags]
+            elif hashtag_style == "camelcase":
+                # Convert to camelCase (first word lowercase, rest capitalized)
+                combined_tags = [
+                    tag[0].lower() + tag[1:].title().replace(" ", "") if len(tag) > 1 else tag.lower()
+                    for tag in combined_tags
+                ]
+            # else: mixed - keep as is
+            
+            # 4. Deduplicate and limit
+            seen = set()
+            unique_tags = []
+            for tag in combined_tags:
+                tag_lower = tag.lower()
+                if tag_lower not in seen:
+                    seen.add(tag_lower)
+                    unique_tags.append(tag)
+            
+            ctx.ai_hashtags = unique_tags[:max_hashtags]
+            logger.info(f"AI hashtags (after preferences): {ctx.ai_hashtags}")
         
         # Track cost (estimated)
         tokens_used = result.get("tokens", {})

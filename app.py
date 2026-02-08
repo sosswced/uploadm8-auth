@@ -1729,21 +1729,80 @@ async def wallet_transfer(data: TransferRequest, user: dict = Depends(get_curren
 # ============================================================
 @app.get("/api/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
+    """Get user settings including Trill preferences"""
     async with db_pool.acquire() as conn:
-        settings = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id = $1", user["id"])
-    return dict(settings) if settings else {}
+        settings = await conn.fetchrow("""
+            SELECT 
+                discord_webhook, telemetry_enabled, hud_enabled, hud_position,
+                speeding_mph, euphoria_mph, hud_speed_unit, hud_color,
+                hud_font_family, hud_font_size, ffmpeg_screenshot_interval,
+                auto_generate_thumbnails, auto_generate_captions,
+                auto_generate_hashtags, default_hashtag_count, always_use_hashtags
+            FROM user_settings 
+            WHERE user_id = $1
+        """, user["id"])
+
+        if not settings:
+            # Return defaults
+            return {
+                "discord_webhook": None,
+                "telemetry_enabled": True,
+                "hud_enabled": True,
+                "hud_position": "bottom-left",
+                "speeding_mph": 80,        # Default Trill threshold
+                "euphoria_mph": 100,       # Default Trill threshold
+                "hud_speed_unit": "mph",
+                "hud_color": "#FFFFFF",
+                "hud_font_family": "Arial",
+                "hud_font_size": 24,
+                "ffmpeg_screenshot_interval": 5,
+                "auto_generate_thumbnails": True,
+                "auto_generate_captions": True,
+                "auto_generate_hashtags": True,
+                "default_hashtag_count": 5,
+                "always_use_hashtags": False
+            }
+
+    return dict(settings)
 
 @app.put("/api/settings")
 async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current_user)):
+    """Update user settings including Trill thresholds"""
     updates, params = [], [user["id"]]
-    for field in ["discord_webhook", "telemetry_enabled", "hud_enabled", "hud_position", "speeding_mph", "euphoria_mph"]:
+
+    # All possible settings fields
+    fields = [
+        "discord_webhook", "telemetry_enabled", "hud_enabled", 
+        "hud_position", "speeding_mph", "euphoria_mph",
+        "hud_speed_unit", "hud_color", "hud_font_family", "hud_font_size",
+        "ffmpeg_screenshot_interval", "auto_generate_thumbnails",
+        "auto_generate_captions", "auto_generate_hashtags",
+        "default_hashtag_count", "always_use_hashtags"
+    ]
+
+    for field in fields:
         val = getattr(data, field, None)
         if val is not None:
             updates.append(f"{field} = ${len(params)+1}")
             params.append(val)
+
     if updates:
         async with db_pool.acquire() as conn:
-            await conn.execute(f"UPDATE user_settings SET {', '.join(updates)}, updated_at = NOW() WHERE user_id = $1", *params)
+            # Create user_settings row if doesn't exist
+            await conn.execute("""
+                INSERT INTO user_settings (user_id) 
+                VALUES ($1) 
+                ON CONFLICT (user_id) DO NOTHING
+            """, user["id"])
+
+            # Update settings
+            await conn.execute(
+                f"UPDATE user_settings SET {', '.join(updates)}, updated_at = NOW() WHERE user_id = $1",
+                *params
+            )
+
+            logger.info(f"Updated settings for user {user['id']}: {updates}")
+
     return {"status": "updated"}
 
 @app.get("/api/me/preferences")
@@ -3318,33 +3377,112 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
 # ============================================================
 @app.get("/api/analytics")
 async def get_analytics(range: str = "30d", user: dict = Depends(get_current_user)):
-    minutes = {"30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440, "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
+    minutes = {"30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440, 
+               "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
-    
+
     async with db_pool.acquire() as conn:
         try:
             stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
-            COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes,
-            COALESCE(SUM(put_spent), 0)::int AS put_used, COALESCE(SUM(aic_spent), 0)::int AS aic_used
+            SELECT COUNT(*)::int AS total, 
+                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+                   COALESCE(SUM(views), 0)::bigint AS views, 
+                   COALESCE(SUM(likes), 0)::bigint AS likes,
+                   COALESCE(SUM(put_spent), 0)::int AS put_used, 
+                   COALESCE(SUM(aic_spent), 0)::int AS aic_used
             FROM uploads WHERE user_id = $1 AND created_at >= $2
             """, user["id"], since)
         except Exception as e:
-            # Schema drift guard: older DBs may not have engagement / spend columns yet
             if e.__class__.__name__ != "UndefinedColumnError":
                 raise
             stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
-            0::bigint AS views, 0::bigint AS likes,
-            0::int AS put_used, 0::int AS aic_used
+            SELECT COUNT(*)::int AS total, 
+                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+                   0::bigint AS views, 0::bigint AS likes,
+                   0::int AS put_used, 0::int AS aic_used
             FROM uploads WHERE user_id = $1 AND created_at >= $2
             """, user["id"], since)
 
-        
-        daily = await conn.fetch("SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads FROM uploads WHERE user_id = $1 AND created_at >= $2 GROUP BY DATE(created_at) ORDER BY date", user["id"], since)
-        platforms = await conn.fetch("SELECT unnest(platforms) AS platform, COUNT(*)::int AS count FROM uploads WHERE user_id = $1 AND created_at >= $2 GROUP BY platform", user["id"], since)
-    
-    return {"total_uploads": stats["total"] if stats else 0, "completed": stats["completed"] if stats else 0, "views": stats["views"] if stats else 0, "likes": stats["likes"] if stats else 0, "put_used": stats["put_used"] if stats else 0, "aic_used": stats["aic_used"] if stats else 0, "daily": [{"date": str(d["date"]), "uploads": d["uploads"]} for d in daily], "platforms": {p["platform"]: p["count"] for p in platforms}}
+        daily = await conn.fetch(
+            "SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads "
+            "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
+            "GROUP BY DATE(created_at) ORDER BY date", 
+            user["id"], since
+        )
+        platforms = await conn.fetch(
+            "SELECT unnest(platforms) AS platform, COUNT(*)::int AS count "
+            "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
+            "GROUP BY platform", 
+            user["id"], since
+        )
+
+        # ================================================================
+        # TRILL TELEMETRY STATS
+        # ================================================================
+        trill_stats = None
+        try:
+            trill_data = await conn.fetchrow("""
+                SELECT 
+                    COUNT(*)::int AS trill_uploads,
+                    COALESCE(AVG(trill_score), 0)::decimal AS avg_score,
+                    COALESCE(MAX(trill_score), 0)::decimal AS max_score,
+                    COALESCE(MAX(max_speed_mph), 0)::decimal AS max_speed_mph,
+                    COALESCE(SUM(distance_miles), 0)::decimal AS total_distance_miles
+                FROM uploads 
+                WHERE user_id = $1 
+                AND created_at >= $2 
+                AND trill_score IS NOT NULL
+            """, user["id"], since)
+
+            if trill_data and trill_data["trill_uploads"] > 0:
+                speed_buckets = await conn.fetch("""
+                    SELECT speed_bucket, COUNT(*)::int AS count
+                    FROM uploads
+                    WHERE user_id = $1
+                    AND created_at >= $2
+                    AND speed_bucket IS NOT NULL
+                    GROUP BY speed_bucket
+                """, user["id"], since)
+
+                bucket_counts = {
+                    "gloryBoy": 0,
+                    "euphoric": 0,
+                    "sendIt": 0,
+                    "spirited": 0,
+                    "chill": 0
+                }
+
+                for bucket in speed_buckets:
+                    if bucket["speed_bucket"] in bucket_counts:
+                        bucket_counts[bucket["speed_bucket"]] = bucket["count"]
+
+                trill_stats = {
+                    "trill_uploads": trill_data["trill_uploads"],
+                    "avg_score": float(trill_data["avg_score"]),
+                    "max_score": float(trill_data["max_score"]),
+                    "max_speed_mph": float(trill_data["max_speed_mph"]),
+                    "total_distance_miles": float(trill_data["total_distance_miles"]),
+                    "speed_buckets": bucket_counts
+                }
+        except Exception as e:
+            logger.warning(f"Trill stats unavailable: {e}")
+        # ================================================================
+
+    result = {
+        "total_uploads": stats["total"] if stats else 0,
+        "completed": stats["completed"] if stats else 0,
+        "views": stats["views"] if stats else 0,
+        "likes": stats["likes"] if stats else 0,
+        "put_used": stats["put_used"] if stats else 0,
+        "aic_used": stats["aic_used"] if stats else 0,
+        "daily": [{"date": str(d["date"]), "uploads": d["uploads"]} for d in daily],
+        "platforms": {p["platform"]: p["count"] for p in platforms}
+    }
+
+    if trill_stats:
+        result["trill"] = trill_stats
+
+    return result
 
 @app.get("/api/exports/excel")
 async def export_excel(type: str = "uploads", range: str = "30d", user: dict = Depends(get_current_user)):

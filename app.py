@@ -416,6 +416,10 @@ def get_s3_client():
     endpoint = R2_ENDPOINT_URL or f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=Config(signature_version="s3v4"), region_name="auto")
 
+# Backward-compat alias: keep older helper name used by some endpoints.
+def get_r2_client():
+    return get_s3_client()
+
 def generate_presigned_upload_url(key: str, content_type: str, ttl: int = 3600) -> str:
     s3 = get_s3_client()
     return s3.generate_presigned_url("put_object", Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type}, ExpiresIn=ttl)

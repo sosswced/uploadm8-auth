@@ -55,23 +55,56 @@ async def load_user(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
 
 
 async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
-    """Load user settings from database."""
+    """
+    Load user settings and preferences from database.
+    
+    This combines data from both user_settings and user_preferences tables
+    to provide a complete settings dictionary for the worker.
+    """
     if not pool:
         return {}
     
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
+        # Load from user_settings (legacy HUD/telemetry settings)
+        settings_row = await conn.fetchrow("""
             SELECT discord_webhook, telemetry_enabled, hud_enabled, hud_position,
                    speeding_mph, euphoria_mph, hud_speed_unit, hud_color,
-                   hud_font_family, hud_font_size, selected_page_id,
-                   ffmpeg_screenshot_interval, auto_generate_thumbnails,
-                   auto_generate_captions, auto_generate_hashtags,
-                   default_hashtag_count, always_use_hashtags
+                   hud_font_family, hud_font_size, selected_page_id
             FROM user_settings WHERE user_id::text = $1
         """, user_id)
         
-        if not row:
-            return {
+        # Load from user_preferences (caption/hashtag/AI settings)
+        prefs_row = await conn.fetchrow("""
+            SELECT auto_captions, auto_thumbnails, thumbnail_interval,
+                   ai_hashtags_enabled, ai_hashtag_count, ai_hashtag_style,
+                   hashtag_position, max_hashtags,
+                   always_hashtags, blocked_hashtags, platform_hashtags,
+                   trill_enabled, trill_min_score, trill_hud_enabled,
+                   trill_ai_enhance, trill_openai_model
+            FROM user_preferences WHERE user_id::text = $1
+        """, user_id)
+        
+        # Build combined settings dict
+        settings = {}
+        
+        # Add user_settings data (HUD/telemetry)
+        if settings_row:
+            settings.update({
+                "discord_webhook": settings_row.get("discord_webhook"),
+                "telemetry_enabled": settings_row.get("telemetry_enabled", True),
+                "hud_enabled": settings_row.get("hud_enabled", True),
+                "hud_position": settings_row.get("hud_position", "bottom-left"),
+                "speeding_mph": settings_row.get("speeding_mph", 80),
+                "euphoria_mph": settings_row.get("euphoria_mph", 100),
+                "hud_speed_unit": settings_row.get("hud_speed_unit", "mph"),
+                "hud_color": settings_row.get("hud_color", "#FFFFFF"),
+                "hud_font_family": settings_row.get("hud_font_family", "Arial"),
+                "hud_font_size": settings_row.get("hud_font_size", 24),
+                "selected_page_id": settings_row.get("selected_page_id"),
+            })
+        else:
+            # Defaults for user_settings
+            settings.update({
                 "telemetry_enabled": True,
                 "hud_enabled": True,
                 "hud_position": "bottom-left",
@@ -81,15 +114,81 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                 "hud_color": "#FFFFFF",
                 "hud_font_family": "Arial",
                 "hud_font_size": 24,
-                "ffmpeg_screenshot_interval": 5,
-                "auto_generate_thumbnails": True,
-                "auto_generate_captions": True,
-                "auto_generate_hashtags": True,
-                "default_hashtag_count": 5,
-                "always_use_hashtags": False,
-            }
+            })
         
-        return dict(row)
+        # Add user_preferences data (AI/captions/hashtags)
+        if prefs_row:
+            # Parse JSONB fields
+            always_hashtags = prefs_row.get("always_hashtags", [])
+            blocked_hashtags = prefs_row.get("blocked_hashtags", [])
+            platform_hashtags = prefs_row.get("platform_hashtags", {})
+            
+            # Handle JSONB parsing if needed (some drivers return as strings)
+            if isinstance(always_hashtags, str):
+                try:
+                    always_hashtags = json.loads(always_hashtags)
+                except:
+                    always_hashtags = []
+            
+            if isinstance(blocked_hashtags, str):
+                try:
+                    blocked_hashtags = json.loads(blocked_hashtags)
+                except:
+                    blocked_hashtags = []
+            
+            if isinstance(platform_hashtags, str):
+                try:
+                    platform_hashtags = json.loads(platform_hashtags)
+                except:
+                    platform_hashtags = {}
+            
+            settings.update({
+                "auto_captions": prefs_row.get("auto_captions", False),
+                "auto_thumbnails": prefs_row.get("auto_thumbnails", False),
+                "thumbnail_interval": prefs_row.get("thumbnail_interval", 5),
+                "ai_hashtags_enabled": prefs_row.get("ai_hashtags_enabled", False),
+                "ai_hashtag_count": prefs_row.get("ai_hashtag_count", 5),
+                "ai_hashtag_style": prefs_row.get("ai_hashtag_style", "mixed"),
+                "hashtag_position": prefs_row.get("hashtag_position", "end"),
+                "max_hashtags": prefs_row.get("max_hashtags", 15),
+                "always_hashtags": always_hashtags or [],
+                "blocked_hashtags": blocked_hashtags or [],
+                "platform_hashtags": platform_hashtags or {},
+                "trill_enabled": prefs_row.get("trill_enabled", False),
+                "trill_min_score": prefs_row.get("trill_min_score", 60),
+                "trill_hud_enabled": prefs_row.get("trill_hud_enabled", False),
+                "trill_ai_enhance": prefs_row.get("trill_ai_enhance", False),
+                "trill_openai_model": prefs_row.get("trill_openai_model", "gpt-4o-mini"),
+            })
+        else:
+            # Defaults for user_preferences
+            settings.update({
+                "auto_captions": False,
+                "auto_thumbnails": False,
+                "thumbnail_interval": 5,
+                "ai_hashtags_enabled": False,
+                "ai_hashtag_count": 5,
+                "ai_hashtag_style": "mixed",
+                "hashtag_position": "end",
+                "max_hashtags": 15,
+                "always_hashtags": [],
+                "blocked_hashtags": [],
+                "platform_hashtags": {},
+                "trill_enabled": False,
+                "trill_min_score": 60,
+                "trill_hud_enabled": False,
+                "trill_ai_enhance": False,
+                "trill_openai_model": "gpt-4o-mini",
+            })
+        
+        # Add legacy aliases for backward compatibility
+        settings["auto_generate_captions"] = settings["auto_captions"]
+        settings["auto_generate_hashtags"] = settings["ai_hashtags_enabled"]
+        settings["auto_generate_thumbnails"] = settings["auto_thumbnails"]
+        settings["ffmpeg_screenshot_interval"] = settings["thumbnail_interval"]
+        settings["default_hashtag_count"] = settings["ai_hashtag_count"]
+        
+        return settings
 
 
 async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> dict:

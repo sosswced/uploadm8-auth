@@ -102,6 +102,7 @@ R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "uploadm8-media")
+R2_BUCKET = R2_BUCKET_NAME  # alias for backward compatibility
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
 
 # Redis
@@ -416,8 +417,9 @@ def get_s3_client():
     endpoint = R2_ENDPOINT_URL or f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=Config(signature_version="s3v4"), region_name="auto")
 
-# Backward-compat alias: keep older helper name used by some endpoints.
+
 def get_r2_client():
+    """Backward-compatible alias for older code paths."""
     return get_s3_client()
 
 def generate_presigned_upload_url(key: str, content_type: str, ttl: int = 3600) -> str:

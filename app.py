@@ -110,6 +110,8 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "uploadm8-media")
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
 
+R2_PUBLIC_BASE = os.environ.get("R2_PUBLIC_BASE", "")  # Public base URL for R2 objects (e.g. https://cdn.uploadm8.com)
+
 # Redis
 REDIS_URL = os.environ.get("REDIS_URL", "")
 UPLOAD_JOB_QUEUE = os.environ.get("UPLOAD_JOB_QUEUE", "uploadm8:jobs")
@@ -418,6 +420,24 @@ async def daily_refill(conn, user_id: str, tier: str):
 # ============================================================
 # R2 Storage
 # ============================================================
+
+def public_r2_url(key_or_url: str) -> str:
+    """
+    Convert an R2 object key (e.g. avatars/<user>/<id>.png) into a publicly fetchable URL.
+    If the value is already an absolute URL, return as-is.
+    Requires R2_PUBLIC_BASE to be set for non-URL keys.
+    """
+    if not key_or_url:
+        return key_or_url
+    v = str(key_or_url)
+    if v.startswith("http://") or v.startswith("https://"):
+        return v
+    base = (R2_PUBLIC_BASE or "").strip()
+    if not base:
+        # Fallback to Cloudflare's r2.dev if user has public access enabled
+        return f"https://{R2_BUCKET_NAME}.r2.dev/{v.lstrip('/')}"
+    return f"{base.rstrip('/')}/{v.lstrip('/')}"
+
 def get_s3_client():
     endpoint = R2_ENDPOINT_URL or f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
     return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=Config(signature_version="s3v4"), region_name="auto")
@@ -1421,7 +1441,7 @@ async def get_me(user: dict = Depends(get_current_user)):
         "subscription_tier": tier, 
         "subscription_status": user.get("subscription_status"),
         "timezone": user.get("timezone", "UTC"),
-        "avatar_url": user.get("avatar_url"),
+        "avatar_url": public_r2_url(user.get("avatar_url")),
         "plan": plan, 
         "wallet": {
             "put_balance": wallet.get("put_balance", 0), 
@@ -1655,18 +1675,18 @@ async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_c
                 CacheControl="public, max-age=31536000"  # Cache for 1 year
             )
             
-            # Generate public URL (adjust based on your R2 public domain setup)
-            avatar_url = f"https://{R2_BUCKET_NAME}.r2.dev/{r2_key}"
-            
-            # Update user's avatar_url in database
+            # Persist the object key in DB (stable), and return a public URL for the frontend
+            avatar_key = r2_key
+            avatar_url = public_r2_url(avatar_key)
+
+            # Update user's avatar_url in database (store key, not full URL)
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE users SET avatar_url = $1, updated_at = NOW() WHERE id = $2",
-                    avatar_url,
+                    avatar_key,
                     user["id"]
                 )
-            
-            logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
+logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
             return JSONResponse(status_code=200, content={"status": "success", "avatar_url": avatar_url})
             
         except Exception as e:

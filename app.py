@@ -1,6 +1,6 @@
 """
 UploadM8 API Server - Production Build v4
-# ====================
+# ==========================================
 Complete implementation with:
 - PUT/AIC wallet system with ledger
 - Announcements system
@@ -420,6 +420,12 @@ def generate_presigned_upload_url(key: str, content_type: str, ttl: int = 3600) 
     s3 = get_s3_client()
     return s3.generate_presigned_url("put_object", Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type}, ExpiresIn=ttl)
 
+
+def generate_presigned_download_url(key: str, ttl: int = 3600) -> str:
+    """Signed/private GET for R2 objects."""
+    s3 = get_s3_client()
+    return s3.generate_presigned_url("get_object", Params={"Bucket": R2_BUCKET_NAME, "Key": key}, ExpiresIn=ttl)
+
 # ============================================================
 # Redis Queue
 # ============================================================
@@ -492,11 +498,7 @@ class PasswordChange(BaseModel):
 class ProfileUpdateSettings(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    # Avatar (private in R2; we store object key in DB)
-    avatar_r2_key: Optional[str] = None
-    avatarUrl: Optional[str] = None
-    avatar_url: Optional[str] = None
-
+    timezone: Optional[str] = None
 
 class PreferencesUpdate(BaseModel):
     emailNotifs: Optional[bool] = None
@@ -602,16 +604,6 @@ PLATFORM_OPTIMAL_DAYS = {
 }
 
 import random
-def generate_presigned_download_url(key: str, expires: int = 3600) -> str:
-    """Generate a presigned GET URL for a private object in R2/S3."""
-    client = get_s3_client()
-    return client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": R2_BUCKET, "Key": key},
-        ExpiresIn=expires,
-    )
-
-
 
 def calculate_smart_schedule(platforms: List[str], num_days: int = 7, user_timezone: str = "UTC") -> Dict[str, datetime]:
     """
@@ -1385,82 +1377,42 @@ async def reset_password(payload: ResetPasswordRequest):
 # User Profile & Wallet
 # ============================================================
 @app.get("/api/me")
-async def get_me(user: dict = Depends(get_current_user)):
-    plan = get_plan(user.get("subscription_tier", "free"))
-    wallet = user.get("wallet", {})
-    role = user.get("role", "user")
-    tier = user.get("subscription_tier", "free")
-    
-    # Check if user is internal (admin/special tiers) - don't show low token warnings
-    is_internal = role in ("admin", "master_admin") or tier in ("master_admin", "friends_family", "lifetime")
-    
-    put_available = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
-    aic_available = wallet.get("aic_balance", 0) - wallet.get("aic_reserved", 0)
-    put_monthly = plan.get("put_monthly", 30)
-    put_pct = (put_available / max(put_monthly, 1)) * 100 if not is_internal else 100
-    
-    # Compute banners - but not for internal users with high token counts
-    banners = []
-    if not is_internal:
-        if put_pct <= 0:
-            banners.append({"type": "blocking", "message": "You're out of PUT tokens!", "cta": "top-up"})
-        elif put_pct <= 10:
-            banners.append({"type": "urgent", "message": f"Only {put_available} PUT left!", "cta": "top-up"})
-        elif put_pct <= 30:
-            banners.append({"type": "warning", "message": f"{put_available} PUT remaining this period", "cta": "upgrade"})
-        
-        if plan.get("ai") and aic_available <= 5:
-            banners.append({"type": "warning", "message": "Low AI credits!", "cta": "buy-aic"})
-    
-    # Get connected accounts count
-    async with db_pool.acquire() as conn:
-        accounts_count = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", user["id"])
-    
-    max_accounts = plan.get("max_accounts", 1)
+async def me(user: dict = Depends(get_current_user)):
+    """
+    Return current user profile payload.
 
-    avatar_signed_url = None
-    if user.get("avatar_r2_key"):
-        avatar_signed_url = generate_presigned_download_url(user["avatar_r2_key"], expires=3600)
-    elif user.get("avatar_url"):
-        avatar_signed_url = user.get("avatar_url")
+    Stabilization window:
+    - Return BOTH avatar_url (snake_case) and avatarUrl (camelCase) for the same value.
+    - Single source of truth is users.avatar_r2_key (private R2 object key).
+    """
+    avatar_key = user.get("avatar_r2_key") or user.get("avatar_r2_key".upper())  # defensive
+    legacy_avatar_url = user.get("avatar_url")
+
+    signed_avatar_url = None
+    if avatar_key:
+        try:
+            signed_avatar_url = generate_presigned_download_url(avatar_key, ttl=3600)
+        except Exception:
+            # Don't fail /api/me if presign fails; return None so frontend can degrade gracefully.
+            signed_avatar_url = None
+
+    # Prefer signed/private URL; fall back to legacy public URL (if still present in DB).
+    avatar_url = signed_avatar_url or legacy_avatar_url
 
     return {
-        "id": str(user["id"]), 
-        "email": user["email"], 
-        "name": user["name"],
-        "first_name": user.get("first_name"),
-        "last_name": user.get("last_name"),
-        "tier_name": plan.get("name", "Free"),
-        "role": role,
-        "subscription_tier": tier, 
-        "subscription_status": user.get("subscription_status"),
-        "timezone": user.get("timezone", "UTC"),        "plan": plan, 
-        "wallet": {
-            "put_balance": wallet.get("put_balance", 0), 
-            "put_reserved": wallet.get("put_reserved", 0),
-            "put_available": put_available, 
-            "aic_balance": wallet.get("aic_balance", 0), 
-            "aic_reserved": wallet.get("aic_reserved", 0),
-            "aic_available": aic_available
-        },
-        "banners": banners, 
-        "flex_enabled": user.get("flex_enabled", False),
-        "created_at": user["created_at"].isoformat() if user.get("created_at") else None,
-        "accounts_connected": accounts_count,
-        "max_accounts": max_accounts,
-        "entitlements": {
-            "max_accounts": max_accounts,
-            "max_hashtags": 30 if is_internal else (10 if tier in ("creator_pro", "studio", "agency") else 5),
-            "show_ads": plan.get("ads", True) and not is_internal,
-            "show_watermark": plan.get("watermark", True) and not is_internal,
-            "scheduling": plan.get("scheduling", False) or is_internal,
-            "ai": plan.get("ai", False) or is_internal,
-        }
-    }
+        "id": user["id"],
+        "email": user["email"],
+        "name": user.get("name"),
+        "role": user.get("role", "user"),
 
-class ProfileUpdate(BaseModel):
-    name: Optional[str] = None
-    timezone: Optional[str] = None
+        # Avatar (dual key contract during stabilization)
+        "avatar_url": avatar_url,
+        "avatarUrl": avatar_url,
+        "avatar_r2_key": avatar_key,  # optional debug/diagnostics
+
+        # Optional user meta
+        "created_at": user.get("created_at").isoformat() if user.get("created_at") else None,
+    }
 
 @app.put("/api/me")
 async def update_me(data: ProfileUpdate, user: dict = Depends(get_current_user)):
@@ -1511,12 +1463,6 @@ async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depe
     if data.last_name is not None:
         updates.append(f"last_name = ${len(params)+1}")
         params.append(data.last_name.strip())
-
-    # Avatar key (store in users.avatar_r2_key). Accept multiple field names for frontend stability.
-    avatar_key = data.avatar_r2_key or data.avatarUrl or data.avatar_url
-    if avatar_key is not None:
-        updates.append(f"avatar_r2_key = ${len(params)+1}")
-        params.append(avatar_key.strip())
     
     # Also update the combined name field for backwards compatibility
     if data.first_name is not None or data.last_name is not None:
@@ -1631,7 +1577,7 @@ async def update_password_settings(data: PasswordChange, user: dict = Depends(ge
 
 @app.post("/api/settings/avatar")
 async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    """Upload profile picture"""
+    """Upload profile picture (private R2 + store avatar_r2_key)."""
     try:
         # Validate file type
         allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"]
@@ -1640,70 +1586,50 @@ async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_c
                 status_code=400,
                 content={"status": "error", "message": f"Invalid file type. Allowed: {', '.join(allowed_types)}"}
             )
-        
+
         # Validate file size (max 5MB)
-        contents = await file.read()
-        file_size = len(contents)
-        if file_size > 5 * 1024 * 1024:  # 5MB
+        content = await file.read()
+        if len(content) > 5 * 1024 * 1024:
             return JSONResponse(
                 status_code=400,
-                content={"status": "error", "message": "File size must be less than 5MB"}
+                content={"status": "error", "message": "File too large. Max size: 5MB"}
             )
-        
-        # Check if R2 is configured
-        if not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
-            logger.warning(f"R2 credentials not configured, avatar upload disabled for user {user['id']}")
-            return JSONResponse(
-                status_code=501,
-                content={"status": "error", "message": "Avatar upload not configured. Please contact support."}
-            )
-        
-        # Generate unique filename
-        file_ext = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
-        r2_key = f"avatars/{user['id']}/{uuid.uuid4()}.{file_ext}"
-        
-        # Upload to R2
-        try:
-            s3 = get_s3_client()
-            s3.put_object(
-                Bucket=R2_BUCKET_NAME,
-                Key=r2_key,
-                Body=contents,
-                ContentType=file.content_type,
-                CacheControl="public, max-age=31536000"  # Cache for 1 year
-            )
-            
-            # Generate public URL (adjust based on your R2 public domain setup)
-            avatar_url = f"https://{R2_BUCKET_NAME}.r2.dev/{r2_key}"
-            
-            # Update user's avatar_url in database
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE users SET avatar_url = $1, updated_at = NOW() WHERE id = $2",
-                    avatar_url,
-                    user["id"]
-                )
-            
-            logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
-            return {"status": "success", "avatar_url": avatar_url}
-            
-        except Exception as e:
-            logger.error(f"Avatar upload failed for user {user['id']}: {str(e)}")
-            return JSONResponse(
-                status_code=500,
-                content={"status": "error", "message": f"Failed to upload avatar: {str(e)}"}
-            )
-    
-    except Exception as e:
-        logger.error(f"Unexpected error in avatar upload for user {user.get('id', 'unknown')}: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": "Unexpected error occurred"}
+
+        # Generate unique filename and store in R2 (private)
+        file_extension = file.filename.split('.')[-1].lower()
+        r2_key = f"avatars/{user['id']}/{uuid.uuid4()}.{file_extension}"
+
+        r2_client = get_r2_client()
+        r2_client.put_object(
+            Bucket=R2_BUCKET,
+            Key=r2_key,
+            Body=content,
+            ContentType=file.content_type,
         )
 
-# ============================================================
-# End Settings Endpoints
-# ============================================================
+        # Persist key as the single source of truth
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET avatar_r2_key = $1, avatar_url = NULL, updated_at = NOW() WHERE id = $2",
+                r2_key, user['id']
+            )
+
+        # Return BOTH keys during stabilization window
+        signed_url = generate_presigned_download_url(r2_key)
+        logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
+        return {
+            "success": True,
+            "r2_key": r2_key,
+            "avatar_url": signed_url,
+            "avatarUrl": signed_url,
+        }
+
+    except Exception as e:
+        logger.error(f"Avatar upload error: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Upload failed"}
+        )
 
 @app.delete("/api/me")
 async def delete_account(user: dict = Depends(get_current_user)):
@@ -1816,11 +1742,7 @@ async def get_settings(user: dict = Depends(get_current_user)):
 @app.put("/api/settings")
 async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current_user)):
     """Update user settings including Trill thresholds"""
-    updates, params = [], [user["id"]        (104, """
-        ALTER TABLE users
-        ADD COLUMN IF NOT EXISTS avatar_r2_key VARCHAR(512);
-        """),
-]
+    updates, params = [], [user["id"]]
 
     # All possible settings fields
     fields = [
@@ -3784,6 +3706,7 @@ async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Q
     csv_bytes = output.getvalue().encode("utf-8")
     headers = {"Content-Disposition": f'attachment; filename="uploadm8-analytics-{days}d.csv"'}
     return Response(content=csv_bytes, media_type="text/csv", headers=headers)
+
 # ====================
 class SupportContactRequest(BaseModel):
     name: Optional[str] = None
@@ -4704,4 +4627,50 @@ async def generate_trill_preview(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))@app.post("/api/profile/avatar/presign")
+async def presign_avatar_upload(payload: dict, user: dict = Depends(get_current_user)):
+    """
+    Generate a presigned PUT URL for uploading a private avatar into R2.
+    Frontend will PUT the bytes to upload_url, then call /api/profile/avatar/commit with the returned key.
+    """
+    filename = (payload.get("filename") or "avatar").strip()
+    content_type = (payload.get("content_type") or payload.get("contentType") or "image/png").strip()
+
+    # Basic content-type allowlist (keep tight)
+    allowed = {"image/png", "image/jpeg", "image/webp"}
+    if content_type not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported content_type. Allowed: {sorted(allowed)}")
+
+    ext = ".png"
+    if content_type == "image/jpeg":
+        ext = ".jpg"
+    elif content_type == "image/webp":
+        ext = ".webp"
+
+    # Private object key: avatars/{user_id}/{uuid}.ext
+    key = f"avatars/{user['id']}/{uuid.uuid4().hex}{ext}"
+    upload_url = generate_presigned_upload_url(key, content_type=content_type, ttl=900)
+
+    return {"upload_url": upload_url, "key": key, "expires_in": 900}
+
+
+@app.post("/api/profile/avatar/commit")
+async def commit_avatar_upload(payload: dict, user: dict = Depends(get_current_user)):
+    """
+    Persist avatar R2 object key as the single source of truth: users.avatar_r2_key.
+    Returns updated avatar_url + avatarUrl (signed/private).
+    """
+    key = (payload.get("key") or "").strip()
+    if not key or not key.startswith(f"avatars/{user['id']}/"):
+        raise HTTPException(status_code=400, detail="Invalid avatar key")
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET avatar_r2_key=$1, updated_at=NOW() WHERE id=$2",
+            key, user["id"]
+        )
+
+    signed_url = generate_presigned_download_url(key, ttl=3600)
+    return {"avatar_r2_key": key, "avatar_url": signed_url, "avatarUrl": signed_url}
+
+

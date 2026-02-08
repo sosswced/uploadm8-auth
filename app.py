@@ -72,6 +72,12 @@ class UserPreferencesUpdate(BaseModel):
     email_notifications: bool = Field(True, alias="emailNotifications")
     discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
 
+    # Trill telemetry preferences
+    trill_enabled: bool = Field(False, alias="trillEnabled")
+    trill_min_score: int = Field(60, ge=0, le=100, alias="trillMinScore")
+    trill_hud_enabled: bool = Field(False, alias="trillHudEnabled")
+    trill_ai_enhance: bool = Field(True, alias="trillAiEnhance")
+    trill_openai_model: str = Field("gpt-4o-mini", alias="trillOpenaiModel")
     class Config:
         populate_by_name = True
         extra = "ignore"
@@ -2651,7 +2657,12 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             "blockedHashtags": blocked_tags or [],
             "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": d.get("email_notifications", True),
-            "discordWebhook": d.get("discord_webhook")
+            "discordWebhook": d.get("discord_webhook"),
+            "trillEnabled": d.get("trill_enabled", False),
+            "trillMinScore": int(d.get("trill_min_score", 60) or 60),
+            "trillHudEnabled": d.get("trill_hud_enabled", False),
+            "trillAiEnhance": d.get("trill_ai_enhance", True),
+            "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini")
         }
 
 @app.post("/api/settings/preferences")
@@ -2683,6 +2694,13 @@ async def save_user_preferences(
         "platformHashtags": "platform_hashtags",
         "emailNotifications": "email_notifications",
         "discordWebhook": "discord_webhook",
+
+        # Trill
+        "trillEnabled": "trill_enabled",
+        "trillMinScore": "trill_min_score",
+        "trillHudEnabled": "trill_hud_enabled",
+        "trillAiEnhance": "trill_ai_enhance",
+        "trillOpenaiModel": "trill_openai_model",
     }
 
     def normalize_prefs_payload(p: dict) -> dict:
@@ -2791,6 +2809,17 @@ async def save_user_preferences(
     email_notifications = bool(p.get("email_notifications", True))
     discord_webhook = p.get("discord_webhook")
 
+    # Trill
+    trill_enabled = bool(p.get("trill_enabled", p.get("trillEnabled", False)))
+    try:
+        trill_min_score = int(p.get("trill_min_score", p.get("trillMinScore", 60)))
+    except Exception:
+        trill_min_score = 60
+    trill_min_score = max(0, min(100, trill_min_score))
+    trill_hud_enabled = bool(p.get("trill_hud_enabled", p.get("trillHudEnabled", False)))
+    trill_ai_enhance = bool(p.get("trill_ai_enhance", p.get("trillAiEnhance", True)))
+    trill_openai_model = str(p.get("trill_openai_model", p.get("trillOpenaiModel", "gpt-4o-mini")) or "gpt-4o-mini")
+
     async with db_pool.acquire() as conn:
         # ensure row exists
         await conn.execute(
@@ -2815,8 +2844,16 @@ async def save_user_preferences(
                 platform_hashtags = $12::jsonb,
                 email_notifications = $13,
                 discord_webhook = $14,
+
+                -- Trill
+                trill_enabled = $15,
+                trill_min_score = $16,
+                trill_hud_enabled = $17,
+                trill_ai_enhance = $18,
+                trill_openai_model = $19,
+
                 updated_at = NOW()
-            WHERE user_id = $15
+            WHERE user_id = $20
             """,
             auto_captions,
             auto_thumbnails,
@@ -2832,6 +2869,11 @@ async def save_user_preferences(
             json.dumps(platform),  # Always use json.dumps for JSONB
             email_notifications,
             discord_webhook,
+            trill_enabled,
+            trill_min_score,
+            trill_hud_enabled,
+            trill_ai_enhance,
+            trill_openai_model,
             user["id"],
         )
 

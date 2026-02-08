@@ -105,6 +105,13 @@ R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "uploadm8-media")
 R2_BUCKET = R2_BUCKET_NAME  # alias for backward compatibility
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
 
+# Normalize R2 endpoint to avoid accidental "/<bucket>" suffix (would break presigned URLs)
+if R2_ENDPOINT_URL:
+    R2_ENDPOINT_URL = R2_ENDPOINT_URL.rstrip("/")
+    if R2_BUCKET_NAME and R2_ENDPOINT_URL.endswith(f"/{R2_BUCKET_NAME}"):
+        R2_ENDPOINT_URL = R2_ENDPOINT_URL[: -(len(R2_BUCKET_NAME) + 1)]
+
+
 # Redis
 REDIS_URL = os.environ.get("REDIS_URL", "")
 UPLOAD_JOB_QUEUE = os.environ.get("UPLOAD_JOB_QUEUE", "uploadm8:jobs")
@@ -4684,6 +4691,5 @@ async def commit_avatar_upload(payload: dict, user: dict = Depends(get_current_u
 
     signed_url = generate_presigned_download_url(key, ttl=3600)
     return {"avatar_r2_key": key, "avatar_url": signed_url, "avatarUrl": signed_url}
-
 
 

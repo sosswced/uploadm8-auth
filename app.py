@@ -1667,7 +1667,7 @@ async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_c
                 )
             
             logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
-            return {"status": "success", "avatar_url": avatar_url}
+            return JSONResponse(status_code=200, content={"status": "success", "avatar_url": avatar_url})
             
         except Exception as e:
             logger.error(f"Avatar upload failed for user {user['id']}: {str(e)}")

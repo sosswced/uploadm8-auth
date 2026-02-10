@@ -388,26 +388,28 @@ async def run_publish_stage(
         # Get final title and caption
         final_title = ctx.get_effective_title()
         final_caption = ctx.get_effective_caption()
-        
+
         # Apply platform-specific hashtags
-        platform_specific_tags = ctx.user_settings.get("platform_hashtags", {}).get(platform, [])
-        base_hashtags = ctx.ai_hashtags or ctx.hashtags or []
-        
-        # Combine base hashtags with platform-specific ones
-        all_hashtags = list(base_hashtags) + list(platform_specific_tags)
-        
-        # Deduplicate (case-insensitive)
-        seen = set()
-        unique_hashtags = []
-        for tag in all_hashtags:
-            tag_lower = tag.lower()
-            if tag_lower not in seen:
-                seen.add(tag_lower)
-                unique_hashtags.append(tag)
-        
-        # Apply max hashtag limit
-        max_hashtags = ctx.user_settings.get("max_hashtags", 15)
-        final_hashtags = unique_hashtags[:max_hashtags]
+        platform_map = getattr(ctx, "platform_hashtags_map", None) or {}
+        if platform_map and platform in platform_map:
+            final_hashtags = platform_map.get(platform, []) or []
+        else:
+            platform_specific_tags = ctx.user_settings.get("platform_hashtags", {}).get(platform, [])
+            base_hashtags = getattr(ctx, "final_hashtags", None) or (ctx.ai_hashtags or ctx.hashtags or [])
+            all_hashtags = list(base_hashtags) + list(platform_specific_tags)
+
+            # Deduplicate (case-insensitive)
+            seen = set()
+            unique_hashtags = []
+            for tag in all_hashtags:
+                tag_lower = str(tag).lower()
+                if tag_lower not in seen:
+                    seen.add(tag_lower)
+                    unique_hashtags.append(tag)
+
+            # Apply max hashtag limit
+            max_hashtags = ctx.user_settings.get("max_hashtags", 15)
+            final_hashtags = unique_hashtags[:max_hashtags]
         
         # Format hashtags with # symbol
         hashtag_str = " ".join(f"#{tag}" for tag in final_hashtags) if final_hashtags else ""

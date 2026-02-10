@@ -34,6 +34,25 @@ logger = logging.getLogger("uploadm8-worker")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
+
+def _norm_tag(t: str) -> str:
+    return str(t or "").strip().lstrip("#").strip()
+
+def _dedupe_case_insensitive(tags: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for t in tags:
+        nt = _norm_tag(t)
+        if not nt:
+            continue
+        key = nt.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(nt)
+    return out
+
+
 # Cost tracking (approximate)
 COST_PER_1K_INPUT = 0.00015  # gpt-4o-mini input
 COST_PER_1K_OUTPUT = 0.0006  # gpt-4o-mini output
@@ -174,7 +193,40 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
         
         # Would track to DB here if we had the pool
         logger.info(f"OpenAI cost estimate: ${cost:.4f}")
-        
+
+
+# ---------------------------------------------------------------------
+# FINAL HASHTAG RESOLUTION (base + per-platform) — deterministic + UI-ready
+# ---------------------------------------------------------------------
+always_tags = ctx.user_settings.get("always_hashtags", []) or []
+blocked = set(_norm_tag(b).lower() for b in (ctx.user_settings.get("blocked_hashtags", []) or []))
+platform_prefs = ctx.user_settings.get("platform_hashtags", {}) or {}
+
+# Base input precedence: user override > AI generated > empty
+if ctx.hashtags:
+    base_input = list(ctx.hashtags)
+elif ctx.ai_hashtags:
+    base_input = list(ctx.ai_hashtags)
+else:
+    base_input = []
+
+base_combined = _dedupe_case_insensitive(list(base_input) + list(always_tags))
+base_filtered = [t for t in base_combined if _norm_tag(t).lower() not in blocked]
+
+max_tags = ctx.user_settings.get("max_hashtags", 15)
+ctx.final_hashtags = base_filtered[:max_tags]
+
+platform_map: Dict[str, List[str]] = {}
+for p in (ctx.platforms or []):
+    extra = platform_prefs.get(p, []) or []
+    merged = _dedupe_case_insensitive(list(ctx.final_hashtags) + list(extra))
+    merged = [t for t in merged if _norm_tag(t).lower() not in blocked]
+    platform_map[p] = merged[:max_tags]
+
+ctx.platform_hashtags_map = platform_map
+logger.info(f"Resolved base hashtags: {ctx.final_hashtags}")
+logger.info(f"Resolved platform hashtags: {ctx.platform_hashtags_map}")
+
         return ctx
         
     except SkipStage:

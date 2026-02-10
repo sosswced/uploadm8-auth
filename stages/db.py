@@ -23,7 +23,8 @@ async def load_upload_record(pool: asyncpg.Pool, upload_id: str) -> Optional[dic
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT id, user_id, r2_key, telemetry_r2_key, processed_r2_key,
-                   filename, file_size, platforms, title, caption, privacy,
+                   filename, file_size, platforms, title, caption, hashtags, privacy,
+                   generated_title, generated_caption, generated_hashtags, platform_hashtags,
                    status, scheduled_time, schedule_mode, cancel_requested,
                    created_at, updated_at
             FROM uploads WHERE id = $1
@@ -426,3 +427,62 @@ async def track_storage_usage(pool: asyncpg.Pool, user_id: str, bytes_used: int,
             INSERT INTO storage_tracking (user_id, bytes_used, operation, created_at)
             VALUES ($1::uuid, $2, $3, NOW())
         """, user_id, bytes_used, operation)
+
+
+async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
+"""Persist AI-generated metadata and per-platform hashtags.
+
+Writes:
+- generated_title/caption/hashtags
+- platform_hashtags jsonb map
+Also backfills title/caption/hashtags only if user did not provide overrides.
+"""
+if not pool:
+    return
+
+gen_title = (ctx.ai_title or "").strip() if getattr(ctx, "ai_title", None) else None
+gen_caption = (ctx.ai_caption or "").strip() if getattr(ctx, "ai_caption", None) else None
+gen_hashtags = getattr(ctx, "ai_hashtags", None) or None
+
+platform_map = getattr(ctx, "platform_hashtags_map", None) or {}
+final_hashtags = getattr(ctx, "final_hashtags", None) or (gen_hashtags or getattr(ctx, "hashtags", None) or [])
+
+async with pool.acquire() as conn:
+    await conn.execute(
+        """
+        UPDATE uploads
+        SET
+            generated_title = COALESCE($2, generated_title),
+            generated_caption = COALESCE($3, generated_caption),
+            generated_hashtags = COALESCE($4::text[], generated_hashtags),
+            platform_hashtags = CASE
+                WHEN $5::jsonb IS NOT NULL THEN $5::jsonb
+                ELSE platform_hashtags
+            END,
+            metadata_generated_at = NOW(),
+
+            title = CASE
+                WHEN (title IS NULL OR btrim(title) = '') AND $2 IS NOT NULL THEN $2
+                ELSE title
+            END,
+            caption = CASE
+                WHEN (caption IS NULL OR btrim(caption) = '') AND $3 IS NOT NULL THEN $3
+                ELSE caption
+            END,
+            hashtags = CASE
+                WHEN (hashtags IS NULL OR array_length(hashtags,1) IS NULL OR array_length(hashtags,1) = 0)
+                     AND $6::text[] IS NOT NULL
+                THEN $6::text[]
+                ELSE hashtags
+            END,
+
+            updated_at = NOW()
+        WHERE id = $1
+        """,
+        ctx.upload_id,
+        gen_title,
+        gen_caption,
+        gen_hashtags,
+        json.dumps(platform_map) if platform_map is not None else None,
+        final_hashtags if final_hashtags else None,
+    )

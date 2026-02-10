@@ -195,37 +195,37 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
         logger.info(f"OpenAI cost estimate: ${cost:.4f}")
 
 
-# ---------------------------------------------------------------------
-# FINAL HASHTAG RESOLUTION (base + per-platform) — deterministic + UI-ready
-# ---------------------------------------------------------------------
-always_tags = ctx.user_settings.get("always_hashtags", []) or []
-blocked = set(_norm_tag(b).lower() for b in (ctx.user_settings.get("blocked_hashtags", []) or []))
-platform_prefs = ctx.user_settings.get("platform_hashtags", {}) or {}
+        # ---------------------------------------------------------------------
+        # FINAL HASHTAG RESOLUTION (base + per-platform) — deterministic + UI-ready
+        # ---------------------------------------------------------------------
+        always_tags = ctx.user_settings.get("always_hashtags", []) or []
+        blocked = set(_norm_tag(b).lower() for b in (ctx.user_settings.get("blocked_hashtags", []) or []))
+        platform_prefs = ctx.user_settings.get("platform_hashtags", {}) or {}
 
-# Base input precedence: user override > AI generated > empty
-if ctx.hashtags:
-    base_input = list(ctx.hashtags)
-elif ctx.ai_hashtags:
-    base_input = list(ctx.ai_hashtags)
-else:
-    base_input = []
+        # Base input precedence: user override > AI generated > empty
+        if ctx.hashtags:
+            base_input = list(ctx.hashtags)
+        elif ctx.ai_hashtags:
+            base_input = list(ctx.ai_hashtags)
+        else:
+            base_input = []
 
-base_combined = _dedupe_case_insensitive(list(base_input) + list(always_tags))
-base_filtered = [t for t in base_combined if _norm_tag(t).lower() not in blocked]
+        base_combined = _dedupe_case_insensitive(list(base_input) + list(always_tags))
+        base_filtered = [t for t in base_combined if _norm_tag(t).lower() not in blocked]
 
-max_tags = ctx.user_settings.get("max_hashtags", 15)
-ctx.final_hashtags = base_filtered[:max_tags]
+        max_tags = ctx.user_settings.get("max_hashtags", 15)
+        ctx.final_hashtags = base_filtered[:max_tags]
 
-platform_map: Dict[str, List[str]] = {}
-for p in (ctx.platforms or []):
-    extra = platform_prefs.get(p, []) or []
-    merged = _dedupe_case_insensitive(list(ctx.final_hashtags) + list(extra))
-    merged = [t for t in merged if _norm_tag(t).lower() not in blocked]
-    platform_map[p] = merged[:max_tags]
+        platform_map: Dict[str, List[str]] = {}
+        for p in (ctx.platforms or []):
+            extra = platform_prefs.get(p, []) or []
+            merged = _dedupe_case_insensitive(list(ctx.final_hashtags) + list(extra))
+            merged = [t for t in merged if _norm_tag(t).lower() not in blocked]
+            platform_map[p] = merged[:max_tags]
 
-ctx.platform_hashtags_map = platform_map
-logger.info(f"Resolved base hashtags: {ctx.final_hashtags}")
-logger.info(f"Resolved platform hashtags: {ctx.platform_hashtags_map}")
+        ctx.platform_hashtags_map = platform_map
+        logger.info(f"Resolved base hashtags: {ctx.final_hashtags}")
+        logger.info(f"Resolved platform hashtags: {ctx.platform_hashtags_map}")
 
         return ctx
         

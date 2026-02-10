@@ -164,95 +164,6 @@ COST_PER_OPENAI_TOKEN = float(os.environ.get("COST_PER_OPENAI_TOKEN", "0.00001")
 COST_PER_GB_MONTH = float(os.environ.get("COST_PER_GB_MONTH", "0.015"))
 COST_PER_COMPUTE_SECOND = float(os.environ.get("COST_PER_COMPUTE_SECOND", "0.0001"))
 
-
-
-# ==================================================
-# Cost Tracking Utilities (merged from cost_tracking_utils.py)
-# Writes into existing cost_tracking table.
-# ==================================================
-
-# OpenAI Pricing (per 1M tokens) - update as needed
-OPENAI_PRICING = {
-    "gpt-4o": {"input": 2.50, "output": 10.00},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
-}
-
-# Cloudflare R2 pricing
-R2_STORAGE_PER_GB_MONTH = float(os.environ.get("R2_STORAGE_PER_GB_MONTH", "0.015"))
-R2_OPERATION_CLASS_A = float(os.environ.get("R2_OPERATION_CLASS_A", "0.0000045"))  # write
-R2_OPERATION_CLASS_B = float(os.environ.get("R2_OPERATION_CLASS_B", "0.00000036"))  # read
-R2_EGRESS_PER_GB = float(os.environ.get("R2_EGRESS_PER_GB", "0.0"))
-
-# Compute pricing
-COMPUTE_COST_PER_CPU_HOUR = float(os.environ.get("COMPUTE_COST_PER_CPU_HOUR", "0.05"))
-
-
-async def _insert_cost(user_id: str, category: str, operation: str, cost_usd: float, tokens: Optional[int] = None) -> None:
-    """Insert a cost record into cost_tracking (minimal schema: category/operation/tokens/cost_usd)."""
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO cost_tracking (user_id, category, operation, tokens, cost_usd) VALUES ($1, $2, $3, $4, $5)",
-            user_id, category, operation, tokens, Decimal(str(cost_usd))
-        )
-
-
-async def track_openai_cost(
-    user_id: str,
-    request_type: str,
-    model: str,
-    input_tokens: int,
-    output_tokens: int
-) -> float:
-    """Track OpenAI cost into cost_tracking (category=openai)."""
-    pricing = OPENAI_PRICING.get(model) or {"input": 10.00, "output": 30.00}
-    input_cost = (input_tokens / 1_000_000) * pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * pricing["output"]
-    total_cost = float(input_cost + output_cost)
-
-    total_tokens = int(input_tokens or 0) + int(output_tokens or 0)
-    await _insert_cost(user_id=user_id, category="openai", operation=request_type, cost_usd=total_cost, tokens=total_tokens)
-    return total_cost
-
-
-async def track_storage_cost(
-    user_id: str,
-    file_type: str,
-    file_size_bytes: int,
-    storage_days: int = 30
-) -> float:
-    """Track R2 storage estimate into cost_tracking (category=storage)."""
-    file_size_gb = float(file_size_bytes) / (1024 ** 3)
-    hours_in_month = 730.0
-    storage_gb_hours = (file_size_gb * float(storage_days) * 24.0) / hours_in_month
-    total_cost = (storage_gb_hours * R2_STORAGE_PER_GB_MONTH) + R2_OPERATION_CLASS_A
-    await _insert_cost(user_id=user_id, category="storage", operation=file_type, cost_usd=float(total_cost), tokens=None)
-    return float(total_cost)
-
-
-async def track_bandwidth_cost(
-    user_id: str,
-    operation: str,
-    bytes_transferred: int
-) -> float:
-    """Track bandwidth estimate into cost_tracking (category=bandwidth)."""
-    gb_transferred = float(bytes_transferred) / (1024 ** 3)
-    total_cost = max(0.0, gb_transferred * R2_EGRESS_PER_GB)
-    total_cost += R2_OPERATION_CLASS_A if operation == "upload" else R2_OPERATION_CLASS_B
-    await _insert_cost(user_id=user_id, category="bandwidth", operation=operation, cost_usd=float(total_cost), tokens=None)
-    return float(total_cost)
-
-
-async def track_compute_cost(
-    user_id: str,
-    operation: str,
-    cpu_seconds: float
-) -> float:
-    """Track compute estimate into cost_tracking (category=compute)."""
-    cpu_hours = float(cpu_seconds) / 3600.0
-    total_cost = cpu_hours * COMPUTE_COST_PER_CPU_HOUR
-    await _insert_cost(user_id=user_id, category="compute", operation=operation, cost_usd=float(total_cost), tokens=None)
-    return float(total_cost)
 # Trill Telemetry Configuration
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GAZETTEER_PLACES_PATH = os.environ.get("GAZETTEER_PLACES_PATH", "")
@@ -317,7 +228,6 @@ TOPUP_PRODUCTS = {
 def get_plan(tier: str) -> dict:
     return PLAN_CONFIG.get(tier.lower(), PLAN_CONFIG["free"])
 
-
 async def log_admin_action(
     admin_id: str,
     target_user_id: str,
@@ -331,16 +241,13 @@ async def log_admin_action(
     """Log admin action for audit trail."""
     try:
         async with db_pool.acquire() as conn:
-            await conn.execute(
-                """
+            await conn.execute("""
                 INSERT INTO admin_actions (
                     admin_id, target_user_id, action_type, description,
                     old_value, new_value, ip_address, user_agent
                 ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8)
-                """,
-                admin_id, target_user_id, action_type, description,
-                old_value, new_value, ip_address, user_agent
-            )
+            """, admin_id, target_user_id, action_type, description,
+                old_value, new_value, ip_address, user_agent)
     except Exception as e:
         logger.error(f"Failed to log admin action: {e}")
 
@@ -1055,8 +962,6 @@ async def run_migrations():
     status VARCHAR(50) DEFAULT 'open',
     created_at TIMESTAMPTZ DEFAULT NOW()
 )"""),
-            (104, """CREATE TABLE IF NOT EXISTS admin_actions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), admin_id UUID REFERENCES users(id) ON DELETE CASCADE, target_user_id UUID REFERENCES users(id) ON DELETE CASCADE, action_type VARCHAR(100) NOT NULL, description TEXT, old_value TEXT, new_value TEXT, ip_address VARCHAR(100), user_agent TEXT, created_at TIMESTAMPTZ DEFAULT NOW())"""),
-
 ]
         
         for version, sql in migrations:
@@ -3934,9 +3839,6 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
             "SELECT subscription_tier, role, status FROM users WHERE id = $1", user_id
         )
 
-    if not current_user:
-        raise HTTPException(status_code=404, detail="User not found")
-
     if data.subscription_tier and current_user["subscription_tier"] != data.subscription_tier:
         updates.append(f"subscription_tier = ${len(params)+1}")
         params.append(data.subscription_tier)
@@ -3944,7 +3846,7 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
             user["id"], user_id, "tier_change",
             f"Changed tier from {current_user['subscription_tier']} to {data.subscription_tier}",
             current_user["subscription_tier"], data.subscription_tier,
-            request.client.host if request.client else None, request.headers.get("user-agent")
+            request.client.host, request.headers.get("user-agent")
         )
 
     if data.role and user.get("role") == "master_admin" and current_user["role"] != data.role:
@@ -3954,7 +3856,7 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
             user["id"], user_id, "role_change",
             f"Changed role from {current_user['role']} to {data.role}",
             current_user["role"], data.role,
-            request.client.host if request.client else None, request.headers.get("user-agent")
+            request.client.host, request.headers.get("user-agent")
         )
 
     if data.status and current_user["status"] != data.status:
@@ -3965,7 +3867,7 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
             user["id"], user_id, action_type,
             f"Changed status from {current_user['status']} to {data.status}",
             current_user["status"], data.status,
-            request.client.host if request.client else None, request.headers.get("user-agent")
+            request.client.host, request.headers.get("user-agent")
         )
 
     if data.flex_enabled is not None:
@@ -3979,7 +3881,105 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
     return {"status": "updated"}
 
 
+class AdminEmailChange(BaseModel):
+    email: EmailStr
+
+class AdminPasswordReset(BaseModel):
+    password: str = Field(..., min_length=8, max_length=128)
+    send_email: bool = True
+
+@app.put("/api/admin/users/{user_id}/email")
+async def admin_change_user_email(
+    user_id: str,
+    payload: AdminEmailChange,
+    request: Request,
+    admin: dict = Depends(require_admin),
+):
+    """Change a user's email (admin). Audit logged + notify old/new addresses."""
+    new_email = payload.email.lower().strip()
+
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT id, email, name FROM users WHERE id = $1", user_id)
+        if not target:
+            raise HTTPException(404, "User not found")
+
+        # Uniqueness check
+        existing = await conn.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1 AND id <> $2", new_email, user_id)
+        if existing:
+            raise HTTPException(409, "Email already in use")
+
+        old_email = (target["email"] or "").lower()
+        if old_email == new_email:
+            return {"status": "noop"}
+
+        await conn.execute("UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2", new_email, user_id)
+
+    # Audit log
+    await log_admin_action(
+        admin["id"], user_id, "email_change",
+        f"Changed email from {old_email} to {new_email}",
+        old_email, new_email,
+        request.client.host if request.client else None,
+        request.headers.get("user-agent"),
+    )
+
+    # Notify both addresses (best-effort)
+    try:
+        if old_email:
+            await send_email(
+                old_email,
+                "Your UploadM8 email was changed",
+                f"<p>Your UploadM8 login email was changed from <b>{old_email}</b> to <b>{new_email}</b>.</p><p>If you did not expect this, contact support.</p>",
+            )
+        await send_email(
+            new_email,
+            "Your UploadM8 email was changed",
+            f"<p>Your UploadM8 login email is now <b>{new_email}</b>.</p><p>If you did not expect this, contact support.</p>",
+        )
+    except Exception:
+        pass
+
+    return {"status": "updated", "email": new_email}
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+async def admin_reset_user_password(
+    user_id: str,
+    payload: AdminPasswordReset,
+    request: Request,
+    admin: dict = Depends(require_admin),
+):
+    """Force reset a user's password (admin). Audit logged + optional email notice."""
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT id, email, name FROM users WHERE id = $1", user_id)
+        if not target:
+            raise HTTPException(404, "User not found")
+
+        new_hash = hash_password(payload.password)
+        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", new_hash, user_id)
+
+    await log_admin_action(
+        admin["id"], user_id, "password_reset",
+        f"Forced password reset for {target['email']}",
+        None, None,
+        request.client.host if request.client else None,
+        request.headers.get("user-agent"),
+    )
+
+    if payload.send_email and target.get("email"):
+        # Best-effort notification (do not include plaintext password in email)
+        try:
+            await send_email(
+                target["email"],
+                "Your UploadM8 password was reset",
+                "<p>An admin reset your UploadM8 password. If you did not request this, contact support immediately.</p>",
+            )
+        except Exception:
+            pass
+
+    return {"status": "updated"}
+
 @app.post("/api/admin/users/{user_id}/ban")
+
 async def admin_ban_user(user_id: str, user: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET status = 'banned' WHERE id = $1", user_id)
@@ -3996,24 +3996,27 @@ async def admin_unban_user(user_id: str, user: dict = Depends(require_admin)):
 async def admin_delete_user(user_id: str, request: Request, user: dict = Depends(require_master_admin)):
     """Delete user account (master admin only)."""
     async with db_pool.acquire() as conn:
+        # Get user info before deletion
         target_user = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", user_id)
         if not target_user:
             raise HTTPException(404, "User not found")
 
+        # Prevent self-deletion
         if user_id == user["id"]:
             raise HTTPException(400, "Cannot delete your own account")
 
+        # Log the deletion
         await log_admin_action(
             user["id"], user_id, "account_delete",
             f"Deleted user account: {target_user['email']}",
             None, None,
-            request.client.host if request.client else None, request.headers.get("user-agent")
+            request.client.host, request.headers.get("user-agent")
         )
 
+        # Delete user (CASCADE will handle related records)
         await conn.execute("DELETE FROM users WHERE id = $1", user_id)
 
     return {"status": "deleted"}
-
 
 @app.get("/api/admin/audit-log")
 async def get_audit_log(
@@ -4327,19 +4330,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         total_mrr = sum(get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data)
         mrr_by_tier = {r["subscription_tier"]: get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data}
         
-        
-
-
-
-        # Previous period MRR (for change %)
-        prev_mrr_data = await conn.fetch("""
-            SELECT subscription_tier, COUNT(*) AS count FROM users 
-            WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') 
-            AND subscription_status = 'active' AND created_at <= $1 GROUP BY subscription_tier
-        """, since)
-        prev_total_mrr = sum(get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in prev_mrr_data)
-        mrr_change = ((total_mrr - prev_total_mrr) / prev_total_mrr) * 100 if prev_total_mrr > 0 else 0
-# Tier breakdown
+        # Tier breakdown
         tier_data = await conn.fetch("SELECT COALESCE(subscription_tier, 'free') as tier, COUNT(*)::int AS count FROM users GROUP BY subscription_tier")
         tier_breakdown = {t["tier"] or "free": t["count"] for t in tier_data}
         
@@ -4354,15 +4345,13 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         costs = await conn.fetchrow("""
             SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
             COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
-            COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
-            COALESCE(SUM(CASE WHEN category = 'bandwidth' THEN cost_usd ELSE 0 END), 0)::decimal AS bandwidth
+            COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute
             FROM cost_tracking WHERE created_at >= $1
         """, since)
         openai_cost = float(costs["openai"] or 0) if costs else 0
         storage_cost = float(costs["storage"] or 0) if costs else 0
         compute_cost = float(costs["compute"] or 0) if costs else 0
-        bandwidth_cost = float(costs.get("bandwidth") or 0) if costs else 0
-        total_costs = openai_cost + storage_cost + compute_cost + bandwidth_cost
+        total_costs = openai_cost + storage_cost + compute_cost
         
         gross_margin = ((total_mrr - total_costs) / max(total_mrr, 1)) * 100 if total_mrr > 0 else 0
         
@@ -4396,7 +4385,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
     
     return {
-        "total_mrr": total_mrr, "mrr_change": round(mrr_change, 2), "mrr_by_tier": mrr_by_tier,
+        "total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": mrr_by_tier,
         "mrr_launch": mrr_by_tier.get("launch", 0), "mrr_creator_pro": mrr_by_tier.get("creator_pro", 0),
         "mrr_studio": mrr_by_tier.get("studio", 0), "mrr_agency": mrr_by_tier.get("agency", 0),
         "launch_users": tier_breakdown.get("launch", 0), "creator_pro_users": tier_breakdown.get("creator_pro", 0),
@@ -4404,7 +4393,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "topup_revenue": float(revenue["topups"]) if revenue else 0, "topup_count": 0,
         "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
         "refunds": 0, "refund_count": 0,
-        "openai_cost": openai_cost, "storage_cost": storage_cost, "compute_cost": compute_cost, "bandwidth_cost": bandwidth_cost,
+        "openai_cost": openai_cost, "storage_cost": storage_cost, "compute_cost": compute_cost,
         "total_costs": total_costs, "cost_per_upload": round(cost_per_upload, 4),
         "gross_margin": round(gross_margin, 1), "gross_margin_change": 0,
         "funnel_signups": new_users, "funnel_connected": funnel_connected, "funnel_uploaded": funnel_uploaded,

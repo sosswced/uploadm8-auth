@@ -939,6 +939,39 @@ async def run_migrations():
     status VARCHAR(50) DEFAULT 'open',
     created_at TIMESTAMPTZ DEFAULT NOW()
 )"""),
+
+            (104, """CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                admin_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                admin_email TEXT,
+                action TEXT NOT NULL,
+                details JSONB DEFAULT '{}'::jsonb,
+                ip_address TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_log_user ON admin_audit_log(user_id);
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_log_created ON admin_audit_log(created_at);
+
+            CREATE TABLE IF NOT EXISTS email_changes (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                old_email TEXT NOT NULL,
+                new_email TEXT NOT NULL,
+                changed_by_admin_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                verification_token TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS password_resets (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reset_by_admin_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                temp_password_hash TEXT NOT NULL,
+                force_change BOOLEAN DEFAULT TRUE,
+                expires_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );"""),
 ]
         
         for version, sql in migrations:
@@ -952,8 +985,6 @@ async def run_migrations():
 
 app = FastAPI(title="UploadM8 API", version="4.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS.split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-install_rate_limit_middleware(app)
-
 # ============================================================
 # SECURITY + RATE LIMITING (in-memory MVP)
 # Replace with Redis later (same interface)
@@ -1002,6 +1033,8 @@ def install_rate_limit_middleware(app: FastAPI) -> None:
 
         return await call_next(request)
 
+# Activate in-memory rate limiting
+install_rate_limit_middleware(app)
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -3897,6 +3930,175 @@ async def admin_unban_user(user_id: str, user: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
     return {"status": "unbanned"}
+
+
+@app.put("/api/admin/users/{user_id}/email")
+async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request: Request, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    new_email = payload.email.lower().strip()
+
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM users WHERE LOWER(email)=LOWER($1) AND id <> $2",
+            new_email,
+            user_id,
+        )
+        if exists:
+            raise HTTPException(status_code=409, detail="Email already in use")
+
+        old = await conn.fetchrow("SELECT email FROM users WHERE id=$1", user_id)
+        if not old:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        verification_token = secrets.token_urlsafe(32)
+
+        await conn.execute(
+            """
+            INSERT INTO email_changes (user_id, old_email, new_email, changed_by_admin_id, verification_token)
+            VALUES ($1::uuid, $2, $3, $4::uuid, $5)
+            """,
+            user_id,
+            old["email"],
+            new_email,
+            user["id"],
+            verification_token,
+        )
+
+        await conn.execute(
+            "UPDATE users SET email=$1, email_verified=false, updated_at=NOW() WHERE id=$2",
+            new_email,
+            user_id,
+        )
+
+        await log_admin_audit(
+            conn,
+            user_id=user_id,
+            admin=user,
+            action="ADMIN_CHANGE_EMAIL",
+            details={"old_email": old["email"], "new_email": new_email},
+            request=request,
+        )
+
+    return {"ok": True, "email": new_email}
+
+
+class AdminResetPasswordIn(BaseModel):
+    temp_password: str = Field(min_length=8, max_length=128)
+
+
+@app.post("/api/admin/users/{user_id}/reset-password")
+async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, request: Request, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    temp = payload.temp_password
+    pw_hash = bcrypt.hashpw(temp.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT id, role FROM users WHERE id=$1", user_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        if target["role"] == "master_admin" and user.get("role") != "master_admin":
+            raise HTTPException(status_code=403, detail="Cannot reset master_admin password")
+
+        await conn.execute(
+            """
+            UPDATE users
+            SET password_hash=$1,
+                must_reset_password=true,
+                updated_at=NOW()
+            WHERE id=$2
+            """,
+            pw_hash,
+            user_id,
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO password_resets (user_id, reset_by_admin_id, temp_password_hash, force_change, expires_at)
+            VALUES ($1::uuid, $2::uuid, $3, TRUE, NOW() + INTERVAL '7 days')
+            """,
+            user_id,
+            user["id"],
+            pw_hash,
+        )
+
+        await log_admin_audit(
+            conn,
+            user_id=user_id,
+            admin=user,
+            action="ADMIN_RESET_PASSWORD",
+            details={"must_reset_password": True},
+            request=request,
+        )
+
+    return {"ok": True}
+
+
+@app.get("/api/admin/audit")
+async def admin_audit(user_id: Optional[str] = None, limit: int = 20, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    limit = max(1, min(limit, 200))
+
+    q = """
+      SELECT id, user_id, admin_id, admin_email, action, details, ip_address, created_at
+      FROM admin_audit_log
+      WHERE 1=1
+    """
+    args: List[Any] = []
+    if user_id:
+        args.append(user_id)
+        q += f" AND user_id = ${len(args)}::uuid"
+
+    args.append(limit)
+    q += f" ORDER BY created_at DESC LIMIT ${len(args)}"
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(q, *args)
+
+    return {"items": [dict(r) for r in rows], "total": len(rows)}
+
+
+@app.get("/api/admin/analytics/users")
+async def admin_analytics_users(user: dict = Depends(get_current_user)):
+    require_admin(user)
+
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='active'")
+        banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='banned'")
+        paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier <> 'free'")
+        new_users_30d = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '30 days'")
+        new_users_7d = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days'")
+        new_users_24h = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")
+
+    return {
+        "total_users": int(total_users or 0),
+        "active_users": int(active_users or 0),
+        "banned_users": int(banned_users or 0),
+        "paid_users": int(paid_users or 0),
+        "new_users_30d": int(new_users_30d or 0),
+        "new_users_7d": int(new_users_7d or 0),
+        "new_users_24h": int(new_users_24h or 0),
+    }
+
+
+@app.get("/api/admin/analytics/revenue")
+async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
+    require_admin(user)
+
+    async with db_pool.acquire() as conn:
+        launch_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='launch'")
+        creator_pro_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='creator_pro'")
+        studio_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='studio'")
+        agency_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='agency'")
+
+    return {
+        "mrr_estimate": 0.0,
+        "launch_count": int(launch_count or 0),
+        "creator_pro_count": int(creator_pro_count or 0),
+        "studio_count": int(studio_count or 0),
+        "agency_count": int(agency_count or 0),
+    }
+
 
 @app.post("/api/admin/users/assign-tier")
 async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), user: dict = Depends(require_master_admin)):

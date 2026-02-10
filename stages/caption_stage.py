@@ -195,65 +195,65 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
         logger.info(f"OpenAI cost estimate: ${cost:.4f}")
 
 
-        # ---------------------------------------------------------------------
-        # FINAL HASHTAG RESOLUTION (base + per-platform) — deterministic + UI-ready
-        # ---------------------------------------------------------------------
-        always_tags = ctx.user_settings.get("always_hashtags", []) or []
-        blocked = set(_norm_tag(b).lower() for b in (ctx.user_settings.get("blocked_hashtags", []) or []))
-        platform_prefs = ctx.user_settings.get("platform_hashtags", {}) or {}
-
-        # Base input precedence: user override > AI generated > empty
-        if ctx.hashtags:
-            base_input = list(ctx.hashtags)
-        elif ctx.ai_hashtags:
-            base_input = list(ctx.ai_hashtags)
-        else:
-            base_input = []
-
-        base_combined = _dedupe_case_insensitive(list(base_input) + list(always_tags))
-        base_filtered = [t for t in base_combined if _norm_tag(t).lower() not in blocked]
-
-        max_tags = ctx.user_settings.get("max_hashtags", 15)
-        ctx.final_hashtags = base_filtered[:max_tags]
-
-        platform_map: Dict[str, List[str]] = {}
-        for p in (ctx.platforms or []):
-            extra = platform_prefs.get(p, []) or []
-            merged = _dedupe_case_insensitive(list(ctx.final_hashtags) + list(extra))
-            merged = [t for t in merged if _norm_tag(t).lower() not in blocked]
-            platform_map[p] = merged[:max_tags]
-
-        ctx.platform_hashtags_map = platform_map
-        logger.info(f"Resolved base hashtags: {ctx.final_hashtags}")
-        logger.info(f"Resolved platform hashtags: {ctx.platform_hashtags_map}")
-
-        return ctx
-        
     except SkipStage:
         raise
     except StageError:
         raise
     except Exception as e:
-        logger.error(f"Caption generation failed: {e}")
-        # Non-fatal - continue pipeline
-        ctx.mark_error(ErrorCode.AI_CAPTION_FAILED.value, str(e))
-        return ctx
+        logger.exception("Caption stage failed")
+        raise StageError(
+            ErrorCode.AI_CAPTION_FAILED,
+            "AI metadata generation failed",
+            details={"error": str(e)},
+            retryable=True,
+            stage="captions",
+        )
 
+    # ---------------------------------------------------------------------
+    # FINAL HASHTAG RESOLUTION (base + per-platform) — deterministic + UI-ready
+    # ---------------------------------------------------------------------
+    always_tags = ctx.user_settings.get("always_hashtags", []) or []
+    blocked = set(_norm_tag(b).lower() for b in (ctx.user_settings.get("blocked_hashtags", []) or []))
+    platform_prefs = ctx.user_settings.get("platform_hashtags", {}) or {}
+
+    # Base input precedence: user override > AI generated > empty
+    if ctx.hashtags:
+        base_input = list(ctx.hashtags)
+    elif ctx.ai_hashtags:
+        base_input = list(ctx.ai_hashtags)
+    else:
+        base_input = []
+
+    base_combined = _dedupe_case_insensitive(list(base_input) + list(always_tags))
+    base_filtered = [t for t in base_combined if _norm_tag(t).lower() not in blocked]
+
+    max_tags = ctx.user_settings.get("max_hashtags", 15)
+    ctx.final_hashtags = base_filtered[:max_tags]
+
+    platform_map: Dict[str, List[str]] = {}
+    for p in (ctx.platforms or []):
+        extra = platform_prefs.get(p, []) or []
+        merged = _dedupe_case_insensitive(list(ctx.final_hashtags) + list(extra))
+        merged = [t for t in merged if _norm_tag(t).lower() not in blocked]
+        platform_map[p] = merged[:max_tags]
+
+    ctx.platform_hashtags_map = platform_map
+    logger.info(f"Resolved base hashtags: {ctx.final_hashtags}")
+    logger.info(f"Resolved platform hashtags: {ctx.platform_hashtags_map}")
+
+    return ctx
 
 async def extract_video_frames(video_path: Path, temp_dir: Path, num_frames: int = 4) -> List[Path]:
     """
     Extract frames from video for AI analysis.
-    
     Args:
         video_path: Path to video file
         temp_dir: Directory to save frames
         num_frames: Number of frames to extract
-        
     Returns:
         List of paths to frame images
     """
     frames = []
-    
     try:
         # Get video duration first
         cmd = [
@@ -262,25 +262,20 @@ async def extract_video_frames(video_path: Path, temp_dir: Path, num_frames: int
             "-of", "json",
             str(video_path)
         ]
-        
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await proc.communicate()
-        
         data = json.loads(stdout)
         duration = float(data.get("format", {}).get("duration", 30))
-        
         # Calculate timestamps (avoid very start and end)
         interval = duration / (num_frames + 1)
         timestamps = [interval * (i + 1) for i in range(num_frames)]
-        
         # Extract frames
         for i, ts in enumerate(timestamps):
             output = temp_dir / f"frame_{i:03d}.jpg"
-            
             cmd = [
                 FFMPEG_PATH,
                 "-ss", str(ts),
@@ -291,23 +286,17 @@ async def extract_video_frames(video_path: Path, temp_dir: Path, num_frames: int
                 "-y",
                 str(output)
             ]
-            
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             await proc.communicate()
-            
             if output.exists():
                 frames.append(output)
-        
     except Exception as e:
         logger.warning(f"Frame extraction error: {e}")
-    
     return frames
-
-
 async def generate_ai_content(
     frames: List[Path],
     generate_title: bool,
@@ -321,14 +310,11 @@ async def generate_ai_content(
 ) -> Dict[str, Any]:
     """
     Generate title, caption, and hashtags using OpenAI.
-    
     Returns dict with keys: title, caption, hashtags, tokens
     """
     result = {"title": None, "caption": None, "hashtags": [], "tokens": {}}
-    
     if not OPENAI_API_KEY:
         return result
-    
     # Build prompt
     tasks = []
     if generate_title:
@@ -337,36 +323,26 @@ async def generate_ai_content(
         tasks.append("2. An engaging CAPTION for social media (max 280 characters)")
     if generate_hashtags and hashtag_count > 0:
         tasks.append(f"3. Exactly {hashtag_count} relevant HASHTAGS (just the words, no # symbol)")
-    
     if not tasks:
         return result
-    
     platform_str = ", ".join(platform_hints) if platform_hints else "social media"
-    
     prompt = f"""Analyze this video content and generate the following for {platform_str}:
-
 {chr(10).join(tasks)}
-
 Context:
 - Filename: {filename}
 - Existing title: {existing_title or 'None'}
 - Existing caption: {existing_caption or 'None'}
-
 Important:
 - Be engaging and encourage interaction
 - Use emojis sparingly but effectively
 - Make content feel authentic, not AI-generated
 - For TikTok/Instagram, be trendy and casual
 - For YouTube, be more descriptive
-
 Respond in this exact JSON format:
 {{"title": "...", "caption": "...", "hashtags": ["tag1", "tag2", ...]}}
-
 If you're not generating something, use null for that field."""
-
     # Build message content
     content = [{"type": "text", "text": prompt}]
-    
     # Add frames if available (limit to 3 for cost)
     for frame in frames[:3]:
         try:
@@ -381,7 +357,6 @@ If you're not generating something, use null for that field."""
                 })
         except:
             pass
-    
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
@@ -397,23 +372,18 @@ If you're not generating something, use null for that field."""
                     "temperature": 0.7,
                 }
             )
-            
             if response.status_code != 200:
                 logger.error(f"OpenAI API error: {response.status_code} - {response.text[:200]}")
                 return result
-            
             data = response.json()
-            
             # Track tokens
             usage = data.get("usage", {})
             result["tokens"] = {
                 "prompt": usage.get("prompt_tokens", 0),
                 "completion": usage.get("completion_tokens", 0),
             }
-            
             # Parse response
             answer = data["choices"][0]["message"]["content"]
-            
             # Try to extract JSON
             try:
                 # Handle markdown code blocks
@@ -421,9 +391,7 @@ If you're not generating something, use null for that field."""
                     answer = answer.split("```json")[1].split("```")[0]
                 elif "```" in answer:
                     answer = answer.split("```")[1].split("```")[0]
-                
                 parsed = json.loads(answer.strip())
-                
                 if parsed.get("title"):
                     result["title"] = str(parsed["title"])[:100]
                 if parsed.get("caption"):
@@ -434,25 +402,18 @@ If you're not generating something, use null for that field."""
                         for h in parsed["hashtags"] 
                         if h
                     ][:hashtag_count]
-                    
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse OpenAI response as JSON: {answer[:200]}")
-            
     except Exception as e:
         logger.error(f"OpenAI API call failed: {e}")
-    
     return result
-
-
 def estimate_cost(tokens: dict, num_images: int) -> float:
     """Estimate OpenAI API cost."""
     input_tokens = tokens.get("prompt", 0)
     output_tokens = tokens.get("completion", 0)
-    
     cost = (
         (input_tokens / 1000) * COST_PER_1K_INPUT +
         (output_tokens / 1000) * COST_PER_1K_OUTPUT +
         num_images * COST_PER_IMAGE
     )
-    
     return cost

@@ -2742,7 +2742,12 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             "blockedHashtags": blocked_tags or [],
             "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": d.get("email_notifications", True),
-            "discordWebhook": d.get("discord_webhook")
+            "discordWebhook": d.get("discord_webhook"),
+            "trillEnabled": bool(d.get("trill_enabled", False)),
+            "trillMinScore": int(d.get("trill_min_score", 0) or 0),
+            "trillHudEnabled": bool(d.get("trill_hud_enabled", False)),
+            "trillAiEnhance": bool(d.get("trill_ai_enhance", False)),
+            "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
         }
 
 @app.post("/api/settings/preferences")
@@ -2774,6 +2779,11 @@ async def save_user_preferences(
         "platformHashtags": "platform_hashtags",
         "emailNotifications": "email_notifications",
         "discordWebhook": "discord_webhook",
+        "trillEnabled": "trill_enabled",
+        "trillMinScore": "trill_min_score",
+        "trillHudEnabled": "trill_hud_enabled",
+        "trillAiEnhance": "trill_ai_enhance",
+        "trillOpenaiModel": "trill_openai_model",
     }
 
     def normalize_prefs_payload(p: dict) -> dict:

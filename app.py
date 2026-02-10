@@ -228,6 +228,29 @@ TOPUP_PRODUCTS = {
 def get_plan(tier: str) -> dict:
     return PLAN_CONFIG.get(tier.lower(), PLAN_CONFIG["free"])
 
+async def log_admin_action(
+    admin_id: str,
+    target_user_id: str,
+    action_type: str,
+    description: str = None,
+    old_value: str = None,
+    new_value: str = None,
+    ip_address: str = None,
+    user_agent: str = None
+):
+    """Log admin action for audit trail."""
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO admin_actions (
+                    admin_id, target_user_id, action_type, description,
+                    old_value, new_value, ip_address, user_agent
+                ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8)
+            """, admin_id, target_user_id, action_type, description,
+                old_value, new_value, ip_address, user_agent)
+    except Exception as e:
+        logger.error(f"Failed to log admin action: {e}")
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -3807,26 +3830,58 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
     return {"users": [dict(u) for u in users], "total": total}
 
 @app.put("/api/admin/users/{user_id}")
-async def admin_update_user(user_id: str, data: AdminUserUpdate, user: dict = Depends(require_admin)):
+async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Request, user: dict = Depends(require_admin)):
     updates, params = [], [user_id]
-    if data.subscription_tier:
+
+    # Get current user data for audit log
+    async with db_pool.acquire() as conn:
+        current_user = await conn.fetchrow(
+            "SELECT subscription_tier, role, status FROM users WHERE id = $1", user_id
+        )
+
+    if data.subscription_tier and current_user["subscription_tier"] != data.subscription_tier:
         updates.append(f"subscription_tier = ${len(params)+1}")
         params.append(data.subscription_tier)
-    if data.role and user.get("role") == "master_admin":
+        await log_admin_action(
+            user["id"], user_id, "tier_change",
+            f"Changed tier from {current_user['subscription_tier']} to {data.subscription_tier}",
+            current_user["subscription_tier"], data.subscription_tier,
+            request.client.host, request.headers.get("user-agent")
+        )
+
+    if data.role and user.get("role") == "master_admin" and current_user["role"] != data.role:
         updates.append(f"role = ${len(params)+1}")
         params.append(data.role)
-    if data.status:
+        await log_admin_action(
+            user["id"], user_id, "role_change",
+            f"Changed role from {current_user['role']} to {data.role}",
+            current_user["role"], data.role,
+            request.client.host, request.headers.get("user-agent")
+        )
+
+    if data.status and current_user["status"] != data.status:
         updates.append(f"status = ${len(params)+1}")
         params.append(data.status)
+        action_type = "user_ban" if data.status == "banned" else "status_change"
+        await log_admin_action(
+            user["id"], user_id, action_type,
+            f"Changed status from {current_user['status']} to {data.status}",
+            current_user["status"], data.status,
+            request.client.host, request.headers.get("user-agent")
+        )
+
     if data.flex_enabled is not None:
         updates.append(f"flex_enabled = ${len(params)+1}")
         params.append(data.flex_enabled)
+
     if updates:
         async with db_pool.acquire() as conn:
             await conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", *params)
+
     return {"status": "updated"}
 
 @app.post("/api/admin/users/{user_id}/ban")
+
 async def admin_ban_user(user_id: str, user: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET status = 'banned' WHERE id = $1", user_id)
@@ -3837,6 +3892,71 @@ async def admin_unban_user(user_id: str, user: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
     return {"status": "unbanned"}
+
+
+@app.delete("/api/admin/users/{user_id}")
+async def admin_delete_user(user_id: str, request: Request, user: dict = Depends(require_master_admin)):
+    """Delete user account (master admin only)."""
+    async with db_pool.acquire() as conn:
+        # Get user info before deletion
+        target_user = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", user_id)
+        if not target_user:
+            raise HTTPException(404, "User not found")
+
+        # Prevent self-deletion
+        if user_id == user["id"]:
+            raise HTTPException(400, "Cannot delete your own account")
+
+        # Log the deletion
+        await log_admin_action(
+            user["id"], user_id, "account_delete",
+            f"Deleted user account: {target_user['email']}",
+            None, None,
+            request.client.host, request.headers.get("user-agent")
+        )
+
+        # Delete user (CASCADE will handle related records)
+        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
+
+    return {"status": "deleted"}
+
+@app.get("/api/admin/audit-log")
+async def get_audit_log(
+    limit: int = 100,
+    offset: int = 0,
+    action_type: Optional[str] = None,
+    target_user_id: Optional[str] = None,
+    user: dict = Depends(require_admin)
+):
+    """Get admin audit log with filtering."""
+    query = """
+        SELECT 
+            aa.id, aa.action_type, aa.description, aa.created_at,
+            aa.old_value, aa.new_value, aa.ip_address,
+            admin.email AS admin_email, admin.name AS admin_name,
+            target.email AS target_email, target.name AS target_name
+        FROM admin_actions aa
+        JOIN users admin ON aa.admin_id = admin.id
+        JOIN users target ON aa.target_user_id = target.id
+        WHERE 1=1
+    """
+    params = []
+
+    if action_type:
+        params.append(action_type)
+        query += f" AND aa.action_type = ${len(params)}"
+
+    if target_user_id:
+        params.append(target_user_id)
+        query += f" AND aa.target_user_id = ${len(params)}::uuid"
+
+    params.extend([limit, offset])
+    query += f" ORDER BY aa.created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}"
+
+    async with db_pool.acquire() as conn:
+        actions = await conn.fetch(query, *params)
+
+    return {"actions": [dict(a) for a in actions]}
 
 @app.post("/api/admin/users/assign-tier")
 async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), user: dict = Depends(require_master_admin)):

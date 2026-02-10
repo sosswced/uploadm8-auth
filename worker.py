@@ -139,6 +139,8 @@ async def run_pipeline(job_data: dict) -> bool:
         # Caption
         try:
             ctx = await run_caption_stage(ctx)
+            # Persist generated metadata so UI/publish sees per-video results
+            await db_stage.save_generated_metadata(db_pool, ctx)
         except SkipStage as e:
             logger.info(f"Caption skipped: {e.reason}")
         except StageError as e:

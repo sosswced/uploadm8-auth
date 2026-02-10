@@ -577,6 +577,13 @@ class AdminUserUpdate(BaseModel):
     status: Optional[str] = None
     flex_enabled: Optional[bool] = None
 
+
+class AdminUpdateEmailIn(BaseModel):
+    email: EmailStr
+
+class AdminResetPasswordIn(BaseModel):
+    temp_password: str = Field(min_length=8, max_length=128)
+
 class ScheduledUploadUpdate(BaseModel):
     title: Optional[str] = None
     scheduled_time: Optional[datetime] = None

@@ -228,29 +228,6 @@ TOPUP_PRODUCTS = {
 def get_plan(tier: str) -> dict:
     return PLAN_CONFIG.get(tier.lower(), PLAN_CONFIG["free"])
 
-async def log_admin_action(
-    admin_id: str,
-    target_user_id: str,
-    action_type: str,
-    description: str = None,
-    old_value: str = None,
-    new_value: str = None,
-    ip_address: str = None,
-    user_agent: str = None
-):
-    """Log admin action for audit trail."""
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO admin_actions (
-                    admin_id, target_user_id, action_type, description,
-                    old_value, new_value, ip_address, user_agent
-                ) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8)
-            """, admin_id, target_user_id, action_type, description,
-                old_value, new_value, ip_address, user_agent)
-    except Exception as e:
-        logger.error(f"Failed to log admin action: {e}")
-
 # ============================================================
 # Helpers
 # ============================================================
@@ -975,6 +952,56 @@ async def run_migrations():
 
 app = FastAPI(title="UploadM8 API", version="4.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS.split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+install_rate_limit_middleware(app)
+
+# ============================================================
+# SECURITY + RATE LIMITING (in-memory MVP)
+# Replace with Redis later (same interface)
+# ============================================================
+_RATE_BUCKETS: Dict[str, Dict[str, Any]] = {}
+
+def _rl_now() -> float:
+    return time.time()
+
+def rate_limit(key: str, limit: int, window_sec: int) -> bool:
+    """Count requests within a sliding window. Returns True if allowed."""
+    bucket = _RATE_BUCKETS.get(key)
+    t = _rl_now()
+    if not bucket or t > bucket["reset_at"]:
+        _RATE_BUCKETS[key] = {"count": 1, "reset_at": t + window_sec}
+        return True
+    if bucket["count"] >= limit:
+        return False
+    bucket["count"] += 1
+    return True
+
+def client_ip(req: Request) -> str:
+    # If behind proxy/CDN, consider X-Forwarded-For parsing.
+    return (req.client.host if req.client else "unknown")
+
+def _json_429(detail: str) -> JSONResponse:
+    return JSONResponse(status_code=429, content={"detail": detail})
+
+def install_rate_limit_middleware(app: FastAPI) -> None:
+    @app.middleware("http")
+    async def rl_middleware(request: Request, call_next):
+        ip = client_ip(request)
+        path = request.url.path
+
+        # Global guardrail
+        if not rate_limit(f"ip:{ip}:global", limit=300, window_sec=60):
+            return _json_429("Rate limit exceeded (global)")
+
+        # Sensitive surfaces
+        if path.startswith("/api/auth/"):
+            if not rate_limit(f"ip:{ip}:auth", limit=30, window_sec=60):
+                return _json_429("Rate limit exceeded (auth)")
+        if path.startswith("/api/admin/"):
+            if not rate_limit(f"ip:{ip}:admin", limit=60, window_sec=60):
+                return _json_429("Rate limit exceeded (admin)")
+
+        return await call_next(request)
+
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -982,6 +1009,16 @@ async def add_request_id(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = request.state.request_id
     return response
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; connect-src 'self' https:;"
+    return resp
 
 # ============================================================
 # Auth Dependencies
@@ -3830,156 +3867,26 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
     return {"users": [dict(u) for u in users], "total": total}
 
 @app.put("/api/admin/users/{user_id}")
-async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Request, user: dict = Depends(require_admin)):
+async def admin_update_user(user_id: str, data: AdminUserUpdate, user: dict = Depends(require_admin)):
     updates, params = [], [user_id]
-
-    # Get current user data for audit log
-    async with db_pool.acquire() as conn:
-        current_user = await conn.fetchrow(
-            "SELECT subscription_tier, role, status FROM users WHERE id = $1", user_id
-        )
-
-    if data.subscription_tier and current_user["subscription_tier"] != data.subscription_tier:
+    if data.subscription_tier:
         updates.append(f"subscription_tier = ${len(params)+1}")
         params.append(data.subscription_tier)
-        await log_admin_action(
-            user["id"], user_id, "tier_change",
-            f"Changed tier from {current_user['subscription_tier']} to {data.subscription_tier}",
-            current_user["subscription_tier"], data.subscription_tier,
-            request.client.host, request.headers.get("user-agent")
-        )
-
-    if data.role and user.get("role") == "master_admin" and current_user["role"] != data.role:
+    if data.role and user.get("role") == "master_admin":
         updates.append(f"role = ${len(params)+1}")
         params.append(data.role)
-        await log_admin_action(
-            user["id"], user_id, "role_change",
-            f"Changed role from {current_user['role']} to {data.role}",
-            current_user["role"], data.role,
-            request.client.host, request.headers.get("user-agent")
-        )
-
-    if data.status and current_user["status"] != data.status:
+    if data.status:
         updates.append(f"status = ${len(params)+1}")
         params.append(data.status)
-        action_type = "user_ban" if data.status == "banned" else "status_change"
-        await log_admin_action(
-            user["id"], user_id, action_type,
-            f"Changed status from {current_user['status']} to {data.status}",
-            current_user["status"], data.status,
-            request.client.host, request.headers.get("user-agent")
-        )
-
     if data.flex_enabled is not None:
         updates.append(f"flex_enabled = ${len(params)+1}")
         params.append(data.flex_enabled)
-
     if updates:
         async with db_pool.acquire() as conn:
             await conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", *params)
-
-    return {"status": "updated"}
-
-
-class AdminEmailChange(BaseModel):
-    email: EmailStr
-
-class AdminPasswordReset(BaseModel):
-    password: str = Field(..., min_length=8, max_length=128)
-    send_email: bool = True
-
-@app.put("/api/admin/users/{user_id}/email")
-async def admin_change_user_email(
-    user_id: str,
-    payload: AdminEmailChange,
-    request: Request,
-    admin: dict = Depends(require_admin),
-):
-    """Change a user's email (admin). Audit logged + notify old/new addresses."""
-    new_email = payload.email.lower().strip()
-
-    async with db_pool.acquire() as conn:
-        target = await conn.fetchrow("SELECT id, email, name FROM users WHERE id = $1", user_id)
-        if not target:
-            raise HTTPException(404, "User not found")
-
-        # Uniqueness check
-        existing = await conn.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1 AND id <> $2", new_email, user_id)
-        if existing:
-            raise HTTPException(409, "Email already in use")
-
-        old_email = (target["email"] or "").lower()
-        if old_email == new_email:
-            return {"status": "noop"}
-
-        await conn.execute("UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2", new_email, user_id)
-
-    # Audit log
-    await log_admin_action(
-        admin["id"], user_id, "email_change",
-        f"Changed email from {old_email} to {new_email}",
-        old_email, new_email,
-        request.client.host if request.client else None,
-        request.headers.get("user-agent"),
-    )
-
-    # Notify both addresses (best-effort)
-    try:
-        if old_email:
-            await send_email(
-                old_email,
-                "Your UploadM8 email was changed",
-                f"<p>Your UploadM8 login email was changed from <b>{old_email}</b> to <b>{new_email}</b>.</p><p>If you did not expect this, contact support.</p>",
-            )
-        await send_email(
-            new_email,
-            "Your UploadM8 email was changed",
-            f"<p>Your UploadM8 login email is now <b>{new_email}</b>.</p><p>If you did not expect this, contact support.</p>",
-        )
-    except Exception:
-        pass
-
-    return {"status": "updated", "email": new_email}
-
-@app.post("/api/admin/users/{user_id}/reset-password")
-async def admin_reset_user_password(
-    user_id: str,
-    payload: AdminPasswordReset,
-    request: Request,
-    admin: dict = Depends(require_admin),
-):
-    """Force reset a user's password (admin). Audit logged + optional email notice."""
-    async with db_pool.acquire() as conn:
-        target = await conn.fetchrow("SELECT id, email, name FROM users WHERE id = $1", user_id)
-        if not target:
-            raise HTTPException(404, "User not found")
-
-        new_hash = hash_password(payload.password)
-        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", new_hash, user_id)
-
-    await log_admin_action(
-        admin["id"], user_id, "password_reset",
-        f"Forced password reset for {target['email']}",
-        None, None,
-        request.client.host if request.client else None,
-        request.headers.get("user-agent"),
-    )
-
-    if payload.send_email and target.get("email"):
-        # Best-effort notification (do not include plaintext password in email)
-        try:
-            await send_email(
-                target["email"],
-                "Your UploadM8 password was reset",
-                "<p>An admin reset your UploadM8 password. If you did not request this, contact support immediately.</p>",
-            )
-        except Exception:
-            pass
-
     return {"status": "updated"}
 
 @app.post("/api/admin/users/{user_id}/ban")
-
 async def admin_ban_user(user_id: str, user: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET status = 'banned' WHERE id = $1", user_id)
@@ -3990,71 +3897,6 @@ async def admin_unban_user(user_id: str, user: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
     return {"status": "unbanned"}
-
-
-@app.delete("/api/admin/users/{user_id}")
-async def admin_delete_user(user_id: str, request: Request, user: dict = Depends(require_master_admin)):
-    """Delete user account (master admin only)."""
-    async with db_pool.acquire() as conn:
-        # Get user info before deletion
-        target_user = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", user_id)
-        if not target_user:
-            raise HTTPException(404, "User not found")
-
-        # Prevent self-deletion
-        if user_id == user["id"]:
-            raise HTTPException(400, "Cannot delete your own account")
-
-        # Log the deletion
-        await log_admin_action(
-            user["id"], user_id, "account_delete",
-            f"Deleted user account: {target_user['email']}",
-            None, None,
-            request.client.host, request.headers.get("user-agent")
-        )
-
-        # Delete user (CASCADE will handle related records)
-        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
-
-    return {"status": "deleted"}
-
-@app.get("/api/admin/audit-log")
-async def get_audit_log(
-    limit: int = 100,
-    offset: int = 0,
-    action_type: Optional[str] = None,
-    target_user_id: Optional[str] = None,
-    user: dict = Depends(require_admin)
-):
-    """Get admin audit log with filtering."""
-    query = """
-        SELECT 
-            aa.id, aa.action_type, aa.description, aa.created_at,
-            aa.old_value, aa.new_value, aa.ip_address,
-            admin.email AS admin_email, admin.name AS admin_name,
-            target.email AS target_email, target.name AS target_name
-        FROM admin_actions aa
-        JOIN users admin ON aa.admin_id = admin.id
-        JOIN users target ON aa.target_user_id = target.id
-        WHERE 1=1
-    """
-    params = []
-
-    if action_type:
-        params.append(action_type)
-        query += f" AND aa.action_type = ${len(params)}"
-
-    if target_user_id:
-        params.append(target_user_id)
-        query += f" AND aa.target_user_id = ${len(params)}::uuid"
-
-    params.extend([limit, offset])
-    query += f" ORDER BY aa.created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}"
-
-    async with db_pool.acquire() as conn:
-        actions = await conn.fetch(query, *params)
-
-    return {"actions": [dict(a) for a in actions]}
 
 @app.post("/api/admin/users/assign-tier")
 async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), user: dict = Depends(require_master_admin)):

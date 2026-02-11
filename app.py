@@ -88,6 +88,28 @@ logger = logging.getLogger("uploadm8-api")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
+
+# ============================================================
+# Postgres JSON/JSONB codecs (forces JSONB -> dict/list, not str)
+# ============================================================
+async def _init_pg_codecs(conn: asyncpg.Connection) -> None:
+    # Ensure asyncpg returns JSON/JSONB as native Python objects.
+    try:
+        await conn.set_type_codec(
+            "json",
+            encoder=lambda v: json.dumps(v),
+            decoder=lambda v: json.loads(v),
+            schema="pg_catalog",
+        )
+        await conn.set_type_codec(
+            "jsonb",
+            encoder=lambda v: json.dumps(v),
+            decoder=lambda v: json.loads(v),
+            schema="pg_catalog",
+        )
+    except Exception as e:
+        logger.warning(f"PG codec init skipped: {e}")
+
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "https://auth.uploadm8.com")
 JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "uploadm8-app")
@@ -748,7 +770,7 @@ async def lifespan(app: FastAPI):
     init_enc_keys()
     if STRIPE_SECRET_KEY: stripe.api_key = STRIPE_SECRET_KEY
     
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, init=_init_pg_codecs)
     logger.info("Database connected")
     
     await run_migrations()
@@ -979,6 +1001,13 @@ async def run_migrations():
                 expires_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );"""),
+            (105, """
+                -- Backfill missing columns referenced by API code
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS hashtags TEXT[];
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS schedule_metadata JSONB;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS user_preferences JSONB;
+            """),
+
 ]
         
         for version, sql in migrations:
@@ -2047,7 +2076,7 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
                 )
 
         scheduled_time = getattr(data, "scheduled_time", None)
-        schedule_metadata = None
+        schedule_metadata: dict = {}
 
         if getattr(data, "schedule_mode", None) == "smart" and smart_schedule:
             schedule_metadata = {p: dt.isoformat() for p, dt in smart_schedule.items()}
@@ -2061,7 +2090,7 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
                 schedule_mode, put_reserved, aic_reserved, schedule_metadata,
                 user_preferences
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15::jsonb, $16::jsonb)
         """,
             upload_id, user["id"], r2_key, data.filename, data.file_size,
             data.platforms, data.title, data.caption, data.hashtags,

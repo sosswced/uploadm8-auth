@@ -13,6 +13,27 @@ import os
 import csv
 import io
 import json
+
+
+# =========================
+# JSON helpers (DB-drift safe)
+# =========================
+
+def _safe_json(v, default):
+    """Best-effort JSON parsing for values that may be stored as TEXT or JSONB."""
+    if v is None:
+        return default
+    if isinstance(v, (list, dict)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return default
+        try:
+            return json.loads(s)
+        except Exception:
+            return default
+    return default
 import secrets
 import hashlib
 import base64
@@ -2133,10 +2154,18 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
         # Fetch preferences again (in case they changed)
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
 
-        await conn.execute(
-            "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
-            upload_id
-        )
+        try:
+            await conn.execute(
+                "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
+                upload_id
+            )
+        except Exception as e:
+            # DB schema drift safe: older deployments may not have uploads.updated_at
+            import asyncpg
+            if isinstance(e, asyncpg.exceptions.UndefinedColumnError):
+                await conn.execute("UPDATE uploads SET status = 'queued' WHERE id = $1", upload_id)
+            else:
+                raise
 
     plan = get_plan(user.get("subscription_tier", "free"))
 
@@ -2172,10 +2201,100 @@ async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
         if upload["status"] in ("completed", "cancelled", "failed"):
             raise HTTPException(400, "Cannot cancel this upload")
         
-        await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1", upload_id)
+        try:
+            await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1", upload_id)
+        except Exception as e:
+            if getattr(getattr(__import__('asyncpg'), 'exceptions', None), 'UndefinedColumnError', None) and isinstance(e, __import__('asyncpg').exceptions.UndefinedColumnError):
+                await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled' WHERE id = $1", upload_id)
+            else:
+                raise
         # Refund reserved tokens
         await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
     return {"status": "cancelled"}
+
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user)):
+    """Detail view for queue modal / view button. DB-drift safe JSON parsing."""
+    async with db_pool.acquire() as conn:
+        # Attempt full select (includes updated_at) then fall back if schema drift
+        sql_full = """
+            SELECT
+                id, user_id, r2_key, filename, file_size, platforms,
+                title, caption, hashtags, privacy, status, cancel_requested,
+                scheduled_time, schedule_mode,
+                processing_started_at, processing_finished_at, completed_at,
+                error_code, error_detail,
+                put_reserved, put_spent, aic_reserved, aic_spent,
+                views, likes, comments, shares,
+                thumbnail_r2_key, video_url, platform_results,
+                created_at, updated_at, duration
+            FROM uploads
+            WHERE id = $1 AND user_id = $2
+        """
+        sql_fallback = """
+            SELECT
+                id, user_id, r2_key, filename, file_size, platforms,
+                title, caption, hashtags, privacy, status, cancel_requested,
+                scheduled_time, schedule_mode,
+                processing_started_at, processing_finished_at, completed_at,
+                error_code, error_detail,
+                put_reserved, put_spent, aic_reserved, aic_spent,
+                views, likes, comments, shares,
+                thumbnail_r2_key, video_url, platform_results,
+                created_at, duration
+            FROM uploads
+            WHERE id = $1 AND user_id = $2
+        """
+        try:
+            row = await conn.fetchrow(sql_full, upload_id, user["id"])
+        except Exception as e:
+            if getattr(getattr(__import__('asyncpg'), 'exceptions', None), 'UndefinedColumnError', None) and isinstance(e, __import__('asyncpg').exceptions.UndefinedColumnError):
+                row = await conn.fetchrow(sql_fallback, upload_id, user["id"])
+            else:
+                raise
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Upload not found")
+
+        def _dt(v):
+            return v.isoformat() if v else None
+
+        return {
+            "id": str(row["id"]),
+            "userId": str(row["user_id"]),
+            "r2Key": row.get("r2_key"),
+            "filename": row.get("filename"),
+            "fileSize": row.get("file_size"),
+            "platforms": _safe_json(row.get("platforms"), []),
+            "title": row.get("title"),
+            "caption": row.get("caption"),
+            "hashtags": _safe_json(row.get("hashtags"), []),
+            "privacy": row.get("privacy"),
+            "status": row.get("status"),
+            "cancelRequested": bool(row.get("cancel_requested")),
+            "scheduledTime": _dt(row.get("scheduled_time")),
+            "scheduleMode": row.get("schedule_mode"),
+            "processingStartedAt": _dt(row.get("processing_started_at")),
+            "processingFinishedAt": _dt(row.get("processing_finished_at")),
+            "completedAt": _dt(row.get("completed_at")),
+            "errorCode": row.get("error_code"),
+            "errorDetail": row.get("error_detail"),
+            "putReserved": row.get("put_reserved"),
+            "putSpent": row.get("put_spent"),
+            "aicReserved": row.get("aic_reserved"),
+            "aicSpent": row.get("aic_spent"),
+            "views": row.get("views"),
+            "likes": row.get("likes"),
+            "comments": row.get("comments"),
+            "shares": row.get("shares"),
+            "thumbnailR2Key": row.get("thumbnail_r2_key"),
+            "videoUrl": row.get("video_url"),
+            "platformResults": _safe_json(row.get("platform_results"), {}),
+            "createdAt": _dt(row.get("created_at")),
+            "updatedAt": _dt(row.get("updated_at")) if "updated_at" in row.keys() else None,
+            "duration": row.get("duration"),
+        }
 
 
 @app.get("/api/uploads")
@@ -2796,29 +2915,74 @@ async def save_user_preferences(
 
     # defaults / coercions (frontend may send strings from text inputs)
     def _coerce_hashtag_list(v):
-        """Normalize hashtag input to flat list of strings"""
+        """Normalize hashtag input into a de-duped list of clean tag strings.
+
+        Accepts:
+        - list[str] from frontend
+        - comma-separated str ("tag1, tag2")
+        - JSON-encoded list string ("["tag1", "tag2"]")
+        - JSON-encoded string (""tag1"")
+        """
+
+        def _clean(x: str) -> str:
+            x = (x or "").strip().lower()
+            if x.startswith("#"):
+                x = x[1:]
+            x = x.replace(" ", "")
+            return x
+
+        def _push(out, item):
+            if not isinstance(item, str):
+                return
+            c = _clean(item)
+            if c and len(c) < 50:
+                out.append(c)
+
         if v is None:
             return []
-        if isinstance(v, list):
-            # Simple flatten - just convert each item to string and filter
-            result = []
-            for item in v:
-                if isinstance(item, str) and item and not item.startswith('[') and not item.startswith('"'):
-                    # Only add if it's a simple string, not JSON garbage
-                    clean = item.strip().lower().replace('#', '')
-                    if clean and len(clean) < 50:  # Reasonable hashtag length
-                        result.append(clean)
-            return result
+
+        # If a JSON string came in, decode first
         if isinstance(v, str):
-            # Simple comma-separated string
             s = v.strip()
-            if not s or s.startswith('[') or s.startswith('"'):
-                # Looks like JSON garbage, ignore it
+            if not s:
                 return []
-            # Normal comma-separated
-            parts = [p.strip().lower().replace('#', '') for p in s.split(',')]
-            return [p for p in parts if p and len(p) < 50]
-        return []
+            if s.startswith("[") or s.startswith("{") or s.startswith('"'):
+                try:
+                    decoded = json.loads(s)
+                    v = decoded
+                except Exception:
+                    # fall back to comma-split parsing
+                    pass
+
+        out = []
+
+        if isinstance(v, list):
+            for item in v:
+                # handle list elements that are themselves JSON list strings
+                if isinstance(item, str) and item.strip().startswith("["):
+                    try:
+                        decoded = json.loads(item)
+                        if isinstance(decoded, list):
+                            for sub in decoded:
+                                _push(out, sub)
+                            continue
+                    except Exception:
+                        pass
+                _push(out, item)
+        elif isinstance(v, str):
+            for part in v.split(","):
+                _push(out, part)
+        else:
+            return []
+
+        # de-dupe while preserving order
+        seen = set()
+        deduped = []
+        for t in out:
+            if t not in seen:
+                deduped.append(t)
+                seen.add(t)
+        return deduped
 
     def _coerce_platform_map(v):
         default_map = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
@@ -2974,9 +3138,9 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
             "ai_hashtag_style": prefs_row["ai_hashtag_style"],
             "hashtag_position": prefs_row["hashtag_position"],
             "max_hashtags": prefs_row["max_hashtags"],
-            "always_hashtags": prefs_row["always_hashtags"] or [],
-            "blocked_hashtags": prefs_row["blocked_hashtags"] or [],
-            "platform_hashtags": prefs_row["platform_hashtags"] or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
+            "always_hashtags": _safe_json(prefs_row["always_hashtags"], []),
+            "blocked_hashtags": _safe_json(prefs_row["blocked_hashtags"], []),
+            "platform_hashtags": _safe_json(prefs_row["platform_hashtags"], {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}),
             "email_notifications": prefs_row["email_notifications"],
             "discord_webhook": prefs_row["discord_webhook"]
         }
@@ -3667,7 +3831,7 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
     plan = get_plan(user.get("subscription_tier", "free"))
     if not plan.get("excel"): raise HTTPException(403, "Excel export requires Studio+ plan")
     
-    minutes = {"7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
@@ -3691,8 +3855,7 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
 
 # ============================================================
 # Admin Endpoints
-# ========================================
-@app.get("/api/analytics/overview")
+# ========================================@app.get("/api/analytics/overview")
 async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = Depends(get_current_user)):
     """High-level KPI summary for analytics dashboard."""
     since = _now_utc() - timedelta(days=days)
@@ -3768,81 +3931,6 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
     }
 
 
-
-
-# ============================================================
-# Admin Analytics Overview (Account Management page)
-# Supports: ?range=7d|30d|90d|6m|1y|Nd and ?days=N (compat)
-# ============================================================
-
-def _parse_range_to_days(range_str: str | None, days: int | None) -> int:
-    """Return lookback days (guarded)."""
-    if days is not None:
-        return max(1, min(int(days), 3650))
-    r = (range_str or '30d').strip().lower()
-    presets = {'7d': 7, '30d': 30, '90d': 90, '6m': 182, '1y': 365}
-    if r in presets:
-        return presets[r]
-    m = re.match(r'^(\d{1,4})d$', r)
-    if m:
-        return max(1, min(int(m.group(1)), 3650))
-    return 30
-
-@app.get('/api/admin/analytics/overview')
-async def admin_analytics_overview(
-    range: str = '30d',
-    days: int | None = None,
-    user: dict = Depends(get_current_user),
-):
-    """Admin-only KPI snapshot for Account Management analytics tab."""
-    if user.get('role') not in ('admin', 'master_admin'):
-        raise HTTPException(status_code=403, detail='Admin access required')
-
-    lookback_days = _parse_range_to_days(range, days)
-    since = _now_utc() - timedelta(days=lookback_days)
-
-    paid_tiers = ('launch', 'creator_pro', 'studio', 'agency', 'friends_family')
-
-    # If you later want Stripe-truth MRR, swap this mapping to a DB lookup.
-    tier_prices = {
-        'launch': 19,
-        'creator_pro': 49,
-        'studio': 99,
-        'agency': 199,
-        'friends_family': 0,
-        'free': 0,
-    }
-
-    async with db_pool.acquire() as conn:
-        u = await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*)::int AS total_users,
-                SUM(CASE WHEN created_at >= $1 THEN 1 ELSE 0 END)::int AS new_users,
-                SUM(CASE WHEN subscription_tier = ANY($2::text[]) THEN 1 ELSE 0 END)::int AS paid_users
-            FROM users
-            """,
-            since,
-            list(paid_tiers),
-        )
-
-        # MRR estimate based on users.subscription_tier snapshot.
-        rows = await conn.fetch(
-            """SELECT subscription_tier, COUNT(*)::int AS c FROM users GROUP BY subscription_tier"""
-        )
-        mrr = 0
-        for r in rows:
-            tier = (r['subscription_tier'] or 'free')
-            mrr += int(r['c']) * int(tier_prices.get(tier, 0))
-
-    return {
-        'range': f'{lookback_days}d',
-        'total_users': (u['total_users'] if u else 0),
-        'new_users': (u['new_users'] if u else 0),
-        'new_users_30d': (u['new_users'] if u else 0),  # compatibility
-        'paid_users': (u['paid_users'] if u else 0),
-        'mrr_estimate': int(mrr),
-    }
 @app.get("/api/analytics/export")
 async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Query("csv"), user: dict = Depends(get_current_user)):
     """Export analytics for the last N days as CSV (default) or JSON."""
@@ -4256,7 +4344,7 @@ async def get_announcements(limit: int = 20, user: dict = Depends(require_admin)
 # ============================================================
 @app.get("/api/admin/kpi/overview")
 async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
-    minutes = {"7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
@@ -4285,6 +4373,94 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
         "revenue": {"total": float(revenue["total"]) if revenue else 0, "subscriptions": float(revenue["subscriptions"]) if revenue else 0, "topups": float(revenue["topups"]) if revenue else 0, "mrr": mrr},
         "tiers": {t["subscription_tier"]: t["count"] for t in tiers},
     }
+@app.get("/api/admin/analytics/overview")
+async def admin_analytics_overview(
+    range: Optional[str] = Query(None, description="Time window: 7d|30d|90d|6m|1y|Nd (custom)"),
+    days: Optional[int] = Query(None, ge=1, le=3650, description="Compatibility: days=N"),
+    user: dict = Depends(require_admin),
+):
+    """
+    Admin analytics overview for the selected time window.
+
+    Contract (frontend expects):
+      - total_users
+      - new_users
+      - paid_users
+      - mrr_estimate
+      - range
+
+    Supports:
+      - ?range=7d|30d|90d|6m|1y
+      - ?range=45d (custom, guarded 1–3650)
+      - ?days=45 (compat)
+    """
+    # -------- range parsing (authoritative) --------
+    preset_map = {"7d": 7, "30d": 30, "90d": 90, "6m": 180, "1y": 365}
+    window_days = None
+
+    if days is not None:
+        window_days = int(days)
+
+    if range:
+        r = str(range).strip().lower()
+        if r in preset_map:
+            window_days = preset_map[r]
+        else:
+            m = re.match(r"^(\d{1,4})d$", r)
+            if m:
+                window_days = int(m.group(1))
+            else:
+                raise HTTPException(status_code=400, detail="Invalid range. Use 7d|30d|90d|6m|1y or Nd (e.g. 45d).")
+
+    if window_days is None:
+        window_days = 30
+
+    if window_days < 1 or window_days > 3650:
+        raise HTTPException(status_code=400, detail="Range out of bounds. Use 1–3650 days.")
+
+    since = _now_utc() - timedelta(days=window_days)
+
+    # -------- KPI aggregation --------
+    # We intentionally avoid a dependency on a billing_events table (not guaranteed to exist).
+    # Instead, derive paid_users + mrr_estimate from users.subscription_tier + users.subscription_status.
+    paid_tiers = ["launch", "creator_pro", "studio", "agency"]
+
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+
+        new_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= $1",
+            since,
+        )
+
+        paid_rows = await conn.fetch(
+            """
+            SELECT subscription_tier, COUNT(*)::bigint AS c
+            FROM users
+            WHERE subscription_status = 'active'
+              AND subscription_tier = ANY($1::text[])
+            GROUP BY subscription_tier
+            """,
+            paid_tiers,
+        )
+
+    counts = {row["subscription_tier"]: int(row["c"]) for row in paid_rows}
+    paid_users = sum(counts.values())
+
+    # MRR estimate based on PLAN_CONFIG prices
+    mrr_estimate = 0.0
+    for tier, c in counts.items():
+        price = float(get_plan(tier).get("price", 0) or 0)
+        mrr_estimate += price * c
+
+    return {
+        "total_users": int(total_users or 0),
+        "new_users": int(new_users or 0),
+        "paid_users": int(paid_users or 0),
+        "mrr_estimate": float(mrr_estimate),
+        "range": f"{window_days}d",
+    }
+
 
 @app.get("/api/admin/kpi/margins")
 async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
@@ -4440,6 +4616,36 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
 # ============================================================
 # ADDITIONAL KPI ENDPOINTS (Added for frontend compatibility)
 # ============================================================
+
+# ------------------------------------------------------------
+# Time range parsing (supports presets + custom 'Nd')
+# ------------------------------------------------------------
+_RANGE_PRESETS_MINUTES = {
+    "24h": 24 * 60,
+    "7d": 7 * 24 * 60,
+    "30d": 30 * 24 * 60,
+    "90d": 90 * 24 * 60,
+    "6m": 180 * 24 * 60,
+    "1y": 365 * 24 * 60,
+}
+
+def _range_to_minutes(range_str: str | None, default_minutes: int) -> int:
+    r = (range_str or "").strip()
+    if not r:
+        return default_minutes
+    if r in _RANGE_PRESETS_MINUTES:
+        return _RANGE_PRESETS_MINUTES[r]
+    m = re.fullmatch(r"(\d{1,4})d", r)
+    if m:
+        days = int(m.group(1))
+        # Guardrails: 1 day .. 10 years
+        days = max(1, min(days, 3650))
+        return days * 24 * 60
+    return default_minutes
+
+def _range_label(range_str: str | None, fallback: str = "30d") -> str:
+    r = (range_str or "").strip()
+    return r if r else fallback
 
 @app.get("/api/admin/kpis")
 async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):

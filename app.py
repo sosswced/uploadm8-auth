@@ -4211,49 +4211,90 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
     }
 @app.get("/api/admin/analytics/overview")
 async def admin_analytics_overview(
-    range: str = "30d",
-    days: int | None = None,
+    range: Optional[str] = Query(None, description="Time window: 7d|30d|90d|6m|1y|Nd (custom)"),
+    days: Optional[int] = Query(None, ge=1, le=3650, description="Compatibility: days=N"),
     user: dict = Depends(require_admin),
 ):
     """
-    Backward-compatible analytics summary for Account Management page.
-    Supports:
-    - ?range=30d (presets + custom 'Nd')
-    - ?days=45 (custom day count)
-    """
-    if days is not None:
-        # Guardrails: 1 day .. 10 years
-        d = max(1, min(int(days), 3650))
-        minutes = d * 24 * 60
-        range_label = f"{d}d"
-    else:
-        minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
-        range_label = _range_label(range, fallback="30d")
+    Admin analytics overview for the selected time window.
 
-    since = _now_utc() - timedelta(minutes=minutes)
+    Contract (frontend expects):
+      - total_users
+      - new_users
+      - paid_users
+      - mrr_estimate
+      - range
+
+    Supports:
+      - ?range=7d|30d|90d|6m|1y
+      - ?range=45d (custom, guarded 1–3650)
+      - ?days=45 (compat)
+    """
+    # -------- range parsing (authoritative) --------
+    preset_map = {"7d": 7, "30d": 30, "90d": 90, "6m": 180, "1y": 365}
+    window_days = None
+
+    if days is not None:
+        window_days = int(days)
+
+    if range:
+        r = str(range).strip().lower()
+        if r in preset_map:
+            window_days = preset_map[r]
+        else:
+            m = re.match(r"^(\d{1,4})d$", r)
+            if m:
+                window_days = int(m.group(1))
+            else:
+                raise HTTPException(status_code=400, detail="Invalid range. Use 7d|30d|90d|6m|1y or Nd (e.g. 45d).")
+
+    if window_days is None:
+        window_days = 30
+
+    if window_days < 1 or window_days > 3650:
+        raise HTTPException(status_code=400, detail="Range out of bounds. Use 1–3650 days.")
+
+    since = _now_utc() - timedelta(days=window_days)
+
+    # -------- KPI aggregation --------
+    # We intentionally avoid a dependency on a billing_events table (not guaranteed to exist).
+    # Instead, derive paid_users + mrr_estimate from users.subscription_tier + users.subscription_status.
+    paid_tiers = ["launch", "creator_pro", "studio", "agency"]
 
     async with db_pool.acquire() as conn:
-        total_users = await conn.fetchval("SELECT COUNT(*)::int FROM users")
-        new_users = await conn.fetchval("SELECT COUNT(*)::int FROM users WHERE created_at >= $1", since)
-        paid_users = await conn.fetchval("""
-            SELECT COUNT(*)::int
-            FROM users
-            WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family')
-        """)
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
 
-        # Conservative estimate: sum of subscription payments in window
-        mrr_estimate = await conn.fetchval("""
-            SELECT COALESCE(SUM(amount), 0)::decimal
-            FROM billing_events
-            WHERE source = 'subscription' AND created_at >= $1
-        """, since)
+        new_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= $1",
+            since,
+        )
+
+        paid_rows = await conn.fetch(
+            """
+            SELECT subscription_tier, COUNT(*)::bigint AS c
+            FROM users
+            WHERE subscription_status = 'active'
+              AND subscription_tier = ANY($1::text[])
+            GROUP BY subscription_tier
+            """,
+            paid_tiers,
+        )
+
+    counts = {row["subscription_tier"]: int(row["c"]) for row in paid_rows}
+    paid_users = sum(counts.values())
+
+    # MRR estimate based on PLAN_CONFIG prices
+    mrr_estimate = 0.0
+    for tier, c in counts.items():
+        price = float(get_plan(tier).get("price", 0) or 0)
+        mrr_estimate += price * c
 
     return {
-        "range": range_label,
-        "total_users": total_users,
-        "new_users": new_users,
-        "paid_users": paid_users,
-        "mrr_estimate": float(mrr_estimate or 0),
+        "total_users": int(total_users or 0),
+        "new_users": int(new_users or 0),
+        "paid_users": int(paid_users or 0),
+        "mrr_estimate": float(mrr_estimate),
+        "range": f"{window_days}d",
     }
 
 

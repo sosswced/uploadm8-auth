@@ -88,28 +88,6 @@ logger = logging.getLogger("uploadm8-api")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
-
-# ============================================================
-# Postgres JSON/JSONB codecs (forces JSONB -> dict/list, not str)
-# ============================================================
-async def _init_pg_codecs(conn: asyncpg.Connection) -> None:
-    # Ensure asyncpg returns JSON/JSONB as native Python objects.
-    try:
-        await conn.set_type_codec(
-            "json",
-            encoder=lambda v: json.dumps(v),
-            decoder=lambda v: json.loads(v),
-            schema="pg_catalog",
-        )
-        await conn.set_type_codec(
-            "jsonb",
-            encoder=lambda v: json.dumps(v),
-            decoder=lambda v: json.loads(v),
-            schema="pg_catalog",
-        )
-    except Exception as e:
-        logger.warning(f"PG codec init skipped: {e}")
-
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "https://auth.uploadm8.com")
 JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "uploadm8-app")
@@ -770,7 +748,7 @@ async def lifespan(app: FastAPI):
     init_enc_keys()
     if STRIPE_SECRET_KEY: stripe.api_key = STRIPE_SECRET_KEY
     
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, init=_init_pg_codecs)
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     logger.info("Database connected")
     
     await run_migrations()
@@ -1001,13 +979,6 @@ async def run_migrations():
                 expires_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );"""),
-            (105, """
-                -- Backfill missing columns referenced by API code
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS hashtags TEXT[];
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS schedule_metadata JSONB;
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS user_preferences JSONB;
-            """),
-
 ]
         
         for version, sql in migrations:
@@ -2076,7 +2047,7 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
                 )
 
         scheduled_time = getattr(data, "scheduled_time", None)
-        schedule_metadata: dict = {}
+        schedule_metadata = None
 
         if getattr(data, "schedule_mode", None) == "smart" and smart_schedule:
             schedule_metadata = {p: dt.isoformat() for p, dt in smart_schedule.items()}
@@ -2090,7 +2061,7 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
                 schedule_mode, put_reserved, aic_reserved, schedule_metadata,
                 user_preferences
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15::jsonb, $16::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15, $16)
         """,
             upload_id, user["id"], r2_key, data.filename, data.file_size,
             data.platforms, data.title, data.caption, data.hashtags,
@@ -3696,7 +3667,7 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
     plan = get_plan(user.get("subscription_tier", "free"))
     if not plan.get("excel"): raise HTTPException(403, "Excel export requires Studio+ plan")
     
-    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    minutes = {"7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
@@ -3720,7 +3691,8 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
 
 # ============================================================
 # Admin Endpoints
-# ========================================@app.get("/api/analytics/overview")
+# ========================================
+@app.get("/api/analytics/overview")
 async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = Depends(get_current_user)):
     """High-level KPI summary for analytics dashboard."""
     since = _now_utc() - timedelta(days=days)
@@ -3796,6 +3768,81 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
     }
 
 
+
+
+# ============================================================
+# Admin Analytics Overview (Account Management page)
+# Supports: ?range=7d|30d|90d|6m|1y|Nd and ?days=N (compat)
+# ============================================================
+
+def _parse_range_to_days(range_str: str | None, days: int | None) -> int:
+    """Return lookback days (guarded)."""
+    if days is not None:
+        return max(1, min(int(days), 3650))
+    r = (range_str or '30d').strip().lower()
+    presets = {'7d': 7, '30d': 30, '90d': 90, '6m': 182, '1y': 365}
+    if r in presets:
+        return presets[r]
+    m = re.match(r'^(\d{1,4})d$', r)
+    if m:
+        return max(1, min(int(m.group(1)), 3650))
+    return 30
+
+@app.get('/api/admin/analytics/overview')
+async def admin_analytics_overview(
+    range: str = '30d',
+    days: int | None = None,
+    user: dict = Depends(get_current_user),
+):
+    """Admin-only KPI snapshot for Account Management analytics tab."""
+    if user.get('role') not in ('admin', 'master_admin'):
+        raise HTTPException(status_code=403, detail='Admin access required')
+
+    lookback_days = _parse_range_to_days(range, days)
+    since = _now_utc() - timedelta(days=lookback_days)
+
+    paid_tiers = ('launch', 'creator_pro', 'studio', 'agency', 'friends_family')
+
+    # If you later want Stripe-truth MRR, swap this mapping to a DB lookup.
+    tier_prices = {
+        'launch': 19,
+        'creator_pro': 49,
+        'studio': 99,
+        'agency': 199,
+        'friends_family': 0,
+        'free': 0,
+    }
+
+    async with db_pool.acquire() as conn:
+        u = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*)::int AS total_users,
+                SUM(CASE WHEN created_at >= $1 THEN 1 ELSE 0 END)::int AS new_users,
+                SUM(CASE WHEN subscription_tier = ANY($2::text[]) THEN 1 ELSE 0 END)::int AS paid_users
+            FROM users
+            """,
+            since,
+            list(paid_tiers),
+        )
+
+        # MRR estimate based on users.subscription_tier snapshot.
+        rows = await conn.fetch(
+            """SELECT subscription_tier, COUNT(*)::int AS c FROM users GROUP BY subscription_tier"""
+        )
+        mrr = 0
+        for r in rows:
+            tier = (r['subscription_tier'] or 'free')
+            mrr += int(r['c']) * int(tier_prices.get(tier, 0))
+
+    return {
+        'range': f'{lookback_days}d',
+        'total_users': (u['total_users'] if u else 0),
+        'new_users': (u['new_users'] if u else 0),
+        'new_users_30d': (u['new_users'] if u else 0),  # compatibility
+        'paid_users': (u['paid_users'] if u else 0),
+        'mrr_estimate': int(mrr),
+    }
 @app.get("/api/analytics/export")
 async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Query("csv"), user: dict = Depends(get_current_user)):
     """Export analytics for the last N days as CSV (default) or JSON."""
@@ -4209,7 +4256,7 @@ async def get_announcements(limit: int = 20, user: dict = Depends(require_admin)
 # ============================================================
 @app.get("/api/admin/kpi/overview")
 async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
-    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    minutes = {"7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
@@ -4238,94 +4285,6 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
         "revenue": {"total": float(revenue["total"]) if revenue else 0, "subscriptions": float(revenue["subscriptions"]) if revenue else 0, "topups": float(revenue["topups"]) if revenue else 0, "mrr": mrr},
         "tiers": {t["subscription_tier"]: t["count"] for t in tiers},
     }
-@app.get("/api/admin/analytics/overview")
-async def admin_analytics_overview(
-    range: Optional[str] = Query(None, description="Time window: 7d|30d|90d|6m|1y|Nd (custom)"),
-    days: Optional[int] = Query(None, ge=1, le=3650, description="Compatibility: days=N"),
-    user: dict = Depends(require_admin),
-):
-    """
-    Admin analytics overview for the selected time window.
-
-    Contract (frontend expects):
-      - total_users
-      - new_users
-      - paid_users
-      - mrr_estimate
-      - range
-
-    Supports:
-      - ?range=7d|30d|90d|6m|1y
-      - ?range=45d (custom, guarded 1–3650)
-      - ?days=45 (compat)
-    """
-    # -------- range parsing (authoritative) --------
-    preset_map = {"7d": 7, "30d": 30, "90d": 90, "6m": 180, "1y": 365}
-    window_days = None
-
-    if days is not None:
-        window_days = int(days)
-
-    if range:
-        r = str(range).strip().lower()
-        if r in preset_map:
-            window_days = preset_map[r]
-        else:
-            m = re.match(r"^(\d{1,4})d$", r)
-            if m:
-                window_days = int(m.group(1))
-            else:
-                raise HTTPException(status_code=400, detail="Invalid range. Use 7d|30d|90d|6m|1y or Nd (e.g. 45d).")
-
-    if window_days is None:
-        window_days = 30
-
-    if window_days < 1 or window_days > 3650:
-        raise HTTPException(status_code=400, detail="Range out of bounds. Use 1–3650 days.")
-
-    since = _now_utc() - timedelta(days=window_days)
-
-    # -------- KPI aggregation --------
-    # We intentionally avoid a dependency on a billing_events table (not guaranteed to exist).
-    # Instead, derive paid_users + mrr_estimate from users.subscription_tier + users.subscription_status.
-    paid_tiers = ["launch", "creator_pro", "studio", "agency"]
-
-    async with db_pool.acquire() as conn:
-        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
-
-        new_users = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE created_at >= $1",
-            since,
-        )
-
-        paid_rows = await conn.fetch(
-            """
-            SELECT subscription_tier, COUNT(*)::bigint AS c
-            FROM users
-            WHERE subscription_status = 'active'
-              AND subscription_tier = ANY($1::text[])
-            GROUP BY subscription_tier
-            """,
-            paid_tiers,
-        )
-
-    counts = {row["subscription_tier"]: int(row["c"]) for row in paid_rows}
-    paid_users = sum(counts.values())
-
-    # MRR estimate based on PLAN_CONFIG prices
-    mrr_estimate = 0.0
-    for tier, c in counts.items():
-        price = float(get_plan(tier).get("price", 0) or 0)
-        mrr_estimate += price * c
-
-    return {
-        "total_users": int(total_users or 0),
-        "new_users": int(new_users or 0),
-        "paid_users": int(paid_users or 0),
-        "mrr_estimate": float(mrr_estimate),
-        "range": f"{window_days}d",
-    }
-
 
 @app.get("/api/admin/kpi/margins")
 async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
@@ -4481,36 +4440,6 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
 # ============================================================
 # ADDITIONAL KPI ENDPOINTS (Added for frontend compatibility)
 # ============================================================
-
-# ------------------------------------------------------------
-# Time range parsing (supports presets + custom 'Nd')
-# ------------------------------------------------------------
-_RANGE_PRESETS_MINUTES = {
-    "24h": 24 * 60,
-    "7d": 7 * 24 * 60,
-    "30d": 30 * 24 * 60,
-    "90d": 90 * 24 * 60,
-    "6m": 180 * 24 * 60,
-    "1y": 365 * 24 * 60,
-}
-
-def _range_to_minutes(range_str: str | None, default_minutes: int) -> int:
-    r = (range_str or "").strip()
-    if not r:
-        return default_minutes
-    if r in _RANGE_PRESETS_MINUTES:
-        return _RANGE_PRESETS_MINUTES[r]
-    m = re.fullmatch(r"(\d{1,4})d", r)
-    if m:
-        days = int(m.group(1))
-        # Guardrails: 1 day .. 10 years
-        days = max(1, min(days, 3650))
-        return days * 24 * 60
-    return default_minutes
-
-def _range_label(range_str: str | None, fallback: str = "30d") -> str:
-    r = (range_str or "").strip()
-    return r if r else fallback
 
 @app.get("/api/admin/kpis")
 async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):

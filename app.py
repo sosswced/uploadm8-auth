@@ -3667,7 +3667,7 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
     plan = get_plan(user.get("subscription_tier", "free"))
     if not plan.get("excel"): raise HTTPException(403, "Excel export requires Studio+ plan")
     
-    minutes = {"7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
@@ -4180,7 +4180,7 @@ async def get_announcements(limit: int = 20, user: dict = Depends(require_admin)
 # ============================================================
 @app.get("/api/admin/kpi/overview")
 async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
-    minutes = {"7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
@@ -4209,6 +4209,53 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
         "revenue": {"total": float(revenue["total"]) if revenue else 0, "subscriptions": float(revenue["subscriptions"]) if revenue else 0, "topups": float(revenue["topups"]) if revenue else 0, "mrr": mrr},
         "tiers": {t["subscription_tier"]: t["count"] for t in tiers},
     }
+@app.get("/api/admin/analytics/overview")
+async def admin_analytics_overview(
+    range: str = "30d",
+    days: int | None = None,
+    user: dict = Depends(require_admin),
+):
+    """
+    Backward-compatible analytics summary for Account Management page.
+    Supports:
+    - ?range=30d (presets + custom 'Nd')
+    - ?days=45 (custom day count)
+    """
+    if days is not None:
+        # Guardrails: 1 day .. 10 years
+        d = max(1, min(int(days), 3650))
+        minutes = d * 24 * 60
+        range_label = f"{d}d"
+    else:
+        minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+        range_label = _range_label(range, fallback="30d")
+
+    since = _now_utc() - timedelta(minutes=minutes)
+
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*)::int FROM users")
+        new_users = await conn.fetchval("SELECT COUNT(*)::int FROM users WHERE created_at >= $1", since)
+        paid_users = await conn.fetchval("""
+            SELECT COUNT(*)::int
+            FROM users
+            WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family')
+        """)
+
+        # Conservative estimate: sum of subscription payments in window
+        mrr_estimate = await conn.fetchval("""
+            SELECT COALESCE(SUM(amount), 0)::decimal
+            FROM billing_events
+            WHERE source = 'subscription' AND created_at >= $1
+        """, since)
+
+    return {
+        "range": range_label,
+        "total_users": total_users,
+        "new_users": new_users,
+        "paid_users": paid_users,
+        "mrr_estimate": float(mrr_estimate or 0),
+    }
+
 
 @app.get("/api/admin/kpi/margins")
 async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
@@ -4364,6 +4411,36 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
 # ============================================================
 # ADDITIONAL KPI ENDPOINTS (Added for frontend compatibility)
 # ============================================================
+
+# ------------------------------------------------------------
+# Time range parsing (supports presets + custom 'Nd')
+# ------------------------------------------------------------
+_RANGE_PRESETS_MINUTES = {
+    "24h": 24 * 60,
+    "7d": 7 * 24 * 60,
+    "30d": 30 * 24 * 60,
+    "90d": 90 * 24 * 60,
+    "6m": 180 * 24 * 60,
+    "1y": 365 * 24 * 60,
+}
+
+def _range_to_minutes(range_str: str | None, default_minutes: int) -> int:
+    r = (range_str or "").strip()
+    if not r:
+        return default_minutes
+    if r in _RANGE_PRESETS_MINUTES:
+        return _RANGE_PRESETS_MINUTES[r]
+    m = re.fullmatch(r"(\d{1,4})d", r)
+    if m:
+        days = int(m.group(1))
+        # Guardrails: 1 day .. 10 years
+        days = max(1, min(days, 3650))
+        return days * 24 * 60
+    return default_minutes
+
+def _range_label(range_str: str | None, fallback: str = "30d") -> str:
+    r = (range_str or "").strip()
+    return r if r else fallback
 
 @app.get("/api/admin/kpis")
 async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):

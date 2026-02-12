@@ -14,26 +14,29 @@ import csv
 import io
 import json
 
-
-# =========================
-# JSON helpers (DB-drift safe)
-# =========================
-
+# ---------------------------------------------------------------------------
+# JSON helpers (DB may store JSONB or TEXT; normalize to python objects)
+# ---------------------------------------------------------------------------
 def _safe_json(v, default):
-    """Best-effort JSON parsing for values that may be stored as TEXT or JSONB."""
+    """Return parsed JSON if v is a JSON string; passthrough for list/dict; fallback to default."""
     if v is None:
         return default
     if isinstance(v, (list, dict)):
         return v
     if isinstance(v, str):
-        s = v.strip()
-        if not s:
-            return default
         try:
-            return json.loads(s)
+            return json.loads(v)
         except Exception:
             return default
     return default
+
+def _json_dumps(v):
+    """Serialize list/dict to JSON string for TEXT columns; pass strings through."""
+    if v is None:
+        return None
+    if isinstance(v, (list, dict)):
+        return json.dumps(v, separators=(",", ":"))
+    return v
 import secrets
 import hashlib
 import base64
@@ -2154,18 +2157,22 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
         # Fetch preferences again (in case they changed)
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
 
+        # Some schemas may not have updated_at; be resilient.
         try:
             await conn.execute(
                 "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
-                upload_id
+                upload_id,
             )
         except Exception as e:
-            # DB schema drift safe: older deployments may not have uploads.updated_at
-            import asyncpg
-            if isinstance(e, asyncpg.exceptions.UndefinedColumnError):
-                await conn.execute("UPDATE uploads SET status = 'queued' WHERE id = $1", upload_id)
+            # asyncpg UndefinedColumnError has attribute sqlstate, but avoid tight coupling.
+            if "UndefinedColumnError" in e.__class__.__name__ or "does not exist" in str(e):
+                await conn.execute(
+                    "UPDATE uploads SET status = 'queued' WHERE id = $1",
+                    upload_id,
+                )
             else:
                 raise
+
 
     plan = get_plan(user.get("subscription_tier", "free"))
 
@@ -2201,100 +2208,10 @@ async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
         if upload["status"] in ("completed", "cancelled", "failed"):
             raise HTTPException(400, "Cannot cancel this upload")
         
-        try:
-            await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1", upload_id)
-        except Exception as e:
-            if getattr(getattr(__import__('asyncpg'), 'exceptions', None), 'UndefinedColumnError', None) and isinstance(e, __import__('asyncpg').exceptions.UndefinedColumnError):
-                await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled' WHERE id = $1", upload_id)
-            else:
-                raise
+        await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1", upload_id)
         # Refund reserved tokens
         await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
     return {"status": "cancelled"}
-
-
-@app.get("/api/uploads/{upload_id}")
-async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user)):
-    """Detail view for queue modal / view button. DB-drift safe JSON parsing."""
-    async with db_pool.acquire() as conn:
-        # Attempt full select (includes updated_at) then fall back if schema drift
-        sql_full = """
-            SELECT
-                id, user_id, r2_key, filename, file_size, platforms,
-                title, caption, hashtags, privacy, status, cancel_requested,
-                scheduled_time, schedule_mode,
-                processing_started_at, processing_finished_at, completed_at,
-                error_code, error_detail,
-                put_reserved, put_spent, aic_reserved, aic_spent,
-                views, likes, comments, shares,
-                thumbnail_r2_key, video_url, platform_results,
-                created_at, updated_at, duration
-            FROM uploads
-            WHERE id = $1 AND user_id = $2
-        """
-        sql_fallback = """
-            SELECT
-                id, user_id, r2_key, filename, file_size, platforms,
-                title, caption, hashtags, privacy, status, cancel_requested,
-                scheduled_time, schedule_mode,
-                processing_started_at, processing_finished_at, completed_at,
-                error_code, error_detail,
-                put_reserved, put_spent, aic_reserved, aic_spent,
-                views, likes, comments, shares,
-                thumbnail_r2_key, video_url, platform_results,
-                created_at, duration
-            FROM uploads
-            WHERE id = $1 AND user_id = $2
-        """
-        try:
-            row = await conn.fetchrow(sql_full, upload_id, user["id"])
-        except Exception as e:
-            if getattr(getattr(__import__('asyncpg'), 'exceptions', None), 'UndefinedColumnError', None) and isinstance(e, __import__('asyncpg').exceptions.UndefinedColumnError):
-                row = await conn.fetchrow(sql_fallback, upload_id, user["id"])
-            else:
-                raise
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Upload not found")
-
-        def _dt(v):
-            return v.isoformat() if v else None
-
-        return {
-            "id": str(row["id"]),
-            "userId": str(row["user_id"]),
-            "r2Key": row.get("r2_key"),
-            "filename": row.get("filename"),
-            "fileSize": row.get("file_size"),
-            "platforms": _safe_json(row.get("platforms"), []),
-            "title": row.get("title"),
-            "caption": row.get("caption"),
-            "hashtags": _safe_json(row.get("hashtags"), []),
-            "privacy": row.get("privacy"),
-            "status": row.get("status"),
-            "cancelRequested": bool(row.get("cancel_requested")),
-            "scheduledTime": _dt(row.get("scheduled_time")),
-            "scheduleMode": row.get("schedule_mode"),
-            "processingStartedAt": _dt(row.get("processing_started_at")),
-            "processingFinishedAt": _dt(row.get("processing_finished_at")),
-            "completedAt": _dt(row.get("completed_at")),
-            "errorCode": row.get("error_code"),
-            "errorDetail": row.get("error_detail"),
-            "putReserved": row.get("put_reserved"),
-            "putSpent": row.get("put_spent"),
-            "aicReserved": row.get("aic_reserved"),
-            "aicSpent": row.get("aic_spent"),
-            "views": row.get("views"),
-            "likes": row.get("likes"),
-            "comments": row.get("comments"),
-            "shares": row.get("shares"),
-            "thumbnailR2Key": row.get("thumbnail_r2_key"),
-            "videoUrl": row.get("video_url"),
-            "platformResults": _safe_json(row.get("platform_results"), {}),
-            "createdAt": _dt(row.get("created_at")),
-            "updatedAt": _dt(row.get("updated_at")) if "updated_at" in row.keys() else None,
-            "duration": row.get("duration"),
-        }
 
 
 @app.get("/api/uploads")
@@ -2915,74 +2832,29 @@ async def save_user_preferences(
 
     # defaults / coercions (frontend may send strings from text inputs)
     def _coerce_hashtag_list(v):
-        """Normalize hashtag input into a de-duped list of clean tag strings.
-
-        Accepts:
-        - list[str] from frontend
-        - comma-separated str ("tag1, tag2")
-        - JSON-encoded list string ("["tag1", "tag2"]")
-        - JSON-encoded string (""tag1"")
-        """
-
-        def _clean(x: str) -> str:
-            x = (x or "").strip().lower()
-            if x.startswith("#"):
-                x = x[1:]
-            x = x.replace(" ", "")
-            return x
-
-        def _push(out, item):
-            if not isinstance(item, str):
-                return
-            c = _clean(item)
-            if c and len(c) < 50:
-                out.append(c)
-
+        """Normalize hashtag input to flat list of strings"""
         if v is None:
             return []
-
-        # If a JSON string came in, decode first
-        if isinstance(v, str):
-            s = v.strip()
-            if not s:
-                return []
-            if s.startswith("[") or s.startswith("{") or s.startswith('"'):
-                try:
-                    decoded = json.loads(s)
-                    v = decoded
-                except Exception:
-                    # fall back to comma-split parsing
-                    pass
-
-        out = []
-
         if isinstance(v, list):
+            # Simple flatten - just convert each item to string and filter
+            result = []
             for item in v:
-                # handle list elements that are themselves JSON list strings
-                if isinstance(item, str) and item.strip().startswith("["):
-                    try:
-                        decoded = json.loads(item)
-                        if isinstance(decoded, list):
-                            for sub in decoded:
-                                _push(out, sub)
-                            continue
-                    except Exception:
-                        pass
-                _push(out, item)
-        elif isinstance(v, str):
-            for part in v.split(","):
-                _push(out, part)
-        else:
-            return []
-
-        # de-dupe while preserving order
-        seen = set()
-        deduped = []
-        for t in out:
-            if t not in seen:
-                deduped.append(t)
-                seen.add(t)
-        return deduped
+                if isinstance(item, str) and item and not item.startswith('[') and not item.startswith('"'):
+                    # Only add if it's a simple string, not JSON garbage
+                    clean = item.strip().lower().replace('#', '')
+                    if clean and len(clean) < 50:  # Reasonable hashtag length
+                        result.append(clean)
+            return result
+        if isinstance(v, str):
+            # Simple comma-separated string
+            s = v.strip()
+            if not s or s.startswith('[') or s.startswith('"'):
+                # Looks like JSON garbage, ignore it
+                return []
+            # Normal comma-separated
+            parts = [p.strip().lower().replace('#', '') for p in s.split(',')]
+            return [p for p in parts if p and len(p) < 50]
+        return []
 
     def _coerce_platform_map(v):
         default_map = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
@@ -3138,9 +3010,9 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
             "ai_hashtag_style": prefs_row["ai_hashtag_style"],
             "hashtag_position": prefs_row["hashtag_position"],
             "max_hashtags": prefs_row["max_hashtags"],
-            "always_hashtags": _safe_json(prefs_row["always_hashtags"], []),
-            "blocked_hashtags": _safe_json(prefs_row["blocked_hashtags"], []),
-            "platform_hashtags": _safe_json(prefs_row["platform_hashtags"], {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}),
+            "always_hashtags": prefs_row["always_hashtags"] or [],
+            "blocked_hashtags": prefs_row["blocked_hashtags"] or [],
+            "platform_hashtags": prefs_row["platform_hashtags"] or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "email_notifications": prefs_row["email_notifications"],
             "discord_webhook": prefs_row["discord_webhook"]
         }
@@ -5229,3 +5101,124 @@ async def generate_trill_preview(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
+# ============================================================================
+# Upload Details Endpoint (queue modal)
+# Resilient to DB schema drift (missing columns) and normalizes JSON fields.
+# ============================================================================
+
+_UPLOADS_COLS_CACHE = {"loaded_at": None, "cols": set()}
+
+async def _get_uploads_columns(conn):
+    # Cache for the process lifetime; schema changes require restart anyway.
+    if _UPLOADS_COLS_CACHE["cols"]:
+        return _UPLOADS_COLS_CACHE["cols"]
+    rows = await conn.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'uploads'
+        """
+    )
+    cols = {r["column_name"] for r in rows}
+    _UPLOADS_COLS_CACHE["cols"] = cols
+    _UPLOADS_COLS_CACHE["loaded_at"] = datetime.utcnow().isoformat()
+    return cols
+
+def _sel(col, cols, cast=None):
+    # Build a SELECT expression that always returns a field named `col`.
+    if col in cols:
+        return col
+    if cast:
+        return f"NULL::{cast} AS {col}"
+    return f"NULL AS {col}"
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user)):
+    """Return detailed upload info for queue modal; tolerates missing columns."""
+    async with db_pool.acquire() as conn:
+        cols = await _get_uploads_columns(conn)
+
+        select_list = ",\n                ".join([
+            _sel("id", cols, "uuid"),
+            _sel("user_id", cols, "uuid"),
+            _sel("r2_key", cols, "text"),
+            _sel("filename", cols, "text"),
+            _sel("file_size", cols, "bigint"),
+            _sel("platforms", cols, "jsonb"),
+            _sel("title", cols, "text"),
+            _sel("caption", cols, "text"),
+            _sel("hashtags", cols, "jsonb"),
+            _sel("privacy", cols, "text"),
+            _sel("status", cols, "text"),
+            _sel("cancel_requested", cols, "boolean"),
+            _sel("scheduled_time", cols, "timestamptz"),
+            _sel("schedule_mode", cols, "text"),
+            _sel("processing_started_at", cols, "timestamptz"),
+            _sel("processing_finished_at", cols, "timestamptz"),
+            _sel("completed_at", cols, "timestamptz"),
+            _sel("error_code", cols, "text"),
+            _sel("error_detail", cols, "text"),
+            _sel("put_reserved", cols, "numeric"),
+            _sel("put_spent", cols, "numeric"),
+            _sel("aic_reserved", cols, "numeric"),
+            _sel("aic_spent", cols, "numeric"),
+            _sel("views", cols, "integer"),
+            _sel("likes", cols, "integer"),
+            _sel("comments", cols, "integer"),
+            _sel("shares", cols, "integer"),
+            _sel("thumbnail_r2_key", cols, "text"),
+            _sel("video_url", cols, "text"),
+            _sel("platform_results", cols, "jsonb"),
+            _sel("created_at", cols, "timestamptz"),
+            _sel("updated_at", cols, "timestamptz"),
+            _sel("duration", cols, "numeric"),
+        ])
+
+        sql = f"""
+            SELECT
+                {select_list}
+            FROM uploads
+            WHERE id = $1 AND user_id = $2
+        """
+
+        row = await conn.fetchrow(sql, upload_id, user["id"])
+        if not row:
+            raise HTTPException(status_code=404, detail="Upload not found")
+
+        return {
+            "id": str(row["id"]) if row["id"] else str(upload_id),
+            "userId": str(row["user_id"]) if row["user_id"] else str(user["id"]),
+            "r2Key": row["r2_key"],
+            "filename": row["filename"],
+            "fileSize": row["file_size"],
+            "platforms": _safe_json(row["platforms"], []),
+            "title": row["title"],
+            "caption": row["caption"],
+            "hashtags": _safe_json(row["hashtags"], []),
+            "privacy": row["privacy"],
+            "status": row["status"],
+            "cancelRequested": bool(row["cancel_requested"]) if row["cancel_requested"] is not None else False,
+            "scheduledTime": row["scheduled_time"].isoformat() if row["scheduled_time"] else None,
+            "scheduleMode": row["schedule_mode"],
+            "processingStartedAt": row["processing_started_at"].isoformat() if row["processing_started_at"] else None,
+            "processingFinishedAt": row["processing_finished_at"].isoformat() if row["processing_finished_at"] else None,
+            "completedAt": row["completed_at"].isoformat() if row["completed_at"] else None,
+            "errorCode": row["error_code"],
+            "errorDetail": row["error_detail"],
+            "putReserved": row["put_reserved"],
+            "putSpent": row["put_spent"],
+            "aicReserved": row["aic_reserved"],
+            "aicSpent": row["aic_spent"],
+            "views": row["views"] or 0,
+            "likes": row["likes"] or 0,
+            "comments": row["comments"] or 0,
+            "shares": row["shares"] or 0,
+            "thumbnailR2Key": row["thumbnail_r2_key"],
+            "videoUrl": row["video_url"],
+            "platformResults": _safe_json(row["platform_results"], {}),
+            "createdAt": row["created_at"].isoformat() if row["created_at"] else None,
+            "updatedAt": row["updated_at"].isoformat() if row["updated_at"] else None,
+            "duration": float(row["duration"]) if row["duration"] is not None else None,
+        }

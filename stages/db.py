@@ -19,28 +19,41 @@ async def load_upload_record(pool: asyncpg.Pool, upload_id: str) -> Optional[dic
     """Load upload record from database."""
     if not pool:
         return None
-    
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT id, user_id, r2_key, telemetry_r2_key, processed_r2_key,
                    filename, file_size, platforms, title, caption, hashtags, privacy,
-                   ai_generated_title, ai_generated_caption, ai_generated_hashtags, platform_hashtags,
-                   status, scheduled_time, schedule_mode, cancel_requested,
+                   ai_generated_title, ai_generated_caption, ai_generated_hashtags,
+                   status, scheduled_time, schedule_mode,
+                   schedule_metadata,
                    created_at, updated_at
             FROM uploads WHERE id = $1
         """, upload_id)
-        
+
         if not row:
             return None
-        
-        return dict(row)
+
+        rec = dict(row)
+
+        # Optional convenience: expose platform hashtag map if present inside schedule_metadata
+        sched = rec.get("schedule_metadata") or {}
+        if isinstance(sched, str):
+            try:
+                sched = json.loads(sched)
+            except Exception:
+                sched = {}
+
+        rec["schedule_metadata"] = sched
+        rec["platform_hashtags_map"] = (sched.get("platform_hashtags") or {}) if isinstance(sched, dict) else {}
+        return rec
 
 
 async def load_user(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
     """Load user record from database."""
     if not pool:
         return None
-    
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT id, email, name, role, subscription_tier, upload_quota,
@@ -48,33 +61,28 @@ async def load_user(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
                    current_period_end, created_at
             FROM users WHERE id::text = $1
         """, user_id)
-        
+
         if not row:
             return None
-        
+
         return dict(row)
 
 
 async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
     """
     Load user settings and preferences from database.
-    
-    This combines data from both user_settings and user_preferences tables
-    to provide a complete settings dictionary for the worker.
     """
     if not pool:
         return {}
-    
+
     async with pool.acquire() as conn:
-        # Load from user_settings (legacy HUD/telemetry settings)
         settings_row = await conn.fetchrow("""
             SELECT discord_webhook, telemetry_enabled, hud_enabled, hud_position,
                    speeding_mph, euphoria_mph, hud_speed_unit, hud_color,
                    hud_font_family, hud_font_size, selected_page_id
             FROM user_settings WHERE user_id::text = $1
         """, user_id)
-        
-        # Load from user_preferences (caption/hashtag/AI settings)
+
         prefs_row = await conn.fetchrow("""
             SELECT auto_captions, auto_thumbnails, thumbnail_interval,
                    ai_hashtags_enabled, ai_hashtag_count, ai_hashtag_style,
@@ -84,11 +92,9 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                    trill_ai_enhance, trill_openai_model
             FROM user_preferences WHERE user_id::text = $1
         """, user_id)
-        
-        # Build combined settings dict
+
         settings = {}
-        
-        # Add user_settings data (HUD/telemetry)
+
         if settings_row:
             settings.update({
                 "discord_webhook": settings_row.get("discord_webhook"),
@@ -104,7 +110,6 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                 "selected_page_id": settings_row.get("selected_page_id"),
             })
         else:
-            # Defaults for user_settings
             settings.update({
                 "telemetry_enabled": True,
                 "hud_enabled": True,
@@ -116,33 +121,30 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                 "hud_font_family": "Arial",
                 "hud_font_size": 24,
             })
-        
-        # Add user_preferences data (AI/captions/hashtags)
+
         if prefs_row:
-            # Parse JSONB fields
             always_hashtags = prefs_row.get("always_hashtags", [])
             blocked_hashtags = prefs_row.get("blocked_hashtags", [])
             platform_hashtags = prefs_row.get("platform_hashtags", {})
-            
-            # Handle JSONB parsing if needed (some drivers return as strings)
+
             if isinstance(always_hashtags, str):
                 try:
                     always_hashtags = json.loads(always_hashtags)
-                except:
+                except Exception:
                     always_hashtags = []
-            
+
             if isinstance(blocked_hashtags, str):
                 try:
                     blocked_hashtags = json.loads(blocked_hashtags)
-                except:
+                except Exception:
                     blocked_hashtags = []
-            
+
             if isinstance(platform_hashtags, str):
                 try:
                     platform_hashtags = json.loads(platform_hashtags)
-                except:
+                except Exception:
                     platform_hashtags = {}
-            
+
             settings.update({
                 "auto_captions": prefs_row.get("auto_captions", False),
                 "auto_thumbnails": prefs_row.get("auto_thumbnails", False),
@@ -162,7 +164,6 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                 "trill_openai_model": prefs_row.get("trill_openai_model", "gpt-4o-mini"),
             })
         else:
-            # Defaults for user_preferences
             settings.update({
                 "auto_captions": False,
                 "auto_thumbnails": False,
@@ -181,14 +182,13 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                 "trill_ai_enhance": False,
                 "trill_openai_model": "gpt-4o-mini",
             })
-        
-        # Add legacy aliases for backward compatibility
+
         settings["auto_generate_captions"] = settings["auto_captions"]
         settings["auto_generate_hashtags"] = settings["ai_hashtags_enabled"]
         settings["auto_generate_thumbnails"] = settings["auto_thumbnails"]
         settings["ffmpeg_screenshot_interval"] = settings["thumbnail_interval"]
         settings["default_hashtag_count"] = settings["ai_hashtag_count"]
-        
+
         return settings
 
 
@@ -196,29 +196,29 @@ async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> d
     """Load any custom entitlement overrides for user."""
     if not pool:
         return {}
-    
+
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT entitlement_key, entitlement_value, value_type
             FROM user_entitlements WHERE user_id::text = $1
         """, user_id)
-        
+
         overrides = {}
         for row in rows:
             key = row["entitlement_key"]
             value = row["entitlement_value"]
             vtype = row.get("value_type", "string")
-            
+
             if vtype == "bool":
                 overrides[key] = value.lower() in ("true", "1", "yes")
             elif vtype == "int":
                 try:
                     overrides[key] = int(value)
-                except:
+                except Exception:
                     pass
             else:
                 overrides[key] = value
-        
+
         return overrides
 
 
@@ -226,16 +226,16 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
     """Load encrypted platform token from database."""
     if not pool:
         return None
-    
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT token_blob FROM platform_tokens
             WHERE user_id::text = $1 AND platform = $2
         """, user_id, platform)
-        
+
         if not row:
             return None
-        
+
         return row["token_blob"]
 
 
@@ -243,13 +243,13 @@ async def load_all_platform_tokens(pool: asyncpg.Pool, user_id: str) -> Dict[str
     """Load all platform tokens for user."""
     if not pool:
         return {}
-    
+
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT platform, token_blob, account_name, account_username, account_avatar
             FROM platform_tokens WHERE user_id::text = $1
         """, user_id)
-        
+
         return {
             row["platform"]: {
                 "token_blob": row["token_blob"],
@@ -265,10 +265,10 @@ async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
     """Mark upload as processing started."""
     if not pool:
         return
-    
+
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE uploads SET 
+            UPDATE uploads SET
                 status = 'processing',
                 processing_started_at = $2,
                 updated_at = NOW()
@@ -280,12 +280,12 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
     """Mark upload as completed with results."""
     if not pool:
         return
-    
+
     status = "completed" if ctx.is_success() else "partial" if ctx.is_partial_success() else "failed"
-    
+
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE uploads SET 
+            UPDATE uploads SET
                 status = $2,
                 processed_r2_key = $3,
                 processing_finished_at = $4,
@@ -295,7 +295,7 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                 platform_results = $7,
                 updated_at = NOW()
             WHERE id = $1
-        """, 
+        """,
             ctx.upload_id,
             status,
             ctx.processed_r2_key,
@@ -310,10 +310,10 @@ async def mark_processing_failed(pool: asyncpg.Pool, ctx: JobContext, error_code
     """Mark upload as failed."""
     if not pool:
         return
-    
+
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE uploads SET 
+            UPDATE uploads SET
                 status = 'failed',
                 processing_finished_at = NOW(),
                 error_code = $2,
@@ -327,10 +327,10 @@ async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
     """Mark upload as cancelled."""
     if not pool:
         return
-    
+
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE uploads SET 
+            UPDATE uploads SET
                 status = 'cancelled',
                 processing_finished_at = NOW(),
                 updated_at = NOW()
@@ -339,26 +339,31 @@ async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
 
 
 async def check_cancel_requested(pool: asyncpg.Pool, upload_id: str) -> bool:
-    """Check if cancel has been requested for this upload."""
+    """
+    No cancel_requested column in schema.
+    Use status as control plane instead.
+    """
     if not pool:
         return False
-    
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT cancel_requested FROM uploads WHERE id = $1",
+            "SELECT status FROM uploads WHERE id = $1",
             upload_id
         )
-        return row["cancel_requested"] if row else False
+        if not row:
+            return False
+        return (row["status"] or "").lower() in ("cancel_requested", "cancelled")
 
 
 async def increment_upload_count(pool: asyncpg.Pool, user_id: str):
     """Increment user's monthly upload count."""
     if not pool:
         return
-    
+
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE users SET 
+            UPDATE users SET
                 uploads_this_month = uploads_this_month + 1,
                 last_active_at = NOW(),
                 updated_at = NOW()
@@ -370,7 +375,7 @@ async def save_job_state(pool: asyncpg.Pool, ctx: JobContext):
     """Save job state for resumability."""
     if not pool:
         return
-    
+
     state_json = json.dumps({
         "job_id": ctx.job_id,
         "state": ctx.state,
@@ -379,7 +384,7 @@ async def save_job_state(pool: asyncpg.Pool, ctx: JobContext):
         "output_artifacts": ctx.output_artifacts,
         "errors": ctx.errors,
     })
-    
+
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO job_state (upload_id, state_json, updated_at)
@@ -393,13 +398,13 @@ async def load_job_state(pool: asyncpg.Pool, upload_id: str) -> Optional[dict]:
     """Load saved job state for resumption."""
     if not pool:
         return None
-    
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT state_json FROM job_state WHERE upload_id = $1",
             upload_id
         )
-        
+
         if row and row["state_json"]:
             return json.loads(row["state_json"])
         return None
@@ -409,7 +414,7 @@ async def track_openai_cost(pool: asyncpg.Pool, user_id: str, operation: str, to
     """Track OpenAI API usage and cost."""
     if not pool:
         return
-    
+
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO cost_tracking (user_id, category, operation, tokens, cost_usd, created_at)
@@ -421,7 +426,7 @@ async def track_storage_usage(pool: asyncpg.Pool, user_id: str, bytes_used: int,
     """Track R2 storage usage."""
     if not pool:
         return
-    
+
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO storage_tracking (user_id, bytes_used, operation, created_at)
@@ -430,11 +435,12 @@ async def track_storage_usage(pool: asyncpg.Pool, user_id: str, bytes_used: int,
 
 
 async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
-    """Persist AI-generated metadata and per-platform hashtags.
+    """
+    Persist AI-generated metadata.
 
     Writes:
     - ai_generated_title/caption/hashtags
-    - platform_hashtags jsonb map
+    - schedule_metadata->platform_hashtags (jsonb map)
 
     Also backfills title/caption/hashtags only if the user did not provide overrides.
     """
@@ -448,6 +454,8 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
     platform_map = getattr(ctx, "platform_hashtags_map", None) or {}
     final_hashtags = getattr(ctx, "final_hashtags", None) or (gen_hashtags or getattr(ctx, "hashtags", None) or [])
 
+    platform_map_json = json.dumps(platform_map) if platform_map is not None else None
+
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -456,10 +464,13 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
                 ai_generated_title = COALESCE($2, ai_generated_title),
                 ai_generated_caption = COALESCE($3, ai_generated_caption),
                 ai_generated_hashtags = COALESCE($4::text[], ai_generated_hashtags),
-                platform_hashtags = CASE
-                    WHEN $5::jsonb IS NOT NULL THEN $5::jsonb
-                    ELSE platform_hashtags
+
+                schedule_metadata = CASE
+                    WHEN $5::jsonb IS NOT NULL THEN
+                        jsonb_set(COALESCE(schedule_metadata, '{}'::jsonb), '{platform_hashtags}', $5::jsonb, true)
+                    ELSE schedule_metadata
                 END,
+
                 metadata_generated_at = NOW(),
 
                 -- Only fill live fields if user did not provide them
@@ -485,6 +496,6 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
             gen_title,
             gen_caption,
             gen_hashtags,
-            __import__('json').dumps(platform_map) if platform_map is not None else None,
+            platform_map_json,
             final_hashtags if final_hashtags else None,
         )

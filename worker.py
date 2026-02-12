@@ -3,6 +3,7 @@ UploadM8 Worker Service - Complete Pipeline
 """
 
 import os
+import sys
 import json
 import asyncio
 import logging
@@ -43,18 +44,22 @@ db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[redis.Redis] = None
 shutdown_requested = False
 
+
 def handle_shutdown(signum, frame):
     global shutdown_requested
     logger.info(f"Shutdown signal received ({signum})")
     shutdown_requested = True
 
+
 async def check_cancelled(ctx: JobContext) -> bool:
-    if ctx.cancel_requested:
+    # ctx.cancel_requested may not exist depending on context builder
+    if bool(getattr(ctx, "cancel_requested", False)):
         return True
     cancelled = await db_stage.check_cancel_requested(db_pool, ctx.upload_id)
     if cancelled:
-        ctx.cancel_requested = True
+        setattr(ctx, "cancel_requested", True)
     return cancelled
+
 
 async def maybe_cancel(ctx: JobContext, stage: str):
     if await check_cancelled(ctx):
@@ -62,34 +67,34 @@ async def maybe_cancel(ctx: JobContext, stage: str):
         await db_stage.mark_cancelled(db_pool, ctx.upload_id)
         raise CancelRequested(ctx.upload_id)
 
+
 async def run_pipeline(job_data: dict) -> bool:
     upload_id = job_data.get("upload_id")
     user_id = job_data.get("user_id")
     job_id = job_data.get("job_id", "unknown")
     action = job_data.get("action") or "process"
-    
+
     logger.info(f"Starting pipeline: upload={upload_id}, job={job_id}, action={action}")
     ctx = None
     temp_dir = None
-    
+
     try:
-        # Load data
         upload_record = await db_stage.load_upload_record(db_pool, upload_id)
         user_record = await db_stage.load_user(db_pool, user_id)
         if not upload_record or not user_record:
             logger.error(f"Records not found: upload={upload_id}, user={user_id}")
             return False
-        
+
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
         entitlements = get_entitlements_from_user(user_record, overrides)
-        
+
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
         ctx.started_at = datetime.now(timezone.utc)
         ctx.state = "processing"
         await db_stage.mark_processing_started(db_pool, ctx)
         await maybe_cancel(ctx, "init")
-        
+
         # Download
         ctx.mark_stage("download")
         temp_dir = tempfile.TemporaryDirectory()
@@ -97,7 +102,7 @@ async def run_pipeline(job_data: dict) -> bool:
         video_local = ctx.temp_dir / ctx.filename
         await r2_stage.download_file(ctx.source_r2_key, video_local)
         ctx.local_video_path = video_local
-        
+
         if ctx.telemetry_r2_key:
             try:
                 telem_local = ctx.temp_dir / "telemetry.map"
@@ -105,19 +110,18 @@ async def run_pipeline(job_data: dict) -> bool:
                 ctx.local_telemetry_path = telem_local
             except Exception as e:
                 logger.warning(f"Telemetry download failed: {e}")
-        
+
         await maybe_cancel(ctx, "download")
-        
-        # Transcode - Convert video to platform-specific formats
+
+        # Transcode
         try:
             ctx = await run_transcode_stage(ctx)
         except SkipStage as e:
             logger.info(f"Transcode skipped: {e.reason}")
         except StageError as e:
             logger.warning(f"Transcode error: {e.message}")
-            # Continue anyway - some platforms might still work with original
         await maybe_cancel(ctx, "transcode")
-        
+
         # Telemetry
         try:
             ctx = await run_telemetry_stage(ctx)
@@ -126,7 +130,7 @@ async def run_pipeline(job_data: dict) -> bool:
         except StageError as e:
             logger.warning(f"Telemetry error: {e.message}")
         await maybe_cancel(ctx, "telemetry")
-        
+
         # Thumbnail
         try:
             ctx = await run_thumbnail_stage(ctx)
@@ -135,18 +139,17 @@ async def run_pipeline(job_data: dict) -> bool:
         except StageError as e:
             logger.warning(f"Thumbnail error: {e.message}")
         await maybe_cancel(ctx, "thumbnail")
-        
+
         # Caption
         try:
             ctx = await run_caption_stage(ctx)
-            # Persist generated metadata so UI/publish sees per-video results
             await db_stage.save_generated_metadata(db_pool, ctx)
         except SkipStage as e:
             logger.info(f"Caption skipped: {e.reason}")
         except StageError as e:
             logger.warning(f"Caption error: {e.message}")
         await maybe_cancel(ctx, "caption")
-        
+
         # HUD
         try:
             ctx = await run_hud_stage(ctx)
@@ -155,7 +158,7 @@ async def run_pipeline(job_data: dict) -> bool:
         except StageError as e:
             logger.warning(f"HUD error: {e.message}")
         await maybe_cancel(ctx, "hud")
-        
+
         # Watermark
         try:
             ctx = await run_watermark_stage(ctx)
@@ -164,7 +167,7 @@ async def run_pipeline(job_data: dict) -> bool:
         except StageError as e:
             logger.warning(f"Watermark error: {e.message}")
         await maybe_cancel(ctx, "watermark")
-        
+
         # Upload processed video
         ctx.mark_stage("upload")
         final_video = ctx.processed_video_path or ctx.local_video_path
@@ -174,7 +177,7 @@ async def run_pipeline(job_data: dict) -> bool:
             ctx.processed_r2_key = processed_key
             ctx.output_artifacts["processed_video"] = processed_key
         await maybe_cancel(ctx, "upload")
-        
+
         # Publish
         try:
             ctx = await run_publish_stage(ctx, db_pool)
@@ -182,24 +185,24 @@ async def run_pipeline(job_data: dict) -> bool:
             logger.error(f"Publish error: {e.message}")
             ctx.mark_error(e.code.value, e.message)
         await maybe_cancel(ctx, "publish")
-        
+
         # Notify
         try:
             ctx = await run_notify_stage(ctx)
         except Exception as e:
             logger.warning(f"Notify error: {e}")
-        
+
         # Complete
         ctx.finished_at = datetime.now(timezone.utc)
         ctx.state = "succeeded" if ctx.is_success() else "failed"
         await db_stage.mark_processing_completed(db_pool, ctx)
-        
+
         if ctx.is_success():
             await db_stage.increment_upload_count(db_pool, user_id)
-        
+
         logger.info(f"Pipeline complete: {ctx.state}, platforms={ctx.get_success_platforms()}")
         return ctx.is_success()
-        
+
     except CancelRequested:
         logger.info(f"Pipeline cancelled: {upload_id}")
         return False
@@ -214,56 +217,56 @@ async def run_pipeline(job_data: dict) -> bool:
         if temp_dir:
             try:
                 temp_dir.cleanup()
-            except:
+            except Exception:
                 pass
+
 
 async def process_jobs():
     global shutdown_requested
     logger.info("Worker started, waiting for jobs...")
     await notify_admin_worker_start()
-    
+
     while not shutdown_requested:
         try:
-            # Check priority queue first
             job_raw = await redis_client.brpop([PRIORITY_JOB_QUEUE, UPLOAD_JOB_QUEUE], timeout=int(POLL_INTERVAL))
-            
             if not job_raw:
                 continue
-            
+
             _, job_json = job_raw
             job_data = json.loads(job_json)
-            
+
             await run_pipeline(job_data)
-            
+
         except json.JSONDecodeError as e:
             logger.error(f"Invalid job JSON: {e}")
         except Exception as e:
             logger.exception(f"Job processing error: {e}")
             await asyncio.sleep(1)
-    
+
     logger.info("Worker shutting down...")
     await notify_admin_worker_stop()
 
+
 async def main():
     global db_pool, redis_client
-    
+
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
-    
+
     if not DATABASE_URL:
         logger.error("DATABASE_URL not set")
         sys.exit(1)
     if not REDIS_URL:
         logger.error("REDIS_URL not set")
         sys.exit(1)
-    
+
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
     logger.info("Database connected")
-    
+
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     await redis_client.ping()
     logger.info("Redis connected")
-    
+
     try:
         await process_jobs()
     finally:
@@ -272,6 +275,6 @@ async def main():
         if redis_client:
             await redis_client.close()
 
+
 if __name__ == "__main__":
-    import sys
     asyncio.run(main())

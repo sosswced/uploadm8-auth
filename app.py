@@ -14,11 +14,54 @@ import csv
 import io
 import json
 
+
 # ---------------------------------------------------------------------------
-# JSON helpers (DB may store JSONB or TEXT; normalize to python objects)
+# DB JSON CODECS (architectural cleanliness)
+# Forces asyncpg to decode json/jsonb into Python objects.
+# Keep _safe_json as a belt-and-suspenders fallback until schema is fully normalized.
 # ---------------------------------------------------------------------------
+async def _init_asyncpg_codecs(conn):
+    try:
+        await conn.set_type_codec(
+            'json',
+            encoder=lambda v: json.dumps(v, separators=(',', ':'), ensure_ascii=False),
+            decoder=json.loads,
+            schema='pg_catalog',
+        )
+    except Exception:
+        pass
+    try:
+        await conn.set_type_codec(
+            'jsonb',
+            encoder=lambda v: json.dumps(v, separators=(',', ':'), ensure_ascii=False),
+            decoder=json.loads,
+            schema='pg_catalog',
+        )
+    except Exception:
+        pass
+
+_UPLOADS_COLS = None
+
+async def _load_uploads_columns(pool):
+    """Cache uploads column set to avoid UndefinedColumnError when schema drifts."""
+    global _UPLOADS_COLS
+    if _UPLOADS_COLS is not None:
+        return _UPLOADS_COLS
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT column_name
+                 FROM information_schema.columns
+                 WHERE table_schema='public' AND table_name='uploads'"""
+        )
+        _UPLOADS_COLS = {r['column_name'] for r in rows}
+    return _UPLOADS_COLS
+
+def _pick_cols(wanted, available):
+    return [c for c in wanted if c in available]
+
+
 def _safe_json(v, default):
-    """Return parsed JSON if v is a JSON string; passthrough for list/dict; fallback to default."""
+    """Parse JSON stored as text OR already-parsed objects. Defensive until schema is fully jsonb."""
     if v is None:
         return default
     if isinstance(v, (list, dict)):
@@ -29,14 +72,6 @@ def _safe_json(v, default):
         except Exception:
             return default
     return default
-
-def _json_dumps(v):
-    """Serialize list/dict to JSON string for TEXT columns; pass strings through."""
-    if v is None:
-        return None
-    if isinstance(v, (list, dict)):
-        return json.dumps(v, separators=(",", ":"))
-    return v
 import secrets
 import hashlib
 import base64
@@ -772,7 +807,8 @@ async def lifespan(app: FastAPI):
     init_enc_keys()
     if STRIPE_SECRET_KEY: stripe.api_key = STRIPE_SECRET_KEY
     
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, init=_init_asyncpg_codecs)
+    await _load_uploads_columns(db_pool)
     logger.info("Database connected")
     
     await run_migrations()
@@ -2157,22 +2193,10 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
         # Fetch preferences again (in case they changed)
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
 
-        # Some schemas may not have updated_at; be resilient.
-        try:
-            await conn.execute(
-                "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
-                upload_id,
-            )
-        except Exception as e:
-            # asyncpg UndefinedColumnError has attribute sqlstate, but avoid tight coupling.
-            if "UndefinedColumnError" in e.__class__.__name__ or "does not exist" in str(e):
-                await conn.execute(
-                    "UPDATE uploads SET status = 'queued' WHERE id = $1",
-                    upload_id,
-                )
-            else:
-                raise
-
+        await conn.execute(
+            "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
+            upload_id
+        )
 
     plan = get_plan(user.get("subscription_tier", "free"))
 
@@ -5103,122 +5127,68 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
 
 
-# ============================================================================
-# Upload Details Endpoint (queue modal)
-# Resilient to DB schema drift (missing columns) and normalizes JSON fields.
-# ============================================================================
-
-_UPLOADS_COLS_CACHE = {"loaded_at": None, "cols": set()}
-
-async def _get_uploads_columns(conn):
-    # Cache for the process lifetime; schema changes require restart anyway.
-    if _UPLOADS_COLS_CACHE["cols"]:
-        return _UPLOADS_COLS_CACHE["cols"]
-    rows = await conn.fetch(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'uploads'
-        """
-    )
-    cols = {r["column_name"] for r in rows}
-    _UPLOADS_COLS_CACHE["cols"] = cols
-    _UPLOADS_COLS_CACHE["loaded_at"] = datetime.utcnow().isoformat()
-    return cols
-
-def _sel(col, cols, cast=None):
-    # Build a SELECT expression that always returns a field named `col`.
-    if col in cols:
-        return col
-    if cast:
-        return f"NULL::{cast} AS {col}"
-    return f"NULL AS {col}"
-
 @app.get("/api/uploads/{upload_id}")
 async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user)):
-    """Return detailed upload info for queue modal; tolerates missing columns."""
+    cols = await _load_uploads_columns(db_pool)
+    wanted = [
+        "id","user_id","r2_key","filename","file_size","platforms",
+        "title","caption","hashtags","privacy","status","cancel_requested",
+        "scheduled_time","schedule_mode",
+        "processing_started_at","processing_finished_at","completed_at",
+        "error_code","error_detail",
+        "put_reserved","put_spent","aic_reserved","aic_spent",
+        "views","likes","comments","shares",
+        "thumbnail_r2_key","video_url","platform_results",
+        "created_at","updated_at","duration",
+    ]
+    select_cols = _pick_cols(wanted, cols)
+    if not select_cols:
+        raise HTTPException(status_code=500, detail="Uploads table has no readable columns")
+
+    sql = f"""SELECT {', '.join(select_cols)} FROM uploads
+               WHERE id = $1 AND user_id = $2"""
+
     async with db_pool.acquire() as conn:
-        cols = await _get_uploads_columns(conn)
-
-        select_list = ",\n                ".join([
-            _sel("id", cols, "uuid"),
-            _sel("user_id", cols, "uuid"),
-            _sel("r2_key", cols, "text"),
-            _sel("filename", cols, "text"),
-            _sel("file_size", cols, "bigint"),
-            _sel("platforms", cols, "jsonb"),
-            _sel("title", cols, "text"),
-            _sel("caption", cols, "text"),
-            _sel("hashtags", cols, "jsonb"),
-            _sel("privacy", cols, "text"),
-            _sel("status", cols, "text"),
-            _sel("cancel_requested", cols, "boolean"),
-            _sel("scheduled_time", cols, "timestamptz"),
-            _sel("schedule_mode", cols, "text"),
-            _sel("processing_started_at", cols, "timestamptz"),
-            _sel("processing_finished_at", cols, "timestamptz"),
-            _sel("completed_at", cols, "timestamptz"),
-            _sel("error_code", cols, "text"),
-            _sel("error_detail", cols, "text"),
-            _sel("put_reserved", cols, "numeric"),
-            _sel("put_spent", cols, "numeric"),
-            _sel("aic_reserved", cols, "numeric"),
-            _sel("aic_spent", cols, "numeric"),
-            _sel("views", cols, "integer"),
-            _sel("likes", cols, "integer"),
-            _sel("comments", cols, "integer"),
-            _sel("shares", cols, "integer"),
-            _sel("thumbnail_r2_key", cols, "text"),
-            _sel("video_url", cols, "text"),
-            _sel("platform_results", cols, "jsonb"),
-            _sel("created_at", cols, "timestamptz"),
-            _sel("updated_at", cols, "timestamptz"),
-            _sel("duration", cols, "numeric"),
-        ])
-
-        sql = f"""
-            SELECT
-                {select_list}
-            FROM uploads
-            WHERE id = $1 AND user_id = $2
-        """
-
         row = await conn.fetchrow(sql, upload_id, user["id"])
-        if not row:
-            raise HTTPException(status_code=404, detail="Upload not found")
 
-        return {
-            "id": str(row["id"]) if row["id"] else str(upload_id),
-            "userId": str(row["user_id"]) if row["user_id"] else str(user["id"]),
-            "r2Key": row["r2_key"],
-            "filename": row["filename"],
-            "fileSize": row["file_size"],
-            "platforms": _safe_json(row["platforms"], []),
-            "title": row["title"],
-            "caption": row["caption"],
-            "hashtags": _safe_json(row["hashtags"], []),
-            "privacy": row["privacy"],
-            "status": row["status"],
-            "cancelRequested": bool(row["cancel_requested"]) if row["cancel_requested"] is not None else False,
-            "scheduledTime": row["scheduled_time"].isoformat() if row["scheduled_time"] else None,
-            "scheduleMode": row["schedule_mode"],
-            "processingStartedAt": row["processing_started_at"].isoformat() if row["processing_started_at"] else None,
-            "processingFinishedAt": row["processing_finished_at"].isoformat() if row["processing_finished_at"] else None,
-            "completedAt": row["completed_at"].isoformat() if row["completed_at"] else None,
-            "errorCode": row["error_code"],
-            "errorDetail": row["error_detail"],
-            "putReserved": row["put_reserved"],
-            "putSpent": row["put_spent"],
-            "aicReserved": row["aic_reserved"],
-            "aicSpent": row["aic_spent"],
-            "views": row["views"] or 0,
-            "likes": row["likes"] or 0,
-            "comments": row["comments"] or 0,
-            "shares": row["shares"] or 0,
-            "thumbnailR2Key": row["thumbnail_r2_key"],
-            "videoUrl": row["video_url"],
-            "platformResults": _safe_json(row["platform_results"], {}),
-            "createdAt": row["created_at"].isoformat() if row["created_at"] else None,
-            "updatedAt": row["updated_at"].isoformat() if row["updated_at"] else None,
-            "duration": float(row["duration"]) if row["duration"] is not None else None,
-        }
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    def g(k, default=None):
+        return row[k] if k in row else default
+
+    return {
+        "id": str(g("id")),
+        "userId": str(g("user_id")),
+        "r2Key": g("r2_key"),
+        "filename": g("filename"),
+        "fileSize": g("file_size"),
+        "platforms": _safe_json(g("platforms"), []),
+        "title": g("title"),
+        "caption": g("caption"),
+        "hashtags": _safe_json(g("hashtags"), []),
+        "privacy": g("privacy"),
+        "status": g("status"),
+        "cancelRequested": bool(g("cancel_requested", False)),
+        "scheduledTime": g("scheduled_time").isoformat() if g("scheduled_time") else None,
+        "scheduleMode": g("schedule_mode"),
+        "processingStartedAt": g("processing_started_at").isoformat() if g("processing_started_at") else None,
+        "processingFinishedAt": g("processing_finished_at").isoformat() if g("processing_finished_at") else None,
+        "completedAt": g("completed_at").isoformat() if g("completed_at") else None,
+        "errorCode": g("error_code"),
+        "errorDetail": g("error_detail"),
+        "putReserved": g("put_reserved"),
+        "putSpent": g("put_spent"),
+        "aicReserved": g("aic_reserved"),
+        "aicSpent": g("aic_spent"),
+        "views": g("views"),
+        "likes": g("likes"),
+        "comments": g("comments"),
+        "shares": g("shares"),
+        "thumbnailR2Key": g("thumbnail_r2_key"),
+        "videoUrl": g("video_url"),
+        "platformResults": _safe_json(g("platform_results"), {}),
+        "createdAt": g("created_at").isoformat() if g("created_at") else None,
+        "updatedAt": g("updated_at").isoformat() if g("updated_at") else None,
+        "duration": g("duration"),
+    }

@@ -24,7 +24,7 @@ async def load_upload_record(pool: asyncpg.Pool, upload_id: str) -> Optional[dic
         row = await conn.fetchrow("""
             SELECT id, user_id, r2_key, telemetry_r2_key, processed_r2_key,
                    filename, file_size, platforms, title, caption, hashtags, privacy,
-                   generated_title, generated_caption, generated_hashtags, platform_hashtags,
+                   ai_generated_title, ai_generated_caption, ai_generated_hashtags, platform_hashtags,
                    status, scheduled_time, schedule_mode, cancel_requested,
                    created_at, updated_at
             FROM uploads WHERE id = $1
@@ -433,7 +433,7 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
     """Persist AI-generated metadata and per-platform hashtags.
 
     Writes:
-    - generated_title/caption/hashtags
+    - ai_generated_title/caption/hashtags
     - platform_hashtags jsonb map
 
     Also backfills title/caption/hashtags only if the user did not provide overrides.
@@ -453,9 +453,9 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
             """
             UPDATE uploads
             SET
-                generated_title = COALESCE($2, generated_title),
-                generated_caption = COALESCE($3, generated_caption),
-                generated_hashtags = COALESCE($4::text[], generated_hashtags),
+                ai_generated_title = COALESCE($2, ai_generated_title),
+                ai_generated_caption = COALESCE($3, ai_generated_caption),
+                ai_generated_hashtags = COALESCE($4::text[], ai_generated_hashtags),
                 platform_hashtags = CASE
                     WHEN $5::jsonb IS NOT NULL THEN $5::jsonb
                     ELSE platform_hashtags

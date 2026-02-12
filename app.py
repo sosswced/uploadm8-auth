@@ -859,13 +859,6 @@ async def run_migrations():
                 created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"""),
             (2, "CREATE TABLE IF NOT EXISTS refresh_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, token_hash VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())"),
             (3, "CREATE TABLE IF NOT EXISTS platform_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, platform VARCHAR(50) NOT NULL, account_id VARCHAR(255), account_name VARCHAR(255), account_username VARCHAR(255), account_avatar VARCHAR(512), token_blob JSONB NOT NULL, is_primary BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"),
-            (31, """
-                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
-                CREATE INDEX IF NOT EXISTS idx_platform_tokens_user_platform_active ON platform_tokens(user_id, platform) WHERE revoked_at IS NULL;
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_platform_tokens_active_identity ON platform_tokens(user_id, platform, account_id)
-                    WHERE revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '';
-            """),
-
             (4, """CREATE TABLE IF NOT EXISTS uploads (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE,
                 r2_key VARCHAR(512) NOT NULL, telemetry_r2_key VARCHAR(512), processed_r2_key VARCHAR(512), thumbnail_r2_key VARCHAR(512),
@@ -1047,9 +1040,30 @@ async def run_migrations():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );"""),
 
-(510, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS description TEXT"),
-(511, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"),
-(512, "UPDATE account_groups SET updated_at = NOW() WHERE updated_at IS NULL"),
+(105, """
+    -- Platform tokens: multi-account support + guardrails
+    ALTER TABLE platform_tokens
+        ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+    -- Drop legacy uniqueness that blocks multi-account (if present)
+    DROP INDEX IF EXISTS ux_platform_tokens_user_platform;
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ux_platform_tokens_user_platform') THEN
+        ALTER TABLE platform_tokens DROP CONSTRAINT ux_platform_tokens_user_platform;
+      END IF;
+    END $$;
+
+    -- Unique per (user, platform, account) for active rows (prevents duplicates, allows multiple accounts)
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_platform_tokens_user_platform_account_active
+    ON platform_tokens (user_id, platform, account_id)
+    WHERE revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '';
+
+    CREATE INDEX IF NOT EXISTS ix_platform_tokens_user_platform_active
+    ON platform_tokens (user_id, platform)
+    WHERE revoked_at IS NULL;
+"""),
 ]
         
         for version, sql in migrations:
@@ -3102,132 +3116,32 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 @app.get("/api/groups")
 async def get_groups(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        groups = await conn.fetch(
-            """
-            SELECT id, user_id, name, description, account_ids, color, created_at, updated_at
-            FROM account_groups
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            """,
-            user["id"],
-        )
-    return [
-        {
-            "id": str(g["id"]),
-            "name": g["name"],
-            "description": g["description"],
-            "account_ids": g["account_ids"] or [],
-            "members": g["account_ids"] or [],
-            "color": g["color"],
-            "created_at": g["created_at"].isoformat() if g["created_at"] else None,
-            "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
-        }
-        for g in groups
-    ]
-
-
-@app.get("/api/groups/{group_id}")
-async def get_group(group_id: str, user: dict = Depends(get_current_user)):
-    async with db_pool.acquire() as conn:
-        g = await conn.fetchrow(
-            """
-            SELECT id, user_id, name, description, account_ids, color, created_at, updated_at
-            FROM account_groups
-            WHERE id = $1 AND user_id = $2
-            """,
-            group_id,
-            user["id"],
-        )
-    if not g:
-        raise HTTPException(404, "Group not found")
-    return {
-        "id": str(g["id"]),
-        "name": g["name"],
-        "description": g["description"],
-        "account_ids": g["account_ids"] or [],
-        "members": g["account_ids"] or [],
-        "color": g["color"],
-        "created_at": g["created_at"].isoformat() if g["created_at"] else None,
-        "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
-    }
-
-
-class GroupUpsert(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    color: Optional[str] = None
-    account_ids: Optional[List[str]] = None  # platform_tokens.id values as strings
-    members: Optional[List[str]] = None      # frontend alias for account_ids
-
+        groups = await conn.fetch("SELECT * FROM account_groups WHERE user_id = $1 ORDER BY created_at DESC", user["id"])
+    return [{"id": str(g["id"]), "name": g["name"], "account_ids": g["account_ids"] or [], "color": g["color"], "created_at": g["created_at"].isoformat() if g["created_at"] else None} for g in groups]
 
 @app.post("/api/groups")
-async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_user)):
-    name = (payload.name or "").strip()
-    if not name:
-        raise HTTPException(400, "name is required")
-    color = payload.color or "#3b82f6"
-    account_ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
-    group_id = str(uuid.uuid4())
-
+async def create_group(name: str = Query(...), color: str = Query("#3b82f6"), user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO account_groups (id, user_id, name, description, account_ids, color, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-            """,
-            group_id,
-            user["id"],
-            name,
-            payload.description,
-            account_ids,
-            color,
-        )
-
-    return {"id": group_id, "name": name, "description": payload.description, "color": color, "account_ids": account_ids, "members": account_ids}
-
+        group_id = str(uuid.uuid4())
+        await conn.execute("INSERT INTO account_groups (id, user_id, name, color) VALUES ($1, $2, $3, $4)", group_id, user["id"], name, color)
+    return {"id": group_id, "name": name, "color": color, "account_ids": []}
 
 @app.put("/api/groups/{group_id}")
-async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends(get_current_user)):
-    updates = []
-    params = [group_id, user["id"]]
-
-    if payload.name is not None:
+async def update_group(group_id: str, name: str = Query(None), color: str = Query(None), account_ids: List[str] = Query(None), user: dict = Depends(get_current_user)):
+    updates, params = [], [group_id, user["id"]]
+    if name:
         updates.append(f"name = ${len(params)+1}")
-        params.append(payload.name.strip())
-
-    if payload.description is not None:
-        updates.append(f"description = ${len(params)+1}")
-        params.append(payload.description)
-
-    if payload.color is not None:
+        params.append(name)
+    if color:
         updates.append(f"color = ${len(params)+1}")
-        params.append(payload.color)
-
-    # accept either account_ids or members
-    if payload.account_ids is not None or payload.members is not None:
-        ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
+        params.append(color)
+    if account_ids is not None:
         updates.append(f"account_ids = ${len(params)+1}")
-        params.append(ids)
-
-    updates.append("updated_at = NOW()")
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id FROM account_groups WHERE id = $1 AND user_id = $2",
-            group_id,
-            user["id"],
-        )
-        if not row:
-            raise HTTPException(404, "Group not found")
-
-        if updates:
-            await conn.execute(
-                f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2",
-                *params,
-            )
-
+        params.append(account_ids)
+    if updates:
+        async with db_pool.acquire() as conn:
+            await conn.execute(f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2", *params)
     return {"status": "updated"}
-
 
 @app.delete("/api/groups/{group_id}")
 async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
@@ -3242,14 +3156,13 @@ async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
 async def get_platforms(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         accounts = await conn.fetch("""
-            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
-                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+            SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
             FROM platform_tokens
             WHERE user_id = $1
               AND revoked_at IS NULL
               AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
-            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
+              AND (COALESCE(account_name, '') <> '' OR COALESCE(account_username, '') <> '')
+            ORDER BY platform, created_at
         """, user["id"])
     
     platforms = {}
@@ -3268,14 +3181,13 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
     """Returns flat list of accounts for frontend compatibility"""
     async with db_pool.acquire() as conn:
         accounts = await conn.fetch("""
-            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
-                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+            SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
             FROM platform_tokens
             WHERE user_id = $1
               AND revoked_at IS NULL
               AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
-            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
+              AND (COALESCE(account_name, '') <> '' OR COALESCE(account_username, '') <> '')
+            ORDER BY platform, created_at
         """, user["id"])
     
     result = []
@@ -3297,7 +3209,14 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
 async def get_accounts_simple(user: dict = Depends(get_current_user)):
     """Simple accounts list for dashboard"""
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id) id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '' AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '') ORDER BY platform, account_id, created_at DESC", user["id"])
+        accounts = await conn.fetch("""
+            SELECT id, platform, account_name, account_username, account_avatar
+            FROM platform_tokens
+            WHERE user_id = $1
+              AND revoked_at IS NULL
+              AND account_id IS NOT NULL AND account_id <> ''
+              AND (COALESCE(account_name, '') <> '' OR COALESCE(account_username, '') <> '')
+        """, user["id"])
     return [{"id": str(a["id"]), "platform": a["platform"], "name": a["account_name"], "username": a["account_username"], "avatar": a["account_avatar"], "status": "active"} for a in accounts]
 
 @app.delete("/api/platforms/{platform}/accounts/{account_id}")
@@ -3488,12 +3407,40 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     "redirect_uri": redirect_uri,
                 })
                 token_data = token_response.json()
+                # TikTok v2 returns tokens under {"data": {...}}; normalize.
+                if isinstance(token_data, dict) and isinstance(token_data.get("data"), dict):
+                    token_data = token_data["data"]
+
                 access_token = token_data.get("access_token")
-                account_id = token_data.get("open_id", secrets.token_hex(8))
-                account_name = "TikTok User"
+                if not access_token:
+                    raise Exception(f"No access_token returned from TikTok: {token_data}")
+
+                # TikTok identity key (required). Do NOT synthesize IDs; that creates ghost accounts.
+                account_id = token_data.get("open_id") or token_data.get("user_id")
+                if not account_id:
+                    raise Exception("TikTok did not return open_id/user_id; cannot create connected account.")
+
+                # Fetch user profile for display (best-effort).
+                account_name = "TikTok"
                 account_username = ""
                 account_avatar = ""
-                
+                try:
+                    userinfo = await client.get(
+                        "https://open.tiktokapis.com/v2/user/info/",
+                        params={"fields": "open_id,union_id,avatar_url,display_name,username"},
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    )
+                    if userinfo.status_code == 200:
+                        ujson = userinfo.json()
+                        if isinstance(ujson, dict) and isinstance(ujson.get("data"), dict):
+                            udata = ujson["data"]
+                            user_obj = udata.get("user") if isinstance(udata.get("user"), dict) else udata
+                            account_username = (user_obj.get("username") or user_obj.get("display_name") or "").strip()
+                            account_name = (user_obj.get("display_name") or account_username or "TikTok").strip()
+                            account_avatar = (user_obj.get("avatar_url") or "").strip()
+                except Exception:
+                    pass
+
             elif platform == "youtube":
                 token_response = await client.post(config["token_url"], data={
                     "client_id": YOUTUBE_CLIENT_ID,
@@ -3604,37 +3551,97 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 account_username = ""
                 account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
             
-            # Refuse to persist "ghost" connections with no identity
-            if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
-                raise Exception("Provider did not return account_id; refusing to store token (prevents phantom accounts).")
 
-            # Store the token
+            # Store the token (and prevent ghost accounts)
+            if not account_id:
+                raise Exception(f"Missing account_id for {platform}; refusing to persist a ghost connection.")
+
+            # Encrypt token material at rest. Cache access token in Redis (Design A).
             token_blob = encrypt_blob({
                 "access_token": access_token,
                 "refresh_token": token_data.get("refresh_token"),
-                "expires_at": token_data.get("expires_in"),
+                "expires_at": (_now_utc() + timedelta(seconds=int(token_data.get("expires_in") or 3600))).isoformat(),
+                "scope": token_data.get("scope"),
             })
-            
+
             async with db_pool.acquire() as conn:
-                # Check if account already connected
-                existing = await conn.fetchrow(
-                    "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND account_id = $3",
-                    user_id, platform, account_id
-                )
-                
-                if existing:
-                    await conn.execute("""
-                        UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3, 
-                        account_avatar = $4, updated_at = NOW() WHERE id = $5
-                    """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
-                else:
-                    await conn.execute("""
-                        INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
-            
-            return popup_response(True, platform)
-    
+                async with conn.transaction():
+                    # Tier gate (total connected accounts) enforced at connect-time.
+                    user_row = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
+                    tier = (user_row["subscription_tier"] if user_row else "free") or "free"
+                    plan = get_plan(str(tier))
+                    max_accounts = int(plan.get("max_accounts", 1))
+
+                    current = await conn.fetchval("""
+                        SELECT COUNT(*)
+                        FROM platform_tokens
+                        WHERE user_id = $1
+                          AND revoked_at IS NULL
+                          AND account_id IS NOT NULL AND account_id <> ''
+                    """, user_id) or 0
+
+                    if current >= max_accounts:
+                        raise Exception(f"Tier limit reached: max connected accounts = {max_accounts}. Upgrade to add more.")
+
+                    # Multi-account upsert by (user_id, platform, account_id)
+                    existing = await conn.fetchrow(
+                        "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND account_id = $3 AND revoked_at IS NULL",
+                        user_id, platform, account_id
+                    )
+
+                    if existing:
+                        await conn.execute("""
+                            UPDATE platform_tokens
+                            SET token_blob = $1,
+                                account_name = $2,
+                                account_username = $3,
+                                account_avatar = $4,
+                                revoked_at = NULL,
+                                updated_at = NOW()
+                            WHERE id = $5
+                        """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
+                    else:
+                        try:
+                            await conn.execute("""
+                                INSERT INTO platform_tokens
+                                    (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
+                                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                            """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
+                        except Exception as ie:
+                            # Back-compat fallback: if DB still enforces (user_id, platform) uniqueness
+                            if "ux_platform_tokens_user_platform" in str(ie):
+                                row = await conn.fetchrow(
+                                    "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND revoked_at IS NULL",
+                                    user_id, platform
+                                )
+                                if row:
+                                    await conn.execute("""
+                                        UPDATE platform_tokens
+                                        SET account_id = $1,
+                                            token_blob = $2,
+                                            account_name = $3,
+                                            account_username = $4,
+                                            account_avatar = $5,
+                                            revoked_at = NULL,
+                                            updated_at = NOW()
+                                        WHERE id = $6
+                                    """, account_id, json.dumps(token_blob), account_name, account_username, account_avatar, row["id"])
+                                else:
+                                    raise
+                            else:
+                                raise
+
+            # Cache access token in Redis (Design A). Refresh token remains encrypted in Postgres (token_blob).
+            try:
+                if redis_client and access_token:
+                    ttl = int(token_data.get("expires_in") or 3600)
+                    ttl = max(60, ttl - 60)
+                    key = f"oauth:access:{user_id}:{platform}:{account_id}"
+                    await redis_client.set(key, access_token, ex=ttl)
+            except Exception:
+                pass
+
+            return popup_response(True, platform)    
     except Exception as e:
         logger.error(f"OAuth callback error for {platform}: {e}")
         return popup_response(False, platform, str(e))

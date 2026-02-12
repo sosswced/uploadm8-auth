@@ -1039,6 +1039,10 @@ async def run_migrations():
                 expires_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );"""),
+
+(510, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS description TEXT"),
+(511, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"),
+(512, "UPDATE account_groups SET updated_at = NOW() WHERE updated_at IS NULL"),
 ]
         
         for version, sql in migrations:
@@ -3091,32 +3095,132 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 @app.get("/api/groups")
 async def get_groups(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        groups = await conn.fetch("SELECT * FROM account_groups WHERE user_id = $1 ORDER BY created_at DESC", user["id"])
-    return [{"id": str(g["id"]), "name": g["name"], "account_ids": g["account_ids"] or [], "color": g["color"], "created_at": g["created_at"].isoformat() if g["created_at"] else None} for g in groups]
+        groups = await conn.fetch(
+            """
+            SELECT id, user_id, name, description, account_ids, color, created_at, updated_at
+            FROM account_groups
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            """,
+            user["id"],
+        )
+    return [
+        {
+            "id": str(g["id"]),
+            "name": g["name"],
+            "description": g["description"],
+            "account_ids": g["account_ids"] or [],
+            "members": g["account_ids"] or [],
+            "color": g["color"],
+            "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+            "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
+        }
+        for g in groups
+    ]
+
+
+@app.get("/api/groups/{group_id}")
+async def get_group(group_id: str, user: dict = Depends(get_current_user)):
+    async with db_pool.acquire() as conn:
+        g = await conn.fetchrow(
+            """
+            SELECT id, user_id, name, description, account_ids, color, created_at, updated_at
+            FROM account_groups
+            WHERE id = $1 AND user_id = $2
+            """,
+            group_id,
+            user["id"],
+        )
+    if not g:
+        raise HTTPException(404, "Group not found")
+    return {
+        "id": str(g["id"]),
+        "name": g["name"],
+        "description": g["description"],
+        "account_ids": g["account_ids"] or [],
+        "members": g["account_ids"] or [],
+        "color": g["color"],
+        "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+        "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
+    }
+
+
+class GroupUpsert(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    account_ids: Optional[List[str]] = None  # platform_tokens.id values as strings
+    members: Optional[List[str]] = None      # frontend alias for account_ids
+
 
 @app.post("/api/groups")
-async def create_group(name: str = Query(...), color: str = Query("#3b82f6"), user: dict = Depends(get_current_user)):
+async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_user)):
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    color = payload.color or "#3b82f6"
+    account_ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
+    group_id = str(uuid.uuid4())
+
     async with db_pool.acquire() as conn:
-        group_id = str(uuid.uuid4())
-        await conn.execute("INSERT INTO account_groups (id, user_id, name, color) VALUES ($1, $2, $3, $4)", group_id, user["id"], name, color)
-    return {"id": group_id, "name": name, "color": color, "account_ids": []}
+        await conn.execute(
+            """
+            INSERT INTO account_groups (id, user_id, name, description, account_ids, color, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+            """,
+            group_id,
+            user["id"],
+            name,
+            payload.description,
+            account_ids,
+            color,
+        )
+
+    return {"id": group_id, "name": name, "description": payload.description, "color": color, "account_ids": account_ids, "members": account_ids}
+
 
 @app.put("/api/groups/{group_id}")
-async def update_group(group_id: str, name: str = Query(None), color: str = Query(None), account_ids: List[str] = Query(None), user: dict = Depends(get_current_user)):
-    updates, params = [], [group_id, user["id"]]
-    if name:
+async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends(get_current_user)):
+    updates = []
+    params = [group_id, user["id"]]
+
+    if payload.name is not None:
         updates.append(f"name = ${len(params)+1}")
-        params.append(name)
-    if color:
+        params.append(payload.name.strip())
+
+    if payload.description is not None:
+        updates.append(f"description = ${len(params)+1}")
+        params.append(payload.description)
+
+    if payload.color is not None:
         updates.append(f"color = ${len(params)+1}")
-        params.append(color)
-    if account_ids is not None:
+        params.append(payload.color)
+
+    # accept either account_ids or members
+    if payload.account_ids is not None or payload.members is not None:
+        ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
         updates.append(f"account_ids = ${len(params)+1}")
-        params.append(account_ids)
-    if updates:
-        async with db_pool.acquire() as conn:
-            await conn.execute(f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2", *params)
+        params.append(ids)
+
+    updates.append("updated_at = NOW()")
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM account_groups WHERE id = $1 AND user_id = $2",
+            group_id,
+            user["id"],
+        )
+        if not row:
+            raise HTTPException(404, "Group not found")
+
+        if updates:
+            await conn.execute(
+                f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2",
+                *params,
+            )
+
     return {"status": "updated"}
+
 
 @app.delete("/api/groups/{group_id}")
 async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
@@ -3130,7 +3234,11 @@ async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
 @app.get("/api/platforms")
 async def get_platforms(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at FROM platform_tokens WHERE user_id = $1 ORDER BY platform, created_at", user["id"])
+        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,'')) 
+                    id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+                 FROM platform_tokens 
+                 WHERE user_id = $1
+                 ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC", user["id"])
     
     platforms = {}
     for acc in accounts:
@@ -3147,7 +3255,11 @@ async def get_platforms(user: dict = Depends(get_current_user)):
 async def get_platform_accounts(user: dict = Depends(get_current_user)):
     """Returns flat list of accounts for frontend compatibility"""
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at FROM platform_tokens WHERE user_id = $1 ORDER BY platform, created_at", user["id"])
+        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,'')) 
+                    id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+                 FROM platform_tokens 
+                 WHERE user_id = $1
+                 ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC", user["id"])
     
     result = []
     for acc in accounts:

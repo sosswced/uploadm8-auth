@@ -859,6 +859,13 @@ async def run_migrations():
                 created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"""),
             (2, "CREATE TABLE IF NOT EXISTS refresh_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, token_hash VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())"),
             (3, "CREATE TABLE IF NOT EXISTS platform_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, platform VARCHAR(50) NOT NULL, account_id VARCHAR(255), account_name VARCHAR(255), account_username VARCHAR(255), account_avatar VARCHAR(512), token_blob JSONB NOT NULL, is_primary BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"),
+            (31, """
+                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+                CREATE INDEX IF NOT EXISTS idx_platform_tokens_user_platform_active ON platform_tokens(user_id, platform) WHERE revoked_at IS NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_platform_tokens_active_identity ON platform_tokens(user_id, platform, account_id)
+                    WHERE revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '';
+            """),
+
             (4, """CREATE TABLE IF NOT EXISTS uploads (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE,
                 r2_key VARCHAR(512) NOT NULL, telemetry_r2_key VARCHAR(512), processed_r2_key VARCHAR(512), thumbnail_r2_key VARCHAR(512),
@@ -3239,6 +3246,9 @@ async def get_platforms(user: dict = Depends(get_current_user)):
                 id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
             FROM platform_tokens
             WHERE user_id = $1
+              AND revoked_at IS NULL
+              AND account_id IS NOT NULL AND account_id <> ''
+              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
             ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
         """, user["id"])
     
@@ -3262,6 +3272,9 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
                 id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
             FROM platform_tokens
             WHERE user_id = $1
+              AND revoked_at IS NULL
+              AND account_id IS NOT NULL AND account_id <> ''
+              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
             ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
         """, user["id"])
     
@@ -3284,7 +3297,7 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
 async def get_accounts_simple(user: dict = Depends(get_current_user)):
     """Simple accounts list for dashboard"""
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1", user["id"])
+        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id) id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '' AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '') ORDER BY platform, account_id, created_at DESC", user["id"])
     return [{"id": str(a["id"]), "platform": a["platform"], "name": a["account_name"], "username": a["account_username"], "avatar": a["account_avatar"], "status": "active"} for a in accounts]
 
 @app.delete("/api/platforms/{platform}/accounts/{account_id}")
@@ -3591,6 +3604,10 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 account_username = ""
                 account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
             
+            # Refuse to persist "ghost" connections with no identity
+            if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
+                raise Exception("Provider did not return account_id; refusing to store token (prevents phantom accounts).")
+
             # Store the token
             token_blob = encrypt_blob({
                 "access_token": access_token,

@@ -3234,11 +3234,13 @@ async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
 @app.get("/api/platforms")
 async def get_platforms(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,'')) 
-                    id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
-                 FROM platform_tokens 
-                 WHERE user_id = $1
-                 ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC", user["id"])
+        accounts = await conn.fetch("""
+            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
+                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+            FROM platform_tokens
+            WHERE user_id = $1
+            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
+        """, user["id"])
     
     platforms = {}
     for acc in accounts:
@@ -3255,11 +3257,13 @@ async def get_platforms(user: dict = Depends(get_current_user)):
 async def get_platform_accounts(user: dict = Depends(get_current_user)):
     """Returns flat list of accounts for frontend compatibility"""
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,'')) 
-                    id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
-                 FROM platform_tokens 
-                 WHERE user_id = $1
-                 ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC", user["id"])
+        accounts = await conn.fetch("""
+            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
+                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+            FROM platform_tokens
+            WHERE user_id = $1
+            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
+        """, user["id"])
     
     result = []
     for acc in accounts:

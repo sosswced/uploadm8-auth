@@ -220,6 +220,26 @@ MAIL_FROM = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
 
 # Cost modeling
 COST_PER_OPENAI_TOKEN = float(os.environ.get("COST_PER_OPENAI_TOKEN", "0.00001"))
+
+
+async def log_openai_cost(conn, user_id, request_type: str, model: str, tokens_in: int, tokens_out: int, meta: dict | None = None, occurred_at: datetime | None = None):
+    meta = meta or {}
+    tokens_total = int(tokens_in or 0) + int(tokens_out or 0)
+    cost_usd = float(os.environ.get("COST_PER_OPENAI_TOKEN", str(COST_PER_OPENAI_TOKEN))) * float(tokens_total)
+    occurred_at = occurred_at or _now_utc()
+    await conn.execute(
+        """INSERT INTO openai_costs (user_id, request_type, model, tokens_in, tokens_out, tokens_total, cost_usd, meta, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)""",
+        user_id, request_type, model, int(tokens_in or 0), int(tokens_out or 0), tokens_total, cost_usd, json.dumps(meta), occurred_at
+    )
+    # optional back-compat rollup
+    await conn.execute(
+        """INSERT INTO cost_tracking (category, cost_usd, notes, created_at)
+             VALUES ('openai', $1, $2, $3)""",
+        float(cost_usd), f"openai:{request_type}:{model}", occurred_at
+    )
+    return cost_usd
+
 COST_PER_GB_MONTH = float(os.environ.get("COST_PER_GB_MONTH", "0.015"))
 COST_PER_COMPUTE_SECOND = float(os.environ.get("COST_PER_COMPUTE_SECOND", "0.0001"))
 
@@ -4841,7 +4861,8 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
 
 @app.get("/api/admin/kpi/revenue")
 async def get_kpi_revenue(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
+        minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'") or 1
@@ -4855,7 +4876,8 @@ async def get_kpi_revenue(user: dict = Depends(require_admin)):
 
 @app.get("/api/admin/kpi/costs")
 async def get_kpi_costs(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
+        minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         costs = await conn.fetchrow("SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai, COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage, COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute FROM cost_tracking WHERE created_at >= $1", since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status = 'completed' AND created_at >= $1", since)
@@ -4865,7 +4887,8 @@ async def get_kpi_costs(user: dict = Depends(require_admin)):
 
 @app.get("/api/admin/kpi/growth")
 async def get_kpi_growth(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
+        minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         signups = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
         connected = await conn.fetchval("SELECT COUNT(DISTINCT u.id) FROM users u JOIN platform_tokens pt ON u.id = pt.user_id WHERE u.created_at >= $1", since)
@@ -4881,7 +4904,8 @@ async def get_kpi_growth(user: dict = Depends(require_admin)):
 
 @app.get("/api/admin/kpi/reliability")
 async def get_kpi_reliability(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
+        minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow("SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed FROM uploads WHERE created_at >= $1", since)
         queue = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
@@ -4894,8 +4918,9 @@ async def get_kpi_reliability(user: dict = Depends(require_admin)):
 
 @app.get("/api/admin/kpi/usage")
 async def get_kpi_usage(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
-    prev_since = since - timedelta(days=30)
+        minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+    prev_since = since - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         active = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since)

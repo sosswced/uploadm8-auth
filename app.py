@@ -59,6 +59,23 @@ async def _load_uploads_columns(pool):
 def _pick_cols(wanted, available):
     return [c for c in wanted if c in available]
 
+_TABLE_COLS_CACHE: dict[str, set[str]] = {}
+
+async def _get_table_cols(conn, table_name: str) -> set[str]:
+    key = f"public.{table_name}"
+    if key in _TABLE_COLS_CACHE:
+        return _TABLE_COLS_CACHE[key]
+    rows = await conn.fetch(
+        """SELECT column_name
+           FROM information_schema.columns
+           WHERE table_schema='public' AND table_name=$1""",
+        table_name,
+    )
+    cols = {r["column_name"] for r in rows}
+    _TABLE_COLS_CACHE[key] = cols
+    return cols
+
+
 
 def _safe_json(v, default):
     """Parse JSON stored as text OR already-parsed objects. Defensive until schema is fully jsonb."""
@@ -220,26 +237,6 @@ MAIL_FROM = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
 
 # Cost modeling
 COST_PER_OPENAI_TOKEN = float(os.environ.get("COST_PER_OPENAI_TOKEN", "0.00001"))
-
-
-async def log_openai_cost(conn, user_id, request_type: str, model: str, tokens_in: int, tokens_out: int, meta: dict | None = None, occurred_at: datetime | None = None):
-    meta = meta or {}
-    tokens_total = int(tokens_in or 0) + int(tokens_out or 0)
-    cost_usd = float(os.environ.get("COST_PER_OPENAI_TOKEN", str(COST_PER_OPENAI_TOKEN))) * float(tokens_total)
-    occurred_at = occurred_at or _now_utc()
-    await conn.execute(
-        """INSERT INTO openai_costs (user_id, request_type, model, tokens_in, tokens_out, tokens_total, cost_usd, meta, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)""",
-        user_id, request_type, model, int(tokens_in or 0), int(tokens_out or 0), tokens_total, cost_usd, json.dumps(meta), occurred_at
-    )
-    # optional back-compat rollup
-    await conn.execute(
-        """INSERT INTO cost_tracking (category, cost_usd, notes, created_at)
-             VALUES ('openai', $1, $2, $3)""",
-        float(cost_usd), f"openai:{request_type}:{model}", occurred_at
-    )
-    return cost_usd
-
 COST_PER_GB_MONTH = float(os.environ.get("COST_PER_GB_MONTH", "0.015"))
 COST_PER_COMPUTE_SECOND = float(os.environ.get("COST_PER_COMPUTE_SECOND", "0.0001"))
 
@@ -4751,118 +4748,121 @@ def _range_label(range_str: str | None, fallback: str = "30d") -> str:
     r = (range_str or "").strip()
     return r if r else fallback
 
+def _parse_iso_dt(s: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid datetime. Use ISO8601 like 2026-02-13T00:00:00Z")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _resolve_window(
+    range_str: Optional[str],
+    start: Optional[str],
+    end: Optional[str],
+    default_minutes: int = 30 * 24 * 60
+) -> tuple[datetime, datetime, str]:
+    now = _now_utc()
+    if start and end:
+        since = _parse_iso_dt(start)
+        until = _parse_iso_dt(end)
+        if until <= since:
+            raise HTTPException(status_code=400, detail="Invalid custom range: end must be after start.")
+        return since, until, "custom"
+    minutes = _range_to_minutes(range_str, default_minutes=default_minutes)
+    since = now - timedelta(minutes=minutes)
+    return since, now, _range_label(range_str, fallback="30d")
+
+
 @app.get("/api/admin/kpis")
-async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):
-    """Combined KPI endpoint that returns all metrics in one call"""
-    minutes = {"7d": 10080, "30d": 43200, "90d": 129600, "365d": 525600, "1y": 525600}.get(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    prev_since = since - timedelta(minutes=minutes)
-    
+async def get_admin_kpis(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None, description="Custom range start (ISO8601)"),
+    end: Optional[str] = Query(None, description="Custom range end (ISO8601)"),
+    user: dict = Depends(require_admin),
+):
+    """Combined KPI endpoint that returns all metrics in one call (range-aware)."""
+    since, until, label = _resolve_window(range, start, end, default_minutes=30 * 24 * 60)
+    window_minutes = int((until - since).total_seconds() / 60)
+    prev_since = since - timedelta(minutes=window_minutes)
+
     async with db_pool.acquire() as conn:
         # Users
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
-        new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
+        new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2", since, until)
         prev_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2", prev_since, since)
-        paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'")
-        active_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
-        
-        new_users_change = ((new_users - prev_users) / max(prev_users, 1)) * 100 if prev_users > 0 else 0
-        
-        # MRR
-        mrr_data = await conn.fetch("""
-            SELECT subscription_tier, COUNT(*) AS count FROM users 
-            WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') 
-            AND subscription_status = 'active' GROUP BY subscription_tier
-        """)
+        paid_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'"
+        )
+        active_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1 AND created_at < $2", since, until)
+
+        new_users_change = ((new_users - prev_users) / max(prev_users, 1)) * 100 if prev_users and prev_users > 0 else 0
+
+        # MRR (unchanged pricing logic)
+        mrr_data = await conn.fetch(
+            """
+            SELECT subscription_tier, COUNT(*) AS count
+            FROM users
+            WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime')
+              AND subscription_status = 'active'
+            GROUP BY subscription_tier
+            """
+        )
         total_mrr = sum(get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data)
         mrr_by_tier = {r["subscription_tier"]: get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data}
-        
-        # Tier breakdown
-        tier_data = await conn.fetch("SELECT COALESCE(subscription_tier, 'free') as tier, COUNT(*)::int AS count FROM users GROUP BY subscription_tier")
-        tier_breakdown = {t["tier"] or "free": t["count"] for t in tier_data}
-        
-        # Revenue
-        revenue = await conn.fetchrow("""
-            SELECT COALESCE(SUM(amount), 0)::decimal AS total,
-            COALESCE(SUM(CASE WHEN source = 'topup' THEN amount ELSE 0 END), 0)::decimal AS topups
-            FROM revenue_tracking WHERE created_at >= $1
-        """, since)
-        
-        # Costs
-        costs = await conn.fetchrow("""
-            SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
-            COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
-            COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute
-            FROM cost_tracking WHERE created_at >= $1
-        """, since)
-        openai_cost = float(costs["openai"] or 0) if costs else 0
-        storage_cost = float(costs["storage"] or 0) if costs else 0
-        compute_cost = float(costs["compute"] or 0) if costs else 0
-        total_costs = openai_cost + storage_cost + compute_cost
-        
-        gross_margin = ((total_mrr - total_costs) / max(total_mrr, 1)) * 100 if total_mrr > 0 else 0
-        
-        # Uploads
-        upload_stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
-            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
-            COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes
-            FROM uploads WHERE created_at >= $1
-        """, since)
-        total_uploads = upload_stats["total"] if upload_stats else 0
-        successful_uploads = upload_stats["completed"] if upload_stats else 0
-        success_rate = (successful_uploads / max(total_uploads, 1)) * 100
-        
-        prev_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1 AND created_at < $2", prev_since, since)
-        uploads_change = ((total_uploads - prev_uploads) / max(prev_uploads, 1)) * 100 if prev_uploads > 0 else 0
-        cost_per_upload = total_costs / max(successful_uploads, 1)
-        
-        # Platform distribution
-        platform_data = await conn.fetch("SELECT unnest(platforms) AS platform, COUNT(*)::int AS uploads FROM uploads WHERE created_at >= $1 GROUP BY platform", since)
-        platform_distribution = {p["platform"]: p["uploads"] for p in platform_data}
-        
-        queue_depth = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
-        
-        # Funnels
-        funnel_connected = await conn.fetchval("SELECT COUNT(DISTINCT u.id) FROM users u JOIN platform_tokens pt ON u.id = pt.user_id WHERE u.created_at >= $1", since)
-        funnel_uploaded = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
-        funnel_signup_connect = (funnel_connected / max(new_users, 1)) * 100
-        funnel_connect_upload = (funnel_uploaded / max(funnel_connected, 1)) * 100
-        
-        cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
-    
-    return {
-        "total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": mrr_by_tier,
-        "mrr_launch": mrr_by_tier.get("launch", 0), "mrr_creator_pro": mrr_by_tier.get("creator_pro", 0),
-        "mrr_studio": mrr_by_tier.get("studio", 0), "mrr_agency": mrr_by_tier.get("agency", 0),
-        "launch_users": tier_breakdown.get("launch", 0), "creator_pro_users": tier_breakdown.get("creator_pro", 0),
-        "studio_users": tier_breakdown.get("studio", 0), "agency_users": tier_breakdown.get("agency", 0),
-        "topup_revenue": float(revenue["topups"]) if revenue else 0, "topup_count": 0,
-        "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
-        "refunds": 0, "refund_count": 0,
-        "openai_cost": openai_cost, "storage_cost": storage_cost, "compute_cost": compute_cost,
-        "total_costs": total_costs, "cost_per_upload": round(cost_per_upload, 4),
-        "gross_margin": round(gross_margin, 1), "gross_margin_change": 0,
-        "funnel_signups": new_users, "funnel_connected": funnel_connected, "funnel_uploaded": funnel_uploaded,
-        "funnel_signup_connect": round(funnel_signup_connect, 1), "funnel_connect_upload": round(funnel_connect_upload, 1),
-        "free_to_paid_rate": round((paid_users / max(total_users, 1)) * 100, 1), "free_to_paid_change": 0,
-        "cancellations": cancellations, "cancellation_rate": round((cancellations / max(paid_users, 1)) * 100, 1),
-        "failed_payments": 0, "payment_failure_rate": 0,
-        "total_uploads": total_uploads, "successful_uploads": successful_uploads, "success_rate": round(success_rate, 1),
-        "transcode_fail_rate": 0, "platform_fail_rate": 0, "retry_rate": 0,
-        "avg_process_time": 0, "avg_transcode_time": 0, "cancel_rate": 0, "queue_depth": queue_depth or 0,
-        "new_users": new_users, "new_users_change": round(new_users_change, 1), "uploads_change": round(uploads_change, 1),
-        "active_users": active_users or 0, "total_views": upload_stats["views"] if upload_stats else 0,
-        "total_likes": upload_stats["likes"] if upload_stats else 0,
-        "avg_uploads_per_user": round(total_uploads / max(active_users or 1, 1), 1),
-        "tier_breakdown": tier_breakdown, "platform_distribution": platform_distribution,
-    }
 
+        # Tier breakdown
+        tier_data = await conn.fetch(
+            "SELECT COALESCE(subscription_tier, 'free') as tier, COUNT(*)::int AS count FROM users GROUP BY subscription_tier"
+        )
+        tier_breakdown = {t["tier"] or "free": t["count"] for t in tier_data}
+
+        # Uploads
+        upload_data = await conn.fetchrow(
+            """
+            SELECT COUNT(*)::int AS total,
+                   COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
+                   COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+                   COUNT(*) FILTER (WHERE status = 'processing')::int AS processing
+            FROM uploads
+            WHERE created_at >= $1 AND created_at < $2
+            """,
+            since, until
+        )
+
+        # Revenue + costs via existing tables (back-compat)
+        revenue_row = await conn.fetchrow(
+            "SELECT COALESCE(SUM(amount), 0)::decimal AS revenue FROM revenue_tracking WHERE created_at >= $1 AND created_at < $2",
+            since, until
+        )
+        cost_row = await conn.fetchrow(
+            "SELECT COALESCE(SUM(cost_usd), 0)::decimal AS costs FROM cost_tracking WHERE created_at >= $1 AND created_at < $2",
+            since, until
+        )
+
+    return {
+        "ok": True,
+        "range": label,
+        "since": since.isoformat(),
+        "until": until.isoformat(),
+        "users": {
+            "total": int(total_users or 0),
+            "new": int(new_users or 0),
+            "paid": int(paid_users or 0),
+            "active": int(active_users or 0),
+            "new_change_pct": float(new_users_change or 0),
+        },
+        "mrr": {"total": float(total_mrr or 0), "by_tier": mrr_by_tier},
+        "tiers": tier_breakdown,
+        "uploads": dict(upload_data) if upload_data else {"total": 0, "completed": 0, "failed": 0, "processing": 0},
+        "revenue": float(revenue_row["revenue"] or 0) if revenue_row else 0.0,
+        "costs": float(cost_row["costs"] or 0) if cost_row else 0.0,
+    }
 
 @app.get("/api/admin/kpi/revenue")
 async def get_kpi_revenue(user: dict = Depends(require_admin)):
-        minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+    since = _now_utc() - timedelta(days=30)
     async with db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'") or 1
@@ -4875,20 +4875,83 @@ async def get_kpi_revenue(user: dict = Depends(require_admin)):
 
 
 @app.get("/api/admin/kpi/costs")
-async def get_kpi_costs(user: dict = Depends(require_admin)):
-        minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    async with db_pool.acquire() as conn:
-        costs = await conn.fetchrow("SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai, COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage, COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute FROM cost_tracking WHERE created_at >= $1", since)
-        uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status = 'completed' AND created_at >= $1", since)
-    o, s, c = (float(costs["openai"] or 0), float(costs["storage"] or 0), float(costs["compute"] or 0)) if costs else (0, 0, 0)
-    return {"openai_cost": o, "storage_cost": s, "compute_cost": c, "total_costs": o+s+c, "costs_change": 0, "cost_per_upload": round((o+s+c) / max(uploads or 1, 1), 4), "successful_uploads": uploads or 0, "total_cogs": o+s+c}
+async def get_kpi_costs(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    since, until, _ = _resolve_window(range, start, end, default_minutes=30 * 24 * 60)
 
+    async with db_pool.acquire() as conn:
+        # Back-compat costs (existing)
+        legacy = await conn.fetchrow(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
+              COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
+              COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
+              COALESCE(SUM(cost_usd), 0)::decimal AS total
+            FROM cost_tracking
+            WHERE created_at >= $1 AND created_at < $2
+            """,
+            since, until
+        )
+
+        # New unified provider ledger (preferred if populated)
+        prov = await conn.fetch(
+            """
+            SELECT provider, category, COALESCE(SUM(amount_usd),0)::decimal AS amt
+            FROM provider_costs
+            WHERE occurred_at >= $1 AND occurred_at < $2
+            GROUP BY provider, category
+            """,
+            since, until
+        )
+
+        uploads = await conn.fetchval(
+            "SELECT COUNT(*) FROM uploads WHERE status = 'completed' AND created_at >= $1 AND created_at < $2",
+            since, until
+        )
+
+    legacy_openai = float(legacy["openai"] or 0) if legacy else 0.0
+    legacy_storage = float(legacy["storage"] or 0) if legacy else 0.0
+    legacy_compute = float(legacy["compute"] or 0) if legacy else 0.0
+    legacy_total = float(legacy["total"] or 0) if legacy else 0.0
+
+    provider_totals = {}
+    by_provider = {}
+    for r in prov or []:
+        provider = r["provider"]
+        category = r["category"]
+        amt = float(r["amt"] or 0)
+        provider_totals[category] = provider_totals.get(category, 0.0) + amt
+        by_provider.setdefault(provider, {})
+        by_provider[provider][category] = by_provider[provider].get(category, 0.0) + amt
+
+    total_costs = (sum(provider_totals.values()) if provider_totals else legacy_total)
+
+    # Keep your old fields so the front-end doesn’t break.
+    openai_cost = provider_totals.get("openai", legacy_openai)
+    storage_cost = provider_totals.get("storage", legacy_storage)
+    compute_cost = provider_totals.get("compute", legacy_compute)
+
+    return {
+        "openai_cost": openai_cost,
+        "storage_cost": storage_cost,
+        "compute_cost": compute_cost,
+        "total_costs": total_costs,
+        "costs_change": 0,
+        "cost_per_upload": round(total_costs / max(int(uploads or 1), 1), 6),
+        "successful_uploads": int(uploads or 0),
+        "total_cogs": total_costs,
+        "provider_totals": provider_totals,
+        "by_provider": by_provider,
+    }
 
 @app.get("/api/admin/kpi/growth")
 async def get_kpi_growth(user: dict = Depends(require_admin)):
-        minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+    since = _now_utc() - timedelta(days=30)
     async with db_pool.acquire() as conn:
         signups = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
         connected = await conn.fetchval("SELECT COUNT(DISTINCT u.id) FROM users u JOIN platform_tokens pt ON u.id = pt.user_id WHERE u.created_at >= $1", since)
@@ -4904,8 +4967,7 @@ async def get_kpi_growth(user: dict = Depends(require_admin)):
 
 @app.get("/api/admin/kpi/reliability")
 async def get_kpi_reliability(user: dict = Depends(require_admin)):
-        minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+    since = _now_utc() - timedelta(days=30)
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow("SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed FROM uploads WHERE created_at >= $1", since)
         queue = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
@@ -4918,9 +4980,8 @@ async def get_kpi_reliability(user: dict = Depends(require_admin)):
 
 @app.get("/api/admin/kpi/usage")
 async def get_kpi_usage(user: dict = Depends(require_admin)):
-        minutes = _range_to_minutes(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
-    prev_since = since - timedelta(minutes=minutes)
+    since = _now_utc() - timedelta(days=30)
+    prev_since = since - timedelta(days=30)
     async with db_pool.acquire() as conn:
         active = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since)
@@ -4932,6 +4993,87 @@ async def get_kpi_usage(user: dict = Depends(require_admin)):
             "new_users": new_users or 0, "new_users_change": round(chg, 1), "total_views": engagement["views"] if engagement else 0,
             "total_likes": engagement["likes"] if engagement else 0, "avg_uploads_per_user": round((uploads or 0) / max(active or 1, 1), 1)}
 
+
+
+@app.post("/api/admin/kpi/refresh")
+async def refresh_kpi_cost_estimates(
+    range: str = Query("30d"),
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+    user: dict = Depends(require_admin),
+):
+    """
+    Manual refresh button hook.
+    Writes best-effort cost estimates into provider_costs for the selected window.
+    Idempotent via external_id.
+    """
+    since, until, label = _resolve_window(range, start, end, default_minutes=30 * 24 * 60)
+    ps = since.date()
+    pe = until.date()
+    days = max(1, int((until - since).total_seconds() / 86400))
+
+    r2_cost_per_gb_month = float(os.environ.get("R2_COST_PER_GB_MONTH", "0.015"))
+    render_cost_per_compute_hour = float(os.environ.get("RENDER_COST_PER_COMPUTE_HOUR", "0.0"))
+    stripe_fee_pct = float(os.environ.get("STRIPE_FEE_PCT", "0.029"))
+    stripe_fee_flat = float(os.environ.get("STRIPE_FEE_FLAT", "0.30"))
+
+    async with db_pool.acquire() as conn:
+        uploads_cols = await _load_uploads_columns(db_pool)
+
+        # Proxy 1: R2 storage (sum of file_size bytes for uploads created in window)
+        r2_storage_usd = 0.0
+        if "file_size" in uploads_cols:
+            bytes_sum = await conn.fetchval(
+                "SELECT COALESCE(SUM(file_size),0)::bigint FROM uploads WHERE created_at >= $1 AND created_at < $2",
+                since, until
+            )
+            gb = float(bytes_sum or 0) / (1024.0 ** 3)
+            # prorate monthly storage by days/30
+            r2_storage_usd = gb * r2_cost_per_gb_month * (days / 30.0)
+
+        # Proxy 2: Render compute (sum compute_seconds in window)
+        render_compute_usd = 0.0
+        if "compute_seconds" in uploads_cols:
+            sec_sum = await conn.fetchval(
+                "SELECT COALESCE(SUM(compute_seconds),0)::double precision FROM uploads WHERE created_at >= $1 AND created_at < $2",
+                since, until
+            )
+            hours = float(sec_sum or 0) / 3600.0
+            render_compute_usd = hours * render_cost_per_compute_hour
+
+        # Proxy 3: Stripe fees (from revenue_tracking)
+        rev_row = await conn.fetchrow(
+            "SELECT COALESCE(SUM(amount),0)::double precision AS gross, COUNT(*)::int AS txns FROM revenue_tracking WHERE created_at >= $1 AND created_at < $2",
+            since, until
+        )
+        gross = float(rev_row["gross"] or 0) if rev_row else 0.0
+        txns = int(rev_row["txns"] or 0) if rev_row else 0
+        stripe_fees_usd = gross * stripe_fee_pct + txns * stripe_fee_flat
+
+        # Idempotent inserts (external_id unique-ish per window/provider/category)
+        rows_to_upsert = [
+            ("cloudflare_r2", "storage", r2_storage_usd, "estimate", f"refresh:{label}:{ps}:{pe}:r2:storage"),
+            ("render", "compute", render_compute_usd, "estimate", f"refresh:{label}:{ps}:{pe}:render:compute"),
+            ("stripe", "fees", stripe_fees_usd, "estimate", f"refresh:{label}:{ps}:{pe}:stripe:fees"),
+        ]
+
+        wrote = 0
+        for provider, category, amount, source, external_id in rows_to_upsert:
+            if amount <= 0:
+                continue
+            # idempotency: clear prior row for this external_id
+            await conn.execute("DELETE FROM provider_costs WHERE external_id = $1", external_id)
+            await conn.execute(
+                """
+                INSERT INTO provider_costs (provider, category, amount_usd, period_start, period_end, occurred_at, source, external_id, meta)
+                VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7,$8::jsonb)
+                
+                """,
+                provider, category, float(amount), ps, pe, source, external_id, json.dumps({"range": label, "days": days})
+            )
+            wrote += 1
+
+    return {"ok": True, "range": label, "since": since.isoformat(), "until": until.isoformat(), "rows_written": wrote}
 
 @app.get("/api/admin/leaderboard")
 async def get_leaderboard(range: str = Query("30d"), sort: str = Query("uploads"), user: dict = Depends(require_admin)):
@@ -5543,135 +5685,128 @@ async def delete_cost_model_config(config_id: str, user: dict = Depends(require_
 
 @app.get("/api/admin/calculator/quotes")
 async def get_enterprise_quotes(
-    status: Optional[str] = None, limit: int = 50, user: dict = Depends(require_admin)
+    status: Optional[str] = None,
+    limit: int = 50,
+    user: dict = Depends(require_admin),
 ):
-    """Get all enterprise quotes, optionally filtered by status."""
+    """Get enterprise quotes. Status filter applies only if column exists."""
     async with db_pool.acquire() as conn:
-        if status:
+        cols = await _get_table_cols(conn, "enterprise_quotes")
+        has_status = "status" in cols
+        if status and has_status:
             rows = await conn.fetch(
                 "SELECT * FROM enterprise_quotes WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
                 status, limit
             )
         else:
             rows = await conn.fetch(
-                "SELECT * FROM enterprise_quotes ORDER BY created_at DESC LIMIT $1", limit
+                "SELECT * FROM enterprise_quotes ORDER BY created_at DESC LIMIT $1",
+                limit
             )
-        return [
-            {
-                "id": str(r["id"]),
-                "user_id": str(r["user_id"]) if r["user_id"] else None,
-                "customer_name": r["customer_name"],
-                "assumptions_json": r["assumptions_json"],
-                "outputs_json": r["outputs_json"],
-                "status": r["status"],
-                "notes": r["notes"],
-                "created_by": str(r["created_by"]) if r["created_by"] else None,
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-            }
-            for r in rows
-        ]
 
+    out = []
+    for r in rows:
+        item = {
+            "id": str(r["id"]),
+            "customer_name": r.get("customer_name"),
+            "assumptions_json": r.get("assumptions") or {},
+            "outputs_json": r.get("outputs") or {},
+            "created_by_user_id": str(r["created_by_user_id"]) if r.get("created_by_user_id") else None,
+            "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+        }
+        if "status" in r:
+            item["status"] = r.get("status")
+        out.append(item)
+    return out
 
 @app.get("/api/admin/calculator/quotes/{quote_id}")
 async def get_enterprise_quote(quote_id: str, user: dict = Depends(require_admin)):
-    """Get a single enterprise quote by ID."""
     async with db_pool.acquire() as conn:
-        r = await conn.fetchrow("SELECT * FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
-        if not r:
-            raise HTTPException(404, "Quote not found")
-        return {
-            "id": str(r["id"]),
-            "user_id": str(r["user_id"]) if r["user_id"] else None,
-            "customer_name": r["customer_name"],
-            "assumptions_json": r["assumptions_json"],
-            "outputs_json": r["outputs_json"],
-            "status": r["status"],
-            "notes": r["notes"],
-            "created_by": str(r["created_by"]) if r["created_by"] else None,
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-        }
-
+        row = await conn.fetchrow("SELECT * FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
+        if not row:
+            raise HTTPException(status_code=404, detail="Quote not found")
+    resp = {
+        "id": str(row["id"]),
+        "customer_name": row.get("customer_name"),
+        "assumptions_json": row.get("assumptions") or {},
+        "outputs_json": row.get("outputs") or {},
+        "created_by_user_id": str(row.get("created_by_user_id")) if row.get("created_by_user_id") else None,
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+    }
+    if "status" in row:
+        resp["status"] = row.get("status")
+    return resp
 
 @app.post("/api/admin/calculator/quotes")
 async def create_enterprise_quote(data: EnterpriseQuoteCreate, user: dict = Depends(require_admin)):
-    """Create a new enterprise quote (saved deal scenario)."""
+    """Create a new enterprise quote."""
+    assumptions = getattr(data, "assumptions_json", None) or {}
+    outputs = getattr(data, "outputs_json", None) or {}
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """INSERT INTO enterprise_quotes (customer_name, assumptions_json, outputs_json, status, notes, created_by)
-               VALUES ($1, $2::jsonb, $3::jsonb, $4, $5, $6) RETURNING id, created_at""",
-            data.customer_name,
-            json.dumps(data.assumptions_json),
-            json.dumps(data.outputs_json),
-            data.status or "draft",
-            data.notes,
-            user["id"]
-        )
-        return {
-            "ok": True,
-            "id": str(row["id"]),
-            "created_at": row["created_at"].isoformat(),
-        }
-
+        cols = await _get_table_cols(conn, "enterprise_quotes")
+        has_status = "status" in cols
+        if has_status:
+            row = await conn.fetchrow(
+                """INSERT INTO enterprise_quotes (customer_name, assumptions, outputs, status, created_by_user_id)
+                   VALUES ($1, $2::jsonb, $3::jsonb, $4, $5)
+                   RETURNING id, created_at""",
+                data.customer_name,
+                json.dumps(assumptions),
+                json.dumps(outputs),
+                data.status or "draft",
+                user["id"],
+            )
+        else:
+            row = await conn.fetchrow(
+                """INSERT INTO enterprise_quotes (customer_name, assumptions, outputs, created_by_user_id)
+                   VALUES ($1, $2::jsonb, $3::jsonb, $4)
+                   RETURNING id, created_at""",
+                data.customer_name,
+                json.dumps(assumptions),
+                json.dumps(outputs),
+                user["id"],
+            )
+    return {"ok": True, "id": str(row["id"]), "created_at": row["created_at"].isoformat() if row.get("created_at") else None}
 
 @app.put("/api/admin/calculator/quotes/{quote_id}")
 async def update_enterprise_quote(quote_id: str, data: EnterpriseQuoteUpdate, user: dict = Depends(require_admin)):
-    """Update an enterprise quote."""
+    assumptions = getattr(data, "assumptions_json", None)
+    outputs = getattr(data, "outputs_json", None)
+
     async with db_pool.acquire() as conn:
+        cols = await _get_table_cols(conn, "enterprise_quotes")
+        has_status = "status" in cols
+
         existing = await conn.fetchrow("SELECT id FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
         if not existing:
-            raise HTTPException(404, "Quote not found")
+            raise HTTPException(status_code=404, detail="Quote not found")
 
-        updates = []
-        params = []
-        idx = 1
+        sets = []
+        args = []
+        n = 1
 
         if data.customer_name is not None:
-            updates.append(f"customer_name = ${idx}")
-            params.append(data.customer_name)
-            idx += 1
-        if data.assumptions_json is not None:
-            updates.append(f"assumptions_json = ${idx}::jsonb")
-            params.append(json.dumps(data.assumptions_json))
-            idx += 1
-        if data.outputs_json is not None:
-            updates.append(f"outputs_json = ${idx}::jsonb")
-            params.append(json.dumps(data.outputs_json))
-            idx += 1
-        if data.status is not None:
-            updates.append(f"status = ${idx}")
-            params.append(data.status)
-            idx += 1
-        if data.notes is not None:
-            updates.append(f"notes = ${idx}")
-            params.append(data.notes)
-            idx += 1
+            sets.append(f"customer_name = ${n}"); args.append(data.customer_name); n += 1
+        if assumptions is not None:
+            sets.append(f"assumptions = ${n}::jsonb"); args.append(json.dumps(assumptions)); n += 1
+        if outputs is not None:
+            sets.append(f"outputs = ${n}::jsonb"); args.append(json.dumps(outputs)); n += 1
+        if has_status and data.status is not None:
+            sets.append(f"status = ${n}"); args.append(data.status); n += 1
 
-        if not updates:
-            return {"ok": True, "message": "Nothing to update"}
+        if not sets:
+            return {"ok": True, "updated": False}
 
-        updates.append("updated_at = NOW()")
-        params.append(uuid.UUID(quote_id))
+        args.append(uuid.UUID(quote_id))
+        await conn.execute(f"UPDATE enterprise_quotes SET {', '.join(sets)} WHERE id = ${n}", *args)
 
-        await conn.execute(
-            f"UPDATE enterprise_quotes SET {', '.join(updates)} WHERE id = ${idx}",
-            *params
-        )
-        return {"ok": True, "id": quote_id}
-
+    return {"ok": True, "updated": True}
 
 @app.delete("/api/admin/calculator/quotes/{quote_id}")
 async def delete_enterprise_quote(quote_id: str, user: dict = Depends(require_admin)):
-    """Delete an enterprise quote."""
     async with db_pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
-        if result == "DELETE 0":
-            raise HTTPException(404, "Quote not found")
-        return {"ok": True}
-
-
-# ---- Calculator Live Data Feed (pulls real metrics for auto-populate) ----
+        res = await conn.execute("DELETE FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
+    return {"ok": True, "result": res}
 
 @app.get("/api/admin/calculator/live-metrics")
 async def get_calculator_live_metrics(user: dict = Depends(require_admin)):

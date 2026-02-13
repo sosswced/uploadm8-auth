@@ -1074,6 +1074,35 @@ async def run_migrations():
     ON platform_tokens (user_id, platform)
     WHERE revoked_at IS NULL;
 """),
+
+            # ---- Business Calculator Tables ----
+            (106, """CREATE TABLE IF NOT EXISTS cost_model_config (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                effective_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                notes TEXT,
+                created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_cost_model_config_date ON cost_model_config(effective_date DESC);
+            """),
+
+            (107, """CREATE TABLE IF NOT EXISTS enterprise_quotes (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                customer_name VARCHAR(255),
+                assumptions_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                outputs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                status VARCHAR(50) DEFAULT 'draft',
+                notes TEXT,
+                created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_enterprise_quotes_created ON enterprise_quotes(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_enterprise_quotes_status ON enterprise_quotes(status);
+            """),
 ]
         
         for version, sql in migrations:
@@ -5351,3 +5380,344 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "updatedAt": g("updated_at").isoformat() if g("updated_at") else None,
         "duration": g("duration"),
     }
+
+
+# ============================================================
+# BUSINESS CALCULATOR - Admin Endpoints
+# ============================================================
+
+class CostModelConfigCreate(BaseModel):
+    config_json: dict
+    notes: Optional[str] = None
+
+class CostModelConfigUpdate(BaseModel):
+    config_json: Optional[dict] = None
+    notes: Optional[str] = None
+
+class EnterpriseQuoteCreate(BaseModel):
+    customer_name: Optional[str] = None
+    assumptions_json: dict
+    outputs_json: dict
+    status: Optional[str] = "draft"
+    notes: Optional[str] = None
+
+class EnterpriseQuoteUpdate(BaseModel):
+    customer_name: Optional[str] = None
+    assumptions_json: Optional[dict] = None
+    outputs_json: Optional[dict] = None
+    status: Optional[str] = None
+    notes: Optional[str] = None
+
+
+# ---- Cost Model Config CRUD ----
+
+@app.get("/api/admin/calculator/config")
+async def get_cost_model_configs(limit: int = 20, user: dict = Depends(require_admin)):
+    """Get all saved cost model configurations (newest first)."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM cost_model_config ORDER BY effective_date DESC LIMIT $1", limit
+        )
+        return [
+            {
+                "id": str(r["id"]),
+                "effective_date": r["effective_date"].isoformat() if r["effective_date"] else None,
+                "config_json": r["config_json"],
+                "notes": r["notes"],
+                "created_by": str(r["created_by"]) if r["created_by"] else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+            for r in rows
+        ]
+
+
+@app.get("/api/admin/calculator/config/latest")
+async def get_latest_cost_model_config(user: dict = Depends(require_admin)):
+    """Get the most recent cost model config (used to pre-populate calculator)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM cost_model_config ORDER BY effective_date DESC LIMIT 1"
+        )
+        if not row:
+            return {"ok": True, "config": None}
+        return {
+            "ok": True,
+            "config": {
+                "id": str(row["id"]),
+                "effective_date": row["effective_date"].isoformat() if row["effective_date"] else None,
+                "config_json": row["config_json"],
+                "notes": row["notes"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
+        }
+
+
+@app.post("/api/admin/calculator/config")
+async def save_cost_model_config(data: CostModelConfigCreate, user: dict = Depends(require_admin)):
+    """Save a new cost model configuration snapshot."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO cost_model_config (config_json, notes, created_by)
+               VALUES ($1::jsonb, $2, $3) RETURNING id, effective_date, created_at""",
+            json.dumps(data.config_json), data.notes, user["id"]
+        )
+        return {
+            "ok": True,
+            "id": str(row["id"]),
+            "effective_date": row["effective_date"].isoformat(),
+            "created_at": row["created_at"].isoformat(),
+        }
+
+
+@app.put("/api/admin/calculator/config/{config_id}")
+async def update_cost_model_config(config_id: str, data: CostModelConfigUpdate, user: dict = Depends(require_admin)):
+    """Update an existing cost model configuration."""
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT id FROM cost_model_config WHERE id = $1", uuid.UUID(config_id))
+        if not existing:
+            raise HTTPException(404, "Config not found")
+
+        updates = []
+        params = []
+        idx = 1
+
+        if data.config_json is not None:
+            updates.append(f"config_json = ${idx}::jsonb")
+            params.append(json.dumps(data.config_json))
+            idx += 1
+        if data.notes is not None:
+            updates.append(f"notes = ${idx}")
+            params.append(data.notes)
+            idx += 1
+
+        if not updates:
+            return {"ok": True, "message": "Nothing to update"}
+
+        updates.append(f"updated_at = NOW()")
+        params.append(uuid.UUID(config_id))
+
+        await conn.execute(
+            f"UPDATE cost_model_config SET {', '.join(updates)} WHERE id = ${idx}",
+            *params
+        )
+        return {"ok": True, "id": config_id}
+
+
+@app.delete("/api/admin/calculator/config/{config_id}")
+async def delete_cost_model_config(config_id: str, user: dict = Depends(require_admin)):
+    """Delete a cost model configuration."""
+    async with db_pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM cost_model_config WHERE id = $1", uuid.UUID(config_id))
+        if result == "DELETE 0":
+            raise HTTPException(404, "Config not found")
+        return {"ok": True}
+
+
+# ---- Enterprise Quotes CRUD ----
+
+@app.get("/api/admin/calculator/quotes")
+async def get_enterprise_quotes(
+    status: Optional[str] = None, limit: int = 50, user: dict = Depends(require_admin)
+):
+    """Get all enterprise quotes, optionally filtered by status."""
+    async with db_pool.acquire() as conn:
+        if status:
+            rows = await conn.fetch(
+                "SELECT * FROM enterprise_quotes WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
+                status, limit
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM enterprise_quotes ORDER BY created_at DESC LIMIT $1", limit
+            )
+        return [
+            {
+                "id": str(r["id"]),
+                "user_id": str(r["user_id"]) if r["user_id"] else None,
+                "customer_name": r["customer_name"],
+                "assumptions_json": r["assumptions_json"],
+                "outputs_json": r["outputs_json"],
+                "status": r["status"],
+                "notes": r["notes"],
+                "created_by": str(r["created_by"]) if r["created_by"] else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+            for r in rows
+        ]
+
+
+@app.get("/api/admin/calculator/quotes/{quote_id}")
+async def get_enterprise_quote(quote_id: str, user: dict = Depends(require_admin)):
+    """Get a single enterprise quote by ID."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
+        if not r:
+            raise HTTPException(404, "Quote not found")
+        return {
+            "id": str(r["id"]),
+            "user_id": str(r["user_id"]) if r["user_id"] else None,
+            "customer_name": r["customer_name"],
+            "assumptions_json": r["assumptions_json"],
+            "outputs_json": r["outputs_json"],
+            "status": r["status"],
+            "notes": r["notes"],
+            "created_by": str(r["created_by"]) if r["created_by"] else None,
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+        }
+
+
+@app.post("/api/admin/calculator/quotes")
+async def create_enterprise_quote(data: EnterpriseQuoteCreate, user: dict = Depends(require_admin)):
+    """Create a new enterprise quote (saved deal scenario)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO enterprise_quotes (customer_name, assumptions_json, outputs_json, status, notes, created_by)
+               VALUES ($1, $2::jsonb, $3::jsonb, $4, $5, $6) RETURNING id, created_at""",
+            data.customer_name,
+            json.dumps(data.assumptions_json),
+            json.dumps(data.outputs_json),
+            data.status or "draft",
+            data.notes,
+            user["id"]
+        )
+        return {
+            "ok": True,
+            "id": str(row["id"]),
+            "created_at": row["created_at"].isoformat(),
+        }
+
+
+@app.put("/api/admin/calculator/quotes/{quote_id}")
+async def update_enterprise_quote(quote_id: str, data: EnterpriseQuoteUpdate, user: dict = Depends(require_admin)):
+    """Update an enterprise quote."""
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT id FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
+        if not existing:
+            raise HTTPException(404, "Quote not found")
+
+        updates = []
+        params = []
+        idx = 1
+
+        if data.customer_name is not None:
+            updates.append(f"customer_name = ${idx}")
+            params.append(data.customer_name)
+            idx += 1
+        if data.assumptions_json is not None:
+            updates.append(f"assumptions_json = ${idx}::jsonb")
+            params.append(json.dumps(data.assumptions_json))
+            idx += 1
+        if data.outputs_json is not None:
+            updates.append(f"outputs_json = ${idx}::jsonb")
+            params.append(json.dumps(data.outputs_json))
+            idx += 1
+        if data.status is not None:
+            updates.append(f"status = ${idx}")
+            params.append(data.status)
+            idx += 1
+        if data.notes is not None:
+            updates.append(f"notes = ${idx}")
+            params.append(data.notes)
+            idx += 1
+
+        if not updates:
+            return {"ok": True, "message": "Nothing to update"}
+
+        updates.append("updated_at = NOW()")
+        params.append(uuid.UUID(quote_id))
+
+        await conn.execute(
+            f"UPDATE enterprise_quotes SET {', '.join(updates)} WHERE id = ${idx}",
+            *params
+        )
+        return {"ok": True, "id": quote_id}
+
+
+@app.delete("/api/admin/calculator/quotes/{quote_id}")
+async def delete_enterprise_quote(quote_id: str, user: dict = Depends(require_admin)):
+    """Delete an enterprise quote."""
+    async with db_pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
+        if result == "DELETE 0":
+            raise HTTPException(404, "Quote not found")
+        return {"ok": True}
+
+
+# ---- Calculator Live Data Feed (pulls real metrics for auto-populate) ----
+
+@app.get("/api/admin/calculator/live-metrics")
+async def get_calculator_live_metrics(user: dict = Depends(require_admin)):
+    """Pull real-time business metrics to pre-populate calculator inputs.
+    Returns actual customer counts by tier, video volumes, cost data, etc."""
+    async with db_pool.acquire() as conn:
+        # Customer counts by tier
+        tier_rows = await conn.fetch(
+            """SELECT subscription_tier, COUNT(*) as cnt
+               FROM users WHERE status = 'active'
+               GROUP BY subscription_tier"""
+        )
+        tier_counts = {r["subscription_tier"]: r["cnt"] for r in tier_rows}
+
+        # Upload volume last 30 days
+        upload_stats = await conn.fetchrow(
+            """SELECT COUNT(*) as total_uploads,
+                      COUNT(DISTINCT user_id) as active_uploaders,
+                      AVG(file_size) as avg_file_size,
+                      AVG(compute_seconds) as avg_compute_seconds
+               FROM uploads
+               WHERE created_at > NOW() - INTERVAL '30 days'
+                 AND status NOT IN ('cancelled', 'deleted')"""
+        )
+
+        # Average platforms per upload
+        platform_avg = await conn.fetchrow(
+            """SELECT AVG(array_length(platforms, 1)) as avg_platforms
+               FROM uploads
+               WHERE created_at > NOW() - INTERVAL '30 days'
+                 AND platforms IS NOT NULL AND array_length(platforms, 1) > 0"""
+        )
+
+        # Cost data last 30 days
+        cost_rows = await conn.fetch(
+            """SELECT category, SUM(cost_usd) as total_cost
+               FROM cost_tracking
+               WHERE created_at > NOW() - INTERVAL '30 days'
+               GROUP BY category"""
+        )
+        cost_by_category = {r["category"]: float(r["total_cost"] or 0) for r in cost_rows}
+
+        # Revenue last 30 days
+        rev_row = await conn.fetchrow(
+            """SELECT SUM(amount) as total_revenue
+               FROM revenue_tracking
+               WHERE created_at > NOW() - INTERVAL '30 days'"""
+        )
+
+        # AI usage rate
+        ai_stats = await conn.fetchrow(
+            """SELECT
+                 COUNT(*) FILTER (WHERE aic_spent > 0) as ai_uploads,
+                 COUNT(*) as total_uploads
+               FROM uploads
+               WHERE created_at > NOW() - INTERVAL '30 days'
+                 AND status NOT IN ('cancelled', 'deleted')"""
+        )
+
+        total_u = ai_stats["total_uploads"] if ai_stats else 0
+        ai_u = ai_stats["ai_uploads"] if ai_stats else 0
+
+        return {
+            "ok": True,
+            "tier_counts": tier_counts,
+            "uploads_30d": upload_stats["total_uploads"] if upload_stats else 0,
+            "active_uploaders_30d": upload_stats["active_uploaders"] if upload_stats else 0,
+            "avg_file_size_mb": round(float(upload_stats["avg_file_size"] or 0) / (1024 * 1024), 1) if upload_stats else 0,
+            "avg_compute_seconds": round(float(upload_stats["avg_compute_seconds"] or 0), 1) if upload_stats else 0,
+            "avg_platforms_per_upload": round(float(platform_avg["avg_platforms"] or 0), 2) if platform_avg else 0,
+            "cost_by_category_30d": cost_by_category,
+            "total_revenue_30d": float(rev_row["total_revenue"] or 0) if rev_row else 0,
+            "ai_usage_rate": round(ai_u / total_u, 3) if total_u > 0 else 0,
+        }

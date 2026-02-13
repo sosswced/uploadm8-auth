@@ -277,6 +277,9 @@ Respond with ONLY the number (1-5) of the best thumbnail. Example: "3" """
             )
             
             if response.status_code != 200:
+                if response.status_code in (401, 403):
+                    logger.warning(f"OpenAI thumbnail selection unauthorized/forbidden ({response.status_code}); using heuristic.")
+                    return screenshots[len(screenshots) // 3]
                 logger.warning(f"OpenAI thumbnail selection failed: {response.status_code}")
                 return screenshots[len(screenshots) // 3]
             

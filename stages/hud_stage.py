@@ -32,7 +32,9 @@ def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
     Returns:
         Path to generated SRT file
     """
-    if not ctx.telemetry or not ctx.telemetry.data_points:
+    telemetry = getattr(ctx, "telemetry", None)
+    points = getattr(telemetry, "data_points", None) or getattr(telemetry, "points", None) or []
+    if not telemetry or not points:
         raise HUDError(
             "No telemetry data for HUD",
             code=ErrorCode.HUD_GENERATION_FAILED
@@ -49,7 +51,7 @@ def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
     
     with open(output_path, 'w') as f:
-        data_points = ctx.telemetry.data_points
+        data_points = points
         for i, point in enumerate(data_points):
             start_time = point['timestamp']
             end_time = data_points[i + 1]['timestamp'] if i + 1 < len(data_points) else start_time + 0.5
@@ -150,7 +152,9 @@ async def run_hud_stage(ctx: JobContext) -> JobContext:
         raise SkipStage("HUD not available for this tier")
     
     # Check if we have telemetry data
-    if not ctx.telemetry or not ctx.telemetry.data_points:
+    telemetry = getattr(ctx, "telemetry", None)
+    points = getattr(telemetry, "data_points", None) or getattr(telemetry, "points", None) or []
+    if not telemetry or not points:
         raise SkipStage("No telemetry data for HUD overlay")
     
     # Check if we have video

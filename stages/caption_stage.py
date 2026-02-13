@@ -373,6 +373,9 @@ If you're not generating something, use null for that field."""
                 }
             )
             if response.status_code != 200:
+                if response.status_code in (401, 403):
+                    logger.warning(f"OpenAI unauthorized/forbidden ({response.status_code}); falling back.")
+                    return result
                 logger.error(f"OpenAI API error: {response.status_code} - {response.text[:200]}")
                 return result
             data = response.json()

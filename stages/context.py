@@ -24,6 +24,48 @@ class TelemetryData:
     speeding_seconds: float = 0.0
     euphoria_seconds: float = 0.0
 
+# Back-compat for older stages
+@property
+def data_points(self) -> List[Dict[str, Any]]:
+    return self.points
+
+@data_points.setter
+def data_points(self, v: List[Dict[str, Any]]):
+    self.points = v
+
+# Back-compat aggregate aliases
+@property
+def max_speed(self) -> float:
+    return self.max_speed_mph
+
+@max_speed.setter
+def max_speed(self, v: float):
+    self.max_speed_mph = float(v or 0)
+
+@property
+def avg_speed(self) -> float:
+    return self.avg_speed_mph
+
+@avg_speed.setter
+def avg_speed(self, v: float):
+    self.avg_speed_mph = float(v or 0)
+
+@property
+def distance_miles(self) -> float:
+    return self.total_distance_miles
+
+@distance_miles.setter
+def distance_miles(self, v: float):
+    self.total_distance_miles = float(v or 0)
+
+@property
+def total_duration(self) -> float:
+    return self.duration_seconds
+
+@total_duration.setter
+def total_duration(self, v: float):
+    self.duration_seconds = float(v or 0)
+
 
 @dataclass
 class TrillScore:
@@ -97,6 +139,11 @@ class JobContext:
     
     telemetry_data: Optional[TelemetryData] = None
     trill_score: Optional[TrillScore] = None
+
+    # Back-compat aliases used by older stages
+    telemetry: Optional[TelemetryData] = None
+    trill: Optional[TrillScore] = None
+    hud_applied: bool = False
     
     platform_results: List[PlatformResult] = field(default_factory=list)
     output_artifacts: Dict[str, str] = field(default_factory=dict)
@@ -110,6 +157,18 @@ class JobContext:
     aic_cost: int = 0
     compute_seconds: float = 0.0
     
+def __post_init__(self):
+    # Keep legacy and new fields in sync
+    if self.telemetry is None and self.telemetry_data is not None:
+        self.telemetry = self.telemetry_data
+    if self.telemetry_data is None and self.telemetry is not None:
+        self.telemetry_data = self.telemetry
+
+    if self.trill is None and self.trill_score is not None:
+        self.trill = self.trill_score
+    if self.trill_score is None and self.trill is not None:
+        self.trill_score = self.trill
+
     def mark_stage(self, stage: str):
         self.stage = stage
     

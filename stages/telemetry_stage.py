@@ -80,12 +80,11 @@ def parse_map_file(map_path: Path) -> TelemetryData:
     
     # Calculate aggregate stats
     speeds = [p['speed_mph'] for p in data_points]
-    telemetry = TelemetryData(
-        data_points=data_points,
-        max_speed=max(speeds),
-        avg_speed=sum(speeds) / len(speeds),
-        total_duration=data_points[-1]['timestamp'] - data_points[0]['timestamp'] if len(data_points) > 1 else 0,
-    )
+    telemetry = TelemetryData()
+    telemetry.points = data_points
+    telemetry.max_speed_mph = max(speeds)
+    telemetry.avg_speed_mph = sum(speeds) / len(speeds)
+    telemetry.duration_seconds = (data_points[-1]['timestamp'] - data_points[0]['timestamp']) if len(data_points) > 1 else 0.0
     
     # Estimate distance (rough approximation)
     if len(data_points) > 1:
@@ -213,6 +212,11 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
         TelemetryError: If processing fails
     """
     if not ctx.local_telemetry_path or not ctx.local_telemetry_path.exists():
+        # Ensure downstream stages never crash on missing attributes
+        ctx.telemetry = None
+        ctx.telemetry_data = None
+        ctx.trill = None
+        ctx.trill_score = None
         raise SkipStage("No telemetry file available")
     
     logger.info(f"Processing telemetry for upload {ctx.upload_id}")
@@ -220,6 +224,7 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
     # Parse telemetry
     telemetry = parse_map_file(ctx.local_telemetry_path)
     ctx.telemetry = telemetry
+    ctx.telemetry_data = telemetry
     
     # Get user thresholds from settings
     speeding_mph = ctx.user_settings.get("speeding_mph", DEFAULT_SPEEDING_MPH)
@@ -228,6 +233,7 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
     # Calculate Trill score
     trill = calculate_trill_score(telemetry, speeding_mph, euphoria_mph)
     ctx.trill = trill
+    ctx.trill_score = trill
     
     logger.info(f"Trill score: {trill.score} ({trill.bucket})")
     

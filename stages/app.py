@@ -13,6 +13,65 @@ import os
 import csv
 import io
 import json
+
+
+# ---------------------------------------------------------------------------
+# DB JSON CODECS (architectural cleanliness)
+# Forces asyncpg to decode json/jsonb into Python objects.
+# Keep _safe_json as a belt-and-suspenders fallback until schema is fully normalized.
+# ---------------------------------------------------------------------------
+async def _init_asyncpg_codecs(conn):
+    try:
+        await conn.set_type_codec(
+            'json',
+            encoder=lambda v: json.dumps(v, separators=(',', ':'), ensure_ascii=False),
+            decoder=json.loads,
+            schema='pg_catalog',
+        )
+    except Exception:
+        pass
+    try:
+        await conn.set_type_codec(
+            'jsonb',
+            encoder=lambda v: json.dumps(v, separators=(',', ':'), ensure_ascii=False),
+            decoder=json.loads,
+            schema='pg_catalog',
+        )
+    except Exception:
+        pass
+
+_UPLOADS_COLS = None
+
+async def _load_uploads_columns(pool):
+    """Cache uploads column set to avoid UndefinedColumnError when schema drifts."""
+    global _UPLOADS_COLS
+    if _UPLOADS_COLS is not None:
+        return _UPLOADS_COLS
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT column_name
+                 FROM information_schema.columns
+                 WHERE table_schema='public' AND table_name='uploads'"""
+        )
+        _UPLOADS_COLS = {r['column_name'] for r in rows}
+    return _UPLOADS_COLS
+
+def _pick_cols(wanted, available):
+    return [c for c in wanted if c in available]
+
+
+def _safe_json(v, default):
+    """Parse JSON stored as text OR already-parsed objects. Defensive until schema is fully jsonb."""
+    if v is None:
+        return default
+    if isinstance(v, (list, dict)):
+        return v
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except Exception:
+            return default
+    return default
 import secrets
 import hashlib
 import base64
@@ -748,7 +807,8 @@ async def lifespan(app: FastAPI):
     init_enc_keys()
     if STRIPE_SECRET_KEY: stripe.api_key = STRIPE_SECRET_KEY
     
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, init=_init_asyncpg_codecs)
+    await _load_uploads_columns(db_pool)
     logger.info("Database connected")
     
     await run_migrations()
@@ -799,6 +859,13 @@ async def run_migrations():
                 created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"""),
             (2, "CREATE TABLE IF NOT EXISTS refresh_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, token_hash VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())"),
             (3, "CREATE TABLE IF NOT EXISTS platform_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, platform VARCHAR(50) NOT NULL, account_id VARCHAR(255), account_name VARCHAR(255), account_username VARCHAR(255), account_avatar VARCHAR(512), token_blob JSONB NOT NULL, is_primary BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"),
+            (31, """
+                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+                CREATE INDEX IF NOT EXISTS idx_platform_tokens_user_platform_active ON platform_tokens(user_id, platform) WHERE revoked_at IS NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_platform_tokens_active_identity ON platform_tokens(user_id, platform, account_id)
+                    WHERE revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '';
+            """),
+
             (4, """CREATE TABLE IF NOT EXISTS uploads (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE,
                 r2_key VARCHAR(512) NOT NULL, telemetry_r2_key VARCHAR(512), processed_r2_key VARCHAR(512), thumbnail_r2_key VARCHAR(512),
@@ -979,6 +1046,10 @@ async def run_migrations():
                 expires_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );"""),
+
+(510, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS description TEXT"),
+(511, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"),
+(512, "UPDATE account_groups SET updated_at = NOW() WHERE updated_at IS NULL"),
 ]
         
         for version, sql in migrations:
@@ -2742,7 +2813,12 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             "blockedHashtags": blocked_tags or [],
             "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": d.get("email_notifications", True),
-            "discordWebhook": d.get("discord_webhook")
+            "discordWebhook": d.get("discord_webhook"),
+            "trillEnabled": bool(d.get("trill_enabled", False)),
+            "trillMinScore": int(d.get("trill_min_score", 0) or 0),
+            "trillHudEnabled": bool(d.get("trill_hud_enabled", False)),
+            "trillAiEnhance": bool(d.get("trill_ai_enhance", False)),
+            "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
         }
 
 @app.post("/api/settings/preferences")
@@ -2774,6 +2850,11 @@ async def save_user_preferences(
         "platformHashtags": "platform_hashtags",
         "emailNotifications": "email_notifications",
         "discordWebhook": "discord_webhook",
+        "trillEnabled": "trill_enabled",
+        "trillMinScore": "trill_min_score",
+        "trillHudEnabled": "trill_hud_enabled",
+        "trillAiEnhance": "trill_ai_enhance",
+        "trillOpenaiModel": "trill_openai_model",
     }
 
     def normalize_prefs_payload(p: dict) -> dict:
@@ -3018,35 +3099,147 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     }
 
 
+
+class AccountGroupIn(BaseModel):
+    name: str
+    color: str | None = None
+    account_ids: list[str] | None = None
+
+class AccountGroupUpdate(BaseModel):
+    name: str | None = None
+    color: str | None = None
+    account_ids: list[str] | None = None
+
+
 @app.get("/api/groups")
 async def get_groups(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        groups = await conn.fetch("SELECT * FROM account_groups WHERE user_id = $1 ORDER BY created_at DESC", user["id"])
-    return [{"id": str(g["id"]), "name": g["name"], "account_ids": g["account_ids"] or [], "color": g["color"], "created_at": g["created_at"].isoformat() if g["created_at"] else None} for g in groups]
+        groups = await conn.fetch(
+            """
+            SELECT id, user_id, name, description, account_ids, color, created_at, updated_at
+            FROM account_groups
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            """,
+            user["id"],
+        )
+    return [
+        {
+            "id": str(g["id"]),
+            "name": g["name"],
+            "description": g["description"],
+            "account_ids": g["account_ids"] or [],
+            "members": g["account_ids"] or [],
+            "color": g["color"],
+            "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+            "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
+        }
+        for g in groups
+    ]
+
+
+@app.get("/api/groups/{group_id}")
+async def get_group(group_id: str, user: dict = Depends(get_current_user)):
+    async with db_pool.acquire() as conn:
+        g = await conn.fetchrow(
+            """
+            SELECT id, user_id, name, description, account_ids, color, created_at, updated_at
+            FROM account_groups
+            WHERE id = $1 AND user_id = $2
+            """,
+            group_id,
+            user["id"],
+        )
+    if not g:
+        raise HTTPException(404, "Group not found")
+    return {
+        "id": str(g["id"]),
+        "name": g["name"],
+        "description": g["description"],
+        "account_ids": g["account_ids"] or [],
+        "members": g["account_ids"] or [],
+        "color": g["color"],
+        "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+        "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
+    }
+
+
+class GroupUpsert(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    color: Optional[str] = None
+    account_ids: Optional[List[str]] = None  # platform_tokens.id values as strings
+    members: Optional[List[str]] = None      # frontend alias for account_ids
+
 
 @app.post("/api/groups")
-async def create_group(name: str = Query(...), color: str = Query("#3b82f6"), user: dict = Depends(get_current_user)):
+async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_user)):
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    color = payload.color or "#3b82f6"
+    account_ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
+    group_id = str(uuid.uuid4())
+
     async with db_pool.acquire() as conn:
-        group_id = str(uuid.uuid4())
-        await conn.execute("INSERT INTO account_groups (id, user_id, name, color) VALUES ($1, $2, $3, $4)", group_id, user["id"], name, color)
-    return {"id": group_id, "name": name, "color": color, "account_ids": []}
+        await conn.execute(
+            """
+            INSERT INTO account_groups (id, user_id, name, description, account_ids, color, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+            """,
+            group_id,
+            user["id"],
+            name,
+            payload.description,
+            account_ids,
+            color,
+        )
+
+    return {"id": group_id, "name": name, "description": payload.description, "color": color, "account_ids": account_ids, "members": account_ids}
+
 
 @app.put("/api/groups/{group_id}")
-async def update_group(group_id: str, name: str = Query(None), color: str = Query(None), account_ids: List[str] = Query(None), user: dict = Depends(get_current_user)):
-    updates, params = [], [group_id, user["id"]]
-    if name:
+async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends(get_current_user)):
+    updates = []
+    params = [group_id, user["id"]]
+
+    if payload.name is not None:
         updates.append(f"name = ${len(params)+1}")
-        params.append(name)
-    if color:
+        params.append(payload.name.strip())
+
+    if payload.description is not None:
+        updates.append(f"description = ${len(params)+1}")
+        params.append(payload.description)
+
+    if payload.color is not None:
         updates.append(f"color = ${len(params)+1}")
-        params.append(color)
-    if account_ids is not None:
+        params.append(payload.color)
+
+    # accept either account_ids or members
+    if payload.account_ids is not None or payload.members is not None:
+        ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
         updates.append(f"account_ids = ${len(params)+1}")
-        params.append(account_ids)
-    if updates:
-        async with db_pool.acquire() as conn:
-            await conn.execute(f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2", *params)
+        params.append(ids)
+
+    updates.append("updated_at = NOW()")
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM account_groups WHERE id = $1 AND user_id = $2",
+            group_id,
+            user["id"],
+        )
+        if not row:
+            raise HTTPException(404, "Group not found")
+
+        if updates:
+            await conn.execute(
+                f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2",
+                *params,
+            )
+
     return {"status": "updated"}
+
 
 @app.delete("/api/groups/{group_id}")
 async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
@@ -3060,7 +3253,16 @@ async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
 @app.get("/api/platforms")
 async def get_platforms(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at FROM platform_tokens WHERE user_id = $1 ORDER BY platform, created_at", user["id"])
+        accounts = await conn.fetch("""
+            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
+                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+            FROM platform_tokens
+            WHERE user_id = $1
+              AND revoked_at IS NULL
+              AND account_id IS NOT NULL AND account_id <> ''
+              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
+            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
+        """, user["id"])
     
     platforms = {}
     for acc in accounts:
@@ -3077,7 +3279,16 @@ async def get_platforms(user: dict = Depends(get_current_user)):
 async def get_platform_accounts(user: dict = Depends(get_current_user)):
     """Returns flat list of accounts for frontend compatibility"""
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at FROM platform_tokens WHERE user_id = $1 ORDER BY platform, created_at", user["id"])
+        accounts = await conn.fetch("""
+            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
+                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+            FROM platform_tokens
+            WHERE user_id = $1
+              AND revoked_at IS NULL
+              AND account_id IS NOT NULL AND account_id <> ''
+              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
+            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
+        """, user["id"])
     
     result = []
     for acc in accounts:
@@ -3098,7 +3309,7 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
 async def get_accounts_simple(user: dict = Depends(get_current_user)):
     """Simple accounts list for dashboard"""
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1", user["id"])
+        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id) id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '' AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '') ORDER BY platform, account_id, created_at DESC", user["id"])
     return [{"id": str(a["id"]), "platform": a["platform"], "name": a["account_name"], "username": a["account_username"], "avatar": a["account_avatar"], "status": "active"} for a in accounts]
 
 @app.delete("/api/platforms/{platform}/accounts/{account_id}")
@@ -3405,6 +3616,10 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 account_username = ""
                 account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
             
+            # Refuse to persist "ghost" connections with no identity
+            if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
+                raise Exception("Provider did not return account_id; refusing to store token (prevents phantom accounts).")
+
             # Store the token
             token_blob = encrypt_blob({
                 "access_token": access_token,
@@ -3657,7 +3872,7 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
     plan = get_plan(user.get("subscription_tier", "free"))
     if not plan.get("excel"): raise HTTPException(403, "Excel export requires Studio+ plan")
     
-    minutes = {"7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
@@ -4170,7 +4385,7 @@ async def get_announcements(limit: int = 20, user: dict = Depends(require_admin)
 # ============================================================
 @app.get("/api/admin/kpi/overview")
 async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
-    minutes = {"7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
     
     async with db_pool.acquire() as conn:
@@ -4199,6 +4414,94 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
         "revenue": {"total": float(revenue["total"]) if revenue else 0, "subscriptions": float(revenue["subscriptions"]) if revenue else 0, "topups": float(revenue["topups"]) if revenue else 0, "mrr": mrr},
         "tiers": {t["subscription_tier"]: t["count"] for t in tiers},
     }
+@app.get("/api/admin/analytics/overview")
+async def admin_analytics_overview(
+    range: Optional[str] = Query(None, description="Time window: 7d|30d|90d|6m|1y|Nd (custom)"),
+    days: Optional[int] = Query(None, ge=1, le=3650, description="Compatibility: days=N"),
+    user: dict = Depends(require_admin),
+):
+    """
+    Admin analytics overview for the selected time window.
+
+    Contract (frontend expects):
+      - total_users
+      - new_users
+      - paid_users
+      - mrr_estimate
+      - range
+
+    Supports:
+      - ?range=7d|30d|90d|6m|1y
+      - ?range=45d (custom, guarded 1–3650)
+      - ?days=45 (compat)
+    """
+    # -------- range parsing (authoritative) --------
+    preset_map = {"7d": 7, "30d": 30, "90d": 90, "6m": 180, "1y": 365}
+    window_days = None
+
+    if days is not None:
+        window_days = int(days)
+
+    if range:
+        r = str(range).strip().lower()
+        if r in preset_map:
+            window_days = preset_map[r]
+        else:
+            m = re.match(r"^(\d{1,4})d$", r)
+            if m:
+                window_days = int(m.group(1))
+            else:
+                raise HTTPException(status_code=400, detail="Invalid range. Use 7d|30d|90d|6m|1y or Nd (e.g. 45d).")
+
+    if window_days is None:
+        window_days = 30
+
+    if window_days < 1 or window_days > 3650:
+        raise HTTPException(status_code=400, detail="Range out of bounds. Use 1–3650 days.")
+
+    since = _now_utc() - timedelta(days=window_days)
+
+    # -------- KPI aggregation --------
+    # We intentionally avoid a dependency on a billing_events table (not guaranteed to exist).
+    # Instead, derive paid_users + mrr_estimate from users.subscription_tier + users.subscription_status.
+    paid_tiers = ["launch", "creator_pro", "studio", "agency"]
+
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+
+        new_users = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= $1",
+            since,
+        )
+
+        paid_rows = await conn.fetch(
+            """
+            SELECT subscription_tier, COUNT(*)::bigint AS c
+            FROM users
+            WHERE subscription_status = 'active'
+              AND subscription_tier = ANY($1::text[])
+            GROUP BY subscription_tier
+            """,
+            paid_tiers,
+        )
+
+    counts = {row["subscription_tier"]: int(row["c"]) for row in paid_rows}
+    paid_users = sum(counts.values())
+
+    # MRR estimate based on PLAN_CONFIG prices
+    mrr_estimate = 0.0
+    for tier, c in counts.items():
+        price = float(get_plan(tier).get("price", 0) or 0)
+        mrr_estimate += price * c
+
+    return {
+        "total_users": int(total_users or 0),
+        "new_users": int(new_users or 0),
+        "paid_users": int(paid_users or 0),
+        "mrr_estimate": float(mrr_estimate),
+        "range": f"{window_days}d",
+    }
+
 
 @app.get("/api/admin/kpi/margins")
 async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
@@ -4354,6 +4657,36 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
 # ============================================================
 # ADDITIONAL KPI ENDPOINTS (Added for frontend compatibility)
 # ============================================================
+
+# ------------------------------------------------------------
+# Time range parsing (supports presets + custom 'Nd')
+# ------------------------------------------------------------
+_RANGE_PRESETS_MINUTES = {
+    "24h": 24 * 60,
+    "7d": 7 * 24 * 60,
+    "30d": 30 * 24 * 60,
+    "90d": 90 * 24 * 60,
+    "6m": 180 * 24 * 60,
+    "1y": 365 * 24 * 60,
+}
+
+def _range_to_minutes(range_str: str | None, default_minutes: int) -> int:
+    r = (range_str or "").strip()
+    if not r:
+        return default_minutes
+    if r in _RANGE_PRESETS_MINUTES:
+        return _RANGE_PRESETS_MINUTES[r]
+    m = re.fullmatch(r"(\d{1,4})d", r)
+    if m:
+        days = int(m.group(1))
+        # Guardrails: 1 day .. 10 years
+        days = max(1, min(days, 3650))
+        return days * 24 * 60
+    return default_minutes
+
+def _range_label(range_str: str | None, fallback: str = "30d") -> str:
+    r = (range_str or "").strip()
+    return r if r else fallback
 
 @app.get("/api/admin/kpis")
 async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):
@@ -4937,3 +5270,70 @@ async def generate_trill_preview(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user)):
+    cols = await _load_uploads_columns(db_pool)
+    wanted = [
+        "id","user_id","r2_key","filename","file_size","platforms",
+        "title","caption","hashtags","privacy","status","cancel_requested",
+        "scheduled_time","schedule_mode",
+        "processing_started_at","processing_finished_at","completed_at",
+        "error_code","error_detail",
+        "put_reserved","put_spent","aic_reserved","aic_spent",
+        "views","likes","comments","shares",
+        "thumbnail_r2_key","video_url","platform_results",
+        "created_at","updated_at","duration",
+    ]
+    select_cols = _pick_cols(wanted, cols)
+    if not select_cols:
+        raise HTTPException(status_code=500, detail="Uploads table has no readable columns")
+
+    sql = f"""SELECT {', '.join(select_cols)} FROM uploads
+               WHERE id = $1 AND user_id = $2"""
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(sql, upload_id, user["id"])
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    def g(k, default=None):
+        return row[k] if k in row else default
+
+    return {
+        "id": str(g("id")),
+        "userId": str(g("user_id")),
+        "r2Key": g("r2_key"),
+        "filename": g("filename"),
+        "fileSize": g("file_size"),
+        "platforms": _safe_json(g("platforms"), []),
+        "title": g("title"),
+        "caption": g("caption"),
+        "hashtags": _safe_json(g("hashtags"), []),
+        "privacy": g("privacy"),
+        "status": g("status"),
+        "cancelRequested": bool(g("cancel_requested", False)),
+        "scheduledTime": g("scheduled_time").isoformat() if g("scheduled_time") else None,
+        "scheduleMode": g("schedule_mode"),
+        "processingStartedAt": g("processing_started_at").isoformat() if g("processing_started_at") else None,
+        "processingFinishedAt": g("processing_finished_at").isoformat() if g("processing_finished_at") else None,
+        "completedAt": g("completed_at").isoformat() if g("completed_at") else None,
+        "errorCode": g("error_code"),
+        "errorDetail": g("error_detail"),
+        "putReserved": g("put_reserved"),
+        "putSpent": g("put_spent"),
+        "aicReserved": g("aic_reserved"),
+        "aicSpent": g("aic_spent"),
+        "views": g("views"),
+        "likes": g("likes"),
+        "comments": g("comments"),
+        "shares": g("shares"),
+        "thumbnailR2Key": g("thumbnail_r2_key"),
+        "videoUrl": g("video_url"),
+        "platformResults": _safe_json(g("platform_results"), {}),
+        "createdAt": g("created_at").isoformat() if g("created_at") else None,
+        "updatedAt": g("updated_at").isoformat() if g("updated_at") else None,
+        "duration": g("duration"),
+    }

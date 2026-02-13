@@ -564,6 +564,8 @@ class UploadInit(BaseModel):
     file_size: int
     content_type: str
     platforms: List[str]
+    group_id: Optional[str] = None
+    account_targets: Optional[dict] = None  # {platform: platform_token_id}
     title: str = ""
     caption: str = ""
     hashtags: List[str] = []
@@ -573,6 +575,14 @@ class UploadInit(BaseModel):
     has_telemetry: bool = False
     use_ai: bool = False
     smart_schedule_days: int = 7  # How many days to spread uploads across
+
+
+class UploadComplete(BaseModel):
+    # Optional overrides at completion time
+    platforms: Optional[List[str]] = None
+    privacy: Optional[str] = None
+    group_id: Optional[str] = None
+    account_targets: Optional[dict] = None  # {platform: platform_token_id}
 
 class SettingsUpdate(BaseModel):
     discord_webhook: Optional[str] = None
@@ -2138,6 +2148,15 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
             schedule_metadata = {p: dt.isoformat() for p, dt in smart_schedule.items()}
             scheduled_time = min(smart_schedule.values())
 
+        # Ensure schedule_metadata exists so we can persist selection context
+        if schedule_metadata is None:
+            schedule_metadata = {}
+        # Persist multi-account routing context (safe even if worker ignores for now)
+        if getattr(data, "group_id", None):
+            schedule_metadata["group_id"] = data.group_id
+        if getattr(data, "account_targets", None):
+            schedule_metadata["account_targets"] = data.account_targets
+
         # Store upload with preferences metadata
         await conn.execute("""
             INSERT INTO uploads (
@@ -2151,7 +2170,7 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
             upload_id, user["id"], r2_key, data.filename, data.file_size,
             data.platforms, data.title, data.caption, data.hashtags,
             data.privacy, scheduled_time, data.schedule_mode, put_cost,
-            aic_cost, json.dumps(schedule_metadata) if schedule_metadata else None,
+            aic_cost, json.dumps(schedule_metadata) if schedule_metadata is not None else None,
             json.dumps(user_prefs)
         )
 
@@ -2205,7 +2224,7 @@ async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = 
     }
 
 @app.post("/api/uploads/{upload_id}/complete")
-async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)):
+async def complete_upload(upload_id: str, data: Optional[UploadComplete] = Body(None), user: dict = Depends(get_current_user)):
     """Complete upload and enqueue with preferences"""
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(

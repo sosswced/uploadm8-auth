@@ -1120,6 +1120,26 @@ async def run_migrations():
             CREATE INDEX IF NOT EXISTS idx_enterprise_quotes_created ON enterprise_quotes(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_enterprise_quotes_status ON enterprise_quotes(status);
             """),
+
+            (108, """CREATE OR REPLACE VIEW internal_usage_30d AS
+            SELECT
+                u.subscription_tier,
+                u.role,
+                COUNT(up.id) as upload_count,
+                COALESCE(SUM(up.put_spent), 0) as put_consumed,
+                COALESCE(SUM(up.aic_spent), 0) as aic_consumed,
+                COALESCE(SUM(up.compute_seconds), 0) as compute_seconds,
+                COALESCE(SUM(up.storage_bytes), 0) as storage_bytes,
+                COALESCE(SUM(up.cost_attributed), 0) as cost_attributed
+            FROM users u
+            LEFT JOIN uploads up ON up.user_id = u.id
+                AND up.created_at > NOW() - INTERVAL '30 days'
+                AND up.status NOT IN ('cancelled', 'deleted')
+            WHERE u.status = 'active'
+              AND (u.role IN ('admin', 'master_admin')
+                   OR u.subscription_tier IN ('friends_family', 'lifetime'))
+            GROUP BY u.subscription_tier, u.role
+            ;"""),
 ]
         
         for version, sql in migrations:
@@ -5821,6 +5841,18 @@ async def get_calculator_live_metrics(user: dict = Depends(require_admin)):
         )
         tier_counts = {r["subscription_tier"]: r["cnt"] for r in tier_rows}
 
+        # Internal tier counts (for cost attribution / calculator defaults)
+        ff_row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM users WHERE status='active' AND subscription_tier='friends_family'")
+        lt_row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM users WHERE status='active' AND subscription_tier='lifetime'")
+        admin_rows = await conn.fetch(
+            "SELECT role, COUNT(*) AS cnt FROM users WHERE status='active' AND role IN ('admin','master_admin') GROUP BY role"
+        )
+        internal_by_role = {r["role"]: r["cnt"] for r in admin_rows}
+        friends_family_count = int(ff_row["cnt"] or 0) if ff_row else 0
+        lifetime_count = int(lt_row["cnt"] or 0) if lt_row else 0
+        admin_count = int(sum(internal_by_role.values())) if internal_by_role else 0
+
+
         # Upload volume last 30 days
         upload_stats = await conn.fetchrow(
             """SELECT COUNT(*) as total_uploads,
@@ -5872,6 +5904,10 @@ async def get_calculator_live_metrics(user: dict = Depends(require_admin)):
         return {
             "ok": True,
             "tier_counts": tier_counts,
+            "friends_family_count": friends_family_count,
+            "lifetime_count": lifetime_count,
+            "admin_count": admin_count,
+            "internal_by_role": internal_by_role,
             "uploads_30d": upload_stats["total_uploads"] if upload_stats else 0,
             "active_uploaders_30d": upload_stats["active_uploaders"] if upload_stats else 0,
             "avg_file_size_mb": round(float(upload_stats["avg_file_size"] or 0) / (1024 * 1024), 1) if upload_stats else 0,
@@ -5881,3 +5917,74 @@ async def get_calculator_live_metrics(user: dict = Depends(require_admin)):
             "total_revenue_30d": float(rev_row["total_revenue"] or 0) if rev_row else 0,
             "ai_usage_rate": round(ai_u / total_u, 3) if total_u > 0 else 0,
         }
+
+
+@app.get("/api/admin/calculator/internal-usage")
+async def get_internal_usage_30d(user: dict = Depends(require_admin)):
+    """Return real internal-tier usage over the last 30 days for cost attribution.
+
+    Source-of-truth: internal_usage_30d view (migration 108).
+    Fallback: direct aggregation query if the view is not present yet.
+    """
+    async with db_pool.acquire() as conn:
+        view_sql = """SELECT subscription_tier, role, upload_count, put_consumed, aic_consumed,
+                               compute_seconds, storage_bytes, cost_attributed
+                        FROM internal_usage_30d
+                        ORDER BY cost_attributed DESC NULLS LAST"""
+        fallback_sql = """SELECT
+                u.subscription_tier,
+                u.role,
+                COUNT(up.id) as upload_count,
+                COALESCE(SUM(up.put_spent), 0) as put_consumed,
+                COALESCE(SUM(up.aic_spent), 0) as aic_consumed,
+                COALESCE(SUM(up.compute_seconds), 0) as compute_seconds,
+                COALESCE(SUM(up.storage_bytes), 0) as storage_bytes,
+                COALESCE(SUM(up.cost_attributed), 0) as cost_attributed
+            FROM users u
+            LEFT JOIN uploads up ON up.user_id = u.id
+                AND up.created_at > NOW() - INTERVAL '30 days'
+                AND up.status NOT IN ('cancelled', 'deleted')
+            WHERE u.status = 'active'
+              AND (u.role IN ('admin', 'master_admin')
+                   OR u.subscription_tier IN ('friends_family', 'lifetime'))
+            GROUP BY u.subscription_tier, u.role
+            ORDER BY cost_attributed DESC NULLS LAST"""
+
+        try:
+            rows = await conn.fetch(view_sql)
+            source = "view"
+        except Exception as e:
+            # Most common: asyncpg.exceptions.UndefinedTableError when view isn't created yet
+            rows = await conn.fetch(fallback_sql)
+            source = "fallback"
+
+        out_rows = []
+        totals = {
+            "upload_count": 0,
+            "put_consumed": 0,
+            "aic_consumed": 0,
+            "compute_seconds": 0,
+            "storage_bytes": 0,
+            "cost_attributed": 0.0,
+        }
+
+        for r in rows:
+            cost_val = float(r["cost_attributed"] or 0)
+            out_rows.append({
+                "subscription_tier": r["subscription_tier"],
+                "role": r["role"],
+                "upload_count": int(r["upload_count"] or 0),
+                "put_consumed": int(r["put_consumed"] or 0),
+                "aic_consumed": int(r["aic_consumed"] or 0),
+                "compute_seconds": float(r["compute_seconds"] or 0),
+                "storage_bytes": int(r["storage_bytes"] or 0),
+                "cost_attributed": cost_val,
+            })
+            totals["upload_count"] += int(r["upload_count"] or 0)
+            totals["put_consumed"] += int(r["put_consumed"] or 0)
+            totals["aic_consumed"] += int(r["aic_consumed"] or 0)
+            totals["compute_seconds"] += float(r["compute_seconds"] or 0)
+            totals["storage_bytes"] += int(r["storage_bytes"] or 0)
+            totals["cost_attributed"] += cost_val
+
+        return {"ok": True, "source": source, "rows": out_rows, "totals": totals}

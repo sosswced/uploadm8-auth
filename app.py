@@ -8,6 +8,8 @@ Complete implementation with:
 - Weekly cost reports
 - All Stripe integrations
 """
+from __future__ import annotations
+
 
 import os
 import csv
@@ -5922,6 +5924,16 @@ async def get_latest_cost_model_config(user: dict = Depends(require_admin)):
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             }
         }
+
+
+class CostModelConfigCreate(BaseModel):
+    config_json: Dict[str, Any]
+    notes: Optional[str] = None
+
+
+class CostModelConfigCreate(BaseModel):
+    config_json: Dict[str, Any]
+    notes: Optional[str] = None
 
 
 @app.post("/api/admin/calculator/config")

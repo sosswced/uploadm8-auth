@@ -8,6 +8,8 @@ Complete implementation with:
 - Weekly cost reports
 - All Stripe integrations
 """
+from __future__ import annotations
+
 
 import os
 import csv
@@ -1149,6 +1151,25 @@ async def run_migrations():
                    OR u.subscription_tier IN ('friends_family', 'lifetime'))
             GROUP BY u.subscription_tier, u.role
             ;"""),
+            (109, """
+                -- Account groups: add updated_at + optional normalized membership table
+                ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+                CREATE TABLE IF NOT EXISTS account_group_members (
+                    group_id UUID REFERENCES account_groups(id) ON DELETE CASCADE,
+                    account_id TEXT NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (group_id, account_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_account_group_members_group ON account_group_members(group_id);
+
+                -- Backfill members from legacy account_ids array
+                INSERT INTO account_group_members (group_id, account_id)
+                SELECT id, unnest(account_ids) FROM account_groups
+                ON CONFLICT DO NOTHING;
+
+                UPDATE account_groups SET updated_at = NOW() WHERE updated_at IS NULL;
+            """)
 ]
         
         for version, sql in migrations:
@@ -3318,29 +3339,113 @@ async def get_groups(user: dict = Depends(get_current_user)):
             })
         return {"groups": groups}
 
+
+# ============================================================
+# Account Groups Payloads (body-first, query back-compat)
+# ============================================================
+
+class GroupCreatePayload(BaseModel):
+    name: str
+    color: str = "#3b82f6"
+    account_ids: List[str] = Field(default_factory=list)
+
+class GroupUpdatePayload(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+    account_ids: Optional[List[str]] = None
+
 @app.post("/api/groups")
-async def create_group(name: str = Query(...), color: str = Query("#3b82f6"), user: dict = Depends(get_current_user)):
+async def create_group(
+    payload: Optional[GroupCreatePayload] = Body(None),
+    # query-string back-compat (older frontends)
+    name: Optional[str] = Query(None),
+    color: str = Query("#3b82f6"),
+    account_ids: Optional[List[str]] = Query(None),
+    user: dict = Depends(get_current_user),
+):
+    body_name = (payload.name if payload else None) or name
+    if not body_name:
+        raise HTTPException(status_code=400, detail="name is required")
+
+    body_color = (payload.color if payload else None) or color
+    body_accounts = payload.account_ids if payload else (account_ids or [])
+
+    group_id = str(uuid.uuid4())
     async with db_pool.acquire() as conn:
-        group_id = str(uuid.uuid4())
-        await conn.execute("INSERT INTO account_groups (id, user_id, name, color) VALUES ($1, $2, $3, $4)", group_id, user["id"], name, color)
-    return {"id": group_id, "name": name, "color": color, "account_ids": []}
+        cols = await _get_table_cols(conn, "account_groups")
+        if "updated_at" in cols:
+            await conn.execute(
+                "INSERT INTO account_groups (id, user_id, name, color, account_ids, updated_at) VALUES ($1,$2,$3,$4,$5,NOW())",
+                group_id, user["id"], body_name, body_color, body_accounts,
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO account_groups (id, user_id, name, color, account_ids) VALUES ($1,$2,$3,$4,$5)",
+                group_id, user["id"], body_name, body_color, body_accounts,
+            )
+
+        # If normalized membership table exists, keep it in sync.
+        has_members = await conn.fetchval("SELECT to_regclass('public.account_group_members') IS NOT NULL")
+        if has_members and body_accounts:
+            await conn.executemany(
+                "INSERT INTO account_group_members (group_id, account_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+                [(group_id, aid) for aid in body_accounts],
+            )
+
+    return {"id": group_id, "name": body_name, "color": body_color, "account_ids": body_accounts}
+
 
 @app.put("/api/groups/{group_id}")
-async def update_group(group_id: str, name: str = Query(None), color: str = Query(None), account_ids: List[str] = Query(None), user: dict = Depends(get_current_user)):
+async def update_group(
+    group_id: str,
+    payload: Optional[GroupUpdatePayload] = Body(None),
+    # query-string back-compat (older frontends)
+    name: Optional[str] = Query(None),
+    color: Optional[str] = Query(None),
+    account_ids: Optional[List[str]] = Query(None),
+    user: dict = Depends(get_current_user),
+):
+    # Body-first; fall back to query params.
+    upd_name = payload.name if payload and payload.name is not None else name
+    upd_color = payload.color if payload and payload.color is not None else color
+    upd_accounts = payload.account_ids if payload and payload.account_ids is not None else account_ids
+
     updates, params = [], [group_id, user["id"]]
-    if name:
+
+    if upd_name is not None:
         updates.append(f"name = ${len(params)+1}")
-        params.append(name)
-    if color:
+        params.append(upd_name)
+    if upd_color is not None:
         updates.append(f"color = ${len(params)+1}")
-        params.append(color)
-    if account_ids is not None:
+        params.append(upd_color)
+    if upd_accounts is not None:
         updates.append(f"account_ids = ${len(params)+1}")
-        params.append(account_ids)
-    if updates:
-        async with db_pool.acquire() as conn:
-            await conn.execute(f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2", *params)
+        params.append(upd_accounts)
+
+    if not updates:
+        return {"status": "no_changes"}
+
+    async with db_pool.acquire() as conn:
+        cols = await _get_table_cols(conn, "account_groups")
+        if "updated_at" in cols:
+            updates.append("updated_at = NOW()")
+        await conn.execute(
+            f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2",
+            *params,
+        )
+
+        # If normalized membership table exists, keep it in sync.
+        has_members = await conn.fetchval("SELECT to_regclass('public.account_group_members') IS NOT NULL")
+        if has_members and upd_accounts is not None:
+            await conn.execute("DELETE FROM account_group_members WHERE group_id = $1", group_id)
+            if upd_accounts:
+                await conn.executemany(
+                    "INSERT INTO account_group_members (group_id, account_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+                    [(group_id, aid) for aid in upd_accounts],
+                )
+
     return {"status": "updated"}
+
 
 @app.delete("/api/groups/{group_id}")
 async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
@@ -5809,6 +5914,11 @@ async def get_latest_cost_model_config(user: dict = Depends(require_admin)):
             }
         }
 
+
+
+class CostModelConfigCreate(BaseModel):
+    config_json: Dict[str, Any]
+    notes: Optional[str] = None
 
 @app.post("/api/admin/calculator/config")
 async def save_cost_model_config(data: CostModelConfigCreate, user: dict = Depends(require_admin)):

@@ -8,8 +8,6 @@ Complete implementation with:
 - Weekly cost reports
 - All Stripe integrations
 """
-from __future__ import annotations
-
 
 import os
 import csv
@@ -2361,9 +2359,20 @@ async def complete_upload(upload_id: str, data: Optional[UploadComplete] = Body(
             values.append(val)
             idx += 1
 
-        # platforms (json)
+        # platforms (array/json tolerant)
         if getattr(data, "platforms", None) is not None and "platforms" in uploads_cols:
-            add_set("platforms = $$", json.dumps(data.platforms))
+            platforms_val = data.platforms
+            # Frontend sometimes sends JSON-stringified arrays; normalize to List[str]
+            if isinstance(platforms_val, str):
+                try:
+                    parsed = json.loads(platforms_val)
+                    if isinstance(parsed, list):
+                        platforms_val = parsed
+                    else:
+                        platforms_val = [platforms_val]
+                except Exception:
+                    platforms_val = [platforms_val]
+            add_set("platforms = $$", platforms_val)
 
         # privacy
         if getattr(data, "privacy", None) is not None and "privacy" in uploads_cols:
@@ -5914,11 +5923,6 @@ async def get_latest_cost_model_config(user: dict = Depends(require_admin)):
             }
         }
 
-
-
-class CostModelConfigCreate(BaseModel):
-    config_json: Dict[str, Any]
-    notes: Optional[str] = None
 
 @app.post("/api/admin/calculator/config")
 async def save_cost_model_config(data: CostModelConfigCreate, user: dict = Depends(require_admin)):

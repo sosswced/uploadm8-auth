@@ -583,6 +583,8 @@ class UploadInit(BaseModel):
     platforms: List[str]
     group_id: Optional[str] = None
     account_targets: Optional[dict] = None  # {platform: platform_token_id}
+    account_ids: Optional[List[str]] = []  # NEW explicit account ids
+    group_ids: Optional[List[str]] = []    # NEW explicit group ids
     title: str = ""
     caption: str = ""
     hashtags: List[str] = []
@@ -591,15 +593,22 @@ class UploadInit(BaseModel):
     schedule_mode: str = "immediate"  # immediate | scheduled | smart
     has_telemetry: bool = False
     use_ai: bool = False
-    smart_schedule_days: int = 7  # How many days to spread uploads across
+    smart_schedule_days: Optional[int] = 14
 
 
 class UploadComplete(BaseModel):
     # Optional overrides at completion time
     platforms: Optional[List[str]] = None
     privacy: Optional[str] = None
+    title: Optional[str] = None
+    caption: Optional[str] = None
+    hashtags: Optional[List[str]] = None
+    account_ids: Optional[List[str]] = None  # NEW
+    group_ids: Optional[List[str]] = None    # NEW
+    # legacy (still accepted)
     group_id: Optional[str] = None
     account_targets: Optional[dict] = None  # {platform: platform_token_id}
+
 
 class SettingsUpdate(BaseModel):
     discord_webhook: Optional[str] = None
@@ -2224,21 +2233,35 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
             schedule_metadata["account_targets"] = data.account_targets
 
         # Store upload with preferences metadata
-        await conn.execute("""
-            INSERT INTO uploads (
-                id, user_id, r2_key, filename, file_size, platforms,
-                title, caption, hashtags, privacy, status, scheduled_time,
-                schedule_mode, put_reserved, aic_reserved, schedule_metadata,
-                user_preferences
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15, $16)
-        """,
-            upload_id, user["id"], r2_key, data.filename, data.file_size,
-            data.platforms, data.title, data.caption, data.hashtags,
-            data.privacy, scheduled_time, data.schedule_mode, put_cost,
-            aic_cost, json.dumps(schedule_metadata) if schedule_metadata is not None else None,
-            json.dumps(user_prefs)
-        )
+        # Store upload with preferences metadata (schema-drift tolerant)
+        uploads_cols = await _load_uploads_columns(db_pool)
+
+        insert_cols = ["id","user_id","r2_key","filename","file_size","platforms","title","caption","hashtags","privacy","status","scheduled_time","schedule_mode","put_reserved","aic_reserved","schedule_metadata","user_preferences"]
+        values = [upload_id, user["id"], r2_key, data.filename, data.file_size, data.platforms, data.title, data.caption, data.hashtags, data.privacy, "pending", scheduled_time, data.schedule_mode, put_cost, aic_cost,
+                  json.dumps(schedule_metadata) if schedule_metadata is not None else None,
+                  json.dumps(user_prefs)]
+
+        def add(col, val):
+            if col in uploads_cols:
+                insert_cols.append(col)
+                values.append(val)
+
+        # NEW fields
+        add("content_type", getattr(data, "content_type", "application/octet-stream"))
+        add("smart_schedule_days", getattr(data, "smart_schedule_days", None))
+        add("account_ids", json.dumps(getattr(data, "account_ids", None) or []))
+        add("group_ids", json.dumps(getattr(data, "group_ids", None) or []))
+        add("has_telemetry", bool(getattr(data, "has_telemetry", False)))
+
+        # Legacy fields if present in schema
+        add("group_id", getattr(data, "group_id", None))
+        add("account_targets", json.dumps(getattr(data, "account_targets", None) or {}))
+
+        placeholders = ", ".join(f"${i}" for i in range(1, len(values)+1))
+        sql = f"""INSERT INTO uploads ({', '.join(insert_cols)}) VALUES ({placeholders})"""
+        await conn.execute(sql, *values)
+
+
 
         # Reserve tokens
         await reserve_tokens(conn, user["id"], put_cost, aic_cost, upload_id)
@@ -2302,11 +2325,59 @@ async def complete_upload(upload_id: str, data: Optional[UploadComplete] = Body(
 
         # Fetch preferences again (in case they changed)
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
+        # Merge completion-time overrides (schema-drift tolerant)
+        if data is None:
+            data = UploadComplete()
 
-        await conn.execute(
-            "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
-            upload_id
-        )
+        uploads_cols = await _load_uploads_columns(db_pool)
+        set_parts = ["status = 'queued'", "updated_at = NOW()"]
+        values = [upload_id, user["id"]]
+        idx = 3
+
+        def add_set(sql_fragment, val):
+            nonlocal idx
+            set_parts.append(sql_fragment.replace("$$", f"${idx}"))
+            values.append(val)
+            idx += 1
+
+        # platforms (json)
+        if getattr(data, "platforms", None) is not None and "platforms" in uploads_cols:
+            add_set("platforms = $$", json.dumps(data.platforms))
+
+        # privacy
+        if getattr(data, "privacy", None) is not None and "privacy" in uploads_cols:
+            add_set("privacy = $$", data.privacy)
+
+        # title/caption (only override if non-empty)
+        if getattr(data, "title", None) is not None and "title" in uploads_cols:
+            if (data.title or "").strip():
+                add_set("title = $$", data.title)
+        if getattr(data, "caption", None) is not None and "caption" in uploads_cols:
+            if (data.caption or "").strip():
+                add_set("caption = $$", data.caption)
+
+        # hashtags/account_ids/group_ids (override only if non-empty list)
+        if getattr(data, "hashtags", None) is not None and "hashtags" in uploads_cols:
+            if isinstance(data.hashtags, list) and len(data.hashtags) > 0:
+                add_set("hashtags = $$", json.dumps(data.hashtags))
+
+        if getattr(data, "account_ids", None) is not None and "account_ids" in uploads_cols:
+            if isinstance(data.account_ids, list) and len(data.account_ids) > 0:
+                add_set("account_ids = $$", json.dumps(data.account_ids))
+
+        if getattr(data, "group_ids", None) is not None and "group_ids" in uploads_cols:
+            if isinstance(data.group_ids, list) and len(data.group_ids) > 0:
+                add_set("group_ids = $$", json.dumps(data.group_ids))
+
+        # legacy
+        if getattr(data, "group_id", None) is not None and "group_id" in uploads_cols:
+            add_set("group_id = $$", data.group_id)
+        if getattr(data, "account_targets", None) is not None and "account_targets" in uploads_cols:
+            if isinstance(data.account_targets, dict) and len(data.account_targets) > 0:
+                add_set("account_targets = $$", json.dumps(data.account_targets))
+
+        sql = f"UPDATE uploads SET {', '.join(set_parts)} WHERE id = $1 AND user_id = $2"
+        await conn.execute(sql, *values)
 
     plan = get_plan(user.get("subscription_tier", "free"))
 
@@ -3201,8 +3272,51 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 @app.get("/api/groups")
 async def get_groups(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        groups = await conn.fetch("SELECT * FROM account_groups WHERE user_id = $1 ORDER BY created_at DESC", user["id"])
-    return [{"id": str(g["id"]), "name": g["name"], "account_ids": g["account_ids"] or [], "color": g["color"], "created_at": g["created_at"].isoformat() if g["created_at"] else None} for g in groups]
+        # Prefer normalized membership table if present; otherwise fall back to account_groups.account_ids
+        has_members = await conn.fetchval("SELECT to_regclass('public.account_group_members') IS NOT NULL")
+        if has_members:
+            rows = await conn.fetch(
+                """
+                SELECT g.id, g.user_id, g.name, g.color, g.created_at, g.updated_at,
+                    COALESCE(
+                        json_agg(agm.account_id) FILTER (WHERE agm.account_id IS NOT NULL),
+                        '[]'
+                    ) AS account_ids
+                FROM account_groups g
+                LEFT JOIN account_group_members agm ON agm.group_id = g.id
+                WHERE g.user_id = $1
+                GROUP BY g.id
+                ORDER BY g.created_at DESC
+                """,
+                user["id"],
+            )
+            groups = []
+            for r in rows:
+                groups.append({
+                    "id": str(r["id"]),
+                    "name": r["name"],
+                    "color": r["color"],
+                    "account_ids": _safe_json(r["account_ids"], []),
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
+                })
+            return {"groups": groups}
+
+        rows = await conn.fetch(
+            "SELECT * FROM account_groups WHERE user_id = $1 ORDER BY created_at DESC",
+            user["id"],
+        )
+        groups = []
+        for g in rows:
+            groups.append({
+                "id": str(g["id"]),
+                "name": g["name"],
+                "color": g.get("color"),
+                "account_ids": _safe_json(g.get("account_ids"), []),
+                "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+                "updated_at": g["updated_at"].isoformat() if g.get("updated_at") else None,
+            })
+        return {"groups": groups}
 
 @app.post("/api/groups")
 async def create_group(name: str = Query(...), color: str = Query("#3b82f6"), user: dict = Depends(get_current_user)):
@@ -5506,22 +5620,24 @@ if __name__ == "__main__":
 async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user)):
     cols = await _load_uploads_columns(db_pool)
     wanted = [
-        "id","user_id","r2_key","filename","file_size","platforms",
+        "id","user_id","r2_key","filename","file_size","content_type",
+        "platforms","account_ids","group_ids",
         "title","caption","hashtags","privacy","status","cancel_requested",
-        "scheduled_time","schedule_mode",
+        "scheduled_time","schedule_mode","smart_schedule_days","schedule_metadata",
         "processing_started_at","processing_finished_at","completed_at",
         "error_code","error_detail",
         "put_reserved","put_spent","aic_reserved","aic_spent",
         "views","likes","comments","shares",
         "thumbnail_r2_key","video_url","platform_results",
         "created_at","updated_at","duration",
+        "ai_title","ai_caption",
     ]
     select_cols = _pick_cols(wanted, cols)
     if not select_cols:
         raise HTTPException(status_code=500, detail="Uploads table has no readable columns")
 
     sql = f"""SELECT {', '.join(select_cols)} FROM uploads
-               WHERE id = $1 AND user_id = $2"""
+              WHERE id = $1 AND user_id = $2"""
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(sql, upload_id, user["id"])
@@ -5532,71 +5648,125 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
     def g(k, default=None):
         return row[k] if k in row else default
 
-    return {
+    def iso(dt):
+        return dt.isoformat() if dt else None
+
+    platforms = _safe_json(g("platforms"), [])
+    hashtags = _safe_json(g("hashtags"), [])
+    platform_results = _safe_json(g("platform_results"), {})
+    schedule_metadata = _safe_json(g("schedule_metadata"), {})
+    account_ids = _safe_json(g("account_ids"), [])
+    group_ids = _safe_json(g("group_ids"), [])
+
+    payload = {
+        # canonical snake_case
         "id": str(g("id")),
-        "userId": str(g("user_id")),
-        "r2Key": g("r2_key"),
+        "user_id": str(g("user_id")),
+        "r2_key": g("r2_key"),
         "filename": g("filename"),
-        "fileSize": g("file_size"),
-        "platforms": _safe_json(g("platforms"), []),
+        "file_size": g("file_size"),
+        "content_type": g("content_type"),
+        "platforms": platforms,
+        "account_ids": account_ids,
+        "group_ids": group_ids,
         "title": g("title"),
         "caption": g("caption"),
-        "hashtags": _safe_json(g("hashtags"), []),
+        "hashtags": hashtags,
         "privacy": g("privacy"),
         "status": g("status"),
-        "cancelRequested": bool(g("cancel_requested", False)),
-        "scheduledTime": g("scheduled_time").isoformat() if g("scheduled_time") else None,
-        "scheduleMode": g("schedule_mode"),
-        "processingStartedAt": g("processing_started_at").isoformat() if g("processing_started_at") else None,
-        "processingFinishedAt": g("processing_finished_at").isoformat() if g("processing_finished_at") else None,
-        "completedAt": g("completed_at").isoformat() if g("completed_at") else None,
-        "errorCode": g("error_code"),
-        "errorDetail": g("error_detail"),
-        "putReserved": g("put_reserved"),
-        "putSpent": g("put_spent"),
-        "aicReserved": g("aic_reserved"),
-        "aicSpent": g("aic_spent"),
-        "views": g("views"),
-        "likes": g("likes"),
-        "comments": g("comments"),
-        "shares": g("shares"),
-        "thumbnailR2Key": g("thumbnail_r2_key"),
-        "videoUrl": g("video_url"),
-        "platformResults": _safe_json(g("platform_results"), {}),
-        "createdAt": g("created_at").isoformat() if g("created_at") else None,
-        "updatedAt": g("updated_at").isoformat() if g("updated_at") else None,
+        "cancel_requested": bool(g("cancel_requested", False)),
+        "scheduled_time": iso(g("scheduled_time")),
+        "schedule_mode": g("schedule_mode"),
+        "smart_schedule_days": g("smart_schedule_days"),
+        "schedule_metadata": schedule_metadata,
+
+        "processing_started_at": iso(g("processing_started_at")),
+        "processing_finished_at": iso(g("processing_finished_at")),
+        "completed_at": iso(g("completed_at")),
+
+        "error_code": g("error_code"),
+        "error_detail": g("error_detail"),
+
+        "put_reserved": g("put_reserved", 0) or 0,
+        "put_spent": g("put_spent", 0) or 0,
+        "aic_reserved": g("aic_reserved", 0) or 0,
+        "aic_spent": g("aic_spent", 0) or 0,
+
+        "views": g("views", 0) or 0,
+        "likes": g("likes", 0) or 0,
+        "comments": g("comments", 0) or 0,
+        "shares": g("shares", 0) or 0,
+
+        "thumbnail_r2_key": g("thumbnail_r2_key"),
+        "video_url": g("video_url"),
+        "platform_results": platform_results,
+
+        "created_at": iso(g("created_at")),
+        "updated_at": iso(g("updated_at")),
         "duration": g("duration"),
+
+        "ai_title": g("ai_title"),
+        "ai_caption": g("ai_caption"),
     }
 
+    # backward-compatible camelCase aliases
+    payload.update({
+        "userId": payload["user_id"],
+        "r2Key": payload["r2_key"],
+        "fileSize": payload["file_size"],
+        "contentType": payload["content_type"],
+        "accountIds": payload["account_ids"],
+        "groupIds": payload["group_ids"],
+        "cancelRequested": payload["cancel_requested"],
+        "scheduledTime": payload["scheduled_time"],
+        "scheduleMode": payload["schedule_mode"],
+        "smartScheduleDays": payload["smart_schedule_days"],
+        "scheduleMetadata": payload["schedule_metadata"],
+        "processingStartedAt": payload["processing_started_at"],
+        "processingFinishedAt": payload["processing_finished_at"],
+        "completedAt": payload["completed_at"],
+        "errorCode": payload["error_code"],
+        "errorDetail": payload["error_detail"],
+        "putReserved": payload["put_reserved"],
+        "putSpent": payload["put_spent"],
+        "aicReserved": payload["aic_reserved"],
+        "aicSpent": payload["aic_spent"],
+        "thumbnailR2Key": payload["thumbnail_r2_key"],
+        "platformResults": payload["platform_results"],
+        "createdAt": payload["created_at"],
+        "updatedAt": payload["updated_at"],
+        "aiTitle": payload["ai_title"],
+        "aiCaption": payload["ai_caption"],
+    })
 
-# ============================================================
-# BUSINESS CALCULATOR - Admin Endpoints
-# ============================================================
-
-class CostModelConfigCreate(BaseModel):
-    config_json: dict
-    notes: Optional[str] = None
-
-class CostModelConfigUpdate(BaseModel):
-    config_json: Optional[dict] = None
-    notes: Optional[str] = None
-
-class EnterpriseQuoteCreate(BaseModel):
-    customer_name: Optional[str] = None
-    assumptions_json: dict
-    outputs_json: dict
-    status: Optional[str] = "draft"
-    notes: Optional[str] = None
-
-class EnterpriseQuoteUpdate(BaseModel):
-    customer_name: Optional[str] = None
-    assumptions_json: Optional[dict] = None
-    outputs_json: Optional[dict] = None
-    status: Optional[str] = None
-    notes: Optional[str] = None
+    return payload
 
 
-# ---- Cost Model Config CRUD ----
+@app.get("/api/uploads/{upload_id}/status")
+async def get_upload_status(upload_id: str, user: dict = Depends(get_current_user)):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, status, error_code, error_detail, updated_at,
+                   processing_started_at, processing_finished_at, completed_at
+            FROM uploads
+            WHERE id = $1 AND user_id = $2
+            """,
+            upload_id, user["id"]
+        )
+    if not row:
+        raise HTTPException(404, "Upload not found")
+    return {
+        "id": str(row["id"]),
+        "status": row["status"],
+        "error_code": row["error_code"],
+        "error_detail": row["error_detail"],
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        "processing_started_at": row["processing_started_at"].isoformat() if row["processing_started_at"] else None,
+        "processing_finished_at": row["processing_finished_at"].isoformat() if row["processing_finished_at"] else None,
+        "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
+    }
+
 
 @app.get("/api/admin/calculator/config")
 async def get_cost_model_configs(limit: int = 20, user: dict = Depends(require_admin)):

@@ -211,8 +211,11 @@ BILLING_MODE = os.environ.get("BILLING_MODE", "test").strip().lower()
 ADMIN_DISCORD_WEBHOOK_URL = os.environ.get("ADMIN_DISCORD_WEBHOOK_URL", "")
 SIGNUP_DISCORD_WEBHOOK_URL = os.environ.get("SIGNUP_DISCORD_WEBHOOK_URL", "")
 MRR_DISCORD_WEBHOOK_URL = os.environ.get("MRR_DISCORD_WEBHOOK_URL", "")
-COMMUNITY_DISCORD_WEBHOOK_URL = os.environ.get("COMMUNITY_DISCORD_WEBHOOK_URL", "")
-
+COMMUNITY_DISCORD_WEBHOOK_URL = (
+    os.getenv("DISCORD_COMMUNITY_WEBHOOK_URL", "").strip()
+    or os.getenv("DISCORD_COMMUNITY_WEBHOOK", "").strip()
+    or os.getenv("COMMUNITY_DISCORD_WEBHOOK_URL", "").strip()
+)
 # Email
 MAILGUN_API_KEY = os.environ.get("MAILGUN_API_KEY", "")
 MAILGUN_DOMAIN = os.environ.get("MAILGUN_DOMAIN", "")
@@ -4334,45 +4337,287 @@ async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), u
 # Announcements
 # ============================================================
 @app.post("/api/admin/announcements/send")
+
+# ---------------------------------------------------------------------------
+# ANNOUNCEMENTS: idempotent delivery intents + multi-channel fanout
+# - Keeps backwards compatibility with legacy AnnouncementRequest booleans.
+# - Uses announcement_deliveries as the source of truth for what was attempted/sent.
+# ---------------------------------------------------------------------------
+
+def _normalize_announcement_channels(channels_in, send_email: bool, send_discord_community: bool, send_user_webhooks: bool):
+    """Return normalized channel list: ['email','discord_community','user_webhook']"""
+    out = []
+    # New-style list/dict support (if frontend starts sending channels explicitly)
+    if isinstance(channels_in, dict):
+        for k, v in channels_in.items():
+            if v is True:
+                out.append(str(k))
+    elif isinstance(channels_in, list):
+        out.extend([str(c) for c in channels_in])
+
+    # Legacy booleans always win (existing UI contract)
+    if send_email and "email" not in out:
+        out.append("email")
+    if send_discord_community and "discord_community" not in out:
+        out.append("discord_community")
+    if send_user_webhooks and "user_webhook" not in out and "user_webhooks" not in out:
+        out.append("user_webhook")
+
+    # Normalize key spelling
+    out = ["user_webhook" if c == "user_webhooks" else c for c in out]
+    # De-dupe, preserve order
+    seen = set()
+    norm = []
+    for c in out:
+        c = (c or "").strip()
+        if not c:
+            continue
+        if c in seen:
+            continue
+        if c not in ("email", "discord_community", "user_webhook"):
+            continue
+        seen.add(c)
+        norm.append(c)
+    return norm
+
+def _channels_to_store_map(channels_list):
+    """Persist in the same shape your DB currently uses (json text map)."""
+    store = {"email": False, "discord_community": False, "user_webhooks": False}
+    for c in channels_list:
+        if c == "email":
+            store["email"] = True
+        elif c == "discord_community":
+            store["discord_community"] = True
+        elif c == "user_webhook":
+            store["user_webhooks"] = True
+    return json.dumps(store)
+
+async def _discord_post_raw(webhook_url: str, *, content: str = None, embeds: list = None):
+    """Return (ok, err). Unlike discord_notify(), this does not swallow failures."""
+    if not webhook_url:
+        return False, "missing webhook url"
+    payload = {}
+    if content:
+        payload["content"] = content[:1999]
+    if embeds:
+        payload["embeds"] = embeds
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.post(webhook_url, json=payload)
+        if r.status_code in (200, 204):
+            return True, ""
+        return False, f"{r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+async def _insert_delivery_intents(conn, announcement_id: str, *, sender_user_id: str, recipients: list, channels_list: list, title: str, body: str):
+    """
+    Insert queued intents into announcement_deliveries, idempotent by (announcement_id,user_id,channel).
+    - email: one row per recipient (destination=email)
+    - user_webhook: one row per recipient with webhook configured (destination=webhook)
+    - discord_community: single row owned by sender (destination=global webhook)
+    """
+    now = _now_utc() if "_now_utc" in globals() else datetime.now(timezone.utc)
+
+    inserts = []
+
+    # Community webhook is a single delivery owned by sender
+    if "discord_community" in channels_list and COMMUNITY_DISCORD_WEBHOOK_URL:
+        inserts.append((announcement_id, sender_user_id, "discord_community", COMMUNITY_DISCORD_WEBHOOK_URL, "queued", None, now))
+
+    # Per-user deliveries
+    for r in recipients:
+        uid = str(r.get("id") or r.get("user_id") or "")
+        email = (r.get("email") or "").strip()
+        webhook = (r.get("discord_webhook") or "").strip()
+
+        if not uid:
+            continue
+
+        if "email" in channels_list and email:
+            inserts.append((announcement_id, uid, "email", email, "queued", None, now))
+
+        if "user_webhook" in channels_list and webhook:
+            inserts.append((announcement_id, uid, "user_webhook", webhook, "queued", None, now))
+
+    if not inserts:
+        return 0
+
+    await conn.executemany(
+        """
+        INSERT INTO announcement_deliveries
+          (announcement_id, user_id, channel, destination, status, error, created_at)
+        SELECT $1::uuid, $2::uuid, $3::text, $4::text, $5::text, $6::text, $7::timestamptz
+        WHERE NOT EXISTS (
+          SELECT 1 FROM announcement_deliveries
+          WHERE announcement_id = $1::uuid AND user_id = $2::uuid AND channel = $3::text
+        )
+        """,
+        inserts,
+    )
+    return len(inserts)
+
+async def _execute_announcement_deliveries(conn, announcement_id: str, title: str, body: str):
+    """Execute queued deliveries for an announcement and update rollups."""
+    rows = await conn.fetch(
+        """
+        SELECT id, channel, destination
+        FROM announcement_deliveries
+        WHERE announcement_id = $1::uuid AND status = 'queued'
+        ORDER BY id ASC
+        """,
+        announcement_id,
+    )
+
+    email_sent = 0
+    discord_sent = 0
+    webhook_sent = 0
+
+    for r in rows:
+        delivery_id = r["id"]
+        ch = r["channel"]
+        dest = (r["destination"] or "").strip()
+
+        ok = False
+        err = ""
+
+        if ch == "email":
+            try:
+                # send_email(to, subject, html_body) exists in your codebase
+                await send_email(dest, title, f"<h1>{title}</h1><p>{body}</p>")
+                ok = True
+                email_sent += 1
+            except Exception as e:
+                ok = False
+                err = str(e)
+
+        elif ch == "discord_community":
+            ok, err = await _discord_post_raw(dest, embeds=[{"title": f"📢 {title}", "description": body, "color": 0xf97316}])
+            if ok:
+                discord_sent += 1
+
+        elif ch == "user_webhook":
+            ok, err = await _discord_post_raw(dest, embeds=[{"title": f"📢 {title}", "description": body, "color": 0xf97316}])
+            if ok:
+                webhook_sent += 1
+
+        status = "sent" if ok else "failed"
+        await conn.execute(
+            """
+            UPDATE announcement_deliveries
+            SET status = $2,
+                error = $3,
+                sent_at = CASE WHEN $2='sent' THEN NOW() ELSE sent_at END
+            WHERE id = $1
+            """,
+            delivery_id,
+            status,
+            (err or None),
+        )
+
+    await conn.execute(
+        """
+        UPDATE announcements
+        SET email_sent = COALESCE(email_sent,0) + $2,
+            discord_sent = COALESCE(discord_sent,0) + $3,
+            webhook_sent = COALESCE(webhook_sent,0) + $4
+        WHERE id = $1::uuid
+        """,
+        announcement_id,
+        int(email_sent),
+        int(discord_sent),
+        int(webhook_sent),
+    )
+
+    return {"email": email_sent, "discord_community": discord_sent, "user_webhook": webhook_sent}
+
+
+
 async def send_announcement(data: AnnouncementRequest, background_tasks: BackgroundTasks, user: dict = Depends(require_admin)):
+    """Creates announcement + idempotent delivery intents, then executes queued deliveries."""
+    title = (data.title or "").strip()
+    body = (data.body or "").strip()
+    if not title or not body:
+        raise HTTPException(status_code=400, detail="title and body are required")
+
     async with db_pool.acquire() as conn:
-        query = "SELECT id, email, name FROM users WHERE status = 'active'"
+        # ----------------------------
+        # Resolve recipients (banned excluded)
+        # ----------------------------
+        query = """
+            SELECT
+              u.id::text AS id,
+              u.email,
+              u.subscription_tier,
+              COALESCE(NULLIF(us.discord_webhook,''), '') AS discord_webhook
+            FROM users u
+            LEFT JOIN user_settings us ON us.user_id = u.id
+            WHERE COALESCE(u.status,'active') <> 'banned'
+        """
         params = []
-        if data.target == "paid":
-            query += " AND subscription_tier NOT IN ('free')"
-        elif data.target == "free":
-            query += " AND subscription_tier = 'free'"
-        elif data.target == "specific_tiers" and data.target_tiers:
-            params.append(data.target_tiers)
-            query += f" AND subscription_tier = ANY(${len(params)})"
-        
-        users = await conn.fetch(query, *params) if params else await conn.fetch(query)
-        
+
+        if getattr(data, "target", None) == "paid":
+            query += " AND u.subscription_tier NOT IN ('free')"
+        elif getattr(data, "target", None) == "free":
+            query += " AND u.subscription_tier = 'free'"
+        elif getattr(data, "target", None) in ("specific_tiers", "tiers") and getattr(data, "target_tiers", None):
+            params.append(list(data.target_tiers))
+            query += f" AND u.subscription_tier = ANY(${len(params)}::text[]) "
+
+        recipients = await conn.fetch(query, *params) if params else await conn.fetch(query)
+        recipients_list = [dict(r) for r in recipients]
+
+        # ----------------------------
+        # Normalize channels
+        # ----------------------------
+        channels_list = _normalize_announcement_channels(
+            getattr(data, "channels", None) if hasattr(data, "channels") else None,
+            bool(getattr(data, "send_email", False)),
+            bool(getattr(data, "send_discord_community", False)),
+            bool(getattr(data, "send_user_webhooks", False)),
+        )
+        if not channels_list:
+            raise HTTPException(status_code=400, detail="No channels selected")
+
+        # Persist in the DB using your current storage shape (json text map)
+        channels_store = _channels_to_store_map(channels_list)
+
+        # ----------------------------
+        # Insert announcement row
+        # ----------------------------
         ann_id = str(uuid.uuid4())
-        channels = {"email": data.send_email, "discord_community": data.send_discord_community, "user_webhooks": data.send_user_webhooks}
-        await conn.execute("INSERT INTO announcements (id, title, body, channels, target, target_tiers, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            ann_id, data.title, data.body, json.dumps(channels), data.target, data.target_tiers, user["id"])
-        
-        email_count, discord_count, webhook_count = 0, 0, 0
-        
-        if data.send_discord_community and COMMUNITY_DISCORD_WEBHOOK_URL:
-            await discord_notify(COMMUNITY_DISCORD_WEBHOOK_URL, embeds=[{"title": f"📢 {data.title}", "description": data.body, "color": 0xf97316}])
-            discord_count = 1
-        
-        if data.send_email:
-            for u in users:
-                background_tasks.add_task(send_email, u["email"], data.title, f"<h1>{data.title}</h1><p>{data.body}</p>")
-                email_count += 1
-        
-        if data.send_user_webhooks:
-            settings = await conn.fetch("SELECT user_id, discord_webhook FROM user_settings WHERE discord_webhook IS NOT NULL AND discord_webhook != ''")
-            for s in settings:
-                background_tasks.add_task(discord_notify, s["discord_webhook"], embeds=[{"title": f"📢 {data.title}", "description": data.body, "color": 0xf97316}])
-                webhook_count += 1
-        
-        await conn.execute("UPDATE announcements SET email_sent = $1, discord_sent = $2, webhook_sent = $3 WHERE id = $4", email_count, discord_count, webhook_count, ann_id)
-    
-    return {"status": "sent", "announcement_id": ann_id, "email_count": email_count, "discord_count": discord_count, "webhook_count": webhook_count}
+        await conn.execute(
+            """
+            INSERT INTO announcements (id, title, body, channels, target, target_tiers, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            ann_id, title, body, channels_store, getattr(data, "target", "all"), getattr(data, "target_tiers", None), user["id"]
+        )
+
+        # ----------------------------
+        # Insert idempotent delivery intents
+        # ----------------------------
+        await _insert_delivery_intents(
+            conn,
+            ann_id,
+            sender_user_id=str(user["id"]),
+            recipients=recipients_list,
+            channels_list=channels_list,
+            title=title,
+            body=body,
+        )
+
+        # ----------------------------
+        # Execute fanout (background). For debugging, you can run inline.
+        # ----------------------------
+        async def _run():
+            async with db_pool.acquire() as c2:
+                return await _execute_announcement_deliveries(c2, ann_id, title, body)
+
+        background_tasks.add_task(_run)
+
+    return {"status": "queued", "announcement_id": ann_id, "recipients": len(recipients_list), "channels": channels_list}
+
 
 @app.get("/api/admin/announcements")
 async def get_announcements(limit: int = 20, user: dict = Depends(require_admin)):

@@ -1,7 +1,35 @@
-"""
-UploadM8 stages package.
+"""UploadM8 stages package.
 
-Intentionally lightweight to avoid circular imports during worker boot.
-Import what you need directly from submodules.
+Keep this file import-light to avoid boot-time circular imports.
 """
-__all__ = []
+
+# Re-export error primitives only (safe).
+from .errors import (
+    ErrorCode,
+    StageError,
+    SkipStage,
+    CancelRequested,
+    PublishError,
+    StorageError,
+    TelemetryError,
+    TranscodeError,
+    ThumbnailError,
+    CaptionError,
+    WatermarkError,
+    VerifyError,
+)
+
+__all__ = [
+    "ErrorCode",
+    "StageError",
+    "SkipStage",
+    "CancelRequested",
+    "PublishError",
+    "StorageError",
+    "TelemetryError",
+    "TranscodeError",
+    "ThumbnailError",
+    "CaptionError",
+    "WatermarkError",
+    "VerifyError",
+]

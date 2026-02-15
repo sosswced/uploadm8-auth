@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .errors import PublishError, ErrorCode
 from .context import JobContext, PlatformResult
+from . import db as db_stage
 
 
 logger = logging.getLogger("uploadm8-worker")
@@ -75,7 +76,7 @@ async def publish_to_tiktok(
         return PlatformResult(
             platform="tiktok",
             success=False,
-            error="No access token"
+            error_message="No access token"
         )
     
     try:
@@ -103,7 +104,7 @@ async def publish_to_tiktok(
                 return PlatformResult(
                     platform="tiktok",
                     success=False,
-                    error=f"Init failed: {init_resp.text[:200]}"
+                    error_message=f"Init failed: {init_resp.text[:200]}"
                 )
             
             init_data = init_resp.json().get("data", {})
@@ -114,7 +115,7 @@ async def publish_to_tiktok(
                 return PlatformResult(
                     platform="tiktok",
                     success=False,
-                    error="No upload URL returned"
+                    error_message="No upload URL returned"
                 )
             
             # Step 2: Upload video
@@ -131,7 +132,7 @@ async def publish_to_tiktok(
                 return PlatformResult(
                     platform="tiktok",
                     success=False,
-                    error=f"Upload failed: {upload_resp.status_code}"
+                    error_message=f"Upload failed: {upload_resp.status_code}"
                 )
             
             return PlatformResult(
@@ -145,7 +146,7 @@ async def publish_to_tiktok(
         return PlatformResult(
             platform="tiktok",
             success=False,
-            error=str(e)
+            error_message=str(e)
         )
 
 
@@ -161,7 +162,7 @@ async def publish_to_youtube(
         return PlatformResult(
             platform="youtube",
             success=False,
-            error="No access token"
+            error_message="No access token"
         )
     
     try:
@@ -194,7 +195,7 @@ async def publish_to_youtube(
                 return PlatformResult(
                     platform="youtube",
                     success=False,
-                    error=f"Init failed: {init_resp.text[:200]}"
+                    error_message=f"Init failed: {init_resp.text[:200]}"
                 )
             
             upload_url = init_resp.headers.get("Location")
@@ -202,7 +203,7 @@ async def publish_to_youtube(
                 return PlatformResult(
                     platform="youtube",
                     success=False,
-                    error="No upload URL"
+                    error_message="No upload URL"
                 )
             
             # Upload video
@@ -219,15 +220,15 @@ async def publish_to_youtube(
                 return PlatformResult(
                     platform="youtube",
                     success=False,
-                    error=f"Upload failed: {upload_resp.status_code}"
+                    error_message=f"Upload failed: {upload_resp.status_code}"
                 )
             
             video_id = upload_resp.json().get("id")
             return PlatformResult(
                 platform="youtube",
                 success=True,
-                video_id=video_id,
-                url=f"https://youtube.com/shorts/{video_id}" if video_id else None
+                platform_video_id=video_id,
+                platform_url=f"https://youtube.com/shorts/{video_id}" if video_id else None
             )
     
     except Exception as e:
@@ -235,7 +236,7 @@ async def publish_to_youtube(
         return PlatformResult(
             platform="youtube",
             success=False,
-            error=str(e)
+            error_message=str(e)
         )
 
 
@@ -251,7 +252,7 @@ async def publish_to_instagram(
         return PlatformResult(
             platform="instagram",
             success=False,
-            error="Missing access token or page ID"
+            error_message="Missing access token or page ID"
         )
     
     # Instagram Reels requires a public URL
@@ -259,7 +260,7 @@ async def publish_to_instagram(
     return PlatformResult(
         platform="instagram",
         success=False,
-        error="Instagram Reels upload requires public video URL (coming soon)"
+        error_message="Instagram Reels upload requires public video URL (coming soon)"
     )
 
 
@@ -275,7 +276,7 @@ async def publish_to_facebook(
         return PlatformResult(
             platform="facebook",
             success=False,
-            error="Missing access token or page ID"
+            error_message="Missing access token or page ID"
         )
     
     try:
@@ -295,14 +296,14 @@ async def publish_to_facebook(
                 return PlatformResult(
                     platform="facebook",
                     success=False,
-                    error=f"Upload failed: {resp.text[:200]}"
+                    error_message=f"Upload failed: {resp.text[:200]}"
                 )
             
             video_id = resp.json().get("id")
             return PlatformResult(
                 platform="facebook",
                 success=True,
-                video_id=video_id
+                platform_video_id=video_id
             )
     
     except Exception as e:
@@ -310,168 +311,111 @@ async def publish_to_facebook(
         return PlatformResult(
             platform="facebook",
             success=False,
-            error=str(e)
+            error_message=str(e)
         )
 
 
-async def run_publish_stage(
-    ctx: JobContext,
-    token_loader
-) -> JobContext:
+async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
+    """Publish to platforms + write a ledger row per publish attempt.
+
+    Ledger contract:
+      - INSERT publish_attempts row before the API call
+      - UPDATE after call (success/fail)
+      - verification loop later turns verify_status into confirmed/rejected/unknown
     """
-    Execute platform publishing stage.
-    
-    Args:
-        ctx: Job context
-        token_loader: Async function to load platform tokens
-        
-    Returns:
-        Updated context with publish results
-    """
+
     if not ctx.platforms:
         logger.warning(f"No platforms specified for upload {ctx.upload_id}")
         return ctx
-    
-    # Check we have at least one video
+
     default_video = ctx.processed_video_path or ctx.local_video_path
     if not default_video or not default_video.exists():
-        raise PublishError(
-            "No video file to publish",
-            code=ErrorCode.UPLOAD_FAILED
-        )
-    
+        raise PublishError("No video file to publish", code=ErrorCode.UPLOAD_FAILED)
+
     logger.info(f"Publishing to platforms: {ctx.platforms}")
-    
-    # Initialize encryption keys
     init_enc_keys()
-    
-    # Platform key mapping
-    platform_to_db_key = {
-        "tiktok": "tiktok",
-        "youtube": "google",
-        "instagram": "meta",
-        "facebook": "meta"
-    }
-    
+
+    platform_to_db_key = {"tiktok": "tiktok", "youtube": "google", "instagram": "meta", "facebook": "meta"}
+
     for platform in ctx.platforms:
         db_key = platform_to_db_key.get(platform, platform)
-        
-        # Get the best video file for this platform
-        # This uses the platform-specific transcoded version if available
-        video_path = ctx.get_video_for_platform(platform)
-        if not video_path or not video_path.exists():
-            video_path = default_video
-        
-        logger.info(f"Using video for {platform}: {video_path.name}")
-        
-        # Load token
-        token_blob = await token_loader(ctx.user_id, db_key)
-        if not token_blob:
-            ctx.platform_results.append(PlatformResult(
-                platform=platform,
-                success=False,
-                error_message="Platform not connected"
-            ))
-            continue
-        
-        # Decrypt token
+
+        video_file = ctx.get_video_for_platform(platform)
+        if not video_file or not video_file.exists():
+            video_file = default_video
+
+        attempt_id = None
         try:
-            token_data = decrypt_token_blob(token_blob)
-        except Exception as e:
-            ctx.platform_results.append(PlatformResult(
-                platform=platform,
-                success=False,
-                error_message=f"Token decrypt failed: {e}"
-            ))
+            attempt_id = await db_stage.insert_publish_attempt(
+                db_pool,
+                upload_id=str(ctx.upload_id),
+                user_id=str(ctx.user_id),
+                platform=str(platform),
+            )
+        except Exception:
+            attempt_id = None
+
+        token_data = None
+        try:
+            token_data = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
+        except Exception:
+            token_data = None
+
+        if not token_data:
+            msg = f"Not connected to {platform}"
+            if attempt_id:
+                try:
+                    await db_stage.update_publish_attempt_failed(
+                        db_pool,
+                        attempt_id=attempt_id,
+                        error_code="NOT_CONNECTED",
+                        error_message=msg,
+                    )
+                except Exception:
+                    pass
+            ctx.platform_results.append(PlatformResult(platform=platform, success=False, attempt_id=attempt_id, error_code="NOT_CONNECTED", error_message=msg))
             continue
-        
-        # Get final title and caption
-        final_title = ctx.get_effective_title()
-        final_caption = ctx.get_effective_caption()
 
-        # Apply platform-specific hashtags
-        platform_map = getattr(ctx, "platform_hashtags_map", None) or {}
-        if platform_map and platform in platform_map:
-            final_hashtags = platform_map.get(platform, []) or []
-        else:
-            platform_specific_tags = ctx.user_settings.get("platform_hashtags", {}).get(platform, [])
-            base_hashtags = getattr(ctx, "final_hashtags", None) or (ctx.ai_hashtags or ctx.hashtags or [])
-            all_hashtags = list(base_hashtags) + list(platform_specific_tags)
+        try:
+            if platform == "tiktok":
+                result = await publish_to_tiktok(video_file, ctx, token_data)
+            elif platform == "youtube":
+                result = await publish_to_youtube(video_file, ctx, token_data)
+            elif platform == "instagram":
+                result = await publish_to_instagram(video_file, ctx, token_data)
+            elif platform == "facebook":
+                result = await publish_to_facebook(video_file, ctx, token_data)
+            else:
+                result = PlatformResult(platform=platform, success=False, error_code="UNSUPPORTED", error_message=f"Unsupported platform: {platform}")
+        except Exception as e:
+            logger.exception(f"Error publishing to {platform}")
+            result = PlatformResult(platform=platform, success=False, error_code="PUBLISH_EXCEPTION", error_message=str(e))
 
-            # Deduplicate (case-insensitive)
-            seen = set()
-            unique_hashtags = []
-            for tag in all_hashtags:
-                tag_lower = str(tag).lower()
-                if tag_lower not in seen:
-                    seen.add(tag_lower)
-                    unique_hashtags.append(tag)
-
-            # Apply max hashtag limit
-            max_hashtags = ctx.user_settings.get("max_hashtags", 15)
-            final_hashtags = unique_hashtags[:max_hashtags]
-        
-        # Format hashtags with # symbol
-        hashtag_str = " ".join(f"#{tag}" for tag in final_hashtags) if final_hashtags else ""
-        
-        # Combine caption with hashtags based on position preference
-        hashtag_position = ctx.user_settings.get("hashtag_position", "end")
-        if hashtag_str:
-            if hashtag_position == "start":
-                final_caption_with_tags = f"{hashtag_str}\n\n{final_caption}".strip()
-            elif hashtag_position == "end":
-                final_caption_with_tags = f"{final_caption}\n\n{hashtag_str}".strip()
-            else:  # caption - hashtags inline in caption
-                final_caption_with_tags = final_caption
-        else:
-            final_caption_with_tags = final_caption
-        
-        logger.info(f"{platform} - Hashtags: {final_hashtags}")
-        
-        # Use final_caption_with_tags for publishing instead of final_caption
-        
-        # Publish based on platform
-        if platform == "tiktok":
-            result = await publish_to_tiktok(
-                video_path,
-                final_title,
-                token_data
-            )
-        elif platform == "youtube":
-            result = await publish_to_youtube(
-                video_path,
-                final_title,
-                final_caption_with_tags,  # Use caption with hashtags
-                token_data
-            )
-        elif platform == "instagram":
-            page_id = ctx.user_settings.get("selected_page_id")
-            result = await publish_to_instagram(
-                video_path,
-                final_caption_with_tags,  # Use caption with hashtags
-                token_data,
-                page_id
-            )
-        elif platform == "facebook":
-            page_id = ctx.user_settings.get("selected_page_id")
-            result = await publish_to_facebook(
-                video_path,
-                final_caption_with_tags,  # Use caption with hashtags
-                token_data,
-                page_id
-            )
-        else:
-            result = PlatformResult(
-                platform=platform,
-                success=False,
-                error_message=f"Unknown platform: {platform}"
-            )
-        
+        result.attempt_id = attempt_id
         ctx.platform_results.append(result)
-        
-        if result.success:
-            logger.info(f"Published to {platform}: {result.platform_video_id}")
-        else:
-            logger.warning(f"Failed to publish to {platform}: {result.error_message}")
-    
+
+        if attempt_id:
+            try:
+                if result.success:
+                    await db_stage.update_publish_attempt_success(
+                        db_pool,
+                        attempt_id=attempt_id,
+                        platform_post_id=result.platform_video_id,
+                        platform_url=result.platform_url,
+                        http_status=result.http_status,
+                        response_payload=result.response_payload,
+                        publish_id=result.publish_id,
+                    )
+                else:
+                    await db_stage.update_publish_attempt_failed(
+                        db_pool,
+                        attempt_id=attempt_id,
+                        error_code=result.error_code or "PUBLISH_FAILED",
+                        error_message=result.error_message or "Publish failed",
+                        http_status=result.http_status,
+                        response_payload=result.response_payload,
+                    )
+            except Exception:
+                pass
+
     return ctx

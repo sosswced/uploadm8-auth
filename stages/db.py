@@ -6,6 +6,7 @@ Database operations for the worker pipeline.
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 import asyncpg
@@ -13,6 +14,10 @@ import asyncpg
 from .context import JobContext
 
 logger = logging.getLogger("uploadm8-worker")
+
+
+def _uuid4() -> str:
+    return str(uuid.uuid4())
 
 
 async def load_upload_record(pool: asyncpg.Pool, upload_id: str) -> Optional[dict]:
@@ -267,13 +272,35 @@ async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
         return
 
     async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE uploads SET
-                status = 'processing',
-                processing_started_at = $2,
-                updated_at = NOW()
-            WHERE id = $1
-        """, ctx.upload_id, ctx.started_at or datetime.now(timezone.utc))
+        # delivery_* columns are optional (migration may not be applied yet)
+        try:
+            await conn.execute(
+                """
+                UPDATE uploads SET
+                    status = 'processing',
+                    processing_started_at = $2,
+                    delivery_status = 'pending',
+                    platforms_confirmed = 0,
+                    platforms_attempted = 0,
+                    platforms_failed = 0,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                ctx.upload_id,
+                ctx.started_at or datetime.now(timezone.utc),
+            )
+        except Exception:
+            await conn.execute(
+                """
+                UPDATE uploads SET
+                    status = 'processing',
+                    processing_started_at = $2,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                ctx.upload_id,
+                ctx.started_at or datetime.now(timezone.utc),
+            )
 
 
 async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
@@ -283,27 +310,63 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
 
     status = "completed" if ctx.is_success() else "partial" if ctx.is_partial_success() else "failed"
 
+    attempted = len(ctx.platform_results or [])
+    failed = len([r for r in (ctx.platform_results or []) if not getattr(r, "success", False)])
+    delivery_status = "pending" if (attempted > 0 and attempted != failed) else "failed"
+
     async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE uploads SET
-                status = $2,
-                processed_r2_key = $3,
-                processing_finished_at = $4,
-                completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END,
-                error_code = $5,
-                error_detail = $6,
-                platform_results = $7,
-                updated_at = NOW()
-            WHERE id = $1
-        """,
-            ctx.upload_id,
-            status,
-            ctx.processed_r2_key,
-            ctx.finished_at or datetime.now(timezone.utc),
-            ctx.error_code,
-            ctx.error_message,
-            json.dumps([r.__dict__ for r in ctx.platform_results])
-        )
+        # delivery_* columns are optional (migration may not be applied yet)
+        try:
+            await conn.execute(
+                """
+                UPDATE uploads SET
+                    status = $2,
+                    processed_r2_key = $3,
+                    processing_finished_at = $4,
+                    completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END,
+                    error_code = $5,
+                    error_detail = $6,
+                    platform_results = $7,
+                    delivery_status = $8,
+                    platforms_attempted = $9,
+                    platforms_confirmed = COALESCE(platforms_confirmed, 0),
+                    platforms_failed = $10,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                ctx.upload_id,
+                status,
+                ctx.processed_r2_key,
+                ctx.finished_at or datetime.now(timezone.utc),
+                ctx.error_code,
+                ctx.error_message,
+                json.dumps([r.__dict__ for r in ctx.platform_results]),
+                delivery_status,
+                attempted,
+                failed,
+            )
+        except Exception:
+            await conn.execute(
+                """
+                UPDATE uploads SET
+                    status = $2,
+                    processed_r2_key = $3,
+                    processing_finished_at = $4,
+                    completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END,
+                    error_code = $5,
+                    error_detail = $6,
+                    platform_results = $7,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                ctx.upload_id,
+                status,
+                ctx.processed_r2_key,
+                ctx.finished_at or datetime.now(timezone.utc),
+                ctx.error_code,
+                ctx.error_message,
+                json.dumps([r.__dict__ for r in ctx.platform_results]),
+            )
 
 
 async def mark_processing_failed(pool: asyncpg.Pool, ctx: JobContext, error_code: str, error_message: str):
@@ -499,3 +562,292 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
             platform_map_json,
             final_hashtags if final_hashtags else None,
         )
+
+
+# ============================================================
+# PUBLISH LEDGER (Real Confirmation)
+# ============================================================
+
+
+async def insert_publish_attempt(
+    pool: asyncpg.Pool,
+    *,
+    upload_id: str,
+    user_id: str,
+    platform: str,
+    scheduled_post_id: Optional[str] = None,
+    account_id: Optional[str] = None,
+    group_id: Optional[str] = None,
+    attempt_no: int = 1,
+) -> str:
+    """Insert ledger row BEFORE calling platform API."""
+    attempt_id = _uuid4()
+    if not pool:
+        return attempt_id
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO publish_attempts (
+                id, upload_id, scheduled_post_id, user_id, platform, account_id, group_id,
+                status, attempt_no, started_at,
+                verify_status, verify_attempts, next_verify_at,
+                created_at, updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                'retrying', $8, NOW(),
+                'pending', 0, NOW(),
+                NOW(), NOW()
+            )
+            """,
+            attempt_id,
+            upload_id,
+            scheduled_post_id,
+            user_id,
+            platform,
+            account_id,
+            group_id,
+            attempt_no,
+        )
+    return attempt_id
+
+
+async def update_publish_attempt_success(
+    pool: asyncpg.Pool,
+    *,
+    attempt_id: str,
+    platform_post_id: Optional[str],
+    platform_url: Optional[str],
+    http_status: Optional[int] = None,
+    response_payload: Optional[dict] = None,
+    publish_id: Optional[str] = None,
+) -> None:
+    if not pool:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE publish_attempts SET
+                status='success',
+                platform_post_id=$2,
+                platform_url=$3,
+                http_status=$4,
+                response_payload=$5,
+                publish_id=$6,
+                ended_at=NOW(),
+                updated_at=NOW(),
+                next_verify_at=NOW()
+            WHERE id=$1
+            """,
+            attempt_id,
+            platform_post_id,
+            platform_url,
+            http_status,
+            json.dumps(response_payload) if response_payload is not None else None,
+            publish_id,
+        )
+
+
+async def update_publish_attempt_failed(
+    pool: asyncpg.Pool,
+    *,
+    attempt_id: str,
+    error_code: str,
+    error_message: str,
+    http_status: Optional[int] = None,
+    response_payload: Optional[dict] = None,
+) -> None:
+    if not pool:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE publish_attempts SET
+                status='failed',
+                error_code=$2,
+                error_message=$3,
+                http_status=$4,
+                response_payload=$5,
+                verify_status='unknown',
+                ended_at=NOW(),
+                updated_at=NOW()
+            WHERE id=$1
+            """,
+            attempt_id,
+            error_code,
+            error_message,
+            http_status,
+            json.dumps(response_payload) if response_payload is not None else None,
+        )
+
+
+async def get_pending_verifications(pool: asyncpg.Pool, *, limit: int = 50) -> list[dict]:
+    if not pool:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                id, upload_id, user_id, platform,
+                platform_post_id, platform_url, publish_id,
+                verify_status, verify_attempts, next_verify_at
+            FROM publish_attempts
+            WHERE status='success'
+              AND verify_status='pending'
+              AND (next_verify_at IS NULL OR next_verify_at <= NOW())
+            ORDER BY COALESCE(next_verify_at, created_at) ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+
+def _next_backoff_seconds(attempts: int) -> int:
+    schedule = [10, 30, 60, 120, 300, 300, 300]
+    idx = min(max(attempts, 0), len(schedule) - 1)
+    return schedule[idx]
+
+
+async def update_verify_confirmed(pool: asyncpg.Pool, *, attempt_id: str, verify_payload: dict, platform_url: Optional[str] = None) -> None:
+    if not pool:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE publish_attempts SET
+                verify_status='confirmed',
+                verified_at=NOW(),
+                verify_payload=$2,
+                platform_url=COALESCE($3, platform_url),
+                updated_at=NOW()
+            WHERE id=$1
+            """,
+            attempt_id,
+            json.dumps(verify_payload),
+            platform_url,
+        )
+        try:
+            await conn.execute(
+                """
+                WITH agg AS (
+                    SELECT upload_id,
+                        COUNT(*)::int AS attempted,
+                        COUNT(*) FILTER (WHERE verify_status='confirmed')::int AS confirmed,
+                        COUNT(*) FILTER (WHERE status='failed' OR verify_status='rejected')::int AS failed
+                    FROM publish_attempts
+                    WHERE upload_id = (SELECT upload_id FROM publish_attempts WHERE id=$1)
+                    GROUP BY upload_id
+                )
+                UPDATE uploads u SET
+                    platforms_attempted = agg.attempted,
+                    platforms_confirmed = agg.confirmed,
+                    platforms_failed = agg.failed,
+                    delivery_status = CASE
+                        WHEN agg.attempted > 0 AND agg.confirmed = agg.attempted THEN 'confirmed'
+                        WHEN agg.confirmed > 0 THEN 'partial'
+                        WHEN agg.failed = agg.attempted THEN 'failed'
+                        ELSE COALESCE(u.delivery_status,'pending')
+                    END,
+                    updated_at = NOW()
+                FROM agg
+                WHERE u.id = agg.upload_id
+                """,
+                attempt_id,
+            )
+        except Exception:
+            pass
+
+
+async def update_verify_rejected(pool: asyncpg.Pool, *, attempt_id: str, verify_payload: dict) -> None:
+    if not pool:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE publish_attempts SET
+                verify_status='rejected',
+                verified_at=NOW(),
+                verify_payload=$2,
+                updated_at=NOW()
+            WHERE id=$1
+            """,
+            attempt_id,
+            json.dumps(verify_payload),
+        )
+
+
+async def update_verify_retry(pool: asyncpg.Pool, *, attempt_id: str, current_verify_attempts: int, verify_payload: dict) -> None:
+    if not pool:
+        return
+    next_in = _next_backoff_seconds(current_verify_attempts)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE publish_attempts SET
+                verify_status='pending',
+                verify_attempts=$2,
+                verify_payload=$3,
+                next_verify_at = NOW() + ($4 || ' seconds')::interval,
+                updated_at=NOW()
+            WHERE id=$1
+            """,
+            attempt_id,
+            int(current_verify_attempts),
+            json.dumps(verify_payload),
+            int(next_in),
+        )
+
+
+async def update_verify_unknown(pool: asyncpg.Pool, *, attempt_id: str, verify_payload: dict) -> None:
+    if not pool:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE publish_attempts SET
+                verify_status='unknown',
+                verified_at=NOW(),
+                verify_payload=$2,
+                updated_at=NOW()
+            WHERE id=$1
+            """,
+            attempt_id,
+            json.dumps(verify_payload),
+        )
+
+
+async def get_publish_attempts_for_upload(pool: asyncpg.Pool, *, upload_id: str) -> list[dict]:
+    if not pool:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT *
+            FROM publish_attempts
+            WHERE upload_id=$1
+            ORDER BY created_at ASC
+            """,
+            upload_id,
+        )
+        return [dict(r) for r in rows]
+
+
+async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
+    """Load admin webhook url from admin_settings.settings_json.notifications.admin_webhook_url."""
+    if not pool:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT settings_json FROM admin_settings WHERE id=1")
+        if not row:
+            return None
+        try:
+            settings = row["settings_json"]
+            if isinstance(settings, str):
+                settings = json.loads(settings)
+            notif = (settings or {}).get("notifications", {})
+            wh = (notif or {}).get("admin_webhook_url")
+            return (wh or "").strip() or None
+        except Exception:
+            return None

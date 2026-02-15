@@ -18,6 +18,7 @@ import httpx
 
 from .context import JobContext
 from .errors import StageError, SkipStage
+from . import db as db_stage
 
 logger = logging.getLogger("uploadm8-worker")
 
@@ -106,9 +107,22 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
 # Admin Notifications
 # ============================================================
 
-async def notify_admin_signup(email: str, name: str, tier: str = "free"):
+async def _get_admin_webhook(db_pool=None) -> str:
+    # Priority: explicit env override -> admin_settings saved webhook
+    if ADMIN_DISCORD_WEBHOOK_URL:
+        return ADMIN_DISCORD_WEBHOOK_URL
+    if db_pool is None:
+        return ""
+    try:
+        wh = await db_stage.load_admin_notification_webhook(db_pool)
+        return wh or ""
+    except Exception:
+        return ""
+
+
+async def notify_admin_signup(email: str, name: str, tier: str = "free", db_pool=None):
     """Notify admin of new user signup."""
-    webhook = SIGNUP_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL
+    webhook = SIGNUP_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
     if not webhook:
         return
     
@@ -126,9 +140,9 @@ async def notify_admin_signup(email: str, name: str, tier: str = "free"):
     await _send_discord_webhook(webhook, embeds=[embed])
 
 
-async def notify_admin_trial_started(email: str, name: str, plan: str):
+async def notify_admin_trial_started(email: str, name: str, plan: str, db_pool=None):
     """Notify admin of new trial signup."""
-    webhook = TRIAL_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL
+    webhook = TRIAL_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
     if not webhook:
         return
     
@@ -146,9 +160,9 @@ async def notify_admin_trial_started(email: str, name: str, plan: str):
     await _send_discord_webhook(webhook, embeds=[embed])
 
 
-async def notify_admin_mrr_collected(amount: float, customer_email: str, plan: str):
+async def notify_admin_mrr_collected(amount: float, customer_email: str, plan: str, db_pool=None):
     """Notify admin of MRR collection."""
-    webhook = MRR_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL
+    webhook = MRR_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
     if not webhook:
         return
     
@@ -166,9 +180,9 @@ async def notify_admin_mrr_collected(amount: float, customer_email: str, plan: s
     await _send_discord_webhook(webhook, embeds=[embed])
 
 
-async def notify_admin_error(error_type: str, details: dict):
+async def notify_admin_error(error_type: str, details: dict, db_pool=None):
     """Notify admin of system error."""
-    webhook = ERROR_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL
+    webhook = ERROR_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
     if not webhook:
         return
     
@@ -182,31 +196,34 @@ async def notify_admin_error(error_type: str, details: dict):
     await _send_discord_webhook(webhook, embeds=[embed])
 
 
-async def notify_admin_worker_start():
+async def notify_admin_worker_start(db_pool=None):
     """Notify admin that worker has started."""
-    if not ADMIN_DISCORD_WEBHOOK_URL:
+    webhook = await _get_admin_webhook(db_pool)
+    if not webhook:
         return
     
     await _send_discord_webhook(
-        ADMIN_DISCORD_WEBHOOK_URL,
+        webhook,
         content="🟢 UploadM8 Worker started"
     )
 
 
-async def notify_admin_worker_stop():
+async def notify_admin_worker_stop(db_pool=None):
     """Notify admin that worker has stopped."""
-    if not ADMIN_DISCORD_WEBHOOK_URL:
+    webhook = await _get_admin_webhook(db_pool)
+    if not webhook:
         return
     
     await _send_discord_webhook(
-        ADMIN_DISCORD_WEBHOOK_URL,
+        webhook,
         content="🔴 UploadM8 Worker stopped"
     )
 
 
-async def notify_admin_daily_summary(data: dict):
+async def notify_admin_daily_summary(data: dict, db_pool=None):
     """Send daily summary to admin."""
-    if not ADMIN_DISCORD_WEBHOOK_URL:
+    webhook = await _get_admin_webhook(db_pool)
+    if not webhook:
         return
     
     embed = {
@@ -223,7 +240,7 @@ async def notify_admin_daily_summary(data: dict):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     
-    await _send_discord_webhook(ADMIN_DISCORD_WEBHOOK_URL, embeds=[embed])
+    await _send_discord_webhook(webhook, embeds=[embed])
 
 
 # ============================================================

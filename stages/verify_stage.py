@@ -1,331 +1,241 @@
-"""
-UploadM8 Verify Stage — Platform Post Verification
-====================================================
-Polls platform APIs to confirm posts are actually live.
+"""stages.verify_stage
 
-This is the "hard confirmation" layer that turns "API accepted" into "confirmed live".
+Real confirmation stage.
 
-Backoff schedule: 10s → 30s → 60s → 120s → 300s → mark unknown
-Max ~10-15 minutes of verification attempts per publish.
+This runs as a background loop (non-blocking to main job pipeline) and turns
+"accepted" publishes into "confirmed" or "rejected" via platform status lookups.
 
-Verification strategies per platform:
-  - TikTok:    GET /v2/post/publish/status/fetch/ with publish_id
-  - YouTube:   GET /v3/videos?id={video_id}&part=status
-  - Instagram: GET /{container_id}?fields=status_code (future)
-  - Facebook:  GET /{video_id}?fields=status (future)
+Contract:
+- Only touches publish_attempts where status='success' and verify_status='pending'.
+- Uses exponential backoff via next_verify_at.
 """
 
-import os
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
-import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 import httpx
-import asyncpg
 
 from . import db as db_stage
-from .publish_stage import decrypt_token_blob, init_enc_keys
+from .publish_stage import decrypt_token, init_enc_keys
 
 logger = logging.getLogger("uploadm8-worker")
 
-# Max verification attempts before marking as unknown
-MAX_VERIFY_ATTEMPTS = 7
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=10.0)
 
 
-# ============================================================================
-# PLATFORM-SPECIFIC VERIFICATION FUNCTIONS
-# ============================================================================
-
-async def verify_tiktok(
-    platform_post_id: str,
-    token_data: dict
-) -> dict:
-    """
-    Check TikTok publish status.
-    Returns: {"status": "confirmed"|"rejected"|"pending", "payload": {...}}
-    """
-    access_token = token_data.get("access_token")
-    if not access_token:
-        return {"status": "pending", "payload": {"error": "no_token"}}
-    
+def _safe_json(resp: httpx.Response) -> Dict[str, Any]:
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
-                },
-                json={"publish_id": platform_post_id}
-            )
-            
-            if resp.status_code != 200:
-                return {"status": "pending", "payload": {"http_status": resp.status_code, "body": resp.text[:500]}}
-            
-            data = resp.json()
-            publish_status = data.get("data", {}).get("status", "").upper()
-            
-            # TikTok statuses: PUBLISH_COMPLETE, FAILED, PROCESSING_UPLOAD, PROCESSING_DOWNLOAD, SENDING_TO_USER_INBOX
-            if publish_status == "PUBLISH_COMPLETE":
-                return {"status": "confirmed", "payload": data}
-            elif publish_status == "FAILED":
-                return {"status": "rejected", "payload": data}
-            else:
-                # Still processing
-                return {"status": "pending", "payload": data}
-    
-    except Exception as e:
-        logger.warning(f"TikTok verify error: {e}")
-        return {"status": "pending", "payload": {"error": str(e)}}
+        data = resp.json()
+        if isinstance(data, dict):
+            # strip obvious secrets
+            out = {}
+            for k, v in data.items():
+                lk = str(k).lower()
+                if "token" in lk or "secret" in lk or "authorization" in lk:
+                    continue
+                out[k] = v
+            return out
+        return {"data": data}
+    except Exception:
+        return {"text": (resp.text or "")[:4000]}
 
 
-async def verify_youtube(
-    platform_post_id: str,
-    token_data: dict
-) -> dict:
-    """
-    Check YouTube video status.
-    Returns: {"status": "confirmed"|"rejected"|"pending", "payload": {...}, "url": "..."}
-    """
-    access_token = token_data.get("access_token")
-    if not access_token:
-        return {"status": "pending", "payload": {"error": "no_token"}}
-    
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                "https://www.googleapis.com/youtube/v3/videos",
-                params={
-                    "id": platform_post_id,
-                    "part": "status,snippet",
-                },
-                headers={"Authorization": f"Bearer {access_token}"}
-            )
-            
-            if resp.status_code != 200:
-                return {"status": "pending", "payload": {"http_status": resp.status_code, "body": resp.text[:500]}}
-            
-            data = resp.json()
-            items = data.get("items", [])
-            
-            if not items:
-                # Video not found — could be deleted or still processing
-                return {"status": "pending", "payload": data}
-            
-            video = items[0]
-            upload_status = video.get("status", {}).get("uploadStatus", "")
-            privacy_status = video.get("status", {}).get("privacyStatus", "")
-            
-            # YouTube statuses: processed, uploaded, failed, rejected, deleted
-            if upload_status == "processed":
-                url = f"https://youtube.com/shorts/{platform_post_id}"
-                return {"status": "confirmed", "payload": data, "url": url}
-            elif upload_status in ("failed", "rejected", "deleted"):
-                return {"status": "rejected", "payload": data}
-            else:
-                # Still uploading/processing
-                return {"status": "pending", "payload": data}
-    
-    except Exception as e:
-        logger.warning(f"YouTube verify error: {e}")
-        return {"status": "pending", "payload": {"error": str(e)}}
+async def _verify_tiktok(client: httpx.AsyncClient, access_token: str, publish_id: str) -> tuple[str, dict, Optional[str]]:
+    """Return (verify_status, payload, url_override)."""
+    # TikTok publish status endpoint (may vary by app scope)
+    url = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    resp = await client.post(url, headers=headers, json={"publish_id": publish_id})
+    payload = {"http_status": resp.status_code, "body": _safe_json(resp)}
 
+    if resp.status_code == 401 or resp.status_code == 403:
+        return "unknown", payload, None
 
-async def verify_facebook(
-    platform_post_id: str,
-    token_data: dict
-) -> dict:
-    """
-    Check Facebook video status.
-    Returns: {"status": "confirmed"|"rejected"|"pending", "payload": {...}}
-    """
-    access_token = token_data.get("access_token")
-    if not access_token:
-        return {"status": "pending", "payload": {"error": "no_token"}}
-    
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                f"https://graph.facebook.com/v19.0/{platform_post_id}",
-                params={
-                    "access_token": access_token,
-                    "fields": "status,published,permalink_url,title"
-                }
-            )
-            
-            if resp.status_code == 404:
-                return {"status": "rejected", "payload": {"http_status": 404, "reason": "not_found"}}
-            
-            if resp.status_code != 200:
-                return {"status": "pending", "payload": {"http_status": resp.status_code, "body": resp.text[:500]}}
-            
-            data = resp.json()
-            status = data.get("status", {})
-            published = data.get("published", False)
-            
-            # Facebook video statuses
-            video_status = status.get("video_status", "") if isinstance(status, dict) else str(status)
-            
-            if published or video_status == "ready":
-                url = data.get("permalink_url")
-                return {"status": "confirmed", "payload": data, "url": url}
-            elif video_status in ("error", "expired"):
-                return {"status": "rejected", "payload": data}
-            else:
-                return {"status": "pending", "payload": data}
-    
-    except Exception as e:
-        logger.warning(f"Facebook verify error: {e}")
-        return {"status": "pending", "payload": {"error": str(e)}}
-
-
-async def verify_instagram(
-    platform_post_id: str,
-    token_data: dict
-) -> dict:
-    """
-    Check Instagram container/media status.
-    Note: Instagram Reels not yet implemented in publish, so this is a placeholder.
-    """
-    # Instagram verification will be implemented when publish is supported
-    return {"status": "pending", "payload": {"note": "Instagram verification not yet implemented"}}
-
-
-# ============================================================================
-# VERIFICATION DISPATCHER
-# ============================================================================
-
-VERIFY_FUNCTIONS = {
-    "tiktok": verify_tiktok,
-    "youtube": verify_youtube,
-    "facebook": verify_facebook,
-    "instagram": verify_instagram,
-}
-
-
-async def verify_single_attempt(
-    pool: asyncpg.Pool,
-    attempt: dict
-) -> str:
-    """
-    Verify a single publish attempt. Returns the resulting verify_status.
-    
-    Args:
-        pool: Database pool
-        attempt: Dict from get_pending_verifications()
-    
-    Returns:
-        "confirmed", "rejected", "pending" (will retry), or "unknown" (gave up)
-    """
-    attempt_id = str(attempt["id"])
-    platform = attempt["platform"]
-    platform_post_id = attempt["platform_post_id"]
-    verify_count = attempt["verify_attempts"]
-    user_id = str(attempt["user_id"])
-    
-    # Check if we've exceeded max attempts
-    if verify_count >= MAX_VERIFY_ATTEMPTS:
-        await db_stage.update_verify_unknown(pool, attempt_id, {"reason": "max_attempts_exceeded"})
-        return "unknown"
-    
-    # Load token for verification API call
-    platform_to_db_key = {
-        "tiktok": "tiktok",
-        "youtube": "google",
-        "instagram": "meta",
-        "facebook": "meta"
-    }
-    db_key = platform_to_db_key.get(platform, platform)
-    
-    token_blob = await db_stage.load_platform_token(pool, user_id, db_key)
-    if not token_blob:
-        # Can't verify without a token — schedule retry in case token is re-added
-        await db_stage.update_verify_retry(pool, attempt_id, verify_count)
-        return "pending"
-    
-    try:
-        token_data = decrypt_token_blob(token_blob)
-    except Exception as e:
-        logger.warning(f"Token decrypt failed during verify: {e}")
-        await db_stage.update_verify_retry(pool, attempt_id, verify_count)
-        return "pending"
-    
-    # Initialize encryption keys (idempotent)
-    init_enc_keys()
-    
-    # Call platform-specific verify function
-    verify_fn = VERIFY_FUNCTIONS.get(platform)
-    if not verify_fn:
-        logger.warning(f"No verify function for platform: {platform}")
-        await db_stage.update_verify_unknown(pool, attempt_id, {"reason": f"unsupported_platform: {platform}"})
-        return "unknown"
-    
-    result = await verify_fn(platform_post_id, token_data)
-    verify_status = result.get("status", "pending")
-    payload = result.get("payload")
-    url = result.get("url")
-    
-    if verify_status == "confirmed":
-        await db_stage.update_verify_confirmed(pool, attempt_id, payload, url)
-        logger.info(f"✅ VERIFIED: {platform} post {platform_post_id} is LIVE")
-        return "confirmed"
-    
-    elif verify_status == "rejected":
-        await db_stage.update_verify_rejected(pool, attempt_id, payload)
-        logger.warning(f"❌ REJECTED: {platform} post {platform_post_id} was rejected/removed")
-        return "rejected"
-    
-    else:
-        # Still pending — schedule next retry with backoff
-        await db_stage.update_verify_retry(pool, attempt_id, verify_count)
-        logger.debug(f"⏳ PENDING: {platform} post {platform_post_id}, attempt {verify_count + 1}")
-        return "pending"
-
-
-# ============================================================================
-# VERIFICATION WORKER LOOP (runs alongside main job loop)
-# ============================================================================
-
-async def run_verification_loop(pool: asyncpg.Pool, shutdown_event: asyncio.Event = None):
-    """
-    Background loop that polls pending verifications and processes them.
-    This runs independently of the main job queue.
-    
-    Call this from worker.py as a background task.
-    """
-    logger.info("Verification worker started")
-    
-    while True:
-        if shutdown_event and shutdown_event.is_set():
-            logger.info("Verification worker shutting down")
+    body = payload.get("body") or {}
+    # Heuristics (TikTok varies): look for status field
+    status = None
+    for key in ("status", "publish_status", "result"):  # tolerate schema drift
+        if key in body:
+            status = body.get(key)
             break
-        
+    if isinstance(status, dict):
+        status = status.get("status") or status.get("publish_status")
+
+    s = str(status or "").upper()
+    if "COMPLETE" in s or "PUBLISHED" in s or "SUCCESS" in s:
+        return "confirmed", payload, None
+    if "FAIL" in s or "REJECT" in s or "ERROR" in s:
+        return "rejected", payload, None
+
+    return "pending", payload, None
+
+
+async def _verify_youtube(client: httpx.AsyncClient, access_token: str, video_id: str) -> tuple[str, dict, Optional[str]]:
+    url = "https://www.googleapis.com/youtube/v3/videos"
+    params = {"id": video_id, "part": "status,snippet"}
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = await client.get(url, headers=headers, params=params)
+    payload = {"http_status": resp.status_code, "body": _safe_json(resp)}
+
+    if resp.status_code == 401 or resp.status_code == 403:
+        return "unknown", payload, None
+
+    body = payload.get("body") or {}
+    items = body.get("items") or []
+    if not items:
+        return "pending", payload, None
+
+    status = (items[0].get("status") or {}).get("uploadStatus")
+    s = str(status or "").lower()
+    if s in ("processed", "uploaded"):
+        # public URL can be derived
+        return "confirmed", payload, f"https://www.youtube.com/watch?v={video_id}"
+    if s in ("failed", "rejected", "deleted"):
+        return "rejected", payload, None
+
+    return "pending", payload, None
+
+
+async def _verify_facebook(client: httpx.AsyncClient, access_token: str, video_id: str) -> tuple[str, dict, Optional[str]]:
+    url = f"https://graph.facebook.com/v19.0/{video_id}"
+    params = {"fields": "status,published", "access_token": access_token}
+    resp = await client.get(url, params=params)
+    payload = {"http_status": resp.status_code, "body": _safe_json(resp)}
+
+    if resp.status_code == 401 or resp.status_code == 403:
+        return "unknown", payload, None
+
+    body = payload.get("body") or {}
+    if body.get("published") is True:
+        return "confirmed", payload, None
+
+    status = body.get("status")
+    if isinstance(status, dict):
+        status = status.get("video_status") or status.get("status")
+
+    s = str(status or "").lower()
+    if "ready" in s or "published" in s:
+        return "confirmed", payload, None
+    if "error" in s or "expired" in s or "failed" in s:
+        return "rejected", payload, None
+
+    return "pending", payload, None
+
+
+async def verify_single_attempt(pool, attempt: dict) -> None:
+    attempt_id = str(attempt.get("id"))
+    platform = str(attempt.get("platform") or "").lower()
+    verify_attempts = int(attempt.get("verify_attempts") or 0)
+
+    # max polls ~7 -> unknown
+    if verify_attempts >= 7:
+        await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "max_attempts"})
+        return
+
+    async with httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT) as client:
         try:
-            # Get attempts that need verification
-            pending = await db_stage.get_pending_verifications(pool, limit=20)
-            
-            if pending:
-                logger.info(f"Processing {len(pending)} pending verifications")
-                
-                for attempt in pending:
-                    try:
-                        await verify_single_attempt(pool, attempt)
-                    except Exception as e:
-                        logger.error(f"Verify error for attempt {attempt.get('id')}: {e}")
-                
-                # Small delay between batches
-                await asyncio.sleep(2)
+            # ensure crypto available for decrypting stored tokens
+            init_enc_keys()
+            if platform == "tiktok":
+                publish_id = attempt.get("publish_id") or attempt.get("platform_post_id")
+                if not publish_id:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_publish_id"})
+                    return
+
+                token_row = await db_stage.load_platform_token(pool, attempt.get("user_id"), "tiktok")
+                token_row = decrypt_token(token_row) if token_row else None
+                access = (token_row or {}).get("access_token")
+                if not access:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_access_token"})
+                    return
+
+                status, payload, url_override = await _verify_tiktok(client, access, str(publish_id))
+
+            elif platform == "youtube":
+                video_id = attempt.get("platform_post_id")
+                if not video_id:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_video_id"})
+                    return
+
+                token_row = await db_stage.load_platform_token(pool, attempt.get("user_id"), "google")
+                token_row = decrypt_token(token_row) if token_row else None
+                access = (token_row or {}).get("access_token")
+                if not access:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_access_token"})
+                    return
+
+                status, payload, url_override = await _verify_youtube(client, access, str(video_id))
+
+            elif platform == "facebook":
+                video_id = attempt.get("platform_post_id")
+                if not video_id:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_video_id"})
+                    return
+
+                token_row = await db_stage.load_platform_token(pool, attempt.get("user_id"), "meta")
+                token_row = decrypt_token(token_row) if token_row else None
+                access = (token_row or {}).get("access_token")
+                if not access:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_access_token"})
+                    return
+
+                status, payload, url_override = await _verify_facebook(client, access, str(video_id))
+
             else:
-                # No pending verifications — wait before checking again
-                await asyncio.sleep(10)
-        
-        except asyncio.CancelledError:
-            logger.info("Verification worker cancelled")
-            break
+                # not implemented yet
+                await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": f"unsupported_platform:{platform}"})
+                return
+
+            if status == "confirmed":
+                await db_stage.update_verify_confirmed(pool, attempt_id=attempt_id, verify_payload=payload, platform_url=url_override)
+            elif status == "rejected":
+                await db_stage.update_verify_rejected(pool, attempt_id=attempt_id, verify_payload=payload)
+            else:
+                await db_stage.update_verify_retry(
+                    pool,
+                    attempt_id=attempt_id,
+                    current_verify_attempts=verify_attempts + 1,
+                    verify_payload=payload,
+                )
+
         except Exception as e:
-            logger.error(f"Verification loop error: {e}")
-            await asyncio.sleep(5)
-    
-    logger.info("Verification worker stopped")
+            # retry with backoff (but don’t loop forever)
+            payload = {"error": str(e), "at": datetime.now(timezone.utc).isoformat()}
+            await db_stage.update_verify_retry(
+                pool,
+                attempt_id=attempt_id,
+                current_verify_attempts=verify_attempts + 1,
+                verify_payload=payload,
+            )
+
+
+async def run_verification_loop(pool, shutdown_event: asyncio.Event, *, poll_interval_seconds: int = 10, batch_size: int = 20) -> None:
+    """Continuously verify pending publish attempts."""
+    logger.info("Verification loop started")
+
+    while not shutdown_event.is_set():
+        try:
+            pending = await db_stage.get_pending_verifications(pool, limit=batch_size)
+            if pending:
+                # limit concurrency
+                sem = asyncio.Semaphore(8)
+
+                async def _run_one(a: dict):
+                    async with sem:
+                        await verify_single_attempt(pool, a)
+
+                await asyncio.gather(*[_run_one(a) for a in pending])
+        except Exception:
+            logger.exception("Verification loop error")
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval_seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Verification loop stopped")

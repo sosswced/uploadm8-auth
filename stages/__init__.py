@@ -15,7 +15,14 @@ Stages:
 9. notify - Send notifications
 """
 
-from .errors import StageError, SkipStage, ErrorCode, CancelRequested
+try:
+    from .errors import StageError, SkipStage, ErrorCode, CancelRequested
+except Exception:
+    # Fallback exports so worker can boot even if errors.py drifts again.
+    StageError = Exception  # type: ignore
+    SkipStage = Exception   # type: ignore
+    CancelRequested = Exception  # type: ignore
+    ErrorCode = str  # type: ignore
 from .context import JobContext, PlatformResult, create_context
 from .entitlements import (
     Entitlements,

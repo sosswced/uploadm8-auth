@@ -557,3 +557,65 @@ def get_max_hashtags(ent: Entitlements) -> int:
     if ent.unlimited_hashtags:
         return 9999
     return ent.max_hashtags
+
+# =====================================================================
+# APPEND-ONLY PATCH: errors contract normalization
+# Fixes ImportError: cannot import name 'StageError' from 'stages.errors'
+# Ensures symbols exist: StageError, SkipStage, CancelRequested, ErrorCode
+# =====================================================================
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Optional, Dict
+
+# ---- ErrorCode (define only if missing) ----
+try:
+    ErrorCode  # type: ignore[name-defined]
+except NameError:
+    class ErrorCode(str, Enum):
+        INTERNAL = "INTERNAL"
+        CANCELLED = "CANCELLED"
+        SKIPPED = "SKIPPED"
+        VALIDATION = "VALIDATION"
+        NOT_FOUND = "NOT_FOUND"
+        UNAUTHORIZED = "UNAUTHORIZED"
+        RATE_LIMIT = "RATE_LIMIT"
+        UPSTREAM = "UPSTREAM"
+
+# ---- StageError (define only if missing) ----
+try:
+    StageError  # type: ignore[name-defined]
+except NameError:
+    @dataclass
+    class StageError(Exception):
+        """Canonical pipeline error type."""
+        code: Any = ErrorCode.INTERNAL
+        message: str = "Stage error"
+        stage: Optional[str] = None
+        meta: Optional[Dict[str, Any]] = None
+        retryable: bool = False
+
+        def __str__(self) -> str:
+            base = f"{self.code}: {self.message}"
+            if self.stage:
+                base = f"[{self.stage}] {base}"
+            return base
+
+# ---- SkipStage (define only if missing) ----
+try:
+    SkipStage  # type: ignore[name-defined]
+except NameError:
+    class SkipStage(Exception):
+        """Raise to intentionally skip a stage without failing the pipeline."""
+        def __init__(self, message: str = "Stage skipped", meta: Optional[Dict[str, Any]] = None):
+            super().__init__(message)
+            self.meta = meta or {}
+
+# ---- CancelRequested (define only if missing) ----
+try:
+    CancelRequested  # type: ignore[name-defined]
+except NameError:
+    class CancelRequested(Exception):
+        """Raise to stop processing due to explicit cancellation."""
+        def __init__(self, message: str = "Cancel requested"):
+            super().__init__(message)

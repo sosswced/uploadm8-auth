@@ -65,6 +65,63 @@ def decrypt_token_blob(blob: Any) -> dict:
     return json.loads(plaintext.decode("utf-8"))
 
 
+
+
+# ---------------------------------------------------------------------
+# Compatibility exports for verify_stage
+# verify_stage imports: from .publish_stage import decrypt_token, init_enc_keys
+# This project stores tokens sometimes as encrypted blobs; other times as plain dicts.
+# decrypt_token returns a dict with access_token etc, or None on failure.
+# ---------------------------------------------------------------------
+def decrypt_token(token_row: Any) -> Optional[dict]:
+    """Best-effort decrypt/parse of a stored platform token row.
+
+    Accepts:
+      - dict: either already plaintext token data OR an encrypted blob dict
+      - str: JSON string for either plaintext dict or encrypted blob
+
+    Returns:
+      - dict token payload (e.g., {"access_token": "..."})
+      - None if missing/invalid
+    """
+    if token_row is None:
+        return None
+    try:
+        if isinstance(token_row, str):
+            token_row = json.loads(token_row)
+        if not isinstance(token_row, dict):
+            return None
+
+        # If this looks like an encrypted blob, decrypt it.
+        if "ciphertext" in token_row and "nonce" in token_row:
+            try:
+                return decrypt_token_blob(token_row)
+            except Exception:
+                return None
+
+        # Already plaintext token dict
+        return token_row
+    except Exception:
+        return None
+
+
+def _derive_title_desc(ctx: JobContext) -> tuple[str, str]:
+    """Derive best-effort title/description from JobContext without assuming schema."""
+    title = getattr(ctx, "title", None) or getattr(ctx, "video_title", None) or getattr(ctx, "name", None)
+    desc = getattr(ctx, "description", None) or getattr(ctx, "caption", None) or ""
+    if not title:
+        title = f"UploadM8 {getattr(ctx, 'upload_id', '')}".strip()
+    return str(title), str(desc)
+
+
+async def publish_to_tiktok_ctx(video_path: Path, ctx: JobContext, token_data: dict) -> PlatformResult:
+    title, _ = _derive_title_desc(ctx)
+    return await publish_to_tiktok(video_path, title, token_data)
+
+
+async def publish_to_youtube_ctx(video_path: Path, ctx: JobContext, token_data: dict) -> PlatformResult:
+    title, desc = _derive_title_desc(ctx)
+    return await publish_to_youtube(video_path, title, desc, token_data)
 async def publish_to_tiktok(
     video_path: Path,
     title: str,
@@ -244,7 +301,7 @@ async def publish_to_instagram(
     video_path: Path,
     caption: str,
     token_data: dict,
-    page_id: str
+    page_id: Optional[str] = None
 ) -> PlatformResult:
     """Publish video to Instagram Reels."""
     access_token = token_data.get("access_token")
@@ -268,7 +325,7 @@ async def publish_to_facebook(
     video_path: Path,
     description: str,
     token_data: dict,
-    page_id: str
+    page_id: Optional[str] = None
 ) -> PlatformResult:
     """Publish video to Facebook."""
     access_token = token_data.get("access_token")
@@ -378,13 +435,15 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
 
         try:
             if platform == "tiktok":
-                result = await publish_to_tiktok(video_file, ctx, token_data)
+                result = await publish_to_tiktok_ctx(video_file, ctx, token_data)
             elif platform == "youtube":
-                result = await publish_to_youtube(video_file, ctx, token_data)
+                result = await publish_to_youtube_ctx(video_file, ctx, token_data)
             elif platform == "instagram":
-                result = await publish_to_instagram(video_file, ctx, token_data)
+                page_id = token_data.get('page_id') or token_data.get('instagram_page_id') or token_data.get('ig_user_id')
+                result = await publish_to_instagram(video_file, (getattr(ctx, 'caption', None) or getattr(ctx, 'description', '') or ''), token_data, page_id)
             elif platform == "facebook":
-                result = await publish_to_facebook(video_file, ctx, token_data)
+                page_id = token_data.get('page_id') or token_data.get('facebook_page_id') or token_data.get('fb_page_id')
+                result = await publish_to_facebook(video_file, (getattr(ctx, 'description', None) or getattr(ctx, 'caption', '') or ''), token_data, page_id)
             else:
                 result = PlatformResult(platform=platform, success=False, error_code="UNSUPPORTED", error_message=f"Unsupported platform: {platform}")
         except Exception as e:

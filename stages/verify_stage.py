@@ -21,7 +21,20 @@ from typing import Optional, Dict, Any
 import httpx
 
 from . import db as db_stage
-from .publish_stage import decrypt_token, init_enc_keys
+try:
+    from .publish_stage import decrypt_token, init_enc_keys
+except Exception:
+    # Back-compat: never hard-crash the worker on crypto symbol drift
+    def init_enc_keys() -> None:
+        return
+
+    def decrypt_token(token_row):
+        try:
+            if isinstance(token_row, str):
+                return json.loads(token_row)
+            return token_row
+        except Exception:
+            return None
 
 logger = logging.getLogger("uploadm8-worker")
 

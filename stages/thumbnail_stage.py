@@ -1,315 +1,240 @@
 """
-UploadM8 Thumbnail Stage
+UploadM8 Telemetry Stage
 ========================
-Generate thumbnails using FFmpeg screenshot extraction
-and optional AI enhancement via OpenAI Vision.
-
-Features:
-- FFmpeg screenshot at user-defined timestamp (settings knob)
-- Multiple sample extraction for best frame selection
-- OpenAI Vision for "marketable thumbnail" generation
-- Tier-gated AI enhancement
+Parse .map telemetry files and calculate Trill scores.
 """
 
-import os
-import asyncio
 import logging
-import base64
-import json
 from pathlib import Path
-from typing import Optional, List
-import httpx
+from typing import List, Dict
 
-from .context import JobContext
-from .errors import StageError, SkipStage, ErrorCode
-from .entitlements import should_generate_thumbnails
+from .errors import TelemetryError, SkipStage, ErrorCode
+from .context import JobContext, TelemetryData, TrillScore
+
 
 logger = logging.getLogger("uploadm8-worker")
 
-# Configuration
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
-FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "ffprobe")
+
+# Default thresholds
+DEFAULT_SPEEDING_MPH = 80
+DEFAULT_EUPHORIA_MPH = 100
 
 
-async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
+def parse_map_file(map_path: Path) -> TelemetryData:
     """
-    Generate thumbnail for video.
+    Parse .map telemetry file.
     
-    Process:
-    1. Check entitlements
-    2. Get video duration
-    3. Extract screenshot(s) at configured interval
-    4. If AI enabled, select best and optionally enhance
-    5. Upload thumbnail to R2
-    """
-    ctx.mark_stage("thumbnail")
-    
-    # Check if thumbnail generation is enabled
-    if not ctx.entitlements or not should_generate_thumbnails(ctx.entitlements):
-        raise SkipStage("Thumbnail generation not enabled for tier", stage="thumbnail")
-    
-    if not ctx.local_video_path or not ctx.local_video_path.exists():
-        raise SkipStage("No local video file", stage="thumbnail")
-    
-    # Get user settings for screenshot
-    screenshot_interval = ctx.user_settings.get("ffmpeg_screenshot_interval", 5)
-    auto_generate = ctx.user_settings.get("auto_generate_thumbnails", True)
-    
-    if not auto_generate:
-        raise SkipStage("Auto thumbnail generation disabled in settings", stage="thumbnail")
-    
-    try:
-        # Get video duration
-        duration = await get_video_duration(ctx.local_video_path)
-        if duration <= 0:
-            raise StageError(ErrorCode.THUMBNAIL_FAILED, "Could not determine video duration", stage="thumbnail")
-        
-        # Calculate screenshot timestamps
-        timestamps = calculate_screenshot_timestamps(duration, screenshot_interval)
-        
-        # Extract screenshots
-        screenshots = await extract_screenshots(ctx.local_video_path, timestamps, ctx.temp_dir)
-        
-        if not screenshots:
-            raise StageError(ErrorCode.THUMBNAIL_FAILED, "No screenshots extracted", stage="thumbnail")
-        
-        # Select best thumbnail
-        if ctx.entitlements.ai_thumbnails_enabled and OPENAI_API_KEY:
-            best_thumbnail = await ai_select_best_thumbnail(screenshots)
-        else:
-            # Simple heuristic: use frame from 1/3 into video
-            best_thumbnail = screenshots[len(screenshots) // 3] if len(screenshots) > 2 else screenshots[0]
-        
-        ctx.thumbnail_path = best_thumbnail
-        
-        # Upload to R2
-        from . import r2 as r2_stage
-        thumbnail_key = f"thumbnails/{ctx.user_id}/{ctx.upload_id}.jpg"
-        await r2_stage.upload_file(best_thumbnail, thumbnail_key, "image/jpeg")
-        ctx.thumbnail_r2_key = thumbnail_key
-        ctx.output_artifacts["thumbnail"] = thumbnail_key
-        
-        logger.info(f"Thumbnail generated: {thumbnail_key}")
-        return ctx
-        
-    except SkipStage:
-        raise
-    except StageError:
-        raise
-    except Exception as e:
-        raise StageError(
-            ErrorCode.THUMBNAIL_FAILED,
-            f"Thumbnail generation failed: {str(e)}",
-            stage="thumbnail",
-            retryable=True
-        )
-
-
-async def get_video_duration(video_path: Path) -> float:
-    """Get video duration in seconds using ffprobe."""
-    try:
-        cmd = [
-            FFPROBE_PATH,
-            "-v", "quiet",
-            "-show_entries", "format=duration",
-            "-of", "json",
-            str(video_path)
-        ]
-        
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        
-        data = json.loads(stdout)
-        return float(data.get("format", {}).get("duration", 0))
-        
-    except Exception as e:
-        logger.warning(f"Failed to get video duration: {e}")
-        return 0
-
-
-def calculate_screenshot_timestamps(duration: float, interval: int, max_samples: int = 10) -> List[float]:
-    """
-    Calculate timestamps for screenshot extraction.
+    Expected CSV format: timestamp,lat,lon,speed_mph,altitude
+    Lines starting with # are comments.
     
     Args:
-        duration: Video duration in seconds
-        interval: Seconds between samples
-        max_samples: Maximum number of samples
+        map_path: Path to .map file
         
     Returns:
-        List of timestamps in seconds
-    """
-    if duration <= 0:
-        return [0]
-    
-    if interval <= 0:
-        interval = 5
-    
-    timestamps = []
-    current = interval
-    
-    while current < duration and len(timestamps) < max_samples:
-        timestamps.append(current)
-        current += interval
-    
-    # Always include a point at 1/3 and 2/3 of the video
-    third = duration / 3
-    two_thirds = duration * 2 / 3
-    
-    if third not in timestamps and third < duration:
-        timestamps.append(third)
-    if two_thirds not in timestamps and two_thirds < duration:
-        timestamps.append(two_thirds)
-    
-    return sorted(set(timestamps))[:max_samples]
-
-
-async def extract_screenshots(video_path: Path, timestamps: List[float], temp_dir: Path) -> List[Path]:
-    """
-    Extract screenshots at specified timestamps using FFmpeg.
-    
-    Args:
-        video_path: Path to video file
-        timestamps: List of timestamps in seconds
-        temp_dir: Directory to save screenshots
+        TelemetryData with parsed points
         
-    Returns:
-        List of paths to screenshot files
+    Raises:
+        TelemetryError: If parsing fails
     """
-    screenshots = []
+    data_points: List[Dict[str, float]] = []
     
-    for i, ts in enumerate(timestamps):
-        output_path = temp_dir / f"thumb_{i:03d}.jpg"
-        
-        cmd = [
-            FFMPEG_PATH,
-            "-ss", str(ts),
-            "-i", str(video_path),
-            "-vframes", "1",
-            "-q:v", "2",  # High quality JPEG
-            "-y",
-            str(output_path)
-        ]
-        
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            _, stderr = await proc.communicate()
-            
-            if proc.returncode == 0 and output_path.exists():
-                screenshots.append(output_path)
-            else:
-                logger.warning(f"Screenshot extraction failed at {ts}s: {stderr.decode()[:200]}")
+    try:
+        with open(map_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
                 
-        except Exception as e:
-            logger.warning(f"Screenshot extraction error at {ts}s: {e}")
+                parts = line.split(',')
+                if len(parts) < 4:
+                    continue
+                
+                try:
+                    point = {
+                        'timestamp': float(parts[0]),
+                        'lat': float(parts[1]),
+                        'lon': float(parts[2]),
+                        'speed_mph': float(parts[3]),
+                        'altitude': float(parts[4]) if len(parts) > 4 else 0
+                    }
+                    data_points.append(point)
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        raise TelemetryError(
+            f"Telemetry file not found: {map_path}",
+            code=ErrorCode.TELEMETRY_PARSE_FAILED
+        )
+    except Exception as e:
+        raise TelemetryError(
+            f"Failed to parse telemetry file: {e}",
+            code=ErrorCode.TELEMETRY_PARSE_FAILED,
+            detail=str(e)
+        )
     
-    return screenshots
+    if not data_points:
+        raise TelemetryError(
+            "No valid telemetry data found",
+            code=ErrorCode.TELEMETRY_EMPTY
+        )
+    
+    # Calculate aggregate stats
+    speeds = [p['speed_mph'] for p in data_points]
+    telemetry = TelemetryData()
+    telemetry.points = data_points
+    telemetry.max_speed_mph = max(speeds)
+    telemetry.avg_speed_mph = sum(speeds) / len(speeds)
+    telemetry.duration_seconds = (data_points[-1]['timestamp'] - data_points[0]['timestamp']) if len(data_points) > 1 else 0.0
+    
+    # Estimate distance (rough approximation)
+    if len(data_points) > 1:
+        total_distance = 0
+        for i in range(1, len(data_points)):
+            dt = data_points[i]['timestamp'] - data_points[i-1]['timestamp']
+            avg_speed = (data_points[i]['speed_mph'] + data_points[i-1]['speed_mph']) / 2
+            total_distance += (avg_speed * dt) / 3600  # miles
+        telemetry.distance_miles = total_distance
+    
+    logger.info(f"Parsed telemetry: {len(data_points)} points, max_speed={telemetry.max_speed:.1f} mph")
+    return telemetry
 
 
-async def ai_select_best_thumbnail(screenshots: List[Path]) -> Path:
+def calculate_trill_score(
+    telemetry: TelemetryData,
+    speeding_mph: int = DEFAULT_SPEEDING_MPH,
+    euphoria_mph: int = DEFAULT_EUPHORIA_MPH
+) -> TrillScore:
     """
-    Use OpenAI Vision to select the best thumbnail from candidates.
+    Calculate Trill score from telemetry data.
+    
+    Score Components (0-100):
+    - Speed score (0-40): Based on max speed vs euphoria threshold
+    - Speeding bonus (0-30): Percentage of time above speeding threshold
+    - Euphoria bonus (0-20): Percentage of time above euphoria threshold
+    - Consistency bonus (0-10): Inverse of speed variance
+    
+    Buckets:
+    - 0-39: chill
+    - 40-59: spirited
+    - 60-79: sendIt
+    - 80-89: euphoric
+    - 90-100: gloryBoy
+    """
+    if not telemetry.data_points:
+        return TrillScore()
+    
+    speeds = [p['speed_mph'] for p in telemetry.data_points]
+    total_points = len(speeds)
+    
+    # Speed score (0-40)
+    speed_score = min(40, (telemetry.max_speed / euphoria_mph) * 40)
+    
+    # Speeding time bonus (0-30)
+    speeding_count = sum(1 for s in speeds if s >= speeding_mph)
+    speeding_ratio = speeding_count / total_points
+    speeding_score = speeding_ratio * 30
+    
+    # Euphoria bonus (0-20)
+    euphoria_count = sum(1 for s in speeds if s >= euphoria_mph)
+    euphoria_ratio = euphoria_count / total_points
+    euphoria_score = euphoria_ratio * 20
+    
+    # Consistency bonus (0-10)
+    if total_points > 1:
+        variance = sum((s - telemetry.avg_speed) ** 2 for s in speeds) / total_points
+        std_dev = variance ** 0.5
+        consistency_score = max(0, 10 - (std_dev / 10))
+    else:
+        consistency_score = 5
+    
+    # Total score
+    total = int(min(100, speed_score + speeding_score + euphoria_score + consistency_score))
+    
+    # Determine bucket
+    if total >= 90:
+        bucket = "gloryBoy"
+    elif total >= 80:
+        bucket = "euphoric"
+    elif total >= 60:
+        bucket = "sendIt"
+    elif total >= 40:
+        bucket = "spirited"
+    else:
+        bucket = "chill"
+    
+    # Check for excessive speed (safety flag)
+    excessive_speed = telemetry.max_speed >= 120
+    
+    # Generate title modifier and hashtags
+    title_modifier, hashtags = get_trill_modifiers(total, telemetry.max_speed, bucket)
+    
+    return TrillScore(
+        score=total,
+        bucket=bucket,
+        speed_score=speed_score,
+        speeding_score=speeding_score,
+        euphoria_score=euphoria_score,
+        consistency_score=consistency_score,
+        excessive_speed=excessive_speed,
+        title_modifier=title_modifier,
+        hashtags=hashtags
+    )
+
+
+def get_trill_modifiers(score: int, max_speed: float, bucket: str) -> tuple[str, List[str]]:
+    """Get title modifier and hashtags based on Trill score."""
+    if bucket == "gloryBoy":
+        return " - GLORY BOY", ["#GloryBoyTour", "#TrillScore100", "#SendIt"]
+    elif bucket == "euphoric":
+        return " - Euphoric", ["#Euphoric", "#TrillScore", "#SpeedDemon"]
+    elif bucket == "sendIt":
+        return " - Send It", ["#SendIt", "#TrillScore", "#Spirited"]
+    elif bucket == "spirited":
+        return " - Spirited Drive", ["#SpiritedDrive", "#TrillScore"]
+    elif max_speed >= 100:
+        return "", ["#TrillScore", "#RoadTrip"]
+    else:
+        return "", ["#TrillScore"]
+
+
+async def run_telemetry_stage(ctx: JobContext) -> JobContext:
+    """
+    Execute telemetry processing stage.
     
     Args:
-        screenshots: List of screenshot paths
+        ctx: Job context
         
     Returns:
-        Path to best screenshot
+        Updated context with telemetry and trill data
+        
+    Raises:
+        SkipStage: If no telemetry file
+        TelemetryError: If processing fails
     """
-    if not OPENAI_API_KEY or len(screenshots) <= 1:
-        return screenshots[0] if screenshots else None
+    if not ctx.local_telemetry_path or not ctx.local_telemetry_path.exists():
+        # Ensure downstream stages never crash on missing attributes
+        ctx.telemetry = None
+        ctx.telemetry_data = None
+        ctx.trill = None
+        ctx.trill_score = None
+        raise SkipStage("No telemetry file available")
     
-    try:
-        # Encode images to base64
-        images_b64 = []
-        for ss in screenshots[:5]:  # Limit to 5 for API cost
-            with open(ss, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-                images_b64.append(b64)
-        
-        # Prepare message content
-        content = [
-            {
-                "type": "text",
-                "text": """Analyze these video thumbnail candidates and select the BEST one for maximum click-through rate.
-                
-Consider:
-- Visual appeal and clarity
-- Subject focus and composition  
-- Color vibrancy
-- Action/interest in the frame
-- Avoid blurry, dark, or unfocused frames
-
-Respond with ONLY the number (1-5) of the best thumbnail. Example: "3" """
-            }
-        ]
-        
-        for i, b64 in enumerate(images_b64, 1):
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{b64}",
-                    "detail": "low"  # Use low detail to reduce costs
-                }
-            })
-        
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [{"role": "user", "content": content}],
-                    "max_tokens": 10
-                }
-            )
-            
-            if response.status_code != 200:
-                if response.status_code in (401, 403):
-                    logger.warning(f"OpenAI thumbnail selection unauthorized/forbidden ({response.status_code}); using heuristic.")
-                    return screenshots[len(screenshots) // 3]
-                logger.warning(f"OpenAI thumbnail selection failed: {response.status_code}")
-                return screenshots[len(screenshots) // 3]
-            
-            data = response.json()
-            answer = data["choices"][0]["message"]["content"].strip()
-            
-            # Parse response
-            try:
-                idx = int(answer) - 1
-                if 0 <= idx < len(screenshots):
-                    logger.info(f"AI selected thumbnail #{idx + 1}")
-                    return screenshots[idx]
-            except:
-                pass
-            
-            return screenshots[len(screenshots) // 3]
-            
-    except Exception as e:
-        logger.warning(f"AI thumbnail selection error: {e}")
-        return screenshots[len(screenshots) // 3] if screenshots else None
-
-
-async def generate_ai_thumbnail(screenshot_path: Path, temp_dir: Path) -> Optional[Path]:
-    """
-    Generate an enhanced AI thumbnail using OpenAI image generation.
-    This is a premium feature for high tiers.
+    logger.info(f"Processing telemetry for upload {ctx.upload_id}")
     
-    Note: This uses DALL-E for image-to-image enhancement which has additional costs.
-    Currently returns the original screenshot as DALL-E doesn't support direct enhancement.
-    """
-    # For now, return the original screenshot
-    # Future: Could use DALL-E 3 with image-to-image or other enhancement APIs
-    return screenshot_path
+    # Parse telemetry
+    telemetry = parse_map_file(ctx.local_telemetry_path)
+    ctx.telemetry = telemetry
+    ctx.telemetry_data = telemetry
+    
+    # Get user thresholds from settings
+    speeding_mph = ctx.user_settings.get("speeding_mph", DEFAULT_SPEEDING_MPH)
+    euphoria_mph = ctx.user_settings.get("euphoria_mph", DEFAULT_EUPHORIA_MPH)
+    
+    # Calculate Trill score
+    trill = calculate_trill_score(telemetry, speeding_mph, euphoria_mph)
+    ctx.trill = trill
+    ctx.trill_score = trill
+    
+    logger.info(f"Trill score: {trill.score} ({trill.bucket})")
+    
+    return ctx

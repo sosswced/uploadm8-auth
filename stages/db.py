@@ -1,853 +1,261 @@
 """
-UploadM8 Database Stage
-=======================
-Database operations for the worker pipeline.
+UploadM8 Job Context
+====================
+Carries all state through the processing pipeline.
 """
 
-import json
-import logging
-import uuid
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
-import asyncpg
+from pathlib import Path
+from typing import Optional, List, Dict, Any
 
-from .context import JobContext
-
-logger = logging.getLogger("uploadm8-worker")
+from .entitlements import Entitlements
 
 
-def _uuid4() -> str:
-    return str(uuid.uuid4())
+@dataclass
+class TelemetryData:
+    """Parsed telemetry data from .map file."""
+
+    points: List[Dict[str, Any]] = field(default_factory=list)
+    max_speed_mph: float = 0.0
+    avg_speed_mph: float = 0.0
+    total_distance_miles: float = 0.0
+    duration_seconds: float = 0.0
+    max_altitude_ft: float = 0.0
+    speeding_seconds: float = 0.0
+    euphoria_seconds: float = 0.0
+
+    # -------------------------
+    # Back-compat aliases used by older stages
+    # -------------------------
+    @property
+    def data_points(self) -> List[Dict[str, Any]]:
+        return self.points
+
+    @data_points.setter
+    def data_points(self, v: List[Dict[str, Any]]):
+        self.points = v or []
+
+    @property
+    def max_speed(self) -> float:
+        return self.max_speed_mph
+
+    @max_speed.setter
+    def max_speed(self, v: float):
+        self.max_speed_mph = float(v or 0)
+
+    @property
+    def avg_speed(self) -> float:
+        return self.avg_speed_mph
+
+    @avg_speed.setter
+    def avg_speed(self, v: float):
+        self.avg_speed_mph = float(v or 0)
+
+    @property
+    def distance_miles(self) -> float:
+        return self.total_distance_miles
+
+    @distance_miles.setter
+    def distance_miles(self, v: float):
+        self.total_distance_miles = float(v or 0)
+
+    @property
+    def total_duration(self) -> float:
+        return self.duration_seconds
+
+    @total_duration.setter
+    def total_duration(self, v: float):
+        self.duration_seconds = float(v or 0)
 
 
-async def load_upload_record(pool: asyncpg.Pool, upload_id: str) -> Optional[dict]:
-    """Load upload record from database."""
-    if not pool:
-        return None
+@dataclass
+class TrillScore:
+    """Calculated Trill score from telemetry."""
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT id, user_id, r2_key, telemetry_r2_key, processed_r2_key,
-                   filename, file_size, platforms, title, caption, hashtags, privacy,
-                   ai_generated_title, ai_generated_caption, ai_generated_hashtags,
-                   status, scheduled_time, schedule_mode,
-                   schedule_metadata,
-                   created_at, updated_at
-            FROM uploads WHERE id = $1
-        """, upload_id)
-
-        if not row:
-            return None
-
-        rec = dict(row)
-
-        # Optional convenience: expose platform hashtag map if present inside schedule_metadata
-        sched = rec.get("schedule_metadata") or {}
-        if isinstance(sched, str):
-            try:
-                sched = json.loads(sched)
-            except Exception:
-                sched = {}
-
-        rec["schedule_metadata"] = sched
-        rec["platform_hashtags_map"] = (sched.get("platform_hashtags") or {}) if isinstance(sched, dict) else {}
-        return rec
+    total: int = 0
+    speed_score: int = 0
+    distance_score: int = 0
+    duration_score: int = 0
+    altitude_score: int = 0
+    thrill_factor: float = 1.0
 
 
-async def load_user(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
-    """Load user record from database."""
-    if not pool:
-        return None
+@dataclass
+class PlatformResult:
+    """Result of publishing to a single platform."""
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT id, email, name, role, subscription_tier, upload_quota,
-                   uploads_this_month, unlimited_uploads, subscription_status,
-                   current_period_end, created_at
-            FROM users WHERE id::text = $1
-        """, user_id)
+    platform: str
+    success: bool
 
-        if not row:
-            return None
+    # Step A (accepted)
+    platform_video_id: Optional[str] = None
+    platform_url: Optional[str] = None
+    publish_id: Optional[str] = None
 
-        return dict(row)
+    # Audit/debug
+    attempt_id: Optional[str] = None
+    http_status: Optional[int] = None
+    response_payload: Optional[Dict[str, Any]] = None
 
+    # Errors
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
 
-async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
-    """
-    Load user settings and preferences from database.
-    """
-    if not pool:
-        return {}
+    # Optional engagement
+    views: int = 0
+    likes: int = 0
 
-    async with pool.acquire() as conn:
-        settings_row = await conn.fetchrow("""
-            SELECT discord_webhook, telemetry_enabled, hud_enabled, hud_position,
-                   speeding_mph, euphoria_mph, hud_speed_unit, hud_color,
-                   hud_font_family, hud_font_size, selected_page_id
-            FROM user_settings WHERE user_id::text = $1
-        """, user_id)
-
-        prefs_row = await conn.fetchrow("""
-            SELECT auto_captions, auto_thumbnails, thumbnail_interval,
-                   ai_hashtags_enabled, ai_hashtag_count, ai_hashtag_style,
-                   hashtag_position, max_hashtags,
-                   always_hashtags, blocked_hashtags, platform_hashtags,
-                   trill_enabled, trill_min_score, trill_hud_enabled,
-                   trill_ai_enhance, trill_openai_model
-            FROM user_preferences WHERE user_id::text = $1
-        """, user_id)
-
-        settings = {}
-
-        if settings_row:
-            settings.update({
-                "discord_webhook": settings_row.get("discord_webhook"),
-                "telemetry_enabled": settings_row.get("telemetry_enabled", True),
-                "hud_enabled": settings_row.get("hud_enabled", True),
-                "hud_position": settings_row.get("hud_position", "bottom-left"),
-                "speeding_mph": settings_row.get("speeding_mph", 80),
-                "euphoria_mph": settings_row.get("euphoria_mph", 100),
-                "hud_speed_unit": settings_row.get("hud_speed_unit", "mph"),
-                "hud_color": settings_row.get("hud_color", "#FFFFFF"),
-                "hud_font_family": settings_row.get("hud_font_family", "Arial"),
-                "hud_font_size": settings_row.get("hud_font_size", 24),
-                "selected_page_id": settings_row.get("selected_page_id"),
-            })
-        else:
-            settings.update({
-                "telemetry_enabled": True,
-                "hud_enabled": True,
-                "hud_position": "bottom-left",
-                "speeding_mph": 80,
-                "euphoria_mph": 100,
-                "hud_speed_unit": "mph",
-                "hud_color": "#FFFFFF",
-                "hud_font_family": "Arial",
-                "hud_font_size": 24,
-            })
-
-        if prefs_row:
-            always_hashtags = prefs_row.get("always_hashtags", [])
-            blocked_hashtags = prefs_row.get("blocked_hashtags", [])
-            platform_hashtags = prefs_row.get("platform_hashtags", {})
-
-            if isinstance(always_hashtags, str):
-                try:
-                    always_hashtags = json.loads(always_hashtags)
-                except Exception:
-                    always_hashtags = []
-
-            if isinstance(blocked_hashtags, str):
-                try:
-                    blocked_hashtags = json.loads(blocked_hashtags)
-                except Exception:
-                    blocked_hashtags = []
-
-            if isinstance(platform_hashtags, str):
-                try:
-                    platform_hashtags = json.loads(platform_hashtags)
-                except Exception:
-                    platform_hashtags = {}
-
-            settings.update({
-                "auto_captions": prefs_row.get("auto_captions", False),
-                "auto_thumbnails": prefs_row.get("auto_thumbnails", False),
-                "thumbnail_interval": prefs_row.get("thumbnail_interval", 5),
-                "ai_hashtags_enabled": prefs_row.get("ai_hashtags_enabled", False),
-                "ai_hashtag_count": prefs_row.get("ai_hashtag_count", 5),
-                "ai_hashtag_style": prefs_row.get("ai_hashtag_style", "mixed"),
-                "hashtag_position": prefs_row.get("hashtag_position", "end"),
-                "max_hashtags": prefs_row.get("max_hashtags", 15),
-                "always_hashtags": always_hashtags or [],
-                "blocked_hashtags": blocked_hashtags or [],
-                "platform_hashtags": platform_hashtags or {},
-                "trill_enabled": prefs_row.get("trill_enabled", False),
-                "trill_min_score": prefs_row.get("trill_min_score", 60),
-                "trill_hud_enabled": prefs_row.get("trill_hud_enabled", False),
-                "trill_ai_enhance": prefs_row.get("trill_ai_enhance", False),
-                "trill_openai_model": prefs_row.get("trill_openai_model", "gpt-4o-mini"),
-            })
-        else:
-            settings.update({
-                "auto_captions": False,
-                "auto_thumbnails": False,
-                "thumbnail_interval": 5,
-                "ai_hashtags_enabled": False,
-                "ai_hashtag_count": 5,
-                "ai_hashtag_style": "mixed",
-                "hashtag_position": "end",
-                "max_hashtags": 15,
-                "always_hashtags": [],
-                "blocked_hashtags": [],
-                "platform_hashtags": {},
-                "trill_enabled": False,
-                "trill_min_score": 60,
-                "trill_hud_enabled": False,
-                "trill_ai_enhance": False,
-                "trill_openai_model": "gpt-4o-mini",
-            })
-
-        settings["auto_generate_captions"] = settings["auto_captions"]
-        settings["auto_generate_hashtags"] = settings["ai_hashtags_enabled"]
-        settings["auto_generate_thumbnails"] = settings["auto_thumbnails"]
-        settings["ffmpeg_screenshot_interval"] = settings["thumbnail_interval"]
-        settings["default_hashtag_count"] = settings["ai_hashtag_count"]
-
-        return settings
+    # Step B (confirmed)
+    verify_status: str = "pending"  # pending/confirmed/rejected/unknown
 
 
-async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> dict:
-    """Load any custom entitlement overrides for user."""
-    if not pool:
-        return {}
+@dataclass
+class JobContext:
+    """Processing context that flows through all pipeline stages."""
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT entitlement_key, entitlement_value, value_type
-            FROM user_entitlements WHERE user_id::text = $1
-        """, user_id)
+    job_id: str
+    upload_id: str
+    user_id: str
+    idempotency_key: str = ""
+    state: str = "queued"
+    stage: str = "init"
+    attempt_count: int = 0
 
-        overrides = {}
-        for row in rows:
-            key = row["entitlement_key"]
-            value = row["entitlement_value"]
-            vtype = row.get("value_type", "string")
+    source_r2_key: str = ""
+    telemetry_r2_key: Optional[str] = None
+    processed_r2_key: Optional[str] = None
+    thumbnail_r2_key: Optional[str] = None
 
-            if vtype == "bool":
-                overrides[key] = value.lower() in ("true", "1", "yes")
-            elif vtype == "int":
-                try:
-                    overrides[key] = int(value)
-                except Exception:
-                    pass
-            else:
-                overrides[key] = value
+    filename: str = ""
+    file_size: int = 0
+    platforms: List[str] = field(default_factory=list)
+    target_accounts: List[str] = field(default_factory=list)
 
-        return overrides
+    title: str = ""
+    caption: str = ""
+    hashtags: List[str] = field(default_factory=list)
+    privacy: str = "public"
 
+    entitlements: Optional[Entitlements] = None
+    user_settings: Dict[str, Any] = field(default_factory=dict)
 
-async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -> Optional[str]:
-    """Load encrypted platform token from database."""
-    if not pool:
-        return None
+    temp_dir: Optional[Path] = None
+    local_video_path: Optional[Path] = None
+    local_telemetry_path: Optional[Path] = None
+    processed_video_path: Optional[Path] = None
+    thumbnail_path: Optional[Path] = None
 
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT token_blob FROM platform_tokens
-            WHERE user_id::text = $1 AND platform = $2
-        """, user_id, platform)
+    platform_videos: Dict[str, Path] = field(default_factory=dict)
+    video_info: Dict[str, Any] = field(default_factory=dict)
 
-        if not row:
-            return None
+    ai_title: Optional[str] = None
+    ai_caption: Optional[str] = None
+    ai_hashtags: List[str] = field(default_factory=list)
 
-        return row["token_blob"]
+    telemetry_data: Optional[TelemetryData] = None
+    trill_score: Optional[TrillScore] = None
 
+    # Back-compat aliases used by older stages
+    telemetry: Optional[TelemetryData] = None
+    trill: Optional[TrillScore] = None
+    hud_applied: bool = False
 
-async def load_all_platform_tokens(pool: asyncpg.Pool, user_id: str) -> Dict[str, Any]:
-    """Load all platform tokens for user."""
-    if not pool:
-        return {}
+    platform_results: List[PlatformResult] = field(default_factory=list)
+    output_artifacts: Dict[str, str] = field(default_factory=dict)
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT platform, token_blob, account_name, account_username, account_avatar
-            FROM platform_tokens WHERE user_id::text = $1
-        """, user_id)
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    errors: List[Dict[str, Any]] = field(default_factory=list)
+    cancel_requested: bool = False
 
-        return {
-            row["platform"]: {
-                "token_blob": row["token_blob"],
-                "account_name": row.get("account_name"),
-                "account_username": row.get("account_username"),
-                "account_avatar": row.get("account_avatar"),
+    # Explicit error tracking (prevents AttributeError + improves UX)
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+    put_cost: int = 0
+    aic_cost: int = 0
+    compute_seconds: float = 0.0
+
+    def __post_init__(self):
+        # Keep legacy and new fields in sync
+        if self.telemetry is None and self.telemetry_data is not None:
+            self.telemetry = self.telemetry_data
+        if self.telemetry_data is None and self.telemetry is not None:
+            self.telemetry_data = self.telemetry
+
+        if self.trill is None and self.trill_score is not None:
+            self.trill = self.trill_score
+        if self.trill_score is None and self.trill is not None:
+            self.trill_score = self.trill
+
+    def mark_stage(self, stage: str):
+        self.stage = stage
+
+    def mark_error(self, code: str, message: str, retryable: bool = False):
+        self.error_code = code
+        self.error_message = message
+        self.errors.append(
+            {
+                "code": code,
+                "message": message,
+                "stage": self.stage,
+                "retryable": retryable,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            for row in rows
-        }
-
-
-async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
-    """Mark upload as processing started."""
-    if not pool:
-        return
-
-    async with pool.acquire() as conn:
-        # delivery_* columns are optional (migration may not be applied yet)
-        try:
-            await conn.execute(
-                """
-                UPDATE uploads SET
-                    status = 'processing',
-                    processing_started_at = $2,
-                    delivery_status = 'pending',
-                    platforms_confirmed = 0,
-                    platforms_attempted = 0,
-                    platforms_failed = 0,
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                ctx.upload_id,
-                ctx.started_at or datetime.now(timezone.utc),
-            )
-        except Exception:
-            await conn.execute(
-                """
-                UPDATE uploads SET
-                    status = 'processing',
-                    processing_started_at = $2,
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                ctx.upload_id,
-                ctx.started_at or datetime.now(timezone.utc),
-            )
-
-
-async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
-    """Mark upload as completed with results."""
-    if not pool:
-        return
-
-    status = "completed" if ctx.is_success() else "partial" if ctx.is_partial_success() else "failed"
-
-    attempted = len(ctx.platform_results or [])
-    failed = len([r for r in (ctx.platform_results or []) if not getattr(r, "success", False)])
-    delivery_status = "pending" if (attempted > 0 and attempted != failed) else "failed"
-
-    async with pool.acquire() as conn:
-        # delivery_* columns are optional (migration may not be applied yet)
-        try:
-            await conn.execute(
-                """
-                UPDATE uploads SET
-                    status = $2,
-                    processed_r2_key = $3,
-                    processing_finished_at = $4,
-                    completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END,
-                    error_code = $5,
-                    error_detail = $6,
-                    platform_results = $7,
-                    delivery_status = $8,
-                    platforms_attempted = $9,
-                    platforms_confirmed = COALESCE(platforms_confirmed, 0),
-                    platforms_failed = $10,
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                ctx.upload_id,
-                status,
-                ctx.processed_r2_key,
-                ctx.finished_at or datetime.now(timezone.utc),
-                ctx.error_code,
-                ctx.error_message,
-                json.dumps([r.__dict__ for r in ctx.platform_results]),
-                delivery_status,
-                attempted,
-                failed,
-            )
-        except Exception:
-            await conn.execute(
-                """
-                UPDATE uploads SET
-                    status = $2,
-                    processed_r2_key = $3,
-                    processing_finished_at = $4,
-                    completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END,
-                    error_code = $5,
-                    error_detail = $6,
-                    platform_results = $7,
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                ctx.upload_id,
-                status,
-                ctx.processed_r2_key,
-                ctx.finished_at or datetime.now(timezone.utc),
-                ctx.error_code,
-                ctx.error_message,
-                json.dumps([r.__dict__ for r in ctx.platform_results]),
-            )
-
-
-async def mark_processing_failed(pool: asyncpg.Pool, ctx: JobContext, error_code: str, error_message: str):
-    """Mark upload as failed."""
-    if not pool:
-        return
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE uploads SET
-                status = 'failed',
-                processing_finished_at = NOW(),
-                error_code = $2,
-                error_detail = $3,
-                updated_at = NOW()
-            WHERE id = $1
-        """, ctx.upload_id, error_code, error_message)
-
-
-async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
-    """Mark upload as cancelled."""
-    if not pool:
-        return
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE uploads SET
-                status = 'cancelled',
-                processing_finished_at = NOW(),
-                updated_at = NOW()
-            WHERE id = $1
-        """, upload_id)
-
-
-async def check_cancel_requested(pool: asyncpg.Pool, upload_id: str) -> bool:
-    """
-    No cancel_requested column in schema.
-    Use status as control plane instead.
-    """
-    if not pool:
-        return False
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT status FROM uploads WHERE id = $1",
-            upload_id
-        )
-        if not row:
-            return False
-        return (row["status"] or "").lower() in ("cancel_requested", "cancelled")
-
-
-async def increment_upload_count(pool: asyncpg.Pool, user_id: str):
-    """Increment user's monthly upload count."""
-    if not pool:
-        return
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE users SET
-                uploads_this_month = uploads_this_month + 1,
-                last_active_at = NOW(),
-                updated_at = NOW()
-            WHERE id::text = $1
-        """, user_id)
-
-
-async def save_job_state(pool: asyncpg.Pool, ctx: JobContext):
-    """Save job state for resumability."""
-    if not pool:
-        return
-
-    state_json = json.dumps({
-        "job_id": ctx.job_id,
-        "state": ctx.state,
-        "stage": ctx.stage,
-        "attempt_count": ctx.attempt_count,
-        "output_artifacts": ctx.output_artifacts,
-        "errors": ctx.errors,
-    })
-
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO job_state (upload_id, state_json, updated_at)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (upload_id) DO UPDATE SET
-                state_json = $2, updated_at = NOW()
-        """, ctx.upload_id, state_json)
-
-
-async def load_job_state(pool: asyncpg.Pool, upload_id: str) -> Optional[dict]:
-    """Load saved job state for resumption."""
-    if not pool:
-        return None
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT state_json FROM job_state WHERE upload_id = $1",
-            upload_id
         )
 
-        if row and row["state_json"]:
-            return json.loads(row["state_json"])
-        return None
+    def get_failed_platforms(self) -> List[str]:
+        return [r.platform for r in self.platform_results if not r.success]
 
+    def get_final_video_path(self) -> Optional[Path]:
+        return self.processed_video_path or self.local_video_path
 
-async def track_openai_cost(pool: asyncpg.Pool, user_id: str, operation: str, tokens: int, cost_usd: float):
-    """Track OpenAI API usage and cost."""
-    if not pool:
-        return
+    def get_video_for_platform(self, platform: str) -> Optional[Path]:
+        if platform in self.platform_videos:
+            return self.platform_videos[platform]
+        if self.processed_video_path and self.processed_video_path.exists():
+            return self.processed_video_path
+        return self.local_video_path
 
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO cost_tracking (user_id, category, operation, tokens, cost_usd, created_at)
-            VALUES ($1::uuid, 'openai', $2, $3, $4, NOW())
-        """, user_id, operation, tokens, cost_usd)
+    def get_effective_title(self) -> str:
+        return self.ai_title or self.title or self.filename
 
+    def get_effective_caption(self) -> str:
+        return self.ai_caption or self.caption or ""
 
-async def track_storage_usage(pool: asyncpg.Pool, user_id: str, bytes_used: int, operation: str):
-    """Track R2 storage usage."""
-    if not pool:
-        return
+    def get_effective_hashtags(self) -> List[str]:
+        return self.ai_hashtags if self.ai_hashtags else self.hashtags
 
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO storage_tracking (user_id, bytes_used, operation, created_at)
-            VALUES ($1::uuid, $2, $3, NOW())
-        """, user_id, bytes_used, operation)
+    def is_success(self) -> bool:
+        return any(r.success for r in self.platform_results)
 
-
-async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
-    """
-    Persist AI-generated metadata.
-
-    Writes:
-    - ai_generated_title/caption/hashtags
-    - schedule_metadata->platform_hashtags (jsonb map)
-
-    Also backfills title/caption/hashtags only if the user did not provide overrides.
-    """
-    if not pool:
-        return
-
-    gen_title = (ctx.ai_title or "").strip() if getattr(ctx, "ai_title", None) else None
-    gen_caption = (ctx.ai_caption or "").strip() if getattr(ctx, "ai_caption", None) else None
-    gen_hashtags = getattr(ctx, "ai_hashtags", None) or None
-
-    platform_map = getattr(ctx, "platform_hashtags_map", None) or {}
-    final_hashtags = getattr(ctx, "final_hashtags", None) or (gen_hashtags or getattr(ctx, "hashtags", None) or [])
-
-    platform_map_json = json.dumps(platform_map) if platform_map is not None else None
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE uploads
-            SET
-                ai_generated_title = COALESCE($2, ai_generated_title),
-                ai_generated_caption = COALESCE($3, ai_generated_caption),
-                ai_generated_hashtags = COALESCE($4::text[], ai_generated_hashtags),
-
-                schedule_metadata = CASE
-                    WHEN $5::jsonb IS NOT NULL THEN
-                        jsonb_set(COALESCE(schedule_metadata, '{}'::jsonb), '{platform_hashtags}', $5::jsonb, true)
-                    ELSE schedule_metadata
-                END,
-
-                metadata_generated_at = NOW(),
-
-                -- Only fill live fields if user did not provide them
-                title = CASE
-                    WHEN (title IS NULL OR btrim(title) = '') AND $2 IS NOT NULL THEN $2
-                    ELSE title
-                END,
-                caption = CASE
-                    WHEN (caption IS NULL OR btrim(caption) = '') AND $3 IS NOT NULL THEN $3
-                    ELSE caption
-                END,
-                hashtags = CASE
-                    WHEN (hashtags IS NULL OR array_length(hashtags,1) IS NULL OR array_length(hashtags,1) = 0)
-                         AND $6::text[] IS NOT NULL
-                    THEN $6::text[]
-                    ELSE hashtags
-                END,
-
-                updated_at = NOW()
-            WHERE id = $1
-            """,
-            ctx.upload_id,
-            gen_title,
-            gen_caption,
-            gen_hashtags,
-            platform_map_json,
-            final_hashtags if final_hashtags else None,
+    def is_partial_success(self) -> bool:
+        return any(r.success for r in self.platform_results) and any(
+            (not r.success) for r in self.platform_results
         )
 
-
-# ============================================================
-# PUBLISH LEDGER (Real Confirmation)
-# ============================================================
+    def get_success_platforms(self) -> List[str]:
+        return [r.platform for r in self.platform_results if r.success]
 
 
-async def insert_publish_attempt(
-    pool: asyncpg.Pool,
-    *,
-    upload_id: str,
-    user_id: str,
-    platform: str,
-    scheduled_post_id: Optional[str] = None,
-    account_id: Optional[str] = None,
-    group_id: Optional[str] = None,
-    attempt_no: int = 1,
-) -> str:
-    """Insert ledger row BEFORE calling platform API."""
-    attempt_id = _uuid4()
-    if not pool:
-        return attempt_id
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO publish_attempts (
-                id, upload_id, scheduled_post_id, user_id, platform, account_id, group_id,
-                status, attempt_no, started_at,
-                verify_status, verify_attempts, next_verify_at,
-                created_at, updated_at
-            )
-            VALUES (
-                $1, $2, $3, $4, $5, $6, $7,
-                'retrying', $8, NOW(),
-                'pending', 0, NOW(),
-                NOW(), NOW()
-            )
-            """,
-            attempt_id,
-            upload_id,
-            scheduled_post_id,
-            user_id,
-            platform,
-            account_id,
-            group_id,
-            attempt_no,
-        )
-    return attempt_id
-
-
-async def update_publish_attempt_success(
-    pool: asyncpg.Pool,
-    *,
-    attempt_id: str,
-    platform_post_id: Optional[str],
-    platform_url: Optional[str],
-    http_status: Optional[int] = None,
-    response_payload: Optional[dict] = None,
-    publish_id: Optional[str] = None,
-) -> None:
-    if not pool:
-        return
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE publish_attempts SET
-                status='success',
-                platform_post_id=$2,
-                platform_url=$3,
-                http_status=$4,
-                response_payload=$5,
-                publish_id=$6,
-                ended_at=NOW(),
-                updated_at=NOW(),
-                next_verify_at=NOW()
-            WHERE id=$1
-            """,
-            attempt_id,
-            platform_post_id,
-            platform_url,
-            http_status,
-            json.dumps(response_payload) if response_payload is not None else None,
-            publish_id,
-        )
-
-
-async def update_publish_attempt_failed(
-    pool: asyncpg.Pool,
-    *,
-    attempt_id: str,
-    error_code: str,
-    error_message: str,
-    http_status: Optional[int] = None,
-    response_payload: Optional[dict] = None,
-) -> None:
-    if not pool:
-        return
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE publish_attempts SET
-                status='failed',
-                error_code=$2,
-                error_message=$3,
-                http_status=$4,
-                response_payload=$5,
-                verify_status='unknown',
-                ended_at=NOW(),
-                updated_at=NOW()
-            WHERE id=$1
-            """,
-            attempt_id,
-            error_code,
-            error_message,
-            http_status,
-            json.dumps(response_payload) if response_payload is not None else None,
-        )
-
-
-async def get_pending_verifications(pool: asyncpg.Pool, *, limit: int = 50) -> list[dict]:
-    if not pool:
-        return []
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT
-                id, upload_id, user_id, platform,
-                platform_post_id, platform_url, publish_id,
-                verify_status, verify_attempts, next_verify_at
-            FROM publish_attempts
-            WHERE status='success'
-              AND verify_status='pending'
-              AND (next_verify_at IS NULL OR next_verify_at <= NOW())
-            ORDER BY COALESCE(next_verify_at, created_at) ASC
-            LIMIT $1
-            """,
-            limit,
-        )
-        return [dict(r) for r in rows]
-
-
-def _next_backoff_seconds(attempts: int) -> int:
-    schedule = [10, 30, 60, 120, 300, 300, 300]
-    idx = min(max(attempts, 0), len(schedule) - 1)
-    return schedule[idx]
-
-
-async def update_verify_confirmed(pool: asyncpg.Pool, *, attempt_id: str, verify_payload: dict, platform_url: Optional[str] = None) -> None:
-    if not pool:
-        return
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE publish_attempts SET
-                verify_status='confirmed',
-                verified_at=NOW(),
-                verify_payload=$2,
-                platform_url=COALESCE($3, platform_url),
-                updated_at=NOW()
-            WHERE id=$1
-            """,
-            attempt_id,
-            json.dumps(verify_payload),
-            platform_url,
-        )
-        try:
-            await conn.execute(
-                """
-                WITH agg AS (
-                    SELECT upload_id,
-                        COUNT(*)::int AS attempted,
-                        COUNT(*) FILTER (WHERE verify_status='confirmed')::int AS confirmed,
-                        COUNT(*) FILTER (WHERE status='failed' OR verify_status='rejected')::int AS failed
-                    FROM publish_attempts
-                    WHERE upload_id = (SELECT upload_id FROM publish_attempts WHERE id=$1)
-                    GROUP BY upload_id
-                )
-                UPDATE uploads u SET
-                    platforms_attempted = agg.attempted,
-                    platforms_confirmed = agg.confirmed,
-                    platforms_failed = agg.failed,
-                    delivery_status = CASE
-                        WHEN agg.attempted > 0 AND agg.confirmed = agg.attempted THEN 'confirmed'
-                        WHEN agg.confirmed > 0 THEN 'partial'
-                        WHEN agg.failed = agg.attempted THEN 'failed'
-                        ELSE COALESCE(u.delivery_status,'pending')
-                    END,
-                    updated_at = NOW()
-                FROM agg
-                WHERE u.id = agg.upload_id
-                """,
-                attempt_id,
-            )
-        except Exception:
-            pass
-
-
-async def update_verify_rejected(pool: asyncpg.Pool, *, attempt_id: str, verify_payload: dict) -> None:
-    if not pool:
-        return
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE publish_attempts SET
-                verify_status='rejected',
-                verified_at=NOW(),
-                verify_payload=$2,
-                updated_at=NOW()
-            WHERE id=$1
-            """,
-            attempt_id,
-            json.dumps(verify_payload),
-        )
-
-
-async def update_verify_retry(pool: asyncpg.Pool, *, attempt_id: str, current_verify_attempts: int, verify_payload: dict) -> None:
-    if not pool:
-        return
-    next_in = _next_backoff_seconds(current_verify_attempts)
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE publish_attempts SET
-                verify_status='pending',
-                verify_attempts=$2,
-                verify_payload=$3,
-                next_verify_at = NOW() + ($4 || ' seconds')::interval,
-                updated_at=NOW()
-            WHERE id=$1
-            """,
-            attempt_id,
-            int(current_verify_attempts),
-            json.dumps(verify_payload),
-            int(next_in),
-        )
-
-
-async def update_verify_unknown(pool: asyncpg.Pool, *, attempt_id: str, verify_payload: dict) -> None:
-    if not pool:
-        return
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE publish_attempts SET
-                verify_status='unknown',
-                verified_at=NOW(),
-                verify_payload=$2,
-                updated_at=NOW()
-            WHERE id=$1
-            """,
-            attempt_id,
-            json.dumps(verify_payload),
-        )
-
-
-async def get_publish_attempts_for_upload(pool: asyncpg.Pool, *, upload_id: str) -> list[dict]:
-    if not pool:
-        return []
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT *
-            FROM publish_attempts
-            WHERE upload_id=$1
-            ORDER BY created_at ASC
-            """,
-            upload_id,
-        )
-        return [dict(r) for r in rows]
-
-
-async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
-    """Load admin webhook url from admin_settings.settings_json.notifications.admin_webhook_url."""
-    if not pool:
-        return None
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT settings_json FROM admin_settings WHERE id=1")
-        if not row:
-            return None
-        try:
-            settings = row["settings_json"]
-            if isinstance(settings, str):
-                settings = json.loads(settings)
-            notif = (settings or {}).get("notifications", {})
-            wh = (notif or {}).get("admin_webhook_url")
-            return (wh or "").strip() or None
-        except Exception:
-            return None
+def create_context(job_data: dict, upload_record: dict, user_settings: dict, entitlements: Entitlements) -> JobContext:
+    return JobContext(
+        job_id=job_data.get("job_id", ""),
+        upload_id=str(upload_record.get("id", "")),
+        user_id=str(upload_record.get("user_id", "")),
+        idempotency_key=job_data.get("idempotency_key", ""),
+        source_r2_key=upload_record.get("r2_key", ""),
+        telemetry_r2_key=upload_record.get("telemetry_r2_key"),
+        filename=upload_record.get("filename", ""),
+        file_size=upload_record.get("file_size", 0),
+        platforms=upload_record.get("platforms", []) or [],
+        title=upload_record.get("title", ""),
+        caption=upload_record.get("caption", ""),
+        hashtags=upload_record.get("hashtags", []) or [],
+        privacy=upload_record.get("privacy", "public") or "public",
+        user_settings=user_settings or {},
+        entitlements=entitlements,
+    )

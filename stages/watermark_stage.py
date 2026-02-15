@@ -1,187 +1,254 @@
-"""
-UploadM8 Watermark Stage
-========================
-Burn UploadM8 watermark onto video for free/low tier users.
+"""stages.verify_stage
 
-Features:
-- Semi-transparent watermark in corner
-- Tier-gated (free users get watermark, paid don't)
-- Configurable position and opacity
+Real confirmation stage.
+
+This runs as a background loop (non-blocking to main job pipeline) and turns
+"accepted" publishes into "confirmed" or "rejected" via platform status lookups.
+
+Contract:
+- Only touches publish_attempts where status='success' and verify_status='pending'.
+- Uses exponential backoff via next_verify_at.
 """
 
-import os
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
-from pathlib import Path
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
-from .context import JobContext
-from .errors import StageError, SkipStage, ErrorCode
-from .entitlements import should_burn_watermark
+import httpx
+
+from . import db as db_stage
+try:
+    from .publish_stage import decrypt_token, init_enc_keys
+except Exception:
+    # Back-compat: never hard-crash the worker on crypto symbol drift
+    def init_enc_keys() -> None:
+        return
+
+    def decrypt_token(token_row):
+        try:
+            if isinstance(token_row, str):
+                return json.loads(token_row)
+            return token_row
+        except Exception:
+            return None
 
 logger = logging.getLogger("uploadm8-worker")
 
-# Configuration
-FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
-WATERMARK_IMAGE = os.environ.get("WATERMARK_IMAGE", "/app/assets/watermark.png")
-WATERMARK_OPACITY = float(os.environ.get("WATERMARK_OPACITY", "0.3"))
-WATERMARK_POSITION = os.environ.get("WATERMARK_POSITION", "bottom-right")  # top-left, top-right, bottom-left, bottom-right
-WATERMARK_SCALE = float(os.environ.get("WATERMARK_SCALE", "0.15"))  # 15% of video width
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=10.0)
 
 
-async def run_watermark_stage(ctx: JobContext) -> JobContext:
-    """
-    Burn watermark onto video if required by tier.
-    
-    Process:
-    1. Check if watermark is required (tier-based)
-    2. Apply watermark using FFmpeg
-    3. Update context with new video path
-    """
-    ctx.mark_stage("watermark")
-    
-    if not ctx.entitlements:
-        raise SkipStage("No entitlements loaded", stage="watermark")
-    
-    # Check if watermark should be applied
-    if not should_burn_watermark(ctx.entitlements):
-        logger.info("Watermark not required for this tier")
-        raise SkipStage("Watermark not required for tier", stage="watermark")
-    
-    # Get video to process (HUD output or original)
-    input_video = ctx.processed_video_path or ctx.local_video_path
-    
-    if not input_video or not input_video.exists():
-        raise SkipStage("No video file to watermark", stage="watermark")
-    
-    # Check if watermark image exists
-    watermark_path = Path(WATERMARK_IMAGE)
-    if not watermark_path.exists():
-        logger.warning(f"Watermark image not found: {WATERMARK_IMAGE}")
-        # Generate text watermark instead
-        return await apply_text_watermark(ctx, input_video)
-    
+def _safe_json(resp: httpx.Response) -> Dict[str, Any]:
     try:
-        output_path = ctx.temp_dir / f"watermarked_{ctx.upload_id}.mp4"
-        
-        # Build FFmpeg filter for watermark
-        position_filter = get_position_filter(WATERMARK_POSITION)
-        
-        # FFmpeg command with watermark overlay
-        cmd = [
-            FFMPEG_PATH,
-            "-i", str(input_video),
-            "-i", str(watermark_path),
-            "-filter_complex",
-            f"[1:v]scale=iw*{WATERMARK_SCALE}:-1,format=rgba,colorchannelmixer=aa={WATERMARK_OPACITY}[wm];"
-            f"[0:v][wm]overlay={position_filter}",
-            "-c:a", "copy",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
-            "-y",
-            str(output_path)
-        ]
-        
-        logger.info(f"Applying watermark: {WATERMARK_POSITION}")
-        
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            logger.error(f"Watermark failed: {stderr.decode()[:500]}")
-            raise StageError(
-                ErrorCode.WATERMARK_FAILED,
-                "FFmpeg watermark overlay failed",
-                stage="watermark"
+        data = resp.json()
+        if isinstance(data, dict):
+            # strip obvious secrets
+            out = {}
+            for k, v in data.items():
+                lk = str(k).lower()
+                if "token" in lk or "secret" in lk or "authorization" in lk:
+                    continue
+                out[k] = v
+            return out
+        return {"data": data}
+    except Exception:
+        return {"text": (resp.text or "")[:4000]}
+
+
+async def _verify_tiktok(client: httpx.AsyncClient, access_token: str, publish_id: str) -> tuple[str, dict, Optional[str]]:
+    """Return (verify_status, payload, url_override)."""
+    # TikTok publish status endpoint (may vary by app scope)
+    url = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    resp = await client.post(url, headers=headers, json={"publish_id": publish_id})
+    payload = {"http_status": resp.status_code, "body": _safe_json(resp)}
+
+    if resp.status_code == 401 or resp.status_code == 403:
+        return "unknown", payload, None
+
+    body = payload.get("body") or {}
+    # Heuristics (TikTok varies): look for status field
+    status = None
+    for key in ("status", "publish_status", "result"):  # tolerate schema drift
+        if key in body:
+            status = body.get(key)
+            break
+    if isinstance(status, dict):
+        status = status.get("status") or status.get("publish_status")
+
+    s = str(status or "").upper()
+    if "COMPLETE" in s or "PUBLISHED" in s or "SUCCESS" in s:
+        return "confirmed", payload, None
+    if "FAIL" in s or "REJECT" in s or "ERROR" in s:
+        return "rejected", payload, None
+
+    return "pending", payload, None
+
+
+async def _verify_youtube(client: httpx.AsyncClient, access_token: str, video_id: str) -> tuple[str, dict, Optional[str]]:
+    url = "https://www.googleapis.com/youtube/v3/videos"
+    params = {"id": video_id, "part": "status,snippet"}
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = await client.get(url, headers=headers, params=params)
+    payload = {"http_status": resp.status_code, "body": _safe_json(resp)}
+
+    if resp.status_code == 401 or resp.status_code == 403:
+        return "unknown", payload, None
+
+    body = payload.get("body") or {}
+    items = body.get("items") or []
+    if not items:
+        return "pending", payload, None
+
+    status = (items[0].get("status") or {}).get("uploadStatus")
+    s = str(status or "").lower()
+    if s in ("processed", "uploaded"):
+        # public URL can be derived
+        return "confirmed", payload, f"https://www.youtube.com/watch?v={video_id}"
+    if s in ("failed", "rejected", "deleted"):
+        return "rejected", payload, None
+
+    return "pending", payload, None
+
+
+async def _verify_facebook(client: httpx.AsyncClient, access_token: str, video_id: str) -> tuple[str, dict, Optional[str]]:
+    url = f"https://graph.facebook.com/v19.0/{video_id}"
+    params = {"fields": "status,published", "access_token": access_token}
+    resp = await client.get(url, params=params)
+    payload = {"http_status": resp.status_code, "body": _safe_json(resp)}
+
+    if resp.status_code == 401 or resp.status_code == 403:
+        return "unknown", payload, None
+
+    body = payload.get("body") or {}
+    if body.get("published") is True:
+        return "confirmed", payload, None
+
+    status = body.get("status")
+    if isinstance(status, dict):
+        status = status.get("video_status") or status.get("status")
+
+    s = str(status or "").lower()
+    if "ready" in s or "published" in s:
+        return "confirmed", payload, None
+    if "error" in s or "expired" in s or "failed" in s:
+        return "rejected", payload, None
+
+    return "pending", payload, None
+
+
+async def verify_single_attempt(pool, attempt: dict) -> None:
+    attempt_id = str(attempt.get("id"))
+    platform = str(attempt.get("platform") or "").lower()
+    verify_attempts = int(attempt.get("verify_attempts") or 0)
+
+    # max polls ~7 -> unknown
+    if verify_attempts >= 7:
+        await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "max_attempts"})
+        return
+
+    async with httpx.AsyncClient(timeout=DEFAULT_HTTP_TIMEOUT) as client:
+        try:
+            # ensure crypto available for decrypting stored tokens
+            init_enc_keys()
+            if platform == "tiktok":
+                publish_id = attempt.get("publish_id") or attempt.get("platform_post_id")
+                if not publish_id:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_publish_id"})
+                    return
+
+                token_row = await db_stage.load_platform_token(pool, attempt.get("user_id"), "tiktok")
+                token_row = decrypt_token(token_row) if token_row else None
+                access = (token_row or {}).get("access_token")
+                if not access:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_access_token"})
+                    return
+
+                status, payload, url_override = await _verify_tiktok(client, access, str(publish_id))
+
+            elif platform == "youtube":
+                video_id = attempt.get("platform_post_id")
+                if not video_id:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_video_id"})
+                    return
+
+                token_row = await db_stage.load_platform_token(pool, attempt.get("user_id"), "google")
+                token_row = decrypt_token(token_row) if token_row else None
+                access = (token_row or {}).get("access_token")
+                if not access:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_access_token"})
+                    return
+
+                status, payload, url_override = await _verify_youtube(client, access, str(video_id))
+
+            elif platform == "facebook":
+                video_id = attempt.get("platform_post_id")
+                if not video_id:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_video_id"})
+                    return
+
+                token_row = await db_stage.load_platform_token(pool, attempt.get("user_id"), "meta")
+                token_row = decrypt_token(token_row) if token_row else None
+                access = (token_row or {}).get("access_token")
+                if not access:
+                    await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": "missing_access_token"})
+                    return
+
+                status, payload, url_override = await _verify_facebook(client, access, str(video_id))
+
+            else:
+                # not implemented yet
+                await db_stage.update_verify_unknown(pool, attempt_id=attempt_id, verify_payload={"reason": f"unsupported_platform:{platform}"})
+                return
+
+            if status == "confirmed":
+                await db_stage.update_verify_confirmed(pool, attempt_id=attempt_id, verify_payload=payload, platform_url=url_override)
+            elif status == "rejected":
+                await db_stage.update_verify_rejected(pool, attempt_id=attempt_id, verify_payload=payload)
+            else:
+                await db_stage.update_verify_retry(
+                    pool,
+                    attempt_id=attempt_id,
+                    current_verify_attempts=verify_attempts + 1,
+                    verify_payload=payload,
+                )
+
+        except Exception as e:
+            # retry with backoff (but don’t loop forever)
+            payload = {"error": str(e), "at": datetime.now(timezone.utc).isoformat()}
+            await db_stage.update_verify_retry(
+                pool,
+                attempt_id=attempt_id,
+                current_verify_attempts=verify_attempts + 1,
+                verify_payload=payload,
             )
-        
-        if not output_path.exists():
-            raise StageError(
-                ErrorCode.WATERMARK_FAILED,
-                "Watermarked video not created",
-                stage="watermark"
-            )
-        
-        ctx.processed_video_path = output_path
-        logger.info(f"Watermark applied: {output_path.stat().st_size} bytes")
-        
-        return ctx
-        
-    except SkipStage:
-        raise
-    except StageError:
-        raise
-    except Exception as e:
-        raise StageError(
-            ErrorCode.WATERMARK_FAILED,
-            f"Watermark stage failed: {str(e)}",
-            stage="watermark"
-        )
 
 
-async def apply_text_watermark(ctx: JobContext, input_video: Path) -> JobContext:
-    """
-    Apply text watermark if image not available.
-    """
-    try:
-        output_path = ctx.temp_dir / f"watermarked_{ctx.upload_id}.mp4"
-        
-        # Position for text
-        position = WATERMARK_POSITION.replace("-", "_")
-        if position == "bottom_right":
-            pos_x, pos_y = "W-tw-20", "H-th-20"
-        elif position == "bottom_left":
-            pos_x, pos_y = "20", "H-th-20"
-        elif position == "top_right":
-            pos_x, pos_y = "W-tw-20", "20"
-        else:  # top_left
-            pos_x, pos_y = "20", "20"
-        
-        # FFmpeg command with text overlay
-        cmd = [
-            FFMPEG_PATH,
-            "-i", str(input_video),
-            "-vf", f"drawtext=text='UploadM8':fontsize=24:fontcolor=white@{WATERMARK_OPACITY}:x={pos_x}:y={pos_y}",
-            "-c:a", "copy",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
-            "-y",
-            str(output_path)
-        ]
-        
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        _, stderr = await proc.communicate()
-        
-        if proc.returncode == 0 and output_path.exists():
-            ctx.processed_video_path = output_path
-            logger.info("Text watermark applied")
-        else:
-            logger.warning(f"Text watermark failed: {stderr.decode()[:200]}")
-        
-        return ctx
-        
-    except Exception as e:
-        logger.warning(f"Text watermark error: {e}")
-        return ctx
+async def run_verification_loop(pool, shutdown_event: asyncio.Event, *, poll_interval_seconds: int = 10, batch_size: int = 20) -> None:
+    """Continuously verify pending publish attempts."""
+    logger.info("Verification loop started")
 
+    while not shutdown_event.is_set():
+        try:
+            pending = await db_stage.get_pending_verifications(pool, limit=batch_size)
+            if pending:
+                # limit concurrency
+                sem = asyncio.Semaphore(8)
 
-def get_position_filter(position: str) -> str:
-    """Convert position name to FFmpeg overlay coordinates."""
-    positions = {
-        "top-left": "10:10",
-        "top-right": "W-w-10:10",
-        "bottom-left": "10:H-h-10",
-        "bottom-right": "W-w-10:H-h-10",
-        "center": "(W-w)/2:(H-h)/2",
-    }
-    return positions.get(position, positions["bottom-right"])
+                async def _run_one(a: dict):
+                    async with sem:
+                        await verify_single_attempt(pool, a)
+
+                await asyncio.gather(*[_run_one(a) for a in pending])
+        except Exception:
+            logger.exception("Verification loop error")
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=poll_interval_seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Verification loop stopped")

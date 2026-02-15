@@ -1,354 +1,187 @@
 """
-UploadM8 Worker Service - Complete Pipeline
+UploadM8 Watermark Stage
+========================
+Burn UploadM8 watermark onto video for free/low tier users.
+
+Features:
+- Semi-transparent watermark in corner
+- Tier-gated (free users get watermark, paid don't)
+- Configurable position and opacity
 """
 
 import os
-import sys
-import json
 import asyncio
 import logging
-import tempfile
-import signal
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import asyncpg
-import redis.asyncio as redis
+from .context import JobContext
+from .errors import StageError, SkipStage, ErrorCode
+from .entitlements import should_burn_watermark
 
-from stages.errors import StageError, SkipStage, CancelRequested
-from stages.context import JobContext, create_context
-from stages.entitlements import get_entitlements_from_user
-from stages import db as db_stage
-from stages import r2 as r2_stage
-from stages.telemetry_stage import run_telemetry_stage
-from stages.transcode_stage import run_transcode_stage
-from stages.thumbnail_stage import run_thumbnail_stage
-from stages.caption_stage import run_caption_stage
-from stages.hud_stage import run_hud_stage
-from stages.watermark_stage import run_watermark_stage
-from stages.publish_stage import run_publish_stage
-from stages.verify_stage import run_verification_loop
-from stages.notify_stage import run_notify_stage, notify_admin_worker_start, notify_admin_worker_stop, notify_admin_error
-
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [worker] %(message)s")
 logger = logging.getLogger("uploadm8-worker")
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-REDIS_URL = os.environ.get("REDIS_URL", "")
-UPLOAD_JOB_QUEUE = os.environ.get("UPLOAD_JOB_QUEUE", "uploadm8:jobs")
-PRIORITY_JOB_QUEUE = os.environ.get("PRIORITY_JOB_QUEUE", "uploadm8:priority")
-POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
-
-db_pool: Optional[asyncpg.Pool] = None
-redis_client: Optional[redis.Redis] = None
-shutdown_requested = False
-shutdown_event = None
+# Configuration
+FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
+WATERMARK_IMAGE = os.environ.get("WATERMARK_IMAGE", "/app/assets/watermark.png")
+WATERMARK_OPACITY = float(os.environ.get("WATERMARK_OPACITY", "0.3"))
+WATERMARK_POSITION = os.environ.get("WATERMARK_POSITION", "bottom-right")  # top-left, top-right, bottom-left, bottom-right
+WATERMARK_SCALE = float(os.environ.get("WATERMARK_SCALE", "0.15"))  # 15% of video width
 
 
-def handle_shutdown(signum, frame):
-    global shutdown_requested, shutdown_event
-    logger.info(f"Shutdown signal received ({signum})")
-    shutdown_requested = True
-    try:
-        if shutdown_event is not None:
-            shutdown_event.set()
-    except Exception:
-        pass
-
-
-async def connect_redis():
-    """Create (or recreate) the Redis client with keepalive + health checks.
-
-    Render/managed Redis can drop idle connections; this hardens BRPOP loops.
+async def run_watermark_stage(ctx: JobContext) -> JobContext:
     """
-    global redis_client
-    # redis-py asyncio client
-    redis_client = redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        socket_keepalive=True,
-        health_check_interval=30,
-        retry_on_timeout=True,
-    )
-    await redis_client.ping()
-    return redis_client
-
-
-async def check_cancelled(ctx: JobContext) -> bool:
-    # ctx.cancel_requested may not exist depending on context builder
-    if bool(getattr(ctx, "cancel_requested", False)):
-        return True
-    cancelled = await db_stage.check_cancel_requested(db_pool, ctx.upload_id)
-    if cancelled:
-        setattr(ctx, "cancel_requested", True)
-    return cancelled
-
-
-async def maybe_cancel(ctx: JobContext, stage: str):
-    if await check_cancelled(ctx):
-        logger.info(f"Cancel at {stage} for {ctx.upload_id}")
-        await db_stage.mark_cancelled(db_pool, ctx.upload_id)
-        raise CancelRequested(ctx.upload_id)
-
-
-async def run_pipeline(job_data: dict) -> bool:
-    upload_id = job_data.get("upload_id")
-    user_id = job_data.get("user_id")
-    job_id = job_data.get("job_id", "unknown")
-    action = job_data.get("action") or "process"
-
-    logger.info(f"Starting pipeline: upload={upload_id}, job={job_id}, action={action}")
-    ctx = None
-    temp_dir = None
-
+    Burn watermark onto video if required by tier.
+    
+    Process:
+    1. Check if watermark is required (tier-based)
+    2. Apply watermark using FFmpeg
+    3. Update context with new video path
+    """
+    ctx.mark_stage("watermark")
+    
+    if not ctx.entitlements:
+        raise SkipStage("No entitlements loaded", stage="watermark")
+    
+    # Check if watermark should be applied
+    if not should_burn_watermark(ctx.entitlements):
+        logger.info("Watermark not required for this tier")
+        raise SkipStage("Watermark not required for tier", stage="watermark")
+    
+    # Get video to process (HUD output or original)
+    input_video = ctx.processed_video_path or ctx.local_video_path
+    
+    if not input_video or not input_video.exists():
+        raise SkipStage("No video file to watermark", stage="watermark")
+    
+    # Check if watermark image exists
+    watermark_path = Path(WATERMARK_IMAGE)
+    if not watermark_path.exists():
+        logger.warning(f"Watermark image not found: {WATERMARK_IMAGE}")
+        # Generate text watermark instead
+        return await apply_text_watermark(ctx, input_video)
+    
     try:
-        upload_record = await db_stage.load_upload_record(db_pool, upload_id)
-        user_record = await db_stage.load_user(db_pool, user_id)
-        if not upload_record or not user_record:
-            logger.error(f"Records not found: upload={upload_id}, user={user_id}")
-            return False
-
-        user_settings = await db_stage.load_user_settings(db_pool, user_id)
-        overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
-        entitlements = get_entitlements_from_user(user_record, overrides)
-
-        ctx = create_context(job_data, upload_record, user_settings, entitlements)
-        ctx.started_at = datetime.now(timezone.utc)
-        ctx.state = "processing"
-        await db_stage.mark_processing_started(db_pool, ctx)
-        await maybe_cancel(ctx, "init")
-
-        # Download
-        ctx.mark_stage("download")
-        temp_dir = tempfile.TemporaryDirectory()
-        ctx.temp_dir = Path(temp_dir.name)
-        video_local = ctx.temp_dir / ctx.filename
-        await r2_stage.download_file(ctx.source_r2_key, video_local)
-        ctx.local_video_path = video_local
-
-        if ctx.telemetry_r2_key:
-            try:
-                telem_local = ctx.temp_dir / "telemetry.map"
-                await r2_stage.download_file(ctx.telemetry_r2_key, telem_local)
-                ctx.local_telemetry_path = telem_local
-            except Exception as e:
-                logger.warning(f"Telemetry download failed: {e}")
-
-        await maybe_cancel(ctx, "download")
-
-        # Transcode
-        try:
-            ctx = await run_transcode_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"Transcode skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"Transcode error: {e.message}")
-        await maybe_cancel(ctx, "transcode")
-
-        # Telemetry
-        try:
-            ctx = await run_telemetry_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"Telemetry skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"Telemetry error: {e.message}")
-        await maybe_cancel(ctx, "telemetry")
-
-        # Thumbnail
-        try:
-            ctx = await run_thumbnail_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"Thumbnail skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"Thumbnail error: {e.message}")
-        await maybe_cancel(ctx, "thumbnail")
-
-        # Caption
-        try:
-            ctx = await run_caption_stage(ctx)
-            await db_stage.save_generated_metadata(db_pool, ctx)
-        except SkipStage as e:
-            logger.info(f"Caption skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"Caption error: {e.message}")
-        await maybe_cancel(ctx, "caption")
-
-        # HUD
-        try:
-            ctx = await run_hud_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"HUD skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"HUD error: {e.message}")
-        await maybe_cancel(ctx, "hud")
-
-        # Watermark
-        try:
-            ctx = await run_watermark_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"Watermark skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"Watermark error: {e.message}")
-        await maybe_cancel(ctx, "watermark")
-
-        # Upload processed video
-        ctx.mark_stage("upload")
-        final_video = ctx.processed_video_path or ctx.local_video_path
-        if final_video and final_video.exists() and final_video != ctx.local_video_path:
-            processed_key = f"processed/{ctx.user_id}/{ctx.upload_id}.mp4"
-            await r2_stage.upload_file(final_video, processed_key, "video/mp4")
-            ctx.processed_r2_key = processed_key
-            ctx.output_artifacts["processed_video"] = processed_key
-        await maybe_cancel(ctx, "upload")
-
-        # Publish
-        try:
-            ctx = await run_publish_stage(ctx, db_pool)
-        except StageError as e:
-            logger.error(f"Publish error: {e.message}")
-            ctx.mark_error(e.code.value, e.message)
-        await maybe_cancel(ctx, "publish")
-
-        # Notify
-        try:
-            ctx = await run_notify_stage(ctx)
-        except Exception as e:
-            logger.warning(f"Notify error: {e}")
-
-        # Complete
-        ctx.finished_at = datetime.now(timezone.utc)
-        ctx.state = "succeeded" if ctx.is_success() else "failed"
-        await db_stage.mark_processing_completed(db_pool, ctx)
-
-        if ctx.is_success():
-            await db_stage.increment_upload_count(db_pool, user_id)
-
-        logger.info(f"Pipeline complete: {ctx.state}, platforms={ctx.get_success_platforms()}")
-        return ctx.is_success()
-
-    except CancelRequested:
-        logger.info(f"Pipeline cancelled: {upload_id}")
-        return False
-    except Exception as e:
-        logger.exception(f"Pipeline failed: {e}")
-        if ctx:
-            ctx.mark_error("INTERNAL", str(e))
-            await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
-        try:
-            await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
-        except TypeError:
-            await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)})
-        return False
-    finally:
-        if temp_dir:
-            try:
-                temp_dir.cleanup()
-            except Exception:
-                pass
-
-
-async def process_jobs():
-    global shutdown_requested, redis_client
-    logger.info("Worker started, waiting for jobs...")
-    # admin start notification handled by main()
-
-    while not shutdown_requested:
-        try:
-            # BRPOP can hold the connection; managed Redis may drop idle sockets.
-            # On disconnect, reconnect and continue.
-            try:
-                job_raw = await redis_client.brpop(
-                    [PRIORITY_JOB_QUEUE, UPLOAD_JOB_QUEUE],
-                    timeout=int(POLL_INTERVAL),
-                )
-            except redis.exceptions.ConnectionError as e:
-                logger.error(f"Redis connection error during BRPOP: {e}. Reconnecting...")
-                try:
-                    await connect_redis()
-                    logger.info("Redis reconnected")
-                except Exception as re_err:
-                    logger.error(f"Redis reconnect failed: {re_err}")
-                await asyncio.sleep(1)
-                continue
-
-            if not job_raw:
-                continue
-
-            _, job_json = job_raw
-            job_data = json.loads(job_json)
-
-            await run_pipeline(job_data)
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid job JSON: {e}")
-        except Exception as e:
-            logger.exception(f"Job processing error: {e}")
-            await asyncio.sleep(1)
-
-    logger.info("Worker shutting down...")
-    # admin stop notification handled by main()
-
-
-
-async def main():
-    global db_pool, redis_client, shutdown_event
-
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
-
-    if not DATABASE_URL:
-        logger.error("DATABASE_URL not set")
-        sys.exit(1)
-    if not REDIS_URL:
-        logger.error("REDIS_URL not set")
-        sys.exit(1)
-
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
-    logger.info("Database connected")
-
-    redis_client = await connect_redis()
-    logger.info("Redis connected")
-
-    shutdown_event = asyncio.Event()
-
-    verify_task = asyncio.create_task(run_verification_loop(db_pool, shutdown_event))
-    job_task = asyncio.create_task(process_jobs())
-
-    try:
-        try:
-            await notify_admin_worker_start(db_pool)
-        except TypeError:
-            # Back-compat: older notify_stage signatures take no args
-            await notify_admin_worker_start()
-        done, pending = await asyncio.wait(
-            [job_task, verify_task],
-            return_when=asyncio.FIRST_COMPLETED,
+        output_path = ctx.temp_dir / f"watermarked_{ctx.upload_id}.mp4"
+        
+        # Build FFmpeg filter for watermark
+        position_filter = get_position_filter(WATERMARK_POSITION)
+        
+        # FFmpeg command with watermark overlay
+        cmd = [
+            FFMPEG_PATH,
+            "-i", str(input_video),
+            "-i", str(watermark_path),
+            "-filter_complex",
+            f"[1:v]scale=iw*{WATERMARK_SCALE}:-1,format=rgba,colorchannelmixer=aa={WATERMARK_OPACITY}[wm];"
+            f"[0:v][wm]overlay={position_filter}",
+            "-c:a", "copy",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-y",
+            str(output_path)
+        ]
+        
+        logger.info(f"Applying watermark: {WATERMARK_POSITION}")
+        
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        for t in pending:
-            t.cancel()
-    finally:
-        try:
-            shutdown_event.set()
-        except Exception:
-            pass
-        try:
-            try:
-                await notify_admin_worker_stop(db_pool)
-            except TypeError:
-                await notify_admin_worker_stop()
-        except Exception:
-            pass
-        if db_pool:
-            await db_pool.close()
-        if redis_client:
-            try:
-                await redis_client.aclose()
-            except AttributeError:
-                # older versions
-                await redis_client.close()
+        _, stderr = await proc.communicate()
+        
+        if proc.returncode != 0:
+            logger.error(f"Watermark failed: {stderr.decode()[:500]}")
+            raise StageError(
+                ErrorCode.WATERMARK_FAILED,
+                "FFmpeg watermark overlay failed",
+                stage="watermark"
+            )
+        
+        if not output_path.exists():
+            raise StageError(
+                ErrorCode.WATERMARK_FAILED,
+                "Watermarked video not created",
+                stage="watermark"
+            )
+        
+        ctx.processed_video_path = output_path
+        logger.info(f"Watermark applied: {output_path.stat().st_size} bytes")
+        
+        return ctx
+        
+    except SkipStage:
+        raise
+    except StageError:
+        raise
+    except Exception as e:
+        raise StageError(
+            ErrorCode.WATERMARK_FAILED,
+            f"Watermark stage failed: {str(e)}",
+            stage="watermark"
+        )
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def apply_text_watermark(ctx: JobContext, input_video: Path) -> JobContext:
+    """
+    Apply text watermark if image not available.
+    """
+    try:
+        output_path = ctx.temp_dir / f"watermarked_{ctx.upload_id}.mp4"
+        
+        # Position for text
+        position = WATERMARK_POSITION.replace("-", "_")
+        if position == "bottom_right":
+            pos_x, pos_y = "W-tw-20", "H-th-20"
+        elif position == "bottom_left":
+            pos_x, pos_y = "20", "H-th-20"
+        elif position == "top_right":
+            pos_x, pos_y = "W-tw-20", "20"
+        else:  # top_left
+            pos_x, pos_y = "20", "20"
+        
+        # FFmpeg command with text overlay
+        cmd = [
+            FFMPEG_PATH,
+            "-i", str(input_video),
+            "-vf", f"drawtext=text='UploadM8':fontsize=24:fontcolor=white@{WATERMARK_OPACITY}:x={pos_x}:y={pos_y}",
+            "-c:a", "copy",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-y",
+            str(output_path)
+        ]
+        
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        
+        if proc.returncode == 0 and output_path.exists():
+            ctx.processed_video_path = output_path
+            logger.info("Text watermark applied")
+        else:
+            logger.warning(f"Text watermark failed: {stderr.decode()[:200]}")
+        
+        return ctx
+        
+    except Exception as e:
+        logger.warning(f"Text watermark error: {e}")
+        return ctx
+
+
+def get_position_filter(position: str) -> str:
+    """Convert position name to FFmpeg overlay coordinates."""
+    positions = {
+        "top-left": "10:10",
+        "top-right": "W-w-10:10",
+        "bottom-left": "10:H-h-10",
+        "bottom-right": "W-w-10:H-h-10",
+        "center": "(W-w)/2:(H-h)/2",
+    }
+    return positions.get(position, positions["bottom-right"])

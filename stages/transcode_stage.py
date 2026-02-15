@@ -1,446 +1,315 @@
 """
-FFmpeg Transcode Stage - Converts videos to platform-specific formats
+UploadM8 Thumbnail Stage
+========================
+Generate thumbnails using FFmpeg screenshot extraction
+and optional AI enhancement via OpenAI Vision.
 
-Ensures videos meet the requirements for:
-- YouTube Shorts: H.264, AAC, 9:16 aspect ratio, max 60 seconds
-- TikTok: H.264, AAC, 9:16 aspect ratio, max 10 minutes
-- Instagram Reels: H.264, AAC, 9:16 aspect ratio, max 90 seconds
-- Facebook Reels: H.264, AAC, 9:16 aspect ratio, max 90 seconds
+Features:
+- FFmpeg screenshot at user-defined timestamp (settings knob)
+- Multiple sample extraction for best frame selection
+- OpenAI Vision for "marketable thumbnail" generation
+- Tier-gated AI enhancement
 """
 
+import os
 import asyncio
-import json
 import logging
-import subprocess
+import base64
+import json
 from pathlib import Path
-from typing import Dict, Optional, Tuple
-from dataclasses import dataclass
+from typing import Optional, List
+import httpx
 
 from .context import JobContext
 from .errors import StageError, SkipStage, ErrorCode
+from .entitlements import should_generate_thumbnails
 
-logger = logging.getLogger("uploadm8-worker.transcode")
+logger = logging.getLogger("uploadm8-worker")
 
-# Platform-specific requirements
-PLATFORM_SPECS = {
-    "youtube": {
-        "name": "YouTube Shorts",
-        "max_duration": 60,           # seconds
-        "preferred_aspect": (9, 16),  # vertical
-        "min_aspect": (9, 16),
-        "max_aspect": (16, 9),        # also supports horizontal
-        "video_codec": "h264",
-        "audio_codec": "aac",
-        "max_width": 1080,
-        "max_height": 1920,
-        "max_fps": 60,
-        "max_bitrate_video": "12M",
-        "max_bitrate_audio": "192k",
-        "sample_rate": 48000,
-        "pixel_format": "yuv420p",
-    },
-    "tiktok": {
-        "name": "TikTok",
-        "max_duration": 600,          # 10 minutes
-        "preferred_aspect": (9, 16),
-        "min_aspect": (9, 16),
-        "max_aspect": (16, 9),
-        "video_codec": "h264",
-        "audio_codec": "aac",
-        "max_width": 1080,
-        "max_height": 1920,
-        "max_fps": 60,
-        "max_bitrate_video": "10M",
-        "max_bitrate_audio": "192k",
-        "sample_rate": 44100,
-        "pixel_format": "yuv420p",
-    },
-    "instagram": {
-        "name": "Instagram Reels",
-        "max_duration": 90,
-        "preferred_aspect": (9, 16),
-        "min_aspect": (4, 5),
-        "max_aspect": (16, 9),
-        "video_codec": "h264",
-        "audio_codec": "aac",
-        "max_width": 1080,
-        "max_height": 1920,
-        "max_fps": 30,
-        "max_bitrate_video": "8M",
-        "max_bitrate_audio": "128k",
-        "sample_rate": 44100,
-        "pixel_format": "yuv420p",
-    },
-    "facebook": {
-        "name": "Facebook Reels",
-        "max_duration": 90,
-        "preferred_aspect": (9, 16),
-        "min_aspect": (9, 16),
-        "max_aspect": (16, 9),
-        "video_codec": "h264",
-        "audio_codec": "aac",
-        "max_width": 1080,
-        "max_height": 1920,
-        "max_fps": 30,
-        "max_bitrate_video": "8M",
-        "max_bitrate_audio": "128k",
-        "sample_rate": 44100,
-        "pixel_format": "yuv420p",
-    },
-}
+# Configuration
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
+FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "ffprobe")
 
 
-@dataclass
-class VideoInfo:
-    """Parsed video metadata from ffprobe"""
-    width: int
-    height: int
-    duration: float
-    fps: float
-    video_codec: str
-    audio_codec: Optional[str]
-    video_bitrate: Optional[int]
-    audio_bitrate: Optional[int]
-    sample_rate: Optional[int]
-    pixel_format: str
-    rotation: int = 0
-
-
-async def get_video_info(video_path: Path) -> VideoInfo:
-    """Use ffprobe to get video metadata"""
-    cmd = [
-        "ffprobe",
-        "-v", "quiet",
-        "-print_format", "json",
-        "-show_format",
-        "-show_streams",
-        str(video_path)
-    ]
-    
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            raise StageError(ErrorCode.TRANSCODE_FAILED, f"ffprobe failed: {stderr.decode()}")
-        
-        data = json.loads(stdout.decode())
-        
-        # Find video and audio streams
-        video_stream = None
-        audio_stream = None
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "video" and not video_stream:
-                video_stream = stream
-            elif stream.get("codec_type") == "audio" and not audio_stream:
-                audio_stream = stream
-        
-        if not video_stream:
-            raise StageError(ErrorCode.TRANSCODE_FAILED, "No video stream found")
-        
-        # Parse video info
-        width = int(video_stream.get("width", 0))
-        height = int(video_stream.get("height", 0))
-        
-        # Handle rotation metadata (common in phone videos)
-        rotation = 0
-        if "tags" in video_stream:
-            rotation = int(video_stream["tags"].get("rotate", 0))
-        if "side_data_list" in video_stream:
-            for side_data in video_stream["side_data_list"]:
-                if "rotation" in side_data:
-                    rotation = int(side_data["rotation"])
-        
-        # Swap width/height if rotated 90 or 270 degrees
-        if rotation in (90, 270, -90, -270):
-            width, height = height, width
-        
-        # Parse framerate
-        fps_str = video_stream.get("r_frame_rate", "30/1")
-        if "/" in fps_str:
-            num, den = fps_str.split("/")
-            fps = float(num) / float(den) if float(den) > 0 else 30.0
-        else:
-            fps = float(fps_str)
-        
-        # Parse duration
-        duration = float(data.get("format", {}).get("duration", 0))
-        if duration == 0:
-            duration = float(video_stream.get("duration", 0))
-        
-        # Parse bitrates
-        video_bitrate = int(video_stream.get("bit_rate", 0)) if video_stream.get("bit_rate") else None
-        audio_bitrate = int(audio_stream.get("bit_rate", 0)) if audio_stream and audio_stream.get("bit_rate") else None
-        sample_rate = int(audio_stream.get("sample_rate", 0)) if audio_stream and audio_stream.get("sample_rate") else None
-        
-        return VideoInfo(
-            width=width,
-            height=height,
-            duration=duration,
-            fps=fps,
-            video_codec=video_stream.get("codec_name", "unknown"),
-            audio_codec=audio_stream.get("codec_name") if audio_stream else None,
-            video_bitrate=video_bitrate,
-            audio_bitrate=audio_bitrate,
-            sample_rate=sample_rate,
-            pixel_format=video_stream.get("pix_fmt", "unknown"),
-            rotation=rotation,
-        )
-        
-    except json.JSONDecodeError as e:
-        raise StageError(ErrorCode.TRANSCODE_FAILED, f"Failed to parse ffprobe output: {e}")
-    except Exception as e:
-        if isinstance(e, StageError):
-            raise
-        raise StageError(ErrorCode.TRANSCODE_FAILED, f"Failed to get video info: {e}")
-
-
-def needs_transcode(info: VideoInfo, platform: str) -> Tuple[bool, list]:
-    """Check if video needs transcoding for the target platform"""
-    spec = PLATFORM_SPECS.get(platform)
-    if not spec:
-        return False, []
-    
-    reasons = []
-    
-    # Check codec
-    if info.video_codec.lower() not in ("h264", "avc"):
-        reasons.append(f"video codec is {info.video_codec}, needs h264")
-    
-    if info.audio_codec and info.audio_codec.lower() != "aac":
-        reasons.append(f"audio codec is {info.audio_codec}, needs aac")
-    
-    # Check pixel format (must be yuv420p for compatibility)
-    if info.pixel_format != "yuv420p":
-        reasons.append(f"pixel format is {info.pixel_format}, needs yuv420p")
-    
-    # Check resolution
-    if info.width > spec["max_width"] or info.height > spec["max_height"]:
-        reasons.append(f"resolution {info.width}x{info.height} exceeds {spec['max_width']}x{spec['max_height']}")
-    
-    # Check fps
-    if info.fps > spec["max_fps"]:
-        reasons.append(f"fps {info.fps:.1f} exceeds max {spec['max_fps']}")
-    
-    # Check duration
-    if info.duration > spec["max_duration"]:
-        reasons.append(f"duration {info.duration:.1f}s exceeds max {spec['max_duration']}s")
-    
-    # Check rotation (needs to be applied)
-    if info.rotation != 0:
-        reasons.append(f"video has {info.rotation}° rotation that needs to be applied")
-    
-    return len(reasons) > 0, reasons
-
-
-def build_ffmpeg_command(
-    input_path: Path,
-    output_path: Path,
-    info: VideoInfo,
-    platform: str,
-    target_aspect: str = "auto"
-) -> list:
-    """Build FFmpeg command for transcoding"""
-    spec = PLATFORM_SPECS.get(platform, PLATFORM_SPECS["youtube"])
-    
-    cmd = [
-        "ffmpeg",
-        "-y",  # Overwrite output
-        "-i", str(input_path),
-    ]
-    
-    # Video filters
-    vf_filters = []
-    
-    # Handle rotation
-    if info.rotation == 90:
-        vf_filters.append("transpose=1")
-    elif info.rotation == 180:
-        vf_filters.append("transpose=1,transpose=1")
-    elif info.rotation == 270 or info.rotation == -90:
-        vf_filters.append("transpose=2")
-    
-    # Calculate scaling
-    target_width = min(info.width, spec["max_width"])
-    target_height = min(info.height, spec["max_height"])
-    
-    # Ensure dimensions are even (required for h264)
-    target_width = target_width - (target_width % 2)
-    target_height = target_height - (target_height % 2)
-    
-    # Add scaling filter
-    vf_filters.append(f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease")
-    vf_filters.append(f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2")
-    
-    # Add format conversion for pixel format
-    vf_filters.append("format=yuv420p")
-    
-    if vf_filters:
-        cmd.extend(["-vf", ",".join(vf_filters)])
-    
-    # Video codec settings
-    cmd.extend([
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "23",
-        "-profile:v", "high",
-        "-level", "4.1",
-        "-maxrate", spec["max_bitrate_video"],
-        "-bufsize", spec["max_bitrate_video"].replace("M", "") + "M",
-    ])
-    
-    # Frame rate limiting
-    if info.fps > spec["max_fps"]:
-        cmd.extend(["-r", str(spec["max_fps"])])
-    
-    # Duration limiting
-    if info.duration > spec["max_duration"]:
-        cmd.extend(["-t", str(spec["max_duration"])])
-    
-    # Audio codec settings
-    if info.audio_codec:
-        cmd.extend([
-            "-c:a", "aac",
-            "-b:a", spec["max_bitrate_audio"],
-            "-ar", str(spec["sample_rate"]),
-            "-ac", "2",  # Stereo
-        ])
-    else:
-        # No audio - add silent audio track (some platforms require audio)
-        cmd.extend([
-            "-f", "lavfi",
-            "-i", "anullsrc=r=44100:cl=stereo",
-            "-shortest",
-            "-c:a", "aac",
-            "-b:a", "128k",
-        ])
-    
-    # Output settings
-    cmd.extend([
-        "-movflags", "+faststart",  # Enable streaming
-        "-pix_fmt", "yuv420p",
-        str(output_path)
-    ])
-    
-    return cmd
-
-
-async def transcode_video(
-    input_path: Path,
-    output_path: Path,
-    platform: str,
-    info: Optional[VideoInfo] = None
-) -> Path:
-    """Transcode video to platform-specific format"""
-    if not info:
-        info = await get_video_info(input_path)
-    
-    cmd = build_ffmpeg_command(input_path, output_path, info, platform)
-    
-    logger.info(f"Transcoding for {platform}: {' '.join(cmd[:10])}...")
-    
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        
-        if proc.returncode != 0:
-            error_msg = stderr.decode()[-500:]  # Last 500 chars of error
-            raise StageError(ErrorCode.TRANSCODE_FAILED, f"FFmpeg failed: {error_msg}")
-        
-        if not output_path.exists():
-            raise StageError(ErrorCode.TRANSCODE_FAILED, "Output file not created")
-        
-        logger.info(f"Transcode complete: {output_path.stat().st_size / 1024 / 1024:.1f}MB")
-        return output_path
-        
-    except Exception as e:
-        if isinstance(e, StageError):
-            raise
-        raise StageError(ErrorCode.TRANSCODE_FAILED, f"Transcode failed: {e}")
-
-
-async def run_transcode_stage(ctx: JobContext) -> JobContext:
+async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     """
-    Run the transcode stage - creates platform-specific versions of the video
+    Generate thumbnail for video.
     
-    This stage:
-    1. Analyzes the input video
-    2. Determines which platforms need transcoding
-    3. Creates optimized versions for each platform
+    Process:
+    1. Check entitlements
+    2. Get video duration
+    3. Extract screenshot(s) at configured interval
+    4. If AI enabled, select best and optionally enhance
+    5. Upload thumbnail to R2
     """
-    ctx.mark_stage("transcode")
+    ctx.mark_stage("thumbnail")
+    
+    # Check if thumbnail generation is enabled
+    if not ctx.entitlements or not should_generate_thumbnails(ctx.entitlements):
+        raise SkipStage("Thumbnail generation not enabled for tier", stage="thumbnail")
     
     if not ctx.local_video_path or not ctx.local_video_path.exists():
-        raise SkipStage("No video file to transcode")
+        raise SkipStage("No local video file", stage="thumbnail")
     
-    platforms = ctx.platforms or []
-    if not platforms:
-        raise SkipStage("No target platforms specified")
+    # Get user settings for screenshot
+    screenshot_interval = ctx.user_settings.get("ffmpeg_screenshot_interval", 5)
+    auto_generate = ctx.user_settings.get("auto_generate_thumbnails", True)
     
-    logger.info(f"Analyzing video for platforms: {platforms}")
+    if not auto_generate:
+        raise SkipStage("Auto thumbnail generation disabled in settings", stage="thumbnail")
     
-    # Get video info
-    info = await get_video_info(ctx.local_video_path)
-    logger.info(f"Video: {info.width}x{info.height}, {info.duration:.1f}s, {info.fps:.1f}fps, "
-                f"codec={info.video_codec}, rotation={info.rotation}")
-    
-    # Store video info in context
-    ctx.video_info = {
-        "width": info.width,
-        "height": info.height,
-        "duration": info.duration,
-        "fps": info.fps,
-        "video_codec": info.video_codec,
-        "audio_codec": info.audio_codec,
-    }
-    
-    # Check each platform and transcode if needed
-    ctx.platform_videos = {}
-    transcoded_any = False
-    
-    for platform in platforms:
-        needs_tc, reasons = needs_transcode(info, platform)
-        
-        if needs_tc:
-            logger.info(f"{platform} needs transcode: {', '.join(reasons)}")
-            
-            output_path = ctx.temp_dir / f"transcoded_{platform}.mp4"
-            await transcode_video(ctx.local_video_path, output_path, platform, info)
-            
-            ctx.platform_videos[platform] = output_path
-            transcoded_any = True
-        else:
-            logger.info(f"{platform}: video is already compatible")
-            ctx.platform_videos[platform] = ctx.local_video_path
-    
-    # If we transcoded, update the processed video path to the first transcoded version
-    # (for backwards compatibility with single-output workflows)
-    if transcoded_any:
-        first_platform = platforms[0]
-        if first_platform in ctx.platform_videos:
-            ctx.processed_video_path = ctx.platform_videos[first_platform]
-    
-    return ctx
-
-
-# Utility function to check if FFmpeg is available
-async def check_ffmpeg_available() -> bool:
-    """Check if FFmpeg is installed and accessible"""
     try:
+        # Get video duration
+        duration = await get_video_duration(ctx.local_video_path)
+        if duration <= 0:
+            raise StageError(ErrorCode.THUMBNAIL_FAILED, "Could not determine video duration", stage="thumbnail")
+        
+        # Calculate screenshot timestamps
+        timestamps = calculate_screenshot_timestamps(duration, screenshot_interval)
+        
+        # Extract screenshots
+        screenshots = await extract_screenshots(ctx.local_video_path, timestamps, ctx.temp_dir)
+        
+        if not screenshots:
+            raise StageError(ErrorCode.THUMBNAIL_FAILED, "No screenshots extracted", stage="thumbnail")
+        
+        # Select best thumbnail
+        if ctx.entitlements.ai_thumbnails_enabled and OPENAI_API_KEY:
+            best_thumbnail = await ai_select_best_thumbnail(screenshots)
+        else:
+            # Simple heuristic: use frame from 1/3 into video
+            best_thumbnail = screenshots[len(screenshots) // 3] if len(screenshots) > 2 else screenshots[0]
+        
+        ctx.thumbnail_path = best_thumbnail
+        
+        # Upload to R2
+        from . import r2 as r2_stage
+        thumbnail_key = f"thumbnails/{ctx.user_id}/{ctx.upload_id}.jpg"
+        await r2_stage.upload_file(best_thumbnail, thumbnail_key, "image/jpeg")
+        ctx.thumbnail_r2_key = thumbnail_key
+        ctx.output_artifacts["thumbnail"] = thumbnail_key
+        
+        logger.info(f"Thumbnail generated: {thumbnail_key}")
+        return ctx
+        
+    except SkipStage:
+        raise
+    except StageError:
+        raise
+    except Exception as e:
+        raise StageError(
+            ErrorCode.THUMBNAIL_FAILED,
+            f"Thumbnail generation failed: {str(e)}",
+            stage="thumbnail",
+            retryable=True
+        )
+
+
+async def get_video_duration(video_path: Path) -> float:
+    """Get video duration in seconds using ffprobe."""
+    try:
+        cmd = [
+            FFPROBE_PATH,
+            "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            str(video_path)
+        ]
+        
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-version",
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await proc.communicate()
-        return proc.returncode == 0
-    except Exception:
-        return False
+        stdout, _ = await proc.communicate()
+        
+        data = json.loads(stdout)
+        return float(data.get("format", {}).get("duration", 0))
+        
+    except Exception as e:
+        logger.warning(f"Failed to get video duration: {e}")
+        return 0
+
+
+def calculate_screenshot_timestamps(duration: float, interval: int, max_samples: int = 10) -> List[float]:
+    """
+    Calculate timestamps for screenshot extraction.
+    
+    Args:
+        duration: Video duration in seconds
+        interval: Seconds between samples
+        max_samples: Maximum number of samples
+        
+    Returns:
+        List of timestamps in seconds
+    """
+    if duration <= 0:
+        return [0]
+    
+    if interval <= 0:
+        interval = 5
+    
+    timestamps = []
+    current = interval
+    
+    while current < duration and len(timestamps) < max_samples:
+        timestamps.append(current)
+        current += interval
+    
+    # Always include a point at 1/3 and 2/3 of the video
+    third = duration / 3
+    two_thirds = duration * 2 / 3
+    
+    if third not in timestamps and third < duration:
+        timestamps.append(third)
+    if two_thirds not in timestamps and two_thirds < duration:
+        timestamps.append(two_thirds)
+    
+    return sorted(set(timestamps))[:max_samples]
+
+
+async def extract_screenshots(video_path: Path, timestamps: List[float], temp_dir: Path) -> List[Path]:
+    """
+    Extract screenshots at specified timestamps using FFmpeg.
+    
+    Args:
+        video_path: Path to video file
+        timestamps: List of timestamps in seconds
+        temp_dir: Directory to save screenshots
+        
+    Returns:
+        List of paths to screenshot files
+    """
+    screenshots = []
+    
+    for i, ts in enumerate(timestamps):
+        output_path = temp_dir / f"thumb_{i:03d}.jpg"
+        
+        cmd = [
+            FFMPEG_PATH,
+            "-ss", str(ts),
+            "-i", str(video_path),
+            "-vframes", "1",
+            "-q:v", "2",  # High quality JPEG
+            "-y",
+            str(output_path)
+        ]
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await proc.communicate()
+            
+            if proc.returncode == 0 and output_path.exists():
+                screenshots.append(output_path)
+            else:
+                logger.warning(f"Screenshot extraction failed at {ts}s: {stderr.decode()[:200]}")
+                
+        except Exception as e:
+            logger.warning(f"Screenshot extraction error at {ts}s: {e}")
+    
+    return screenshots
+
+
+async def ai_select_best_thumbnail(screenshots: List[Path]) -> Path:
+    """
+    Use OpenAI Vision to select the best thumbnail from candidates.
+    
+    Args:
+        screenshots: List of screenshot paths
+        
+    Returns:
+        Path to best screenshot
+    """
+    if not OPENAI_API_KEY or len(screenshots) <= 1:
+        return screenshots[0] if screenshots else None
+    
+    try:
+        # Encode images to base64
+        images_b64 = []
+        for ss in screenshots[:5]:  # Limit to 5 for API cost
+            with open(ss, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("utf-8")
+                images_b64.append(b64)
+        
+        # Prepare message content
+        content = [
+            {
+                "type": "text",
+                "text": """Analyze these video thumbnail candidates and select the BEST one for maximum click-through rate.
+                
+Consider:
+- Visual appeal and clarity
+- Subject focus and composition  
+- Color vibrancy
+- Action/interest in the frame
+- Avoid blurry, dark, or unfocused frames
+
+Respond with ONLY the number (1-5) of the best thumbnail. Example: "3" """
+            }
+        ]
+        
+        for i, b64 in enumerate(images_b64, 1):
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{b64}",
+                    "detail": "low"  # Use low detail to reduce costs
+                }
+            })
+        
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": 10
+                }
+            )
+            
+            if response.status_code != 200:
+                if response.status_code in (401, 403):
+                    logger.warning(f"OpenAI thumbnail selection unauthorized/forbidden ({response.status_code}); using heuristic.")
+                    return screenshots[len(screenshots) // 3]
+                logger.warning(f"OpenAI thumbnail selection failed: {response.status_code}")
+                return screenshots[len(screenshots) // 3]
+            
+            data = response.json()
+            answer = data["choices"][0]["message"]["content"].strip()
+            
+            # Parse response
+            try:
+                idx = int(answer) - 1
+                if 0 <= idx < len(screenshots):
+                    logger.info(f"AI selected thumbnail #{idx + 1}")
+                    return screenshots[idx]
+            except:
+                pass
+            
+            return screenshots[len(screenshots) // 3]
+            
+    except Exception as e:
+        logger.warning(f"AI thumbnail selection error: {e}")
+        return screenshots[len(screenshots) // 3] if screenshots else None
+
+
+async def generate_ai_thumbnail(screenshot_path: Path, temp_dir: Path) -> Optional[Path]:
+    """
+    Generate an enhanced AI thumbnail using OpenAI image generation.
+    This is a premium feature for high tiers.
+    
+    Note: This uses DALL-E for image-to-image enhancement which has additional costs.
+    Currently returns the original screenshot as DALL-E doesn't support direct enhancement.
+    """
+    # For now, return the original screenshot
+    # Future: Could use DALL-E 3 with image-to-image or other enhancement APIs
+    return screenshot_path

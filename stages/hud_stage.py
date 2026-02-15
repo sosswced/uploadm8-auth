@@ -1,235 +1,188 @@
 """
-UploadM8 HUD Stage
-==================
-Generate speed HUD overlay on videos using FFmpeg.
+UploadM8 Stage Errors
+=====================
+Centralized error handling for the processing pipeline.
 """
 
-import os
-import logging
-import subprocess
-import tempfile
-from pathlib import Path
+from enum import Enum
 from typing import Optional
 
-from .errors import HUDError, SkipStage, ErrorCode
-from .context import JobContext
+
+class ErrorCode(str, Enum):
+    """Standardized error codes for debugging and frontend display."""
+    # Generic
+    UNKNOWN = "UNKNOWN"
+    INTERNAL = "INTERNAL"
+    TIMEOUT = "TIMEOUT"
+    CANCELLED = "CANCELLED"
+    
+    # Auth
+    AUTH_FAILED = "AUTH_FAILED"
+    TOKEN_EXPIRED = "TOKEN_EXPIRED"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    FORBIDDEN = "FORBIDDEN"
+    
+    # Upload
+    UPLOAD_FAILED = "UPLOAD_FAILED"
+    UPLOAD_TOO_LARGE = "UPLOAD_TOO_LARGE"
+    INVALID_FILE_TYPE = "INVALID_FILE_TYPE"
+    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
+    PRESIGN_FAILED = "PRESIGN_FAILED"
+    
+    # Processing
+    DOWNLOAD_FAILED = "DOWNLOAD_FAILED"
+    TRANSCODE_FAILED = "TRANSCODE_FAILED"
+    FFMPEG_FAILED = "FFMPEG_FAILED"
+    TELEMETRY_PARSE_FAILED = "TELEMETRY_PARSE"
+    HUD_FAILED = "HUD_FAILED"
+    WATERMARK_FAILED = "WATERMARK_FAILED"
+    THUMBNAIL_FAILED = "THUMBNAIL_FAILED"
+    
+    # AI
+    AI_CAPTION_FAILED = "AI_CAPTION_FAILED"
+    AI_THUMBNAIL_FAILED = "AI_THUMBNAIL_FAILED"
+    AI_HASHTAG_FAILED = "AI_HASHTAG_FAILED"
+    OPENAI_RATE_LIMIT = "OPENAI_RATE_LIMIT"
+    OPENAI_ERROR = "OPENAI_ERROR"
+    
+    # Platform
+    PLATFORM_AUTH_FAILED = "PLATFORM_AUTH"
+    PLATFORM_UPLOAD_FAILED = "PLATFORM_UPLOAD"
+    PLATFORM_RATE_LIMIT = "PLATFORM_RATE_LIMIT"
+    TIKTOK_FAILED = "TIKTOK_FAILED"
+    YOUTUBE_FAILED = "YOUTUBE_FAILED"
+    INSTAGRAM_FAILED = "INSTAGRAM_FAILED"
+    FACEBOOK_FAILED = "FACEBOOK_FAILED"
+    
+    # Entitlements
+    TIER_BLOCKED = "TIER_BLOCKED"
+    FEATURE_DISABLED = "FEATURE_DISABLED"
+    
+    # Database
+    DB_ERROR = "DB_ERROR"
+    NOT_FOUND = "NOT_FOUND"
+    
+    # Network
+    NETWORK_ERROR = "NETWORK_ERROR"
+    DNS_ERROR = "DNS_ERROR"
+    CORS_ERROR = "CORS_ERROR"
 
 
-logger = logging.getLogger("uploadm8-worker")
-
-
-JOB_TIMEOUT_SECONDS = int(os.environ.get("JOB_TIMEOUT_SECONDS", "600"))
-
-
-def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
+class StageError(Exception):
     """
-    Generate SRT subtitle file with speed data.
+    Error raised during stage processing.
     
-    Args:
-        ctx: Job context with telemetry data
-        output_path: Path to write SRT file
-        
-    Returns:
-        Path to generated SRT file
+    Attributes:
+        code: Standardized error code
+        message: Human-readable error message
+        details: Optional additional context
+        retryable: Whether this error can be retried
+        stage: Which stage raised the error
     """
-    telemetry = getattr(ctx, "telemetry", None)
-    points = getattr(telemetry, "data_points", None) or getattr(telemetry, "points", None) or []
-    if not telemetry or not points:
-        raise HUDError(
-            "No telemetry data for HUD",
-            code=ErrorCode.HUD_GENERATION_FAILED
-        )
     
-    # Get speed unit preference
-    speed_unit = ctx.user_settings.get("hud_speed_unit", "mph")
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        details: Optional[dict] = None,
+        retryable: bool = False,
+        stage: str = "unknown"
+    ):
+        self.code = code
+        self.message = message
+        self.details = details or {}
+        self.retryable = retryable
+        self.stage = stage
+        super().__init__(f"[{code.value}] {message}")
     
-    def format_srt_time(seconds: float) -> str:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        ms = int((seconds % 1) * 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-    
-    with open(output_path, 'w') as f:
-        data_points = points
-        for i, point in enumerate(data_points):
-            start_time = point['timestamp']
-            end_time = data_points[i + 1]['timestamp'] if i + 1 < len(data_points) else start_time + 0.5
-            
-            speed = point['speed_mph']
-            if speed_unit == 'kmh':
-                speed = speed * 1.60934
-                unit_label = 'KM/H'
-            else:
-                unit_label = 'MPH'
-            
-            f.write(f"{i + 1}\n")
-            f.write(f"{format_srt_time(start_time)} --> {format_srt_time(end_time)}\n")
-            f.write(f"{int(speed)} {unit_label}\n\n")
-    
-    return output_path
+    def to_dict(self) -> dict:
+        """Convert to dictionary for logging/API response."""
+        return {
+            "error_code": self.code.value,
+            "error_message": self.message,
+            "details": self.details,
+            "retryable": self.retryable,
+            "stage": self.stage,
+        }
 
 
-def build_ffmpeg_command(
-    input_path: Path,
-    output_path: Path,
-    srt_path: Path,
-    settings: dict
-) -> list:
-    """Build FFmpeg command for HUD overlay."""
-    # Get user settings
-    hud_color = settings.get("hud_color", "#FFFFFF")
-    font_family = settings.get("hud_font_family", "Arial")
-    font_size = settings.get("hud_font_size", 24)
-    position = settings.get("hud_position", "bottom-left")
-    
-    # Convert hex color to FFmpeg format (BGR with alpha)
-    if hud_color.startswith('#'):
-        hud_color = hud_color[1:]
-    # Convert RGB to BGR for ASS format
-    if len(hud_color) == 6:
-        r, g, b = hud_color[0:2], hud_color[2:4], hud_color[4:6]
-        hud_color = f"&H{b}{g}{r}&"
-    
-    # Map position to ASS alignment
-    alignments = {
-        'top-left': 7,
-        'top-center': 8,
-        'top-right': 9,
-        'center-left': 4,
-        'center': 5,
-        'center-right': 6,
-        'bottom-left': 1,
-        'bottom-center': 2,
-        'bottom-right': 3,
-    }
-    alignment = alignments.get(position, 1)
-    
-    # Build force_style for subtitles
-    force_style = (
-        f"FontName={font_family},"
-        f"FontSize={font_size},"
-        f"PrimaryColour={hud_color},"
-        f"Alignment={alignment},"
-        f"MarginV=20,"
-        f"BorderStyle=3,"
-        f"Outline=2,"
-        f"Shadow=1"
-    )
-    
-    return [
-        'ffmpeg', '-y',
-        '-i', str(input_path),
-        '-vf', f"subtitles={str(srt_path)}:force_style='{force_style}'",
-        '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-c:a', 'copy',
-        str(output_path)
-    ]
-
-
-async def run_hud_stage(ctx: JobContext) -> JobContext:
+class SkipStage(Exception):
     """
-    Execute HUD overlay generation stage.
+    Raised when a stage should be skipped (not an error).
     
-    Args:
-        ctx: Job context
-        
-    Returns:
-        Updated context with processed video path
-        
-    Raises:
-        SkipStage: If HUD not enabled or no telemetry
-        HUDError: If FFmpeg fails
+    Examples:
+    - No telemetry file provided
+    - AI captions not enabled for tier
+    - User disabled HUD overlay
     """
-    # Check if HUD is enabled
-    if not ctx.user_settings.get("hud_enabled", True):
-        raise SkipStage("HUD disabled in user settings")
     
-    # Check tier entitlements
-    if not ctx.entitlements.can_burn_hud:
-        raise SkipStage("HUD not available for this tier")
+    def __init__(self, reason: str, stage: str = "unknown"):
+        self.reason = reason
+        self.stage = stage
+        super().__init__(f"Stage skipped: {reason}")
+
+
+class CancelRequested(Exception):
+    """Raised when a cancel has been requested for this job."""
     
-    # Check if we have telemetry data
-    telemetry = getattr(ctx, "telemetry", None)
-    points = getattr(telemetry, "data_points", None) or getattr(telemetry, "points", None) or []
-    if not telemetry or not points:
-        raise SkipStage("No telemetry data for HUD overlay")
+    def __init__(self, upload_id: str):
+        self.upload_id = upload_id
+        super().__init__(f"Cancel requested for upload {upload_id}")
+
+
+def error_from_exception(e: Exception, stage: str = "unknown") -> StageError:
+    """Convert a generic exception to a StageError."""
+    if isinstance(e, StageError):
+        return e
     
-    # Check if we have video
-    if not ctx.local_video_path or not ctx.local_video_path.exists():
-        raise SkipStage("No video file for HUD overlay")
+    error_msg = str(e)
     
-    logger.info(f"Generating HUD overlay for upload {ctx.upload_id}")
+    # Try to categorize common errors
+    if "timeout" in error_msg.lower():
+        return StageError(ErrorCode.TIMEOUT, error_msg, retryable=True, stage=stage)
+    if "connection" in error_msg.lower() or "network" in error_msg.lower():
+        return StageError(ErrorCode.NETWORK_ERROR, error_msg, retryable=True, stage=stage)
+    if "quota" in error_msg.lower() or "limit" in error_msg.lower():
+        return StageError(ErrorCode.QUOTA_EXCEEDED, error_msg, retryable=False, stage=stage)
+    if "auth" in error_msg.lower() or "unauthorized" in error_msg.lower():
+        return StageError(ErrorCode.AUTH_FAILED, error_msg, retryable=False, stage=stage)
+    if "ffmpeg" in error_msg.lower():
+        return StageError(ErrorCode.FFMPEG_FAILED, error_msg, retryable=False, stage=stage)
     
-    # Create temp SRT file
-    srt_path = ctx.temp_dir / "speed.srt"
-    try:
-        generate_srt_file(ctx, srt_path)
-    except Exception as e:
-        raise HUDError(
-            f"Failed to generate SRT file: {e}",
-            code=ErrorCode.HUD_GENERATION_FAILED,
-            detail=str(e)
-        )
-    
-    # Set output path
-    output_filename = f"hud_{ctx.local_video_path.name}"
-    output_path = ctx.temp_dir / output_filename
-    
-    # Build and run FFmpeg command
-    cmd = build_ffmpeg_command(
-        ctx.local_video_path,
-        output_path,
-        srt_path,
-        ctx.user_settings
-    )
-    
-    try:
-        logger.debug(f"FFmpeg command: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=JOB_TIMEOUT_SECONDS
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"FFmpeg stderr: {result.stderr}")
-            raise HUDError(
-                "FFmpeg encoding failed",
-                code=ErrorCode.FFMPEG_FAILED,
-                detail=result.stderr[:500]
-            )
-        
-        if not output_path.exists():
-            raise HUDError(
-                "FFmpeg produced no output",
-                code=ErrorCode.FFMPEG_FAILED
-            )
-        
-        ctx.processed_video_path = output_path
-        ctx.hud_applied = True
-        logger.info(f"HUD overlay generated: {output_path}")
-        
-    except subprocess.TimeoutExpired:
-        raise HUDError(
-            "FFmpeg timed out",
-            code=ErrorCode.TIMEOUT,
-            recoverable=True
-        )
-    except FileNotFoundError:
-        raise HUDError(
-            "FFmpeg not installed",
-            code=ErrorCode.FFMPEG_NOT_FOUND,
-            detail="Install FFmpeg on the worker server"
-        )
-    finally:
-        # Clean up SRT file
-        try:
-            srt_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-    
-    return ctx
+    return StageError(ErrorCode.UNKNOWN, error_msg, stage=stage)
+
+
+# HTTP status code mapping
+ERROR_HTTP_STATUS = {
+    ErrorCode.UNKNOWN: 500,
+    ErrorCode.INTERNAL: 500,
+    ErrorCode.TIMEOUT: 504,
+    ErrorCode.CANCELLED: 499,
+    ErrorCode.AUTH_FAILED: 401,
+    ErrorCode.TOKEN_EXPIRED: 401,
+    ErrorCode.UNAUTHORIZED: 401,
+    ErrorCode.FORBIDDEN: 403,
+    ErrorCode.UPLOAD_FAILED: 500,
+    ErrorCode.UPLOAD_TOO_LARGE: 413,
+    ErrorCode.INVALID_FILE_TYPE: 415,
+    ErrorCode.QUOTA_EXCEEDED: 429,
+    ErrorCode.TIER_BLOCKED: 403,
+    ErrorCode.FEATURE_DISABLED: 403,
+    ErrorCode.NOT_FOUND: 404,
+    ErrorCode.NETWORK_ERROR: 502,
+}
+
+
+def get_http_status(code: ErrorCode) -> int:
+    """Get HTTP status code for an error code."""
+    return ERROR_HTTP_STATUS.get(code, 500)
+
+# Backward compatibility alias
+TelemetryError = StageError
+
+# Backward compatibility aliases for stage-specific errors
+HUDError = StageError
+PublishError = StageError
+CaptionError = StageError
+ThumbnailError = StageError
+WatermarkError = StageError

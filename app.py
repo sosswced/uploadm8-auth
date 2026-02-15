@@ -5937,7 +5937,7 @@ class CostModelConfigCreate(BaseModel):
 
 
 @app.post("/api/admin/calculator/config")
-async def save_cost_model_config(data: CostModelConfigCreate, user: dict = Depends(require_admin)):
+async def save_cost_model_config(data: "CostModelConfigCreate", user: dict = Depends(require_admin)):
     """Save a new cost model configuration snapshot."""
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(

@@ -5582,3 +5582,73 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "updatedAt": g("updated_at").isoformat() if g("updated_at") else None,
         "duration": g("duration"),
     }
+
+
+
+# ============================================================
+# APPEND-ONLY PATCH: admin audit logger (schema-resilient)
+# - Fixes NameError: log_admin_audit not defined
+# - Writes to admin_audit_log using newest columns when present
+# ============================================================
+
+import asyncpg
+import json as _json
+
+async def log_admin_audit(
+    pool: asyncpg.Pool,
+    *,
+    admin_id: str,
+    admin_email: str,
+    action: str,
+    target_user_id: str | None = None,
+    target_email: str | None = None,
+    details: dict | None = None,
+    ip_address: str | None = None,
+    user_id: str | None = None,
+) -> None:
+    if not pool:
+        return
+    meta = details or {}
+    async with pool.acquire() as conn:
+        # Try modern schema first
+        try:
+            await conn.execute(
+                """
+                INSERT INTO admin_audit_log (
+                    admin_id, admin_email, action,
+                    target_user_id, target_email,
+                    meta, details, ip_address, user_id,
+                    created_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+                """,
+                admin_id,
+                admin_email,
+                action,
+                target_user_id,
+                target_email,
+                _json.dumps(meta),
+                _json.dumps(meta),
+                ip_address,
+                user_id,
+            )
+            return
+        except asyncpg.exceptions.UndefinedColumnError:
+            pass
+
+        # Fallback to legacy schema (only meta + target_user_id)
+        await conn.execute(
+            """
+            INSERT INTO admin_audit_log (
+                admin_id, admin_email, action,
+                target_user_id, target_email,
+                meta,
+                created_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,NOW())
+            """,
+            admin_id,
+            admin_email,
+            action,
+            target_user_id,
+            target_email,
+            _json.dumps(meta),
+        )

@@ -28,6 +28,7 @@ from stages.caption_stage import run_caption_stage
 from stages.hud_stage import run_hud_stage
 from stages.watermark_stage import run_watermark_stage
 from stages.publish_stage import run_publish_stage
+from stages.verify_stage import run_verification_loop
 from stages.notify_stage import run_notify_stage, notify_admin_worker_start, notify_admin_worker_stop, notify_admin_error
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -43,12 +44,18 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
 db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[redis.Redis] = None
 shutdown_requested = False
+shutdown_event = None
 
 
 def handle_shutdown(signum, frame):
-    global shutdown_requested
+    global shutdown_requested, shutdown_event
     logger.info(f"Shutdown signal received ({signum})")
     shutdown_requested = True
+    try:
+        if shutdown_event is not None:
+            shutdown_event.set()
+    except Exception:
+        pass
 
 
 async def check_cancelled(ctx: JobContext) -> bool:
@@ -211,7 +218,7 @@ async def run_pipeline(job_data: dict) -> bool:
         if ctx:
             ctx.mark_error("INTERNAL", str(e))
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
-        await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)})
+        await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
         return False
     finally:
         if temp_dir:
@@ -224,7 +231,7 @@ async def run_pipeline(job_data: dict) -> bool:
 async def process_jobs():
     global shutdown_requested
     logger.info("Worker started, waiting for jobs...")
-    await notify_admin_worker_start()
+    # admin start notification handled by main()
 
     while not shutdown_requested:
         try:
@@ -244,11 +251,11 @@ async def process_jobs():
             await asyncio.sleep(1)
 
     logger.info("Worker shutting down...")
-    await notify_admin_worker_stop()
+    # admin stop notification handled by main()
 
 
 async def main():
-    global db_pool, redis_client
+    global db_pool, redis_client, shutdown_event
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -267,9 +274,28 @@ async def main():
     await redis_client.ping()
     logger.info("Redis connected")
 
+    shutdown_event = asyncio.Event()
+
+    verify_task = asyncio.create_task(run_verification_loop(db_pool, shutdown_event))
+    job_task = asyncio.create_task(process_jobs())
+
     try:
-        await process_jobs()
+        await notify_admin_worker_start(db_pool)
+        done, pending = await asyncio.wait(
+            [job_task, verify_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
     finally:
+        try:
+            shutdown_event.set()
+        except Exception:
+            pass
+        try:
+            await notify_admin_worker_stop(db_pool)
+        except Exception:
+            pass
         if db_pool:
             await db_pool.close()
         if redis_client:

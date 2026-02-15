@@ -274,10 +274,10 @@ async def main():
             await db_pool.close()
         if redis_client:
             try:
-    await redis_client.aclose()
-except AttributeError:
-    # older versions
-    await redis_client.close()
+                await redis_client.aclose()
+            except AttributeError:
+                # older versions
+                await redis_client.close()
 
 
 if __name__ == "__main__":

@@ -8,8 +8,6 @@ Complete implementation with:
 - Weekly cost reports
 - All Stripe integrations
 """
-from __future__ import annotations
-
 
 import os
 import csv
@@ -60,23 +58,6 @@ async def _load_uploads_columns(pool):
 
 def _pick_cols(wanted, available):
     return [c for c in wanted if c in available]
-
-_TABLE_COLS_CACHE: dict[str, set[str]] = {}
-
-async def _get_table_cols(conn, table_name: str) -> set[str]:
-    key = f"public.{table_name}"
-    if key in _TABLE_COLS_CACHE:
-        return _TABLE_COLS_CACHE[key]
-    rows = await conn.fetch(
-        """SELECT column_name
-           FROM information_schema.columns
-           WHERE table_schema='public' AND table_name=$1""",
-        table_name,
-    )
-    cols = {r["column_name"] for r in rows}
-    _TABLE_COLS_CACHE[key] = cols
-    return cols
-
 
 
 def _safe_json(v, default):
@@ -583,10 +564,6 @@ class UploadInit(BaseModel):
     file_size: int
     content_type: str
     platforms: List[str]
-    group_id: Optional[str] = None
-    account_targets: Optional[dict] = None  # {platform: platform_token_id}
-    account_ids: Optional[List[str]] = []  # NEW explicit account ids
-    group_ids: Optional[List[str]] = []    # NEW explicit group ids
     title: str = ""
     caption: str = ""
     hashtags: List[str] = []
@@ -595,22 +572,7 @@ class UploadInit(BaseModel):
     schedule_mode: str = "immediate"  # immediate | scheduled | smart
     has_telemetry: bool = False
     use_ai: bool = False
-    smart_schedule_days: Optional[int] = 14
-
-
-class UploadComplete(BaseModel):
-    # Optional overrides at completion time
-    platforms: Optional[List[str]] = None
-    privacy: Optional[str] = None
-    title: Optional[str] = None
-    caption: Optional[str] = None
-    hashtags: Optional[List[str]] = None
-    account_ids: Optional[List[str]] = None  # NEW
-    group_ids: Optional[List[str]] = None    # NEW
-    # legacy (still accepted)
-    group_id: Optional[str] = None
-    account_targets: Optional[dict] = None  # {platform: platform_token_id}
-
+    smart_schedule_days: int = 7  # How many days to spread uploads across
 
 class SettingsUpdate(BaseModel):
     discord_webhook: Optional[str] = None
@@ -897,6 +859,13 @@ async def run_migrations():
                 created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"""),
             (2, "CREATE TABLE IF NOT EXISTS refresh_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, token_hash VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())"),
             (3, "CREATE TABLE IF NOT EXISTS platform_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, platform VARCHAR(50) NOT NULL, account_id VARCHAR(255), account_name VARCHAR(255), account_username VARCHAR(255), account_avatar VARCHAR(512), token_blob JSONB NOT NULL, is_primary BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"),
+            (31, """
+                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+                CREATE INDEX IF NOT EXISTS idx_platform_tokens_user_platform_active ON platform_tokens(user_id, platform) WHERE revoked_at IS NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_platform_tokens_active_identity ON platform_tokens(user_id, platform, account_id)
+                    WHERE revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '';
+            """),
+
             (4, """CREATE TABLE IF NOT EXISTS uploads (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE,
                 r2_key VARCHAR(512) NOT NULL, telemetry_r2_key VARCHAR(512), processed_r2_key VARCHAR(512), thumbnail_r2_key VARCHAR(512),
@@ -1078,98 +1047,9 @@ async def run_migrations():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );"""),
 
-(105, """
-    -- Platform tokens: multi-account support + guardrails
-    ALTER TABLE platform_tokens
-        ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ,
-        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
-
-    -- Drop legacy uniqueness that blocks multi-account (if present)
-    DROP INDEX IF EXISTS ux_platform_tokens_user_platform;
-    DO $$
-    BEGIN
-      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ux_platform_tokens_user_platform') THEN
-        ALTER TABLE platform_tokens DROP CONSTRAINT ux_platform_tokens_user_platform;
-      END IF;
-    END $$;
-
-    -- Unique per (user, platform, account) for active rows (prevents duplicates, allows multiple accounts)
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_platform_tokens_user_platform_account_active
-    ON platform_tokens (user_id, platform, account_id)
-    WHERE revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '';
-
-    CREATE INDEX IF NOT EXISTS ix_platform_tokens_user_platform_active
-    ON platform_tokens (user_id, platform)
-    WHERE revoked_at IS NULL;
-"""),
-
-            # ---- Business Calculator Tables ----
-            (106, """CREATE TABLE IF NOT EXISTS cost_model_config (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                effective_date DATE NOT NULL DEFAULT CURRENT_DATE,
-                config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                notes TEXT,
-                created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_cost_model_config_date ON cost_model_config(effective_date DESC);
-            """),
-
-            (107, """CREATE TABLE IF NOT EXISTS enterprise_quotes (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-                customer_name VARCHAR(255),
-                assumptions_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                outputs_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                status VARCHAR(50) DEFAULT 'draft',
-                notes TEXT,
-                created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_enterprise_quotes_created ON enterprise_quotes(created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_enterprise_quotes_status ON enterprise_quotes(status);
-            """),
-
-            (108, """CREATE OR REPLACE VIEW internal_usage_30d AS
-            SELECT
-                u.subscription_tier,
-                u.role,
-                COUNT(up.id) as upload_count,
-                COALESCE(SUM(up.put_spent), 0) as put_consumed,
-                COALESCE(SUM(up.aic_spent), 0) as aic_consumed,
-                COALESCE(SUM(up.compute_seconds), 0) as compute_seconds,
-                COALESCE(SUM(up.storage_bytes), 0) as storage_bytes,
-                COALESCE(SUM(up.cost_attributed), 0) as cost_attributed
-            FROM users u
-            LEFT JOIN uploads up ON up.user_id = u.id
-                AND up.created_at > NOW() - INTERVAL '30 days'
-                AND up.status NOT IN ('cancelled', 'deleted')
-            WHERE u.status = 'active'
-              AND (u.role IN ('admin', 'master_admin')
-                   OR u.subscription_tier IN ('friends_family', 'lifetime'))
-            GROUP BY u.subscription_tier, u.role
-            ;"""),
-            (109, """
-                -- Account groups: add updated_at + optional normalized membership table
-                ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
-
-                CREATE TABLE IF NOT EXISTS account_group_members (
-                    group_id UUID REFERENCES account_groups(id) ON DELETE CASCADE,
-                    account_id TEXT NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    PRIMARY KEY (group_id, account_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_account_group_members_group ON account_group_members(group_id);
-
-                -- Backfill members from legacy account_ids array
-                INSERT INTO account_group_members (group_id, account_id)
-                SELECT id, unnest(account_ids) FROM account_groups
-                ON CONFLICT DO NOTHING;
-
-                UPDATE account_groups SET updated_at = NOW() WHERE updated_at IS NULL;
-            """)
+(510, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS description TEXT"),
+(511, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"),
+(512, "UPDATE account_groups SET updated_at = NOW() WHERE updated_at IS NULL"),
 ]
         
         for version, sql in migrations:
@@ -2244,45 +2124,22 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
             schedule_metadata = {p: dt.isoformat() for p, dt in smart_schedule.items()}
             scheduled_time = min(smart_schedule.values())
 
-        # Ensure schedule_metadata exists so we can persist selection context
-        if schedule_metadata is None:
-            schedule_metadata = {}
-        # Persist multi-account routing context (safe even if worker ignores for now)
-        if getattr(data, "group_id", None):
-            schedule_metadata["group_id"] = data.group_id
-        if getattr(data, "account_targets", None):
-            schedule_metadata["account_targets"] = data.account_targets
-
         # Store upload with preferences metadata
-        # Store upload with preferences metadata (schema-drift tolerant)
-        uploads_cols = await _load_uploads_columns(db_pool)
-
-        insert_cols = ["id","user_id","r2_key","filename","file_size","platforms","title","caption","hashtags","privacy","status","scheduled_time","schedule_mode","put_reserved","aic_reserved","schedule_metadata","user_preferences"]
-        values = [upload_id, user["id"], r2_key, data.filename, data.file_size, data.platforms, data.title, data.caption, data.hashtags, data.privacy, "pending", scheduled_time, data.schedule_mode, put_cost, aic_cost,
-                  json.dumps(schedule_metadata) if schedule_metadata is not None else None,
-                  json.dumps(user_prefs)]
-
-        def add(col, val):
-            if col in uploads_cols:
-                insert_cols.append(col)
-                values.append(val)
-
-        # NEW fields
-        add("content_type", getattr(data, "content_type", "application/octet-stream"))
-        add("smart_schedule_days", getattr(data, "smart_schedule_days", None))
-        add("account_ids", json.dumps(getattr(data, "account_ids", None) or []))
-        add("group_ids", json.dumps(getattr(data, "group_ids", None) or []))
-        add("has_telemetry", bool(getattr(data, "has_telemetry", False)))
-
-        # Legacy fields if present in schema
-        add("group_id", getattr(data, "group_id", None))
-        add("account_targets", json.dumps(getattr(data, "account_targets", None) or {}))
-
-        placeholders = ", ".join(f"${i}" for i in range(1, len(values)+1))
-        sql = f"""INSERT INTO uploads ({', '.join(insert_cols)}) VALUES ({placeholders})"""
-        await conn.execute(sql, *values)
-
-
+        await conn.execute("""
+            INSERT INTO uploads (
+                id, user_id, r2_key, filename, file_size, platforms,
+                title, caption, hashtags, privacy, status, scheduled_time,
+                schedule_mode, put_reserved, aic_reserved, schedule_metadata,
+                user_preferences
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15, $16)
+        """,
+            upload_id, user["id"], r2_key, data.filename, data.file_size,
+            data.platforms, data.title, data.caption, data.hashtags,
+            data.privacy, scheduled_time, data.schedule_mode, put_cost,
+            aic_cost, json.dumps(schedule_metadata) if schedule_metadata else None,
+            json.dumps(user_prefs)
+        )
 
         # Reserve tokens
         await reserve_tokens(conn, user["id"], put_cost, aic_cost, upload_id)
@@ -2334,7 +2191,7 @@ async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = 
     }
 
 @app.post("/api/uploads/{upload_id}/complete")
-async def complete_upload(upload_id: str, data: Optional[UploadComplete] = Body(None), user: dict = Depends(get_current_user)):
+async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)):
     """Complete upload and enqueue with preferences"""
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
@@ -2346,70 +2203,11 @@ async def complete_upload(upload_id: str, data: Optional[UploadComplete] = Body(
 
         # Fetch preferences again (in case they changed)
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
-        # Merge completion-time overrides (schema-drift tolerant)
-        if data is None:
-            data = UploadComplete()
 
-        uploads_cols = await _load_uploads_columns(db_pool)
-        set_parts = ["status = 'queued'", "updated_at = NOW()"]
-        values = [upload_id, user["id"]]
-        idx = 3
-
-        def add_set(sql_fragment, val):
-            nonlocal idx
-            set_parts.append(sql_fragment.replace("$$", f"${idx}"))
-            values.append(val)
-            idx += 1
-
-        # platforms (array/json tolerant)
-        if getattr(data, "platforms", None) is not None and "platforms" in uploads_cols:
-            platforms_val = data.platforms
-            # Frontend sometimes sends JSON-stringified arrays; normalize to List[str]
-            if isinstance(platforms_val, str):
-                try:
-                    parsed = json.loads(platforms_val)
-                    if isinstance(parsed, list):
-                        platforms_val = parsed
-                    else:
-                        platforms_val = [platforms_val]
-                except Exception:
-                    platforms_val = [platforms_val]
-            add_set("platforms = $$", platforms_val)
-
-        # privacy
-        if getattr(data, "privacy", None) is not None and "privacy" in uploads_cols:
-            add_set("privacy = $$", data.privacy)
-
-        # title/caption (only override if non-empty)
-        if getattr(data, "title", None) is not None and "title" in uploads_cols:
-            if (data.title or "").strip():
-                add_set("title = $$", data.title)
-        if getattr(data, "caption", None) is not None and "caption" in uploads_cols:
-            if (data.caption or "").strip():
-                add_set("caption = $$", data.caption)
-
-        # hashtags/account_ids/group_ids (override only if non-empty list)
-        if getattr(data, "hashtags", None) is not None and "hashtags" in uploads_cols:
-            if isinstance(data.hashtags, list) and len(data.hashtags) > 0:
-                add_set("hashtags = $$", json.dumps(data.hashtags))
-
-        if getattr(data, "account_ids", None) is not None and "account_ids" in uploads_cols:
-            if isinstance(data.account_ids, list) and len(data.account_ids) > 0:
-                add_set("account_ids = $$", json.dumps(data.account_ids))
-
-        if getattr(data, "group_ids", None) is not None and "group_ids" in uploads_cols:
-            if isinstance(data.group_ids, list) and len(data.group_ids) > 0:
-                add_set("group_ids = $$", json.dumps(data.group_ids))
-
-        # legacy
-        if getattr(data, "group_id", None) is not None and "group_id" in uploads_cols:
-            add_set("group_id = $$", data.group_id)
-        if getattr(data, "account_targets", None) is not None and "account_targets" in uploads_cols:
-            if isinstance(data.account_targets, dict) and len(data.account_targets) > 0:
-                add_set("account_targets = $$", json.dumps(data.account_targets))
-
-        sql = f"UPDATE uploads SET {', '.join(set_parts)} WHERE id = $1 AND user_id = $2"
-        await conn.execute(sql, *values)
+        await conn.execute(
+            "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
+            upload_id
+        )
 
     plan = get_plan(user.get("subscription_tier", "free"))
 
@@ -3301,159 +3099,144 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     }
 
 
+
+class AccountGroupIn(BaseModel):
+    name: str
+    color: str | None = None
+    account_ids: list[str] | None = None
+
+class AccountGroupUpdate(BaseModel):
+    name: str | None = None
+    color: str | None = None
+    account_ids: list[str] | None = None
+
+
 @app.get("/api/groups")
 async def get_groups(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        # Prefer normalized membership table if present; otherwise fall back to account_groups.account_ids
-        has_members = await conn.fetchval("SELECT to_regclass('public.account_group_members') IS NOT NULL")
-        if has_members:
-            rows = await conn.fetch(
-                """
-                SELECT g.id, g.user_id, g.name, g.color, g.created_at, g.updated_at,
-                    COALESCE(
-                        json_agg(agm.account_id) FILTER (WHERE agm.account_id IS NOT NULL),
-                        '[]'
-                    ) AS account_ids
-                FROM account_groups g
-                LEFT JOIN account_group_members agm ON agm.group_id = g.id
-                WHERE g.user_id = $1
-                GROUP BY g.id
-                ORDER BY g.created_at DESC
-                """,
-                user["id"],
-            )
-            groups = []
-            for r in rows:
-                groups.append({
-                    "id": str(r["id"]),
-                    "name": r["name"],
-                    "color": r["color"],
-                    "account_ids": _safe_json(r["account_ids"], []),
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
-                })
-            return {"groups": groups}
-
-        rows = await conn.fetch(
-            "SELECT * FROM account_groups WHERE user_id = $1 ORDER BY created_at DESC",
+        groups = await conn.fetch(
+            """
+            SELECT id, user_id, name, description, account_ids, color, created_at, updated_at
+            FROM account_groups
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            """,
             user["id"],
         )
-        groups = []
-        for g in rows:
-            groups.append({
-                "id": str(g["id"]),
-                "name": g["name"],
-                "color": g.get("color"),
-                "account_ids": _safe_json(g.get("account_ids"), []),
-                "created_at": g["created_at"].isoformat() if g["created_at"] else None,
-                "updated_at": g["updated_at"].isoformat() if g.get("updated_at") else None,
-            })
-        return {"groups": groups}
+    return [
+        {
+            "id": str(g["id"]),
+            "name": g["name"],
+            "description": g["description"],
+            "account_ids": g["account_ids"] or [],
+            "members": g["account_ids"] or [],
+            "color": g["color"],
+            "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+            "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
+        }
+        for g in groups
+    ]
 
 
-# ============================================================
-# Account Groups Payloads (body-first, query back-compat)
-# ============================================================
+@app.get("/api/groups/{group_id}")
+async def get_group(group_id: str, user: dict = Depends(get_current_user)):
+    async with db_pool.acquire() as conn:
+        g = await conn.fetchrow(
+            """
+            SELECT id, user_id, name, description, account_ids, color, created_at, updated_at
+            FROM account_groups
+            WHERE id = $1 AND user_id = $2
+            """,
+            group_id,
+            user["id"],
+        )
+    if not g:
+        raise HTTPException(404, "Group not found")
+    return {
+        "id": str(g["id"]),
+        "name": g["name"],
+        "description": g["description"],
+        "account_ids": g["account_ids"] or [],
+        "members": g["account_ids"] or [],
+        "color": g["color"],
+        "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+        "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
+    }
 
-class GroupCreatePayload(BaseModel):
-    name: str
-    color: str = "#3b82f6"
-    account_ids: List[str] = Field(default_factory=list)
 
-class GroupUpdatePayload(BaseModel):
+class GroupUpsert(BaseModel):
     name: Optional[str] = None
+    description: Optional[str] = None
     color: Optional[str] = None
-    account_ids: Optional[List[str]] = None
+    account_ids: Optional[List[str]] = None  # platform_tokens.id values as strings
+    members: Optional[List[str]] = None      # frontend alias for account_ids
+
 
 @app.post("/api/groups")
-async def create_group(
-    payload: Optional[GroupCreatePayload] = Body(None),
-    # query-string back-compat (older frontends)
-    name: Optional[str] = Query(None),
-    color: str = Query("#3b82f6"),
-    account_ids: Optional[List[str]] = Query(None),
-    user: dict = Depends(get_current_user),
-):
-    body_name = (payload.name if payload else None) or name
-    if not body_name:
-        raise HTTPException(status_code=400, detail="name is required")
-
-    body_color = (payload.color if payload else None) or color
-    body_accounts = payload.account_ids if payload else (account_ids or [])
-
+async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_user)):
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    color = payload.color or "#3b82f6"
+    account_ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
     group_id = str(uuid.uuid4())
+
     async with db_pool.acquire() as conn:
-        cols = await _get_table_cols(conn, "account_groups")
-        if "updated_at" in cols:
-            await conn.execute(
-                "INSERT INTO account_groups (id, user_id, name, color, account_ids, updated_at) VALUES ($1,$2,$3,$4,$5,NOW())",
-                group_id, user["id"], body_name, body_color, body_accounts,
-            )
-        else:
-            await conn.execute(
-                "INSERT INTO account_groups (id, user_id, name, color, account_ids) VALUES ($1,$2,$3,$4,$5)",
-                group_id, user["id"], body_name, body_color, body_accounts,
-            )
+        await conn.execute(
+            """
+            INSERT INTO account_groups (id, user_id, name, description, account_ids, color, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+            """,
+            group_id,
+            user["id"],
+            name,
+            payload.description,
+            account_ids,
+            color,
+        )
 
-        # If normalized membership table exists, keep it in sync.
-        has_members = await conn.fetchval("SELECT to_regclass('public.account_group_members') IS NOT NULL")
-        if has_members and body_accounts:
-            await conn.executemany(
-                "INSERT INTO account_group_members (group_id, account_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-                [(group_id, aid) for aid in body_accounts],
-            )
-
-    return {"id": group_id, "name": body_name, "color": body_color, "account_ids": body_accounts}
+    return {"id": group_id, "name": name, "description": payload.description, "color": color, "account_ids": account_ids, "members": account_ids}
 
 
 @app.put("/api/groups/{group_id}")
-async def update_group(
-    group_id: str,
-    payload: Optional[GroupUpdatePayload] = Body(None),
-    # query-string back-compat (older frontends)
-    name: Optional[str] = Query(None),
-    color: Optional[str] = Query(None),
-    account_ids: Optional[List[str]] = Query(None),
-    user: dict = Depends(get_current_user),
-):
-    # Body-first; fall back to query params.
-    upd_name = payload.name if payload and payload.name is not None else name
-    upd_color = payload.color if payload and payload.color is not None else color
-    upd_accounts = payload.account_ids if payload and payload.account_ids is not None else account_ids
+async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends(get_current_user)):
+    updates = []
+    params = [group_id, user["id"]]
 
-    updates, params = [], [group_id, user["id"]]
-
-    if upd_name is not None:
+    if payload.name is not None:
         updates.append(f"name = ${len(params)+1}")
-        params.append(upd_name)
-    if upd_color is not None:
-        updates.append(f"color = ${len(params)+1}")
-        params.append(upd_color)
-    if upd_accounts is not None:
-        updates.append(f"account_ids = ${len(params)+1}")
-        params.append(upd_accounts)
+        params.append(payload.name.strip())
 
-    if not updates:
-        return {"status": "no_changes"}
+    if payload.description is not None:
+        updates.append(f"description = ${len(params)+1}")
+        params.append(payload.description)
+
+    if payload.color is not None:
+        updates.append(f"color = ${len(params)+1}")
+        params.append(payload.color)
+
+    # accept either account_ids or members
+    if payload.account_ids is not None or payload.members is not None:
+        ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
+        updates.append(f"account_ids = ${len(params)+1}")
+        params.append(ids)
+
+    updates.append("updated_at = NOW()")
 
     async with db_pool.acquire() as conn:
-        cols = await _get_table_cols(conn, "account_groups")
-        if "updated_at" in cols:
-            updates.append("updated_at = NOW()")
-        await conn.execute(
-            f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2",
-            *params,
+        row = await conn.fetchrow(
+            "SELECT id FROM account_groups WHERE id = $1 AND user_id = $2",
+            group_id,
+            user["id"],
         )
+        if not row:
+            raise HTTPException(404, "Group not found")
 
-        # If normalized membership table exists, keep it in sync.
-        has_members = await conn.fetchval("SELECT to_regclass('public.account_group_members') IS NOT NULL")
-        if has_members and upd_accounts is not None:
-            await conn.execute("DELETE FROM account_group_members WHERE group_id = $1", group_id)
-            if upd_accounts:
-                await conn.executemany(
-                    "INSERT INTO account_group_members (group_id, account_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-                    [(group_id, aid) for aid in upd_accounts],
-                )
+        if updates:
+            await conn.execute(
+                f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2",
+                *params,
+            )
 
     return {"status": "updated"}
 
@@ -3471,13 +3254,14 @@ async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
 async def get_platforms(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         accounts = await conn.fetch("""
-            SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
+                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
             FROM platform_tokens
             WHERE user_id = $1
               AND revoked_at IS NULL
               AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_name, '') <> '' OR COALESCE(account_username, '') <> '')
-            ORDER BY platform, created_at
+              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
+            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
         """, user["id"])
     
     platforms = {}
@@ -3496,13 +3280,14 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
     """Returns flat list of accounts for frontend compatibility"""
     async with db_pool.acquire() as conn:
         accounts = await conn.fetch("""
-            SELECT id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
+                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
             FROM platform_tokens
             WHERE user_id = $1
               AND revoked_at IS NULL
               AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_name, '') <> '' OR COALESCE(account_username, '') <> '')
-            ORDER BY platform, created_at
+              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
+            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
         """, user["id"])
     
     result = []
@@ -3524,14 +3309,7 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
 async def get_accounts_simple(user: dict = Depends(get_current_user)):
     """Simple accounts list for dashboard"""
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("""
-            SELECT id, platform, account_name, account_username, account_avatar
-            FROM platform_tokens
-            WHERE user_id = $1
-              AND revoked_at IS NULL
-              AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_name, '') <> '' OR COALESCE(account_username, '') <> '')
-        """, user["id"])
+        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id) id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '' AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '') ORDER BY platform, account_id, created_at DESC", user["id"])
     return [{"id": str(a["id"]), "platform": a["platform"], "name": a["account_name"], "username": a["account_username"], "avatar": a["account_avatar"], "status": "active"} for a in accounts]
 
 @app.delete("/api/platforms/{platform}/accounts/{account_id}")
@@ -3722,40 +3500,12 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     "redirect_uri": redirect_uri,
                 })
                 token_data = token_response.json()
-                # TikTok v2 returns tokens under {"data": {...}}; normalize.
-                if isinstance(token_data, dict) and isinstance(token_data.get("data"), dict):
-                    token_data = token_data["data"]
-
                 access_token = token_data.get("access_token")
-                if not access_token:
-                    raise Exception(f"No access_token returned from TikTok: {token_data}")
-
-                # TikTok identity key (required). Do NOT synthesize IDs; that creates ghost accounts.
-                account_id = token_data.get("open_id") or token_data.get("user_id")
-                if not account_id:
-                    raise Exception("TikTok did not return open_id/user_id; cannot create connected account.")
-
-                # Fetch user profile for display (best-effort).
-                account_name = "TikTok"
+                account_id = token_data.get("open_id", secrets.token_hex(8))
+                account_name = "TikTok User"
                 account_username = ""
                 account_avatar = ""
-                try:
-                    userinfo = await client.get(
-                        "https://open.tiktokapis.com/v2/user/info/",
-                        params={"fields": "open_id,union_id,avatar_url,display_name,username"},
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
-                    if userinfo.status_code == 200:
-                        ujson = userinfo.json()
-                        if isinstance(ujson, dict) and isinstance(ujson.get("data"), dict):
-                            udata = ujson["data"]
-                            user_obj = udata.get("user") if isinstance(udata.get("user"), dict) else udata
-                            account_username = (user_obj.get("username") or user_obj.get("display_name") or "").strip()
-                            account_name = (user_obj.get("display_name") or account_username or "TikTok").strip()
-                            account_avatar = (user_obj.get("avatar_url") or "").strip()
-                except Exception:
-                    pass
-
+                
             elif platform == "youtube":
                 token_response = await client.post(config["token_url"], data={
                     "client_id": YOUTUBE_CLIENT_ID,
@@ -3866,97 +3616,37 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 account_username = ""
                 account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
             
+            # Refuse to persist "ghost" connections with no identity
+            if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
+                raise Exception("Provider did not return account_id; refusing to store token (prevents phantom accounts).")
 
-            # Store the token (and prevent ghost accounts)
-            if not account_id:
-                raise Exception(f"Missing account_id for {platform}; refusing to persist a ghost connection.")
-
-            # Encrypt token material at rest. Cache access token in Redis (Design A).
+            # Store the token
             token_blob = encrypt_blob({
                 "access_token": access_token,
                 "refresh_token": token_data.get("refresh_token"),
-                "expires_at": (_now_utc() + timedelta(seconds=int(token_data.get("expires_in") or 3600))).isoformat(),
-                "scope": token_data.get("scope"),
+                "expires_at": token_data.get("expires_in"),
             })
-
+            
             async with db_pool.acquire() as conn:
-                async with conn.transaction():
-                    # Tier gate (total connected accounts) enforced at connect-time.
-                    user_row = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
-                    tier = (user_row["subscription_tier"] if user_row else "free") or "free"
-                    plan = get_plan(str(tier))
-                    max_accounts = int(plan.get("max_accounts", 1))
-
-                    current = await conn.fetchval("""
-                        SELECT COUNT(*)
-                        FROM platform_tokens
-                        WHERE user_id = $1
-                          AND revoked_at IS NULL
-                          AND account_id IS NOT NULL AND account_id <> ''
-                    """, user_id) or 0
-
-                    if current >= max_accounts:
-                        raise Exception(f"Tier limit reached: max connected accounts = {max_accounts}. Upgrade to add more.")
-
-                    # Multi-account upsert by (user_id, platform, account_id)
-                    existing = await conn.fetchrow(
-                        "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND account_id = $3 AND revoked_at IS NULL",
-                        user_id, platform, account_id
-                    )
-
-                    if existing:
-                        await conn.execute("""
-                            UPDATE platform_tokens
-                            SET token_blob = $1,
-                                account_name = $2,
-                                account_username = $3,
-                                account_avatar = $4,
-                                revoked_at = NULL,
-                                updated_at = NOW()
-                            WHERE id = $5
-                        """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
-                    else:
-                        try:
-                            await conn.execute("""
-                                INSERT INTO platform_tokens
-                                    (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
-                                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                            """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
-                        except Exception as ie:
-                            # Back-compat fallback: if DB still enforces (user_id, platform) uniqueness
-                            if "ux_platform_tokens_user_platform" in str(ie):
-                                row = await conn.fetchrow(
-                                    "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND revoked_at IS NULL",
-                                    user_id, platform
-                                )
-                                if row:
-                                    await conn.execute("""
-                                        UPDATE platform_tokens
-                                        SET account_id = $1,
-                                            token_blob = $2,
-                                            account_name = $3,
-                                            account_username = $4,
-                                            account_avatar = $5,
-                                            revoked_at = NULL,
-                                            updated_at = NOW()
-                                        WHERE id = $6
-                                    """, account_id, json.dumps(token_blob), account_name, account_username, account_avatar, row["id"])
-                                else:
-                                    raise
-                            else:
-                                raise
-
-            # Cache access token in Redis (Design A). Refresh token remains encrypted in Postgres (token_blob).
-            try:
-                if redis_client and access_token:
-                    ttl = int(token_data.get("expires_in") or 3600)
-                    ttl = max(60, ttl - 60)
-                    key = f"oauth:access:{user_id}:{platform}:{account_id}"
-                    await redis_client.set(key, access_token, ex=ttl)
-            except Exception:
-                pass
-
-            return popup_response(True, platform)    
+                # Check if account already connected
+                existing = await conn.fetchrow(
+                    "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND account_id = $3",
+                    user_id, platform, account_id
+                )
+                
+                if existing:
+                    await conn.execute("""
+                        UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3, 
+                        account_avatar = $4, updated_at = NOW() WHERE id = $5
+                    """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
+                else:
+                    await conn.execute("""
+                        INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
+            
+            return popup_response(True, platform)
+    
     except Exception as e:
         logger.error(f"OAuth callback error for {platform}: {e}")
         return popup_response(False, platform, str(e))
@@ -4998,117 +4688,113 @@ def _range_label(range_str: str | None, fallback: str = "30d") -> str:
     r = (range_str or "").strip()
     return r if r else fallback
 
-def _parse_iso_dt(s: str) -> datetime:
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid datetime. Use ISO8601 like 2026-02-13T00:00:00Z")
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-def _resolve_window(
-    range_str: Optional[str],
-    start: Optional[str],
-    end: Optional[str],
-    default_minutes: int = 30 * 24 * 60
-) -> tuple[datetime, datetime, str]:
-    now = _now_utc()
-    if start and end:
-        since = _parse_iso_dt(start)
-        until = _parse_iso_dt(end)
-        if until <= since:
-            raise HTTPException(status_code=400, detail="Invalid custom range: end must be after start.")
-        return since, until, "custom"
-    minutes = _range_to_minutes(range_str, default_minutes=default_minutes)
-    since = now - timedelta(minutes=minutes)
-    return since, now, _range_label(range_str, fallback="30d")
-
-
 @app.get("/api/admin/kpis")
-async def get_admin_kpis(
-    range: str = Query("30d"),
-    start: Optional[str] = Query(None, description="Custom range start (ISO8601)"),
-    end: Optional[str] = Query(None, description="Custom range end (ISO8601)"),
-    user: dict = Depends(require_admin),
-):
-    """Combined KPI endpoint that returns all metrics in one call (range-aware)."""
-    since, until, label = _resolve_window(range, start, end, default_minutes=30 * 24 * 60)
-    window_minutes = int((until - since).total_seconds() / 60)
-    prev_since = since - timedelta(minutes=window_minutes)
-
+async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    """Combined KPI endpoint that returns all metrics in one call"""
+    minutes = {"7d": 10080, "30d": 43200, "90d": 129600, "365d": 525600, "1y": 525600}.get(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+    prev_since = since - timedelta(minutes=minutes)
+    
     async with db_pool.acquire() as conn:
         # Users
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
-        new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2", since, until)
+        new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
         prev_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2", prev_since, since)
-        paid_users = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'"
-        )
-        active_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1 AND created_at < $2", since, until)
-
-        new_users_change = ((new_users - prev_users) / max(prev_users, 1)) * 100 if prev_users and prev_users > 0 else 0
-
-        # MRR (unchanged pricing logic)
-        mrr_data = await conn.fetch(
-            """
-            SELECT subscription_tier, COUNT(*) AS count
-            FROM users
-            WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime')
-              AND subscription_status = 'active'
-            GROUP BY subscription_tier
-            """
-        )
+        paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'")
+        active_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
+        
+        new_users_change = ((new_users - prev_users) / max(prev_users, 1)) * 100 if prev_users > 0 else 0
+        
+        # MRR
+        mrr_data = await conn.fetch("""
+            SELECT subscription_tier, COUNT(*) AS count FROM users 
+            WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') 
+            AND subscription_status = 'active' GROUP BY subscription_tier
+        """)
         total_mrr = sum(get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data)
         mrr_by_tier = {r["subscription_tier"]: get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data}
-
+        
         # Tier breakdown
-        tier_data = await conn.fetch(
-            "SELECT COALESCE(subscription_tier, 'free') as tier, COUNT(*)::int AS count FROM users GROUP BY subscription_tier"
-        )
+        tier_data = await conn.fetch("SELECT COALESCE(subscription_tier, 'free') as tier, COUNT(*)::int AS count FROM users GROUP BY subscription_tier")
         tier_breakdown = {t["tier"] or "free": t["count"] for t in tier_data}
-
+        
+        # Revenue
+        revenue = await conn.fetchrow("""
+            SELECT COALESCE(SUM(amount), 0)::decimal AS total,
+            COALESCE(SUM(CASE WHEN source = 'topup' THEN amount ELSE 0 END), 0)::decimal AS topups
+            FROM revenue_tracking WHERE created_at >= $1
+        """, since)
+        
+        # Costs
+        costs = await conn.fetchrow("""
+            SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
+            COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
+            COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute
+            FROM cost_tracking WHERE created_at >= $1
+        """, since)
+        openai_cost = float(costs["openai"] or 0) if costs else 0
+        storage_cost = float(costs["storage"] or 0) if costs else 0
+        compute_cost = float(costs["compute"] or 0) if costs else 0
+        total_costs = openai_cost + storage_cost + compute_cost
+        
+        gross_margin = ((total_mrr - total_costs) / max(total_mrr, 1)) * 100 if total_mrr > 0 else 0
+        
         # Uploads
-        upload_data = await conn.fetchrow(
-            """
-            SELECT COUNT(*)::int AS total,
-                   COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
-                   COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
-                   COUNT(*) FILTER (WHERE status = 'processing')::int AS processing
-            FROM uploads
-            WHERE created_at >= $1 AND created_at < $2
-            """,
-            since, until
-        )
-
-        # Revenue + costs via existing tables (back-compat)
-        revenue_row = await conn.fetchrow(
-            "SELECT COALESCE(SUM(amount), 0)::decimal AS revenue FROM revenue_tracking WHERE created_at >= $1 AND created_at < $2",
-            since, until
-        )
-        cost_row = await conn.fetchrow(
-            "SELECT COALESCE(SUM(cost_usd), 0)::decimal AS costs FROM cost_tracking WHERE created_at >= $1 AND created_at < $2",
-            since, until
-        )
-
+        upload_stats = await conn.fetchrow("""
+            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
+            COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes
+            FROM uploads WHERE created_at >= $1
+        """, since)
+        total_uploads = upload_stats["total"] if upload_stats else 0
+        successful_uploads = upload_stats["completed"] if upload_stats else 0
+        success_rate = (successful_uploads / max(total_uploads, 1)) * 100
+        
+        prev_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1 AND created_at < $2", prev_since, since)
+        uploads_change = ((total_uploads - prev_uploads) / max(prev_uploads, 1)) * 100 if prev_uploads > 0 else 0
+        cost_per_upload = total_costs / max(successful_uploads, 1)
+        
+        # Platform distribution
+        platform_data = await conn.fetch("SELECT unnest(platforms) AS platform, COUNT(*)::int AS uploads FROM uploads WHERE created_at >= $1 GROUP BY platform", since)
+        platform_distribution = {p["platform"]: p["uploads"] for p in platform_data}
+        
+        queue_depth = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
+        
+        # Funnels
+        funnel_connected = await conn.fetchval("SELECT COUNT(DISTINCT u.id) FROM users u JOIN platform_tokens pt ON u.id = pt.user_id WHERE u.created_at >= $1", since)
+        funnel_uploaded = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
+        funnel_signup_connect = (funnel_connected / max(new_users, 1)) * 100
+        funnel_connect_upload = (funnel_uploaded / max(funnel_connected, 1)) * 100
+        
+        cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
+    
     return {
-        "ok": True,
-        "range": label,
-        "since": since.isoformat(),
-        "until": until.isoformat(),
-        "users": {
-            "total": int(total_users or 0),
-            "new": int(new_users or 0),
-            "paid": int(paid_users or 0),
-            "active": int(active_users or 0),
-            "new_change_pct": float(new_users_change or 0),
-        },
-        "mrr": {"total": float(total_mrr or 0), "by_tier": mrr_by_tier},
-        "tiers": tier_breakdown,
-        "uploads": dict(upload_data) if upload_data else {"total": 0, "completed": 0, "failed": 0, "processing": 0},
-        "revenue": float(revenue_row["revenue"] or 0) if revenue_row else 0.0,
-        "costs": float(cost_row["costs"] or 0) if cost_row else 0.0,
+        "total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": mrr_by_tier,
+        "mrr_launch": mrr_by_tier.get("launch", 0), "mrr_creator_pro": mrr_by_tier.get("creator_pro", 0),
+        "mrr_studio": mrr_by_tier.get("studio", 0), "mrr_agency": mrr_by_tier.get("agency", 0),
+        "launch_users": tier_breakdown.get("launch", 0), "creator_pro_users": tier_breakdown.get("creator_pro", 0),
+        "studio_users": tier_breakdown.get("studio", 0), "agency_users": tier_breakdown.get("agency", 0),
+        "topup_revenue": float(revenue["topups"]) if revenue else 0, "topup_count": 0,
+        "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
+        "refunds": 0, "refund_count": 0,
+        "openai_cost": openai_cost, "storage_cost": storage_cost, "compute_cost": compute_cost,
+        "total_costs": total_costs, "cost_per_upload": round(cost_per_upload, 4),
+        "gross_margin": round(gross_margin, 1), "gross_margin_change": 0,
+        "funnel_signups": new_users, "funnel_connected": funnel_connected, "funnel_uploaded": funnel_uploaded,
+        "funnel_signup_connect": round(funnel_signup_connect, 1), "funnel_connect_upload": round(funnel_connect_upload, 1),
+        "free_to_paid_rate": round((paid_users / max(total_users, 1)) * 100, 1), "free_to_paid_change": 0,
+        "cancellations": cancellations, "cancellation_rate": round((cancellations / max(paid_users, 1)) * 100, 1),
+        "failed_payments": 0, "payment_failure_rate": 0,
+        "total_uploads": total_uploads, "successful_uploads": successful_uploads, "success_rate": round(success_rate, 1),
+        "transcode_fail_rate": 0, "platform_fail_rate": 0, "retry_rate": 0,
+        "avg_process_time": 0, "avg_transcode_time": 0, "cancel_rate": 0, "queue_depth": queue_depth or 0,
+        "new_users": new_users, "new_users_change": round(new_users_change, 1), "uploads_change": round(uploads_change, 1),
+        "active_users": active_users or 0, "total_views": upload_stats["views"] if upload_stats else 0,
+        "total_likes": upload_stats["likes"] if upload_stats else 0,
+        "avg_uploads_per_user": round(total_uploads / max(active_users or 1, 1), 1),
+        "tier_breakdown": tier_breakdown, "platform_distribution": platform_distribution,
     }
+
 
 @app.get("/api/admin/kpi/revenue")
 async def get_kpi_revenue(user: dict = Depends(require_admin)):
@@ -5125,79 +4811,14 @@ async def get_kpi_revenue(user: dict = Depends(require_admin)):
 
 
 @app.get("/api/admin/kpi/costs")
-async def get_kpi_costs(
-    range: str = Query("30d"),
-    start: Optional[str] = Query(None),
-    end: Optional[str] = Query(None),
-    user: dict = Depends(require_admin),
-):
-    since, until, _ = _resolve_window(range, start, end, default_minutes=30 * 24 * 60)
-
+async def get_kpi_costs(user: dict = Depends(require_admin)):
+    since = _now_utc() - timedelta(days=30)
     async with db_pool.acquire() as conn:
-        # Back-compat costs (existing)
-        legacy = await conn.fetchrow(
-            """
-            SELECT
-              COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
-              COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
-              COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
-              COALESCE(SUM(cost_usd), 0)::decimal AS total
-            FROM cost_tracking
-            WHERE created_at >= $1 AND created_at < $2
-            """,
-            since, until
-        )
+        costs = await conn.fetchrow("SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai, COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage, COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute FROM cost_tracking WHERE created_at >= $1", since)
+        uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status = 'completed' AND created_at >= $1", since)
+    o, s, c = (float(costs["openai"] or 0), float(costs["storage"] or 0), float(costs["compute"] or 0)) if costs else (0, 0, 0)
+    return {"openai_cost": o, "storage_cost": s, "compute_cost": c, "total_costs": o+s+c, "costs_change": 0, "cost_per_upload": round((o+s+c) / max(uploads or 1, 1), 4), "successful_uploads": uploads or 0, "total_cogs": o+s+c}
 
-        # New unified provider ledger (preferred if populated)
-        prov = await conn.fetch(
-            """
-            SELECT provider, category, COALESCE(SUM(amount_usd),0)::decimal AS amt
-            FROM provider_costs
-            WHERE occurred_at >= $1 AND occurred_at < $2
-            GROUP BY provider, category
-            """,
-            since, until
-        )
-
-        uploads = await conn.fetchval(
-            "SELECT COUNT(*) FROM uploads WHERE status = 'completed' AND created_at >= $1 AND created_at < $2",
-            since, until
-        )
-
-    legacy_openai = float(legacy["openai"] or 0) if legacy else 0.0
-    legacy_storage = float(legacy["storage"] or 0) if legacy else 0.0
-    legacy_compute = float(legacy["compute"] or 0) if legacy else 0.0
-    legacy_total = float(legacy["total"] or 0) if legacy else 0.0
-
-    provider_totals = {}
-    by_provider = {}
-    for r in prov or []:
-        provider = r["provider"]
-        category = r["category"]
-        amt = float(r["amt"] or 0)
-        provider_totals[category] = provider_totals.get(category, 0.0) + amt
-        by_provider.setdefault(provider, {})
-        by_provider[provider][category] = by_provider[provider].get(category, 0.0) + amt
-
-    total_costs = (sum(provider_totals.values()) if provider_totals else legacy_total)
-
-    # Keep your old fields so the front-end doesn’t break.
-    openai_cost = provider_totals.get("openai", legacy_openai)
-    storage_cost = provider_totals.get("storage", legacy_storage)
-    compute_cost = provider_totals.get("compute", legacy_compute)
-
-    return {
-        "openai_cost": openai_cost,
-        "storage_cost": storage_cost,
-        "compute_cost": compute_cost,
-        "total_costs": total_costs,
-        "costs_change": 0,
-        "cost_per_upload": round(total_costs / max(int(uploads or 1), 1), 6),
-        "successful_uploads": int(uploads or 0),
-        "total_cogs": total_costs,
-        "provider_totals": provider_totals,
-        "by_provider": by_provider,
-    }
 
 @app.get("/api/admin/kpi/growth")
 async def get_kpi_growth(user: dict = Depends(require_admin)):
@@ -5243,87 +4864,6 @@ async def get_kpi_usage(user: dict = Depends(require_admin)):
             "new_users": new_users or 0, "new_users_change": round(chg, 1), "total_views": engagement["views"] if engagement else 0,
             "total_likes": engagement["likes"] if engagement else 0, "avg_uploads_per_user": round((uploads or 0) / max(active or 1, 1), 1)}
 
-
-
-@app.post("/api/admin/kpi/refresh")
-async def refresh_kpi_cost_estimates(
-    range: str = Query("30d"),
-    start: Optional[str] = Query(None),
-    end: Optional[str] = Query(None),
-    user: dict = Depends(require_admin),
-):
-    """
-    Manual refresh button hook.
-    Writes best-effort cost estimates into provider_costs for the selected window.
-    Idempotent via external_id.
-    """
-    since, until, label = _resolve_window(range, start, end, default_minutes=30 * 24 * 60)
-    ps = since.date()
-    pe = until.date()
-    days = max(1, int((until - since).total_seconds() / 86400))
-
-    r2_cost_per_gb_month = float(os.environ.get("R2_COST_PER_GB_MONTH", "0.015"))
-    render_cost_per_compute_hour = float(os.environ.get("RENDER_COST_PER_COMPUTE_HOUR", "0.0"))
-    stripe_fee_pct = float(os.environ.get("STRIPE_FEE_PCT", "0.029"))
-    stripe_fee_flat = float(os.environ.get("STRIPE_FEE_FLAT", "0.30"))
-
-    async with db_pool.acquire() as conn:
-        uploads_cols = await _load_uploads_columns(db_pool)
-
-        # Proxy 1: R2 storage (sum of file_size bytes for uploads created in window)
-        r2_storage_usd = 0.0
-        if "file_size" in uploads_cols:
-            bytes_sum = await conn.fetchval(
-                "SELECT COALESCE(SUM(file_size),0)::bigint FROM uploads WHERE created_at >= $1 AND created_at < $2",
-                since, until
-            )
-            gb = float(bytes_sum or 0) / (1024.0 ** 3)
-            # prorate monthly storage by days/30
-            r2_storage_usd = gb * r2_cost_per_gb_month * (days / 30.0)
-
-        # Proxy 2: Render compute (sum compute_seconds in window)
-        render_compute_usd = 0.0
-        if "compute_seconds" in uploads_cols:
-            sec_sum = await conn.fetchval(
-                "SELECT COALESCE(SUM(compute_seconds),0)::double precision FROM uploads WHERE created_at >= $1 AND created_at < $2",
-                since, until
-            )
-            hours = float(sec_sum or 0) / 3600.0
-            render_compute_usd = hours * render_cost_per_compute_hour
-
-        # Proxy 3: Stripe fees (from revenue_tracking)
-        rev_row = await conn.fetchrow(
-            "SELECT COALESCE(SUM(amount),0)::double precision AS gross, COUNT(*)::int AS txns FROM revenue_tracking WHERE created_at >= $1 AND created_at < $2",
-            since, until
-        )
-        gross = float(rev_row["gross"] or 0) if rev_row else 0.0
-        txns = int(rev_row["txns"] or 0) if rev_row else 0
-        stripe_fees_usd = gross * stripe_fee_pct + txns * stripe_fee_flat
-
-        # Idempotent inserts (external_id unique-ish per window/provider/category)
-        rows_to_upsert = [
-            ("cloudflare_r2", "storage", r2_storage_usd, "estimate", f"refresh:{label}:{ps}:{pe}:r2:storage"),
-            ("render", "compute", render_compute_usd, "estimate", f"refresh:{label}:{ps}:{pe}:render:compute"),
-            ("stripe", "fees", stripe_fees_usd, "estimate", f"refresh:{label}:{ps}:{pe}:stripe:fees"),
-        ]
-
-        wrote = 0
-        for provider, category, amount, source, external_id in rows_to_upsert:
-            if amount <= 0:
-                continue
-            # idempotency: clear prior row for this external_id
-            await conn.execute("DELETE FROM provider_costs WHERE external_id = $1", external_id)
-            await conn.execute(
-                """
-                INSERT INTO provider_costs (provider, category, amount_usd, period_start, period_end, occurred_at, source, external_id, meta)
-                VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7,$8::jsonb)
-                
-                """,
-                provider, category, float(amount), ps, pe, source, external_id, json.dumps({"range": label, "days": days})
-            )
-            wrote += 1
-
-    return {"ok": True, "range": label, "since": since.isoformat(), "until": until.isoformat(), "rows_written": wrote}
 
 @app.get("/api/admin/leaderboard")
 async def get_leaderboard(range: str = Query("30d"), sort: str = Query("uploads"), user: dict = Depends(require_admin)):
@@ -5736,24 +5276,22 @@ if __name__ == "__main__":
 async def get_upload_details(upload_id: str, user: dict = Depends(get_current_user)):
     cols = await _load_uploads_columns(db_pool)
     wanted = [
-        "id","user_id","r2_key","filename","file_size","content_type",
-        "platforms","account_ids","group_ids",
+        "id","user_id","r2_key","filename","file_size","platforms",
         "title","caption","hashtags","privacy","status","cancel_requested",
-        "scheduled_time","schedule_mode","smart_schedule_days","schedule_metadata",
+        "scheduled_time","schedule_mode",
         "processing_started_at","processing_finished_at","completed_at",
         "error_code","error_detail",
         "put_reserved","put_spent","aic_reserved","aic_spent",
         "views","likes","comments","shares",
         "thumbnail_r2_key","video_url","platform_results",
         "created_at","updated_at","duration",
-        "ai_title","ai_caption",
     ]
     select_cols = _pick_cols(wanted, cols)
     if not select_cols:
         raise HTTPException(status_code=500, detail="Uploads table has no readable columns")
 
     sql = f"""SELECT {', '.join(select_cols)} FROM uploads
-              WHERE id = $1 AND user_id = $2"""
+               WHERE id = $1 AND user_id = $2"""
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(sql, upload_id, user["id"])
@@ -5764,523 +5302,38 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
     def g(k, default=None):
         return row[k] if k in row else default
 
-    def iso(dt):
-        return dt.isoformat() if dt else None
-
-    platforms = _safe_json(g("platforms"), [])
-    hashtags = _safe_json(g("hashtags"), [])
-    platform_results = _safe_json(g("platform_results"), {})
-    schedule_metadata = _safe_json(g("schedule_metadata"), {})
-    account_ids = _safe_json(g("account_ids"), [])
-    group_ids = _safe_json(g("group_ids"), [])
-
-    payload = {
-        # canonical snake_case
+    return {
         "id": str(g("id")),
-        "user_id": str(g("user_id")),
-        "r2_key": g("r2_key"),
+        "userId": str(g("user_id")),
+        "r2Key": g("r2_key"),
         "filename": g("filename"),
-        "file_size": g("file_size"),
-        "content_type": g("content_type"),
-        "platforms": platforms,
-        "account_ids": account_ids,
-        "group_ids": group_ids,
+        "fileSize": g("file_size"),
+        "platforms": _safe_json(g("platforms"), []),
         "title": g("title"),
         "caption": g("caption"),
-        "hashtags": hashtags,
+        "hashtags": _safe_json(g("hashtags"), []),
         "privacy": g("privacy"),
         "status": g("status"),
-        "cancel_requested": bool(g("cancel_requested", False)),
-        "scheduled_time": iso(g("scheduled_time")),
-        "schedule_mode": g("schedule_mode"),
-        "smart_schedule_days": g("smart_schedule_days"),
-        "schedule_metadata": schedule_metadata,
-
-        "processing_started_at": iso(g("processing_started_at")),
-        "processing_finished_at": iso(g("processing_finished_at")),
-        "completed_at": iso(g("completed_at")),
-
-        "error_code": g("error_code"),
-        "error_detail": g("error_detail"),
-
-        "put_reserved": g("put_reserved", 0) or 0,
-        "put_spent": g("put_spent", 0) or 0,
-        "aic_reserved": g("aic_reserved", 0) or 0,
-        "aic_spent": g("aic_spent", 0) or 0,
-
-        "views": g("views", 0) or 0,
-        "likes": g("likes", 0) or 0,
-        "comments": g("comments", 0) or 0,
-        "shares": g("shares", 0) or 0,
-
-        "thumbnail_r2_key": g("thumbnail_r2_key"),
-        "video_url": g("video_url"),
-        "platform_results": platform_results,
-
-        "created_at": iso(g("created_at")),
-        "updated_at": iso(g("updated_at")),
+        "cancelRequested": bool(g("cancel_requested", False)),
+        "scheduledTime": g("scheduled_time").isoformat() if g("scheduled_time") else None,
+        "scheduleMode": g("schedule_mode"),
+        "processingStartedAt": g("processing_started_at").isoformat() if g("processing_started_at") else None,
+        "processingFinishedAt": g("processing_finished_at").isoformat() if g("processing_finished_at") else None,
+        "completedAt": g("completed_at").isoformat() if g("completed_at") else None,
+        "errorCode": g("error_code"),
+        "errorDetail": g("error_detail"),
+        "putReserved": g("put_reserved"),
+        "putSpent": g("put_spent"),
+        "aicReserved": g("aic_reserved"),
+        "aicSpent": g("aic_spent"),
+        "views": g("views"),
+        "likes": g("likes"),
+        "comments": g("comments"),
+        "shares": g("shares"),
+        "thumbnailR2Key": g("thumbnail_r2_key"),
+        "videoUrl": g("video_url"),
+        "platformResults": _safe_json(g("platform_results"), {}),
+        "createdAt": g("created_at").isoformat() if g("created_at") else None,
+        "updatedAt": g("updated_at").isoformat() if g("updated_at") else None,
         "duration": g("duration"),
-
-        "ai_title": g("ai_title"),
-        "ai_caption": g("ai_caption"),
     }
-
-    # backward-compatible camelCase aliases
-    payload.update({
-        "userId": payload["user_id"],
-        "r2Key": payload["r2_key"],
-        "fileSize": payload["file_size"],
-        "contentType": payload["content_type"],
-        "accountIds": payload["account_ids"],
-        "groupIds": payload["group_ids"],
-        "cancelRequested": payload["cancel_requested"],
-        "scheduledTime": payload["scheduled_time"],
-        "scheduleMode": payload["schedule_mode"],
-        "smartScheduleDays": payload["smart_schedule_days"],
-        "scheduleMetadata": payload["schedule_metadata"],
-        "processingStartedAt": payload["processing_started_at"],
-        "processingFinishedAt": payload["processing_finished_at"],
-        "completedAt": payload["completed_at"],
-        "errorCode": payload["error_code"],
-        "errorDetail": payload["error_detail"],
-        "putReserved": payload["put_reserved"],
-        "putSpent": payload["put_spent"],
-        "aicReserved": payload["aic_reserved"],
-        "aicSpent": payload["aic_spent"],
-        "thumbnailR2Key": payload["thumbnail_r2_key"],
-        "platformResults": payload["platform_results"],
-        "createdAt": payload["created_at"],
-        "updatedAt": payload["updated_at"],
-        "aiTitle": payload["ai_title"],
-        "aiCaption": payload["ai_caption"],
-    })
-
-    return payload
-
-
-@app.get("/api/uploads/{upload_id}/status")
-async def get_upload_status(upload_id: str, user: dict = Depends(get_current_user)):
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, status, error_code, error_detail, updated_at,
-                   processing_started_at, processing_finished_at, completed_at
-            FROM uploads
-            WHERE id = $1 AND user_id = $2
-            """,
-            upload_id, user["id"]
-        )
-    if not row:
-        raise HTTPException(404, "Upload not found")
-    return {
-        "id": str(row["id"]),
-        "status": row["status"],
-        "error_code": row["error_code"],
-        "error_detail": row["error_detail"],
-        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
-        "processing_started_at": row["processing_started_at"].isoformat() if row["processing_started_at"] else None,
-        "processing_finished_at": row["processing_finished_at"].isoformat() if row["processing_finished_at"] else None,
-        "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
-    }
-
-
-@app.get("/api/admin/calculator/config")
-async def get_cost_model_configs(limit: int = 20, user: dict = Depends(require_admin)):
-    """Get all saved cost model configurations (newest first)."""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM cost_model_config ORDER BY effective_date DESC LIMIT $1", limit
-        )
-        return [
-            {
-                "id": str(r["id"]),
-                "effective_date": r["effective_date"].isoformat() if r["effective_date"] else None,
-                "config_json": r["config_json"],
-                "notes": r["notes"],
-                "created_by": str(r["created_by"]) if r["created_by"] else None,
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-            }
-            for r in rows
-        ]
-
-
-@app.get("/api/admin/calculator/config/latest")
-async def get_latest_cost_model_config(user: dict = Depends(require_admin)):
-    """Get the most recent cost model config (used to pre-populate calculator)."""
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM cost_model_config ORDER BY effective_date DESC LIMIT 1"
-        )
-        if not row:
-            return {"ok": True, "config": None}
-        return {
-            "ok": True,
-            "config": {
-                "id": str(row["id"]),
-                "effective_date": row["effective_date"].isoformat() if row["effective_date"] else None,
-                "config_json": row["config_json"],
-                "notes": row["notes"],
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            }
-        }
-
-
-class CostModelConfigCreate(BaseModel):
-    config_json: Dict[str, Any]
-    notes: Optional[str] = None
-
-
-class CostModelConfigCreate(BaseModel):
-    config_json: Dict[str, Any]
-    notes: Optional[str] = None
-
-
-@app.post("/api/admin/calculator/config")
-async def save_cost_model_config(data: "CostModelConfigCreate", user: dict = Depends(require_admin)):
-    """Save a new cost model configuration snapshot."""
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """INSERT INTO cost_model_config (config_json, notes, created_by)
-               VALUES ($1::jsonb, $2, $3) RETURNING id, effective_date, created_at""",
-            json.dumps(data.config_json), data.notes, user["id"]
-        )
-        return {
-            "ok": True,
-            "id": str(row["id"]),
-            "effective_date": row["effective_date"].isoformat(),
-            "created_at": row["created_at"].isoformat(),
-        }
-
-
-@app.put("/api/admin/calculator/config/{config_id}")
-async def update_cost_model_config(config_id: str, data: CostModelConfigUpdate, user: dict = Depends(require_admin)):
-    """Update an existing cost model configuration."""
-    async with db_pool.acquire() as conn:
-        existing = await conn.fetchrow("SELECT id FROM cost_model_config WHERE id = $1", uuid.UUID(config_id))
-        if not existing:
-            raise HTTPException(404, "Config not found")
-
-        updates = []
-        params = []
-        idx = 1
-
-        if data.config_json is not None:
-            updates.append(f"config_json = ${idx}::jsonb")
-            params.append(json.dumps(data.config_json))
-            idx += 1
-        if data.notes is not None:
-            updates.append(f"notes = ${idx}")
-            params.append(data.notes)
-            idx += 1
-
-        if not updates:
-            return {"ok": True, "message": "Nothing to update"}
-
-        updates.append(f"updated_at = NOW()")
-        params.append(uuid.UUID(config_id))
-
-        await conn.execute(
-            f"UPDATE cost_model_config SET {', '.join(updates)} WHERE id = ${idx}",
-            *params
-        )
-        return {"ok": True, "id": config_id}
-
-
-@app.delete("/api/admin/calculator/config/{config_id}")
-async def delete_cost_model_config(config_id: str, user: dict = Depends(require_admin)):
-    """Delete a cost model configuration."""
-    async with db_pool.acquire() as conn:
-        result = await conn.execute("DELETE FROM cost_model_config WHERE id = $1", uuid.UUID(config_id))
-        if result == "DELETE 0":
-            raise HTTPException(404, "Config not found")
-        return {"ok": True}
-
-
-# ---- Enterprise Quotes CRUD ----
-
-@app.get("/api/admin/calculator/quotes")
-async def get_enterprise_quotes(
-    status: Optional[str] = None,
-    limit: int = 50,
-    user: dict = Depends(require_admin),
-):
-    """Get enterprise quotes. Status filter applies only if column exists."""
-    async with db_pool.acquire() as conn:
-        cols = await _get_table_cols(conn, "enterprise_quotes")
-        has_status = "status" in cols
-        if status and has_status:
-            rows = await conn.fetch(
-                "SELECT * FROM enterprise_quotes WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
-                status, limit
-            )
-        else:
-            rows = await conn.fetch(
-                "SELECT * FROM enterprise_quotes ORDER BY created_at DESC LIMIT $1",
-                limit
-            )
-
-    out = []
-    for r in rows:
-        item = {
-            "id": str(r["id"]),
-            "customer_name": r.get("customer_name"),
-            "assumptions_json": r.get("assumptions") or {},
-            "outputs_json": r.get("outputs") or {},
-            "created_by_user_id": str(r["created_by_user_id"]) if r.get("created_by_user_id") else None,
-            "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
-        }
-        if "status" in r:
-            item["status"] = r.get("status")
-        out.append(item)
-    return out
-
-@app.get("/api/admin/calculator/quotes/{quote_id}")
-async def get_enterprise_quote(quote_id: str, user: dict = Depends(require_admin)):
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
-        if not row:
-            raise HTTPException(status_code=404, detail="Quote not found")
-    resp = {
-        "id": str(row["id"]),
-        "customer_name": row.get("customer_name"),
-        "assumptions_json": row.get("assumptions") or {},
-        "outputs_json": row.get("outputs") or {},
-        "created_by_user_id": str(row.get("created_by_user_id")) if row.get("created_by_user_id") else None,
-        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
-    }
-    if "status" in row:
-        resp["status"] = row.get("status")
-    return resp
-
-@app.post("/api/admin/calculator/quotes")
-async def create_enterprise_quote(data: EnterpriseQuoteCreate, user: dict = Depends(require_admin)):
-    """Create a new enterprise quote."""
-    assumptions = getattr(data, "assumptions_json", None) or {}
-    outputs = getattr(data, "outputs_json", None) or {}
-    async with db_pool.acquire() as conn:
-        cols = await _get_table_cols(conn, "enterprise_quotes")
-        has_status = "status" in cols
-        if has_status:
-            row = await conn.fetchrow(
-                """INSERT INTO enterprise_quotes (customer_name, assumptions, outputs, status, created_by_user_id)
-                   VALUES ($1, $2::jsonb, $3::jsonb, $4, $5)
-                   RETURNING id, created_at""",
-                data.customer_name,
-                json.dumps(assumptions),
-                json.dumps(outputs),
-                data.status or "draft",
-                user["id"],
-            )
-        else:
-            row = await conn.fetchrow(
-                """INSERT INTO enterprise_quotes (customer_name, assumptions, outputs, created_by_user_id)
-                   VALUES ($1, $2::jsonb, $3::jsonb, $4)
-                   RETURNING id, created_at""",
-                data.customer_name,
-                json.dumps(assumptions),
-                json.dumps(outputs),
-                user["id"],
-            )
-    return {"ok": True, "id": str(row["id"]), "created_at": row["created_at"].isoformat() if row.get("created_at") else None}
-
-@app.put("/api/admin/calculator/quotes/{quote_id}")
-async def update_enterprise_quote(quote_id: str, data: EnterpriseQuoteUpdate, user: dict = Depends(require_admin)):
-    assumptions = getattr(data, "assumptions_json", None)
-    outputs = getattr(data, "outputs_json", None)
-
-    async with db_pool.acquire() as conn:
-        cols = await _get_table_cols(conn, "enterprise_quotes")
-        has_status = "status" in cols
-
-        existing = await conn.fetchrow("SELECT id FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
-        if not existing:
-            raise HTTPException(status_code=404, detail="Quote not found")
-
-        sets = []
-        args = []
-        n = 1
-
-        if data.customer_name is not None:
-            sets.append(f"customer_name = ${n}"); args.append(data.customer_name); n += 1
-        if assumptions is not None:
-            sets.append(f"assumptions = ${n}::jsonb"); args.append(json.dumps(assumptions)); n += 1
-        if outputs is not None:
-            sets.append(f"outputs = ${n}::jsonb"); args.append(json.dumps(outputs)); n += 1
-        if has_status and data.status is not None:
-            sets.append(f"status = ${n}"); args.append(data.status); n += 1
-
-        if not sets:
-            return {"ok": True, "updated": False}
-
-        args.append(uuid.UUID(quote_id))
-        await conn.execute(f"UPDATE enterprise_quotes SET {', '.join(sets)} WHERE id = ${n}", *args)
-
-    return {"ok": True, "updated": True}
-
-@app.delete("/api/admin/calculator/quotes/{quote_id}")
-async def delete_enterprise_quote(quote_id: str, user: dict = Depends(require_admin)):
-    async with db_pool.acquire() as conn:
-        res = await conn.execute("DELETE FROM enterprise_quotes WHERE id = $1", uuid.UUID(quote_id))
-    return {"ok": True, "result": res}
-
-@app.get("/api/admin/calculator/live-metrics")
-async def get_calculator_live_metrics(user: dict = Depends(require_admin)):
-    """Pull real-time business metrics to pre-populate calculator inputs.
-    Returns actual customer counts by tier, video volumes, cost data, etc."""
-    async with db_pool.acquire() as conn:
-        # Customer counts by tier
-        tier_rows = await conn.fetch(
-            """SELECT subscription_tier, COUNT(*) as cnt
-               FROM users WHERE status = 'active'
-               GROUP BY subscription_tier"""
-        )
-        tier_counts = {r["subscription_tier"]: r["cnt"] for r in tier_rows}
-
-        # Internal tier counts (for cost attribution / calculator defaults)
-        ff_row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM users WHERE status='active' AND subscription_tier='friends_family'")
-        lt_row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM users WHERE status='active' AND subscription_tier='lifetime'")
-        admin_rows = await conn.fetch(
-            "SELECT role, COUNT(*) AS cnt FROM users WHERE status='active' AND role IN ('admin','master_admin') GROUP BY role"
-        )
-        internal_by_role = {r["role"]: r["cnt"] for r in admin_rows}
-        friends_family_count = int(ff_row["cnt"] or 0) if ff_row else 0
-        lifetime_count = int(lt_row["cnt"] or 0) if lt_row else 0
-        admin_count = int(sum(internal_by_role.values())) if internal_by_role else 0
-
-
-        # Upload volume last 30 days
-        upload_stats = await conn.fetchrow(
-            """SELECT COUNT(*) as total_uploads,
-                      COUNT(DISTINCT user_id) as active_uploaders,
-                      AVG(file_size) as avg_file_size,
-                      AVG(compute_seconds) as avg_compute_seconds
-               FROM uploads
-               WHERE created_at > NOW() - INTERVAL '30 days'
-                 AND status NOT IN ('cancelled', 'deleted')"""
-        )
-
-        # Average platforms per upload
-        platform_avg = await conn.fetchrow(
-            """SELECT AVG(array_length(platforms, 1)) as avg_platforms
-               FROM uploads
-               WHERE created_at > NOW() - INTERVAL '30 days'
-                 AND platforms IS NOT NULL AND array_length(platforms, 1) > 0"""
-        )
-
-        # Cost data last 30 days
-        cost_rows = await conn.fetch(
-            """SELECT category, SUM(cost_usd) as total_cost
-               FROM cost_tracking
-               WHERE created_at > NOW() - INTERVAL '30 days'
-               GROUP BY category"""
-        )
-        cost_by_category = {r["category"]: float(r["total_cost"] or 0) for r in cost_rows}
-
-        # Revenue last 30 days
-        rev_row = await conn.fetchrow(
-            """SELECT SUM(amount) as total_revenue
-               FROM revenue_tracking
-               WHERE created_at > NOW() - INTERVAL '30 days'"""
-        )
-
-        # AI usage rate
-        ai_stats = await conn.fetchrow(
-            """SELECT
-                 COUNT(*) FILTER (WHERE aic_spent > 0) as ai_uploads,
-                 COUNT(*) as total_uploads
-               FROM uploads
-               WHERE created_at > NOW() - INTERVAL '30 days'
-                 AND status NOT IN ('cancelled', 'deleted')"""
-        )
-
-        total_u = ai_stats["total_uploads"] if ai_stats else 0
-        ai_u = ai_stats["ai_uploads"] if ai_stats else 0
-
-        return {
-            "ok": True,
-            "tier_counts": tier_counts,
-            "friends_family_count": friends_family_count,
-            "lifetime_count": lifetime_count,
-            "admin_count": admin_count,
-            "internal_by_role": internal_by_role,
-            "uploads_30d": upload_stats["total_uploads"] if upload_stats else 0,
-            "active_uploaders_30d": upload_stats["active_uploaders"] if upload_stats else 0,
-            "avg_file_size_mb": round(float(upload_stats["avg_file_size"] or 0) / (1024 * 1024), 1) if upload_stats else 0,
-            "avg_compute_seconds": round(float(upload_stats["avg_compute_seconds"] or 0), 1) if upload_stats else 0,
-            "avg_platforms_per_upload": round(float(platform_avg["avg_platforms"] or 0), 2) if platform_avg else 0,
-            "cost_by_category_30d": cost_by_category,
-            "total_revenue_30d": float(rev_row["total_revenue"] or 0) if rev_row else 0,
-            "ai_usage_rate": round(ai_u / total_u, 3) if total_u > 0 else 0,
-        }
-
-
-@app.get("/api/admin/calculator/internal-usage")
-async def get_internal_usage_30d(user: dict = Depends(require_admin)):
-    """Return real internal-tier usage over the last 30 days for cost attribution.
-
-    Source-of-truth: internal_usage_30d view (migration 108).
-    Fallback: direct aggregation query if the view is not present yet.
-    """
-    async with db_pool.acquire() as conn:
-        view_sql = """SELECT subscription_tier, role, upload_count, put_consumed, aic_consumed,
-                               compute_seconds, storage_bytes, cost_attributed
-                        FROM internal_usage_30d
-                        ORDER BY cost_attributed DESC NULLS LAST"""
-        fallback_sql = """SELECT
-                u.subscription_tier,
-                u.role,
-                COUNT(up.id) as upload_count,
-                COALESCE(SUM(up.put_spent), 0) as put_consumed,
-                COALESCE(SUM(up.aic_spent), 0) as aic_consumed,
-                COALESCE(SUM(up.compute_seconds), 0) as compute_seconds,
-                COALESCE(SUM(up.storage_bytes), 0) as storage_bytes,
-                COALESCE(SUM(up.cost_attributed), 0) as cost_attributed
-            FROM users u
-            LEFT JOIN uploads up ON up.user_id = u.id
-                AND up.created_at > NOW() - INTERVAL '30 days'
-                AND up.status NOT IN ('cancelled', 'deleted')
-            WHERE u.status = 'active'
-              AND (u.role IN ('admin', 'master_admin')
-                   OR u.subscription_tier IN ('friends_family', 'lifetime'))
-            GROUP BY u.subscription_tier, u.role
-            ORDER BY cost_attributed DESC NULLS LAST"""
-
-        try:
-            rows = await conn.fetch(view_sql)
-            source = "view"
-        except Exception as e:
-            # Most common: asyncpg.exceptions.UndefinedTableError when view isn't created yet
-            rows = await conn.fetch(fallback_sql)
-            source = "fallback"
-
-        out_rows = []
-        totals = {
-            "upload_count": 0,
-            "put_consumed": 0,
-            "aic_consumed": 0,
-            "compute_seconds": 0,
-            "storage_bytes": 0,
-            "cost_attributed": 0.0,
-        }
-
-        for r in rows:
-            cost_val = float(r["cost_attributed"] or 0)
-            out_rows.append({
-                "subscription_tier": r["subscription_tier"],
-                "role": r["role"],
-                "upload_count": int(r["upload_count"] or 0),
-                "put_consumed": int(r["put_consumed"] or 0),
-                "aic_consumed": int(r["aic_consumed"] or 0),
-                "compute_seconds": float(r["compute_seconds"] or 0),
-                "storage_bytes": int(r["storage_bytes"] or 0),
-                "cost_attributed": cost_val,
-            })
-            totals["upload_count"] += int(r["upload_count"] or 0)
-            totals["put_consumed"] += int(r["put_consumed"] or 0)
-            totals["aic_consumed"] += int(r["aic_consumed"] or 0)
-            totals["compute_seconds"] += float(r["compute_seconds"] or 0)
-            totals["storage_bytes"] += int(r["storage_bytes"] or 0)
-            totals["cost_attributed"] += cost_val
-
-        return {"ok": True, "source": source, "rows": out_rows, "totals": totals}

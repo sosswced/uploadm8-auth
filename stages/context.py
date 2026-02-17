@@ -11,10 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from typing import TYPE_CHECKING
+from .entitlements import Entitlements
 
-if TYPE_CHECKING:
-    from .entitlements import Entitlements
 
 @dataclass
 class TelemetryData:
@@ -173,7 +171,7 @@ class JobContext:
     errors: List[Dict[str, Any]] = field(default_factory=list)
     cancel_requested: bool = False
 
-    # Explicit error tracking (prevents AttributeError + improves UX)
+    # Explicit error tracking
     error_code: Optional[str] = None
     error_message: Optional[str] = None
 

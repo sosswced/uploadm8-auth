@@ -1,261 +1,226 @@
 """
-UploadM8 Job Context
-====================
-Carries all state through the processing pipeline.
+UploadM8 Worker Database Functions
+===================================
+Database helpers used by the worker pipeline.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+import logging
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
-from .entitlements import Entitlements
+import asyncpg
 
+from .context import JobContext
 
-@dataclass
-class TelemetryData:
-    """Parsed telemetry data from .map file."""
-
-    points: List[Dict[str, Any]] = field(default_factory=list)
-    max_speed_mph: float = 0.0
-    avg_speed_mph: float = 0.0
-    total_distance_miles: float = 0.0
-    duration_seconds: float = 0.0
-    max_altitude_ft: float = 0.0
-    speeding_seconds: float = 0.0
-    euphoria_seconds: float = 0.0
-
-    # -------------------------
-    # Back-compat aliases used by older stages
-    # -------------------------
-    @property
-    def data_points(self) -> List[Dict[str, Any]]:
-        return self.points
-
-    @data_points.setter
-    def data_points(self, v: List[Dict[str, Any]]):
-        self.points = v or []
-
-    @property
-    def max_speed(self) -> float:
-        return self.max_speed_mph
-
-    @max_speed.setter
-    def max_speed(self, v: float):
-        self.max_speed_mph = float(v or 0)
-
-    @property
-    def avg_speed(self) -> float:
-        return self.avg_speed_mph
-
-    @avg_speed.setter
-    def avg_speed(self, v: float):
-        self.avg_speed_mph = float(v or 0)
-
-    @property
-    def distance_miles(self) -> float:
-        return self.total_distance_miles
-
-    @distance_miles.setter
-    def distance_miles(self, v: float):
-        self.total_distance_miles = float(v or 0)
-
-    @property
-    def total_duration(self) -> float:
-        return self.duration_seconds
-
-    @total_duration.setter
-    def total_duration(self, v: float):
-        self.duration_seconds = float(v or 0)
+logger = logging.getLogger("uploadm8-worker")
 
 
-@dataclass
-class TrillScore:
-    """Calculated Trill score from telemetry."""
-
-    total: int = 0
-    speed_score: int = 0
-    distance_score: int = 0
-    duration_score: int = 0
-    altitude_score: int = 0
-    thrill_factor: float = 1.0
+# ============================================================
+# Load Functions
+# ============================================================
+async def load_upload_record(pool: asyncpg.Pool, upload_id: str) -> Optional[dict]:
+    """Load an upload record by ID."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM uploads WHERE id = $1", upload_id)
+        return dict(row) if row else None
 
 
-@dataclass
-class PlatformResult:
-    """Result of publishing to a single platform."""
-
-    platform: str
-    success: bool
-
-    # Step A (accepted)
-    platform_video_id: Optional[str] = None
-    platform_url: Optional[str] = None
-    publish_id: Optional[str] = None
-
-    # Audit/debug
-    attempt_id: Optional[str] = None
-    http_status: Optional[int] = None
-    response_payload: Optional[Dict[str, Any]] = None
-
-    # Errors
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-
-    # Optional engagement
-    views: int = 0
-    likes: int = 0
-
-    # Step B (confirmed)
-    verify_status: str = "pending"  # pending/confirmed/rejected/unknown
+async def load_user(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
+    """Load a user record by ID."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        return dict(row) if row else None
 
 
-@dataclass
-class JobContext:
-    """Processing context that flows through all pipeline stages."""
+async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
+    """Load user settings, returning defaults if none exist."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id = $1", user_id)
+        if row:
+            return dict(row)
 
-    job_id: str
-    upload_id: str
-    user_id: str
-    idempotency_key: str = ""
-    state: str = "queued"
-    stage: str = "init"
-    attempt_count: int = 0
+        # Try user_preferences table as fallback
+        row = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", user_id)
+        if row:
+            return dict(row)
 
-    source_r2_key: str = ""
-    telemetry_r2_key: Optional[str] = None
-    processed_r2_key: Optional[str] = None
-    thumbnail_r2_key: Optional[str] = None
+    return {}
 
-    filename: str = ""
-    file_size: int = 0
-    platforms: List[str] = field(default_factory=list)
-    target_accounts: List[str] = field(default_factory=list)
 
-    title: str = ""
-    caption: str = ""
-    hashtags: List[str] = field(default_factory=list)
-    privacy: str = "public"
+async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
+    """
+    Load per-user entitlement overrides set by admin.
+    Returns None if no overrides table exists or no overrides set.
+    """
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM entitlement_overrides WHERE user_id = $1", user_id
+            )
+            return dict(row) if row else None
+    except asyncpg.exceptions.UndefinedTableError:
+        # Table doesn't exist yet — no overrides
+        return None
+    except Exception as e:
+        logger.debug(f"Entitlement overrides lookup failed (non-fatal): {e}")
+        return None
 
-    entitlements: Optional[Entitlements] = None
-    user_settings: Dict[str, Any] = field(default_factory=dict)
 
-    temp_dir: Optional[Path] = None
-    local_video_path: Optional[Path] = None
-    local_telemetry_path: Optional[Path] = None
-    processed_video_path: Optional[Path] = None
-    thumbnail_path: Optional[Path] = None
-
-    platform_videos: Dict[str, Path] = field(default_factory=dict)
-    video_info: Dict[str, Any] = field(default_factory=dict)
-
-    ai_title: Optional[str] = None
-    ai_caption: Optional[str] = None
-    ai_hashtags: List[str] = field(default_factory=list)
-
-    telemetry_data: Optional[TelemetryData] = None
-    trill_score: Optional[TrillScore] = None
-
-    # Back-compat aliases used by older stages
-    telemetry: Optional[TelemetryData] = None
-    trill: Optional[TrillScore] = None
-    hud_applied: bool = False
-
-    platform_results: List[PlatformResult] = field(default_factory=list)
-    output_artifacts: Dict[str, str] = field(default_factory=dict)
-
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    errors: List[Dict[str, Any]] = field(default_factory=list)
-    cancel_requested: bool = False
-
-    # Explicit error tracking (prevents AttributeError + improves UX)
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-
-    put_cost: int = 0
-    aic_cost: int = 0
-    compute_seconds: float = 0.0
-
-    def __post_init__(self):
-        # Keep legacy and new fields in sync
-        if self.telemetry is None and self.telemetry_data is not None:
-            self.telemetry = self.telemetry_data
-        if self.telemetry_data is None and self.telemetry is not None:
-            self.telemetry_data = self.telemetry
-
-        if self.trill is None and self.trill_score is not None:
-            self.trill = self.trill_score
-        if self.trill_score is None and self.trill is not None:
-            self.trill_score = self.trill
-
-    def mark_stage(self, stage: str):
-        self.stage = stage
-
-    def mark_error(self, code: str, message: str, retryable: bool = False):
-        self.error_code = code
-        self.error_message = message
-        self.errors.append(
-            {
-                "code": code,
-                "message": message,
-                "stage": self.stage,
-                "retryable": retryable,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
+# ============================================================
+# Status Updates
+# ============================================================
+async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
+    """Mark upload as processing."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE uploads
+            SET status = 'processing',
+                processing_started_at = $2,
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            ctx.upload_id,
+            ctx.started_at or datetime.now(timezone.utc),
         )
 
-    def get_failed_platforms(self) -> List[str]:
-        return [r.platform for r in self.platform_results if not r.success]
 
-    def get_final_video_path(self) -> Optional[Path]:
-        return self.processed_video_path or self.local_video_path
-
-    def get_video_for_platform(self, platform: str) -> Optional[Path]:
-        if platform in self.platform_videos:
-            return self.platform_videos[platform]
-        if self.processed_video_path and self.processed_video_path.exists():
-            return self.processed_video_path
-        return self.local_video_path
-
-    def get_effective_title(self) -> str:
-        return self.ai_title or self.title or self.filename
-
-    def get_effective_caption(self) -> str:
-        return self.ai_caption or self.caption or ""
-
-    def get_effective_hashtags(self) -> List[str]:
-        return self.ai_hashtags if self.ai_hashtags else self.hashtags
-
-    def is_success(self) -> bool:
-        return any(r.success for r in self.platform_results)
-
-    def is_partial_success(self) -> bool:
-        return any(r.success for r in self.platform_results) and any(
-            (not r.success) for r in self.platform_results
+async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
+    """Mark upload as completed (success or failed based on ctx.state)."""
+    platform_results_json = None
+    if ctx.platform_results:
+        platform_results_json = json.dumps(
+            [
+                {
+                    "platform": r.platform,
+                    "success": r.success,
+                    "platform_video_id": r.platform_video_id,
+                    "platform_url": r.platform_url,
+                    "publish_id": r.publish_id,
+                    "error_code": r.error_code,
+                    "error_message": r.error_message,
+                    "verify_status": r.verify_status,
+                    "http_status": r.http_status,
+                    "views": r.views,
+                    "likes": r.likes,
+                }
+                for r in ctx.platform_results
+            ]
         )
 
-    def get_success_platforms(self) -> List[str]:
-        return [r.platform for r in self.platform_results if r.success]
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE uploads
+            SET status = $2,
+                processing_finished_at = $3,
+                completed_at = CASE WHEN $2 = 'succeeded' THEN $3 ELSE completed_at END,
+                error_code = $4,
+                error_detail = $5,
+                platform_results = $6::jsonb,
+                compute_seconds = $7,
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            ctx.upload_id,
+            ctx.state,
+            ctx.finished_at or datetime.now(timezone.utc),
+            ctx.error_code,
+            ctx.error_message,
+            platform_results_json,
+            ctx.compute_seconds,
+        )
 
 
-def create_context(job_data: dict, upload_record: dict, user_settings: dict, entitlements: Entitlements) -> JobContext:
-    return JobContext(
-        job_id=job_data.get("job_id", ""),
-        upload_id=str(upload_record.get("id", "")),
-        user_id=str(upload_record.get("user_id", "")),
-        idempotency_key=job_data.get("idempotency_key", ""),
-        source_r2_key=upload_record.get("r2_key", ""),
-        telemetry_r2_key=upload_record.get("telemetry_r2_key"),
-        filename=upload_record.get("filename", ""),
-        file_size=upload_record.get("file_size", 0),
-        platforms=upload_record.get("platforms", []) or [],
-        title=upload_record.get("title", ""),
-        caption=upload_record.get("caption", ""),
-        hashtags=upload_record.get("hashtags", []) or [],
-        privacy=upload_record.get("privacy", "public") or "public",
-        user_settings=user_settings or {},
-        entitlements=entitlements,
-    )
+async def mark_processing_failed(
+    pool: asyncpg.Pool, ctx: JobContext, error_code: str, error_detail: str
+):
+    """Mark upload as failed with error info."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE uploads
+            SET status = 'failed',
+                error_code = $2,
+                error_detail = $3,
+                processing_finished_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            ctx.upload_id,
+            error_code,
+            error_detail,
+        )
+
+
+async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
+    """Mark upload as cancelled."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE uploads
+            SET status = 'cancelled',
+                processing_finished_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            upload_id,
+        )
+
+
+async def check_cancel_requested(pool: asyncpg.Pool, upload_id: str) -> bool:
+    """Check if cancellation was requested for this upload."""
+    async with pool.acquire() as conn:
+        val = await conn.fetchval(
+            "SELECT cancel_requested FROM uploads WHERE id = $1", upload_id
+        )
+        return bool(val)
+
+
+# ============================================================
+# Metadata & Counts
+# ============================================================
+async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
+    """Save AI-generated metadata (title, caption, hashtags) back to the upload."""
+    updates = []
+    params = [ctx.upload_id]
+    idx = 1
+
+    if ctx.ai_title:
+        idx += 1
+        updates.append(f"ai_generated_title = ${idx}")
+        params.append(ctx.ai_title)
+
+    if ctx.ai_caption:
+        idx += 1
+        updates.append(f"ai_generated_caption = ${idx}")
+        params.append(ctx.ai_caption)
+
+    if ctx.ai_hashtags:
+        idx += 1
+        updates.append(f"ai_generated_hashtags = ${idx}")
+        params.append(ctx.ai_hashtags)
+
+    if not updates:
+        return
+
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                f"UPDATE uploads SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1",
+                *params,
+            )
+        except asyncpg.exceptions.UndefinedColumnError as e:
+            logger.warning(f"save_generated_metadata skipped (column missing): {e}")
+
+
+async def increment_upload_count(pool: asyncpg.Pool, user_id: str):
+    """Increment the user's completed upload count (last_active_at update)."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET last_active_at = NOW(), updated_at = NOW() WHERE id = $1",
+            user_id,
+        )

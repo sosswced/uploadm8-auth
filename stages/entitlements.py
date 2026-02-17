@@ -1,261 +1,242 @@
 """
-UploadM8 Job Context
-====================
-Carries all state through the processing pipeline.
+UploadM8 Entitlements System
+=============================
+Defines tier-based entitlements and helper functions for the worker pipeline.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-
-from .entitlements import Entitlements
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 
+# ============================================================
+# Tier Configuration (mirrors PLAN_CONFIG from API server)
+# ============================================================
+TIER_CONFIG: Dict[str, Dict[str, Any]] = {
+    "free": {
+        "name": "Free", "price": 0,
+        "put_daily": 1, "put_monthly": 30, "aic_monthly": 0,
+        "max_accounts": 1,
+        "watermark": True, "ads": True, "ai": False,
+        "scheduling": False, "webhooks": False, "white_label": False,
+        "excel": False, "priority": False, "flex": False,
+        "hud": False,
+    },
+    "launch": {
+        "name": "Launch", "price": 29,
+        "put_daily": 5, "put_monthly": 600, "aic_monthly": 30,
+        "max_accounts": 4,
+        "watermark": True, "ads": False, "ai": True,
+        "scheduling": False, "webhooks": False, "white_label": False,
+        "excel": False, "priority": False, "flex": False,
+        "hud": False,
+    },
+    "creator_pro": {
+        "name": "Creator Pro", "price": 59,
+        "put_daily": 10, "put_monthly": 1200, "aic_monthly": 300,
+        "max_accounts": 8,
+        "watermark": False, "ads": False, "ai": True,
+        "scheduling": True, "webhooks": True, "white_label": False,
+        "excel": False, "priority": False, "flex": False,
+        "hud": True,
+    },
+    "studio": {
+        "name": "Studio", "price": 99,
+        "put_daily": 25, "put_monthly": 3000, "aic_monthly": 1000,
+        "max_accounts": 20,
+        "watermark": False, "ads": False, "ai": True,
+        "scheduling": True, "webhooks": True, "white_label": True,
+        "excel": True, "priority": False, "flex": False,
+        "hud": True,
+    },
+    "agency": {
+        "name": "Agency", "price": 199,
+        "put_daily": 75, "put_monthly": 9000, "aic_monthly": 3000,
+        "max_accounts": 60,
+        "watermark": False, "ads": False, "ai": True,
+        "scheduling": True, "webhooks": True, "white_label": True,
+        "excel": True, "priority": True, "flex": False,
+        "hud": True,
+    },
+    "master_admin": {
+        "name": "Admin", "price": 0,
+        "put_daily": 9999, "put_monthly": 999999, "aic_monthly": 999999,
+        "max_accounts": 999,
+        "watermark": False, "ads": False, "ai": True,
+        "scheduling": True, "webhooks": True, "white_label": True,
+        "excel": True, "priority": True, "flex": True,
+        "hud": True, "internal": True,
+    },
+    "friends_family": {
+        "name": "Friends", "price": 0,
+        "put_daily": 100, "put_monthly": 12000, "aic_monthly": 5000,
+        "max_accounts": 80,
+        "watermark": False, "ads": False, "ai": True,
+        "scheduling": True, "webhooks": True, "white_label": True,
+        "excel": True, "priority": True, "flex": True,
+        "hud": True, "internal": True,
+    },
+    "lifetime": {
+        "name": "Lifetime", "price": 0,
+        "put_daily": 100, "put_monthly": 12000, "aic_monthly": 5000,
+        "max_accounts": 80,
+        "watermark": False, "ads": False, "ai": True,
+        "scheduling": True, "webhooks": True, "white_label": True,
+        "excel": True, "priority": True, "flex": True,
+        "hud": True, "internal": True,
+    },
+}
+
+STRIPE_LOOKUP_TO_TIER = {
+    "uploadm8_launch_monthly": "launch",
+    "uploadm8_creatorpro_monthly": "creator_pro",
+    "uploadm8_studio_monthly": "studio",
+    "uploadm8_agency_monthly": "agency",
+}
+
+
+# ============================================================
+# Entitlements Dataclass
+# ============================================================
 @dataclass
-class TelemetryData:
-    """Parsed telemetry data from .map file."""
+class Entitlements:
+    """Resolved entitlements for a user, combining tier + overrides."""
 
-    points: List[Dict[str, Any]] = field(default_factory=list)
-    max_speed_mph: float = 0.0
-    avg_speed_mph: float = 0.0
-    total_distance_miles: float = 0.0
-    duration_seconds: float = 0.0
-    max_altitude_ft: float = 0.0
-    speeding_seconds: float = 0.0
-    euphoria_seconds: float = 0.0
+    tier: str = "free"
+    tier_display: str = "Free"
 
-    # -------------------------
-    # Back-compat aliases used by older stages
-    # -------------------------
-    @property
-    def data_points(self) -> List[Dict[str, Any]]:
-        return self.points
+    # Limits
+    put_daily: int = 1
+    put_monthly: int = 30
+    aic_monthly: int = 0
+    max_accounts: int = 1
 
-    @data_points.setter
-    def data_points(self, v: List[Dict[str, Any]]):
-        self.points = v or []
+    # Feature flags
+    can_watermark: bool = True      # True = watermark IS applied (free tier)
+    can_ai: bool = False
+    can_schedule: bool = False
+    can_webhooks: bool = False
+    can_white_label: bool = False
+    can_excel: bool = False
+    can_priority: bool = False
+    can_flex: bool = False
+    can_burn_hud: bool = False
+    show_ads: bool = True
 
-    @property
-    def max_speed(self) -> float:
-        return self.max_speed_mph
-
-    @max_speed.setter
-    def max_speed(self, v: float):
-        self.max_speed_mph = float(v or 0)
-
-    @property
-    def avg_speed(self) -> float:
-        return self.avg_speed_mph
-
-    @avg_speed.setter
-    def avg_speed(self, v: float):
-        self.avg_speed_mph = float(v or 0)
-
-    @property
-    def distance_miles(self) -> float:
-        return self.total_distance_miles
-
-    @distance_miles.setter
-    def distance_miles(self, v: float):
-        self.total_distance_miles = float(v or 0)
-
-    @property
-    def total_duration(self) -> float:
-        return self.duration_seconds
-
-    @total_duration.setter
-    def total_duration(self, v: float):
-        self.duration_seconds = float(v or 0)
+    # Internal tier flag
+    is_internal: bool = False
 
 
-@dataclass
-class TrillScore:
-    """Calculated Trill score from telemetry."""
-
-    total: int = 0
-    speed_score: int = 0
-    distance_score: int = 0
-    duration_score: int = 0
-    altitude_score: int = 0
-    thrill_factor: float = 1.0
-
-
-@dataclass
-class PlatformResult:
-    """Result of publishing to a single platform."""
-
-    platform: str
-    success: bool
-
-    # Step A (accepted)
-    platform_video_id: Optional[str] = None
-    platform_url: Optional[str] = None
-    publish_id: Optional[str] = None
-
-    # Audit/debug
-    attempt_id: Optional[str] = None
-    http_status: Optional[int] = None
-    response_payload: Optional[Dict[str, Any]] = None
-
-    # Errors
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-
-    # Optional engagement
-    views: int = 0
-    likes: int = 0
-
-    # Step B (confirmed)
-    verify_status: str = "pending"  # pending/confirmed/rejected/unknown
-
-
-@dataclass
-class JobContext:
-    """Processing context that flows through all pipeline stages."""
-
-    job_id: str
-    upload_id: str
-    user_id: str
-    idempotency_key: str = ""
-    state: str = "queued"
-    stage: str = "init"
-    attempt_count: int = 0
-
-    source_r2_key: str = ""
-    telemetry_r2_key: Optional[str] = None
-    processed_r2_key: Optional[str] = None
-    thumbnail_r2_key: Optional[str] = None
-
-    filename: str = ""
-    file_size: int = 0
-    platforms: List[str] = field(default_factory=list)
-    target_accounts: List[str] = field(default_factory=list)
-
-    title: str = ""
-    caption: str = ""
-    hashtags: List[str] = field(default_factory=list)
-    privacy: str = "public"
-
-    entitlements: Optional[Entitlements] = None
-    user_settings: Dict[str, Any] = field(default_factory=dict)
-
-    temp_dir: Optional[Path] = None
-    local_video_path: Optional[Path] = None
-    local_telemetry_path: Optional[Path] = None
-    processed_video_path: Optional[Path] = None
-    thumbnail_path: Optional[Path] = None
-
-    platform_videos: Dict[str, Path] = field(default_factory=dict)
-    video_info: Dict[str, Any] = field(default_factory=dict)
-
-    ai_title: Optional[str] = None
-    ai_caption: Optional[str] = None
-    ai_hashtags: List[str] = field(default_factory=list)
-
-    telemetry_data: Optional[TelemetryData] = None
-    trill_score: Optional[TrillScore] = None
-
-    # Back-compat aliases used by older stages
-    telemetry: Optional[TelemetryData] = None
-    trill: Optional[TrillScore] = None
-    hud_applied: bool = False
-
-    platform_results: List[PlatformResult] = field(default_factory=list)
-    output_artifacts: Dict[str, str] = field(default_factory=dict)
-
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    errors: List[Dict[str, Any]] = field(default_factory=list)
-    cancel_requested: bool = False
-
-    # Explicit error tracking (prevents AttributeError + improves UX)
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-
-    put_cost: int = 0
-    aic_cost: int = 0
-    compute_seconds: float = 0.0
-
-    def __post_init__(self):
-        # Keep legacy and new fields in sync
-        if self.telemetry is None and self.telemetry_data is not None:
-            self.telemetry = self.telemetry_data
-        if self.telemetry_data is None and self.telemetry is not None:
-            self.telemetry_data = self.telemetry
-
-        if self.trill is None and self.trill_score is not None:
-            self.trill = self.trill_score
-        if self.trill_score is None and self.trill is not None:
-            self.trill_score = self.trill
-
-    def mark_stage(self, stage: str):
-        self.stage = stage
-
-    def mark_error(self, code: str, message: str, retryable: bool = False):
-        self.error_code = code
-        self.error_message = message
-        self.errors.append(
-            {
-                "code": code,
-                "message": message,
-                "stage": self.stage,
-                "retryable": retryable,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-
-    def get_failed_platforms(self) -> List[str]:
-        return [r.platform for r in self.platform_results if not r.success]
-
-    def get_final_video_path(self) -> Optional[Path]:
-        return self.processed_video_path or self.local_video_path
-
-    def get_video_for_platform(self, platform: str) -> Optional[Path]:
-        if platform in self.platform_videos:
-            return self.platform_videos[platform]
-        if self.processed_video_path and self.processed_video_path.exists():
-            return self.processed_video_path
-        return self.local_video_path
-
-    def get_effective_title(self) -> str:
-        return self.ai_title or self.title or self.filename
-
-    def get_effective_caption(self) -> str:
-        return self.ai_caption or self.caption or ""
-
-    def get_effective_hashtags(self) -> List[str]:
-        return self.ai_hashtags if self.ai_hashtags else self.hashtags
-
-    def is_success(self) -> bool:
-        return any(r.success for r in self.platform_results)
-
-    def is_partial_success(self) -> bool:
-        return any(r.success for r in self.platform_results) and any(
-            (not r.success) for r in self.platform_results
-        )
-
-    def get_success_platforms(self) -> List[str]:
-        return [r.platform for r in self.platform_results if r.success]
-
-
-def create_context(job_data: dict, upload_record: dict, user_settings: dict, entitlements: Entitlements) -> JobContext:
-    return JobContext(
-        job_id=job_data.get("job_id", ""),
-        upload_id=str(upload_record.get("id", "")),
-        user_id=str(upload_record.get("user_id", "")),
-        idempotency_key=job_data.get("idempotency_key", ""),
-        source_r2_key=upload_record.get("r2_key", ""),
-        telemetry_r2_key=upload_record.get("telemetry_r2_key"),
-        filename=upload_record.get("filename", ""),
-        file_size=upload_record.get("file_size", 0),
-        platforms=upload_record.get("platforms", []) or [],
-        title=upload_record.get("title", ""),
-        caption=upload_record.get("caption", ""),
-        hashtags=upload_record.get("hashtags", []) or [],
-        privacy=upload_record.get("privacy", "public") or "public",
-        user_settings=user_settings or {},
-        entitlements=entitlements,
+# ============================================================
+# Builder Functions
+# ============================================================
+def get_entitlements_for_tier(tier: str) -> Entitlements:
+    """Build entitlements from a tier name."""
+    cfg = TIER_CONFIG.get(tier.lower(), TIER_CONFIG["free"])
+    return Entitlements(
+        tier=tier.lower(),
+        tier_display=cfg.get("name", tier.title()),
+        put_daily=cfg.get("put_daily", 1),
+        put_monthly=cfg.get("put_monthly", 30),
+        aic_monthly=cfg.get("aic_monthly", 0),
+        max_accounts=cfg.get("max_accounts", 1),
+        can_watermark=cfg.get("watermark", True),
+        can_ai=cfg.get("ai", False),
+        can_schedule=cfg.get("scheduling", False),
+        can_webhooks=cfg.get("webhooks", False),
+        can_white_label=cfg.get("white_label", False),
+        can_excel=cfg.get("excel", False),
+        can_priority=cfg.get("priority", False),
+        can_flex=cfg.get("flex", False),
+        can_burn_hud=cfg.get("hud", False),
+        show_ads=cfg.get("ads", True),
+        is_internal=cfg.get("internal", False),
     )
+
+
+def get_entitlements_from_user(user_record: dict, overrides: Optional[dict] = None) -> Entitlements:
+    """
+    Build entitlements from a user DB row + optional admin overrides.
+
+    Args:
+        user_record: Row from the users table (dict).
+        overrides: Optional dict of per-user overrides from entitlement_overrides table.
+
+    Returns:
+        Fully resolved Entitlements.
+    """
+    tier = (user_record.get("subscription_tier") or "free").lower()
+    ent = get_entitlements_for_tier(tier)
+
+    # Apply per-user overrides (admin can grant features individually)
+    if overrides:
+        if overrides.get("can_ai") is not None:
+            ent.can_ai = bool(overrides["can_ai"])
+        if overrides.get("can_schedule") is not None:
+            ent.can_schedule = bool(overrides["can_schedule"])
+        if overrides.get("can_burn_hud") is not None:
+            ent.can_burn_hud = bool(overrides["can_burn_hud"])
+        if overrides.get("can_priority") is not None:
+            ent.can_priority = bool(overrides["can_priority"])
+        if overrides.get("can_flex") is not None:
+            ent.can_flex = bool(overrides["can_flex"])
+        if overrides.get("max_accounts") is not None:
+            ent.max_accounts = int(overrides["max_accounts"])
+        if overrides.get("can_watermark") is not None:
+            ent.can_watermark = bool(overrides["can_watermark"])
+
+    # flex_enabled on user record is a legacy per-user toggle
+    if user_record.get("flex_enabled"):
+        ent.can_flex = True
+
+    return ent
+
+
+def entitlements_to_dict(ent: Entitlements) -> dict:
+    """Serialize entitlements to a JSON-safe dict."""
+    return {
+        "tier": ent.tier,
+        "tier_display": ent.tier_display,
+        "put_daily": ent.put_daily,
+        "put_monthly": ent.put_monthly,
+        "aic_monthly": ent.aic_monthly,
+        "max_accounts": ent.max_accounts,
+        "can_watermark": ent.can_watermark,
+        "can_ai": ent.can_ai,
+        "can_schedule": ent.can_schedule,
+        "can_webhooks": ent.can_webhooks,
+        "can_white_label": ent.can_white_label,
+        "can_excel": ent.can_excel,
+        "can_priority": ent.can_priority,
+        "can_flex": ent.can_flex,
+        "can_burn_hud": ent.can_burn_hud,
+        "show_ads": ent.show_ads,
+        "is_internal": ent.is_internal,
+    }
+
+
+# ============================================================
+# Guard Helpers (used by upload presign, account connect, etc.)
+# ============================================================
+def can_user_upload(user_record: dict, overrides: Optional[dict] = None) -> bool:
+    """Check if user's tier allows uploading."""
+    ent = get_entitlements_from_user(user_record, overrides)
+    return ent.put_daily > 0
+
+
+def can_user_connect_platform(user_record: dict, current_count: int, overrides: Optional[dict] = None) -> bool:
+    """Check if user can connect another platform account."""
+    ent = get_entitlements_from_user(user_record, overrides)
+    return current_count < ent.max_accounts
+
+
+def get_tier_display_name(tier: str) -> str:
+    """Get human-readable tier name."""
+    cfg = TIER_CONFIG.get(tier.lower(), {})
+    return cfg.get("name", tier.title())
+
+
+def get_tier_from_lookup_key(lookup_key: str) -> str:
+    """Convert Stripe lookup key to internal tier name."""
+    return STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")

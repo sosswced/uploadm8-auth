@@ -1,110 +1,211 @@
 """
-UploadM8 Transcode Stage
-=======================
-Transcode the uploaded video into a normalized, platform-friendly MP4.
+UploadM8 Verify Stage
+======================
+Background verification loop that polls platform APIs to confirm
+published videos actually went live (Step B confirmation).
 
-Contract:
-- Exports: run_transcode_stage(ctx)
-- Input:  ctx.local_video_path must point to the downloaded source video
-- Output: ctx.processed_video_path set to transcoded mp4
+The publish stage records "accepted" status (Step A). This stage
+asynchronously verifies that videos actually appear on platforms.
 
-This stage is intentionally conservative:
-- If input video path is missing, it raises StageError (pipeline should fail)
-- If FFmpeg is unavailable, it raises StageError
+Exports: run_verification_loop(db_pool, shutdown_event)
 """
 
-from __future__ import annotations
-
 import asyncio
+import json
+import logging
 import os
-from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
-from .errors import StageError, ErrorCode
+import asyncpg
+import httpx
 
+from . import db as db_stage
+from .publish_stage import decrypt_token, init_enc_keys
 
-def _get_ffmpeg_bin() -> str:
-    # allow override for container differences
-    return os.environ.get("FFMPEG_BIN", "ffmpeg")
+logger = logging.getLogger("uploadm8-worker")
 
-
-async def _run_cmd(cmd: list[str]) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    out_b, err_b = await proc.communicate()
-    out = out_b.decode("utf-8", errors="replace") if out_b else ""
-    err = err_b.decode("utf-8", errors="replace") if err_b else ""
-    return proc.returncode, out, err
+VERIFY_INTERVAL_SECONDS = int(os.environ.get("VERIFY_INTERVAL_SECONDS", "60"))
+VERIFY_MAX_AGE_HOURS = int(os.environ.get("VERIFY_MAX_AGE_HOURS", "24"))
 
 
-async def run_transcode_stage(ctx, *, target_height: Optional[int] = None, crf: str = "23"):
-    """Canonical entrypoint expected by worker.py."""
+async def verify_tiktok(publish_id: str, token_data: dict) -> str:
+    """
+    Check TikTok publish status.
+    Returns: 'confirmed', 'rejected', 'pending', or 'unknown'.
+    """
+    access_token = token_data.get("access_token")
+    if not access_token or not publish_id:
+        return "unknown"
 
-    # Stage markers (support both sync and async variants)
-    if hasattr(ctx, "mark_stage"):
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"publish_id": publish_id},
+            )
+
+            if resp.status_code != 200:
+                return "unknown"
+
+            data = resp.json().get("data", {})
+            status = data.get("status", "").upper()
+
+            if status == "PUBLISH_COMPLETE":
+                return "confirmed"
+            elif status in ("FAILED", "UPLOAD_ERROR"):
+                return "rejected"
+            elif status in ("PROCESSING_UPLOAD", "PROCESSING_DOWNLOAD", "SENDING_TO_USER_INBOX"):
+                return "pending"
+            else:
+                return "unknown"
+
+    except Exception as e:
+        logger.debug(f"TikTok verify failed: {e}")
+        return "unknown"
+
+
+async def verify_youtube(video_id: str, token_data: dict) -> str:
+    """
+    Check YouTube video status.
+    Returns: 'confirmed', 'rejected', 'pending', or 'unknown'.
+    """
+    access_token = token_data.get("access_token")
+    if not access_token or not video_id:
+        return "unknown"
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={
+                    "id": video_id,
+                    "part": "status",
+                },
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+
+            if resp.status_code != 200:
+                return "unknown"
+
+            items = resp.json().get("items", [])
+            if not items:
+                return "rejected"
+
+            upload_status = items[0].get("status", {}).get("uploadStatus", "")
+            if upload_status == "processed":
+                return "confirmed"
+            elif upload_status in ("failed", "rejected", "deleted"):
+                return "rejected"
+            elif upload_status == "uploaded":
+                return "pending"
+            else:
+                return "unknown"
+
+    except Exception as e:
+        logger.debug(f"YouTube verify failed: {e}")
+        return "unknown"
+
+
+async def verify_single_attempt(
+    db_pool: asyncpg.Pool,
+    attempt: dict,
+) -> None:
+    """Verify a single publish attempt and update the DB."""
+    platform = attempt.get("platform", "")
+    attempt_id = str(attempt.get("id", ""))
+    publish_id = attempt.get("publish_id")
+    platform_post_id = attempt.get("platform_post_id")
+    user_id = str(attempt.get("user_id", ""))
+
+    if not attempt_id:
+        return
+
+    # Load platform token for this user
+    platform_to_db_key = {
+        "tiktok": "tiktok",
+        "youtube": "google",
+        "instagram": "meta",
+        "facebook": "meta",
+    }
+    db_key = platform_to_db_key.get(platform, platform)
+
+    token_data = None
+    try:
+        token_data = await db_stage.load_platform_token(db_pool, user_id, db_key)
+    except Exception:
+        pass
+
+    if not token_data:
+        # Can't verify without token — mark unknown
+        await db_stage.update_publish_attempt_verified(db_pool, attempt_id, "unknown")
+        return
+
+    # Decrypt if needed
+    try:
+        token_data = decrypt_token(token_data) or token_data
+    except Exception:
+        pass
+
+    # Platform-specific verification
+    verify_status = "unknown"
+
+    if platform == "tiktok" and publish_id:
+        verify_status = await verify_tiktok(publish_id, token_data)
+    elif platform == "youtube" and platform_post_id:
+        verify_status = await verify_youtube(platform_post_id, token_data)
+    else:
+        # Instagram/Facebook verification not yet implemented
+        verify_status = "unknown"
+
+    # Update DB
+    await db_stage.update_publish_attempt_verified(db_pool, attempt_id, verify_status)
+    logger.debug(f"Verify {platform}/{attempt_id}: {verify_status}")
+
+
+async def run_verification_loop(
+    db_pool: asyncpg.Pool,
+    shutdown_event: asyncio.Event,
+):
+    """
+    Background loop that polls pending publish attempts and verifies them.
+
+    Runs alongside the main job processing loop. Exits when shutdown_event is set.
+    """
+    logger.info("Verification loop started")
+    init_enc_keys()
+
+    while not shutdown_event.is_set():
         try:
-            res = ctx.mark_stage("transcode")
-            if hasattr(res, "__await__"):
-                await res
-        except Exception:
-            pass
+            # Load pending verifications
+            pending = await db_stage.load_pending_verifications(db_pool, limit=50)
 
-    in_path = getattr(ctx, "local_video_path", None)
-    if not in_path:
-        raise StageError(ErrorCode.VALIDATION, "Missing local_video_path for transcode", stage="transcode")
+            if pending:
+                logger.info(f"Verifying {len(pending)} publish attempts")
+                for attempt in pending:
+                    if shutdown_event.is_set():
+                        break
+                    try:
+                        await verify_single_attempt(db_pool, attempt)
+                    except Exception as e:
+                        logger.warning(f"Verify attempt failed: {e}")
+                    # Small delay between API calls to avoid rate limits
+                    await asyncio.sleep(0.5)
 
-    in_path = Path(in_path)
-    if not in_path.exists():
-        raise StageError(ErrorCode.NOT_FOUND, f"Input video not found: {in_path}", stage="transcode")
+        except Exception as e:
+            logger.warning(f"Verification loop error: {e}")
 
-    tmp_dir = getattr(ctx, "temp_dir", None)
-    if not tmp_dir:
-        # create a stage-local temp dir under /tmp if pipeline didn't supply one
-        tmp_dir = Path("/tmp") / f"uploadm8_{getattr(ctx, 'upload_id', 'unknown')}"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        setattr(ctx, "temp_dir", tmp_dir)
+        # Wait for next cycle or shutdown
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(),
+                timeout=VERIFY_INTERVAL_SECONDS,
+            )
+            break  # shutdown_event was set
+        except asyncio.TimeoutError:
+            pass  # Normal timeout — loop again
 
-    out_path = Path(tmp_dir) / "processed.mp4"
-
-    # Scale logic: optional knob, default keeps source dimensions.
-    vf = None
-    if target_height:
-        # keep aspect ratio, force even dimensions
-        vf = f"scale=-2:{int(target_height)}"
-
-    cmd = [
-        _get_ffmpeg_bin(),
-        "-y",
-        "-i",
-        str(in_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-    ]
-    if vf:
-        cmd += ["-vf", vf]
-    cmd += [str(out_path)]
-
-    rc, out, err = await _run_cmd(cmd)
-    if rc != 0 or not out_path.exists():
-        # keep stderr short; worker logs capture full traceback anyway
-        snippet = (err or out)[-1500:]
-        raise StageError(ErrorCode.UPSTREAM, f"FFmpeg transcode failed (rc={rc}). {snippet}", stage="transcode")
-
-    setattr(ctx, "processed_video_path", out_path)
-
-    return ctx
+    logger.info("Verification loop stopped")

@@ -75,12 +75,29 @@ class TelemetryData:
 class TrillScore:
     """Calculated Trill score from telemetry."""
 
-    total: int = 0
-    speed_score: int = 0
-    distance_score: int = 0
-    duration_score: int = 0
-    altitude_score: int = 0
-    thrill_factor: float = 1.0
+    # Primary fields (used by telemetry_stage)
+    score: int = 0
+    bucket: str = "chill"
+    speed_score: float = 0.0
+    speeding_score: float = 0.0
+    euphoria_score: float = 0.0
+    consistency_score: float = 0.0
+    excessive_speed: bool = False
+    title_modifier: str = ""
+    hashtags: List[str] = field(default_factory=list)
+
+    # Legacy aliases
+    @property
+    def total(self) -> int:
+        return self.score
+
+    @total.setter
+    def total(self, v: int):
+        self.score = v
+
+    @property
+    def thrill_factor(self) -> float:
+        return self.score / 100.0 if self.score else 0.0
 
 
 @dataclass

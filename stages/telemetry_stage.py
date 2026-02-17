@@ -1,480 +1,247 @@
 """
-UploadM8 Publish Stage
-======================
-Publish videos to social media platforms.
-Wraps existing platform upload modules.
+UploadM8 Telemetry Stage
+========================
+Parse .map telemetry files and calculate Trill scores.
 """
 
-import os
-import json
 import logging
-import base64
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import List, Dict
 
-import httpx
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-from .errors import PublishError, ErrorCode
-from .context import JobContext, PlatformResult
-from . import db as db_stage
+from .errors import TelemetryError, SkipStage, ErrorCode
+from .context import JobContext, TelemetryData, TrillScore
 
 
 logger = logging.getLogger("uploadm8-worker")
 
 
-# Encryption keys (initialized at startup)
-TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
-_ENC_KEYS: Dict[str, bytes] = {}
+# Default thresholds
+DEFAULT_SPEEDING_MPH = 80
+DEFAULT_EUPHORIA_MPH = 100
 
 
-def init_enc_keys():
-    """Parse encryption keys from environment."""
-    global _ENC_KEYS
-    if not TOKEN_ENC_KEYS:
-        return
-    
-    clean = TOKEN_ENC_KEYS.strip().strip('"').replace("\\n", "")
-    parts = [p.strip() for p in clean.split(",") if p.strip()]
-    for part in parts:
-        if ":" not in part:
-            continue
-        kid, b64key = part.split(":", 1)
-        try:
-            raw = base64.b64decode(b64key.strip())
-            if len(raw) == 32:
-                _ENC_KEYS[kid.strip()] = raw
-        except Exception:
-            pass
+def parse_map_file(map_path: Path) -> TelemetryData:
+    """
+    Parse .map telemetry file.
 
+    Expected CSV format: timestamp,lat,lon,speed_mph,altitude
+    Lines starting with # are comments.
 
-def decrypt_token_blob(blob: Any) -> dict:
-    """Decrypt platform token blob."""
-    if isinstance(blob, str):
-        blob = json.loads(blob)
-    
-    kid = blob.get("kid", "v1")
-    key = _ENC_KEYS.get(kid)
-    if not key:
-        raise ValueError(f"Unknown key id: {kid}")
-    
-    nonce = base64.b64decode(blob["nonce"])
-    ciphertext = base64.b64decode(blob["ciphertext"])
-    aesgcm = AESGCM(key)
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-    return json.loads(plaintext.decode("utf-8"))
-
-
-
-
-# ---------------------------------------------------------------------
-# Compatibility exports for verify_stage
-# verify_stage imports: from .publish_stage import decrypt_token, init_enc_keys
-# This project stores tokens sometimes as encrypted blobs; other times as plain dicts.
-# decrypt_token returns a dict with access_token etc, or None on failure.
-# ---------------------------------------------------------------------
-def decrypt_token(token_row: Any) -> Optional[dict]:
-    """Best-effort decrypt/parse of a stored platform token row.
-
-    Accepts:
-      - dict: either already plaintext token data OR an encrypted blob dict
-      - str: JSON string for either plaintext dict or encrypted blob
+    Args:
+        map_path: Path to .map file
 
     Returns:
-      - dict token payload (e.g., {"access_token": "..."})
-      - None if missing/invalid
+        TelemetryData with parsed points
+
+    Raises:
+        TelemetryError: If parsing fails
     """
-    if token_row is None:
-        return None
+    data_points: List[Dict[str, float]] = []
+
     try:
-        if isinstance(token_row, str):
-            token_row = json.loads(token_row)
-        if not isinstance(token_row, dict):
-            return None
+        with open(map_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
 
-        # If this looks like an encrypted blob, decrypt it.
-        if "ciphertext" in token_row and "nonce" in token_row:
-            try:
-                return decrypt_token_blob(token_row)
-            except Exception:
-                return None
+                parts = line.split(',')
+                if len(parts) < 4:
+                    continue
 
-        # Already plaintext token dict
-        return token_row
-    except Exception:
-        return None
-
-
-def _derive_title_desc(ctx: JobContext) -> tuple[str, str]:
-    """Derive best-effort title/description from JobContext without assuming schema."""
-    title = getattr(ctx, "title", None) or getattr(ctx, "video_title", None) or getattr(ctx, "name", None)
-    desc = getattr(ctx, "description", None) or getattr(ctx, "caption", None) or ""
-    if not title:
-        title = f"UploadM8 {getattr(ctx, 'upload_id', '')}".strip()
-    return str(title), str(desc)
-
-
-async def publish_to_tiktok_ctx(video_path: Path, ctx: JobContext, token_data: dict) -> PlatformResult:
-    title, _ = _derive_title_desc(ctx)
-    return await publish_to_tiktok(video_path, title, token_data)
-
-
-async def publish_to_youtube_ctx(video_path: Path, ctx: JobContext, token_data: dict) -> PlatformResult:
-    title, desc = _derive_title_desc(ctx)
-    return await publish_to_youtube(video_path, title, desc, token_data)
-async def publish_to_tiktok(
-    video_path: Path,
-    title: str,
-    token_data: dict
-) -> PlatformResult:
-    """Publish video to TikTok using Content Posting API."""
-    access_token = token_data.get("access_token")
-    if not access_token:
-        return PlatformResult(
-            platform="tiktok",
-            success=False,
-            error_message="No access token"
-        )
-    
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            # Step 1: Initialize upload
-            init_resp = await client.post(
-                "https://open.tiktokapis.com/v2/post/publish/video/init/",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "post_info": {
-                        "title": title[:150],
-                        "privacy_level": "PUBLIC_TO_EVERYONE",
-                    },
-                    "source_info": {
-                        "source": "FILE_UPLOAD",
-                        "video_size": video_path.stat().st_size,
+                try:
+                    point = {
+                        'timestamp': float(parts[0]),
+                        'lat': float(parts[1]),
+                        'lon': float(parts[2]),
+                        'speed_mph': float(parts[3]),
+                        'altitude': float(parts[4]) if len(parts) > 4 else 0
                     }
-                }
-            )
-            
-            if init_resp.status_code != 200:
-                return PlatformResult(
-                    platform="tiktok",
-                    success=False,
-                    error_message=f"Init failed: {init_resp.text[:200]}"
-                )
-            
-            init_data = init_resp.json().get("data", {})
-            upload_url = init_data.get("upload_url")
-            publish_id = init_data.get("publish_id")
-            
-            if not upload_url:
-                return PlatformResult(
-                    platform="tiktok",
-                    success=False,
-                    error_message="No upload URL returned"
-                )
-            
-            # Step 2: Upload video
-            with open(video_path, 'rb') as f:
-                video_data = f.read()
-            
-            upload_resp = await client.put(
-                upload_url,
-                content=video_data,
-                headers={"Content-Type": "video/mp4"}
-            )
-            
-            if upload_resp.status_code not in (200, 201):
-                return PlatformResult(
-                    platform="tiktok",
-                    success=False,
-                    error_message=f"Upload failed: {upload_resp.status_code}"
-                )
-            
-            return PlatformResult(
-                platform="tiktok",
-                success=True,
-                publish_id=publish_id
-            )
-    
+                    data_points.append(point)
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        raise TelemetryError(
+            f"Telemetry file not found: {map_path}",
+            code=ErrorCode.TELEMETRY_PARSE_FAILED
+        )
     except Exception as e:
-        logger.error(f"TikTok publish error: {e}")
-        return PlatformResult(
-            platform="tiktok",
-            success=False,
-            error_message=str(e)
+        raise TelemetryError(
+            f"Failed to parse telemetry file: {e}",
+            code=ErrorCode.TELEMETRY_PARSE_FAILED,
+            detail=str(e)
         )
 
-
-async def publish_to_youtube(
-    video_path: Path,
-    title: str,
-    description: str,
-    token_data: dict
-) -> PlatformResult:
-    """Publish video to YouTube using resumable upload."""
-    access_token = token_data.get("access_token")
-    if not access_token:
-        return PlatformResult(
-            platform="youtube",
-            success=False,
-            error_message="No access token"
-        )
-    
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            # Initialize resumable upload
-            metadata = {
-                "snippet": {
-                    "title": title[:100],
-                    "description": description[:5000] if description else "",
-                    "categoryId": "22"  # People & Blogs
-                },
-                "status": {
-                    "privacyStatus": "public",
-                    "selfDeclaredMadeForKids": False
-                }
-            }
-            
-            init_resp = await client.post(
-                "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "X-Upload-Content-Type": "video/mp4",
-                    "X-Upload-Content-Length": str(video_path.stat().st_size)
-                },
-                json=metadata
-            )
-            
-            if init_resp.status_code != 200:
-                return PlatformResult(
-                    platform="youtube",
-                    success=False,
-                    error_message=f"Init failed: {init_resp.text[:200]}"
-                )
-            
-            upload_url = init_resp.headers.get("Location")
-            if not upload_url:
-                return PlatformResult(
-                    platform="youtube",
-                    success=False,
-                    error_message="No upload URL"
-                )
-            
-            # Upload video
-            with open(video_path, 'rb') as f:
-                video_data = f.read()
-            
-            upload_resp = await client.put(
-                upload_url,
-                content=video_data,
-                headers={"Content-Type": "video/mp4"}
-            )
-            
-            if upload_resp.status_code not in (200, 201):
-                return PlatformResult(
-                    platform="youtube",
-                    success=False,
-                    error_message=f"Upload failed: {upload_resp.status_code}"
-                )
-            
-            video_id = upload_resp.json().get("id")
-            return PlatformResult(
-                platform="youtube",
-                success=True,
-                platform_video_id=video_id,
-                platform_url=f"https://youtube.com/shorts/{video_id}" if video_id else None
-            )
-    
-    except Exception as e:
-        logger.error(f"YouTube publish error: {e}")
-        return PlatformResult(
-            platform="youtube",
-            success=False,
-            error_message=str(e)
+    if not data_points:
+        raise TelemetryError(
+            "No valid telemetry data found",
+            code=ErrorCode.TELEMETRY_EMPTY
         )
 
+    # Calculate aggregate stats
+    speeds = [p['speed_mph'] for p in data_points]
+    telemetry = TelemetryData()
+    telemetry.points = data_points
+    telemetry.max_speed_mph = max(speeds)
+    telemetry.avg_speed_mph = sum(speeds) / len(speeds)
+    telemetry.duration_seconds = (data_points[-1]['timestamp'] - data_points[0]['timestamp']) if len(data_points) > 1 else 0.0
 
-async def publish_to_instagram(
-    video_path: Path,
-    caption: str,
-    token_data: dict,
-    page_id: Optional[str] = None
-) -> PlatformResult:
-    """Publish video to Instagram Reels."""
-    access_token = token_data.get("access_token")
-    if not access_token or not page_id:
-        return PlatformResult(
-            platform="instagram",
-            success=False,
-            error_message="Missing access token or page ID"
-        )
-    
-    # Instagram Reels requires a public URL
-    # This is a limitation - would need CDN or public R2 URL
-    return PlatformResult(
-        platform="instagram",
-        success=False,
-        error_message="Instagram Reels upload requires public video URL (coming soon)"
+    # Estimate distance (rough approximation)
+    if len(data_points) > 1:
+        total_distance = 0
+        for i in range(1, len(data_points)):
+            dt = data_points[i]['timestamp'] - data_points[i-1]['timestamp']
+            avg_speed = (data_points[i]['speed_mph'] + data_points[i-1]['speed_mph']) / 2
+            total_distance += (avg_speed * dt) / 3600  # miles
+        telemetry.distance_miles = total_distance
+
+    # Max altitude
+    altitudes = [p.get('altitude', 0) for p in data_points]
+    if altitudes:
+        telemetry.max_altitude_ft = max(altitudes)
+
+    logger.info(f"Parsed telemetry: {len(data_points)} points, max_speed={telemetry.max_speed:.1f} mph")
+    return telemetry
+
+
+def calculate_trill_score(
+    telemetry: TelemetryData,
+    speeding_mph: int = DEFAULT_SPEEDING_MPH,
+    euphoria_mph: int = DEFAULT_EUPHORIA_MPH
+) -> TrillScore:
+    """
+    Calculate Trill score from telemetry data.
+
+    Score Components (0-100):
+    - Speed score (0-40): Based on max speed vs euphoria threshold
+    - Speeding bonus (0-30): Percentage of time above speeding threshold
+    - Euphoria bonus (0-20): Percentage of time above euphoria threshold
+    - Consistency bonus (0-10): Inverse of speed variance
+
+    Buckets:
+    - 0-39: chill
+    - 40-59: spirited
+    - 60-79: sendIt
+    - 80-89: euphoric
+    - 90-100: gloryBoy
+    """
+    if not telemetry.data_points:
+        return TrillScore()
+
+    speeds = [p['speed_mph'] for p in telemetry.data_points]
+    total_points = len(speeds)
+
+    # Speed score (0-40)
+    speed_score = min(40, (telemetry.max_speed / euphoria_mph) * 40)
+
+    # Speeding time bonus (0-30)
+    speeding_count = sum(1 for s in speeds if s >= speeding_mph)
+    speeding_ratio = speeding_count / total_points
+    speeding_score = speeding_ratio * 30
+
+    # Euphoria bonus (0-20)
+    euphoria_count = sum(1 for s in speeds if s >= euphoria_mph)
+    euphoria_ratio = euphoria_count / total_points
+    euphoria_score = euphoria_ratio * 20
+
+    # Consistency bonus (0-10)
+    if total_points > 1:
+        variance = sum((s - telemetry.avg_speed) ** 2 for s in speeds) / total_points
+        std_dev = variance ** 0.5
+        consistency_score = max(0, 10 - (std_dev / 10))
+    else:
+        consistency_score = 5
+
+    # Total score
+    total = int(min(100, speed_score + speeding_score + euphoria_score + consistency_score))
+
+    # Determine bucket
+    if total >= 90:
+        bucket = "gloryBoy"
+    elif total >= 80:
+        bucket = "euphoric"
+    elif total >= 60:
+        bucket = "sendIt"
+    elif total >= 40:
+        bucket = "spirited"
+    else:
+        bucket = "chill"
+
+    # Check for excessive speed (safety flag)
+    excessive_speed = telemetry.max_speed >= 120
+
+    # Generate title modifier and hashtags
+    title_modifier, hashtags = get_trill_modifiers(total, telemetry.max_speed, bucket)
+
+    return TrillScore(
+        score=total,
+        bucket=bucket,
+        speed_score=speed_score,
+        speeding_score=speeding_score,
+        euphoria_score=euphoria_score,
+        consistency_score=consistency_score,
+        excessive_speed=excessive_speed,
+        title_modifier=title_modifier,
+        hashtags=hashtags,
     )
 
 
-async def publish_to_facebook(
-    video_path: Path,
-    description: str,
-    token_data: dict,
-    page_id: Optional[str] = None
-) -> PlatformResult:
-    """Publish video to Facebook."""
-    access_token = token_data.get("access_token")
-    if not access_token or not page_id:
-        return PlatformResult(
-            platform="facebook",
-            success=False,
-            error_message="Missing access token or page ID"
-        )
-    
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            with open(video_path, 'rb') as f:
-                files = {"source": ("video.mp4", f, "video/mp4")}
-                resp = await client.post(
-                    f"https://graph.facebook.com/v19.0/{page_id}/videos",
-                    params={
-                        "access_token": access_token,
-                        "description": description[:5000] if description else ""
-                    },
-                    files=files
-                )
-            
-            if resp.status_code != 200:
-                return PlatformResult(
-                    platform="facebook",
-                    success=False,
-                    error_message=f"Upload failed: {resp.text[:200]}"
-                )
-            
-            video_id = resp.json().get("id")
-            return PlatformResult(
-                platform="facebook",
-                success=True,
-                platform_video_id=video_id
-            )
-    
-    except Exception as e:
-        logger.error(f"Facebook publish error: {e}")
-        return PlatformResult(
-            platform="facebook",
-            success=False,
-            error_message=str(e)
-        )
+def get_trill_modifiers(score: int, max_speed: float, bucket: str) -> tuple:
+    """Get title modifier and hashtags based on Trill score."""
+    if bucket == "gloryBoy":
+        return " - GLORY BOY", ["#GloryBoyTour", "#TrillScore100", "#SendIt"]
+    elif bucket == "euphoric":
+        return " - Euphoric", ["#Euphoric", "#TrillScore", "#SpeedDemon"]
+    elif bucket == "sendIt":
+        return " - Send It", ["#SendIt", "#TrillScore", "#Spirited"]
+    elif bucket == "spirited":
+        return " - Spirited Drive", ["#SpiritedDrive", "#TrillScore"]
+    elif max_speed >= 100:
+        return "", ["#TrillScore", "#RoadTrip"]
+    else:
+        return "", ["#TrillScore"]
 
 
-async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
-    """Publish to platforms + write a ledger row per publish attempt.
-
-    Ledger contract:
-      - INSERT publish_attempts row before the API call
-      - UPDATE after call (success/fail)
-      - verification loop later turns verify_status into confirmed/rejected/unknown
+async def run_telemetry_stage(ctx: JobContext) -> JobContext:
     """
+    Execute telemetry processing stage.
 
-    if not ctx.platforms:
-        logger.warning(f"No platforms specified for upload {ctx.upload_id}")
-        return ctx
+    Args:
+        ctx: Job context
 
-    default_video = ctx.processed_video_path or ctx.local_video_path
-    if not default_video or not default_video.exists():
-        raise PublishError("No video file to publish", code=ErrorCode.UPLOAD_FAILED)
+    Returns:
+        Updated context with telemetry and trill data
 
-    logger.info(f"Publishing to platforms: {ctx.platforms}")
-    init_enc_keys()
+    Raises:
+        SkipStage: If no telemetry file
+        TelemetryError: If processing fails
+    """
+    ctx.mark_stage("telemetry")
 
-    platform_to_db_key = {"tiktok": "tiktok", "youtube": "google", "instagram": "meta", "facebook": "meta"}
+    if not ctx.local_telemetry_path or not ctx.local_telemetry_path.exists():
+        # Ensure downstream stages never crash on missing attributes
+        ctx.telemetry = None
+        ctx.telemetry_data = None
+        ctx.trill = None
+        ctx.trill_score = None
+        raise SkipStage("No telemetry file available")
 
-    for platform in ctx.platforms:
-        db_key = platform_to_db_key.get(platform, platform)
+    logger.info(f"Processing telemetry for upload {ctx.upload_id}")
 
-        video_file = ctx.get_video_for_platform(platform)
-        if not video_file or not video_file.exists():
-            video_file = default_video
+    # Parse telemetry
+    telemetry = parse_map_file(ctx.local_telemetry_path)
+    ctx.telemetry = telemetry
+    ctx.telemetry_data = telemetry
 
-        attempt_id = None
-        try:
-            attempt_id = await db_stage.insert_publish_attempt(
-                db_pool,
-                upload_id=str(ctx.upload_id),
-                user_id=str(ctx.user_id),
-                platform=str(platform),
-            )
-        except Exception:
-            attempt_id = None
+    # Get user thresholds from settings
+    speeding_mph = ctx.user_settings.get("speeding_mph", DEFAULT_SPEEDING_MPH)
+    euphoria_mph = ctx.user_settings.get("euphoria_mph", DEFAULT_EUPHORIA_MPH)
 
-        token_data = None
-        try:
-            token_data = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
-        except Exception:
-            token_data = None
+    # Calculate Trill score
+    trill = calculate_trill_score(telemetry, speeding_mph, euphoria_mph)
+    ctx.trill = trill
+    ctx.trill_score = trill
 
-        if not token_data:
-            msg = f"Not connected to {platform}"
-            if attempt_id:
-                try:
-                    await db_stage.update_publish_attempt_failed(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        error_code="NOT_CONNECTED",
-                        error_message=msg,
-                    )
-                except Exception:
-                    pass
-            ctx.platform_results.append(PlatformResult(platform=platform, success=False, attempt_id=attempt_id, error_code="NOT_CONNECTED", error_message=msg))
-            continue
-
-        try:
-            if platform == "tiktok":
-                result = await publish_to_tiktok_ctx(video_file, ctx, token_data)
-            elif platform == "youtube":
-                result = await publish_to_youtube_ctx(video_file, ctx, token_data)
-            elif platform == "instagram":
-                page_id = token_data.get('page_id') or token_data.get('instagram_page_id') or token_data.get('ig_user_id')
-                result = await publish_to_instagram(video_file, (getattr(ctx, 'caption', None) or getattr(ctx, 'description', '') or ''), token_data, page_id)
-            elif platform == "facebook":
-                page_id = token_data.get('page_id') or token_data.get('facebook_page_id') or token_data.get('fb_page_id')
-                result = await publish_to_facebook(video_file, (getattr(ctx, 'description', None) or getattr(ctx, 'caption', '') or ''), token_data, page_id)
-            else:
-                result = PlatformResult(platform=platform, success=False, error_code="UNSUPPORTED", error_message=f"Unsupported platform: {platform}")
-        except Exception as e:
-            logger.exception(f"Error publishing to {platform}")
-            result = PlatformResult(platform=platform, success=False, error_code="PUBLISH_EXCEPTION", error_message=str(e))
-
-        result.attempt_id = attempt_id
-        ctx.platform_results.append(result)
-
-        if attempt_id:
-            try:
-                if result.success:
-                    await db_stage.update_publish_attempt_success(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        platform_post_id=result.platform_video_id,
-                        platform_url=result.platform_url,
-                        http_status=result.http_status,
-                        response_payload=result.response_payload,
-                        publish_id=result.publish_id,
-                    )
-                else:
-                    await db_stage.update_publish_attempt_failed(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        error_code=result.error_code or "PUBLISH_FAILED",
-                        error_message=result.error_message or "Publish failed",
-                        http_status=result.http_status,
-                        response_payload=result.response_payload,
-                    )
-            except Exception:
-                pass
+    logger.info(f"Trill score: {trill.score} ({trill.bucket})")
 
     return ctx

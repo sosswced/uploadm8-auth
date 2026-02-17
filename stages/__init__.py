@@ -1,9 +1,9 @@
 """stages package initializer.
 
 IMPORTANT: keep this import-light. Importing submodules here can create
-circular imports and boot-time crashes. Exporting error primitives is optional.
+circular imports and boot-time crashes.
 
-Worker/stages should import directly from stages.errors.
+Worker/stages should import directly from stages.errors, stages.context, etc.
 """
 
 # Optional re-exports (safe). Do not hard-fail if errors module changes.

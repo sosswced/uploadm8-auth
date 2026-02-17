@@ -1,96 +1,83 @@
-"""stages/telemetry_stage.py
+"""
+UploadM8 Thumbnail Stage
+=========================
+Generate video thumbnails using FFmpeg.
 
-UploadM8 Telemetry Stage
------------------------
-
-This module MUST export `run_telemetry_stage(ctx)` because worker.py imports it.
-
-Design goals (operational):
-- Never crash the pipeline if telemetry is missing or malformed.
-- Ensure downstream stages can safely reference `ctx.telemetry`.
-
-Telemetry parsing for .map files can be expanded later. For now we do a
-best-effort read + minimal summary.
+Exports: run_thumbnail_stage(ctx)
 """
 
-from __future__ import annotations
-
+import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+
+from .errors import SkipStage, ErrorCode, StageError
+from .context import JobContext
 
 logger = logging.getLogger("uploadm8-worker")
 
 
-def _ensure_ctx_fields(ctx: Any) -> None:
-    """Ensure common fields exist to prevent AttributeErrors downstream."""
-    if not hasattr(ctx, "telemetry") or getattr(ctx, "telemetry") is None:
-        setattr(ctx, "telemetry", {"data_points": [], "summary": {}, "skipped": True})
+async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
+    """
+    Generate a thumbnail from the video at the 1-second mark.
 
-    if not hasattr(ctx, "output_artifacts") or getattr(ctx, "output_artifacts") is None:
-        setattr(ctx, "output_artifacts", {})
+    - If no video is available, skip gracefully.
+    - Uses FFmpeg to extract a single frame.
+    - Sets ctx.thumbnail_path on success.
+    """
+    ctx.mark_stage("thumbnail")
 
+    video_path = ctx.processed_video_path or ctx.local_video_path
+    if not video_path or not video_path.exists():
+        raise SkipStage("No video file for thumbnail generation")
 
-def _safe_path(p: Any) -> Optional[Path]:
-    if p is None:
-        return None
-    try:
-        return p if isinstance(p, Path) else Path(str(p))
-    except Exception:
-        return None
+    if not ctx.temp_dir:
+        raise SkipStage("No temp directory available")
 
+    output_path = ctx.temp_dir / f"thumb_{ctx.upload_id}.jpg"
 
-def _summarize_map_file(path: Path) -> Dict[str, Any]:
-    """Minimal .map summary without making assumptions about file format."""
-    size = path.stat().st_size
-    # Read a small chunk to avoid memory blowups.
-    try:
-        with path.open("rb") as f:
-            head = f.read(4096)
-    except Exception:
-        head = b""
-
-    summary: Dict[str, Any] = {
-        "file": str(path),
-        "bytes": int(size),
-        "head_bytes": int(len(head)),
-    }
-
-    # Heuristic: count lines if it's text-like
-    try:
-        text = head.decode("utf-8", errors="ignore")
-        summary["head_preview"] = text[:300]
-        summary["head_lines"] = int(text.count("\n"))
-    except Exception:
-        pass
-
-    return summary
-
-
-async def run_telemetry_stage(ctx: Any) -> Any:
-    """Worker entrypoint: compute telemetry artifacts and attach to ctx."""
-    _ensure_ctx_fields(ctx)
-
-    telem_path = _safe_path(getattr(ctx, "local_telemetry_path", None))
-    if not telem_path or not telem_path.exists():
-        # No telemetry is a normal condition.
-        ctx.telemetry = {"data_points": [], "summary": {}, "skipped": True}
-        return ctx
+    # Extract frame at 1 second (or 0 if video is very short)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(video_path),
+        "-ss", "1",
+        "-vframes", "1",
+        "-q:v", "2",
+        "-vf", "scale=640:-2",
+        str(output_path),
+    ]
 
     try:
-        summary = _summarize_map_file(telem_path)
-        # Keep schema stable for downstream HUD stage.
-        ctx.telemetry = {
-            "data_points": [],
-            "summary": summary,
-            "skipped": False,
-        }
-        ctx.output_artifacts["telemetry"] = {"source": str(telem_path)}
-        logger.info(f"Telemetry stage completed (bytes={summary.get('bytes')})")
-        return ctx
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
 
+        if proc.returncode != 0:
+            # Try again at 0 seconds (very short video)
+            cmd[cmd.index("1")] = "0"
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+
+        if proc.returncode != 0 or not output_path.exists():
+            logger.warning(f"Thumbnail generation failed (non-fatal): rc={proc.returncode}")
+            raise SkipStage("FFmpeg thumbnail extraction failed")
+
+        ctx.thumbnail_path = output_path
+        ctx.output_artifacts["thumbnail"] = str(output_path)
+        logger.info(f"Thumbnail generated: {output_path} ({output_path.stat().st_size} bytes)")
+
+    except SkipStage:
+        raise
     except Exception as e:
-        # Never fail pipeline for telemetry.
-        logger.warning(f"Telemetry stage failed (non-fatal): {e}")
-        ctx.telemetry = {"data_points": [], "summary": {"error": str(e)}, "skipped": True}
-        return ctx
+        # Thumbnail failure should never crash the pipeline
+        logger.warning(f"Thumbnail stage error (non-fatal): {e}")
+        raise SkipStage(f"Thumbnail generation failed: {e}")
+
+    return ctx

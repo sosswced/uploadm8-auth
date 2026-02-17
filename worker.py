@@ -17,58 +17,23 @@ import asyncpg
 import redis.asyncio as redis
 
 from stages.errors import StageError, SkipStage, CancelRequested
-from stages.context import JobContext, create_context
+from stages.context import create_context
 from stages.entitlements import get_entitlements_from_user
 from stages import db as db_stage
 from stages import r2 as r2_stage
+from stages.telemetry_stage import run_telemetry_stage
+from stages.transcode_stage import run_transcode_stage
+from stages.thumbnail_stage import run_thumbnail_stage
+from stages.caption_stage import run_caption_stage
+from stages.hud_stage import run_hud_stage
+from stages.watermark_stage import run_watermark_stage
+from stages.publish_stage import run_publish_stage
 from stages.verify_stage import run_verification_loop
+from stages.notify_stage import run_notify_stage, notify_admin_worker_start, notify_admin_worker_stop, notify_admin_error
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [worker] %(message)s")
 logger = logging.getLogger("uploadm8-worker")
-# =====================================================================
-# PATCH: Dynamic stage entrypoint resolver (Option B)
-# Stops import-time crashes when stage modules rename their entrypoints.
-# Canonical: run_<stage>_stage(ctx)
-# Fallbacks: run_stage / run / execute / process
-# =====================================================================
-import importlib
-
-_STAGE_ENTRYPOINT_CANDIDATES = (
-    "run_{stage}_stage",
-    "run_stage",
-    "run",
-    "execute",
-    "process",
-)
-
-def _resolve_stage_fn(module_name: str, stage: str):
-    mod = importlib.import_module(module_name)
-    tried = []
-    for pattern in _STAGE_ENTRYPOINT_CANDIDATES:
-        fn_name = pattern.format(stage=stage)
-        tried.append(fn_name)
-        fn = getattr(mod, fn_name, None)
-        if callable(fn):
-            logger.info("Resolved stage %s -> %s.%s", stage, module_name, fn_name)
-            return fn
-    raise ImportError(f"No stage entrypoint found in {module_name}. Tried: {tried}")
-
-_STAGE_MODULES = {
-    "telemetry": "stages.telemetry_stage",
-    "transcode": "stages.transcode_stage",
-    "thumbnail": "stages.thumbnail_stage",
-    "caption": "stages.caption_stage",
-    "hud": "stages.hud_stage",
-    "watermark": "stages.watermark_stage",
-    "publish": "stages.publish_stage",
-    "notify": "stages.notify_stage",
-}
-
-def get_stage_fns():
-    # Resolve lazily when pipeline starts (not at module import time)
-    return {k: _resolve_stage_fn(v, k) for k, v in _STAGE_MODULES.items()}
-
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 REDIS_URL = os.environ.get("REDIS_URL", "")
@@ -132,7 +97,6 @@ async def run_pipeline(job_data: dict) -> bool:
         entitlements = get_entitlements_from_user(user_record, overrides)
 
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
-        stage_fns = get_stage_fns()
         ctx.started_at = datetime.now(timezone.utc)
         ctx.state = "processing"
         await db_stage.mark_processing_started(db_pool, ctx)
@@ -158,7 +122,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # Transcode
         try:
-            ctx = await stage_fns['transcode'](ctx)
+            ctx = await run_transcode_stage(ctx)
         except SkipStage as e:
             logger.info(f"Transcode skipped: {e.reason}")
         except StageError as e:
@@ -167,7 +131,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # Telemetry
         try:
-            ctx = await stage_fns['telemetry'](ctx)
+            ctx = await run_telemetry_stage(ctx)
         except SkipStage as e:
             logger.info(f"Telemetry skipped: {e.reason}")
         except StageError as e:
@@ -176,7 +140,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # Thumbnail
         try:
-            ctx = await stage_fns['thumbnail'](ctx)
+            ctx = await run_thumbnail_stage(ctx)
         except SkipStage as e:
             logger.info(f"Thumbnail skipped: {e.reason}")
         except StageError as e:
@@ -185,7 +149,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # Caption
         try:
-            ctx = await stage_fns['caption'](ctx)
+            ctx = await run_caption_stage(ctx)
             await db_stage.save_generated_metadata(db_pool, ctx)
         except SkipStage as e:
             logger.info(f"Caption skipped: {e.reason}")
@@ -195,7 +159,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # HUD
         try:
-            ctx = await stage_fns['hud'](ctx)
+            ctx = await run_hud_stage(ctx)
         except SkipStage as e:
             logger.info(f"HUD skipped: {e.reason}")
         except StageError as e:
@@ -204,7 +168,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # Watermark
         try:
-            ctx = await stage_fns['watermark'](ctx)
+            ctx = await run_watermark_stage(ctx)
         except SkipStage as e:
             logger.info(f"Watermark skipped: {e.reason}")
         except StageError as e:
@@ -223,7 +187,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # Publish
         try:
-            ctx = await stage_fns['publish'](ctx, db_pool)
+            ctx = await run_publish_stage(ctx, db_pool)
         except StageError as e:
             logger.error(f"Publish error: {e.message}")
             ctx.mark_error(e.code.value, e.message)
@@ -231,7 +195,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # Notify
         try:
-            ctx = await stage_fns['notify'](ctx)
+            ctx = await run_notify_stage(ctx)
         except Exception as e:
             logger.warning(f"Notify error: {e}")
 

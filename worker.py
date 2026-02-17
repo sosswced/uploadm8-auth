@@ -17,7 +17,7 @@ import asyncpg
 import redis.asyncio as redis
 
 from stages.errors import StageError, SkipStage, CancelRequested
-from stages.context import create_context
+from stages.context import JobContext, create_context
 from stages.entitlements import get_entitlements_from_user
 from stages import db as db_stage
 from stages import r2 as r2_stage

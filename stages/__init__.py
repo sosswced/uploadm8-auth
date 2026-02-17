@@ -1,35 +1,30 @@
-"""UploadM8 stages package.
+"""stages package initializer.
 
-Keep this file import-light to avoid boot-time circular imports.
+IMPORTANT: keep this import-light. Importing submodules here can create
+circular imports and boot-time crashes. Exporting error primitives is optional.
+
+Worker/stages should import directly from stages.errors.
 """
 
-# Re-export error primitives only (safe).
-from .errors import (
-    ErrorCode,
-    StageError,
-    SkipStage,
-    CancelRequested,
-    PublishError,
-    StorageError,
-    TelemetryError,
-    TranscodeError,
-    ThumbnailError,
-    CaptionError,
-    WatermarkError,
-    VerifyError,
-)
-
-__all__ = [
-    "ErrorCode",
-    "StageError",
-    "SkipStage",
-    "CancelRequested",
-    "PublishError",
-    "StorageError",
-    "TelemetryError",
-    "TranscodeError",
-    "ThumbnailError",
-    "CaptionError",
-    "WatermarkError",
-    "VerifyError",
-]
+# Optional re-exports (safe). Do not hard-fail if errors module changes.
+try:
+    from .errors import (
+        ErrorCode,
+        StageError,
+        PublishError,
+        TelemetryError,
+        StorageError,
+        SkipStage,
+        CancelRequested,
+    )
+    __all__ = [
+        "ErrorCode",
+        "StageError",
+        "PublishError",
+        "TelemetryError",
+        "StorageError",
+        "SkipStage",
+        "CancelRequested",
+    ]
+except Exception:
+    __all__ = []

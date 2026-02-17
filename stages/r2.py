@@ -1,480 +1,370 @@
 """
-UploadM8 Publish Stage
-======================
-Publish videos to social media platforms.
-Wraps existing platform upload modules.
+UploadM8 Notification Stage
+===========================
+Send notifications via Discord webhooks and email.
+
+Notifications:
+- User webhook: Upload status (success/fail)
+- Admin webhook: Signup, trial, MRR, errors
+- Email: Welcome, upgrade confirmation, promotions
 """
 
 import os
 import json
 import logging
-import base64
-from pathlib import Path
-from typing import Dict, Any, Optional
-
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
 import httpx
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .errors import PublishError, ErrorCode
-from .context import JobContext, PlatformResult
+from .context import JobContext
+from .errors import StageError, SkipStage
 from . import db as db_stage
-
 
 logger = logging.getLogger("uploadm8-worker")
 
+# Configuration
+ADMIN_DISCORD_WEBHOOK_URL = os.environ.get("ADMIN_DISCORD_WEBHOOK_URL", "")
+SIGNUP_DISCORD_WEBHOOK_URL = os.environ.get("SIGNUP_DISCORD_WEBHOOK_URL", "")
+TRIAL_DISCORD_WEBHOOK_URL = os.environ.get("TRIAL_DISCORD_WEBHOOK_URL", "")
+MRR_DISCORD_WEBHOOK_URL = os.environ.get("MRR_DISCORD_WEBHOOK_URL", "")
+ERROR_DISCORD_WEBHOOK_URL = os.environ.get("ERROR_DISCORD_WEBHOOK_URL", "")
 
-# Encryption keys (initialized at startup)
-TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
-_ENC_KEYS: Dict[str, bytes] = {}
+MAILGUN_API_KEY = os.environ.get("MAILGUN_API_KEY", "")
+MAILGUN_DOMAIN = os.environ.get("MAILGUN_DOMAIN", "")
+MAIL_FROM = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
 
 
-def init_enc_keys():
-    """Parse encryption keys from environment."""
-    global _ENC_KEYS
-    if not TOKEN_ENC_KEYS:
+async def run_notify_stage(ctx: JobContext) -> JobContext:
+    """
+    Send notifications for completed upload.
+    
+    Process:
+    1. Send user webhook if configured
+    2. Log completion
+    """
+    ctx.mark_stage("notify")
+    
+    # Get user's Discord webhook
+    user_webhook = ctx.user_settings.get("discord_webhook")
+    
+    if user_webhook:
+        await send_user_upload_notification(user_webhook, ctx)
+    
+    return ctx
+
+
+async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
+    """Send upload status to user's Discord webhook."""
+    try:
+        is_success = ctx.is_success()
+        
+        # Build embed
+        if is_success:
+            color = 0x22c55e  # Green
+            title = "✅ Upload Completed"
+            description = f"Your video has been uploaded successfully!"
+        elif ctx.is_partial_success():
+            color = 0xf97316  # Orange
+            title = "⚠️ Partial Upload"
+            description = f"Some platforms failed. Check your queue for details."
+        else:
+            color = 0xef4444  # Red
+            title = "❌ Upload Failed"
+            description = f"Upload failed: {ctx.error_message or 'Unknown error'}"
+        
+        fields = [
+            {"name": "Filename", "value": ctx.filename[:50], "inline": True},
+            {"name": "Platforms", "value": ", ".join(ctx.platforms) or "None", "inline": True},
+        ]
+        
+        # Add platform results
+        for result in ctx.platform_results:
+            status = "✅" if result.success else "❌"
+            value = result.platform_url if result.success else (result.error_message or "Failed")
+            fields.append({
+                "name": f"{status} {result.platform.title()}",
+                "value": value[:100],
+                "inline": False
+            })
+        
+        embed = {
+            "title": title,
+            "description": description,
+            "color": color,
+            "fields": fields,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "footer": {"text": "UploadM8"}
+        }
+        
+        await _send_discord_webhook(webhook_url, embeds=[embed])
+        
+    except Exception as e:
+        logger.warning(f"User webhook notification failed: {e}")
+
+
+# ============================================================
+# Admin Notifications
+# ============================================================
+
+async def _get_admin_webhook(db_pool=None) -> str:
+    # Priority: explicit env override -> admin_settings saved webhook
+    if ADMIN_DISCORD_WEBHOOK_URL:
+        return ADMIN_DISCORD_WEBHOOK_URL
+    if db_pool is None:
+        return ""
+    try:
+        wh = await db_stage.load_admin_notification_webhook(db_pool)
+        return wh or ""
+    except Exception:
+        return ""
+
+
+async def notify_admin_signup(email: str, name: str, tier: str = "free", db_pool=None):
+    """Notify admin of new user signup."""
+    webhook = SIGNUP_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
+    if not webhook:
         return
     
-    clean = TOKEN_ENC_KEYS.strip().strip('"').replace("\\n", "")
-    parts = [p.strip() for p in clean.split(",") if p.strip()]
-    for part in parts:
-        if ":" not in part:
-            continue
-        kid, b64key = part.split(":", 1)
-        try:
-            raw = base64.b64decode(b64key.strip())
-            if len(raw) == 32:
-                _ENC_KEYS[kid.strip()] = raw
-        except Exception:
-            pass
-
-
-def decrypt_token_blob(blob: Any) -> dict:
-    """Decrypt platform token blob."""
-    if isinstance(blob, str):
-        blob = json.loads(blob)
+    embed = {
+        "title": "🎉 New User Signup",
+        "color": 0x3b82f6,
+        "fields": [
+            {"name": "Email", "value": email, "inline": True},
+            {"name": "Name", "value": name, "inline": True},
+            {"name": "Tier", "value": tier, "inline": True},
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
     
-    kid = blob.get("kid", "v1")
-    key = _ENC_KEYS.get(kid)
-    if not key:
-        raise ValueError(f"Unknown key id: {kid}")
+    await _send_discord_webhook(webhook, embeds=[embed])
+
+
+async def notify_admin_trial_started(email: str, name: str, plan: str, db_pool=None):
+    """Notify admin of new trial signup."""
+    webhook = TRIAL_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
+    if not webhook:
+        return
     
-    nonce = base64.b64decode(blob["nonce"])
-    ciphertext = base64.b64decode(blob["ciphertext"])
-    aesgcm = AESGCM(key)
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
-    return json.loads(plaintext.decode("utf-8"))
-
-
-
-
-# ---------------------------------------------------------------------
-# Compatibility exports for verify_stage
-# verify_stage imports: from .publish_stage import decrypt_token, init_enc_keys
-# This project stores tokens sometimes as encrypted blobs; other times as plain dicts.
-# decrypt_token returns a dict with access_token etc, or None on failure.
-# ---------------------------------------------------------------------
-def decrypt_token(token_row: Any) -> Optional[dict]:
-    """Best-effort decrypt/parse of a stored platform token row.
-
-    Accepts:
-      - dict: either already plaintext token data OR an encrypted blob dict
-      - str: JSON string for either plaintext dict or encrypted blob
-
-    Returns:
-      - dict token payload (e.g., {"access_token": "..."})
-      - None if missing/invalid
-    """
-    if token_row is None:
-        return None
-    try:
-        if isinstance(token_row, str):
-            token_row = json.loads(token_row)
-        if not isinstance(token_row, dict):
-            return None
-
-        # If this looks like an encrypted blob, decrypt it.
-        if "ciphertext" in token_row and "nonce" in token_row:
-            try:
-                return decrypt_token_blob(token_row)
-            except Exception:
-                return None
-
-        # Already plaintext token dict
-        return token_row
-    except Exception:
-        return None
-
-
-def _derive_title_desc(ctx: JobContext) -> tuple[str, str]:
-    """Derive best-effort title/description from JobContext without assuming schema."""
-    title = getattr(ctx, "title", None) or getattr(ctx, "video_title", None) or getattr(ctx, "name", None)
-    desc = getattr(ctx, "description", None) or getattr(ctx, "caption", None) or ""
-    if not title:
-        title = f"UploadM8 {getattr(ctx, 'upload_id', '')}".strip()
-    return str(title), str(desc)
-
-
-async def publish_to_tiktok_ctx(video_path: Path, ctx: JobContext, token_data: dict) -> PlatformResult:
-    title, _ = _derive_title_desc(ctx)
-    return await publish_to_tiktok(video_path, title, token_data)
-
-
-async def publish_to_youtube_ctx(video_path: Path, ctx: JobContext, token_data: dict) -> PlatformResult:
-    title, desc = _derive_title_desc(ctx)
-    return await publish_to_youtube(video_path, title, desc, token_data)
-async def publish_to_tiktok(
-    video_path: Path,
-    title: str,
-    token_data: dict
-) -> PlatformResult:
-    """Publish video to TikTok using Content Posting API."""
-    access_token = token_data.get("access_token")
-    if not access_token:
-        return PlatformResult(
-            platform="tiktok",
-            success=False,
-            error_message="No access token"
-        )
+    embed = {
+        "title": "🚀 Trial Started",
+        "color": 0x8b5cf6,
+        "fields": [
+            {"name": "Email", "value": email, "inline": True},
+            {"name": "Name", "value": name, "inline": True},
+            {"name": "Plan", "value": plan, "inline": True},
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
     
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            # Step 1: Initialize upload
-            init_resp = await client.post(
-                "https://open.tiktokapis.com/v2/post/publish/video/init/",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "post_info": {
-                        "title": title[:150],
-                        "privacy_level": "PUBLIC_TO_EVERYONE",
-                    },
-                    "source_info": {
-                        "source": "FILE_UPLOAD",
-                        "video_size": video_path.stat().st_size,
-                    }
-                }
-            )
-            
-            if init_resp.status_code != 200:
-                return PlatformResult(
-                    platform="tiktok",
-                    success=False,
-                    error_message=f"Init failed: {init_resp.text[:200]}"
-                )
-            
-            init_data = init_resp.json().get("data", {})
-            upload_url = init_data.get("upload_url")
-            publish_id = init_data.get("publish_id")
-            
-            if not upload_url:
-                return PlatformResult(
-                    platform="tiktok",
-                    success=False,
-                    error_message="No upload URL returned"
-                )
-            
-            # Step 2: Upload video
-            with open(video_path, 'rb') as f:
-                video_data = f.read()
-            
-            upload_resp = await client.put(
-                upload_url,
-                content=video_data,
-                headers={"Content-Type": "video/mp4"}
-            )
-            
-            if upload_resp.status_code not in (200, 201):
-                return PlatformResult(
-                    platform="tiktok",
-                    success=False,
-                    error_message=f"Upload failed: {upload_resp.status_code}"
-                )
-            
-            return PlatformResult(
-                platform="tiktok",
-                success=True,
-                publish_id=publish_id
-            )
-    
-    except Exception as e:
-        logger.error(f"TikTok publish error: {e}")
-        return PlatformResult(
-            platform="tiktok",
-            success=False,
-            error_message=str(e)
-        )
+    await _send_discord_webhook(webhook, embeds=[embed])
 
 
-async def publish_to_youtube(
-    video_path: Path,
-    title: str,
-    description: str,
-    token_data: dict
-) -> PlatformResult:
-    """Publish video to YouTube using resumable upload."""
-    access_token = token_data.get("access_token")
-    if not access_token:
-        return PlatformResult(
-            platform="youtube",
-            success=False,
-            error_message="No access token"
-        )
+async def notify_admin_mrr_collected(amount: float, customer_email: str, plan: str, db_pool=None):
+    """Notify admin of MRR collection."""
+    webhook = MRR_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
+    if not webhook:
+        return
     
-    try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            # Initialize resumable upload
-            metadata = {
-                "snippet": {
-                    "title": title[:100],
-                    "description": description[:5000] if description else "",
-                    "categoryId": "22"  # People & Blogs
-                },
-                "status": {
-                    "privacyStatus": "public",
-                    "selfDeclaredMadeForKids": False
-                }
-            }
-            
-            init_resp = await client.post(
-                "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "X-Upload-Content-Type": "video/mp4",
-                    "X-Upload-Content-Length": str(video_path.stat().st_size)
-                },
-                json=metadata
-            )
-            
-            if init_resp.status_code != 200:
-                return PlatformResult(
-                    platform="youtube",
-                    success=False,
-                    error_message=f"Init failed: {init_resp.text[:200]}"
-                )
-            
-            upload_url = init_resp.headers.get("Location")
-            if not upload_url:
-                return PlatformResult(
-                    platform="youtube",
-                    success=False,
-                    error_message="No upload URL"
-                )
-            
-            # Upload video
-            with open(video_path, 'rb') as f:
-                video_data = f.read()
-            
-            upload_resp = await client.put(
-                upload_url,
-                content=video_data,
-                headers={"Content-Type": "video/mp4"}
-            )
-            
-            if upload_resp.status_code not in (200, 201):
-                return PlatformResult(
-                    platform="youtube",
-                    success=False,
-                    error_message=f"Upload failed: {upload_resp.status_code}"
-                )
-            
-            video_id = upload_resp.json().get("id")
-            return PlatformResult(
-                platform="youtube",
-                success=True,
-                platform_video_id=video_id,
-                platform_url=f"https://youtube.com/shorts/{video_id}" if video_id else None
-            )
+    embed = {
+        "title": "💰 MRR Collected",
+        "color": 0x22c55e,
+        "fields": [
+            {"name": "Amount", "value": f"${amount:.2f}", "inline": True},
+            {"name": "Customer", "value": customer_email, "inline": True},
+            {"name": "Plan", "value": plan, "inline": True},
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
     
-    except Exception as e:
-        logger.error(f"YouTube publish error: {e}")
-        return PlatformResult(
-            platform="youtube",
-            success=False,
-            error_message=str(e)
-        )
+    await _send_discord_webhook(webhook, embeds=[embed])
 
 
-async def publish_to_instagram(
-    video_path: Path,
-    caption: str,
-    token_data: dict,
-    page_id: Optional[str] = None
-) -> PlatformResult:
-    """Publish video to Instagram Reels."""
-    access_token = token_data.get("access_token")
-    if not access_token or not page_id:
-        return PlatformResult(
-            platform="instagram",
-            success=False,
-            error_message="Missing access token or page ID"
-        )
+async def notify_admin_error(error_type: str, details: dict, db_pool=None):
+    """Notify admin of system error."""
+    webhook = ERROR_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
+    if not webhook:
+        return
     
-    # Instagram Reels requires a public URL
-    # This is a limitation - would need CDN or public R2 URL
-    return PlatformResult(
-        platform="instagram",
-        success=False,
-        error_message="Instagram Reels upload requires public video URL (coming soon)"
+    embed = {
+        "title": f"🚨 Error: {error_type}",
+        "color": 0xef4444,
+        "description": f"```json\n{json.dumps(details, indent=2, default=str)[:1500]}\n```",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    await _send_discord_webhook(webhook, embeds=[embed])
+
+
+async def notify_admin_worker_start(db_pool=None):
+    """Notify admin that worker has started."""
+    webhook = await _get_admin_webhook(db_pool)
+    if not webhook:
+        return
+    
+    await _send_discord_webhook(
+        webhook,
+        content="🟢 UploadM8 Worker started"
     )
 
 
-async def publish_to_facebook(
-    video_path: Path,
-    description: str,
-    token_data: dict,
-    page_id: Optional[str] = None
-) -> PlatformResult:
-    """Publish video to Facebook."""
-    access_token = token_data.get("access_token")
-    if not access_token or not page_id:
-        return PlatformResult(
-            platform="facebook",
-            success=False,
-            error_message="Missing access token or page ID"
-        )
+async def notify_admin_worker_stop(db_pool=None):
+    """Notify admin that worker has stopped."""
+    webhook = await _get_admin_webhook(db_pool)
+    if not webhook:
+        return
+    
+    await _send_discord_webhook(
+        webhook,
+        content="🔴 UploadM8 Worker stopped"
+    )
+
+
+async def notify_admin_daily_summary(data: dict, db_pool=None):
+    """Send daily summary to admin."""
+    webhook = await _get_admin_webhook(db_pool)
+    if not webhook:
+        return
+    
+    embed = {
+        "title": "📊 Daily Summary",
+        "color": 0x3b82f6,
+        "fields": [
+            {"name": "New Users", "value": str(data.get("new_users", 0)), "inline": True},
+            {"name": "Uploads", "value": str(data.get("uploads", 0)), "inline": True},
+            {"name": "MRR", "value": f"${data.get('mrr', 0):.2f}", "inline": True},
+            {"name": "OpenAI Cost", "value": f"${data.get('openai_cost', 0):.2f}", "inline": True},
+            {"name": "Storage Used", "value": f"{data.get('storage_gb', 0):.2f} GB", "inline": True},
+            {"name": "Active Users", "value": str(data.get("active_users", 0)), "inline": True},
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    
+    await _send_discord_webhook(webhook, embeds=[embed])
+
+
+# ============================================================
+# Email Notifications
+# ============================================================
+
+async def send_welcome_email(email: str, name: str):
+    """Send welcome email to new user."""
+    if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
+        logger.info(f"Welcome email skipped (no Mailgun): {email}")
+        return
+    
+    subject = "Welcome to UploadM8! 🎉"
+    html = f"""
+    <h1>Welcome to UploadM8, {name}!</h1>
+    <p>Thanks for signing up. You're now ready to upload videos to multiple platforms with a single click.</p>
+    <h2>Getting Started:</h2>
+    <ol>
+        <li>Connect your social media accounts (TikTok, YouTube, Instagram, Facebook)</li>
+        <li>Upload your first video</li>
+        <li>Let our AI generate titles, captions, and hashtags</li>
+        <li>Publish to all platforms at once!</li>
+    </ol>
+    <p><a href="{FRONTEND_URL}/dashboard.html" style="background: #f97316; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px;">Go to Dashboard</a></p>
+    <p>If you have any questions, just reply to this email.</p>
+    <p>- The UploadM8 Team</p>
+    """
+    
+    await _send_mailgun_email(email, subject, html)
+
+
+async def send_upgrade_email(email: str, name: str, new_tier: str):
+    """Send upgrade confirmation email."""
+    if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
+        return
+    
+    subject = f"Welcome to {new_tier.title()}! 🚀"
+    html = f"""
+    <h1>Upgrade Confirmed!</h1>
+    <p>Hi {name},</p>
+    <p>Your account has been upgraded to <strong>{new_tier.title()}</strong>!</p>
+    <p>You now have access to:</p>
+    <ul>
+        <li>Higher upload limits</li>
+        <li>AI-powered captions and thumbnails</li>
+        <li>Smart scheduling</li>
+        <li>And more!</li>
+    </ul>
+    <p><a href="{FRONTEND_URL}/dashboard.html">Go to Dashboard</a></p>
+    <p>- The UploadM8 Team</p>
+    """
+    
+    await _send_mailgun_email(email, subject, html)
+
+
+async def send_tier_change_email(email: str, name: str, old_tier: str, new_tier: str, is_upgrade: bool):
+    """Send tier change notification email."""
+    if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
+        return
+    
+    if is_upgrade:
+        subject = f"🎉 Upgraded to {new_tier.title()}"
+        message = f"Your account has been upgraded from {old_tier.title()} to {new_tier.title()}!"
+    else:
+        subject = f"Plan Changed to {new_tier.title()}"
+        message = f"Your account has been changed from {old_tier.title()} to {new_tier.title()}."
+    
+    html = f"""
+    <h1>Plan Changed</h1>
+    <p>Hi {name},</p>
+    <p>{message}</p>
+    <p><a href="{FRONTEND_URL}/settings.html">View your account settings</a></p>
+    <p>- The UploadM8 Team</p>
+    """
+    
+    await _send_mailgun_email(email, subject, html)
+
+
+# ============================================================
+# Internal Helpers
+# ============================================================
+
+async def _send_discord_webhook(webhook_url: str, content: str = None, embeds: List[dict] = None):
+    """Send message to Discord webhook."""
+    if not webhook_url:
+        return
+    
+    payload = {}
+    if content:
+        payload["content"] = content
+    if embeds:
+        payload["embeds"] = embeds
     
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            with open(video_path, 'rb') as f:
-                files = {"source": ("video.mp4", f, "video/mp4")}
-                resp = await client.post(
-                    f"https://graph.facebook.com/v19.0/{page_id}/videos",
-                    params={
-                        "access_token": access_token,
-                        "description": description[:5000] if description else ""
-                    },
-                    files=files
-                )
-            
-            if resp.status_code != 200:
-                return PlatformResult(
-                    platform="facebook",
-                    success=False,
-                    error_message=f"Upload failed: {resp.text[:200]}"
-                )
-            
-            video_id = resp.json().get("id")
-            return PlatformResult(
-                platform="facebook",
-                success=True,
-                platform_video_id=video_id
-            )
-    
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(webhook_url, json=payload)
+            if response.status_code not in (200, 204):
+                logger.warning(f"Discord webhook failed: {response.status_code}")
     except Exception as e:
-        logger.error(f"Facebook publish error: {e}")
-        return PlatformResult(
-            platform="facebook",
-            success=False,
-            error_message=str(e)
-        )
+        logger.warning(f"Discord webhook error: {e}")
 
 
-async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
-    """Publish to platforms + write a ledger row per publish attempt.
-
-    Ledger contract:
-      - INSERT publish_attempts row before the API call
-      - UPDATE after call (success/fail)
-      - verification loop later turns verify_status into confirmed/rejected/unknown
-    """
-
-    if not ctx.platforms:
-        logger.warning(f"No platforms specified for upload {ctx.upload_id}")
-        return ctx
-
-    default_video = ctx.processed_video_path or ctx.local_video_path
-    if not default_video or not default_video.exists():
-        raise PublishError("No video file to publish", code=ErrorCode.UPLOAD_FAILED)
-
-    logger.info(f"Publishing to platforms: {ctx.platforms}")
-    init_enc_keys()
-
-    platform_to_db_key = {"tiktok": "tiktok", "youtube": "google", "instagram": "meta", "facebook": "meta"}
-
-    for platform in ctx.platforms:
-        db_key = platform_to_db_key.get(platform, platform)
-
-        video_file = ctx.get_video_for_platform(platform)
-        if not video_file or not video_file.exists():
-            video_file = default_video
-
-        attempt_id = None
-        try:
-            attempt_id = await db_stage.insert_publish_attempt(
-                db_pool,
-                upload_id=str(ctx.upload_id),
-                user_id=str(ctx.user_id),
-                platform=str(platform),
+async def _send_mailgun_email(to: str, subject: str, html: str):
+    """Send email via Mailgun API."""
+    if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
+        return
+    
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
+                auth=("api", MAILGUN_API_KEY),
+                data={
+                    "from": MAIL_FROM,
+                    "to": to,
+                    "subject": subject,
+                    "html": html,
+                }
             )
-        except Exception:
-            attempt_id = None
-
-        token_data = None
-        try:
-            token_data = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
-        except Exception:
-            token_data = None
-
-        if not token_data:
-            msg = f"Not connected to {platform}"
-            if attempt_id:
-                try:
-                    await db_stage.update_publish_attempt_failed(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        error_code="NOT_CONNECTED",
-                        error_message=msg,
-                    )
-                except Exception:
-                    pass
-            ctx.platform_results.append(PlatformResult(platform=platform, success=False, attempt_id=attempt_id, error_code="NOT_CONNECTED", error_message=msg))
-            continue
-
-        try:
-            if platform == "tiktok":
-                result = await publish_to_tiktok_ctx(video_file, ctx, token_data)
-            elif platform == "youtube":
-                result = await publish_to_youtube_ctx(video_file, ctx, token_data)
-            elif platform == "instagram":
-                page_id = token_data.get('page_id') or token_data.get('instagram_page_id') or token_data.get('ig_user_id')
-                result = await publish_to_instagram(video_file, (getattr(ctx, 'caption', None) or getattr(ctx, 'description', '') or ''), token_data, page_id)
-            elif platform == "facebook":
-                page_id = token_data.get('page_id') or token_data.get('facebook_page_id') or token_data.get('fb_page_id')
-                result = await publish_to_facebook(video_file, (getattr(ctx, 'description', None) or getattr(ctx, 'caption', '') or ''), token_data, page_id)
+            
+            if response.status_code != 200:
+                logger.warning(f"Mailgun send failed: {response.status_code}")
             else:
-                result = PlatformResult(platform=platform, success=False, error_code="UNSUPPORTED", error_message=f"Unsupported platform: {platform}")
-        except Exception as e:
-            logger.exception(f"Error publishing to {platform}")
-            result = PlatformResult(platform=platform, success=False, error_code="PUBLISH_EXCEPTION", error_message=str(e))
-
-        result.attempt_id = attempt_id
-        ctx.platform_results.append(result)
-
-        if attempt_id:
-            try:
-                if result.success:
-                    await db_stage.update_publish_attempt_success(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        platform_post_id=result.platform_video_id,
-                        platform_url=result.platform_url,
-                        http_status=result.http_status,
-                        response_payload=result.response_payload,
-                        publish_id=result.publish_id,
-                    )
-                else:
-                    await db_stage.update_publish_attempt_failed(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        error_code=result.error_code or "PUBLISH_FAILED",
-                        error_message=result.error_message or "Publish failed",
-                        http_status=result.http_status,
-                        response_payload=result.response_payload,
-                    )
-            except Exception:
-                pass
-
-    return ctx
+                logger.info(f"Email sent to {to}: {subject}")
+                
+    except Exception as e:
+        logger.warning(f"Mailgun error: {e}")

@@ -1,110 +1,240 @@
 """
-UploadM8 Transcode Stage
-=======================
-Transcode the uploaded video into a normalized, platform-friendly MP4.
-
-Contract:
-- Exports: run_transcode_stage(ctx)
-- Input:  ctx.local_video_path must point to the downloaded source video
-- Output: ctx.processed_video_path set to transcoded mp4
-
-This stage is intentionally conservative:
-- If input video path is missing, it raises StageError (pipeline should fail)
-- If FFmpeg is unavailable, it raises StageError
+UploadM8 Telemetry Stage
+========================
+Parse .map telemetry files and calculate Trill scores.
 """
 
-from __future__ import annotations
-
-import asyncio
-import os
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Dict
 
-from .errors import StageError, ErrorCode
-
-
-def _get_ffmpeg_bin() -> str:
-    # allow override for container differences
-    return os.environ.get("FFMPEG_BIN", "ffmpeg")
+from .errors import TelemetryError, SkipStage, ErrorCode
+from .context import JobContext, TelemetryData, TrillScore
 
 
-async def _run_cmd(cmd: list[str]) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+logger = logging.getLogger("uploadm8-worker")
+
+
+# Default thresholds
+DEFAULT_SPEEDING_MPH = 80
+DEFAULT_EUPHORIA_MPH = 100
+
+
+def parse_map_file(map_path: Path) -> TelemetryData:
+    """
+    Parse .map telemetry file.
+    
+    Expected CSV format: timestamp,lat,lon,speed_mph,altitude
+    Lines starting with # are comments.
+    
+    Args:
+        map_path: Path to .map file
+        
+    Returns:
+        TelemetryData with parsed points
+        
+    Raises:
+        TelemetryError: If parsing fails
+    """
+    data_points: List[Dict[str, float]] = []
+    
+    try:
+        with open(map_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                parts = line.split(',')
+                if len(parts) < 4:
+                    continue
+                
+                try:
+                    point = {
+                        'timestamp': float(parts[0]),
+                        'lat': float(parts[1]),
+                        'lon': float(parts[2]),
+                        'speed_mph': float(parts[3]),
+                        'altitude': float(parts[4]) if len(parts) > 4 else 0
+                    }
+                    data_points.append(point)
+                except ValueError:
+                    continue
+    except FileNotFoundError:
+        raise TelemetryError(
+            f"Telemetry file not found: {map_path}",
+            code=ErrorCode.TELEMETRY_PARSE_FAILED
+        )
+    except Exception as e:
+        raise TelemetryError(
+            f"Failed to parse telemetry file: {e}",
+            code=ErrorCode.TELEMETRY_PARSE_FAILED,
+            detail=str(e)
+        )
+    
+    if not data_points:
+        raise TelemetryError(
+            "No valid telemetry data found",
+            code=ErrorCode.TELEMETRY_EMPTY
+        )
+    
+    # Calculate aggregate stats
+    speeds = [p['speed_mph'] for p in data_points]
+    telemetry = TelemetryData()
+    telemetry.points = data_points
+    telemetry.max_speed_mph = max(speeds)
+    telemetry.avg_speed_mph = sum(speeds) / len(speeds)
+    telemetry.duration_seconds = (data_points[-1]['timestamp'] - data_points[0]['timestamp']) if len(data_points) > 1 else 0.0
+    
+    # Estimate distance (rough approximation)
+    if len(data_points) > 1:
+        total_distance = 0
+        for i in range(1, len(data_points)):
+            dt = data_points[i]['timestamp'] - data_points[i-1]['timestamp']
+            avg_speed = (data_points[i]['speed_mph'] + data_points[i-1]['speed_mph']) / 2
+            total_distance += (avg_speed * dt) / 3600  # miles
+        telemetry.distance_miles = total_distance
+    
+    logger.info(f"Parsed telemetry: {len(data_points)} points, max_speed={telemetry.max_speed:.1f} mph")
+    return telemetry
+
+
+def calculate_trill_score(
+    telemetry: TelemetryData,
+    speeding_mph: int = DEFAULT_SPEEDING_MPH,
+    euphoria_mph: int = DEFAULT_EUPHORIA_MPH
+) -> TrillScore:
+    """
+    Calculate Trill score from telemetry data.
+    
+    Score Components (0-100):
+    - Speed score (0-40): Based on max speed vs euphoria threshold
+    - Speeding bonus (0-30): Percentage of time above speeding threshold
+    - Euphoria bonus (0-20): Percentage of time above euphoria threshold
+    - Consistency bonus (0-10): Inverse of speed variance
+    
+    Buckets:
+    - 0-39: chill
+    - 40-59: spirited
+    - 60-79: sendIt
+    - 80-89: euphoric
+    - 90-100: gloryBoy
+    """
+    if not telemetry.data_points:
+        return TrillScore()
+    
+    speeds = [p['speed_mph'] for p in telemetry.data_points]
+    total_points = len(speeds)
+    
+    # Speed score (0-40)
+    speed_score = min(40, (telemetry.max_speed / euphoria_mph) * 40)
+    
+    # Speeding time bonus (0-30)
+    speeding_count = sum(1 for s in speeds if s >= speeding_mph)
+    speeding_ratio = speeding_count / total_points
+    speeding_score = speeding_ratio * 30
+    
+    # Euphoria bonus (0-20)
+    euphoria_count = sum(1 for s in speeds if s >= euphoria_mph)
+    euphoria_ratio = euphoria_count / total_points
+    euphoria_score = euphoria_ratio * 20
+    
+    # Consistency bonus (0-10)
+    if total_points > 1:
+        variance = sum((s - telemetry.avg_speed) ** 2 for s in speeds) / total_points
+        std_dev = variance ** 0.5
+        consistency_score = max(0, 10 - (std_dev / 10))
+    else:
+        consistency_score = 5
+    
+    # Total score
+    total = int(min(100, speed_score + speeding_score + euphoria_score + consistency_score))
+    
+    # Determine bucket
+    if total >= 90:
+        bucket = "gloryBoy"
+    elif total >= 80:
+        bucket = "euphoric"
+    elif total >= 60:
+        bucket = "sendIt"
+    elif total >= 40:
+        bucket = "spirited"
+    else:
+        bucket = "chill"
+    
+    # Check for excessive speed (safety flag)
+    excessive_speed = telemetry.max_speed >= 120
+    
+    # Generate title modifier and hashtags
+    title_modifier, hashtags = get_trill_modifiers(total, telemetry.max_speed, bucket)
+    
+    return TrillScore(
+        score=total,
+        bucket=bucket,
+        speed_score=speed_score,
+        speeding_score=speeding_score,
+        euphoria_score=euphoria_score,
+        consistency_score=consistency_score,
+        excessive_speed=excessive_speed,
+        title_modifier=title_modifier,
+        hashtags=hashtags
     )
-    out_b, err_b = await proc.communicate()
-    out = out_b.decode("utf-8", errors="replace") if out_b else ""
-    err = err_b.decode("utf-8", errors="replace") if err_b else ""
-    return proc.returncode, out, err
 
 
-async def run_transcode_stage(ctx, *, target_height: Optional[int] = None, crf: str = "23"):
-    """Canonical entrypoint expected by worker.py."""
+def get_trill_modifiers(score: int, max_speed: float, bucket: str) -> tuple[str, List[str]]:
+    """Get title modifier and hashtags based on Trill score."""
+    if bucket == "gloryBoy":
+        return " - GLORY BOY", ["#GloryBoyTour", "#TrillScore100", "#SendIt"]
+    elif bucket == "euphoric":
+        return " - Euphoric", ["#Euphoric", "#TrillScore", "#SpeedDemon"]
+    elif bucket == "sendIt":
+        return " - Send It", ["#SendIt", "#TrillScore", "#Spirited"]
+    elif bucket == "spirited":
+        return " - Spirited Drive", ["#SpiritedDrive", "#TrillScore"]
+    elif max_speed >= 100:
+        return "", ["#TrillScore", "#RoadTrip"]
+    else:
+        return "", ["#TrillScore"]
 
-    # Stage markers (support both sync and async variants)
-    if hasattr(ctx, "mark_stage"):
-        try:
-            res = ctx.mark_stage("transcode")
-            if hasattr(res, "__await__"):
-                await res
-        except Exception:
-            pass
 
-    in_path = getattr(ctx, "local_video_path", None)
-    if not in_path:
-        raise StageError(ErrorCode.VALIDATION, "Missing local_video_path for transcode", stage="transcode")
-
-    in_path = Path(in_path)
-    if not in_path.exists():
-        raise StageError(ErrorCode.NOT_FOUND, f"Input video not found: {in_path}", stage="transcode")
-
-    tmp_dir = getattr(ctx, "temp_dir", None)
-    if not tmp_dir:
-        # create a stage-local temp dir under /tmp if pipeline didn't supply one
-        tmp_dir = Path("/tmp") / f"uploadm8_{getattr(ctx, 'upload_id', 'unknown')}"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        setattr(ctx, "temp_dir", tmp_dir)
-
-    out_path = Path(tmp_dir) / "processed.mp4"
-
-    # Scale logic: optional knob, default keeps source dimensions.
-    vf = None
-    if target_height:
-        # keep aspect ratio, force even dimensions
-        vf = f"scale=-2:{int(target_height)}"
-
-    cmd = [
-        _get_ffmpeg_bin(),
-        "-y",
-        "-i",
-        str(in_path),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-    ]
-    if vf:
-        cmd += ["-vf", vf]
-    cmd += [str(out_path)]
-
-    rc, out, err = await _run_cmd(cmd)
-    if rc != 0 or not out_path.exists():
-        # keep stderr short; worker logs capture full traceback anyway
-        snippet = (err or out)[-1500:]
-        raise StageError(ErrorCode.UPSTREAM, f"FFmpeg transcode failed (rc={rc}). {snippet}", stage="transcode")
-
-    setattr(ctx, "processed_video_path", out_path)
-
+async def run_telemetry_stage(ctx: JobContext) -> JobContext:
+    """
+    Execute telemetry processing stage.
+    
+    Args:
+        ctx: Job context
+        
+    Returns:
+        Updated context with telemetry and trill data
+        
+    Raises:
+        SkipStage: If no telemetry file
+        TelemetryError: If processing fails
+    """
+    if not ctx.local_telemetry_path or not ctx.local_telemetry_path.exists():
+        # Ensure downstream stages never crash on missing attributes
+        ctx.telemetry = None
+        ctx.telemetry_data = None
+        ctx.trill = None
+        ctx.trill_score = None
+        raise SkipStage("No telemetry file available")
+    
+    logger.info(f"Processing telemetry for upload {ctx.upload_id}")
+    
+    # Parse telemetry
+    telemetry = parse_map_file(ctx.local_telemetry_path)
+    ctx.telemetry = telemetry
+    ctx.telemetry_data = telemetry
+    
+    # Get user thresholds from settings
+    speeding_mph = ctx.user_settings.get("speeding_mph", DEFAULT_SPEEDING_MPH)
+    euphoria_mph = ctx.user_settings.get("euphoria_mph", DEFAULT_EUPHORIA_MPH)
+    
+    # Calculate Trill score
+    trill = calculate_trill_score(telemetry, speeding_mph, euphoria_mph)
+    ctx.trill = trill
+    ctx.trill_score = trill
+    
+    logger.info(f"Trill score: {trill.score} ({trill.bucket})")
+    
     return ctx

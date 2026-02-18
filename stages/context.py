@@ -155,6 +155,7 @@ class JobContext:
     caption: str = ""
     hashtags: List[str] = field(default_factory=list)
     privacy: str = "public"
+    reframe_mode: str = "auto"  # auto | pad | crop | none
 
     entitlements: Optional[Entitlements] = None
     user_settings: Dict[str, Any] = field(default_factory=dict)
@@ -259,6 +260,14 @@ class JobContext:
 
 
 def create_context(job_data: dict, upload_record: dict, user_settings: dict, entitlements: Entitlements) -> JobContext:
+    # Resolve reframe_mode: job payload > upload record > user setting > "auto"
+    reframe_mode = (
+        job_data.get("reframe_mode")
+        or upload_record.get("reframe_mode")
+        or (user_settings or {}).get("reframe_mode")
+        or "auto"
+    )
+
     return JobContext(
         job_id=job_data.get("job_id", ""),
         upload_id=str(upload_record.get("id", "")),
@@ -273,6 +282,7 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
         caption=upload_record.get("caption", ""),
         hashtags=upload_record.get("hashtags", []) or [],
         privacy=upload_record.get("privacy", "public") or "public",
+        reframe_mode=reframe_mode,
         user_settings=user_settings or {},
         entitlements=entitlements,
     )

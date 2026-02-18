@@ -239,7 +239,7 @@ def check_platform_blocked(info: VideoInfo, platform: str, reframe_mode: str = "
     # YouTube Shorts REQUIRES vertical or square — landscape becomes a regular upload
     # UNLESS the user opted into vertical reframing
     if is_landscape and not spec.get("landscape_allowed", True):
-        if reframe_mode in ("blur_fill", "center_crop"):
+        if reframe_mode in ("blur_fill", "center_crop", "pad", "auto"):
             return None  # Reframe will handle it
         return (
             f"{spec['name']} requires vertical (9:16) or square (1:1) video. "
@@ -282,7 +282,11 @@ def check_platform_blocked(info: VideoInfo, platform: str, reframe_mode: str = "
 #                  that require vertical (YouTube Shorts).
 # ─────────────────────────────────────────────────────────────────────
 
-VALID_REFRAME_MODES = ("none", "blur_fill", "center_crop")
+# "pad" = 1080x1920 canvas with black bars (no blur)
+# "auto" = platform policy: pad for vertical platforms if landscape; YouTube also trims to 59.5s
+VALID_REFRAME_MODES = ("none", "pad", "blur_fill", "center_crop", "auto")
+
+YOUTUBE_SHORTS_TRIM_SECONDS = 59.5
 
 
 def _build_blur_fill_filter(info: VideoInfo, target_w: int = 1080, target_h: int = 1920) -> str:
@@ -342,6 +346,18 @@ def _build_center_crop_filter(info: VideoInfo, target_w: int = 1080, target_h: i
     return filtergraph
 
 
+def _build_pad_filter(target_w: int = 1080, target_h: int = 1920) -> str:
+    """
+    Pad to a fixed vertical canvas (1080x1920) while preserving aspect ratio.
+    This is the "letterbox to vertical" strategy (no blur, no crop).
+    """
+    return (
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+        f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
+        f"format=yuv420p"
+    )
+
+
 def needs_transcode(info: VideoInfo, platform: str) -> Tuple[bool, list]:
     """Check if video needs transcoding for the target platform.
 
@@ -391,8 +407,12 @@ def needs_transcode(info: VideoInfo, platform: str) -> Tuple[bool, list]:
 
 
 def build_ffmpeg_command(
-    input_path: Path, output_path: Path, info: VideoInfo, platform: str,
+    input_path: Path,
+    output_path: Path,
+    info: VideoInfo,
+    platform: str,
     reframe_mode: str = "none",
+    trim_seconds: Optional[float] = None,
 ) -> list:
     """Build FFmpeg command for transcoding.
 
@@ -403,9 +423,11 @@ def build_ffmpeg_command(
     - No forced padding: platforms handle letterboxing in their own players.
       Baking black bars into the video file makes it look bad everywhere.
 
-    Reframe modes (for landscape → vertical-only platforms):
+    Reframe modes:
     - "blur_fill": blurred background + sharp center (recommended for dashcam)
     - "center_crop": center 9:16 slice (loses ~65% width)
+    - "pad": letterbox into a fixed 1080x1920 canvas (black bars)
+    - "auto": policy-driven (applied in run_transcode_stage)
     - "none": no reframe, use normal scaling
     """
     spec = PLATFORM_SPECS.get(platform, PLATFORM_SPECS["youtube"])
@@ -413,19 +435,25 @@ def build_ffmpeg_command(
     cmd = [FFMPEG_BIN, "-y", "-i", str(input_path)]
 
     is_landscape = info.width > info.height
-    needs_reframe = (
+
+    # Effective target canvas for vertical reframes
+    target_w = min(spec["max_width"], spec["max_height"])   # 1080
+    target_h = max(spec["max_width"], spec["max_height"])   # 1920
+
+    # Reframe strategy selection:
+    # - blur_fill / center_crop = only applied when platform disallows landscape
+    # - pad = explicit; can be used even when the platform accepts landscape
+    use_blur_or_crop = (
         reframe_mode in ("blur_fill", "center_crop")
         and is_landscape
         and not spec.get("landscape_allowed", True)
     )
+    use_pad = (reframe_mode == "pad" and is_landscape)
 
-    if needs_reframe:
-        # ── Vertical reframe path ───────────────────────────────────
+    if use_blur_or_crop:
+        # ── Vertical reframe path (blur_fill/center_crop) ────────────
         # Uses a complex filtergraph (-filter_complex) instead of -vf
         # because blur_fill needs to split the input into two streams.
-        target_w = min(spec["max_width"], spec["max_height"])   # 1080
-        target_h = max(spec["max_width"], spec["max_height"])   # 1920
-
         if reframe_mode == "blur_fill":
             filtergraph = _build_blur_fill_filter(info, target_w, target_h)
             logger.info(
@@ -450,7 +478,7 @@ def build_ffmpeg_command(
         cmd.extend(["-filter_complex", filtergraph])
 
     else:
-        # ── Normal scaling path ─────────────────────────────────────
+        # ── Normal / pad scaling path ────────────────────────────────
         vf_filters = []
 
         # Rotation
@@ -461,31 +489,35 @@ def build_ffmpeg_command(
         elif info.rotation in (270, -90):
             vf_filters.append("transpose=2")
 
-        # Orientation-aware bounding box
-        max_long = max(spec["max_width"], spec["max_height"])    # 1920
-        max_short = min(spec["max_width"], spec["max_height"])   # 1080
-
-        if is_landscape:
-            box_w, box_h = max_long, max_short     # 1920 x 1080 for landscape
+        if use_pad:
+            # Force vertical canvas output (1080x1920) with padding
+            vf_filters.append(_build_pad_filter(target_w, target_h))
         else:
-            box_w, box_h = max_short, max_long     # 1080 x 1920 for portrait
+            # Orientation-aware bounding box (no forced padding)
+            max_long = max(spec["max_width"], spec["max_height"])    # 1920
+            max_short = min(spec["max_width"], spec["max_height"])   # 1080
 
-        # Proportional scale factor — shrink only, never upscale
-        scale_w = box_w / info.width if info.width > box_w else 1.0
-        scale_h = box_h / info.height if info.height > box_h else 1.0
-        scale_factor = min(scale_w, scale_h)
+            if is_landscape:
+                box_w, box_h = max_long, max_short     # 1920 x 1080 for landscape
+            else:
+                box_w, box_h = max_short, max_long     # 1080 x 1920 for portrait
 
-        target_width = int(info.width * scale_factor)
-        target_height = int(info.height * scale_factor)
-        target_width -= target_width % 2
-        target_height -= target_height % 2
+            # Proportional scale factor — shrink only, never upscale
+            scale_w = box_w / info.width if info.width > box_w else 1.0
+            scale_h = box_h / info.height if info.height > box_h else 1.0
+            scale_factor = min(scale_w, scale_h)
 
-        needs_scale = (target_width != info.width or target_height != info.height)
+            target_width = int(info.width * scale_factor)
+            target_height = int(info.height * scale_factor)
+            target_width -= target_width % 2
+            target_height -= target_height % 2
 
-        if needs_scale:
-            vf_filters.append(f"scale={target_width}:{target_height}")
+            needs_scale = (target_width != info.width or target_height != info.height)
 
-        vf_filters.append("format=yuv420p")
+            if needs_scale:
+                vf_filters.append(f"scale={target_width}:{target_height}")
+
+            vf_filters.append("format=yuv420p")
 
         if vf_filters:
             cmd.extend(["-vf", ",".join(vf_filters)])
@@ -500,8 +532,16 @@ def build_ffmpeg_command(
 
     if info.fps > spec["max_fps"]:
         cmd.extend(["-r", str(spec["max_fps"])])
-    if info.duration > spec["max_duration"]:
-        cmd.extend(["-t", str(spec["max_duration"])])
+
+    # Duration trim: platform max_duration OR explicit trim_seconds (used by auto policy for YouTube Shorts)
+    effective_trim = None
+    if trim_seconds is not None:
+        effective_trim = float(trim_seconds)
+    elif info.duration > spec["max_duration"]:
+        effective_trim = float(spec["max_duration"])
+
+    if effective_trim is not None and info.duration > effective_trim:
+        cmd.extend(["-t", f"{effective_trim:.3f}"])
 
     # Audio
     if info.audio_codec:
@@ -520,14 +560,18 @@ def build_ffmpeg_command(
 
 
 async def transcode_video(
-    input_path: Path, output_path: Path, platform: str,
-    info: Optional[VideoInfo] = None, reframe_mode: str = "none",
+    input_path: Path,
+    output_path: Path,
+    platform: str,
+    info: Optional[VideoInfo] = None,
+    reframe_mode: str = "none",
+    trim_seconds: Optional[float] = None,
 ) -> Path:
     """Transcode video to platform-specific format."""
     if not info:
         info = await get_video_info(input_path)
 
-    cmd = build_ffmpeg_command(input_path, output_path, info, platform, reframe_mode)
+    cmd = build_ffmpeg_command(input_path, output_path, info, platform, reframe_mode, trim_seconds=trim_seconds)
     logger.info(f"Transcoding for {platform}: {info.width}x{info.height} -> "
                 f"{output_path.name}, reframe={reframe_mode}, "
                 f"cmd starts: {' '.join(cmd[:12])}...")
@@ -566,7 +610,7 @@ async def run_transcode_stage(ctx: JobContext) -> JobContext:
       6. Verify output file sizes are within platform limits
 
     Reframe mode is read from ctx.reframe_mode (set by the API/frontend).
-    Valid values: "blur_fill", "center_crop", "none" (default).
+    Valid values: "auto", "pad", "blur_fill", "center_crop", "none" (default).
     When set, landscape videos can be auto-converted to vertical for
     platforms that require it (YouTube Shorts).
     """
@@ -611,6 +655,7 @@ async def run_transcode_stage(ctx: JobContext) -> JobContext:
     transcoded_any = False
 
     is_landscape = info.width > info.height
+    user_reframe_mode = reframe_mode  # preserve original user intent
 
     for platform in platforms:
         spec = PLATFORM_SPECS.get(platform, {})
@@ -622,15 +667,31 @@ async def run_transcode_stage(ctx: JobContext) -> JobContext:
             ctx.platform_blocked[platform] = blocked_reason
             continue
 
-        # ── Determine if this platform needs a reframe ──────────────
+        # ── Determine if this platform needs a reframe / trim policy ─────────
         platform_reframe = "none"
-        if is_landscape and not spec.get("landscape_allowed", True) and reframe_mode != "none":
-            platform_reframe = reframe_mode
-            ctx.platform_reframed[platform] = reframe_mode
-            logger.info(
-                f"{platform}: landscape video will be reframed to vertical "
-                f"via {reframe_mode}"
-            )
+        platform_trim_seconds: Optional[float] = None
+
+        if user_reframe_mode == "auto":
+            # Auto rules:
+            # - TikTok/IG/FB/YouTube: pad to 1080x1920 if landscape
+            # - YouTube: also trim to 59.5s (Shorts-safe)
+            if is_landscape and platform in ("tiktok", "instagram", "facebook", "youtube"):
+                platform_reframe = "pad"
+                ctx.platform_reframed[platform] = "pad"
+                logger.info(f"{platform}: auto mode → pad to {min(spec.get('max_width',1080), spec.get('max_height',1920))}x{max(spec.get('max_width',1080), spec.get('max_height',1920))}")
+
+            if platform == "youtube":
+                platform_trim_seconds = YOUTUBE_SHORTS_TRIM_SECONDS
+
+        else:
+            # Manual behavior (existing): only reframe when platform disallows landscape
+            if is_landscape and not spec.get("landscape_allowed", True) and user_reframe_mode != "none":
+                platform_reframe = user_reframe_mode
+                ctx.platform_reframed[platform] = user_reframe_mode
+                logger.info(
+                    f"{platform}: landscape video will be reframed to vertical "
+                    f"via {user_reframe_mode}"
+                )
 
         # ── Landscape warning (for platforms that accept but don't prefer it)
         if is_landscape and spec.get("landscape_allowed", True) and spec.get("preferred_aspect") == (9, 16):
@@ -656,6 +717,12 @@ async def run_transcode_stage(ctx: JobContext) -> JobContext:
         # ── Transcode / reframe check ───────────────────────────────
         needs_tc, reasons = needs_transcode(info, platform)
 
+        # Auto-mode YouTube Shorts trim triggers a transcode even if within platform max_duration
+        if platform == "youtube" and platform_trim_seconds is not None and info.duration > platform_trim_seconds:
+            if not needs_tc:
+                needs_tc = True
+            reasons.append(f"trim to {platform_trim_seconds:.1f}s for Shorts-safe upload")
+
         # Force transcode if reframe is needed (even if video is otherwise compatible)
         if platform_reframe != "none" and not needs_tc:
             needs_tc = True
@@ -665,7 +732,12 @@ async def run_transcode_stage(ctx: JobContext) -> JobContext:
             logger.info(f"{platform} needs transcode: {', '.join(reasons)}")
             output_path = ctx.temp_dir / f"transcoded_{platform}.mp4"
             await transcode_video(
-                ctx.local_video_path, output_path, platform, info, platform_reframe
+                ctx.local_video_path,
+                output_path,
+                platform,
+                info,
+                platform_reframe,
+                trim_seconds=platform_trim_seconds,
             )
 
             # Verify output size is within platform limit

@@ -324,7 +324,7 @@ async def run_pipeline(job_data: dict) -> bool:
 
 
 async def process_jobs():
-    global shutdown_requested
+    global shutdown_requested, redis_client
     logger.info("Worker started, waiting for jobs...")
 
     consecutive_redis_errors = 0

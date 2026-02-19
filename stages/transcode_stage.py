@@ -1,130 +1,121 @@
 """
-UploadM8 Transcode Stage
-=========================
-Converts videos to platform-specific formats using FFmpeg.
+UploadM8 Transcode Stage - Platform-specific video transcoding
 
-Ensures videos meet the requirements for:
-- YouTube Shorts: H.264, AAC, 9:16 or 1:1, max 3 minutes  (LANDSCAPE REJECTED)
-- TikTok: H.264 High, AAC-LC 256k/44.1kHz, max 10 min upload
-- Instagram Reels: H.264, AAC, max 3 minutes (15 min via API)
-- Facebook Reels: H.264, AAC, 3-90s (all videos = Reels since Jun 2025)
+Creates separate, optimized video files for each target platform.
+Each platform gets its own properly formatted MP4 with correct:
+  - Aspect ratio (9:16 vertical via pad/crop based on reframe_mode)
+  - Resolution (max 1080x1920)
+  - Duration (trimmed to platform max)
+  - Codec (H.264 High + AAC-LC)
+  - Frame rate (capped per platform)
+  - Pixel format (yuv420p)
+  - Audio sample rate (per platform)
 
-Exports:
-  - run_transcode_stage(ctx)
+Reframe modes (ctx.reframe_mode):
+  auto  - Landscape input -> pad to 9:16 for all platforms. Already vertical -> pass through.
+  pad   - Always letterbox/pillarbox to 9:16 (black bars, no content lost)
+  crop  - Center-crop to fill 9:16 (loses edges, no black bars)
+  none  - Keep original aspect ratio, only fix codec/format/duration/fps
+
+Platform specs verified February 2026.
 """
 
 import asyncio
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
 from .context import JobContext
 from .errors import StageError, SkipStage, ErrorCode
 
-logger = logging.getLogger("uploadm8-worker")
+logger = logging.getLogger("uploadm8-worker.transcode")
 
-FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "ffprobe")
 
-# ─────────────────────────────────────────────────────────────────────
-# Platform-specific requirements  (last verified Feb 2026)
-#
-# Sources:
-#   YouTube  – support.google.com/youtube/answer/15424877  (3-min Shorts since Oct 2024)
-#   TikTok   – developers.tiktok.com  Content Posting API + partner docs (Sep 2025)
-#   Instagram – help.instagram.com/1038071743007909  (3-min Reels since Jan 2025)
-#   Facebook – postfa.st/sizes/facebook/reels  (all videos = Reels since Jun 2025)
-#
-# IMPORTANT — landscape_allowed:
-#   YouTube Shorts REQUIRES vertical (9:16) or square (1:1) aspect ratio.
-#   A landscape video will NOT qualify as a Short; it becomes a regular
-#   YouTube upload.  TikTok, Instagram, and Facebook accept landscape
-#   but strongly prefer vertical.  The flag controls whether the
-#   transcoder should warn/block landscape uploads for a given platform.
-#
-# max_file_size is in bytes — the pipeline should reject files that
-# exceed this BEFORE transcoding to avoid wasted compute.
-# ─────────────────────────────────────────────────────────────────────
-
+# -------------------------------------------------------------------------
+# Platform specifications (verified Feb 2026)
+# -------------------------------------------------------------------------
 PLATFORM_SPECS = {
-    "youtube": {
-        "name": "YouTube Shorts",
-        "max_duration": 180,              # 3 minutes (Oct 2024 update)
-        "preferred_aspect": (9, 16),
-        "landscape_allowed": False,       # Landscape → regular upload, NOT a Short
+    "tiktok": {
+        "name": "TikTok",
+        "max_duration": 600,            # 10 min via Content Posting API
+        "target_width": 1080,
+        "target_height": 1920,
+        "preferred_aspect": (9, 16),    # vertical
         "video_codec": "h264",
         "audio_codec": "aac",
-        "max_width": 1080,
-        "max_height": 1920,
+        "max_fps": 30,                  # 60 accepted but heavily compressed; 30 safer
+        "max_bitrate_video": "10M",
+        "max_bitrate_audio": "256k",
+        "sample_rate": 44100,
+        "pixel_format": "yuv420p",
+        "profile": "high",
+        "level": "4.2",
+        "max_file_mb": 500,             # API limit
+    },
+    "youtube": {
+        "name": "YouTube Shorts",
+        "max_duration": 180,            # 3 minutes (expanded Oct 2024)
+        "target_width": 1080,
+        "target_height": 1920,
+        "preferred_aspect": (9, 16),
+        "video_codec": "h264",
+        "audio_codec": "aac",
         "max_fps": 60,
-        "max_bitrate_video": "15M",       # YT compression is aggressive; higher source = better
+        "max_bitrate_video": "12M",
         "max_bitrate_audio": "192k",
         "sample_rate": 48000,
         "pixel_format": "yuv420p",
-        "max_file_size": 2 * 1024**3,     # 2 GB
-        "container": "mp4",
-    },
-    "tiktok": {
-        "name": "TikTok",
-        "max_duration": 600,              # 10 min in-app record; 60 min upload (API safe: 10 min)
-        "preferred_aspect": (9, 16),
-        "landscape_allowed": True,        # Accepted, but vertical strongly preferred by algorithm
-        "video_codec": "h264",            # H.264 High Profile, level 4.2
-        "audio_codec": "aac",             # AAC-LC
-        "max_width": 1080,
-        "max_height": 1920,
-        "max_fps": 60,                    # Supported; 30 fps recommended for less compression
-        "max_bitrate_video": "15M",       # 8-15 Mbps VBR recommended; >20 gets flattened
-        "max_bitrate_audio": "256k",      # AAC-LC 256 kbps per partner docs
-        "sample_rate": 44100,             # 44.1 kHz confirmed
-        "pixel_format": "yuv420p",
-        "max_file_size": 500 * 1024**2,   # 500 MB (<3 min); 2 GB for 3-10 min
-        "max_file_size_long": 2 * 1024**3,  # For videos > 3 min
-        "container": "mp4",
+        "profile": "high",
+        "level": "4.1",
+        "max_file_mb": 256000,          # YouTube general limit (256GB)
     },
     "instagram": {
         "name": "Instagram Reels",
-        "max_duration": 180,              # 3 minutes (Jan 2025 update); up to 15 min via API
+        "max_duration": 90,             # 90s via API (app supports up to 3 min / 15 min)
+        "target_width": 1080,
+        "target_height": 1920,
         "preferred_aspect": (9, 16),
-        "landscape_allowed": True,        # Accepted, but gets letterboxed
         "video_codec": "h264",
         "audio_codec": "aac",
-        "max_width": 1080,
-        "max_height": 1920,
-        "max_fps": 60,                    # 30 fps minimum, 60 supported
-        "max_bitrate_video": "10M",       # IG compression heavy; 10M is sweet spot
-        "max_bitrate_audio": "192k",
+        "max_fps": 30,
+        "max_bitrate_video": "5M",      # IG compresses aggressively; lower = less re-compression
+        "max_bitrate_audio": "128k",
         "sample_rate": 44100,
         "pixel_format": "yuv420p",
-        "max_file_size": 650 * 1024**2,   # 650 MB for <10 min; 4 GB absolute max
-        "container": "mp4",
+        "profile": "high",
+        "level": "4.0",
+        "max_file_mb": 4096,            # 4GB
     },
     "facebook": {
         "name": "Facebook Reels",
-        "max_duration": 90,               # API still enforces 3-90s for Reels endpoint
+        "max_duration": 0,              # 0 = no limit (June 2025: all videos are Reels)
+        "target_width": 1080,
+        "target_height": 1920,
         "preferred_aspect": (9, 16),
-        "landscape_allowed": True,        # All videos are Reels since Jun 2025
         "video_codec": "h264",
         "audio_codec": "aac",
-        "max_width": 1080,
-        "max_height": 1920,
-        "max_fps": 60,                    # 24-60 fps per Meta docs
-        "max_bitrate_video": "10M",
-        "max_bitrate_audio": "192k",
+        "max_fps": 30,
+        "max_bitrate_video": "8M",
+        "max_bitrate_audio": "128k",
         "sample_rate": 44100,
         "pixel_format": "yuv420p",
-        "max_file_size": 1 * 1024**3,     # 1 GB
-        "container": "mp4",
+        "profile": "high",
+        "level": "4.1",
+        "max_file_mb": 4096,            # 4GB
     },
 }
 
 
+# -------------------------------------------------------------------------
+# Video info
+# -------------------------------------------------------------------------
 @dataclass
 class VideoInfo:
-    """Parsed video metadata from ffprobe."""
+    """Parsed video metadata from ffprobe"""
     width: int
     height: int
     duration: float
@@ -136,24 +127,43 @@ class VideoInfo:
     sample_rate: Optional[int]
     pixel_format: str
     rotation: int = 0
+    file_size: int = 0
+
+    @property
+    def is_landscape(self) -> bool:
+        return self.width > self.height
+
+    @property
+    def is_portrait(self) -> bool:
+        return self.height > self.width
+
+    @property
+    def is_square(self) -> bool:
+        return self.width == self.height
+
+    @property
+    def aspect_ratio(self) -> float:
+        if self.height == 0:
+            return 0
+        return self.width / self.height
 
 
 async def get_video_info(video_path: Path) -> VideoInfo:
-    """Use ffprobe to get video metadata."""
+    """Use ffprobe to get video metadata"""
     cmd = [
-        FFPROBE_BIN,
+        "ffprobe",
         "-v", "quiet",
         "-print_format", "json",
         "-show_format",
         "-show_streams",
-        str(video_path),
+        str(video_path)
     ]
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
 
@@ -162,6 +172,7 @@ async def get_video_info(video_path: Path) -> VideoInfo:
 
         data = json.loads(stdout.decode())
 
+        # Find video and audio streams
         video_stream = None
         audio_stream = None
         for stream in data.get("streams", []):
@@ -173,6 +184,7 @@ async def get_video_info(video_path: Path) -> VideoInfo:
         if not video_stream:
             raise StageError(ErrorCode.TRANSCODE_FAILED, "No video stream found")
 
+        # Parse dimensions
         width = int(video_stream.get("width", 0))
         height = int(video_stream.get("height", 0))
 
@@ -183,11 +195,13 @@ async def get_video_info(video_path: Path) -> VideoInfo:
         if "side_data_list" in video_stream:
             for side_data in video_stream["side_data_list"]:
                 if "rotation" in side_data:
-                    rotation = int(side_data["rotation"])
+                    rotation = abs(int(side_data["rotation"]))
 
-        if rotation in (90, 270, -90, -270):
+        # Swap width/height if rotated 90 or 270 degrees
+        if rotation in (90, 270):
             width, height = height, width
 
+        # Parse framerate
         fps_str = video_stream.get("r_frame_rate", "30/1")
         if "/" in fps_str:
             num, den = fps_str.split("/")
@@ -195,424 +209,311 @@ async def get_video_info(video_path: Path) -> VideoInfo:
         else:
             fps = float(fps_str)
 
+        # Parse duration
         duration = float(data.get("format", {}).get("duration", 0))
         if duration == 0:
             duration = float(video_stream.get("duration", 0))
 
+        # Parse bitrates
         video_bitrate = int(video_stream.get("bit_rate", 0)) if video_stream.get("bit_rate") else None
         audio_bitrate = int(audio_stream.get("bit_rate", 0)) if audio_stream and audio_stream.get("bit_rate") else None
         sample_rate = int(audio_stream.get("sample_rate", 0)) if audio_stream and audio_stream.get("sample_rate") else None
 
+        # File size
+        file_size = int(data.get("format", {}).get("size", 0))
+        if file_size == 0:
+            try:
+                file_size = video_path.stat().st_size
+            except Exception:
+                pass
+
         return VideoInfo(
-            width=width, height=height, duration=duration, fps=fps,
+            width=width,
+            height=height,
+            duration=duration,
+            fps=fps,
             video_codec=video_stream.get("codec_name", "unknown"),
             audio_codec=audio_stream.get("codec_name") if audio_stream else None,
-            video_bitrate=video_bitrate, audio_bitrate=audio_bitrate,
+            video_bitrate=video_bitrate,
+            audio_bitrate=audio_bitrate,
             sample_rate=sample_rate,
             pixel_format=video_stream.get("pix_fmt", "unknown"),
             rotation=rotation,
+            file_size=file_size,
         )
 
     except json.JSONDecodeError as e:
         raise StageError(ErrorCode.TRANSCODE_FAILED, f"Failed to parse ffprobe output: {e}")
-    except StageError:
-        raise
     except Exception as e:
+        if isinstance(e, StageError):
+            raise
         raise StageError(ErrorCode.TRANSCODE_FAILED, f"Failed to get video info: {e}")
 
 
-def check_platform_blocked(info: VideoInfo, platform: str, reframe_mode: str = "none") -> Optional[str]:
-    """Check for hard blockers that transcoding CANNOT fix.
-
-    Returns a human-readable reason string if the video is fundamentally
-    incompatible with the platform, or None if it can proceed.
-
-    If reframe_mode is "blur_fill" or "center_crop", landscape videos are
-    NOT blocked — they'll be reframed to vertical in build_ffmpeg_command().
+# -------------------------------------------------------------------------
+# Transcode decision logic
+# -------------------------------------------------------------------------
+def resolve_reframe_action(info: VideoInfo, reframe_mode: str, platform: str) -> str:
     """
-    spec = PLATFORM_SPECS.get(platform)
-    if not spec:
-        return None
+    Decide the actual reframe action for this video + platform + mode.
 
-    is_landscape = info.width > info.height
-
-    # YouTube Shorts REQUIRES vertical or square — landscape becomes a regular upload
-    # UNLESS the user opted into vertical reframing
-    if is_landscape and not spec.get("landscape_allowed", True):
-        if reframe_mode in ("blur_fill", "center_crop", "pad", "auto"):
-            return None  # Reframe will handle it
-        return (
-            f"{spec['name']} requires vertical (9:16) or square (1:1) video. "
-            f"Your {info.width}x{info.height} landscape video would be uploaded "
-            f"as a regular YouTube video, NOT a Short. "
-            f"Enable vertical reframe (blur_fill or center_crop) to auto-convert."
-        )
-
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Vertical reframe modes
-#
-# When a landscape video targets a vertical-only platform (YouTube Shorts),
-# the transcoder can reframe it to 9:16 using one of these strategies:
-#
-#   blur_fill    – Full video centered in a 1080x1920 frame, with a
-#                  blurred + zoomed copy filling the top/bottom gaps.
-#                  No content lost. Looks native on Shorts/TikTok.
-#                  ┌───────────────┐
-#                  │ ░░░ BLUR ░░░░ │
-#                  │ ┌───────────┐ │
-#                  │ │ FULL VID  │ │
-#                  │ └───────────┘ │
-#                  │ ░░░ BLUR ░░░░ │
-#                  └───────────────┘
-#
-#   center_crop  – Crops the center 9:16 slice out of the 16:9 frame.
-#                  Loses ~65% of the frame width. Only useful if the
-#                  subject is centered (talking head, not dashcam).
-#                  ┌───────────────┐
-#                  │               │
-#                  │   CROPPED     │
-#                  │   CENTER      │
-#                  │               │
-#                  └───────────────┘
-#
-#   none         – No reframe. Landscape videos are blocked on platforms
-#                  that require vertical (YouTube Shorts).
-# ─────────────────────────────────────────────────────────────────────
-
-# "pad" = 1080x1920 canvas with black bars (no blur)
-# "auto" = platform policy: pad for vertical platforms if landscape; YouTube also trims to 59.5s
-VALID_REFRAME_MODES = ("none", "pad", "blur_fill", "center_crop", "auto")
-
-YOUTUBE_SHORTS_TRIM_SECONDS = 59.5
-
-
-def _build_blur_fill_filter(info: VideoInfo, target_w: int = 1080, target_h: int = 1920) -> str:
-    """Build an FFmpeg filtergraph that reframes landscape → vertical with blur-fill.
-
-    The filter creates two layers:
-      1. Background: input scaled UP to cover the full target canvas,
-         center-cropped, then heavily blurred.
-      2. Foreground: input scaled DOWN to fit within target_w, keeping
-         its original aspect ratio.
-    The foreground is overlaid centered on the background.
-
-    Example for 1920x1080 → 1080x1920:
-      BG: scale to ~3413x1920 (covers canvas), crop 1080x1920, blur
-      FG: scale to 1080x608 (fits width, maintains 16:9)
-      Overlay: FG centered at y=(1920-608)/2 = 656
+    Returns one of: "pad", "crop", "none"
     """
-    # Background: scale to cover, crop center, blur hard
-    bg = (
-        f"scale={target_w}:{target_h}:"
-        f"force_original_aspect_ratio=increase,"
-        f"crop={target_w}:{target_h},"
-        f"boxblur=luma_radius=25:luma_power=2"
-    )
+    mode = (reframe_mode or "auto").lower().strip()
 
-    # Foreground: scale to fit width, auto-height (keep aspect, force even)
-    fg = f"scale={target_w}:-2"
+    if mode == "none":
+        return "none"
 
-    # Combine with complex filtergraph
-    filtergraph = (
-        f"[0:v]{bg}[bg];"
-        f"[0:v]{fg}[fg];"
-        f"[bg][fg]overlay=0:(H-h)/2,format=yuv420p"
-    )
+    if mode == "pad":
+        return "pad"
 
-    return filtergraph
+    if mode == "crop":
+        return "crop"
 
+    # mode == "auto" (default)
+    # If video is already vertical (9:16 or close), no reframing needed
+    if info.is_portrait or info.is_square:
+        return "none"
 
-def _build_center_crop_filter(info: VideoInfo, target_w: int = 1080, target_h: int = 1920) -> str:
-    """Build an FFmpeg filtergraph that center-crops landscape → vertical 9:16.
-
-    Crops the center vertical slice, then scales to target resolution.
-    WARNING: For dashcam footage this loses most of the frame — blur_fill
-    is almost always a better choice.
-    """
-    # From the input, crop a 9:16 slice centered horizontally
-    # crop_width = input_height * (9/16)
-    crop_w = int(info.height * target_w / target_h)
-    crop_w -= crop_w % 2  # Even width for h264
-
-    filtergraph = (
-        f"crop={crop_w}:{info.height}:(iw-{crop_w})/2:0,"
-        f"scale={target_w}:{target_h},"
-        f"format=yuv420p"
-    )
-
-    return filtergraph
+    # Landscape video going to a vertical platform -> pad (safe default, preserves all content)
+    return "pad"
 
 
-def _build_pad_filter(target_w: int = 1080, target_h: int = 1920) -> str:
-    """
-    Pad to a fixed vertical canvas (1080x1920) while preserving aspect ratio.
-    This is the "letterbox to vertical" strategy (no blur, no crop).
-    """
-    return (
-        f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
-        f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,"
-        f"format=yuv420p"
-    )
-
-
-def needs_transcode(info: VideoInfo, platform: str) -> Tuple[bool, list]:
-    """Check if video needs transcoding for the target platform.
-
-    Resolution check is orientation-aware: a 1920x1080 landscape video
-    is fine for platforms that list max_width=1080, max_height=1920
-    (those are portrait-preferred dimensions, not hard per-axis limits).
-
-    Note: call check_platform_blocked() FIRST to catch hard blockers
-    that transcoding cannot fix (e.g. landscape on YouTube Shorts).
-    """
+def needs_transcode(info: VideoInfo, platform: str, reframe_action: str) -> Tuple[bool, List[str]]:
+    """Check if video needs transcoding for the target platform"""
     spec = PLATFORM_SPECS.get(platform)
     if not spec:
         return False, []
 
     reasons = []
 
+    # Check if reframing is needed (aspect ratio change)
+    if reframe_action in ("pad", "crop"):
+        reasons.append(f"reframe={reframe_action} to {spec['target_width']}x{spec['target_height']}")
+
+    # Check codec
     if info.video_codec.lower() not in ("h264", "avc"):
         reasons.append(f"video codec is {info.video_codec}, needs h264")
+
     if info.audio_codec and info.audio_codec.lower() != "aac":
         reasons.append(f"audio codec is {info.audio_codec}, needs aac")
+
+    # Check pixel format
     if info.pixel_format != "yuv420p":
         reasons.append(f"pixel format is {info.pixel_format}, needs yuv420p")
 
-    # Orientation-aware resolution check:
-    # max_long_side = larger of the two spec dimensions (1920)
-    # max_short_side = smaller of the two spec dimensions (1080)
-    # Compare against the input's long/short sides regardless of orientation
-    max_long = max(spec["max_width"], spec["max_height"])
-    max_short = min(spec["max_width"], spec["max_height"])
-    input_long = max(info.width, info.height)
-    input_short = min(info.width, info.height)
+    # Check resolution (even without reframe, may need downscale)
+    if reframe_action == "none":
+        if info.width > spec["target_width"] or info.height > spec["target_height"]:
+            reasons.append(f"resolution {info.width}x{info.height} exceeds max")
 
-    if input_long > max_long or input_short > max_short:
-        reasons.append(
-            f"resolution {info.width}x{info.height} exceeds "
-            f"{max_short}x{max_long} bounding box"
-        )
-
+    # Check fps
     if info.fps > spec["max_fps"]:
         reasons.append(f"fps {info.fps:.1f} exceeds max {spec['max_fps']}")
-    if info.duration > spec["max_duration"]:
+
+    # Check duration
+    if spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
         reasons.append(f"duration {info.duration:.1f}s exceeds max {spec['max_duration']}s")
+
+    # Check audio sample rate
+    if info.sample_rate and info.sample_rate != spec["sample_rate"]:
+        reasons.append(f"sample rate {info.sample_rate} needs {spec['sample_rate']}")
+
+    # Check rotation
     if info.rotation != 0:
-        reasons.append(f"video has {info.rotation}° rotation")
+        reasons.append(f"has {info.rotation} degree rotation to apply")
 
     return len(reasons) > 0, reasons
 
 
+# -------------------------------------------------------------------------
+# FFmpeg command builder
+# -------------------------------------------------------------------------
 def build_ffmpeg_command(
     input_path: Path,
     output_path: Path,
     info: VideoInfo,
     platform: str,
-    reframe_mode: str = "none",
-    trim_seconds: Optional[float] = None,
+    reframe_action: str,
 ) -> list:
-    """Build FFmpeg command for transcoding.
+    """Build platform-specific FFmpeg command"""
+    spec = PLATFORM_SPECS.get(platform, PLATFORM_SPECS["tiktok"])
 
-    Scaling logic:
-    - Orientation-aware: matches the input's landscape/portrait orientation
-      against the platform's max bounding box.
-    - Proportional: scales both axes by the same factor to preserve aspect ratio.
-    - No forced padding: platforms handle letterboxing in their own players.
-      Baking black bars into the video file makes it look bad everywhere.
+    cmd = [
+        "ffmpeg",
+        "-y",                           # Overwrite output
+        "-i", str(input_path),
+    ]
 
-    Reframe modes:
-    - "blur_fill": blurred background + sharp center (recommended for dashcam)
-    - "center_crop": center 9:16 slice (loses ~65% width)
-    - "pad": letterbox into a fixed 1080x1920 canvas (black bars)
-    - "auto": policy-driven (applied in run_transcode_stage)
-    - "none": no reframe, use normal scaling
-    """
-    spec = PLATFORM_SPECS.get(platform, PLATFORM_SPECS["youtube"])
+    # -- Video filters --
+    vf_filters = []
 
-    cmd = [FFMPEG_BIN, "-y", "-i", str(input_path)]
+    # 1. Handle rotation (metadata rotation not auto-applied by all decoders)
+    if info.rotation == 90:
+        vf_filters.append("transpose=1")
+    elif info.rotation == 180:
+        vf_filters.append("transpose=1,transpose=1")
+    elif info.rotation == 270:
+        vf_filters.append("transpose=2")
 
-    is_landscape = info.width > info.height
+    # 2. Reframe logic
+    tw = spec["target_width"]
+    th = spec["target_height"]
 
-    # Effective target canvas for vertical reframes
-    target_w = min(spec["max_width"], spec["max_height"])   # 1080
-    target_h = max(spec["max_width"], spec["max_height"])   # 1920
+    if reframe_action == "pad":
+        # Scale to fit inside target box, then pad with black bars
+        # force_original_aspect_ratio=decrease -> shrink to fit
+        # pad -> center in target box
+        vf_filters.append(f"scale={tw}:{th}:force_original_aspect_ratio=decrease")
+        vf_filters.append(f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2")
 
-    # Reframe strategy selection:
-    # - blur_fill / center_crop = only applied when platform disallows landscape
-    # - pad = explicit; can be used even when the platform accepts landscape
-    use_blur_or_crop = (
-        reframe_mode in ("blur_fill", "center_crop")
-        and is_landscape
-        and not spec.get("landscape_allowed", True)
-    )
-    use_pad = (reframe_mode == "pad" and is_landscape)
+    elif reframe_action == "crop":
+        # Scale to fill target box (some edges clipped), then crop to exact size
+        # force_original_aspect_ratio=increase -> scale up to fill
+        # crop -> center-crop to target
+        vf_filters.append(f"scale={tw}:{th}:force_original_aspect_ratio=increase")
+        vf_filters.append(f"crop={tw}:{th}")
 
-    if use_blur_or_crop:
-        # ── Vertical reframe path (blur_fill/center_crop) ────────────
-        # Uses a complex filtergraph (-filter_complex) instead of -vf
-        # because blur_fill needs to split the input into two streams.
-        if reframe_mode == "blur_fill":
-            filtergraph = _build_blur_fill_filter(info, target_w, target_h)
-            logger.info(
-                f"Reframing {info.width}x{info.height} → {target_w}x{target_h} "
-                f"via blur_fill for {platform}"
-            )
-        else:
-            filtergraph = _build_center_crop_filter(info, target_w, target_h)
-            logger.info(
-                f"Reframing {info.width}x{info.height} → {target_w}x{target_h} "
-                f"via center_crop for {platform}"
-            )
+    elif reframe_action == "none":
+        # Keep original aspect ratio but ensure within max bounds
+        max_w = spec["target_width"]
+        max_h = spec["target_height"]
 
-        # Handle rotation before reframe
-        if info.rotation == 90:
-            filtergraph = filtergraph.replace("[0:v]", "[0:v]transpose=1,", 1)
-        elif info.rotation == 180:
-            filtergraph = filtergraph.replace("[0:v]", "[0:v]transpose=1,transpose=1,", 1)
-        elif info.rotation in (270, -90):
-            filtergraph = filtergraph.replace("[0:v]", "[0:v]transpose=2,", 1)
+        # For landscape videos with reframe=none, allow landscape dimensions
+        if info.is_landscape:
+            max_w = max(spec["target_width"], spec["target_height"])  # 1920
+            max_h = min(spec["target_width"], spec["target_height"])  # 1080
 
-        cmd.extend(["-filter_complex", filtergraph])
+        if info.width > max_w or info.height > max_h:
+            vf_filters.append(f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease")
 
-    else:
-        # ── Normal / pad scaling path ────────────────────────────────
-        vf_filters = []
+        # Ensure even dimensions (h264 requirement)
+        vf_filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
 
-        # Rotation
-        if info.rotation == 90:
-            vf_filters.append("transpose=1")
-        elif info.rotation == 180:
-            vf_filters.append("transpose=1,transpose=1")
-        elif info.rotation in (270, -90):
-            vf_filters.append("transpose=2")
+    # 3. Force yuv420p (universal compatibility)
+    vf_filters.append("format=yuv420p")
 
-        if use_pad:
-            # Force vertical canvas output (1080x1920) with padding
-            vf_filters.append(_build_pad_filter(target_w, target_h))
-        else:
-            # Orientation-aware bounding box (no forced padding)
-            max_long = max(spec["max_width"], spec["max_height"])    # 1920
-            max_short = min(spec["max_width"], spec["max_height"])   # 1080
+    if vf_filters:
+        cmd.extend(["-vf", ",".join(vf_filters)])
 
-            if is_landscape:
-                box_w, box_h = max_long, max_short     # 1920 x 1080 for landscape
-            else:
-                box_w, box_h = max_short, max_long     # 1080 x 1920 for portrait
-
-            # Proportional scale factor — shrink only, never upscale
-            scale_w = box_w / info.width if info.width > box_w else 1.0
-            scale_h = box_h / info.height if info.height > box_h else 1.0
-            scale_factor = min(scale_w, scale_h)
-
-            target_width = int(info.width * scale_factor)
-            target_height = int(info.height * scale_factor)
-            target_width -= target_width % 2
-            target_height -= target_height % 2
-
-            needs_scale = (target_width != info.width or target_height != info.height)
-
-            if needs_scale:
-                vf_filters.append(f"scale={target_width}:{target_height}")
-
-            vf_filters.append("format=yuv420p")
-
-        if vf_filters:
-            cmd.extend(["-vf", ",".join(vf_filters)])
-
-    # Video codec
+    # -- Video codec settings --
     cmd.extend([
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-        "-profile:v", "high", "-level", "4.1",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "23",
+        "-profile:v", spec.get("profile", "high"),
+        "-level", spec.get("level", "4.1"),
         "-maxrate", spec["max_bitrate_video"],
-        "-bufsize", spec["max_bitrate_video"].replace("M", "") + "M",
+        "-bufsize", str(int(spec["max_bitrate_video"].replace("M", "")) * 2) + "M",
     ])
 
+    # -- Frame rate capping --
     if info.fps > spec["max_fps"]:
         cmd.extend(["-r", str(spec["max_fps"])])
 
-    # Duration trim: platform max_duration OR explicit trim_seconds (used by auto policy for YouTube Shorts)
-    effective_trim = None
-    if trim_seconds is not None:
-        effective_trim = float(trim_seconds)
-    elif info.duration > spec["max_duration"]:
-        effective_trim = float(spec["max_duration"])
+    # -- Duration trimming --
+    if spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
+        # Trim 0.5s before max to avoid edge-case frame overrun
+        trim_to = max(1.0, spec["max_duration"] - 0.5)
+        cmd.extend(["-t", f"{trim_to:.3f}"])
 
-    if effective_trim is not None and info.duration > effective_trim:
-        cmd.extend(["-t", f"{effective_trim:.3f}"])
-
-    # Audio
+    # -- Audio settings --
     if info.audio_codec:
         cmd.extend([
-            "-c:a", "aac", "-b:a", spec["max_bitrate_audio"],
-            "-ar", str(spec["sample_rate"]), "-ac", "2",
+            "-c:a", "aac",
+            "-b:a", spec["max_bitrate_audio"],
+            "-ar", str(spec["sample_rate"]),
+            "-ac", "2",                  # Stereo
         ])
     else:
+        # No audio stream -> generate silent audio (many platforms require audio)
         cmd.extend([
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-shortest", "-c:a", "aac", "-b:a", "128k",
+            "-f", "lavfi",
+            "-i", f"anullsrc=r={spec['sample_rate']}:cl=stereo",
+            "-shortest",
+            "-c:a", "aac",
+            "-b:a", "128k",
         ])
 
-    cmd.extend(["-movflags", "+faststart", "-pix_fmt", "yuv420p", str(output_path)])
+    # -- Output container settings --
+    cmd.extend([
+        "-movflags", "+faststart",       # Enable progressive download / streaming
+        "-pix_fmt", "yuv420p",
+        str(output_path)
+    ])
+
     return cmd
 
 
+# -------------------------------------------------------------------------
+# Transcode execution
+# -------------------------------------------------------------------------
 async def transcode_video(
     input_path: Path,
     output_path: Path,
     platform: str,
-    info: Optional[VideoInfo] = None,
-    reframe_mode: str = "none",
-    trim_seconds: Optional[float] = None,
+    info: VideoInfo,
+    reframe_action: str,
 ) -> Path:
-    """Transcode video to platform-specific format."""
-    if not info:
-        info = await get_video_info(input_path)
+    """Transcode a video to a platform-specific format"""
+    cmd = build_ffmpeg_command(input_path, output_path, info, platform, reframe_action)
 
-    cmd = build_ffmpeg_command(input_path, output_path, info, platform, reframe_mode, trim_seconds=trim_seconds)
-    logger.info(f"Transcoding for {platform}: {info.width}x{info.height} -> "
-                f"{output_path.name}, reframe={reframe_mode}, "
-                f"cmd starts: {' '.join(cmd[:12])}...")
+    cmd_preview = " ".join(cmd[:15]) + "..."
+    logger.info(
+        f"Transcoding for {platform}: {info.width}x{info.height} -> {output_path.name}, "
+        f"reframe={reframe_action}, cmd starts: {cmd_preview}"
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
 
         if proc.returncode != 0:
             error_msg = stderr.decode()[-500:]
-            raise StageError(ErrorCode.TRANSCODE_FAILED, f"FFmpeg failed: {error_msg}")
+            raise StageError(ErrorCode.TRANSCODE_FAILED, f"FFmpeg failed for {platform}: {error_msg}")
 
         if not output_path.exists():
-            raise StageError(ErrorCode.TRANSCODE_FAILED, "Output file not created")
+            raise StageError(ErrorCode.TRANSCODE_FAILED, f"Output file not created for {platform}")
 
-        logger.info(f"Transcode complete: {output_path.stat().st_size / 1024 / 1024:.1f}MB")
+        out_size_mb = output_path.stat().st_size / 1024 / 1024
+        logger.info(f"Transcode complete for {platform}: {out_size_mb:.1f}MB")
+
+        # Warn if output exceeds platform file size limit
+        spec = PLATFORM_SPECS.get(platform, {})
+        max_mb = spec.get("max_file_mb", 0)
+        if max_mb > 0 and out_size_mb > max_mb:
+            logger.warning(
+                f"{platform} WARNING: Output {out_size_mb:.1f}MB exceeds platform limit {max_mb}MB. "
+                f"Upload may be rejected."
+            )
+
         return output_path
 
-    except StageError:
-        raise
     except Exception as e:
-        raise StageError(ErrorCode.TRANSCODE_FAILED, f"Transcode failed: {e}")
+        if isinstance(e, StageError):
+            raise
+        raise StageError(ErrorCode.TRANSCODE_FAILED, f"Transcode failed for {platform}: {e}")
 
 
+# -------------------------------------------------------------------------
+# Stage entry point
+# -------------------------------------------------------------------------
 async def run_transcode_stage(ctx: JobContext) -> JobContext:
-    """Run the transcode stage — creates platform-specific versions of the video.
+    """
+    Run the transcode stage - creates platform-specific video versions.
 
-    Pipeline:
-      1. Analyze input video with ffprobe
-      2. Check file size against platform limits
-      3. Check for hard blockers (respects reframe_mode setting)
-      4. Determine which platforms need transcoding or reframing
-      5. Create optimized versions for each platform
-      6. Verify output file sizes are within platform limits
-
-    Reframe mode is read from ctx.reframe_mode (set by the API/frontend).
-    Valid values: "auto", "pad", "blur_fill", "center_crop", "none" (default).
-    When set, landscape videos can be auto-converted to vertical for
-    platforms that require it (YouTube Shorts).
+    Pipeline flow:
+    1. Analyze input video (ffprobe)
+    2. For each platform:
+       a. Resolve reframe action (auto/pad/crop/none -> actual action)
+       b. Check if transcoding is needed
+       c. Build platform-specific FFmpeg command
+       d. Execute transcode
+    3. Store per-platform video paths in ctx.platform_videos
     """
     ctx.mark_stage("transcode")
 
@@ -623,174 +524,124 @@ async def run_transcode_stage(ctx: JobContext) -> JobContext:
     if not platforms:
         raise SkipStage("No target platforms specified")
 
-    # Read reframe preference from job context (set by user at upload time)
-    reframe_mode = getattr(ctx, "reframe_mode", "none") or "none"
-    if reframe_mode not in VALID_REFRAME_MODES:
-        logger.warning(f"Invalid reframe_mode '{reframe_mode}', falling back to 'none'")
-        reframe_mode = "none"
+    reframe_mode = getattr(ctx, "reframe_mode", "auto") or "auto"
 
-    logger.info(f"Analyzing video for platforms: {platforms}, reframe_mode={reframe_mode}")
+    # -- Step 1: Analyze input video --
+    # Use HUD/watermarked video if available (pipeline reorder: HUD+watermark run before transcode)
+    input_video = ctx.local_video_path
+    if ctx.processed_video_path and ctx.processed_video_path.exists():
+        input_video = ctx.processed_video_path
+        logger.info(f"Using processed video as transcode input: {input_video.name}")
 
-    info = await get_video_info(ctx.local_video_path)
-    input_file_size = ctx.local_video_path.stat().st_size
+    info = await get_video_info(input_video)
+
+    orientation = "landscape" if info.is_landscape else ("portrait" if info.is_portrait else "square")
+    file_mb = info.file_size / 1024 / 1024 if info.file_size else 0
+
     logger.info(
         f"Video: {info.width}x{info.height}, {info.duration:.1f}s, {info.fps:.1f}fps, "
         f"codec={info.video_codec}, pix_fmt={info.pixel_format}, rotation={info.rotation}, "
-        f"file_size={input_file_size / 1024 / 1024:.1f}MB"
+        f"file_size={file_mb:.1f}MB"
     )
+    logger.info(f"Analyzing video for platforms: {platforms}, reframe_mode={reframe_mode}")
 
+    # Store video info in context
     ctx.video_info = {
-        "width": info.width, "height": info.height,
-        "duration": info.duration, "fps": info.fps,
-        "video_codec": info.video_codec, "audio_codec": info.audio_codec,
-        "orientation": "landscape" if info.width > info.height else (
-            "portrait" if info.height > info.width else "square"
-        ),
+        "width": info.width,
+        "height": info.height,
+        "duration": info.duration,
+        "fps": info.fps,
+        "video_codec": info.video_codec,
+        "audio_codec": info.audio_codec,
+        "orientation": orientation,
+        "file_size": info.file_size,
     }
 
+    # -- Step 2: Per-platform transcode --
     ctx.platform_videos = {}
-    ctx.platform_blocked = {}       # Platforms that can't proceed (hard blockers)
-    ctx.platform_warnings = {}      # Non-blocking warnings (e.g. landscape on TikTok)
-    ctx.platform_reframed = {}      # Platforms where reframe was applied
     transcoded_any = False
 
-    is_landscape = info.width > info.height
-    user_reframe_mode = reframe_mode  # preserve original user intent
-
     for platform in platforms:
-        spec = PLATFORM_SPECS.get(platform, {})
-
-        # ── Hard blocker check (respects reframe_mode) ──────────────
-        blocked_reason = check_platform_blocked(info, platform, reframe_mode)
-        if blocked_reason:
-            logger.warning(f"{platform} BLOCKED: {blocked_reason}")
-            ctx.platform_blocked[platform] = blocked_reason
+        spec = PLATFORM_SPECS.get(platform)
+        if not spec:
+            logger.warning(f"Unknown platform '{platform}', skipping transcode")
+            ctx.platform_videos[platform] = ctx.local_video_path
             continue
 
-        # ── Determine if this platform needs a reframe / trim policy ─────────
-        platform_reframe = "none"
-        platform_trim_seconds: Optional[float] = None
+        # Resolve what reframe action to take for this platform
+        reframe_action = resolve_reframe_action(info, reframe_mode, platform)
 
-        if user_reframe_mode == "auto":
-            # Auto rules:
-            # - TikTok/IG/FB/YouTube: pad to 1080x1920 if landscape
-            # - YouTube: also trim to 59.5s (Shorts-safe)
-            if is_landscape and platform in ("tiktok", "instagram", "facebook", "youtube"):
-                platform_reframe = "pad"
-                ctx.platform_reframed[platform] = "pad"
-                logger.info(f"{platform}: auto mode → pad to {min(spec.get('max_width',1080), spec.get('max_height',1920))}x{max(spec.get('max_width',1080), spec.get('max_height',1920))}")
-
-            if platform == "youtube":
-                platform_trim_seconds = YOUTUBE_SHORTS_TRIM_SECONDS
-
-        else:
-            # Manual behavior (existing): only reframe when platform disallows landscape
-            if is_landscape and not spec.get("landscape_allowed", True) and user_reframe_mode != "none":
-                platform_reframe = user_reframe_mode
-                ctx.platform_reframed[platform] = user_reframe_mode
-                logger.info(
-                    f"{platform}: landscape video will be reframed to vertical "
-                    f"via {user_reframe_mode}"
-                )
-
-        # ── Landscape warning (for platforms that accept but don't prefer it)
-        if is_landscape and spec.get("landscape_allowed", True) and spec.get("preferred_aspect") == (9, 16):
-            warning = (
-                f"Video is landscape {info.width}x{info.height}; "
-                f"{spec.get('name', platform)} prefers vertical 9:16. "
-                f"Video will be letterboxed by the platform."
-            )
-            logger.info(f"{platform} WARNING: {warning}")
-            ctx.platform_warnings[platform] = warning
-
-        # ── Input file size check ───────────────────────────────────
-        max_size = spec.get("max_file_size")
-        if platform == "tiktok" and info.duration > 180:
-            max_size = spec.get("max_file_size_long", max_size)
-
-        if max_size and input_file_size > max_size:
+        # Log the reframe decision
+        if reframe_action != "none":
             logger.info(
-                f"{platform}: input file {input_file_size / 1024 / 1024:.0f}MB "
-                f"exceeds {max_size / 1024 / 1024:.0f}MB limit — will transcode to compress"
+                f"{platform}: {reframe_mode} mode -> {reframe_action} to "
+                f"{spec['target_width']}x{spec['target_height']}"
             )
 
-        # ── Transcode / reframe check ───────────────────────────────
-        needs_tc, reasons = needs_transcode(info, platform)
+        # Check if landscape video going to vertical platform (informational warning)
+        if info.is_landscape and reframe_action == "none":
+            logger.info(
+                f"{platform} WARNING: Video is landscape {info.width}x{info.height}; "
+                f"{spec['name']} prefers vertical 9:16. Video will be letterboxed by the platform."
+            )
 
-        # Auto-mode YouTube Shorts trim triggers a transcode even if within platform max_duration
-        if platform == "youtube" and platform_trim_seconds is not None and info.duration > platform_trim_seconds:
-            if not needs_tc:
-                needs_tc = True
-            reasons.append(f"trim to {platform_trim_seconds:.1f}s for Shorts-safe upload")
+        # Check duration
+        if spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
+            logger.info(
+                f"{platform}: Video {info.duration:.1f}s exceeds max {spec['max_duration']}s, "
+                f"will be trimmed to {spec['max_duration'] - 0.5:.1f}s"
+            )
 
-        # Force transcode if reframe is needed (even if video is otherwise compatible)
-        if platform_reframe != "none" and not needs_tc:
-            needs_tc = True
-            reasons.append(f"landscape → vertical reframe ({platform_reframe})")
+        # Determine if transcode is needed
+        needs_tc, reasons = needs_transcode(info, platform, reframe_action)
 
         if needs_tc:
-            logger.info(f"{platform} needs transcode: {', '.join(reasons)}")
-            output_path = ctx.temp_dir / f"transcoded_{platform}.mp4"
-            await transcode_video(
-                ctx.local_video_path,
-                output_path,
-                platform,
-                info,
-                platform_reframe,
-                trim_seconds=platform_trim_seconds,
-            )
+            for reason in reasons:
+                logger.info(f"{platform} needs transcode: {reason}")
 
-            # Verify output size is within platform limit
-            output_size = output_path.stat().st_size
-            if max_size and output_size > max_size:
-                logger.warning(
-                    f"{platform}: transcoded file {output_size / 1024 / 1024:.0f}MB "
-                    f"still exceeds {max_size / 1024 / 1024:.0f}MB limit"
-                )
+            output_path = ctx.temp_dir / f"transcoded_{platform}.mp4"
+            await transcode_video(input_video, output_path, platform, info, reframe_action)
 
             ctx.platform_videos[platform] = output_path
             transcoded_any = True
         else:
-            logger.info(f"{platform}: video is already compatible")
-            ctx.platform_videos[platform] = ctx.local_video_path
+            logger.info(f"{platform}: video is already compatible, using original")
+            ctx.platform_videos[platform] = input_video
 
-    # If ALL platforms were blocked, raise an error
-    if not ctx.platform_videos:
-        blocked_summary = "; ".join(
-            f"{p}: {r}" for p, r in ctx.platform_blocked.items()
-        )
-        raise StageError(
-            ErrorCode.TRANSCODE_FAILED,
-            f"No compatible platforms: {blocked_summary}"
-        )
-
-    if ctx.platform_blocked:
-        logger.warning(
-            f"Skipped {len(ctx.platform_blocked)} blocked platform(s): "
-            f"{', '.join(ctx.platform_blocked.keys())}"
-        )
-
-    if ctx.platform_reframed:
-        logger.info(
-            f"Reframed for {len(ctx.platform_reframed)} platform(s): "
-            f"{', '.join(f'{p} ({m})' for p, m in ctx.platform_reframed.items())}"
-        )
-
+    # -- Step 3: Set processed video path (backward compat) --
     if transcoded_any:
-        for p in platforms:
-            if p in ctx.platform_videos:
-                ctx.processed_video_path = ctx.platform_videos[p]
-                break
+        first_platform = platforms[0]
+        if first_platform in ctx.platform_videos:
+            ctx.processed_video_path = ctx.platform_videos[first_platform]
+
+    # Summary log
+    summary_parts = []
+    for p in platforms:
+        vpath = ctx.platform_videos.get(p)
+        if vpath and vpath != input_video:
+            try:
+                sz = vpath.stat().st_size / 1024 / 1024
+                summary_parts.append(f"{p}={sz:.1f}MB")
+            except Exception:
+                summary_parts.append(f"{p}=transcoded")
+        else:
+            summary_parts.append(f"{p}=original")
+
+    logger.info(f"Transcode summary: {', '.join(summary_parts)}")
 
     return ctx
 
 
+# -------------------------------------------------------------------------
+# Utility
+# -------------------------------------------------------------------------
 async def check_ffmpeg_available() -> bool:
-    """Check if FFmpeg is installed and accessible."""
+    """Check if FFmpeg is installed and accessible"""
     try:
         proc = await asyncio.create_subprocess_exec(
-            FFMPEG_BIN, "-version",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            "ffmpeg", "-version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         await proc.communicate()
         return proc.returncode == 0

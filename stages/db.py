@@ -473,3 +473,83 @@ async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
                 return None
     except Exception:
         return None
+
+
+# ============================================================
+# Per-Platform Asset Persistence
+# ============================================================
+
+async def save_processed_assets(pool: asyncpg.Pool, upload_id: str, assets: Dict[str, str]):
+    """Save per-platform R2 keys to the uploads table.
+
+    assets = {"tiktok": "processed/.../tiktok.mp4", "youtube": "processed/.../youtube.mp4", ...}
+
+    Tries processed_assets JSONB column first.
+    Falls back to storing in output_artifacts if column doesn't exist.
+    """
+    assets_json = json.dumps(assets)
+
+    async with pool.acquire() as conn:
+        # Try the dedicated column first
+        try:
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET processed_assets = $2::jsonb,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                upload_id,
+                assets_json,
+            )
+            logger.info(f"Saved processed_assets for upload {upload_id}: {list(assets.keys())}")
+            return
+        except asyncpg.exceptions.UndefinedColumnError:
+            pass  # Column doesn't exist yet, fall back
+
+        # Fallback: store in existing JSONB column if available
+        try:
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb) || jsonb_build_object('processed_assets', $2::jsonb),
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                upload_id,
+                assets_json,
+            )
+            logger.info(f"Saved processed_assets (fallback) for upload {upload_id}")
+        except Exception as e:
+            logger.warning(f"Could not save processed_assets: {e}")
+
+
+async def load_processed_assets(pool: asyncpg.Pool, upload_id: str) -> Dict[str, str]:
+    """Load per-platform R2 keys for an upload.
+
+    Returns dict like {"tiktok": "processed/.../tiktok.mp4", ...}
+    """
+    async with pool.acquire() as conn:
+        # Try dedicated column
+        try:
+            val = await conn.fetchval(
+                "SELECT processed_assets FROM uploads WHERE id = $1",
+                upload_id,
+            )
+            if val:
+                return json.loads(val) if isinstance(val, str) else dict(val)
+        except asyncpg.exceptions.UndefinedColumnError:
+            pass
+
+        # Fallback: check output_artifacts
+        try:
+            val = await conn.fetchval(
+                "SELECT output_artifacts->'processed_assets' FROM uploads WHERE id = $1",
+                upload_id,
+            )
+            if val:
+                return json.loads(val) if isinstance(val, str) else dict(val)
+        except Exception:
+            pass
+
+    return {}

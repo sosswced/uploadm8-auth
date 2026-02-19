@@ -779,9 +779,9 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
     # Token DB key mapping (platform -> token table platform key)
     platform_to_db_key = {
         "tiktok": "tiktok",
-        "youtube": "google",
-        "instagram": "meta",
-        "facebook": "meta",
+        "youtube": "youtube",
+        "instagram": "instagram",
+        "facebook": "facebook",
     }
 
     for platform in ctx.platforms:

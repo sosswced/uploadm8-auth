@@ -4,19 +4,23 @@ UploadM8 Worker Service - Complete Pipeline
 Pipeline order (critical):
   1. Download        - Fetch original video + telemetry from R2
   2. Telemetry       - Parse .map file, calculate Trill score
-  3. Thumbnail       - Extract frame from original video
-  4. Caption         - AI-generate title/caption/hashtags
-  5. HUD             - Burn speed overlay onto video (if entitled)
-  6. Watermark       - Burn text watermark onto video (if entitled)
-  7. Transcode       - Create per-platform MP4s FROM the HUD+watermarked video
+  3. HUD             - Burn speed overlay onto video (if entitled)
+  4. Watermark       - Burn text watermark onto video (if entitled)
+  5. Transcode       - Create per-platform MP4s FROM the HUD+watermarked video
+  6. Thumbnail       - Extract frame at user-configured offset (thumbnail_offset)
+  7. Caption         - AI-generate title/caption/hashtags (vision-grounded)
   8. Upload          - Upload EACH platform MP4 to its own R2 key
   9. Publish         - Send correct file to each platform API
   10. Notify         - Discord webhooks
 
 WHY this order matters:
   - HUD + Watermark modify the video BEFORE platform-specific transcoding
-  - Transcode then creates 4 separate files (tiktok.mp4, youtube.mp4, etc.)
-    each with correct resolution, duration trim, bitrate, and frame rate
+  - Transcode creates 4 separate files (tiktok.mp4, youtube.mp4, etc.)
+    each with correct resolution, duration trim, bitrate, fps, and audio
+    sample rate (44.1 kHz TikTok/IG/FB, 48 kHz YouTube)
+  - Thumbnail runs AFTER transcode so it captures the final processed frame
+  - Caption runs AFTER thumbnail so GPT-4o vision has the actual image
+  - Caption after transcode means failed transcodes never reach OpenAI
   - Each platform gets its OWN R2 key and its OWN API call
 """
 
@@ -145,7 +149,8 @@ async def run_pipeline(job_data: dict) -> bool:
 
         # ================================================================
         # STAGE 2: Telemetry - Parse .map, calculate Trill score
-        # (Must run before HUD so speed data is available for overlay)
+        # Must run before HUD (speed data needed for overlay) and before
+        # caption (Trill data grounds AI generation).
         # ================================================================
         try:
             ctx = await run_telemetry_stage(ctx)
@@ -156,31 +161,7 @@ async def run_pipeline(job_data: dict) -> bool:
         await maybe_cancel(ctx, "telemetry")
 
         # ================================================================
-        # STAGE 3: Thumbnail - Extract frame from original video
-        # (Run on original before HUD/watermark burns overlays)
-        # ================================================================
-        try:
-            ctx = await run_thumbnail_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"Thumbnail skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"Thumbnail error: {e.message}")
-        await maybe_cancel(ctx, "thumbnail")
-
-        # ================================================================
-        # STAGE 4: Caption - AI-generate title/caption/hashtags
-        # ================================================================
-        try:
-            ctx = await run_caption_stage(ctx)
-            await db_stage.save_generated_metadata(db_pool, ctx)
-        except SkipStage as e:
-            logger.info(f"Caption skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"Caption error: {e.message}")
-        await maybe_cancel(ctx, "caption")
-
-        # ================================================================
-        # STAGE 5: HUD - Burn speed overlay onto video
+        # STAGE 3: HUD - Burn speed overlay onto video
         # Sets ctx.processed_video_path if applied
         # ================================================================
         try:
@@ -192,7 +173,7 @@ async def run_pipeline(job_data: dict) -> bool:
         await maybe_cancel(ctx, "hud")
 
         # ================================================================
-        # STAGE 6: Watermark - Burn text watermark onto video
+        # STAGE 4: Watermark - Burn text watermark onto video
         # Uses ctx.processed_video_path (from HUD) or ctx.local_video_path
         # Updates ctx.processed_video_path with watermarked output
         # ================================================================
@@ -205,10 +186,13 @@ async def run_pipeline(job_data: dict) -> bool:
         await maybe_cancel(ctx, "watermark")
 
         # ================================================================
-        # STAGE 7: Transcode - Create per-platform MP4s
+        # STAGE 5: Transcode - Create per-platform MP4s
         # Input: ctx.processed_video_path (HUD+watermarked) or ctx.local_video_path
         # Output: ctx.platform_videos = {tiktok: Path, youtube: Path, ...}
-        # Each file has platform-correct resolution, duration, fps, bitrate
+        # Each file gets platform-correct resolution, duration, fps, bitrate
+        # AND audio sample rate (44.1 kHz for TikTok/IG/FB, 48 kHz for YouTube).
+        # Running before thumbnail/caption means failed transcodes never
+        # reach OpenAI, saving cost.
         # ================================================================
         try:
             ctx = await run_transcode_stage(ctx)
@@ -217,6 +201,36 @@ async def run_pipeline(job_data: dict) -> bool:
         except StageError as e:
             logger.warning(f"Transcode error: {e.message}")
         await maybe_cancel(ctx, "transcode")
+
+        # ================================================================
+        # STAGE 6: Thumbnail - Extract frame from the processed video
+        # Runs AFTER transcode so the thumbnail comes from the final,
+        # HUD+watermarked+correctly-encoded video.
+        # Capture time is read from ctx.user_settings["thumbnail_offset"].
+        # ================================================================
+        try:
+            ctx = await run_thumbnail_stage(ctx)
+        except SkipStage as e:
+            logger.info(f"Thumbnail skipped: {e.reason}")
+        except StageError as e:
+            logger.warning(f"Thumbnail error: {e.message}")
+        await maybe_cancel(ctx, "thumbnail")
+
+        # ================================================================
+        # STAGE 7: Caption - AI-generate title/caption/hashtags
+        # Runs AFTER thumbnail so the JPEG is available for GPT-4o vision.
+        # Runs AFTER transcode so failed transcodes don't waste OpenAI spend.
+        # Captions are grounded in: thumbnail image + Trill score + .map data.
+        # Will SKIP if neither thumbnail nor telemetry is available.
+        # ================================================================
+        try:
+            ctx = await run_caption_stage(ctx)
+            await db_stage.save_generated_metadata(db_pool, ctx)
+        except SkipStage as e:
+            logger.info(f"Caption skipped: {e.reason}")
+        except StageError as e:
+            logger.warning(f"Caption error: {e.message}")
+        await maybe_cancel(ctx, "caption")
 
         # ================================================================
         # STAGE 8: Upload - Upload EACH platform video to its own R2 key

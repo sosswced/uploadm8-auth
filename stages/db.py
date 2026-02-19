@@ -259,7 +259,7 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                 if row:
                     row_dict = dict(row)
                     # Token data may be in 'token_data' JSONB column or 'encrypted_token'
-                    token_data = row_dict.get("token_data")
+                    token_data = row_dict.get("token_blob") or row_dict.get("token_data")
                     if token_data:
                         if isinstance(token_data, str):
                             return json.loads(token_data)
@@ -288,7 +288,7 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                 )
                 if row:
                     row_dict = dict(row)
-                    token_data = row_dict.get("token_data") or row_dict.get("encrypted_token")
+                    token_data = row_dict.get("token_blob") or row_dict.get("token_data") or row_dict.get("encrypted_token")
                     if token_data:
                         if isinstance(token_data, str):
                             return json.loads(token_data)

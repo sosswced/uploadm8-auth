@@ -368,7 +368,6 @@ async def process_jobs():
             if consecutive_redis_errors >= REDIS_MAX_RETRIES:
                 logger.error("Redis unreachable after max retries, attempting reconnect...")
                 try:
-                    global redis_client
                     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
                     await redis_client.ping()
                     logger.info("Redis reconnected successfully")

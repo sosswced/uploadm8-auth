@@ -339,11 +339,22 @@ def build_ffmpeg_command(
     """Build platform-specific FFmpeg command"""
     spec = PLATFORM_SPECS.get(platform, PLATFORM_SPECS["tiktok"])
 
+    needs_silent_audio = not info.audio_codec
+
     cmd = [
         "ffmpeg",
         "-y",                           # Overwrite output
         "-i", str(input_path),
     ]
+
+    # When there is no audio stream we must declare the silent source as a
+    # second input BEFORE any output/codec flags — FFmpeg requires all -i
+    # arguments to precede filter/codec/output arguments.
+    if needs_silent_audio:
+        cmd.extend([
+            "-f", "lavfi",
+            "-i", f"anullsrc=r={spec['sample_rate']}:cl=stereo",
+        ])
 
     # -- Video filters --
     vf_filters = []
@@ -418,21 +429,26 @@ def build_ffmpeg_command(
         cmd.extend(["-t", f"{trim_to:.3f}"])
 
     # -- Audio settings --
-    if info.audio_codec:
+    # The anullsrc input (input index 1) was already declared at the top of the
+    # command when needs_silent_audio is True.  We now either encode the real
+    # audio stream or map+encode the synthetic silent stream.
+    if not needs_silent_audio:
         cmd.extend([
             "-c:a", "aac",
             "-b:a", spec["max_bitrate_audio"],
             "-ar", str(spec["sample_rate"]),
-            "-ac", "2",                  # Stereo
+            "-ac", "2",                  # Force stereo
         ])
     else:
-        # No audio stream -> generate silent audio (many platforms require audio)
+        # Map video from input 0, audio from anullsrc input 1
         cmd.extend([
-            "-f", "lavfi",
-            "-i", f"anullsrc=r={spec['sample_rate']}:cl=stereo",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
             "-shortest",
             "-c:a", "aac",
             "-b:a", "128k",
+            "-ar", str(spec["sample_rate"]),
+            "-ac", "2",
         ])
 
     # -- Output container settings --

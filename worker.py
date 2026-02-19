@@ -1,5 +1,23 @@
 """
 UploadM8 Worker Service - Complete Pipeline
+
+Pipeline order (critical):
+  1. Download        - Fetch original video + telemetry from R2
+  2. Telemetry       - Parse .map file, calculate Trill score
+  3. Thumbnail       - Extract frame from original video
+  4. Caption         - AI-generate title/caption/hashtags
+  5. HUD             - Burn speed overlay onto video (if entitled)
+  6. Watermark       - Burn text watermark onto video (if entitled)
+  7. Transcode       - Create per-platform MP4s FROM the HUD+watermarked video
+  8. Upload          - Upload EACH platform MP4 to its own R2 key
+  9. Publish         - Send correct file to each platform API
+  10. Notify         - Discord webhooks
+
+WHY this order matters:
+  - HUD + Watermark modify the video BEFORE platform-specific transcoding
+  - Transcode then creates 4 separate files (tiktok.mp4, youtube.mp4, etc.)
+    each with correct resolution, duration trim, bitrate, and frame rate
+  - Each platform gets its OWN R2 key and its OWN API call
 """
 
 import os
@@ -41,6 +59,10 @@ UPLOAD_JOB_QUEUE = os.environ.get("UPLOAD_JOB_QUEUE", "uploadm8:jobs")
 PRIORITY_JOB_QUEUE = os.environ.get("PRIORITY_JOB_QUEUE", "uploadm8:priority")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
 
+# Redis resilience
+REDIS_RETRY_DELAY = 5.0
+REDIS_MAX_RETRIES = 10
+
 db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[redis.Redis] = None
 shutdown_requested = False
@@ -59,7 +81,6 @@ def handle_shutdown(signum, frame):
 
 
 async def check_cancelled(ctx: JobContext) -> bool:
-    # ctx.cancel_requested may not exist depending on context builder
     if bool(getattr(ctx, "cancel_requested", False)):
         return True
     cancelled = await db_stage.check_cancel_requested(db_pool, ctx.upload_id)
@@ -102,7 +123,9 @@ async def run_pipeline(job_data: dict) -> bool:
         await db_stage.mark_processing_started(db_pool, ctx)
         await maybe_cancel(ctx, "init")
 
-        # Download
+        # ================================================================
+        # STAGE 1: Download original video + telemetry from R2
+        # ================================================================
         ctx.mark_stage("download")
         temp_dir = tempfile.TemporaryDirectory()
         ctx.temp_dir = Path(temp_dir.name)
@@ -120,16 +143,10 @@ async def run_pipeline(job_data: dict) -> bool:
 
         await maybe_cancel(ctx, "download")
 
-        # Transcode
-        try:
-            ctx = await run_transcode_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"Transcode skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"Transcode error: {e.message}")
-        await maybe_cancel(ctx, "transcode")
-
-        # Telemetry
+        # ================================================================
+        # STAGE 2: Telemetry - Parse .map, calculate Trill score
+        # (Must run before HUD so speed data is available for overlay)
+        # ================================================================
         try:
             ctx = await run_telemetry_stage(ctx)
         except SkipStage as e:
@@ -138,7 +155,10 @@ async def run_pipeline(job_data: dict) -> bool:
             logger.warning(f"Telemetry error: {e.message}")
         await maybe_cancel(ctx, "telemetry")
 
-        # Thumbnail
+        # ================================================================
+        # STAGE 3: Thumbnail - Extract frame from original video
+        # (Run on original before HUD/watermark burns overlays)
+        # ================================================================
         try:
             ctx = await run_thumbnail_stage(ctx)
         except SkipStage as e:
@@ -147,7 +167,9 @@ async def run_pipeline(job_data: dict) -> bool:
             logger.warning(f"Thumbnail error: {e.message}")
         await maybe_cancel(ctx, "thumbnail")
 
-        # Caption
+        # ================================================================
+        # STAGE 4: Caption - AI-generate title/caption/hashtags
+        # ================================================================
         try:
             ctx = await run_caption_stage(ctx)
             await db_stage.save_generated_metadata(db_pool, ctx)
@@ -157,7 +179,10 @@ async def run_pipeline(job_data: dict) -> bool:
             logger.warning(f"Caption error: {e.message}")
         await maybe_cancel(ctx, "caption")
 
-        # HUD
+        # ================================================================
+        # STAGE 5: HUD - Burn speed overlay onto video
+        # Sets ctx.processed_video_path if applied
+        # ================================================================
         try:
             ctx = await run_hud_stage(ctx)
         except SkipStage as e:
@@ -166,7 +191,11 @@ async def run_pipeline(job_data: dict) -> bool:
             logger.warning(f"HUD error: {e.message}")
         await maybe_cancel(ctx, "hud")
 
-        # Watermark
+        # ================================================================
+        # STAGE 6: Watermark - Burn text watermark onto video
+        # Uses ctx.processed_video_path (from HUD) or ctx.local_video_path
+        # Updates ctx.processed_video_path with watermarked output
+        # ================================================================
         try:
             ctx = await run_watermark_stage(ctx)
         except SkipStage as e:
@@ -175,17 +204,74 @@ async def run_pipeline(job_data: dict) -> bool:
             logger.warning(f"Watermark error: {e.message}")
         await maybe_cancel(ctx, "watermark")
 
-        # Upload processed video
+        # ================================================================
+        # STAGE 7: Transcode - Create per-platform MP4s
+        # Input: ctx.processed_video_path (HUD+watermarked) or ctx.local_video_path
+        # Output: ctx.platform_videos = {tiktok: Path, youtube: Path, ...}
+        # Each file has platform-correct resolution, duration, fps, bitrate
+        # ================================================================
+        try:
+            ctx = await run_transcode_stage(ctx)
+        except SkipStage as e:
+            logger.info(f"Transcode skipped: {e.reason}")
+        except StageError as e:
+            logger.warning(f"Transcode error: {e.message}")
+        await maybe_cancel(ctx, "transcode")
+
+        # ================================================================
+        # STAGE 8: Upload - Upload EACH platform video to its own R2 key
+        # Old: one processed/{user_id}/{upload_id}.mp4
+        # New: processed/{user_id}/{upload_id}/tiktok.mp4
+        #      processed/{user_id}/{upload_id}/youtube.mp4
+        #      processed/{user_id}/{upload_id}/instagram.mp4
+        #      processed/{user_id}/{upload_id}/facebook.mp4
+        # ================================================================
         ctx.mark_stage("upload")
-        final_video = ctx.processed_video_path or ctx.local_video_path
-        if final_video and final_video.exists() and final_video != ctx.local_video_path:
-            processed_key = f"processed/{ctx.user_id}/{ctx.upload_id}.mp4"
-            await r2_stage.upload_file(final_video, processed_key, "video/mp4")
-            ctx.processed_r2_key = processed_key
-            ctx.output_artifacts["processed_video"] = processed_key
+        processed_assets = {}
+
+        if ctx.platform_videos:
+            for platform, video_path in ctx.platform_videos.items():
+                if video_path and video_path.exists():
+                    r2_key = f"processed/{ctx.user_id}/{ctx.upload_id}/{platform}.mp4"
+                    try:
+                        await r2_stage.upload_file(video_path, r2_key, "video/mp4")
+                        processed_assets[platform] = r2_key
+                        logger.info(f"Uploaded {platform} asset: {r2_key} ({video_path.stat().st_size / 1024 / 1024:.1f}MB)")
+                    except Exception as e:
+                        logger.error(f"R2 upload failed for {platform}: {e}")
+                else:
+                    logger.warning(f"No video file for {platform}, skipping R2 upload")
+
+        # Also upload a "default" processed video for backward compatibility
+        # (admin preview, re-processing, etc.)
+        fallback_video = ctx.processed_video_path or ctx.local_video_path
+        if fallback_video and fallback_video.exists():
+            default_key = f"processed/{ctx.user_id}/{ctx.upload_id}/default.mp4"
+            try:
+                await r2_stage.upload_file(fallback_video, default_key, "video/mp4")
+                processed_assets["default"] = default_key
+                ctx.processed_r2_key = default_key
+            except Exception as e:
+                logger.warning(f"Default R2 upload failed: {e}")
+
+        # Store per-platform R2 keys in context (for publish stage + DB)
+        ctx.output_artifacts["processed_assets"] = json.dumps(processed_assets)
+        ctx.output_artifacts["processed_video"] = ctx.processed_r2_key or ""
+
+        # Persist processed_assets to DB
+        try:
+            await db_stage.save_processed_assets(db_pool, ctx.upload_id, processed_assets)
+        except Exception as e:
+            logger.warning(f"Could not persist processed_assets to DB: {e}")
+
+        logger.info(f"Upload summary: {', '.join(f'{p}={k}' for p, k in processed_assets.items())}")
         await maybe_cancel(ctx, "upload")
 
-        # Publish
+        # ================================================================
+        # STAGE 9: Publish - Send correct file to each platform API
+        # publish_stage uses ctx.get_video_for_platform(platform) which
+        # checks ctx.platform_videos[platform] first (local temp files)
+        # ================================================================
         try:
             ctx = await run_publish_stage(ctx, db_pool)
         except StageError as e:
@@ -193,13 +279,17 @@ async def run_pipeline(job_data: dict) -> bool:
             ctx.mark_error(e.code.value, e.message)
         await maybe_cancel(ctx, "publish")
 
-        # Notify
+        # ================================================================
+        # STAGE 10: Notify - Discord webhooks
+        # ================================================================
         try:
             ctx = await run_notify_stage(ctx)
         except Exception as e:
             logger.warning(f"Notify error: {e}")
 
+        # ================================================================
         # Complete
+        # ================================================================
         ctx.finished_at = datetime.now(timezone.utc)
         ctx.state = "succeeded" if ctx.is_success() else "failed"
         await db_stage.mark_processing_completed(db_pool, ctx)
@@ -207,7 +297,12 @@ async def run_pipeline(job_data: dict) -> bool:
         if ctx.is_success():
             await db_stage.increment_upload_count(db_pool, user_id)
 
-        logger.info(f"Pipeline complete: {ctx.state}, platforms={ctx.get_success_platforms()}")
+        success_list = ctx.get_success_platforms()
+        failed_list = ctx.get_failed_platforms()
+        logger.info(
+            f"Pipeline complete: {ctx.state}, "
+            f"succeeded={success_list}, failed={failed_list}"
+        )
         return ctx.is_success()
 
     except CancelRequested:
@@ -231,11 +326,17 @@ async def run_pipeline(job_data: dict) -> bool:
 async def process_jobs():
     global shutdown_requested
     logger.info("Worker started, waiting for jobs...")
-    # admin start notification handled by main()
+
+    consecutive_redis_errors = 0
 
     while not shutdown_requested:
         try:
-            job_raw = await redis_client.brpop([PRIORITY_JOB_QUEUE, UPLOAD_JOB_QUEUE], timeout=int(POLL_INTERVAL))
+            job_raw = await redis_client.brpop(
+                [PRIORITY_JOB_QUEUE, UPLOAD_JOB_QUEUE],
+                timeout=int(POLL_INTERVAL)
+            )
+            consecutive_redis_errors = 0  # Reset on success
+
             if not job_raw:
                 continue
 
@@ -244,6 +345,37 @@ async def process_jobs():
 
             await run_pipeline(job_data)
 
+        except redis.ReadOnlyError:
+            # Redis upgrade in progress - back off and retry
+            consecutive_redis_errors += 1
+            wait_time = min(REDIS_RETRY_DELAY * consecutive_redis_errors, 60.0)
+            logger.warning(
+                f"Redis read-only (upgrade in progress), "
+                f"retrying in {wait_time:.0f}s (attempt {consecutive_redis_errors})"
+            )
+            await asyncio.sleep(wait_time)
+
+        except (redis.ConnectionError, redis.TimeoutError, OSError) as e:
+            consecutive_redis_errors += 1
+            wait_time = min(REDIS_RETRY_DELAY * consecutive_redis_errors, 60.0)
+            logger.warning(
+                f"Redis connection error: {e}, "
+                f"retrying in {wait_time:.0f}s (attempt {consecutive_redis_errors})"
+            )
+            await asyncio.sleep(wait_time)
+
+            # If Redis is down for too long, try to reconnect
+            if consecutive_redis_errors >= REDIS_MAX_RETRIES:
+                logger.error("Redis unreachable after max retries, attempting reconnect...")
+                try:
+                    global redis_client
+                    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+                    await redis_client.ping()
+                    logger.info("Redis reconnected successfully")
+                    consecutive_redis_errors = 0
+                except Exception as re_err:
+                    logger.error(f"Redis reconnect failed: {re_err}")
+
         except json.JSONDecodeError as e:
             logger.error(f"Invalid job JSON: {e}")
         except Exception as e:
@@ -251,7 +383,6 @@ async def process_jobs():
             await asyncio.sleep(1)
 
     logger.info("Worker shutting down...")
-    # admin stop notification handled by main()
 
 
 async def main():
@@ -302,7 +433,6 @@ async def main():
             try:
                 await redis_client.aclose()
             except AttributeError:
-                # older versions
                 await redis_client.close()
 
 

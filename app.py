@@ -2279,11 +2279,13 @@ async def get_uploads(
         select_sql = f"""
             SELECT
                 id, filename, title, caption, platforms, status,
-                scheduled_time, created_at,
+                scheduled_time, created_at, completed_at,
                 put_reserved, aic_reserved,
                 views, likes,
                 trill_score, speed_bucket, max_speed_mph, avg_speed_mph, distance_miles, duration_seconds,
-                ai_title, ai_caption
+                ai_title, ai_caption,
+                thumbnail_r2_key, error_code, error_detail,
+                platform_results, file_size, duration
             FROM uploads
             WHERE {where_sql}
             ORDER BY created_at DESC
@@ -2307,11 +2309,32 @@ async def get_uploads(
 
         def _row_to_public(u):
             d = dict(u)
+            # Generate presigned thumbnail URL if available
+            thumb_url = None
+            thumb_key = d.get("thumbnail_r2_key")
+            if thumb_key:
+                try:
+                    thumb_url = r2_presign_get_url(thumb_key, expires_in=3600)
+                except Exception:
+                    pass
+            # Normalize platform_results — stored as JSONB, may come back as str or dict
+            raw_pr = d.get("platform_results")
+            if isinstance(raw_pr, str):
+                try:
+                    import json as _j; raw_pr = _j.loads(raw_pr)
+                except Exception:
+                    raw_pr = None
+            # Normalize status: worker writes 'succeeded' but frontend expects 'completed'
+            raw_status = d.get("status") or "pending"
+            if raw_status == "succeeded":
+                raw_status = "completed"
+            elif raw_status == "partial_success":
+                raw_status = "partial"
             return {
                 "id": str(d.get("id")),
                 "filename": d.get("filename"),
                 "platforms": d.get("platforms"),
-                "status": d.get("status"),
+                "status": raw_status,
                 "title": d.get("title"),
                 "caption": d.get("caption"),
                 "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
@@ -2329,6 +2352,19 @@ async def get_uploads(
                 "duration_seconds": d.get("duration_seconds"),
                 "ai_title": d.get("ai_title"),
                 "ai_caption": d.get("ai_caption"),
+                # Fields needed by queue.html
+                "thumbnail_url": thumb_url,
+                "error": d.get("error_detail") or d.get("error_code"),
+                "platform_results": raw_pr or [],
+                "file_size": d.get("file_size"),
+                "duration": d.get("duration") or d.get("duration_seconds"),
+                "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
+                # account_name / account_username: not stored on uploads row;
+                # return empty so queue.html fallback ('Multiple' / '—') renders correctly
+                "account_name": None,
+                "account_username": None,
+                # progress: worker doesn't write a % value; None means no progress bar shown
+                "progress": None,
             }
 
         uploads = [_row_to_public(u) for u in rows]
@@ -5547,18 +5583,26 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
     def g(k, default=None):
         return row[k] if k in row else default
 
+    # Normalize status: worker writes 'succeeded' but frontend expects 'completed'
+    _raw_status = g("status") or "pending"
+    if _raw_status == "succeeded":
+        _raw_status = "completed"
+    elif _raw_status == "partial_success":
+        _raw_status = "partial"
+
     return {
         "id": str(g("id")),
         "userId": str(g("user_id")),
         "r2Key": g("r2_key"),
         "filename": g("filename"),
         "fileSize": g("file_size"),
+        "file_size": g("file_size"),
         "platforms": _safe_json(g("platforms"), []),
         "title": g("title"),
         "caption": g("caption"),
         "hashtags": _safe_json(g("hashtags"), []),
         "privacy": g("privacy"),
-        "status": g("status"),
+        "status": _raw_status,
         "cancelRequested": bool(g("cancel_requested", False)),
         "scheduledTime": g("scheduled_time").isoformat() if g("scheduled_time") else None,
         "scheduleMode": g("schedule_mode"),
@@ -5577,7 +5621,8 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "shares": g("shares"),
         "thumbnailR2Key": g("thumbnail_r2_key"),
         "videoUrl": g("video_url"),
-        "platformResults": _safe_json(g("platform_results"), {}),
+        "platformResults": _safe_json(g("platform_results"), []),
+        "platform_results": _safe_json(g("platform_results"), []),
         "createdAt": g("created_at").isoformat() if g("created_at") else None,
         "updatedAt": g("updated_at").isoformat() if g("updated_at") else None,
         "duration": g("duration"),

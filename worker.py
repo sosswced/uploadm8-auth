@@ -305,7 +305,13 @@ async def run_pipeline(job_data: dict) -> bool:
         # Complete
         # ================================================================
         ctx.finished_at = datetime.now(timezone.utc)
-        ctx.state = "succeeded" if ctx.is_success() else "failed"
+        # Set state: partial when some platforms succeeded and some failed
+        if ctx.is_partial_success():
+            ctx.state = "partial"
+        elif ctx.is_success():
+            ctx.state = "succeeded"
+        else:
+            ctx.state = "failed"
         await db_stage.mark_processing_completed(db_pool, ctx)
 
         if ctx.is_success():

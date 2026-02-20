@@ -123,7 +123,7 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
             UPDATE uploads
             SET status = $2,
                 processing_finished_at = $3,
-                completed_at = CASE WHEN $2 = 'succeeded' THEN $3 ELSE completed_at END,
+                completed_at = CASE WHEN $2 IN ('succeeded','partial') THEN $3 ELSE completed_at END,
                 error_code = $4,
                 error_detail = $5,
                 platform_results = $6::jsonb,

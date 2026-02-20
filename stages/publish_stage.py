@@ -319,6 +319,48 @@ async def publish_to_tiktok(
         )
 
 
+async def _refresh_youtube_token(token_data: dict) -> dict:
+    """Attempt to refresh a YouTube access token using the stored refresh_token.
+    Returns updated token_data dict with new access_token, or original if refresh fails.
+    """
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token:
+        logger.warning("YouTube: No refresh_token stored, cannot refresh")
+        return token_data
+
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "") or os.environ.get("YOUTUBE_CLIENT_ID", "")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "") or os.environ.get("YOUTUBE_CLIENT_SECRET", "")
+
+    if not client_id or not client_secret:
+        logger.warning("YouTube: Missing GOOGLE_CLIENT_ID/SECRET env vars, cannot refresh token")
+        return token_data
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                }
+            )
+            if resp.status_code == 200:
+                new_tokens = resp.json()
+                logger.info("YouTube: Token refreshed successfully")
+                return {
+                    **token_data,
+                    "access_token": new_tokens["access_token"],
+                }
+            else:
+                logger.warning(f"YouTube: Token refresh failed: {resp.status_code} {resp.text[:200]}")
+                return token_data
+    except Exception as e:
+        logger.warning(f"YouTube: Token refresh exception: {e}")
+        return token_data
+
+
 async def publish_to_youtube(
     video_path: Path,
     ctx: JobContext,
@@ -328,6 +370,9 @@ async def publish_to_youtube(
 
     Flow: POST metadata (get Location header) -> PUT binary -> video_id
     """
+    # Always refresh token first — YouTube access tokens expire after 1 hour
+    token_data = await _refresh_youtube_token(token_data)
+
     access_token = token_data.get("access_token")
     if not access_token:
         return PlatformResult(

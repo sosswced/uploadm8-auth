@@ -813,7 +813,9 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
         # -- Load platform token --
         token_data = None
         try:
-            token_data = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
+            raw_token = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
+            # Decrypt if encrypted blob (token_blob is always encrypted via encrypt_blob())
+            token_data = decrypt_token(raw_token) if raw_token else None
         except Exception as e:
             logger.warning(f"{platform}: Token load failed: {e}")
             token_data = None

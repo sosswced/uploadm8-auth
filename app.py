@@ -2279,13 +2279,11 @@ async def get_uploads(
         select_sql = f"""
             SELECT
                 id, filename, title, caption, platforms, status,
-                scheduled_time, created_at, completed_at,
+                scheduled_time, created_at,
                 put_reserved, aic_reserved,
                 views, likes,
                 trill_score, speed_bucket, max_speed_mph, avg_speed_mph, distance_miles, duration_seconds,
-                ai_title, ai_caption,
-                thumbnail_r2_key, error_code, error_detail,
-                platform_results, file_size, duration
+                ai_title, ai_caption
             FROM uploads
             WHERE {where_sql}
             ORDER BY created_at DESC
@@ -2309,32 +2307,11 @@ async def get_uploads(
 
         def _row_to_public(u):
             d = dict(u)
-            # Generate presigned thumbnail URL if available
-            thumb_url = None
-            thumb_key = d.get("thumbnail_r2_key")
-            if thumb_key:
-                try:
-                    thumb_url = r2_presign_get_url(thumb_key, expires_in=3600)
-                except Exception:
-                    pass
-            # Normalize platform_results — stored as JSONB, may come back as str or dict
-            raw_pr = d.get("platform_results")
-            if isinstance(raw_pr, str):
-                try:
-                    import json as _j; raw_pr = _j.loads(raw_pr)
-                except Exception:
-                    raw_pr = None
-            # Normalize status: worker writes 'succeeded' but frontend expects 'completed'
-            raw_status = d.get("status") or "pending"
-            if raw_status == "succeeded":
-                raw_status = "completed"
-            elif raw_status == "partial_success":
-                raw_status = "partial"
             return {
                 "id": str(d.get("id")),
                 "filename": d.get("filename"),
                 "platforms": d.get("platforms"),
-                "status": raw_status,
+                "status": d.get("status"),
                 "title": d.get("title"),
                 "caption": d.get("caption"),
                 "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
@@ -2352,19 +2329,6 @@ async def get_uploads(
                 "duration_seconds": d.get("duration_seconds"),
                 "ai_title": d.get("ai_title"),
                 "ai_caption": d.get("ai_caption"),
-                # Fields needed by queue.html
-                "thumbnail_url": thumb_url,
-                "error": d.get("error_detail") or d.get("error_code"),
-                "platform_results": raw_pr or [],
-                "file_size": d.get("file_size"),
-                "duration": d.get("duration") or d.get("duration_seconds"),
-                "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
-                # account_name / account_username: not stored on uploads row;
-                # return empty so queue.html fallback ('Multiple' / '—') renders correctly
-                "account_name": None,
-                "account_username": None,
-                # progress: worker doesn't write a % value; None means no progress bar shown
-                "progress": None,
             }
 
         uploads = [_row_to_public(u) for u in rows]
@@ -3634,6 +3598,8 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 account_username = instagram_account.get("username", "")
                 account_avatar = instagram_account.get("profile_picture_url", "")
                 access_token = page_access_token  # Use Page token for API calls
+                # Store ig_user_id in token so publish_stage can find it
+                ig_user_id_for_token = account_id
                 
             elif platform == "facebook":
                 token_response = await client.get(config["token_url"], params={
@@ -3643,28 +3609,64 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     "redirect_uri": redirect_uri,
                 })
                 token_data = token_response.json()
-                access_token = token_data.get("access_token")
-                
-                # Get user info
-                user_response = await client.get(
-                    f"https://graph.facebook.com/me?fields=id,name,picture&access_token={access_token}"
+                user_access_token = token_data.get("access_token")
+
+                if not user_access_token:
+                    raise Exception(f"No access token from Facebook: {token_data}")
+
+                # Get user's Pages — Reels must be posted to a Page, not personal profile
+                pages_response = await client.get(
+                    f"https://graph.facebook.com/v18.0/me/accounts",
+                    params={"access_token": user_access_token, "fields": "id,name,access_token,picture"}
                 )
-                user_data = user_response.json()
-                account_id = user_data.get("id", secrets.token_hex(8))
-                account_name = user_data.get("name", "Facebook User")
-                account_username = ""
-                account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
+                pages_data = pages_response.json()
+                pages = pages_data.get("data", [])
+
+                if not pages:
+                    # Fall back to personal profile with a clear error stored
+                    user_response = await client.get(
+                        f"https://graph.facebook.com/me?fields=id,name,picture&access_token={user_access_token}"
+                    )
+                    user_data = user_response.json()
+                    account_id = user_data.get("id", secrets.token_hex(8))
+                    account_name = user_data.get("name", "Facebook User")
+                    account_username = ""
+                    account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
+                    access_token = user_access_token
+                    fb_page_id_for_token = None  # No page found — will fail at publish with clear error
+                    logger.warning(f"Facebook OAuth: No Pages found for user {account_id}. Reels require a Facebook Page.")
+                else:
+                    # Use the first Page (most users have one)
+                    page = pages[0]
+                    fb_page_id_for_token = page.get("id")
+                    page_access_token_fb = page.get("access_token")
+                    account_id = fb_page_id_for_token
+                    account_name = page.get("name", "Facebook Page")
+                    account_username = ""
+                    account_avatar = page.get("picture", {}).get("data", {}).get("url", "")
+                    access_token = page_access_token_fb  # Page token used for posting
             
             # Refuse to persist "ghost" connections with no identity
             if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
                 raise Exception("Provider did not return account_id; refusing to store token (prevents phantom accounts).")
 
-            # Store the token
-            token_blob = encrypt_blob({
+            # Build token payload — include platform-specific IDs publish_stage needs
+            _token_payload = {
                 "access_token": access_token,
                 "refresh_token": token_data.get("refresh_token"),
                 "expires_at": token_data.get("expires_in"),
-            })
+            }
+            # Instagram: store ig_user_id so publish_stage can call /{ig_user_id}/media
+            # ig_user_id_for_token is set in the instagram branch above to account_id
+            if platform == "instagram":
+                _token_payload["ig_user_id"] = account_id
+            # Facebook: store page_id so publish_stage can post to /{page_id}/videos
+            # fb_page_id_for_token is set in the facebook branch above
+            if platform == "facebook" and account_id:
+                _token_payload["page_id"] = account_id
+
+            # Store the token
+            token_blob = encrypt_blob(_token_payload)
             
             async with db_pool.acquire() as conn:
                 # Check if account already connected
@@ -5583,26 +5585,18 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
     def g(k, default=None):
         return row[k] if k in row else default
 
-    # Normalize status: worker writes 'succeeded' but frontend expects 'completed'
-    _raw_status = g("status") or "pending"
-    if _raw_status == "succeeded":
-        _raw_status = "completed"
-    elif _raw_status == "partial_success":
-        _raw_status = "partial"
-
     return {
         "id": str(g("id")),
         "userId": str(g("user_id")),
         "r2Key": g("r2_key"),
         "filename": g("filename"),
         "fileSize": g("file_size"),
-        "file_size": g("file_size"),
         "platforms": _safe_json(g("platforms"), []),
         "title": g("title"),
         "caption": g("caption"),
         "hashtags": _safe_json(g("hashtags"), []),
         "privacy": g("privacy"),
-        "status": _raw_status,
+        "status": g("status"),
         "cancelRequested": bool(g("cancel_requested", False)),
         "scheduledTime": g("scheduled_time").isoformat() if g("scheduled_time") else None,
         "scheduleMode": g("schedule_mode"),
@@ -5621,8 +5615,7 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "shares": g("shares"),
         "thumbnailR2Key": g("thumbnail_r2_key"),
         "videoUrl": g("video_url"),
-        "platformResults": _safe_json(g("platform_results"), []),
-        "platform_results": _safe_json(g("platform_results"), []),
+        "platformResults": _safe_json(g("platform_results"), {}),
         "createdAt": g("created_at").isoformat() if g("created_at") else None,
         "updatedAt": g("updated_at").isoformat() if g("updated_at") else None,
         "duration": g("duration"),

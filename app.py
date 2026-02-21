@@ -81,7 +81,20 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 from decimal import Decimal
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, urlsplit, urlunsplit, parse_qsl
+
+# Sensitive query-param keys that must never appear in logs
+_SENSITIVE_KEYS = {"access_token", "client_secret", "code", "refresh_token", "fb_exchange_token"}
+
+def redact_url(url: str) -> str:
+    """Strip sensitive query params from a URL before logging it."""
+    try:
+        parts = urlsplit(url)
+        q = parse_qsl(parts.query, keep_blank_values=True)
+        redacted = [(k, "***" if k in _SENSITIVE_KEYS else v) for k, v in q]
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(redacted), parts.fragment))
+    except Exception:
+        return "<url-redact-error>"
 from io import BytesIO
 
 import httpx
@@ -140,6 +153,12 @@ class UserPreferencesUpdate(BaseModel):
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("uploadm8-api")
+
+# httpx logs every outbound request URL at INFO level — including access_token,
+# client_secret, and OAuth codes in query params. Suppress to WARNING so those
+# URLs never appear in logs or log aggregators.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ============================================================
 # Configuration
@@ -3673,8 +3692,16 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
             return popup_response(True, platform)
     
     except Exception as e:
-        logger.error(f"OAuth callback error for {platform}: {e}")
-        return popup_response(False, platform, str(e))
+        # Sanitize error before logging — exception message may contain tokens or secrets
+        err_type = type(e).__name__
+        err_safe = str(e)
+        # Strip anything that looks like a token (long alphanumeric strings)
+        import re as _re
+        err_safe = _re.sub(r'[A-Za-z0-9_-]{40,}', '***', err_safe)
+        logger.error(f"OAuth callback error for {platform} ({err_type}): {err_safe}")
+        # Return a stable user-facing message — never echo raw exception text to the browser
+        user_msg = str(e) if len(str(e)) < 200 and "token" not in str(e).lower() else "Connection failed. Please try again."
+        return popup_response(False, platform, user_msg)
 
 # ============================================================
 # Billing

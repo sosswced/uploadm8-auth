@@ -336,12 +336,56 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                             await db_stage.save_refreshed_token(db_pool, user_id, platform, updated)
                         return updated
 
-            # Instagram: store new user token (page token IS the user token for IG)
+            # ── Recover missing ig_user_id / page_id ────────────────────────
+            # Old tokens stored before the OAuth fix may lack these IDs.
+            # Now that we have a fresh user token we can fetch them on the fly
+            # so the publish succeeds without forcing the user to reconnect.
+            pages_resp = await client.get(
+                "https://graph.facebook.com/v18.0/me/accounts",
+                params={"access_token": new_user_token, "fields": "id,name,access_token,instagram_business_account"},
+            )
+
+            recovered_ig_user_id = token_data.get("ig_user_id") or token_data.get("instagram_user_id")
+            recovered_page_id    = token_data.get("page_id") or token_data.get("facebook_page_id")
+            recovered_page_token = new_user_token  # fallback
+
+            if pages_resp.status_code == 200:
+                pages = pages_resp.json().get("data", [])
+
+                if platform == "instagram" and not recovered_ig_user_id:
+                    # Find the Page that has an Instagram Business Account linked
+                    for page in pages:
+                        ig_biz = page.get("instagram_business_account")
+                        if ig_biz and ig_biz.get("id"):
+                            recovered_ig_user_id = ig_biz["id"]
+                            recovered_page_token = page.get("access_token", new_user_token)
+                            logger.info(
+                                f"instagram: Recovered ig_user_id={recovered_ig_user_id} "
+                                f"from Page '{page.get('name', '?')}' during token refresh"
+                            )
+                            break
+
+                if platform == "facebook" and not recovered_page_id and pages:
+                    first = pages[0]
+                    recovered_page_id    = first["id"]
+                    recovered_page_token = first.get("access_token", new_user_token)
+                    logger.info(
+                        f"facebook: Recovered page_id={recovered_page_id} "
+                        f"from Page '{first.get('name', '?')}' during token refresh"
+                    )
+
+            # Build updated blob — preserve any existing IDs, override with recovered ones
             updated = {
                 **token_data,
-                "access_token": new_user_token,
-                "expires_at": None,
+                "access_token":  recovered_page_token if platform == "instagram" else new_user_token,
+                "expires_at":    None,
             }
+            if platform == "instagram" and recovered_ig_user_id:
+                updated["ig_user_id"] = recovered_ig_user_id
+            if platform == "facebook" and recovered_page_id:
+                updated["page_id"]    = recovered_page_id
+                updated["access_token"] = recovered_page_token
+
             if db_pool and user_id:
                 await db_stage.save_refreshed_token(db_pool, user_id, platform, updated)
             return updated

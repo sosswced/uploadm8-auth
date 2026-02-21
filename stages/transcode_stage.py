@@ -410,7 +410,7 @@ def build_ffmpeg_command(
     # -- Video codec settings --
     cmd.extend([
         "-c:v", "libx264",
-        "-preset", "fast",
+        "-preset", "medium",
         "-crf", "23",
         "-profile:v", spec.get("profile", "high"),
         "-level", spec.get("level", "4.1"),
@@ -470,8 +470,15 @@ async def transcode_video(
     platform: str,
     info: VideoInfo,
     reframe_action: str,
+    db_pool=None,
+    upload_id: str = None,
 ) -> Path:
-    """Transcode a video to a platform-specific format"""
+    """Transcode a video to a platform-specific format.
+    
+    When db_pool and upload_id are provided, streams FFmpeg stderr in real-time
+    and writes progress (0-100) to the uploads table every ~2 seconds so the
+    frontend can display a live progress bar.
+    """
     cmd = build_ffmpeg_command(input_path, output_path, info, platform, reframe_action)
 
     cmd_preview = " ".join(cmd[:15]) + "..."
@@ -480,16 +487,60 @@ async def transcode_video(
         f"reframe={reframe_action}, cmd starts: {cmd_preview}"
     )
 
+    # Duration in seconds — used to calculate percent complete from FFmpeg time output
+    total_duration = info.duration if info.duration and info.duration > 0 else None
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await proc.communicate()
+
+        stderr_lines = []
+        last_progress_write = 0.0
+        PROGRESS_INTERVAL = 2.0  # Write to DB at most once per 2 seconds
+
+        if db_pool and upload_id and total_duration:
+            # Stream stderr line-by-line so we can parse FFmpeg progress in real time
+            # FFmpeg writes lines like: frame=  120 fps= 30 ... time=00:00:04.00 ...
+            import re, time as _time
+            time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+
+            async def _stream_stderr():
+                nonlocal last_progress_write
+                while True:
+                    line_bytes = await proc.stderr.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode("utf-8", errors="replace")
+                    stderr_lines.append(line)
+                    m = time_pattern.search(line)
+                    if m:
+                        h, mn, s = float(m.group(1)), float(m.group(2)), float(m.group(3))
+                        encoded_secs = h * 3600 + mn * 60 + s
+                        pct = int(min(99, (encoded_secs / total_duration) * 100))
+                        now = _time.monotonic()
+                        if now - last_progress_write >= PROGRESS_INTERVAL:
+                            last_progress_write = now
+                            try:
+                                from stages import db as _db
+                                await _db.update_upload_progress(
+                                    db_pool, upload_id, pct,
+                                    stage=f"transcoding:{platform}"
+                                )
+                            except Exception:
+                                pass
+
+            await asyncio.gather(proc.wait(), _stream_stderr())
+            stderr_output = "".join(stderr_lines)
+        else:
+            # No db_pool — fall back to original blocking communicate()
+            stdout_data, stderr_data = await proc.communicate()
+            stderr_output = stderr_data.decode("utf-8", errors="replace")
 
         if proc.returncode != 0:
-            error_msg = stderr.decode()[-500:]
+            error_msg = stderr_output[-500:]
             raise StageError(ErrorCode.TRANSCODE_FAILED, f"FFmpeg failed for {platform}: {error_msg}")
 
         if not output_path.exists():
@@ -515,34 +566,10 @@ async def transcode_video(
         raise StageError(ErrorCode.TRANSCODE_FAILED, f"Transcode failed for {platform}: {e}")
 
 
-
-# -------------------------------------------------------------------------
-# Transcode deduplication helper
-# -------------------------------------------------------------------------
-def _transcode_signature(info: VideoInfo, platform: str, reframe_action: str) -> tuple:
-    """
-    Returns a tuple that uniquely identifies the transcode output characteristics.
-    Two platforms with the same signature will produce identical output files,
-    so we transcode once and copy rather than re-encoding.
-    Differentiators: reframe action, audio sample rate, effective trim, pixel format, profile/level.
-    """
-    spec = PLATFORM_SPECS.get(platform, {})
-    max_dur = spec.get("max_duration", 0)
-    trim = round(max_dur - 0.5, 3) if max_dur > 0 and info.duration > max_dur else 0
-    return (
-        reframe_action,
-        spec.get("sample_rate", 44100),
-        trim,
-        spec.get("pixel_format", "yuv420p"),
-        spec.get("profile", "high"),
-        spec.get("level", "4.1"),
-    )
-
-
 # -------------------------------------------------------------------------
 # Stage entry point
 # -------------------------------------------------------------------------
-async def run_transcode_stage(ctx: JobContext) -> JobContext:
+async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
     """
     Run the transcode stage - creates platform-specific video versions.
 
@@ -597,12 +624,9 @@ async def run_transcode_stage(ctx: JobContext) -> JobContext:
         "file_size": info.file_size,
     }
 
-    # -- Step 2: Plan transcodes with deduplication --
-    # Compute per-platform plan first, then run unique encodes in parallel.
+    # -- Step 2: Per-platform transcode --
     ctx.platform_videos = {}
     transcoded_any = False
-
-    platform_plans: Dict[str, tuple] = {}  # platform -> (needs_tc, reasons, reframe_action, sig)
 
     for platform in platforms:
         spec = PLATFORM_SPECS.get(platform)
@@ -611,82 +635,50 @@ async def run_transcode_stage(ctx: JobContext) -> JobContext:
             ctx.platform_videos[platform] = ctx.local_video_path
             continue
 
+        # Resolve what reframe action to take for this platform
         reframe_action = resolve_reframe_action(info, reframe_mode, platform)
 
+        # Log the reframe decision
         if reframe_action != "none":
             logger.info(
                 f"{platform}: {reframe_mode} mode -> {reframe_action} to "
                 f"{spec['target_width']}x{spec['target_height']}"
             )
 
+        # Check if landscape video going to vertical platform (informational warning)
         if info.is_landscape and reframe_action == "none":
             logger.info(
                 f"{platform} WARNING: Video is landscape {info.width}x{info.height}; "
                 f"{spec['name']} prefers vertical 9:16. Video will be letterboxed by the platform."
             )
 
+        # Check duration
         if spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
             logger.info(
                 f"{platform}: Video {info.duration:.1f}s exceeds max {spec['max_duration']}s, "
                 f"will be trimmed to {spec['max_duration'] - 0.5:.1f}s"
             )
 
+        # Determine if transcode is needed
         needs_tc, reasons = needs_transcode(info, platform, reframe_action)
-        sig = _transcode_signature(info, platform, reframe_action)
-        platform_plans[platform] = (needs_tc, reasons, reframe_action, sig)
 
-    # Build dedup map: signature -> first platform that will do the actual encode
-    sig_to_lead: Dict[tuple, str] = {}
-    for platform, (needs_tc, _reasons, reframe_action, sig) in platform_plans.items():
-        if needs_tc and sig not in sig_to_lead:
-            sig_to_lead[sig] = platform
+        if needs_tc:
+            for reason in reasons:
+                logger.info(f"{platform} needs transcode: {reason}")
 
-    lead_platforms = list(sig_to_lead.values())
+            output_path = ctx.temp_dir / f"transcoded_{platform}.mp4"
+            await transcode_video(
+                input_video, output_path, platform, info, reframe_action,
+                db_pool=db_pool, upload_id=str(ctx.upload_id) if ctx.upload_id else None,
+            )
 
-    # -- Step 3: Run all unique encodes in parallel --
-    async def _do_transcode(platform: str, reframe_action: str) -> Path:
-        for reason in platform_plans[platform][1]:
-            logger.info(f"{platform} needs transcode: {reason}")
-        output_path = ctx.temp_dir / f"transcoded_{platform}.mp4"
-        await transcode_video(input_video, output_path, platform, info, reframe_action)
-        return output_path
-
-    if lead_platforms:
-        logger.info(
-            f"Parallel transcoding {len(lead_platforms)} unique encode(s) "
-            f"for {len(platform_plans)} platform(s): {lead_platforms}"
-        )
-        tasks = [_do_transcode(p, platform_plans[p][2]) for p in lead_platforms]
-        lead_results = await asyncio.gather(*tasks)
-        transcoded_any = True
-        lead_paths: Dict[str, Path] = dict(zip(lead_platforms, lead_results))
-
-        for platform, (needs_tc, _reasons, reframe_action, sig) in platform_plans.items():
-            if not needs_tc:
-                logger.info(f"{platform}: video is already compatible, using original")
-                ctx.platform_videos[platform] = input_video
-            else:
-                lead = sig_to_lead[sig]
-                if lead == platform:
-                    ctx.platform_videos[platform] = lead_paths[platform]
-                else:
-                    # Identical spec as lead — copy rather than re-encode
-                    src = lead_paths[lead]
-                    dst = ctx.temp_dir / f"transcoded_{platform}.mp4"
-                    import shutil as _shutil
-                    _shutil.copy2(str(src), str(dst))
-                    src_mb = src.stat().st_size / 1024 / 1024
-                    logger.info(
-                        f"{platform}: reusing transcode from '{lead}' "
-                        f"(identical spec) -> {dst.name} ({src_mb:.1f}MB)"
-                    )
-                    ctx.platform_videos[platform] = dst
-    else:
-        for platform in platform_plans:
+            ctx.platform_videos[platform] = output_path
+            transcoded_any = True
+        else:
             logger.info(f"{platform}: video is already compatible, using original")
             ctx.platform_videos[platform] = input_video
 
-    # -- Step 4: Set processed video path (backward compat) --
+    # -- Step 3: Set processed video path (backward compat) --
     if transcoded_any:
         first_platform = platforms[0]
         if first_platform in ctx.platform_videos:

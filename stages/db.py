@@ -480,27 +480,37 @@ async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
 # ============================================================
 
 
-
-async def save_refreshed_token(pool: asyncpg.Pool, user_id: str, platform: str, new_token_blob: dict):
-    """Persist a refreshed token blob back to platform_tokens so the next job uses fresh tokens."""
-    import json as _json
+async def update_upload_progress(
+    pool: asyncpg.Pool,
+    upload_id: str,
+    percent: int,
+    stage: str = "transcoding",
+):
+    """Write live transcoding progress (0-100) and stage label to the uploads row.
+    Called every ~2s by transcode_stage while FFmpeg is running.
+    Silently ignored if the columns don't exist yet (pre-migration).
+    """
     try:
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                UPDATE platform_tokens
-                SET token_blob = $1, updated_at = NOW()
-                WHERE user_id = $2 AND platform = $3
+                UPDATE uploads
+                SET processing_progress = $1,
+                    processing_stage    = $2,
+                    updated_at          = NOW()
+                WHERE id = $3
                 """,
-                _json.dumps(new_token_blob),
-                user_id,
-                platform,
+                max(0, min(100, percent)),
+                stage[:64],
+                upload_id,
             )
     except Exception as e:
-        import logging as _logging
-        _logging.getLogger("uploadm8-worker.db").warning(
-            f"save_refreshed_token failed for {platform}/{user_id}: {e}"
+        import logging as _log
+        _log.getLogger("uploadm8-worker.db").debug(
+            f"update_upload_progress skipped ({upload_id}): {e}"
         )
+
+
 async def save_processed_assets(pool: asyncpg.Pool, upload_id: str, assets: Dict[str, str]):
     """Save per-platform R2 keys to the uploads table.
 

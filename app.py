@@ -3598,8 +3598,6 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 account_username = instagram_account.get("username", "")
                 account_avatar = instagram_account.get("profile_picture_url", "")
                 access_token = page_access_token  # Use Page token for API calls
-                # Store ig_user_id in token so publish_stage can find it
-                ig_user_id_for_token = account_id
                 
             elif platform == "facebook":
                 token_response = await client.get(config["token_url"], params={
@@ -3609,64 +3607,28 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     "redirect_uri": redirect_uri,
                 })
                 token_data = token_response.json()
-                user_access_token = token_data.get("access_token")
-
-                if not user_access_token:
-                    raise Exception(f"No access token from Facebook: {token_data}")
-
-                # Get user's Pages — Reels must be posted to a Page, not personal profile
-                pages_response = await client.get(
-                    f"https://graph.facebook.com/v18.0/me/accounts",
-                    params={"access_token": user_access_token, "fields": "id,name,access_token,picture"}
+                access_token = token_data.get("access_token")
+                
+                # Get user info
+                user_response = await client.get(
+                    f"https://graph.facebook.com/me?fields=id,name,picture&access_token={access_token}"
                 )
-                pages_data = pages_response.json()
-                pages = pages_data.get("data", [])
-
-                if not pages:
-                    # Fall back to personal profile with a clear error stored
-                    user_response = await client.get(
-                        f"https://graph.facebook.com/me?fields=id,name,picture&access_token={user_access_token}"
-                    )
-                    user_data = user_response.json()
-                    account_id = user_data.get("id", secrets.token_hex(8))
-                    account_name = user_data.get("name", "Facebook User")
-                    account_username = ""
-                    account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
-                    access_token = user_access_token
-                    fb_page_id_for_token = None  # No page found — will fail at publish with clear error
-                    logger.warning(f"Facebook OAuth: No Pages found for user {account_id}. Reels require a Facebook Page.")
-                else:
-                    # Use the first Page (most users have one)
-                    page = pages[0]
-                    fb_page_id_for_token = page.get("id")
-                    page_access_token_fb = page.get("access_token")
-                    account_id = fb_page_id_for_token
-                    account_name = page.get("name", "Facebook Page")
-                    account_username = ""
-                    account_avatar = page.get("picture", {}).get("data", {}).get("url", "")
-                    access_token = page_access_token_fb  # Page token used for posting
+                user_data = user_response.json()
+                account_id = user_data.get("id", secrets.token_hex(8))
+                account_name = user_data.get("name", "Facebook User")
+                account_username = ""
+                account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
             
             # Refuse to persist "ghost" connections with no identity
             if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
                 raise Exception("Provider did not return account_id; refusing to store token (prevents phantom accounts).")
 
-            # Build token payload — include platform-specific IDs publish_stage needs
-            _token_payload = {
+            # Store the token
+            token_blob = encrypt_blob({
                 "access_token": access_token,
                 "refresh_token": token_data.get("refresh_token"),
                 "expires_at": token_data.get("expires_in"),
-            }
-            # Instagram: store ig_user_id so publish_stage can call /{ig_user_id}/media
-            # ig_user_id_for_token is set in the instagram branch above to account_id
-            if platform == "instagram":
-                _token_payload["ig_user_id"] = account_id
-            # Facebook: store page_id so publish_stage can post to /{page_id}/videos
-            # fb_page_id_for_token is set in the facebook branch above
-            if platform == "facebook" and account_id:
-                _token_payload["page_id"] = account_id
-
-            # Store the token
-            token_blob = encrypt_blob(_token_payload)
+            })
             
             async with db_pool.acquire() as conn:
                 # Check if account already connected
@@ -4011,6 +3973,48 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
             "revenue_total": revenue_total,
         },
     }
+
+@app.get("/api/analytics/my-avg-processing")
+async def my_avg_processing(user: dict = Depends(get_current_user)):
+    """Return this user's personal average processing time in seconds.
+    Used by upload.html to calibrate the progress estimate instead of
+    using a hardcoded 7-minute fallback.
+    Falls back to 420s (7 min) when fewer than 3 completed uploads exist.
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS sample_count,
+                    COALESCE(
+                        AVG(EXTRACT(EPOCH FROM (processing_finished_at - processing_started_at))),
+                        420
+                    )::double precision AS avg_seconds
+                FROM uploads
+                WHERE user_id      = $1
+                  AND status       IN ('succeeded', 'completed', 'partial')
+                  AND processing_started_at  IS NOT NULL
+                  AND processing_finished_at IS NOT NULL
+                  AND processing_finished_at > processing_started_at
+                """,
+                user["id"],
+            )
+        sample_count = int(row["sample_count"] or 0)
+        avg_seconds  = float(row["avg_seconds"] or 420)
+        # Only trust personal average if we have at least 3 data points
+        if sample_count < 3:
+            avg_seconds = 420.0
+        return {
+            "avg_processing_seconds": round(avg_seconds, 1),
+            "sample_count": sample_count,
+            "reliable": sample_count >= 3,
+        }
+    except Exception as e:
+        logger.warning(f"my_avg_processing failed: {e}")
+        return {"avg_processing_seconds": 420.0, "sample_count": 0, "reliable": False}
+
+
 
 
 @app.get("/api/analytics/export")
@@ -5563,6 +5567,7 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "title","caption","hashtags","privacy","status","cancel_requested",
         "scheduled_time","schedule_mode",
         "processing_started_at","processing_finished_at","completed_at",
+        "processing_progress","processing_stage",
         "error_code","error_detail",
         "put_reserved","put_spent","aic_reserved","aic_spent",
         "views","likes","comments","shares",
@@ -5603,6 +5608,8 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "processingStartedAt": g("processing_started_at").isoformat() if g("processing_started_at") else None,
         "processingFinishedAt": g("processing_finished_at").isoformat() if g("processing_finished_at") else None,
         "completedAt": g("completed_at").isoformat() if g("completed_at") else None,
+        "processingProgress": g("processing_progress"),
+        "processingStage": g("processing_stage"),
         "errorCode": g("error_code"),
         "errorDetail": g("error_detail"),
         "putReserved": g("put_reserved"),

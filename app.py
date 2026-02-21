@@ -3351,7 +3351,7 @@ OAUTH_CONFIG = {
     "facebook": {
         "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
         "token_url": "https://graph.facebook.com/v18.0/oauth/access_token",
-        "scope": "pages_manage_posts,pages_read_engagement,publish_video",
+        "scope": "pages_manage_posts,pages_read_engagement,pages_show_list,publish_video",
     },
 }
 
@@ -3607,28 +3607,50 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     "redirect_uri": redirect_uri,
                 })
                 token_data = token_response.json()
-                access_token = token_data.get("access_token")
-                
-                # Get user info
-                user_response = await client.get(
-                    f"https://graph.facebook.com/me?fields=id,name,picture&access_token={access_token}"
+                user_access_token = token_data.get("access_token")
+
+                if not user_access_token:
+                    raise Exception(f"No access token returned: {token_data}")
+
+                # Facebook Reels require a Page token, not a user token.
+                # Fetch the user's Pages and use the first one.
+                pages_response = await client.get(
+                    "https://graph.facebook.com/v18.0/me/accounts",
+                    params={"access_token": user_access_token, "fields": "id,name,access_token,picture"},
                 )
-                user_data = user_response.json()
-                account_id = user_data.get("id", secrets.token_hex(8))
-                account_name = user_data.get("name", "Facebook User")
+                pages_data = pages_response.json()
+                pages = pages_data.get("data", [])
+
+                if not pages:
+                    raise Exception(
+                        "No Facebook Pages found. You need a Facebook Page to publish Reels. "
+                        "Create a Page at facebook.com/pages/create and try again."
+                    )
+
+                # Use the first Page
+                page = pages[0]
+                account_id    = page["id"]                                         # Page ID
+                account_name  = page.get("name", "Facebook Page")
                 account_username = ""
-                account_avatar = user_data.get("picture", {}).get("data", {}).get("url", "")
+                account_avatar   = page.get("picture", {}).get("data", {}).get("url", "")
+                access_token     = page["access_token"]                            # Page token
             
             # Refuse to persist "ghost" connections with no identity
             if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
                 raise Exception("Provider did not return account_id; refusing to store token (prevents phantom accounts).")
 
-            # Store the token
-            token_blob = encrypt_blob({
+            # Store the token — include platform-specific IDs in the blob so
+            # publish_stage can read them without needing a separate DB lookup.
+            blob_payload = {
                 "access_token": access_token,
                 "refresh_token": token_data.get("refresh_token"),
                 "expires_at": token_data.get("expires_in"),
-            })
+            }
+            if platform == "instagram" and account_id:
+                blob_payload["ig_user_id"] = str(account_id)
+            if platform == "facebook" and account_id:
+                blob_payload["page_id"] = str(account_id)
+            token_blob = encrypt_blob(blob_payload)
             
             async with db_pool.acquire() as conn:
                 # Check if account already connected

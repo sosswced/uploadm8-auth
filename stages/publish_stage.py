@@ -446,13 +446,25 @@ async def publish_to_tiktok(
 
     try:
         file_size = video_path.stat().st_size
+        # TikTok chunk rules:
+        # - Each chunk must be 5MB–64MB, except the final chunk (up to 128MB)
+        # - For files ≤ 64MB: single chunk (chunk_size = file_size, total_chunk_count = 1)
+        # - For files > 64MB: use 64MB chunks
+        CHUNK_SIZE = 64 * 1024 * 1024  # 64MB
+        if file_size <= CHUNK_SIZE:
+            chunk_size = file_size
+            total_chunk_count = 1
+        else:
+            chunk_size = CHUNK_SIZE
+            total_chunk_count = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE  # ceiling division
+
         async with httpx.AsyncClient(timeout=120) as client:
             # Step 1: Initialize upload
             init_resp = await client.post(
                 "https://open.tiktokapis.com/v2/post/publish/video/init/",
                 headers={
                     "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json; charset=UTF-8"
                 },
                 json={
                     "post_info": {
@@ -462,6 +474,8 @@ async def publish_to_tiktok(
                     "source_info": {
                         "source": "FILE_UPLOAD",
                         "video_size": file_size,
+                        "chunk_size": chunk_size,
+                        "total_chunk_count": total_chunk_count,
                     }
                 }
             )
@@ -487,27 +501,34 @@ async def publish_to_tiktok(
                     error_message="No upload URL returned"
                 )
 
-            # Step 2: Upload video binary
+            # Step 2: Upload video in chunks (or single chunk for small files)
+            # TikTok requires Content-Range: bytes {start}-{end}/{total} per chunk
             with open(video_path, "rb") as f:
-                video_data = f.read()
+                for chunk_index in range(total_chunk_count):
+                    chunk_start = chunk_index * chunk_size
+                    chunk_data = f.read(chunk_size)
+                    chunk_end = chunk_start + len(chunk_data) - 1
 
-            upload_resp = await client.put(
-                upload_url,
-                content=video_data,
-                headers={
-                    "Content-Type": "video/mp4",
-                    "Content-Length": str(file_size),
-                }
-            )
+                    upload_resp = await client.put(
+                        upload_url,
+                        content=chunk_data,
+                        headers={
+                            "Content-Type": "video/mp4",
+                            "Content-Length": str(len(chunk_data)),
+                            "Content-Range": f"bytes {chunk_start}-{chunk_end}/{file_size}",
+                        }
+                    )
 
-            if upload_resp.status_code not in (200, 201):
-                return PlatformResult(
-                    platform="tiktok",
-                    success=False,
-                    http_status=upload_resp.status_code,
-                    error_code="UPLOAD_FAILED",
-                    error_message=f"Upload failed: {upload_resp.status_code}"
-                )
+                    if upload_resp.status_code not in (200, 201, 206):
+                        return PlatformResult(
+                            platform="tiktok",
+                            success=False,
+                            http_status=upload_resp.status_code,
+                            error_code="UPLOAD_FAILED",
+                            error_message=f"Upload failed chunk {chunk_index+1}/{total_chunk_count}: {upload_resp.status_code}"
+                        )
+
+            logger.info(f"TikTok: uploaded {total_chunk_count} chunk(s), {file_size/1024/1024:.1f}MB total")
 
             logger.info(f"TikTok publish accepted: publish_id={publish_id}")
             return PlatformResult(

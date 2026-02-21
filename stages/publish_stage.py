@@ -469,7 +469,12 @@ async def publish_to_tiktok(
                 json={
                     "post_info": {
                         "title": tiktok_title,
-                        "privacy_level": "PUBLIC_TO_EVERYONE",
+                        "privacy_level": {
+                        "public":   os.environ.get("TIKTOK_PRIVACY_LEVEL", "PUBLIC_TO_EVERYONE"),
+                        "unlisted": os.environ.get("TIKTOK_PRIVACY_LEVEL", "FOLLOWER_OF_CREATOR"),
+                        "private":  "SELF_ONLY",
+                    }.get((getattr(ctx, "privacy", None) or "public").lower(),
+                          os.environ.get("TIKTOK_PRIVACY_LEVEL", "PUBLIC_TO_EVERYONE")),
                     },
                     "source_info": {
                         "source": "FILE_UPLOAD",
@@ -631,7 +636,11 @@ async def publish_to_youtube(
                     "categoryId": "22"  # People & Blogs
                 },
                 "status": {
-                    "privacyStatus": "public",
+                    "privacyStatus": {
+                            "public":   "public",
+                            "unlisted": "unlisted",
+                            "private":  "private",
+                        }.get((getattr(ctx, "privacy", None) or "public").lower(), "public"),
                     "selfDeclaredMadeForKids": False
                 }
             }

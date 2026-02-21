@@ -2262,7 +2262,7 @@ async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow("SELECT put_reserved, aic_reserved, status FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user["id"])
         if not upload: raise HTTPException(404, "Upload not found")
-        if upload["status"] in ("completed", "cancelled", "failed"):
+        if upload["status"] in ("completed", "succeeded", "cancelled", "failed"):
             raise HTTPException(400, "Cannot cancel this upload")
         
         await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1", upload_id)
@@ -3820,7 +3820,7 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
         try:
             stats = await conn.fetchrow("""
             SELECT COUNT(*)::int AS total, 
-                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+                   SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
                    COALESCE(SUM(views), 0)::bigint AS views, 
                    COALESCE(SUM(likes), 0)::bigint AS likes,
                    COALESCE(SUM(put_spent), 0)::int AS put_used, 
@@ -3832,7 +3832,7 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
                 raise
             stats = await conn.fetchrow("""
             SELECT COUNT(*)::int AS total, 
-                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+                   SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
                    0::bigint AS views, 0::bigint AS likes,
                    0::int AS put_used, 0::int AS aic_used
             FROM uploads WHERE user_id = $1 AND created_at >= $2
@@ -3960,7 +3960,7 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
                 """
                 SELECT
                     COUNT(*)::int AS uploads_total,
-                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS uploads_completed,
+                    SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS uploads_completed,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS uploads_failed,
                     COALESCE(AVG(EXTRACT(EPOCH FROM (processing_finished_at - processing_started_at))), 0)::double precision AS avg_processing_seconds,
                     COALESCE(SUM(views), 0)::bigint AS views_total,
@@ -3978,7 +3978,7 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
                 """
                 SELECT
                     COUNT(*)::int AS uploads_total,
-                    SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS uploads_completed,
+                    SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS uploads_completed,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS uploads_failed,
                     0::double precision AS avg_processing_seconds,
                     0::bigint AS views_total,
@@ -4730,7 +4730,7 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family')")
         
         upload_stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
             COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes
             FROM uploads WHERE created_at >= $1
@@ -4969,7 +4969,7 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
             SUM(CASE WHEN status IN ('pending', 'queued', 'processing') THEN 1 ELSE 0 END)::int AS in_queue,
             COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes
             FROM uploads WHERE user_id = $1
@@ -5077,7 +5077,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         
         # Uploads
         upload_stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed,
+            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
             COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes
             FROM uploads WHERE created_at >= $1
@@ -5151,7 +5151,7 @@ async def get_kpi_costs(user: dict = Depends(require_admin)):
     since = _now_utc() - timedelta(days=30)
     async with db_pool.acquire() as conn:
         costs = await conn.fetchrow("SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai, COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage, COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute FROM cost_tracking WHERE created_at >= $1", since)
-        uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status = 'completed' AND created_at >= $1", since)
+        uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('completed','succeeded') AND created_at >= $1", since)
     o, s, c = (float(costs["openai"] or 0), float(costs["storage"] or 0), float(costs["compute"] or 0)) if costs else (0, 0, 0)
     return {"openai_cost": o, "storage_cost": s, "compute_cost": c, "total_costs": o+s+c, "costs_change": 0, "cost_per_upload": round((o+s+c) / max(uploads or 1, 1), 4), "successful_uploads": uploads or 0, "total_cogs": o+s+c}
 
@@ -5176,7 +5176,7 @@ async def get_kpi_growth(user: dict = Depends(require_admin)):
 async def get_kpi_reliability(user: dict = Depends(require_admin)):
     since = _now_utc() - timedelta(days=30)
     async with db_pool.acquire() as conn:
-        stats = await conn.fetchrow("SELECT COUNT(*)::int AS total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)::int AS completed FROM uploads WHERE created_at >= $1", since)
+        stats = await conn.fetchrow("SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed FROM uploads WHERE created_at >= $1", since)
         queue = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
     total, completed = (stats["total"] or 0, stats["completed"] or 0) if stats else (0, 0)
     sr = (completed / max(total, 1)) * 100

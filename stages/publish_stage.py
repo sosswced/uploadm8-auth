@@ -340,9 +340,12 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
             # Old tokens stored before the OAuth fix may lack these IDs.
             # Now that we have a fresh user token we can fetch them on the fly
             # so the publish succeeds without forcing the user to reconnect.
+            # Step 1: Fetch user's Pages — id, name, page access_token only.
+            # instagram_business_account is NOT a valid inline field on /me/accounts;
+            # it must be fetched per-page via /{page_id}?fields=instagram_business_account
             pages_resp = await client.get(
                 "https://graph.facebook.com/v18.0/me/accounts",
-                params={"access_token": new_user_token, "fields": "id,name,access_token,instagram_business_account"},
+                params={"access_token": new_user_token, "fields": "id,name,access_token"},
             )
 
             recovered_ig_user_id = token_data.get("ig_user_id") or token_data.get("instagram_user_id")
@@ -353,17 +356,29 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                 pages = pages_resp.json().get("data", [])
 
                 if platform == "instagram" and not recovered_ig_user_id:
-                    # Find the Page that has an Instagram Business Account linked
+                    # instagram_business_account must be fetched per-page
                     for page in pages:
-                        ig_biz = page.get("instagram_business_account")
-                        if ig_biz and ig_biz.get("id"):
-                            recovered_ig_user_id = ig_biz["id"]
-                            recovered_page_token = page.get("access_token", new_user_token)
-                            logger.info(
-                                f"instagram: Recovered ig_user_id={recovered_ig_user_id} "
-                                f"from Page '{page.get('name', '?')}' during token refresh"
-                            )
-                            break
+                        page_id_tmp    = page.get("id")
+                        page_token_tmp = page.get("access_token", new_user_token)
+                        if not page_id_tmp:
+                            continue
+                        ig_resp = await client.get(
+                            f"https://graph.facebook.com/v18.0/{page_id_tmp}",
+                            params={
+                                "access_token": page_token_tmp,
+                                "fields": "instagram_business_account",
+                            },
+                        )
+                        if ig_resp.status_code == 200:
+                            ig_biz = ig_resp.json().get("instagram_business_account")
+                            if ig_biz and ig_biz.get("id"):
+                                recovered_ig_user_id = ig_biz["id"]
+                                recovered_page_token = page_token_tmp
+                                logger.info(
+                                    f"instagram: Recovered ig_user_id={recovered_ig_user_id} "
+                                    f"from Page '{page.get('name', '?')}' during token refresh"
+                                )
+                                break
 
                 if platform == "facebook" and not recovered_page_id and pages:
                     first = pages[0]
@@ -387,7 +402,14 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                 updated["access_token"] = recovered_page_token
 
             if db_pool and user_id:
-                await db_stage.save_refreshed_token(db_pool, user_id, platform, updated)
+                try:
+                    await db_stage.save_refreshed_token(db_pool, user_id, platform, updated)
+                except AttributeError:
+                    # db.py not yet redeployed with save_refreshed_token — skip persist,
+                    # recovered IDs are still used for this publish attempt
+                    logger.debug(f"{platform}: save_refreshed_token not available yet, skipping persist")
+                except Exception as save_err:
+                    logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
             return updated
 
     except Exception as e:

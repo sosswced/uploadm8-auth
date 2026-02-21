@@ -262,14 +262,33 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                     token_data = row_dict.get("token_blob") or row_dict.get("token_data")
                     if token_data:
                         if isinstance(token_data, str):
-                            return json.loads(token_data)
-                        return dict(token_data) if hasattr(token_data, "keys") else token_data
+                            parsed = json.loads(token_data)
+                        else:
+                            parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
+                        # Inject platform-specific IDs from the DB row's account_id column
+                        # into the token blob if they're missing. This fixes old tokens stored
+                        # before the OAuth callback was updated to include these fields.
+                        account_id_col = row_dict.get("account_id")
+                        if account_id_col and isinstance(parsed, dict):
+                            # Instagram: account_id column stores the Instagram Business Account ID
+                            # which is exactly what ig_user_id needs to be.
+                            # Facebook: account_id stores the Facebook *user* ID (not Page ID),
+                            # so we cannot inject it as page_id — FB connections need a reconnect.
+                            if platform == "instagram" and not parsed.get("ig_user_id"):
+                                parsed["ig_user_id"] = str(account_id_col)
+                                logger.debug(f"Injected ig_user_id={account_id_col} from account_id column")
+                        return parsed
                     # May be encrypted blob
                     encrypted = row_dict.get("encrypted_token")
                     if encrypted:
                         if isinstance(encrypted, str):
-                            return json.loads(encrypted)
-                        return dict(encrypted) if hasattr(encrypted, "keys") else encrypted
+                            parsed = json.loads(encrypted)
+                        else:
+                            parsed = dict(encrypted) if hasattr(encrypted, "keys") else encrypted
+                        if account_id_col and isinstance(parsed, dict):
+                            if platform == "instagram" and not parsed.get("ig_user_id"):
+                                parsed["ig_user_id"] = str(account_id_col)
+                        return parsed
                     return row_dict
             except asyncpg.exceptions.UndefinedTableError:
                 pass
@@ -288,11 +307,18 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                 )
                 if row:
                     row_dict = dict(row)
+                    account_id_col = row_dict.get("account_id")
                     token_data = row_dict.get("token_blob") or row_dict.get("token_data") or row_dict.get("encrypted_token")
                     if token_data:
                         if isinstance(token_data, str):
-                            return json.loads(token_data)
-                        return dict(token_data) if hasattr(token_data, "keys") else token_data
+                            parsed = json.loads(token_data)
+                        else:
+                            parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
+                        if account_id_col and isinstance(parsed, dict):
+                            if platform == "instagram" and not parsed.get("ig_user_id"):
+                                parsed["ig_user_id"] = str(account_id_col)
+                                logger.debug(f"Injected ig_user_id={account_id_col} from connected_accounts.account_id")
+                        return parsed
                     return row_dict
             except asyncpg.exceptions.UndefinedTableError:
                 pass
@@ -478,38 +504,6 @@ async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
 # ============================================================
 # Per-Platform Asset Persistence
 # ============================================================
-
-
-async def update_upload_progress(
-    pool: asyncpg.Pool,
-    upload_id: str,
-    percent: int,
-    stage: str = "transcoding",
-):
-    """Write live transcoding progress (0-100) and stage label to the uploads row.
-    Called every ~2s by transcode_stage while FFmpeg is running.
-    Silently ignored if the columns don't exist yet (pre-migration).
-    """
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE uploads
-                SET processing_progress = $1,
-                    processing_stage    = $2,
-                    updated_at          = NOW()
-                WHERE id = $3
-                """,
-                max(0, min(100, percent)),
-                stage[:64],
-                upload_id,
-            )
-    except Exception as e:
-        import logging as _log
-        _log.getLogger("uploadm8-worker.db").debug(
-            f"update_upload_progress skipped ({upload_id}): {e}"
-        )
-
 
 async def save_processed_assets(pool: asyncpg.Pool, upload_id: str, assets: Dict[str, str]):
     """Save per-platform R2 keys to the uploads table.

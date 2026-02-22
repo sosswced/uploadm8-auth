@@ -1069,6 +1069,11 @@ async def run_migrations():
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );"""),
 
+(105, """
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS processing_stage    VARCHAR(100);
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS processing_progress  INT DEFAULT 0;
+"""),
+
 (510, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS description TEXT"),
 (511, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"),
 (512, "UPDATE account_groups SET updated_at = NOW() WHERE updated_at IS NULL"),
@@ -2401,8 +2406,7 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
 
         # --- Hashtag assembly ---
         # Step 1: Always merge always_hashtags + platform-specific hashtags.
-        #         These are manual user settings and MUST work on every plan,
-        #         regardless of whether AI hashtag generation is enabled.
+        #         These are manual user settings — work on every plan, no AI flag needed.
         combined = list(data.hashtags) + list(user_prefs.get("always_hashtags", []) or [])
 
         platform_hashtags = user_prefs.get("platform_hashtags") or {}
@@ -2412,13 +2416,12 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
                 if tags:
                     combined.extend(tags)
 
-        # Step 2: AI-generated hashtag injection (only when plan + toggle allow it).
-        #         Placeholder: actual AI generation happens in the caption stage;
-        #         this just signals the worker to run it.
+        # Step 2: AI-generated hashtag injection — gated on plan + user toggle.
+        #         Actual AI generation happens later in caption_stage.
         if user_prefs.get("ai_hashtags_enabled") and plan.get("ai"):
             pass  # ai_hashtags merged into ctx later by caption_stage
 
-        # Step 3: Deduplicate, strip blocked, enforce per-plan limit — always runs.
+        # Step 3: Deduplicate, strip blocked, enforce limit — always runs.
         blocked = set(user_prefs.get("blocked_hashtags", []) or [])
         combined = [h for h in combined if h and h not in blocked]
         data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
@@ -2680,10 +2683,14 @@ async def get_uploads(
         # Prefer explicit column list; if schema is older, fall back to SELECT *
         select_sql = f"""
             SELECT
-                id, filename, title, caption, platforms, status,
+                id, filename, title, caption, platforms, status, privacy,
                 scheduled_time, created_at,
                 put_reserved, aic_reserved,
                 views, likes,
+                cancel_requested,
+                error_code, error_detail,
+                platform_results,
+                thumbnail_r2_key,
                 trill_score, speed_bucket, max_speed_mph, avg_speed_mph, distance_miles, duration_seconds,
                 ai_title, ai_caption,
                 processing_stage, processing_progress
@@ -2710,20 +2717,46 @@ async def get_uploads(
 
         def _row_to_public(u):
             d = dict(u)
+            # Parse platform_results JSONB — may come back as str, dict, or list
+            raw_pr = d.get("platform_results")
+            if isinstance(raw_pr, str):
+                try:
+                    raw_pr = json.loads(raw_pr)
+                except Exception:
+                    raw_pr = []
+            if not isinstance(raw_pr, list):
+                raw_pr = []
+
+            # Normalise error: prefer error_detail, fall back to error_code
+            error_msg = d.get("error_detail") or d.get("error_code") or None
+
             return {
                 "id": str(d.get("id")),
                 "filename": d.get("filename"),
-                "platforms": d.get("platforms"),
+                "platforms": list(d.get("platforms") or []),
                 "status": d.get("status"),
                 "title": d.get("title"),
                 "caption": d.get("caption"),
+                "privacy": d.get("privacy", "public"),
                 "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
                 "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
                 "put_cost": d.get("put_reserved", 0),
                 "aic_cost": d.get("aic_reserved", 0),
                 "views": d.get("views", 0) or 0,
                 "likes": d.get("likes", 0) or 0,
-                # Trill (optional)
+                # Cancel support
+                "cancel_requested": bool(d.get("cancel_requested", False)),
+                # Error info — shown in queue error bubble
+                "error": error_msg,
+                "error_code": d.get("error_code"),
+                # Per-platform publish results — shown as success/fail badges
+                "platform_results": raw_pr,
+                # Thumbnail (presign inline — skip if R2 unavailable)
+                "thumbnail_url": None,  # populated below if key exists
+                # Live processing progress — written by worker at each pipeline stage
+                "progress": int(d.get("processing_progress") or 0),
+                "current_stage": d.get("processing_stage"),
+                # Trill optional
                 "trill_score": d.get("trill_score"),
                 "speed_bucket": d.get("speed_bucket"),
                 "max_speed_mph": d.get("max_speed_mph"),
@@ -2732,13 +2765,27 @@ async def get_uploads(
                 "duration_seconds": d.get("duration_seconds"),
                 "ai_title": d.get("ai_title"),
                 "ai_caption": d.get("ai_caption"),
-                # Live processing progress — written by worker at each pipeline checkpoint.
-                # Mapped to short names for queue.html (upload.progress, upload.current_stage)
-                "progress": d.get("processing_progress", 0) or 0,
-                "current_stage": d.get("processing_stage"),
             }
 
-        uploads = [_row_to_public(u) for u in rows]
+        uploads = []
+        for u in rows:
+            try:
+                item = _row_to_public(u)
+                # Presign thumbnail if available — non-fatal if it fails
+                thumb_key = dict(u).get("thumbnail_r2_key")
+                if thumb_key:
+                    try:
+                        s3 = get_s3_client()
+                        item["thumbnail_url"] = s3.generate_presigned_url(
+                            "get_object",
+                            Params={"Bucket": R2_BUCKET_NAME, "Key": thumb_key},
+                            ExpiresIn=3600,
+                        )
+                    except Exception:
+                        pass  # thumbnail is cosmetic — never crash over it
+                uploads.append(item)
+            except Exception as row_err:
+                logger.warning(f"get_uploads: skipping malformed row {dict(u).get('id')}: {row_err}")
 
         if not meta:
             return uploads

@@ -375,6 +375,155 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
         return None
 
 
+
+
+async def save_refreshed_token(
+    pool_or_conn,
+    *,
+    user_id: str,
+    platform: str,
+    token_payload: dict,
+    account_id: Optional[str] = None,
+):
+    """Persist refreshed OAuth token payload back to storage.
+
+    Why this exists:
+    - Publish stage may refresh access tokens during posting.
+    - If we don't persist the refreshed token, subsequent jobs will keep using stale tokens,
+      causing periodic 401/invalid_token and refresh churn.
+
+    Storage strategy (best-effort, schema-tolerant):
+    1) Try UPDATE platform_tokens.token_blob (common in this codebase).
+    2) If token_blob column is missing, try UPDATE platform_tokens.token_data.
+    3) If that is missing, try UPDATE platform_tokens.encrypted_token.
+    Fails non-fatally (logs warning) if no compatible column exists.
+    """
+    if not token_payload or not isinstance(token_payload, dict):
+        logger.warning("save_refreshed_token called with empty/invalid token_payload; skipping")
+        return
+
+    payload_json = json.dumps(token_payload)
+
+    async def _do_update(conn):
+        # Prefer token_blob
+        try:
+            if account_id:
+                await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                    SET token_blob = $1,
+                        updated_at = NOW()
+                    WHERE user_id = $2 AND platform = $3 AND account_id = $4
+                    """,
+                    payload_json,
+                    user_id,
+                    platform,
+                    str(account_id),
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                    SET token_blob = $1,
+                        updated_at = NOW()
+                    WHERE user_id = $2 AND platform = $3
+                    """,
+                    payload_json,
+                    user_id,
+                    platform,
+                )
+            return True
+        except asyncpg.exceptions.UndefinedColumnError:
+            pass
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.debug("save_refreshed_token: platform_tokens table missing; skipping")
+            return False
+
+        # Fallback token_data
+        try:
+            if account_id:
+                await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                    SET token_data = $1::jsonb,
+                        updated_at = NOW()
+                    WHERE user_id = $2 AND platform = $3 AND account_id = $4
+                    """,
+                    payload_json,
+                    user_id,
+                    platform,
+                    str(account_id),
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                    SET token_data = $1::jsonb,
+                        updated_at = NOW()
+                    WHERE user_id = $2 AND platform = $3
+                    """,
+                    payload_json,
+                    user_id,
+                    platform,
+                )
+            return True
+        except asyncpg.exceptions.UndefinedColumnError:
+            pass
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.debug("save_refreshed_token: platform_tokens table missing; skipping")
+            return False
+
+        # Fallback encrypted_token
+        try:
+            if account_id:
+                await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                    SET encrypted_token = $1,
+                        updated_at = NOW()
+                    WHERE user_id = $2 AND platform = $3 AND account_id = $4
+                    """,
+                    payload_json,
+                    user_id,
+                    platform,
+                    str(account_id),
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                    SET encrypted_token = $1,
+                        updated_at = NOW()
+                    WHERE user_id = $2 AND platform = $3
+                    """,
+                    payload_json,
+                    user_id,
+                    platform,
+                )
+            return True
+        except asyncpg.exceptions.UndefinedColumnError:
+            logger.warning(
+                "save_refreshed_token: no compatible token column found on platform_tokens "
+                "(expected token_blob or token_data or encrypted_token)"
+            )
+            return False
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.debug("save_refreshed_token: platform_tokens table missing; skipping")
+            return False
+        except Exception as e:
+            logger.warning(f"save_refreshed_token failed: {e}")
+            return False
+
+    # pool_or_conn can be an asyncpg.Pool or an asyncpg.Connection
+    try:
+        if hasattr(pool_or_conn, "acquire"):
+            async with pool_or_conn.acquire() as conn:
+                await _do_update(conn)
+        else:
+            await _do_update(pool_or_conn)
+    except Exception as e:
+        logger.warning(f"save_refreshed_token outer failure: {e}")
+
 # ============================================================
 # Publish Attempts / Ledger (used by publish_stage + verify_stage)
 # ============================================================

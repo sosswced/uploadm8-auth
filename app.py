@@ -2575,6 +2575,46 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
     }
 
 
+@app.post("/api/uploads/{upload_id}/reprepare")
+async def reprepare_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Generate a fresh presigned R2 URL for an upload stuck in pending state.
+    Used when the browser refreshed mid-transfer before /complete was called.
+    The DB record exists — we just issue new PUT URLs so the client can retry.
+    """
+    async with db_pool.acquire() as conn:
+        upload = await conn.fetchrow(
+            "SELECT id, r2_key, filename, status, telemetry_r2_key FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"]
+        )
+        if not upload:
+            raise HTTPException(404, "Upload not found")
+        if upload["status"] not in ("pending",):
+            raise HTTPException(400, f"Upload is not resumable (status: {upload['status']}). Use /retry for failed uploads.")
+
+    r2_key = upload["r2_key"]
+    filename = upload["filename"] or ""
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    ct_map = {"mp4": "video/mp4", "mov": "video/quicktime", "avi": "video/x-msvideo", "webm": "video/webm"}
+    content_type = ct_map.get(ext, "video/mp4")
+
+    result = {
+        "upload_id": upload_id,
+        "presigned_url": generate_presigned_upload_url(r2_key, content_type),
+        "r2_key": r2_key,
+        "filename": filename,
+        "status": upload["status"],
+    }
+    if upload["telemetry_r2_key"]:
+        result["telemetry_presigned_url"] = generate_presigned_upload_url(
+            upload["telemetry_r2_key"], "application/octet-stream"
+        )
+        result["telemetry_r2_key"] = upload["telemetry_r2_key"]
+
+    return result
+
+
+
 @app.post("/api/uploads/{upload_id}/cancel")
 async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:

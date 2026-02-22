@@ -251,6 +251,22 @@ GAZETTEER_PLACES_PATH = os.environ.get("GAZETTEER_PLACES_PATH", "")
 PADUS_PATH = os.environ.get("PADUS_PATH", "")
 PADUS_LAYER = os.environ.get("PADUS_LAYER", "")
 
+# ── External Provider Cost Sync ──────────────────────────────────────────────
+# Upstash: email + API key from console.upstash.com → Account → Management API
+UPSTASH_EMAIL     = os.environ.get("UPSTASH_EMAIL", "")
+UPSTASH_API_KEY   = os.environ.get("UPSTASH_API_KEY", "")
+UPSTASH_DB_ID     = os.environ.get("UPSTASH_DB_ID", "")   # from console URL or list endpoint
+
+# Cloudflare: API token with R2 Read + Account Analytics Read permissions
+CF_API_TOKEN      = os.environ.get("CF_API_TOKEN", "")    # separate from R2 access key
+
+# Render: no billing API exists — enter monthly total as an env var.
+# Update this whenever your service config changes (new services, tier upgrades).
+RENDER_MONTHLY_COST = float(os.environ.get("RENDER_MONTHLY_COST", "0"))
+
+# Mailgun: uses existing MAILGUN_API_KEY + MAILGUN_DOMAIN already defined above
+# Stripe:  uses existing STRIPE_SECRET_KEY already defined above
+
 # Trill system prompt for AI content generation
 TRILL_SYSTEM_PROMPT = """You are an expert social media content creator specializing in driving/automotive content.
 Create viral, high-engagement content that balances excitement with platform safety guidelines.
@@ -1133,6 +1149,13 @@ async def run_migrations():
     CREATE INDEX IF NOT EXISTS idx_tt_webhook_event   ON tiktok_webhook_events(event);
     CREATE INDEX IF NOT EXISTS idx_tt_webhook_openid  ON tiktok_webhook_events(user_openid);
     CREATE INDEX IF NOT EXISTS idx_tt_webhook_created ON tiktok_webhook_events(processed_at);
+"""),
+(603, """
+    CREATE TABLE IF NOT EXISTS platform_metrics_cache (
+        user_id   UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data      JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
 """),
 ]
         
@@ -4820,6 +4843,419 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
 
     return result
 
+# ============================================================
+# Platform Metrics — Live data from each platform API
+# ============================================================
+# Endpoints:
+#   GET /api/analytics/platform-metrics         (live fetch + 3h cache)
+#   GET /api/analytics/platform-metrics/cached  (DB cache only)
+# Place this block AFTER the existing @app.get("/api/analytics") handler
+# and BEFORE @app.get("/api/exports/excel").
+# ============================================================
+
+import time as _time
+import asyncio as _asyncio
+
+# In-memory cache per user  {user_id_str: {"fetched_at": float, "data": dict}}
+_platform_metrics_cache: dict = {}
+_PLATFORM_CACHE_TTL = 3 * 60 * 60  # 3 hours
+
+
+async def _fetch_tiktok_metrics(access_token: str) -> dict:
+    """TikTok Content API — video list + basic totals."""
+    if not access_token:
+        return {"status": "not_connected"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                "https://open.tiktokapis.com/v2/video/list/",
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                json={"max_count": 20},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"TikTok video list HTTP {resp.status_code}: {resp.text[:200]}")
+                return {"status": "error", "error": f"HTTP {resp.status_code}"}
+
+            videos = resp.json().get("data", {}).get("videos", []) or []
+            views = sum(v.get("view_count", 0) for v in videos)
+            likes = sum(v.get("like_count", 0) for v in videos)
+            comments = sum(v.get("comment_count", 0) for v in videos)
+            shares = sum(v.get("share_count", 0) for v in videos)
+            durs = [v.get("duration", 0) for v in videos if v.get("duration")]
+            avg_watch = round(sum(durs) / len(durs), 1) if durs else None
+
+            return {
+                "status": "live",
+                "views": views,
+                "likes": likes,
+                "comments": comments,
+                "shares": shares,
+                "avg_watch_seconds": avg_watch,
+                "video_count": len(videos),
+            }
+    except Exception as e:
+        logger.error(f"TikTok metrics error: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+async def _fetch_youtube_metrics(access_token: str) -> dict:
+    """YouTube Data API v3 + (optional) YouTube Analytics API."""
+    if not access_token:
+        return {"status": "not_connected"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            ch = await client.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={"part": "statistics", "mine": "true"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if ch.status_code != 200:
+                return {"status": "error", "error": f"HTTP {ch.status_code}"}
+
+            items = ch.json().get("items", []) or []
+            stats = items[0].get("statistics", {}) if items else {}
+
+            views = likes = comments = shares = 0
+            avg_watch = minutes_watched = None
+            try:
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                thirty = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+                an = await client.get(
+                    "https://youtubeanalytics.googleapis.com/v2/reports",
+                    params={
+                        "ids": "channel==MINE",
+                        "startDate": thirty,
+                        "endDate": today,
+                        "metrics": "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
+                    },
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if an.status_code == 200:
+                    rows = an.json().get("rows", []) or []
+                    if rows:
+                        views = sum(r[0] for r in rows)
+                        likes = sum(r[1] for r in rows)
+                        comments = sum(r[2] for r in rows)
+                        shares = sum(r[3] for r in rows)
+                        avg_watch = round(sum(r[4] for r in rows) / len(rows), 1)
+                        minutes_watched = int(sum(r[5] for r in rows))
+                else:
+                    views = int(stats.get("viewCount", 0))
+                    likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else 0
+                    comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+            except Exception:
+                views = int(stats.get("viewCount", 0))
+                likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else 0
+                comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+
+            return {
+                "status": "live",
+                "views": views,
+                "likes": likes,
+                "comments": comments,
+                "shares": shares,
+                "subscribers": int(stats.get("subscriberCount", 0)) if "subscriberCount" in stats else 0,
+                "avg_watch_seconds": avg_watch,
+                "minutes_watched": minutes_watched,
+                "video_count": int(stats.get("videoCount", 0)) if "videoCount" in stats else 0,
+            }
+    except Exception as e:
+        logger.error(f"YouTube metrics error: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
+    """Instagram Graph API — Reels insights."""
+    if not access_token or not ig_user_id:
+        return {"status": "not_connected"}
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            media = await client.get(
+                f"https://graph.facebook.com/v21.0/{ig_user_id}/media",
+                params={"access_token": access_token, "fields": "id,media_type,timestamp", "limit": 20},
+            )
+            if media.status_code != 200:
+                return {"status": "error", "error": f"HTTP {media.status_code}"}
+
+            items = media.json().get("data", []) or []
+            if not items:
+                return {"status": "live", "views": 0, "likes": 0, "comments": 0, "saves": 0, "reach": 0, "shares": 0, "video_count": 0}
+
+            total_views = total_likes = total_comments = 0
+            total_saves = total_reach = total_shares = 0
+
+            for item in items[:10]:
+                ins = await client.get(
+                    f"https://graph.facebook.com/v21.0/{item['id']}/insights",
+                    params={"access_token": access_token, "metric": "plays,likes,comments,saved,reach,shares"},
+                )
+                if ins.status_code != 200:
+                    continue
+                for m in ins.json().get("data", []) or []:
+                    name = m.get("name", "")
+                    vals = m.get("values", [])
+                    val = vals[-1].get("value", 0) if vals else m.get("value", 0)
+                    if isinstance(val, dict):
+                        val = sum(val.values())
+                    if name == "plays":
+                        total_views += val
+                    elif name == "likes":
+                        total_likes += val
+                    elif name == "comments":
+                        total_comments += val
+                    elif name == "saved":
+                        total_saves += val
+                    elif name == "reach":
+                        total_reach += val
+                    elif name == "shares":
+                        total_shares += val
+
+            return {
+                "status": "live",
+                "views": total_views,
+                "likes": total_likes,
+                "comments": total_comments,
+                "saves": total_saves,
+                "reach": total_reach,
+                "shares": total_shares,
+                "video_count": len(items),
+            }
+    except Exception as e:
+        logger.error(f"Instagram metrics error: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
+    """Facebook Graph API — Page video insights."""
+    if not access_token or not page_id:
+        return {"status": "not_connected"}
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            vids = await client.get(
+                f"https://graph.facebook.com/v21.0/{page_id}/videos",
+                params={"access_token": access_token, "fields": "id,created_time", "limit": 15},
+            )
+            if vids.status_code != 200:
+                return {"status": "error", "error": f"HTTP {vids.status_code}"}
+
+            videos = vids.json().get("data", []) or []
+            if not videos:
+                return {"status": "live", "views": 0, "reactions": 0, "comments": 0, "shares": 0, "followers": 0, "video_count": 0}
+
+            total_views = total_reactions = total_comments = total_shares = 0
+
+            for vid in videos[:10]:
+                ins = await client.get(
+                    f"https://graph.facebook.com/v21.0/{vid['id']}",
+                    params={
+                        "access_token": access_token,
+                        "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_shares,total_video_comments)",
+                    },
+                )
+                if ins.status_code != 200:
+                    continue
+                for m in ins.json().get("insights", {}).get("data", []) or []:
+                    name = m.get("name", "")
+                    vals = m.get("values", [{}])
+                    val = vals[-1].get("value", 0) if vals else 0
+                    if isinstance(val, dict):
+                        val = sum(val.values())
+                    if name == "total_video_views":
+                        total_views += val
+                    elif name == "total_video_reactions_by_type_total":
+                        total_reactions += val
+                    elif name == "total_video_shares":
+                        total_shares += val
+                    elif name == "total_video_comments":
+                        total_comments += val
+
+            followers = 0
+            try:
+                pg = await client.get(
+                    f"https://graph.facebook.com/v21.0/{page_id}",
+                    params={"access_token": access_token, "fields": "fan_count"},
+                )
+                if pg.status_code == 200:
+                    followers = pg.json().get("fan_count", 0)
+            except Exception:
+                pass
+
+            return {
+                "status": "live",
+                "views": total_views,
+                "reactions": total_reactions,
+                "comments": total_comments,
+                "shares": total_shares,
+                "followers": followers,
+                "video_count": len(videos),
+            }
+    except Exception as e:
+        logger.error(f"Facebook metrics error: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+async def _platform_metrics_db_cache_get(conn, user_id: str) -> Optional[dict]:
+    try:
+        row = await conn.fetchrow("SELECT fetched_at, data FROM platform_metrics_cache WHERE user_id = $1", user_id)
+        if not row:
+            return None
+        data = row["data"]
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                data = None
+        if not isinstance(data, dict):
+            return None
+        out = dict(data)
+        out["cached"] = True
+        out["cache_source"] = "db"
+        out["fetched_at"] = row["fetched_at"].isoformat() if row["fetched_at"] else out.get("fetched_at")
+        return out
+    except Exception:
+        return None
+
+
+async def _platform_metrics_db_cache_set(conn, user_id: str, output: dict) -> None:
+    try:
+        await conn.execute(
+            """
+            INSERT INTO platform_metrics_cache (user_id, fetched_at, data)
+            VALUES ($1, NOW(), $2::jsonb)
+            ON CONFLICT (user_id) DO UPDATE
+            SET fetched_at = EXCLUDED.fetched_at,
+                data = EXCLUDED.data
+            """,
+            user_id,
+            json.dumps(output),
+        )
+    except Exception:
+        pass
+
+
+@app.get("/api/analytics/platform-metrics")
+async def get_platform_metrics(force: bool = False, user: dict = Depends(get_current_user)):
+    """
+    Fetch live engagement metrics from all connected platform APIs.
+    Cached 3 hours per user (memory + DB). Pass ?force=true to bypass cache.
+    """
+    user_id = str(user["id"])
+    now = _time.time()
+
+    # 1) in-memory cache
+    cached = _platform_metrics_cache.get(user_id)
+    if cached and not force:
+        age = now - cached["fetched_at"]
+        if age < _PLATFORM_CACHE_TTL:
+            result = dict(cached["data"])
+            result["cached"] = True
+            result["cache_source"] = "memory"
+            result["cache_age_minutes"] = int(age / 60)
+            result["next_refresh_minutes"] = int((_PLATFORM_CACHE_TTL - age) / 60)
+            return result
+
+    # 2) DB cache (survives restarts)
+    async with db_pool.acquire() as conn:
+        db_cached = await _platform_metrics_db_cache_get(conn, user_id)
+        if db_cached and not force:
+            _platform_metrics_cache[user_id] = {"fetched_at": now, "data": db_cached}
+            return db_cached
+
+        token_rows = await conn.fetch(
+            "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            user["id"],
+        )
+        upload_counts = await conn.fetch(
+            """SELECT unnest(platforms) AS platform, COUNT(*)::int AS cnt
+               FROM uploads
+               WHERE user_id = $1 AND status IN ('succeeded', 'completed', 'partial')
+               GROUP BY platform""",
+            user["id"],
+        )
+
+    upload_map = {r["platform"]: r["cnt"] for r in upload_counts}
+
+    token_map: dict = {}
+    for row in token_rows:
+        plat = row["platform"]
+        blob = row["token_blob"]
+        if not blob:
+            continue
+        try:
+            decrypted = decrypt_blob(blob)
+        except Exception:
+            continue
+        if decrypted:
+            if plat == "instagram" and not decrypted.get("ig_user_id") and row["account_id"]:
+                decrypted["ig_user_id"] = str(row["account_id"])
+            if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
+                decrypted["page_id"] = str(row["account_id"])
+            token_map[plat] = decrypted
+
+    async def run_tiktok():
+        t = token_map.get("tiktok", {})
+        return await _fetch_tiktok_metrics(t.get("access_token", ""))
+
+    async def run_youtube():
+        t = token_map.get("youtube", {})
+        return await _fetch_youtube_metrics(t.get("access_token", ""))
+
+    async def run_instagram():
+        t = token_map.get("instagram", {})
+        ig_id = (t.get("ig_user_id") or t.get("instagram_user_id") or t.get("instagram_page_id") or "")
+        return await _fetch_instagram_metrics(t.get("access_token", ""), ig_id)
+
+    async def run_facebook():
+        t = token_map.get("facebook", {})
+        page_id = (t.get("page_id") or t.get("facebook_page_id") or t.get("fb_page_id") or "")
+        return await _fetch_facebook_metrics(t.get("access_token", ""), page_id)
+
+    tasks = {}
+    if "tiktok" in token_map:
+        tasks["tiktok"] = run_tiktok()
+    if "youtube" in token_map:
+        tasks["youtube"] = run_youtube()
+    if "instagram" in token_map:
+        tasks["instagram"] = run_instagram()
+    if "facebook" in token_map:
+        tasks["facebook"] = run_facebook()
+
+    platforms_result: dict = {}
+    if tasks:
+        results = await _asyncio.gather(*tasks.values(), return_exceptions=True)
+        for plat, res in zip(tasks.keys(), results):
+            platforms_result[plat] = {"status": "error", "error": str(res)} if isinstance(res, Exception) else res
+
+    for plat in ["tiktok", "youtube", "instagram", "facebook"]:
+        if plat not in platforms_result:
+            platforms_result[plat] = {"status": "not_connected"}
+        platforms_result[plat]["uploads"] = upload_map.get(plat, 0)
+
+    output = {
+        "platforms": platforms_result,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "cached": False,
+        "cache_age_minutes": 0,
+        "next_refresh_minutes": int(_PLATFORM_CACHE_TTL / 60),
+    }
+
+    _platform_metrics_cache[user_id] = {"fetched_at": now, "data": output}
+    async with db_pool.acquire() as conn:
+        await _platform_metrics_db_cache_set(conn, user_id, output)
+
+    return output
+
+
+@app.get("/api/analytics/platform-metrics/cached")
+async def get_platform_metrics_cached(user: dict = Depends(get_current_user)):
+    """Return DB-cached platform metrics only (no live API calls)."""
+    user_id = str(user["id"])
+    async with db_pool.acquire() as conn:
+        cached = await _platform_metrics_db_cache_get(conn, user_id)
+    if cached:
+        return cached
+    return {"platforms": {}, "cached": True, "cache_source": "db", "fetched_at": None}
+
 @app.get("/api/exports/excel")
 async def export_excel(type: str = "uploads", range: str = "30d", user: dict = Depends(get_current_user)):
     plan = get_plan(user.get("subscription_tier", "free"))
@@ -6663,6 +7099,308 @@ async def admin_disconnect_log(
     }
 
 # ============================================================
+# ============================================================
+# PROVIDER COSTS — manual entry endpoints
+# Costs from Render, Redis, R2, Mailgun, Postgres, Stripe
+# are external and have no auto-sync API.  Admin enters them
+# monthly via the KPI dashboard; persisted in admin_settings.
+# ============================================================
+
+@app.get("/api/admin/kpi/provider-costs")
+async def get_provider_costs(user: dict = Depends(require_admin)):
+    """Return provider cost figures. Synced values come from external APIs; Render cost from env var."""
+    defaults = {
+        "render_cost": RENDER_MONTHLY_COST,  # always reflects current env var
+        "redis_cost": 0.0,
+        "redis_memory_mb": 0.0,
+        "storage_cost": 0.0,
+        "storage_gb": 0.0,
+        "bandwidth_cost": 0.0,
+        "bandwidth_tb": 0.0,
+        "mailgun_cost": 0.0,
+        "mailgun_emails_sent": 0,
+        "postgres_cost": 0.0,
+        "postgres_size_gb": 0.0,
+        "stripe_fees": 0.0,
+        "stripe_fee_txns": 0,
+        "last_updated": None,
+        "last_synced": None,
+        "period_label": None,
+    }
+    saved = admin_settings_cache.get("provider_costs", {})
+    merged = {**defaults, **saved}
+    # render_cost env var always wins over stale saved value
+    merged["render_cost"] = RENDER_MONTHLY_COST if RENDER_MONTHLY_COST > 0 else merged.get("render_cost", 0)
+    return merged
+
+
+@app.put("/api/admin/kpi/provider-costs")
+async def update_provider_costs(payload: dict, user: dict = Depends(require_admin)):
+    """Persist manually-entered provider costs into admin_settings."""
+    global admin_settings_cache
+    # Sanitise — only accept numeric fields we know about
+    allowed = {
+        "render_cost", "redis_cost", "redis_memory_mb",
+        "storage_cost", "storage_gb",
+        "bandwidth_cost", "bandwidth_tb",
+        "mailgun_cost", "mailgun_emails_sent",
+        "postgres_cost", "postgres_size_gb",
+        "stripe_fees", "stripe_fee_txns",
+        "period_label",
+    }
+    clean = {k: v for k, v in payload.items() if k in allowed}
+    clean["last_updated"] = _now_utc().isoformat()
+    admin_settings_cache["provider_costs"] = clean
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1",
+            json.dumps(admin_settings_cache),
+        )
+    return {"status": "saved", "provider_costs": clean}
+
+
+# ============================================================
+# COST SYNC — pulls live data from external provider APIs.
+# Render has no billing API; its cost is read from RENDER_MONTHLY_COST env var.
+# Results are merged with any existing provider_costs in admin_settings so
+# that manual overrides for missing credentials are preserved.
+# ============================================================
+
+@app.post("/api/admin/kpi/sync-costs")
+async def sync_provider_costs(user: dict = Depends(require_admin)):
+    """
+    Fetch live cost/usage data from Upstash, Cloudflare R2, Mailgun, and Stripe.
+    Render cost is read from the RENDER_MONTHLY_COST environment variable.
+    Results are saved to admin_settings and returned.
+    """
+    results: dict = {}
+    errors: dict = {}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+
+        # ── 1. Upstash Redis ─────────────────────────────────────────────────
+        if UPSTASH_EMAIL and UPSTASH_API_KEY and UPSTASH_DB_ID:
+            try:
+                r = await client.get(
+                    f"https://api.upstash.com/v2/redis/stats/{UPSTASH_DB_ID}",
+                    auth=(UPSTASH_EMAIL, UPSTASH_API_KEY),
+                )
+                r.raise_for_status()
+                d = r.json()
+                # total_monthly_billing is in USD cents on some accounts, dollars on others.
+                # The value from the screenshot was $2.51 matching ~2.51 dollars, so it's dollars.
+                billing_raw = d.get("total_monthly_billing", 0) or 0
+                storage_bytes = d.get("total_monthly_storage", 0) or 0
+                # dailybandwidth is bytes; sum bandwidths array if available
+                bandwidth_bytes = d.get("dailybandwidth", 0) or 0
+                results["redis_cost"]       = round(float(billing_raw), 4)
+                results["redis_memory_mb"]  = round(storage_bytes / (1024 * 1024), 2)
+                results["redis_bandwidth_mb"] = round(bandwidth_bytes / (1024 * 1024), 2)
+            except Exception as e:
+                errors["redis"] = str(e)
+        else:
+            errors["redis"] = "Missing UPSTASH_EMAIL, UPSTASH_API_KEY, or UPSTASH_DB_ID"
+
+        # ── 2. Cloudflare R2 ─────────────────────────────────────────────────
+        if CF_API_TOKEN and R2_ACCOUNT_ID:
+            try:
+                # Use GraphQL Analytics API to get storage + operations for current month
+                from datetime import date, timezone
+                today = date.today()
+                month_start = today.replace(day=1).isoformat()
+                tomorrow = (today + timedelta(days=1)).isoformat()
+
+                gql_query = """
+                query R2Usage($accountId: String!, $since: String!, $until: String!) {
+                  viewer {
+                    accounts(filter: {accountTag: $accountId}) {
+                      r2StorageAdaptiveGroups(
+                        filter: {date_geq: $since, date_leq: $until}
+                        limit: 1
+                        orderBy: [date_DESC]
+                      ) {
+                        max { payloadSize objectCount }
+                      }
+                      r2OperationsAdaptiveGroups(
+                        filter: {date_geq: $since, date_leq: $until}
+                        limit: 10000
+                      ) {
+                        sum { requests }
+                        dimensions { actionType }
+                      }
+                    }
+                  }
+                }
+                """
+                r = await client.post(
+                    "https://api.cloudflare.com/client/v4/graphql",
+                    headers={"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"},
+                    json={"query": gql_query, "variables": {
+                        "accountId": R2_ACCOUNT_ID,
+                        "since": month_start,
+                        "until": tomorrow,
+                    }},
+                )
+                r.raise_for_status()
+                d = r.json()
+                acct = (d.get("data", {}).get("viewer", {}).get("accounts") or [{}])[0]
+
+                # Storage
+                storage_groups = acct.get("r2StorageAdaptiveGroups") or []
+                storage_bytes = 0
+                if storage_groups:
+                    storage_bytes = storage_groups[0].get("max", {}).get("payloadSize", 0) or 0
+                storage_gb = round(storage_bytes / (1024 ** 3), 3)
+
+                # Operations — split Class A vs Class B
+                ops_groups = acct.get("r2OperationsAdaptiveGroups") or []
+                class_a_ops = 0
+                class_b_ops = 0
+                class_a_actions = {"PutObject", "CopyObject", "CompleteMultipartUpload",
+                                   "CreateMultipartUpload", "UploadPart", "UploadPartCopy",
+                                   "DeleteObject", "DeleteObjects", "ListBuckets",
+                                   "PutBucketEncryption", "PutBucketCors", "CreateBucket",
+                                   "DeleteBucket"}
+                for g in ops_groups:
+                    action = (g.get("dimensions") or {}).get("actionType", "")
+                    count = (g.get("sum") or {}).get("requests", 0) or 0
+                    if action in class_a_actions:
+                        class_a_ops += count
+                    else:
+                        class_b_ops += count
+
+                # R2 pricing: 10 GB/month free, $0.015/GB-month after
+                # Class A: 1M free, $4.50/million after
+                # Class B: 10M free, $0.36/million after
+                R2_FREE_STORAGE_GB = 10.0
+                R2_PRICE_PER_GB    = 0.015
+                R2_FREE_CLASS_A    = 1_000_000
+                R2_PRICE_CLASS_A   = 4.50   # per million
+                R2_FREE_CLASS_B    = 10_000_000
+                R2_PRICE_CLASS_B   = 0.36   # per million
+
+                storage_cost = max(storage_gb - R2_FREE_STORAGE_GB, 0) * R2_PRICE_PER_GB
+                class_a_cost = max(class_a_ops - R2_FREE_CLASS_A, 0) / 1_000_000 * R2_PRICE_CLASS_A
+                class_b_cost = max(class_b_ops - R2_FREE_CLASS_B, 0) / 1_000_000 * R2_PRICE_CLASS_B
+                r2_total_cost = round(storage_cost + class_a_cost + class_b_cost, 4)
+
+                results["storage_gb"]      = storage_gb
+                results["storage_cost"]    = r2_total_cost
+                results["r2_class_a_ops"]  = class_a_ops
+                results["r2_class_b_ops"]  = class_b_ops
+                results["bandwidth_cost"]  = 0.0   # R2 has zero egress fees
+                results["bandwidth_tb"]    = 0.0
+            except Exception as e:
+                errors["r2"] = str(e)
+        else:
+            errors["r2"] = "Missing CF_API_TOKEN or R2_ACCOUNT_ID"
+
+        # ── 3. Mailgun ───────────────────────────────────────────────────────
+        if MAILGUN_API_KEY and MAILGUN_DOMAIN:
+            try:
+                from datetime import date
+                today = date.today()
+                month_start = today.replace(day=1).strftime("%a, %d %b %Y 00:00:00 UTC")
+                r = await client.get(
+                    f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/stats/total",
+                    auth=("api", MAILGUN_API_KEY),
+                    params={"event": ["accepted", "delivered", "failed"], "duration": "1m"},
+                )
+                r.raise_for_status()
+                d = r.json()
+                stats = d.get("stats", [])
+                total_sent = sum(
+                    (s.get("accepted", {}).get("total", 0) or 0)
+                    for s in stats
+                )
+                # Mailgun free plan = 3000/month; paid plans start at $15 for 50K
+                # We track count; cost is $0 on free plan
+                results["mailgun_emails_sent"] = total_sent
+                results["mailgun_cost"] = 0.0   # update if on paid plan
+            except Exception as e:
+                errors["mailgun"] = str(e)
+        else:
+            errors["mailgun"] = "Missing MAILGUN_API_KEY or MAILGUN_DOMAIN"
+
+        # ── 4. Stripe fees ───────────────────────────────────────────────────
+        if STRIPE_SECRET_KEY:
+            try:
+                from datetime import date, datetime, timezone
+                today = date.today()
+                month_start_dt = datetime(today.year, today.month, 1, tzinfo=timezone.utc)
+                month_start_ts = int(month_start_dt.timestamp())
+
+                # List balance transactions of type "charge" for this month and sum fees
+                r = await client.get(
+                    "https://api.stripe.com/v1/balance_transactions",
+                    headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}"},
+                    params={
+                        "type": "charge",
+                        "created[gte]": month_start_ts,
+                        "limit": 100,
+                    },
+                )
+                r.raise_for_status()
+                d = r.json()
+                txns = d.get("data", [])
+                total_fees_cents = sum(t.get("fee", 0) for t in txns)
+                txn_count = len(txns)
+
+                # Handle pagination — Stripe paginates at 100 items
+                while d.get("has_more"):
+                    last_id = txns[-1]["id"] if txns else None
+                    if not last_id:
+                        break
+                    r = await client.get(
+                        "https://api.stripe.com/v1/balance_transactions",
+                        headers={"Authorization": f"Bearer {STRIPE_SECRET_KEY}"},
+                        params={
+                            "type": "charge",
+                            "created[gte]": month_start_ts,
+                            "limit": 100,
+                            "starting_after": last_id,
+                        },
+                    )
+                    r.raise_for_status()
+                    d = r.json()
+                    page_txns = d.get("data", [])
+                    total_fees_cents += sum(t.get("fee", 0) for t in page_txns)
+                    txn_count += len(page_txns)
+                    txns = page_txns
+
+                results["stripe_fees"]      = round(total_fees_cents / 100, 2)
+                results["stripe_fee_txns"]  = txn_count
+            except Exception as e:
+                errors["stripe"] = str(e)
+        else:
+            errors["stripe"] = "Missing STRIPE_SECRET_KEY"
+
+    # ── 5. Render — env var only ─────────────────────────────────────────────
+    results["render_cost"] = RENDER_MONTHLY_COST
+
+    # ── Persist to admin_settings ────────────────────────────────────────────
+    global admin_settings_cache
+    existing = admin_settings_cache.get("provider_costs", {})
+    # Merge: sync results overwrite, but don't erase fields not covered (e.g. manual fields)
+    merged = {**existing, **results}
+    merged["last_updated"] = _now_utc().isoformat()
+    merged["last_synced"]  = _now_utc().isoformat()
+    admin_settings_cache["provider_costs"] = merged
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1",
+            json.dumps(admin_settings_cache),
+        )
+
+    return {
+        "status": "ok",
+        "synced": list(results.keys()),
+        "errors": errors,
+        "provider_costs": merged,
+    }
+
+
 # APPEND-ONLY PATCH: admin audit logger (schema-resilient)
 # - Fixes NameError: log_admin_audit not defined
 # - Writes to admin_audit_log using newest columns when present

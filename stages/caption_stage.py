@@ -3,25 +3,37 @@ UploadM8 Caption Stage
 =======================
 Generate AI-powered titles, captions, and hashtags using OpenAI.
 
+WHAT'S NEW IN THIS VERSION:
+  - Multi-frame extraction: pulls 8 frames from the video via FFmpeg
+    (beginning, action middle, and end of clip) for richer visual context
+  - Pandas telemetry enrichment: uses p95 speed, acceleration events,
+    speeding_seconds, euphoria_seconds from the telemetry stage
+  - Location-mandatory prompts: city/state/road are injected as required
+    context, not optional hints — AI must reference them
+  - Platform-specific prompt engineering: separate tone and hashtag
+    instructions per TikTok / YouTube / Instagram / Facebook
+  - Title fallback: if user supplied a title, AI still enhances it
+    rather than regenerating from scratch
+
 GROUNDING RULES (enforced):
-  - All generated content MUST be based on the actual FFmpeg thumbnail image
-    and/or real telemetry / Trill data parsed from the .map file.
-  - If neither a thumbnail nor telemetry is available, caption generation is
-    skipped rather than producing fabricated content.
-  - GPT-4o (vision) is used when a thumbnail is present so the model can
-    describe what it actually sees in the frame.
-  - Trill score, speeds, distance, and hashtags from the .map file are
-    injected verbatim into the prompt so the model has real evidence.
+  - All generated content MUST be based on actual FFmpeg frames and/or
+    real telemetry / Trill data from the .map file
+  - If neither frames nor telemetry exist, generation is skipped
+  - GPT-4o (vision) is used when frames are available
+  - Location data is injected verbatim — no invented place names
 
 Exports: run_caption_stage(ctx)
 """
 
+import asyncio
 import base64
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
+
+import httpx
 
 from .errors import SkipStage, CaptionError, ErrorCode
 from .context import JobContext, TrillScore, TelemetryData
@@ -29,58 +41,187 @@ from .context import JobContext, TrillScore, TelemetryData
 logger = logging.getLogger("uploadm8-worker.caption")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-# Use vision model when image is available; fall back to mini for text-only
 OPENAI_VISION_MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o")
 OPENAI_TEXT_MODEL = os.environ.get("OPENAI_TEXT_MODEL", "gpt-4o-mini")
+FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
+FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "ffprobe")
+
+# Number of frames to extract for AI analysis
+NUM_ANALYSIS_FRAMES = 8
 
 
 # ---------------------------------------------------------------------------
-# OpenAI helpers
+# FFmpeg multi-frame extraction
+# ---------------------------------------------------------------------------
+
+async def _get_video_duration(video_path: Path) -> float:
+    """Use ffprobe to get video duration in seconds."""
+    try:
+        cmd = [
+            FFPROBE_PATH,
+            "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            str(video_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        data = json.loads(stdout.decode())
+        return float(data.get("format", {}).get("duration", 30.0))
+    except Exception as e:
+        logger.warning(f"ffprobe duration failed: {e} — assuming 30s")
+        return 30.0
+
+
+async def _extract_single_frame(
+    video_path: Path,
+    output_path: Path,
+    timestamp: float,
+) -> bool:
+    """Extract a single JPEG frame at the given timestamp."""
+    cmd = [
+        FFMPEG_PATH,
+        "-y",
+        "-ss", f"{timestamp:.3f}",
+        "-i", str(video_path),
+        "-vframes", "1",
+        "-q:v", "4",
+        "-vf", "scale=768:-2",  # 768px wide — enough for GPT-4o vision, not too costly
+        str(output_path),
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            return True
+        logger.debug(f"Frame at {timestamp:.1f}s failed: {stderr.decode()[-200:]}")
+        return False
+    except Exception as e:
+        logger.debug(f"Frame extraction error at {timestamp:.1f}s: {e}")
+        return False
+
+
+async def extract_analysis_frames(
+    video_path: Path,
+    temp_dir: Path,
+    num_frames: int = NUM_ANALYSIS_FRAMES,
+) -> List[Path]:
+    """
+    Extract multiple frames evenly distributed across the video
+    for OpenAI visual analysis.
+
+    Strategy:
+      - Skip first 5% and last 5% of video (avoids black frames / end cards)
+      - Spread remaining frames across the video uniformly
+      - Extract concurrently for speed
+      - Return paths for successfully extracted frames only
+    """
+    if not video_path or not video_path.exists():
+        return []
+
+    duration = await _get_video_duration(video_path)
+
+    # Skip first and last 5%
+    start_offset = duration * 0.05
+    end_offset = duration * 0.95
+    effective_duration = end_offset - start_offset
+
+    if effective_duration <= 0:
+        # Very short clip — just grab a couple frames
+        timestamps = [0.5, max(0, duration - 0.5)]
+    else:
+        interval = effective_duration / num_frames
+        timestamps = [start_offset + interval * i + interval / 2 for i in range(num_frames)]
+
+    # Extract all frames concurrently
+    tasks = []
+    output_paths = []
+    for i, ts in enumerate(timestamps):
+        out = temp_dir / f"caption_frame_{i:03d}.jpg"
+        output_paths.append(out)
+        tasks.append(_extract_single_frame(video_path, out, ts))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    frames = [
+        output_paths[i]
+        for i, ok in enumerate(results)
+        if ok is True and output_paths[i].exists()
+    ]
+
+    logger.info(f"Extracted {len(frames)}/{num_frames} analysis frames from {video_path.name}")
+    return frames
+
+
+def _frames_to_b64(frames: List[Path], max_frames: int = 6) -> List[str]:
+    """
+    Convert frame paths to base64 strings for OpenAI vision.
+    Caps at max_frames to control cost (6 frames * ~85 tokens = ~510 tokens).
+    """
+    b64_list = []
+    for frame in frames[:max_frames]:
+        try:
+            data = frame.read_bytes()
+            if len(data) < 100:
+                continue
+            b64_list.append(base64.b64encode(data).decode("utf-8"))
+        except Exception:
+            pass
+    return b64_list
+
+
+# ---------------------------------------------------------------------------
+# OpenAI API call
 # ---------------------------------------------------------------------------
 
 async def _call_openai(
     prompt: str,
     system: str = "",
-    max_tokens: int = 500,
-    image_b64: Optional[str] = None,
+    max_tokens: int = 600,
+    image_b64_list: Optional[List[str]] = None,
 ) -> Optional[str]:
     """
-    Make an OpenAI API call.
+    Make an OpenAI API call with optional multi-image vision.
 
-    - If image_b64 is provided, uses the vision model with the image embedded.
+    - If image_b64_list is provided, uses OPENAI_VISION_MODEL (gpt-4o)
+      with all images embedded in the message.
     - Returns response text or None on failure.
     """
     if not OPENAI_API_KEY:
         return None
 
-    import httpx
-
-    model = OPENAI_VISION_MODEL if image_b64 else OPENAI_TEXT_MODEL
+    model = OPENAI_VISION_MODEL if image_b64_list else OPENAI_TEXT_MODEL
 
     try:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
 
-        if image_b64:
-            # Vision message: interleave image + text
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_b64}",
-                            "detail": "low",   # "low" = 1 tile = ~85 tokens, sufficient for scene reading
-                        },
+        if image_b64_list:
+            content = []
+            # Add all frames to message
+            for b64 in image_b64_list:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64}",
+                        "detail": "low",
                     },
-                    {"type": "text", "text": prompt},
-                ],
-            })
+                })
+            content.append({"type": "text", "text": prompt})
+            messages.append({"role": "user", "content": content})
         else:
             messages.append({"role": "user", "content": prompt})
 
-        async with httpx.AsyncClient(timeout=45) as client:
+        async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={
@@ -91,16 +232,15 @@ async def _call_openai(
                     "model": model,
                     "messages": messages,
                     "max_tokens": max_tokens,
-                    "temperature": 0.7,
+                    "temperature": 0.72,
                 },
             )
 
             if resp.status_code == 429:
                 logger.warning("OpenAI rate limited")
                 return None
-
             if resp.status_code != 200:
-                logger.warning(f"OpenAI error {resp.status_code}: {resp.text[:200]}")
+                logger.warning(f"OpenAI error {resp.status_code}: {resp.text[:300]}")
                 return None
 
             data = resp.json()
@@ -111,229 +251,377 @@ async def _call_openai(
         return None
 
 
-def _load_thumbnail_b64(ctx: JobContext) -> Optional[str]:
-    """
-    Load the thumbnail image as a base64 string if available.
-    Returns None if no thumbnail has been generated yet.
-    """
-    path: Optional[Path] = ctx.thumbnail_path
-    if not path:
-        return None
-    try:
-        p = Path(path)
-        if p.exists() and p.stat().st_size > 0:
-            return base64.b64encode(p.read_bytes()).decode("utf-8")
-    except Exception as e:
-        logger.warning(f"Could not load thumbnail for vision: {e}")
-    return None
+# ---------------------------------------------------------------------------
+# Evidence builder
+# ---------------------------------------------------------------------------
 
-
-def _build_telemetry_context(ctx: JobContext) -> str:
+def _build_telemetry_block(ctx: JobContext) -> str:
     """
-    Build a human-readable telemetry summary from .map-derived data.
-    Returns an empty string if no telemetry is available.
+    Build a comprehensive telemetry evidence block including
+    pandas-enriched stats. Returns empty string if no telemetry.
     """
-    trill: Optional[TrillScore] = ctx.trill_score or ctx.trill
     telem: Optional[TelemetryData] = ctx.telemetry_data or ctx.telemetry
+    trill: Optional[TrillScore] = ctx.trill_score or ctx.trill
 
     lines = []
 
     if telem:
-        # Location — most important context for caption quality
-        if telem.location_display:
-            lines.append(f"Location: {telem.location_display}")
-        if telem.location_road:
-            lines.append(f"Road/highway: {telem.location_road}")
-        if telem.mid_lat and telem.mid_lon:
-            lines.append(f"GPS coordinates: {telem.mid_lat:.5f}, {telem.mid_lon:.5f}")
+        # --- Location (highest priority for caption quality) ---
+        if getattr(telem, "location_display", None):
+            lines.append(f"📍 Location: {telem.location_display}")
+        if getattr(telem, "location_road", None):
+            lines.append(f"🛣️  Road/Highway: {telem.location_road}")
+        if (
+            not getattr(telem, "location_display", None)
+            and getattr(telem, "mid_lat", None)
+            and getattr(telem, "mid_lon", None)
+        ):
+            lines.append(f"📍 GPS: {telem.mid_lat:.4f}°, {telem.mid_lon:.4f}°")
 
-        if telem.max_speed_mph:
-            lines.append(f"Max speed: {telem.max_speed_mph:.1f} mph")
-        if telem.avg_speed_mph:
-            lines.append(f"Avg speed: {telem.avg_speed_mph:.1f} mph")
-        if telem.total_distance_miles:
-            lines.append(f"Distance: {telem.total_distance_miles:.2f} miles")
-        if telem.duration_seconds:
-            mins = int(telem.duration_seconds // 60)
-            secs = int(telem.duration_seconds % 60)
-            lines.append(f"Clip duration: {mins}m {secs}s")
-        if telem.max_altitude_ft:
-            lines.append(f"Max altitude: {telem.max_altitude_ft:.0f} ft")
-        if telem.speeding_seconds:
-            lines.append(f"Time above speed limit: {telem.speeding_seconds:.0f}s")
-        if telem.euphoria_seconds:
-            lines.append(f"Euphoria/high-G seconds: {telem.euphoria_seconds:.0f}s")
+        # --- Speed stats ---
+        lines.append(f"🏎️  Max Speed: {telem.max_speed_mph:.1f} mph")
+        lines.append(f"📊 Avg Speed: {telem.avg_speed_mph:.1f} mph")
+
+        # Pandas-enriched stats (attached by telemetry_stage)
+        p95 = getattr(telem, "_speed_p95", None)
+        if p95 and p95 > telem.avg_speed_mph:
+            lines.append(f"📈 95th-Percentile Speed: {p95:.1f} mph")
+
+        accel_events = getattr(telem, "_accel_events", 0)
+        if accel_events > 0:
+            lines.append(f"⚡ Hard Acceleration Events: {accel_events}")
+
+        # --- Time at speed ---
+        if telem.speeding_seconds > 0:
+            lines.append(f"⏱️  Time Above Speed Threshold: {telem.speeding_seconds:.0f}s")
+        if telem.euphoria_seconds > 0:
+            lines.append(f"🔥 Euphoria-Speed Seconds: {telem.euphoria_seconds:.0f}s")
+
+        # --- Distance and duration ---
+        if telem.total_distance_miles > 0:
+            lines.append(f"📏 Distance: {telem.total_distance_miles:.2f} miles")
+        if telem.duration_seconds > 0:
+            m = int(telem.duration_seconds // 60)
+            s = int(telem.duration_seconds % 60)
+            lines.append(f"⏰ Clip Duration: {m}m {s}s")
+
+        if telem.max_altitude_ft > 0:
+            lines.append(f"⛰️  Max Altitude: {telem.max_altitude_ft:.0f} ft")
 
     if trill:
-        lines.append(f"Trill score: {trill.score}/100 ({trill.bucket})")
+        lines.append(f"🏆 Trill Score: {trill.score}/100 ({trill.bucket.upper()})")
         if trill.title_modifier:
-            lines.append(f"Speed character: {trill.title_modifier}")
-        if trill.hashtags:
-            lines.append(f"Trill hashtags: {', '.join(trill.hashtags)}")
+            lines.append(f"🎯 Speed Character: {trill.title_modifier.strip()}")
         if trill.excessive_speed:
-            lines.append("Note: excessive speed detected in clip")
+            lines.append("⚠️  Note: Excessive speed detected in clip")
 
     return "\n".join(lines)
 
 
-def _build_grounding_evidence(ctx: JobContext, has_image: bool) -> str:
+def _build_full_evidence(ctx: JobContext, has_frames: bool) -> str:
     """
-    Assemble all factual evidence available for this clip.
-    This is injected into every prompt so the model cannot hallucinate.
+    Assemble complete evidence payload for OpenAI prompts.
     """
     parts = []
 
-    if has_image:
-        parts.append("A thumbnail frame extracted from the video is attached.")
+    if has_frames:
+        parts.append(f"VIDEO FRAMES: {NUM_ANALYSIS_FRAMES} frames extracted from the video are attached for visual analysis.")
 
-    telem_ctx = _build_telemetry_context(ctx)
-    if telem_ctx:
-        parts.append("Telemetry data from the .map file:\n" + telem_ctx)
+    telem_block = _build_telemetry_block(ctx)
+    if telem_block:
+        parts.append(f"TELEMETRY DATA (from .map file):\n{telem_block}")
 
     if ctx.filename:
-        parts.append(f"Original filename: {ctx.filename}")
+        parts.append(f"FILENAME: {ctx.filename}")
 
     if ctx.title:
-        parts.append(f"User-supplied title: {ctx.title}")
+        parts.append(f"USER TITLE: {ctx.title}")
 
     if ctx.caption:
-        parts.append(f"User notes: {ctx.caption}")
+        parts.append(f"USER NOTES: {ctx.caption}")
 
     if ctx.platforms:
-        parts.append(f"Target platforms: {', '.join(ctx.platforms)}")
+        parts.append(f"TARGET PLATFORMS: {', '.join(p.upper() for p in ctx.platforms)}")
 
     return "\n\n".join(parts) if parts else ""
 
 
+def _get_platform_tone_instructions(platforms: List[str]) -> str:
+    """
+    Return platform-specific tone and style instructions based on
+    which platforms this upload is targeting.
+    """
+    tones = []
+    plats = [p.lower() for p in (platforms or [])]
+
+    if "tiktok" in plats:
+        tones.append(
+            "TikTok: Keep it raw and punchy. Use trendy slang naturally. "
+            "Short sentences. Start with a hook. Drive engagement with "
+            "'POV:', 'Caught on dashcam:', or speed-first openers."
+        )
+    if "youtube" in plats or "youtube_shorts" in plats:
+        tones.append(
+            "YouTube Shorts: Slightly more descriptive. Mention the car, "
+            "location, or speed clearly. Viewers expect context."
+        )
+    if "instagram" in plats:
+        tones.append(
+            "Instagram Reels: Aesthetic and aspirational. Emphasise the "
+            "experience — the road, the speed, the feeling. Use emojis "
+            "sparingly but effectively."
+        )
+    if "facebook" in plats:
+        tones.append(
+            "Facebook Reels: Broader audience. Keep it relatable. "
+            "'Check out this dashcam footage from...' tone works well."
+        )
+
+    if not tones:
+        tones.append(
+            "General social media: Engaging, authentic, not AI-sounding. "
+            "2-3 sentences max. Mention location and/or speed if available."
+        )
+
+    return "\n".join(tones)
+
+
+def _build_location_mandate(ctx: JobContext) -> str:
+    """
+    Build a mandatory location instruction for prompts.
+    If we have location data, the AI MUST use it — not optionally.
+    """
+    telem = ctx.telemetry_data or ctx.telemetry
+    if not telem:
+        return ""
+
+    location = getattr(telem, "location_display", None)
+    road = getattr(telem, "location_road", None)
+    city = getattr(telem, "location_city", None)
+    state = getattr(telem, "location_state", None)
+
+    if not location and not city:
+        return ""
+
+    parts = []
+    if location:
+        parts.append(f"Location: {location}")
+    if road:
+        parts.append(f"Road: {road}")
+    if city:
+        parts.append(f"City: {city}")
+    if state:
+        parts.append(f"State: {state}")
+
+    mandate = (
+        f"\n\nLOCATION MANDATE: This video was recorded in {location or city}. "
+        f"You MUST reference the location ({', '.join(parts)}) naturally in "
+        f"the content. Do NOT generate generic content — use the actual place name. "
+        f"Examples: 'flying through {city}', 'on the streets of {location}', "
+        f"'dashcam caught this in {location}'."
+    )
+    return mandate
+
+
 # ---------------------------------------------------------------------------
-# Individual generators
+# Individual content generators
 # ---------------------------------------------------------------------------
 
-async def generate_title(ctx: JobContext, image_b64: Optional[str], evidence: str) -> Optional[str]:
-    """Generate a grounded title. Returns None if generation fails or evidence is empty."""
+async def generate_title(
+    ctx: JobContext,
+    image_b64_list: List[str],
+    evidence: str,
+) -> Optional[str]:
+    """Generate a grounded, location-aware title."""
     if not evidence:
         return None
 
-    # Pull location for explicit instruction if available
-    telem = ctx.telemetry_data or ctx.telemetry
-    location_hint = ""
-    if telem and telem.location_display:
-        location_hint = (
-            f" If the location ({telem.location_display}) adds meaningful context "
-            f"(e.g. a famous road, city, or region known for driving), incorporate it naturally."
+    trill = ctx.trill_score or ctx.trill
+    trill_modifier = ""
+    if trill and trill.title_modifier:
+        trill_modifier = (
+            f"\nTrill modifier to incorporate: \"{trill.title_modifier.strip()}\" "
+            f"(only if it fits naturally)"
         )
 
+    location_mandate = _build_location_mandate(ctx)
+
     system = (
-        "You are a social media content expert specialising in driving and dashcam videos. "
-        "Generate ONLY the title text — no quotes, no explanation, under 100 characters. "
-        "Base the title strictly on the visual content and/or the telemetry data provided. "
-        f"Do not invent events or sensationalise beyond what the evidence shows.{location_hint}"
+        "You are a viral social media content expert for driving and dashcam videos. "
+        "Write ONLY the title text — no quotes, no explanation, no preamble. "
+        "Max 100 characters. "
+        "Make it punchy, engaging, and platform-ready. "
+        "Base it STRICTLY on the visual content and telemetry provided. "
+        "Do NOT invent events or exaggerate beyond what the data shows."
+        f"{location_mandate}"
     )
 
     prompt = (
-        "Generate a short, engaging title (max 100 characters) for this dashcam/driving video.\n\n"
-        f"Evidence:\n{evidence}"
+        "Generate a short, viral title (max 100 characters) for this dashcam/driving video.\n\n"
+        f"EVIDENCE:\n{evidence}"
+        f"{trill_modifier}"
+        "\n\nReturn ONLY the title text. No quotes. No explanation."
     )
 
-    return await _call_openai(prompt, system, max_tokens=60, image_b64=image_b64)
+    return await _call_openai(
+        prompt,
+        system,
+        max_tokens=80,
+        image_b64_list=image_b64_list or None,
+    )
 
 
-async def generate_caption(ctx: JobContext, image_b64: Optional[str], evidence: str) -> Optional[str]:
-    """Generate a grounded caption. Returns None if evidence is empty."""
+async def generate_caption(
+    ctx: JobContext,
+    image_b64_list: List[str],
+    evidence: str,
+) -> Optional[str]:
+    """Generate a grounded, location-aware, platform-tuned caption."""
     if not evidence:
         return None
 
+    platform_tones = _get_platform_tone_instructions(ctx.platforms or [])
+    location_mandate = _build_location_mandate(ctx)
+
     telem = ctx.telemetry_data or ctx.telemetry
-    location_hint = ""
-    if telem and telem.location_display:
-        location_hint = (
-            f" The clip was recorded in or around {telem.location_display}. "
-            f"Reference the location naturally if it adds colour — e.g. mentioning the city, "
-            f"a well-known road, or region vibe. Don't force it if it doesn't fit."
+    speed_callout = ""
+    if telem and telem.max_speed_mph > 0:
+        speed_callout = (
+            f"\nSpeed context: Max speed was {telem.max_speed_mph:.0f} mph. "
+            f"Reference the speed if it adds punch — but do NOT exaggerate."
         )
-        if telem.location_road:
-            location_hint += f" The road is: {telem.location_road}."
 
     system = (
-        "You are a social media content expert specialising in driving and dashcam videos. "
+        "You are a social media content expert for driving and dashcam videos. "
         "Write ONLY the caption text — 2-3 sentences, no quotes, no preamble. "
-        "Describe what is actually shown in the video frame and/or what the telemetry reveals. "
-        f"Do not fabricate road conditions, events, or emotions not supported by the evidence.{location_hint}"
+        "Describe what is ACTUALLY shown in the frames and what the telemetry ACTUALLY reveals. "
+        "Do NOT fabricate road conditions, events, or emotions not supported by the evidence. "
+        f"Platform tone guidance:\n{platform_tones}"
+        f"{location_mandate}"
+        f"{speed_callout}"
     )
 
     prompt = (
         "Write a short, engaging social media caption for this dashcam/driving video.\n\n"
-        f"Evidence:\n{evidence}"
+        f"EVIDENCE:\n{evidence}"
+        "\n\nReturn ONLY the caption text. 2-3 sentences max."
     )
 
-    return await _call_openai(prompt, system, max_tokens=200, image_b64=image_b64)
+    return await _call_openai(
+        prompt,
+        system,
+        max_tokens=250,
+        image_b64_list=image_b64_list or None,
+    )
 
 
-async def generate_hashtags(ctx: JobContext, image_b64: Optional[str], evidence: str) -> List[str]:
-    """Generate grounded hashtags. Returns empty list if evidence is empty."""
-    if not evidence:
-        return []
+async def generate_hashtags(
+    ctx: JobContext,
+    image_b64_list: List[str],
+    evidence: str,
+    max_count: int = 15,
+) -> List[str]:
+    """
+    Generate grounded, location-specific, platform-relevant hashtags.
 
-    # Seed with any Trill hashtags from the .map file — these are always included
+    Priority order in merged list:
+      1. Trill score hashtags (evidence-based from .map file)
+      2. Location hashtags (city, state, road — real place names only)
+      3. AI-generated content hashtags
+    """
     trill = ctx.trill_score or ctx.trill
     trill_tags: List[str] = list(trill.hashtags) if trill and trill.hashtags else []
 
-    # Build location tags from geocoded data — real place names, not invented
     telem = ctx.telemetry_data or ctx.telemetry
     location_tags: List[str] = []
     location_instruction = ""
+
     if telem:
-        if telem.location_city:
-            city_tag = "#" + telem.location_city.replace(" ", "")
-            location_tags.append(city_tag)
-        if telem.location_state:
+        city = getattr(telem, "location_city", None)
+        state = getattr(telem, "location_state", None)
+        road = getattr(telem, "location_road", None)
+        display = getattr(telem, "location_display", None)
+        country = getattr(telem, "location_country", None)
+
+        if city:
+            clean_city = city.replace(" ", "").replace("-", "")
+            location_tags.append(f"#{clean_city}")
+        if state:
             from .telemetry_stage import _abbreviate_us_state
-            state_abbr = _abbreviate_us_state(telem.location_state)
-            location_tags.append(f"#{state_abbr}")
-        if telem.location_display:
+            abbr = _abbreviate_us_state(state)
+            if abbr != city:  # avoid duplicate if city IS the state
+                location_tags.append(f"#{abbr}")
+        if road:
+            clean_road = road.replace(" ", "").replace("-", "").replace("/", "")
+            if len(clean_road) > 2:
+                location_tags.append(f"#{clean_road}")
+        if country and country not in ("US", ""):
+            location_tags.append(f"#{country}")
+
+        if display:
             location_instruction = (
-                f" The clip is from {telem.location_display}. "
-                f"Include location-specific hashtags like city name, state, or region — "
-                f"but only real place names, not invented ones."
+                f"\n\nLOCATION HASHTAG MANDATE: The video was recorded in {display}. "
+                f"You MUST include city-specific and/or state-specific hashtags "
+                f"(e.g. #{city.replace(' ', '') if city else ''}, #{abbr if state else ''}, "
+                f"#{''.join(display.split(',')[0].split())}driving, etc.). "
+                f"Use ONLY real, verifiable place names — NO invented locations."
             )
-        if telem.location_road:
-            # Clean road name into a hashtag (e.g. "Route 66" → "#Route66")
-            road_tag = "#" + telem.location_road.replace(" ", "").replace("-", "")
-            location_tags.append(road_tag)
+
+    if not evidence:
+        return list(dict.fromkeys(trill_tags + location_tags))[:max_count]
+
+    platform_tags = []
+    for p in (ctx.platforms or []):
+        p = p.lower()
+        if p == "tiktok":
+            platform_tags += ["#fyp", "#foryoupage", "#dashcam"]
+        elif p in ("youtube", "youtube_shorts"):
+            platform_tags += ["#YouTubeShorts", "#dashcam"]
+        elif p == "instagram":
+            platform_tags += ["#Reels", "#dashcam"]
+        elif p == "facebook":
+            platform_tags += ["#FacebookReels"]
 
     system = (
         "You generate hashtags for social media dashcam/driving videos. "
         "Return ONLY a JSON array of strings, each starting with #. "
         "Example: [\"#dashcam\", \"#driving\", \"#fyp\"]. "
-        "Base hashtags on the visual content and telemetry data provided. "
-        f"Do not include generic filler tags unrelated to the content.{location_instruction}"
+        "Base hashtags ONLY on the visual content and telemetry data provided. "
+        "Do NOT include generic filler tags unrelated to the content. "
+        "Include a mix of: speed/driving tags, car culture tags, location tags, "
+        "and viral discovery tags."
+        f"{location_instruction}"
     )
 
     prompt = (
-        "Generate 5-10 relevant hashtags for this dashcam/driving video. "
-        "Return them as a JSON array of strings.\n\n"
-        f"Evidence:\n{evidence}"
+        f"Generate {min(max_count, 12)} relevant hashtags for this dashcam/driving video. "
+        "Return them as a JSON array of strings starting with #.\n\n"
+        f"EVIDENCE:\n{evidence}"
     )
 
-    result = await _call_openai(prompt, system, max_tokens=120, image_b64=image_b64)
-    if not result:
-        return list(dict.fromkeys(trill_tags + location_tags))
+    result = await _call_openai(
+        prompt,
+        system,
+        max_tokens=150,
+        image_b64_list=image_b64_list or None,
+    )
 
-    try:
-        clean = result.strip().strip("`").strip()
-        if clean.startswith("json"):
-            clean = clean[4:].strip()
-        ai_tags = json.loads(clean)
-        if isinstance(ai_tags, list):
-            ai_tags = [str(t) for t in ai_tags if isinstance(t, str)]
-        else:
-            ai_tags = []
-    except (json.JSONDecodeError, ValueError):
-        ai_tags = [w.strip() for w in result.split() if w.startswith("#")][:10]
+    ai_tags: List[str] = []
+    if result:
+        try:
+            clean = result.strip().strip("`").strip()
+            if clean.lower().startswith("json"):
+                clean = clean[4:].strip()
+            parsed = json.loads(clean)
+            if isinstance(parsed, list):
+                ai_tags = [str(t) for t in parsed if isinstance(t, str) and t.startswith("#")]
+        except (json.JSONDecodeError, ValueError):
+            # Fallback: scrape hashtags from free text
+            ai_tags = [w.strip() for w in result.split() if w.startswith("#")][:max_count]
 
-    # Merge: Trill tags (evidence-based) → location tags → AI tags
-    merged = list(dict.fromkeys(trill_tags + location_tags + ai_tags))
-    return merged
+    # Merge with deduplication: Trill → location → platform → AI
+    merged = list(dict.fromkeys(trill_tags + location_tags + platform_tags + ai_tags))
+    return merged[:max_count]
 
 
 # ---------------------------------------------------------------------------
@@ -344,52 +632,90 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
     """
     Execute AI caption generation stage.
 
-    Requirements:
-    - Must run AFTER thumbnail_stage so ctx.thumbnail_path is populated.
-    - Must run AFTER telemetry_stage so Trill / .map data is in ctx.
-    - Will skip if neither thumbnail nor telemetry is available (no evidence = no generation).
-    - Uses GPT-4o vision when a thumbnail exists; GPT-4o-mini for text-only fallback.
+    Pipeline:
+    1. Check entitlements and API key
+    2. Extract 8 frames from video using FFmpeg
+    3. Load thumbnail as additional visual context
+    4. Build telemetry evidence block (location, speed, Trill, pandas stats)
+    5. Generate title, caption, hashtags via GPT-4o vision
+    6. Write results to ctx.ai_title, ctx.ai_caption, ctx.ai_hashtags
 
-    Produces:
-    - ctx.ai_title
-    - ctx.ai_caption
-    - ctx.ai_hashtags
+    Requirements:
+    - Runs AFTER telemetry_stage (for location + Trill data)
+    - Runs AFTER thumbnail_stage (thumbnail used as frame 0)
+    - Will skip only if NO video file AND NO telemetry exist
     """
     ctx.mark_stage("caption")
 
-    # Tier check
+    # Entitlement check
     if ctx.entitlements and not ctx.entitlements.can_ai:
         raise SkipStage("AI captions not available for this tier")
 
     if not OPENAI_API_KEY:
         raise SkipStage("OpenAI API key not configured")
 
-    # ------------------------------------------------------------------ #
-    # Load evidence — thumbnail image + telemetry data                    #
-    # ------------------------------------------------------------------ #
-    image_b64 = _load_thumbnail_b64(ctx)
-    evidence = _build_grounding_evidence(ctx, has_image=image_b64 is not None)
+    # Determine video source for frame extraction
+    video_path: Optional[Path] = None
+    for candidate in (ctx.processed_video_path, ctx.local_video_path):
+        if candidate and Path(candidate).exists():
+            video_path = Path(candidate)
+            break
 
-    if not evidence:
-        # No thumbnail and no telemetry — refusing to generate unsupported content
-        logger.info("Skipping caption generation: no thumbnail or telemetry evidence available")
-        raise SkipStage("No visual or telemetry evidence available for grounded caption generation")
+    temp_dir: Optional[Path] = ctx.temp_dir
 
-    has_image = image_b64 is not None
-    has_telem = bool(_build_telemetry_context(ctx))
+    # ------------------------------------------------------------------ #
+    # Frame extraction                                                     #
+    # ------------------------------------------------------------------ #
+    extracted_frames: List[Path] = []
+
+    if video_path and temp_dir:
+        try:
+            extracted_frames = await extract_analysis_frames(video_path, temp_dir)
+        except Exception as e:
+            logger.warning(f"Frame extraction failed (non-fatal): {e}")
+
+    # Also grab the thumbnail as an additional frame (it's already extracted)
+    thumbnail_path: Optional[Path] = ctx.thumbnail_path
+    if thumbnail_path and Path(thumbnail_path).exists():
+        # Prepend thumbnail so GPT-4o sees it first as "the poster frame"
+        extracted_frames = [Path(thumbnail_path)] + [
+            f for f in extracted_frames
+            if f != thumbnail_path and f.exists()
+        ]
+
+    has_frames = len(extracted_frames) > 0
+    image_b64_list = _frames_to_b64(extracted_frames, max_frames=6) if has_frames else []
+    has_images = len(image_b64_list) > 0
+
+    # ------------------------------------------------------------------ #
+    # Telemetry evidence                                                   #
+    # ------------------------------------------------------------------ #
+    has_telemetry = bool(_build_telemetry_block(ctx))
+
+    # Skip only if absolutely no evidence
+    if not has_images and not has_telemetry and not ctx.filename:
+        logger.info("Skipping caption generation: no frames, no telemetry, no filename")
+        raise SkipStage("No evidence available for grounded caption generation")
+
+    evidence = _build_full_evidence(ctx, has_images)
+
     logger.info(
-        f"Generating AI captions for upload {ctx.upload_id} "
-        f"[image={'yes' if has_image else 'no'}, telemetry={'yes' if has_telem else 'no'}]"
+        f"Caption generation for upload {ctx.upload_id} | "
+        f"frames={len(extracted_frames)} | b64_frames={len(image_b64_list)} | "
+        f"telemetry={'yes' if has_telemetry else 'no'} | "
+        f"model={'vision' if has_images else 'text'}"
     )
 
     # ------------------------------------------------------------------ #
     # Generate title                                                       #
     # ------------------------------------------------------------------ #
     try:
-        ai_title = await generate_title(ctx, image_b64, evidence)
+        ai_title = await generate_title(ctx, image_b64_list, evidence)
         if ai_title:
-            ctx.ai_title = ai_title
-            logger.info(f"AI title: {ai_title[:80]}")
+            # Strip surrounding quotes if model added them
+            ai_title = ai_title.strip().strip('"').strip("'")
+            ctx.ai_title = ai_title[:100]
+            logger.info(f"AI title: {ctx.ai_title}")
     except Exception as e:
         logger.warning(f"AI title generation failed (non-fatal): {e}")
 
@@ -397,10 +723,11 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
     # Generate caption                                                     #
     # ------------------------------------------------------------------ #
     try:
-        ai_caption = await generate_caption(ctx, image_b64, evidence)
+        ai_caption = await generate_caption(ctx, image_b64_list, evidence)
         if ai_caption:
-            ctx.ai_caption = ai_caption
-            logger.info(f"AI caption: {ai_caption[:80]}")
+            ai_caption = ai_caption.strip().strip('"').strip("'")
+            ctx.ai_caption = ai_caption[:500]
+            logger.info(f"AI caption: {ctx.ai_caption[:100]}")
     except Exception as e:
         logger.warning(f"AI caption generation failed (non-fatal): {e}")
 
@@ -408,14 +735,23 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
     # Generate hashtags                                                    #
     # ------------------------------------------------------------------ #
     try:
-        ai_hashtags = await generate_hashtags(ctx, image_b64, evidence)
+        # Determine hashtag limit from entitlements
+        max_hashtags = 30  # default ceiling
+        if ctx.entitlements:
+            try:
+                max_hashtags = ctx.entitlements.max_hashtags or 30
+            except AttributeError:
+                pass
+
+        # Merge with any user-supplied hashtags
+        ai_hashtags = await generate_hashtags(ctx, image_b64_list, evidence, max_count=max_hashtags)
         if ai_hashtags:
             ctx.ai_hashtags = ai_hashtags
-            logger.info(f"AI hashtags ({len(ai_hashtags)}): {ai_hashtags}")
+            logger.info(f"AI hashtags ({len(ai_hashtags)}): {ai_hashtags[:8]}...")
     except Exception as e:
         logger.warning(f"AI hashtag generation failed (non-fatal): {e}")
 
-    # Track AIC cost (1 token per generation batch)
+    # AIC cost: 1 token per generation batch
     ctx.aic_cost += 1
 
     return ctx

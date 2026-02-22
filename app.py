@@ -2582,11 +2582,28 @@ async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
         if not upload: raise HTTPException(404, "Upload not found")
         if upload["status"] in ("completed", "succeeded", "cancelled", "failed"):
             raise HTTPException(400, "Cannot cancel this upload")
-        
-        await conn.execute("UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1", upload_id)
-        # Refund reserved tokens
-        await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
-    return {"status": "cancelled"}
+
+        current_status = upload["status"]
+
+        if current_status == "processing":
+            # Worker is actively running this job — signal it to stop gracefully.
+            # The worker checks cancel_requested at each pipeline stage checkpoint
+            # and will set status to 'cancelled' itself when it detects the signal.
+            # Do NOT change status here or the worker loses track of the job.
+            await conn.execute(
+                "UPDATE uploads SET cancel_requested = TRUE, updated_at = NOW() WHERE id = $1",
+                upload_id
+            )
+            return {"status": "cancel_requested", "message": "Cancel signal sent — job will stop at next checkpoint"}
+        else:
+            # Job is pending/queued — no worker has picked it up yet.
+            # Safe to cancel immediately and refund reserved tokens.
+            await conn.execute(
+                "UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1",
+                upload_id
+            )
+            await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
+            return {"status": "cancelled"}
 
 
 @app.get("/api/uploads")
@@ -2620,7 +2637,8 @@ async def get_uploads(
                 put_reserved, aic_reserved,
                 views, likes,
                 trill_score, speed_bucket, max_speed_mph, avg_speed_mph, distance_miles, duration_seconds,
-                ai_title, ai_caption
+                ai_title, ai_caption,
+                processing_stage, processing_progress
             FROM uploads
             WHERE {where_sql}
             ORDER BY created_at DESC
@@ -2666,6 +2684,10 @@ async def get_uploads(
                 "duration_seconds": d.get("duration_seconds"),
                 "ai_title": d.get("ai_title"),
                 "ai_caption": d.get("ai_caption"),
+                # Live processing progress — written by worker at each pipeline checkpoint.
+                # Mapped to short names for queue.html (upload.progress, upload.current_stage)
+                "progress": d.get("processing_progress", 0) or 0,
+                "current_stage": d.get("processing_stage"),
             }
 
         uploads = [_row_to_public(u) for u in rows]

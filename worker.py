@@ -93,7 +93,28 @@ async def check_cancelled(ctx: JobContext) -> bool:
     return cancelled
 
 
+# Maps each pipeline checkpoint to an approximate % complete value.
+# Transcode is the heaviest stage (FFmpeg), so it gets the biggest jump.
+STAGE_PROGRESS = {
+    "init":       5,
+    "download":   10,
+    "telemetry":  18,
+    "hud":        25,
+    "watermark":  32,
+    "transcode":  55,
+    "thumbnail":  63,
+    "caption":    72,
+    "upload":     85,
+    "publish":    95,
+    "notify":     99,
+}
+
+
 async def maybe_cancel(ctx: JobContext, stage: str):
+    # Write stage + progress to DB at every checkpoint so the queue screen can show live status
+    progress = STAGE_PROGRESS.get(stage, 0)
+    await db_stage.update_stage_progress(db_pool, ctx.upload_id, stage, progress)
+
     if await check_cancelled(ctx):
         logger.info(f"Cancel at {stage} for {ctx.upload_id}")
         await db_stage.mark_cancelled(db_pool, ctx.upload_id)

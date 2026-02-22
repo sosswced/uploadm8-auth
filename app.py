@@ -2399,21 +2399,29 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
         if not getattr(data, "privacy", None):
             data.privacy = user_prefs["default_privacy"]
 
-        # Apply hashtag rules (only when plan allows AI features)
-        if user_prefs["ai_hashtags_enabled"] and plan.get("ai"):
-            combined = list(data.hashtags) + list(user_prefs.get("always_hashtags", []))
+        # --- Hashtag assembly ---
+        # Step 1: Always merge always_hashtags + platform-specific hashtags.
+        #         These are manual user settings and MUST work on every plan,
+        #         regardless of whether AI hashtag generation is enabled.
+        combined = list(data.hashtags) + list(user_prefs.get("always_hashtags", []) or [])
 
-            # Apply platform-specific hashtags
-            platform_hashtags = user_prefs.get("platform_hashtags") or {}
-            for platform in data.platforms:
-                tags = platform_hashtags.get(platform) if isinstance(platform_hashtags, dict) else None
+        platform_hashtags = user_prefs.get("platform_hashtags") or {}
+        for platform in data.platforms:
+            if isinstance(platform_hashtags, dict):
+                tags = platform_hashtags.get(platform) or platform_hashtags.get(platform.lower()) or []
                 if tags:
                     combined.extend(tags)
 
-            # Deduplicate, remove blocked, and limit
-            blocked = set(user_prefs.get("blocked_hashtags", []) or [])
-            combined = [h for h in combined if h and h not in blocked]
-            data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
+        # Step 2: AI-generated hashtag injection (only when plan + toggle allow it).
+        #         Placeholder: actual AI generation happens in the caption stage;
+        #         this just signals the worker to run it.
+        if user_prefs.get("ai_hashtags_enabled") and plan.get("ai"):
+            pass  # ai_hashtags merged into ctx later by caption_stage
+
+        # Step 3: Deduplicate, strip blocked, enforce per-plan limit — always runs.
+        blocked = set(user_prefs.get("blocked_hashtags", []) or [])
+        combined = [h for h in combined if h and h not in blocked]
+        data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
 
         # Calculate PUT cost
         put_cost = len(data.platforms)

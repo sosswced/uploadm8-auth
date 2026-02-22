@@ -139,6 +139,14 @@ def _build_telemetry_context(ctx: JobContext) -> str:
     lines = []
 
     if telem:
+        # Location — most important context for caption quality
+        if telem.location_display:
+            lines.append(f"Location: {telem.location_display}")
+        if telem.location_road:
+            lines.append(f"Road/highway: {telem.location_road}")
+        if telem.mid_lat and telem.mid_lon:
+            lines.append(f"GPS coordinates: {telem.mid_lat:.5f}, {telem.mid_lon:.5f}")
+
         if telem.max_speed_mph:
             lines.append(f"Max speed: {telem.max_speed_mph:.1f} mph")
         if telem.avg_speed_mph:
@@ -206,11 +214,20 @@ async def generate_title(ctx: JobContext, image_b64: Optional[str], evidence: st
     if not evidence:
         return None
 
+    # Pull location for explicit instruction if available
+    telem = ctx.telemetry_data or ctx.telemetry
+    location_hint = ""
+    if telem and telem.location_display:
+        location_hint = (
+            f" If the location ({telem.location_display}) adds meaningful context "
+            f"(e.g. a famous road, city, or region known for driving), incorporate it naturally."
+        )
+
     system = (
         "You are a social media content expert specialising in driving and dashcam videos. "
         "Generate ONLY the title text — no quotes, no explanation, under 100 characters. "
         "Base the title strictly on the visual content and/or the telemetry data provided. "
-        "Do not invent events or sensationalise beyond what the evidence shows."
+        f"Do not invent events or sensationalise beyond what the evidence shows.{location_hint}"
     )
 
     prompt = (
@@ -226,11 +243,22 @@ async def generate_caption(ctx: JobContext, image_b64: Optional[str], evidence: 
     if not evidence:
         return None
 
+    telem = ctx.telemetry_data or ctx.telemetry
+    location_hint = ""
+    if telem and telem.location_display:
+        location_hint = (
+            f" The clip was recorded in or around {telem.location_display}. "
+            f"Reference the location naturally if it adds colour — e.g. mentioning the city, "
+            f"a well-known road, or region vibe. Don't force it if it doesn't fit."
+        )
+        if telem.location_road:
+            location_hint += f" The road is: {telem.location_road}."
+
     system = (
         "You are a social media content expert specialising in driving and dashcam videos. "
         "Write ONLY the caption text — 2-3 sentences, no quotes, no preamble. "
         "Describe what is actually shown in the video frame and/or what the telemetry reveals. "
-        "Do not fabricate road conditions, events, or emotions not supported by the evidence."
+        f"Do not fabricate road conditions, events, or emotions not supported by the evidence.{location_hint}"
     )
 
     prompt = (
@@ -250,12 +278,35 @@ async def generate_hashtags(ctx: JobContext, image_b64: Optional[str], evidence:
     trill = ctx.trill_score or ctx.trill
     trill_tags: List[str] = list(trill.hashtags) if trill and trill.hashtags else []
 
+    # Build location tags from geocoded data — real place names, not invented
+    telem = ctx.telemetry_data or ctx.telemetry
+    location_tags: List[str] = []
+    location_instruction = ""
+    if telem:
+        if telem.location_city:
+            city_tag = "#" + telem.location_city.replace(" ", "")
+            location_tags.append(city_tag)
+        if telem.location_state:
+            from .telemetry_stage import _abbreviate_us_state
+            state_abbr = _abbreviate_us_state(telem.location_state)
+            location_tags.append(f"#{state_abbr}")
+        if telem.location_display:
+            location_instruction = (
+                f" The clip is from {telem.location_display}. "
+                f"Include location-specific hashtags like city name, state, or region — "
+                f"but only real place names, not invented ones."
+            )
+        if telem.location_road:
+            # Clean road name into a hashtag (e.g. "Route 66" → "#Route66")
+            road_tag = "#" + telem.location_road.replace(" ", "").replace("-", "")
+            location_tags.append(road_tag)
+
     system = (
         "You generate hashtags for social media dashcam/driving videos. "
         "Return ONLY a JSON array of strings, each starting with #. "
         "Example: [\"#dashcam\", \"#driving\", \"#fyp\"]. "
         "Base hashtags on the visual content and telemetry data provided. "
-        "Do not include generic filler tags unrelated to the content."
+        f"Do not include generic filler tags unrelated to the content.{location_instruction}"
     )
 
     prompt = (
@@ -264,9 +315,9 @@ async def generate_hashtags(ctx: JobContext, image_b64: Optional[str], evidence:
         f"Evidence:\n{evidence}"
     )
 
-    result = await _call_openai(prompt, system, max_tokens=100, image_b64=image_b64)
+    result = await _call_openai(prompt, system, max_tokens=120, image_b64=image_b64)
     if not result:
-        return trill_tags
+        return list(dict.fromkeys(trill_tags + location_tags))
 
     try:
         clean = result.strip().strip("`").strip()
@@ -280,8 +331,8 @@ async def generate_hashtags(ctx: JobContext, image_b64: Optional[str], evidence:
     except (json.JSONDecodeError, ValueError):
         ai_tags = [w.strip() for w in result.split() if w.startswith("#")][:10]
 
-    # Merge Trill tags first (they are evidence-based from the .map file)
-    merged = list(dict.fromkeys(trill_tags + ai_tags))
+    # Merge: Trill tags (evidence-based) → location tags → AI tags
+    merged = list(dict.fromkeys(trill_tags + location_tags + ai_tags))
     return merged
 
 

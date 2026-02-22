@@ -2,11 +2,16 @@
 UploadM8 Telemetry Stage
 ========================
 Parse .map telemetry files and calculate Trill scores.
+Also extracts GPS coordinates and reverse-geocodes them to city/state
+so the caption stage can ground AI content in a real location.
 """
 
 import logging
+import asyncio
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
+
+import httpx
 
 from .errors import TelemetryError, SkipStage, ErrorCode
 from .context import JobContext, TelemetryData, TrillScore
@@ -102,6 +107,142 @@ def parse_map_file(map_path: Path) -> TelemetryData:
 
     logger.info(f"Parsed telemetry: {len(data_points)} points, max_speed={telemetry.max_speed:.1f} mph")
     return telemetry
+
+
+def _extract_representative_gps(data_points: List[Dict]) -> Optional[tuple]:
+    """
+    Pick the best single GPS point to represent the clip's location.
+    Uses the midpoint of the route rather than start/end — midpoint tends
+    to be the most "interesting" part of a dashcam clip and avoids
+    driveway/parking lot coordinates at the very start.
+
+    Returns (lat, lon) tuple or None if no valid GPS points exist.
+    """
+    valid = [
+        p for p in data_points
+        if p.get("lat") and p.get("lon")
+        and abs(p["lat"]) > 0.001   # filter out null-island / zeroed GPS
+        and abs(p["lon"]) > 0.001
+    ]
+    if not valid:
+        return None
+
+    # Use the midpoint of the clip
+    mid_idx = len(valid) // 2
+    p = valid[mid_idx]
+    return (p["lat"], p["lon"])
+
+
+async def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, str]]:
+    """
+    Reverse geocode a lat/lon to city, state, country using the free
+    OpenStreetMap Nominatim API. No API key required.
+
+    Returns a dict with keys: city, state, country, road, display
+    Returns None on any failure — geocoding is always non-fatal.
+    """
+    try:
+        url = "https://nominatim.openstreetmap.org/reverse"
+        params = {
+            "lat": str(lat),
+            "lon": str(lon),
+            "format": "json",
+            "addressdetails": "1",
+            "zoom": "12",          # city-level precision
+        }
+        headers = {
+            # Nominatim requires a User-Agent identifying your app
+            "User-Agent": "UploadM8/1.0 (video-upload-platform; contact@uploadm8.com)"
+        }
+
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(url, params=params, headers=headers)
+
+        if resp.status_code != 200:
+            logger.warning(f"Nominatim returned {resp.status_code}")
+            return None
+
+        data = resp.json()
+        addr = data.get("address", {})
+
+        # Extract city — Nominatim uses different keys depending on location type
+        city = (
+            addr.get("city")
+            or addr.get("town")
+            or addr.get("village")
+            or addr.get("hamlet")
+            or addr.get("suburb")
+            or addr.get("county")
+            or ""
+        )
+
+        # State — "state" for US, "county" for UK, etc.
+        state = addr.get("state") or addr.get("region") or ""
+
+        # US: abbreviate state name if possible
+        state_display = _abbreviate_us_state(state) if state else ""
+
+        country = addr.get("country_code", "").upper()
+
+        # Road / highway name
+        road = (
+            addr.get("road")
+            or addr.get("motorway")
+            or addr.get("trunk")
+            or addr.get("primary")
+            or ""
+        )
+
+        # Build clean display string
+        if city and state_display:
+            if country == "US":
+                display = f"{city}, {state_display}"
+            else:
+                display = f"{city}, {state_display}, {country}"
+        elif city:
+            display = city
+        elif state:
+            display = state
+        else:
+            display = data.get("display_name", "").split(",")[0]
+
+        result = {
+            "city": city,
+            "state": state,
+            "state_display": state_display,
+            "country": country,
+            "road": road,
+            "display": display,
+        }
+        logger.info(f"Reverse geocoded ({lat:.4f}, {lon:.4f}) → {display}")
+        return result
+
+    except Exception as e:
+        logger.warning(f"Reverse geocode failed (non-fatal): {e}")
+        return None
+
+
+# US state name → abbreviation lookup
+_US_STATES = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
+    "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+    "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS",
+    "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN", "Mississippi": "MS",
+    "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+    "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK",
+    "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI", "South Carolina": "SC",
+    "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX", "Utah": "UT",
+    "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY", "District of Columbia": "DC",
+}
+
+
+def _abbreviate_us_state(state_name: str) -> str:
+    """Return 2-letter abbreviation for US state, or original string if not found."""
+    return _US_STATES.get(state_name, state_name)
 
 
 def calculate_trill_score(
@@ -210,7 +351,7 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
         ctx: Job context
 
     Returns:
-        Updated context with telemetry and trill data
+        Updated context with telemetry, trill data, and location
 
     Raises:
         SkipStage: If no telemetry file
@@ -232,6 +373,37 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
     telemetry = parse_map_file(ctx.local_telemetry_path)
     ctx.telemetry = telemetry
     ctx.telemetry_data = telemetry
+
+    # ------------------------------------------------------------------ #
+    # GPS → Location                                                       #
+    # Extract a representative GPS point and reverse geocode to city/state #
+    # so the caption stage can write location-aware content.              #
+    # ------------------------------------------------------------------ #
+    gps_point = _extract_representative_gps(telemetry.points)
+
+    if gps_point:
+        lat, lon = gps_point
+        telemetry.mid_lat = lat
+        telemetry.mid_lon = lon
+
+        # Store start point too for reference
+        if telemetry.points:
+            telemetry.start_lat = telemetry.points[0].get("lat")
+            telemetry.start_lon = telemetry.points[0].get("lon")
+
+        # Reverse geocode — non-fatal, just skips location on failure
+        geo = await reverse_geocode(lat, lon)
+        if geo:
+            telemetry.location_city = geo["city"]
+            telemetry.location_state = geo["state"]
+            telemetry.location_country = geo["country"]
+            telemetry.location_display = geo["display"]
+            telemetry.location_road = geo["road"]
+            logger.info(f"Location resolved: {geo['display']}")
+        else:
+            logger.info(f"GPS coords available ({lat:.4f}, {lon:.4f}) but geocoding failed")
+    else:
+        logger.info("No valid GPS coordinates found in telemetry data")
 
     # Get user thresholds from settings
     speeding_mph = ctx.user_settings.get("speeding_mph", DEFAULT_SPEEDING_MPH)

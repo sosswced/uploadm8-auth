@@ -27,6 +27,17 @@ class TelemetryData:
     speeding_seconds: float = 0.0
     euphoria_seconds: float = 0.0
 
+    # GPS / location — populated by telemetry_stage after reverse geocoding
+    start_lat: Optional[float] = None
+    start_lon: Optional[float] = None
+    mid_lat: Optional[float] = None       # midpoint of the route (best representative point)
+    mid_lon: Optional[float] = None
+    location_city: Optional[str] = None
+    location_state: Optional[str] = None
+    location_country: Optional[str] = None
+    location_display: Optional[str] = None  # e.g. "Kansas City, MO" or "Los Angeles, CA"
+    location_road: Optional[str] = None     # road/highway name if available
+
     # -------------------------
     # Back-compat aliases used by older stages
     # -------------------------

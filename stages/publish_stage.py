@@ -50,6 +50,74 @@ IG_POLL_MAX_ATTEMPTS = 36  # 3 minutes max (36 * 5s)
 # Presigned URL expiry for Meta uploads (1 hour)
 PRESIGNED_URL_EXPIRY = 3600
 
+# =====================================================================
+# Privacy Level Resolution — single source of truth
+# =====================================================================
+
+def resolve_privacy_level(canonical: str, platform: str) -> str:
+    """Map a canonical UploadM8 privacy level to each platform's native value.
+
+    Canonical levels:  "public" | "unlisted" | "private"
+    Unknown inputs default to "public" behaviour for the given platform.
+
+    Privacy matrix:
+
+    Canonical │ TikTok                │ YouTube   │ Instagram │ Facebook
+    ──────────┼───────────────────────┼───────────┼───────────┼──────────
+    public    │ PUBLIC_TO_EVERYONE    │ public    │ public    │ EVERYONE
+    unlisted  │ SELF_ONLY             │ unlisted  │ private   │ SELF
+    private   │ MUTUAL_FOLLOW_FRIENDS │ private   │ private   │ SELF
+
+    TikTok notes:
+      - public   → PUBLIC_TO_EVERYONE (visible to everyone)
+      - unlisted → SELF_ONLY ("Only You" — what we use for pre-approval uploads)
+      - private  → MUTUAL_FOLLOW_FRIENDS (friends / mutual followers)
+
+    Instagram notes:
+      - No per-post unlisted concept via Graph API; unlisted maps to private.
+
+    Facebook notes:
+      - SELF = only you (closest to unlisted/private).
+      - private also maps to SELF since FB has no followers-only Reels API value.
+    """
+    level = (canonical or "public").strip().lower()
+    if level not in ("public", "unlisted", "private"):
+        level = "public"
+
+    if platform == "tiktok":
+        return {
+            "public":   "PUBLIC_TO_EVERYONE",
+            "unlisted": "SELF_ONLY",              # "Only You" — safe for pre-approval testing
+            "private":  "MUTUAL_FOLLOW_FRIENDS",  # friends / mutual follow
+        }[level]
+
+    if platform == "youtube":
+        return {
+            "public":   "public",
+            "unlisted": "unlisted",
+            "private":  "private",
+        }[level]
+
+    if platform == "instagram":
+        # Instagram Reels via Graph API: no unlisted — map unlisted → private
+        return {
+            "public":   "public",
+            "unlisted": "private",
+            "private":  "private",
+        }[level]
+
+    if platform == "facebook":
+        # Facebook Graph API privacy object value
+        # private → SELF (no followers-only Reel API value available)
+        return {
+            "public":   "EVERYONE",
+            "unlisted": "SELF",
+            "private":  "SELF",
+        }[level]
+
+    # Unknown platform — return canonical as-is (safe default)
+    return level
+
 
 # =====================================================================
 # Token Encryption (used by this stage + verify_stage)
@@ -290,15 +358,30 @@ async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = N
             if resp.status_code == 200:
                 new_tokens = resp.json()
                 logger.info("TikTok: Token refreshed successfully")
+                new_access  = new_tokens.get("access_token", token_data["access_token"])
+                new_refresh = new_tokens.get("refresh_token", refresh_token)
+                new_open_id = new_tokens.get("open_id") or token_data.get("open_id")
                 updated = {
                     **token_data,
-                    "access_token": new_tokens.get("access_token", token_data["access_token"]),
-                    "refresh_token": new_tokens.get("refresh_token", refresh_token),
-                    "expires_at": new_tokens.get("expires_in"),
+                    "access_token":  new_access,
+                    "refresh_token": new_refresh,
+                    "expires_at":    new_tokens.get("expires_in"),
                 }
+                if new_open_id:
+                    updated["open_id"] = new_open_id
                 # Persist back to DB so future jobs use the fresh token
                 if db_pool and user_id:
-                    await db_stage.save_refreshed_token(db_pool, user_id, "tiktok", updated)
+                    try:
+                        await db_stage.save_refreshed_token(
+                            db_pool,
+                            user_id=user_id,
+                            platform="tiktok",
+                            access_token=new_access,
+                            refresh_token=new_refresh,
+                            open_id=new_open_id,
+                        )
+                    except Exception as save_err:
+                        logger.warning(f"TikTok: Failed to persist refreshed token: {save_err}")
                 return updated
             else:
                 logger.warning(f"TikTok: Token refresh failed: {resp.status_code} {resp.text[:200]}")
@@ -377,7 +460,15 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                             "expires_at": None,  # Page tokens from LLT don't expire
                         }
                         if db_pool and user_id:
-                            await db_stage.save_refreshed_token(db_pool, user_id, platform, updated)
+                            try:
+                                await db_stage.save_refreshed_token(
+                                    db_pool,
+                                    user_id=user_id,
+                                    platform=platform,
+                                    access_token=new_page_token,
+                                )
+                            except Exception as save_err:
+                                logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
                         return updated
 
             # ── Recover missing ig_user_id / page_id ────────────────────────
@@ -447,11 +538,12 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
 
             if db_pool and user_id:
                 try:
-                    await db_stage.save_refreshed_token(db_pool, user_id, platform, updated)
-                except AttributeError:
-                    # db.py not yet redeployed with save_refreshed_token — skip persist,
-                    # recovered IDs are still used for this publish attempt
-                    logger.debug(f"{platform}: save_refreshed_token not available yet, skipping persist")
+                    await db_stage.save_refreshed_token(
+                        db_pool,
+                        user_id=user_id,
+                        platform=platform,
+                        access_token=updated["access_token"],
+                    )
                 except Exception as save_err:
                     logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
             return updated
@@ -513,12 +605,10 @@ async def publish_to_tiktok(
                 json={
                     "post_info": {
                         "title": tiktok_title,
-                        "privacy_level": {
-                        "public":   os.environ.get("TIKTOK_PRIVACY_LEVEL", "PUBLIC_TO_EVERYONE"),
-                        "unlisted": os.environ.get("TIKTOK_PRIVACY_LEVEL", "FOLLOWER_OF_CREATOR"),
-                        "private":  "SELF_ONLY",
-                    }.get((getattr(ctx, "privacy", None) or "public").lower(),
-                          os.environ.get("TIKTOK_PRIVACY_LEVEL", "PUBLIC_TO_EVERYONE")),
+                        "privacy_level": resolve_privacy_level(
+                            getattr(ctx, "privacy", None) or "public",
+                            "tiktok",
+                        ),
                     },
                     "source_info": {
                         "source": "FILE_UPLOAD",
@@ -628,12 +718,21 @@ async def _refresh_youtube_token(token_data: dict, db_pool=None, user_id: str = 
             if resp.status_code == 200:
                 new_tokens = resp.json()
                 logger.info("YouTube: Token refreshed successfully")
+                new_access = new_tokens["access_token"]
                 updated = {
                     **token_data,
-                    "access_token": new_tokens["access_token"],
+                    "access_token": new_access,
                 }
                 if db_pool and user_id:
-                    await db_stage.save_refreshed_token(db_pool, user_id, "youtube", updated)
+                    try:
+                        await db_stage.save_refreshed_token(
+                            db_pool,
+                            user_id=user_id,
+                            platform="youtube",
+                            access_token=new_access,
+                        )
+                    except Exception as save_err:
+                        logger.warning(f"YouTube: Failed to persist refreshed token: {save_err}")
                 return updated
             else:
                 logger.warning(f"YouTube: Token refresh failed: {resp.status_code} {resp.text[:200]}")
@@ -680,11 +779,10 @@ async def publish_to_youtube(
                     "categoryId": "22"  # People & Blogs
                 },
                 "status": {
-                    "privacyStatus": {
-                            "public":   "public",
-                            "unlisted": "unlisted",
-                            "private":  "private",
-                        }.get((getattr(ctx, "privacy", None) or "public").lower(), "public"),
+                    "privacyStatus": resolve_privacy_level(
+                        getattr(ctx, "privacy", None) or "public",
+                        "youtube",
+                    ),
                     "selfDeclaredMadeForKids": False
                 }
             }
@@ -823,20 +921,22 @@ async def publish_to_instagram(
         )
 
     caption = _build_full_caption(ctx)
+    ig_privacy = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "instagram")
 
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             # Step 1: Create media container
-            logger.info(f"Instagram: Creating Reels container for ig_user_id={ig_user_id}")
+            logger.info(f"Instagram: Creating Reels container for ig_user_id={ig_user_id} (privacy={ig_privacy})")
+            ig_params = {
+                "access_token": access_token,
+                "media_type": "REELS",
+                "video_url": video_url,
+                "caption": caption[:2200] if caption else "",
+                "share_to_feed": "true" if ig_privacy == "public" else "false",
+            }
             create_resp = await client.post(
                 f"https://graph.facebook.com/{META_API_VERSION}/{ig_user_id}/media",
-                params={
-                    "access_token": access_token,
-                    "media_type": "REELS",
-                    "video_url": video_url,
-                    "caption": caption[:2200] if caption else "",
-                    "share_to_feed": "true",
-                }
+                params=ig_params
             )
 
             if create_resp.status_code != 200:
@@ -1008,6 +1108,8 @@ async def publish_to_facebook(
         )
 
     description = _build_full_caption(ctx)
+    fb_privacy_value = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "facebook")
+    fb_privacy_param = {"value": fb_privacy_value}  # FB Graph API format: {"value": "EVERYONE"}
 
     try:
         async with httpx.AsyncClient(timeout=300) as client:
@@ -1020,6 +1122,7 @@ async def publish_to_facebook(
                         params={
                             "access_token": access_token,
                             "description": description[:5000] if description else "",
+                            "privacy": json.dumps(fb_privacy_param),
                         },
                         files=files,
                     )
@@ -1031,6 +1134,7 @@ async def publish_to_facebook(
                         "access_token": access_token,
                         "file_url": video_url,
                         "description": description[:5000] if description else "",
+                        "privacy": json.dumps(fb_privacy_param),
                     },
                 )
             else:

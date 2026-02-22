@@ -163,8 +163,13 @@ async def mark_processing_failed(
 
 
 async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
-    """Mark upload as cancelled."""
+    """Mark upload as cancelled and refund any reserved tokens back to the user's wallet."""
     async with pool.acquire() as conn:
+        # Fetch reserved token amounts so we can refund them
+        row = await conn.fetchrow(
+            "SELECT user_id, put_reserved, aic_reserved FROM uploads WHERE id = $1",
+            upload_id,
+        )
         await conn.execute(
             """
             UPDATE uploads
@@ -175,6 +180,20 @@ async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
             """,
             upload_id,
         )
+        # Refund reserved tokens back to wallet (cancel_requested path: pending cancel was
+        # set by the API but token refund was skipped because job was mid-processing)
+        if row and (row["put_reserved"] or row["aic_reserved"]):
+            await conn.execute(
+                """
+                UPDATE wallets
+                SET put_reserved = GREATEST(0, put_reserved - $1),
+                    aic_reserved = GREATEST(0, aic_reserved - $2)
+                WHERE user_id = $3
+                """,
+                row["put_reserved"] or 0,
+                row["aic_reserved"] or 0,
+                row["user_id"],
+            )
 
 
 async def check_cancel_requested(pool: asyncpg.Pool, upload_id: str) -> bool:
@@ -187,6 +206,33 @@ async def check_cancel_requested(pool: asyncpg.Pool, upload_id: str) -> bool:
             return bool(val)
     except Exception:
         return False
+
+
+async def update_stage_progress(pool: asyncpg.Pool, upload_id: str, stage: str, progress: int):
+    """Write the current pipeline stage and % progress to the DB so the queue screen
+    and upload page timer can both display live status.
+    Writes to processing_stage + processing_progress — the same columns the
+    single-upload endpoint (/api/uploads/{id}) already reads and returns as
+    processingStage / processingProgress to upload.html's polling loop.
+    """
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET processing_stage    = $2,
+                    processing_progress = $3,
+                    updated_at          = NOW()
+                WHERE id = $1
+                """,
+                upload_id,
+                stage,
+                progress,
+            )
+    except Exception:
+        # Non-fatal — if columns don't exist yet neither screen will show progress,
+        # but the pipeline won't crash
+        pass
 
 
 # ============================================================

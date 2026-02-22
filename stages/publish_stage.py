@@ -156,21 +156,65 @@ def _get_caption(ctx: JobContext) -> str:
 
 
 def _get_hashtags(ctx: JobContext) -> str:
-    """Get hashtag string for publishing."""
+    """Get hashtag string for publishing.
+
+    Tags are stored without the '#' prefix (stripped at save time).
+    We always add '#' here so captions look correct on every platform.
+    """
     tags = []
     if hasattr(ctx, "get_effective_hashtags"):
         tags = ctx.get_effective_hashtags()
     else:
         tags = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
-    return " ".join(tags) if tags else ""
+
+    # Normalise: ensure each tag starts with '#' and contains no whitespace
+    normalised = []
+    for t in tags:
+        t = str(t).strip()
+        if not t:
+            continue
+        if not t.startswith("#"):
+            t = f"#{t}"
+        normalised.append(t)
+    return " ".join(normalised) if normalised else ""
 
 
 def _build_full_caption(ctx: JobContext) -> str:
-    """Build caption + hashtags combined (for IG/FB)."""
+    """Build caption + hashtags combined (for IG/FB/YouTube).
+
+    Respects the user's hashtag_position preference:
+      - 'start' → hashtags appear before the caption text
+      - 'end'   → hashtags appear after the caption text (default)
+
+    The position is stored in ctx.user_preferences (JSONB saved at presign time).
+    """
     caption = _get_caption(ctx)
     hashtags = _get_hashtags(ctx)
-    parts = [p for p in [caption, hashtags] if p]
-    return "\n\n".join(parts) if parts else ""
+
+    if not hashtags:
+        return caption or ""
+    if not caption:
+        return hashtags
+
+    # Resolve hashtag position from stored user preferences
+    hashtag_position = "end"  # safe default
+    try:
+        up = getattr(ctx, "user_preferences", None)
+        if isinstance(up, str):
+            import json as _json
+            up = _json.loads(up)
+        if isinstance(up, dict):
+            hashtag_position = (
+                up.get("hashtag_position")
+                or up.get("hashtagPosition")
+                or "end"
+            ).lower()
+    except Exception:
+        pass
+
+    if hashtag_position == "start":
+        return f"{hashtags}\n\n{caption}"
+    return f"{caption}\n\n{hashtags}"
 
 
 def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:

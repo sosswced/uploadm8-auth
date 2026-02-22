@@ -38,6 +38,8 @@ from typing import Optional
 import asyncpg
 import redis.asyncio as redis
 
+import httpx
+
 from stages.errors import StageError, SkipStage, CancelRequested
 from stages.context import JobContext, create_context
 from stages.entitlements import get_entitlements_from_user
@@ -71,6 +73,133 @@ db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[redis.Redis] = None
 shutdown_requested = False
 shutdown_event = None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hotfix helpers (runtime patching)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _save_refreshed_token_fallback(db_pool, user_id: str, platform: str, token_data: dict, account_id: str | None = None):
+    """Persist refreshed token into platform_tokens.token_data (json)."""
+    if not db_pool or not user_id or not platform or not isinstance(token_data, dict):
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            if account_id:
+                await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                       SET token_data = $1, updated_at = NOW()
+                     WHERE user_id = $2
+                       AND platform = $3
+                       AND account_id = $4
+                       AND revoked_at IS NULL
+                    """,
+                    json.dumps(token_data),
+                    user_id,
+                    platform,
+                    account_id,
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                       SET token_data = $1, updated_at = NOW()
+                     WHERE user_id = $2
+                       AND platform = $3
+                       AND revoked_at IS NULL
+                    """,
+                    json.dumps(token_data),
+                    user_id,
+                    platform,
+                )
+    except Exception as e:
+        logger.warning(f"Failed to persist refreshed token fallback: {e}")
+
+
+def _ensure_db_stage_token_persist():
+    """If stages.db is missing save_refreshed_token, inject a fallback."""
+    try:
+        if not hasattr(db_stage, 'save_refreshed_token'):
+            async def _shim(pool, user_id, platform, token_data, account_id=None):
+                return await _save_refreshed_token_fallback(pool, str(user_id), str(platform), token_data or {}, str(account_id) if account_id else None)
+            setattr(db_stage, 'save_refreshed_token', _shim)
+            logger.warning('Injected fallback db_stage.save_refreshed_token (persisting into platform_tokens.token_data)')
+    except Exception:
+        pass
+
+
+async def _tiktok_inbox_upload(access_token: str, video_path: Path) -> dict:
+    """
+    TikTok Content Posting API (Upload / Inbox draft) — FILE_UPLOAD flow.
+    Fixes 'total chunk count is invalid' by strictly following TikTok's chunk rules:
+      total_chunk_count = floor(video_size / chunk_size)
+      each chunk 5–64MB; final chunk may exceed chunk_size up to 128MB
+    """
+    if not access_token:
+        return {'ok': False, 'error': 'missing-access-token'}
+    if not video_path or not Path(video_path).exists():
+        return {'ok': False, 'error': 'missing-video-file'}
+
+    video_path = Path(video_path)
+    video_size = int(video_path.stat().st_size)
+
+    if video_size < 5 * 1024 * 1024:
+        chunk_size = video_size
+        total_chunk_count = 1
+    else:
+        chunk_size = 10_000_000  # 10MB (within 5–64MB)
+        total_chunk_count = max(1, video_size // chunk_size)  # floor
+
+    init_body = {
+        'source_info': {
+            'source': 'FILE_UPLOAD',
+            'video_size': video_size,
+            'chunk_size': chunk_size,
+            'total_chunk_count': total_chunk_count,
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        init_resp = await client.post(
+            'https://open.tiktokapis.com/v2/post/publish/inbox/video/init/',
+            headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json; charset=UTF-8'},
+            json=init_body,
+        )
+        if init_resp.status_code != 200:
+            return {'ok': False, 'error': f'init-http-{init_resp.status_code}', 'detail': init_resp.text[:500]}
+
+        init_json = init_resp.json()
+        err = (init_json.get('error') or {})
+        if err.get('code') not in ('ok', 'OK', None, ''):
+            return {'ok': False, 'error': f"init-error-{err.get('code')}", 'detail': (err.get('message') or '')[:500]}
+
+        data = init_json.get('data') or {}
+        publish_id = data.get('publish_id')
+        upload_url = data.get('upload_url')
+        if not upload_url:
+            return {'ok': False, 'error': 'init-missing-upload-url', 'detail': str(init_json)[:500]}
+
+        with open(video_path, 'rb') as f:
+            for idx in range(total_chunk_count):
+                start = idx * chunk_size
+                end = (video_size - 1) if (idx == total_chunk_count - 1) else min(start + chunk_size - 1, video_size - 1)
+                length = end - start + 1
+
+                f.seek(start)
+                chunk = f.read(length)
+                if len(chunk) != length:
+                    return {'ok': False, 'error': 'short-read', 'detail': f'expected={length} got={len(chunk)}'}
+
+                put_headers = {
+                    'Content-Type': 'video/mp4',
+                    'Content-Length': str(length),
+                    'Content-Range': f'bytes {start}-{end}/{video_size}',
+                }
+                put_resp = await client.put(upload_url, headers=put_headers, content=chunk)
+                if put_resp.status_code not in (200, 201, 204):
+                    return {'ok': False, 'error': f'put-http-{put_resp.status_code}', 'detail': put_resp.text[:500]}
+
+        return {'ok': True, 'publish_id': publish_id, 'video_size': video_size, 'chunk_size': chunk_size, 'total_chunk_count': total_chunk_count}
 
 
 def handle_shutdown(signum, frame):
@@ -308,12 +437,90 @@ async def run_pipeline(job_data: dict) -> bool:
         # checks ctx.platform_videos[platform] first (local temp files)
         # ================================================================
         try:
+            _ensure_db_stage_token_persist()
             ctx = await run_publish_stage(ctx, db_pool)
         except StageError as e:
-            logger.error(f"Publish error: {e.message}")
-            ctx.mark_error(e.code.value, e.message)
-        await maybe_cancel(ctx, "publish")
+            msg = (e.message or "")
+            logger.error(f"Publish error: {msg}")
 
+            did_fallback = False
+            try:
+                wants_tiktok = "tiktok" in (getattr(ctx, "platforms", []) or getattr(ctx, "target_platforms", []) or getattr(ctx, "requested_platforms", []) or [])
+                if wants_tiktok and ("total chunk count is invalid" in msg.lower() or "invalid_params" in msg.lower()):
+                    from stages.publish_stage import decrypt_token, init_enc_keys
+                    init_enc_keys()
+
+                    async with db_pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            "SELECT token_blob, token_data, account_id FROM platform_tokens "
+                            "WHERE user_id = $1 AND platform = 'tiktok' AND revoked_at IS NULL "
+                            "ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 1",
+                            str(ctx.user_id),
+                        )
+
+                    if row:
+                        raw = row["token_blob"] or row["token_data"]
+                        raw_dict = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+                        token = decrypt_token(raw_dict) if raw_dict else {}
+                        access_token = (token or {}).get("access_token", "")
+
+                        vp = None
+                        try:
+                            vp = (getattr(ctx, "platform_videos", {}) or {}).get("tiktok")
+                        except Exception:
+                            vp = None
+                        if not vp:
+                            vp = getattr(ctx, "processed_video_path", None) or getattr(ctx, "local_video_path", None)
+
+                        if access_token and vp:
+                            logger.warning("TikTok publish failed; running inbox FILE_UPLOAD fallback (strict chunk rules).")
+                            res = await _tiktok_inbox_upload(access_token, Path(vp))
+                            if res.get("ok"):
+                                did_fallback = True
+                                publish_id = res.get("publish_id")
+                                logger.info(f"TikTok inbox upload OK (publish_id={publish_id})")
+
+                                async with db_pool.acquire() as conn:
+                                    existing = await conn.fetchval(
+                                        "SELECT platform_results FROM uploads WHERE id = $1",
+                                        str(ctx.upload_id),
+                                    )
+                                    try:
+                                        pr = json.loads(existing) if isinstance(existing, str) and existing else (existing or [])
+                                    except Exception:
+                                        pr = []
+                                    if not isinstance(pr, list):
+                                        pr = []
+
+                                    pr = [x for x in pr if not (isinstance(x, dict) and x.get("platform") == "tiktok")]
+                                    pr.append({
+                                        "platform": "tiktok",
+                                        "status": "uploaded_to_inbox",
+                                        "publish_id": publish_id,
+                                        "note": "Uploaded via FILE_UPLOAD inbox flow; creator must finalize in TikTok app unless Direct Post is enabled.",
+                                        "ts": datetime.now(timezone.utc).isoformat(),
+                                    })
+
+                                    await conn.execute(
+                                        "UPDATE uploads SET platform_results = $1, updated_at = NOW(), error_code = NULL, error_detail = NULL WHERE id = $2",
+                                        json.dumps(pr),
+                                        str(ctx.upload_id),
+                                    )
+
+                                try:
+                                    if hasattr(ctx, "mark_platform_success"):
+                                        ctx.mark_platform_success("tiktok", {"publish_id": publish_id})
+                                except Exception:
+                                    pass
+                            else:
+                                logger.error(f"TikTok inbox fallback failed: {res}")
+            except Exception as fb_err:
+                logger.warning(f"TikTok inbox fallback errored: {fb_err}")
+
+            if not did_fallback:
+                ctx.mark_error(e.code.value, e.message)
+
+        await maybe_cancel(ctx, "publish")
         # ================================================================
         # STAGE 10: Notify - Discord webhooks
         # ================================================================

@@ -354,11 +354,11 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
     # user_settings control WHETHER the user has toggled AI on.
     # Both must be true for generation to proceed.
     if not ctx.entitlements:
-        raise SkipStage("No entitlements", stage="captions")
+        raise SkipStage("No entitlements")
 
     can_ai = getattr(ctx.entitlements, "can_ai", False)
     if not can_ai:
-        raise SkipStage("AI not available on this plan", stage="captions")
+        raise SkipStage("AI not available on this plan")
 
     us = ctx.user_settings or {}
 
@@ -375,10 +375,10 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
         generate_hashtags = bool(us["auto_generate_hashtags"])
 
     if not (generate_title or generate_caption or generate_hashtags):
-        raise SkipStage("AI generation not enabled by user settings", stage="captions")
+        raise SkipStage("AI generation not enabled by user settings")
 
     if not ctx.local_video_path or not ctx.local_video_path.exists():
-        raise SkipStage("No local video file", stage="captions")
+        raise SkipStage("No local video file")
 
     try:
         frames = await extract_video_frames(ctx.local_video_path, ctx.temp_dir)

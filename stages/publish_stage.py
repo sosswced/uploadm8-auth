@@ -223,15 +223,18 @@ def _get_caption(ctx: JobContext) -> str:
     )
 
 
-def _get_hashtags(ctx: JobContext) -> str:
-    """Get hashtag string for publishing.
-
-    Tags are stored without the '#' prefix (stripped at save time).
-    We always add '#' here so captions look correct on every platform.
+def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
     """
-    tags = []
+    Get the final hashtag string for a platform, applying user preferences:
+      - always_hashtags (prepended)
+      - platform-specific extras
+      - blocked_hashtags removed
+      - max_hashtags cap
+
+    Tags returned with '#' prefix, space-separated.
+    """
     if hasattr(ctx, "get_effective_hashtags"):
-        tags = ctx.get_effective_hashtags()
+        tags = ctx.get_effective_hashtags(platform=platform or None)
     else:
         tags = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
 
@@ -247,36 +250,46 @@ def _get_hashtags(ctx: JobContext) -> str:
     return " ".join(normalised) if normalised else ""
 
 
-def _build_full_caption(ctx: JobContext) -> str:
+def _build_full_caption(ctx: JobContext, platform: str = "") -> str:
     """Build caption + hashtags combined (for IG/FB/YouTube).
 
     Respects the user's hashtag_position preference:
       - 'start' → hashtags appear before the caption text
       - 'end'   → hashtags appear after the caption text (default)
 
-    The position is stored in ctx.user_preferences (JSONB saved at presign time).
+    The position is read from ctx.user_settings (primary) or ctx.user_preferences (legacy).
     """
     caption = _get_caption(ctx)
-    hashtags = _get_hashtags(ctx)
+    hashtags = _get_hashtags(ctx, platform=platform)
 
     if not hashtags:
         return caption or ""
     if not caption:
         return hashtags
 
-    # Resolve hashtag position from stored user preferences
+    # Resolve hashtag position from user_settings (primary) or legacy user_preferences
     hashtag_position = "end"  # safe default
     try:
-        up = getattr(ctx, "user_preferences", None)
-        if isinstance(up, str):
-            import json as _json
-            up = _json.loads(up)
-        if isinstance(up, dict):
+        # Primary: user_settings (dict from DB row)
+        us = getattr(ctx, "user_settings", None) or {}
+        if isinstance(us, dict) and us:
             hashtag_position = (
-                up.get("hashtag_position")
-                or up.get("hashtagPosition")
+                us.get("hashtag_position")
+                or us.get("hashtagPosition")
                 or "end"
             ).lower()
+        else:
+            # Legacy: user_preferences (JSONB blob)
+            up = getattr(ctx, "user_preferences", None)
+            if isinstance(up, str):
+                import json as _json
+                up = _json.loads(up)
+            if isinstance(up, dict):
+                hashtag_position = (
+                    up.get("hashtag_position")
+                    or up.get("hashtagPosition")
+                    or "end"
+                ).lower()
     except Exception:
         pass
 
@@ -576,7 +589,7 @@ async def publish_to_tiktok(
         )
 
     title = _get_title(ctx)
-    caption = _build_full_caption(ctx)
+    caption = _build_full_caption(ctx, platform="tiktok")
     # TikTok post_info fields:
     #   title       – max 150 chars, shown in TikTok Studio / For You caption
     #   description – full caption + hashtags (up to 2200 chars), shown on post
@@ -774,7 +787,7 @@ async def publish_to_youtube(
         )
 
     title = _get_title(ctx)[:100]
-    caption = _build_full_caption(ctx)
+    caption = _build_full_caption(ctx, platform="youtube")
     description = caption[:5000] if caption else ""
 
     try:
@@ -929,7 +942,7 @@ async def publish_to_instagram(
             error_message="Instagram requires a public video URL. Configure R2_PUBLIC_URL or ensure presigned URLs work."
         )
 
-    caption = _build_full_caption(ctx)
+    caption = _build_full_caption(ctx, platform="instagram")
     ig_privacy = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "instagram")
 
     try:
@@ -1116,7 +1129,7 @@ async def publish_to_facebook(
             error_message="No Facebook page ID found in token data"
         )
 
-    description = _build_full_caption(ctx)
+    description = _build_full_caption(ctx, platform="facebook")
     fb_privacy_value = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "facebook")
     fb_privacy_param = {"value": fb_privacy_value}  # FB Graph API format: {"value": "EVERYONE"}
 

@@ -272,8 +272,92 @@ class JobContext:
     def get_effective_caption(self) -> str:
         return self.ai_caption or self.caption or ""
 
-    def get_effective_hashtags(self) -> List[str]:
-        return self.ai_hashtags if self.ai_hashtags else self.hashtags
+    def get_effective_hashtags(self, platform: Optional[str] = None) -> List[str]:
+        """
+        Build the final deduplicated hashtag list for a given platform, applying:
+          1. AI-generated hashtags (or upload-level hashtags as fallback)
+          2. Always-add hashtags from user_settings (prepended, always present)
+          3. Platform-specific extra hashtags from user_settings
+          4. Blocked hashtags removed
+          5. Max hashtags cap from user_settings (default 15)
+
+        Args:
+            platform: Optional platform name ('tiktok', 'youtube', 'instagram', 'facebook').
+                      When provided, platform_hashtags for that platform are added.
+
+        Returns:
+            List[str] — each tag starts with '#', deduplicated, capped at max_hashtags.
+        """
+        us = self.user_settings or {}
+
+        # ── 1. Base hashtags: AI-generated > upload-level fallback ──────────
+        base_tags: List[str] = list(self.ai_hashtags) if self.ai_hashtags else list(self.hashtags or [])
+
+        # ── 2. Preference lists ──────────────────────────────────────────────
+        def _to_list(v) -> List[str]:
+            """Normalise a preference value to a clean list of strings."""
+            if not v:
+                return []
+            if isinstance(v, str):
+                import json as _json
+                try:
+                    parsed = _json.loads(v)
+                    if isinstance(parsed, list):
+                        v = parsed
+                    else:
+                        v = [str(parsed)]
+                except Exception:
+                    v = [t.strip() for t in v.replace(",", " ").split() if t.strip()]
+            if isinstance(v, list):
+                return [str(t).strip() for t in v if t and str(t).strip()]
+            return []
+
+        always_tags:  List[str] = _to_list(us.get("always_hashtags") or us.get("alwaysHashtags"))
+        blocked_tags: List[str] = _to_list(us.get("blocked_hashtags") or us.get("blockedHashtags"))
+        platform_extra: List[str] = []
+
+        if platform:
+            ph = us.get("platform_hashtags") or us.get("platformHashtags") or {}
+            if isinstance(ph, str):
+                try:
+                    import json as _json
+                    ph = _json.loads(ph)
+                except Exception:
+                    ph = {}
+            platform_extra = _to_list(ph.get(platform) or ph.get(platform.lower()))
+
+        # ── 3. Blocked set (normalised, no # prefix) ─────────────────────────
+        blocked_set = {t.lstrip("#").lower() for t in blocked_tags if t}
+
+        # ── 4. Normalise all tags → ensure '#' prefix, lowercase ─────────────
+        def _normalise(tags: List[str]) -> List[str]:
+            out = []
+            for t in tags:
+                t = t.strip().lstrip("#").lower()
+                if t and t not in blocked_set:
+                    out.append(f"#{t}")
+            return out
+
+        # ── 5. Assemble: always_tags (front) + base + platform_extra ─────────
+        ordered: List[str] = []
+        seen: set = set()
+
+        def _add(tags: List[str]):
+            for t in _normalise(tags):
+                key = t.lstrip("#").lower()
+                if key not in seen:
+                    seen.add(key)
+                    ordered.append(t)
+
+        _add(always_tags)    # always appear first
+        _add(base_tags)      # AI / upload hashtags
+        _add(platform_extra) # platform-specific extras
+
+        # ── 6. Cap at max_hashtags from user settings ─────────────────────────
+        max_h = int(us.get("max_hashtags") or us.get("maxHashtags") or 15)
+        max_h = max(1, min(max_h, 50))  # sane bounds
+
+        return ordered[:max_h]
 
     def is_success(self) -> bool:
         return any(r.success for r in self.platform_results)

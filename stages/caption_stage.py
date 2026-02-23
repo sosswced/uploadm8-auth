@@ -349,22 +349,33 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
     - ctx.ai_caption
     - ctx.ai_hashtags (proper List[str])
     """
-    # Feature gate checks
+    # ── Feature gate checks ────────────────────────────────────────────────
+    # Entitlements control WHETHER the plan supports AI at all.
+    # user_settings control WHETHER the user has toggled AI on.
+    # Both must be true for generation to proceed.
     if not ctx.entitlements:
         raise SkipStage("No entitlements", stage="captions")
 
-    generate_title = getattr(ctx.entitlements, "ai_captions_enabled", False)
-    generate_caption = getattr(ctx.entitlements, "ai_captions_enabled", False)
-    generate_hashtags = getattr(ctx.entitlements, "ai_hashtags_enabled", False)
+    can_ai = getattr(ctx.entitlements, "can_ai", False)
+    if not can_ai:
+        raise SkipStage("AI not available on this plan", stage="captions")
 
-    # Check user settings overrides
-    if not ctx.user_settings.get("auto_generate_captions", True):
-        generate_caption = False
-    if not ctx.user_settings.get("auto_generate_hashtags", True):
-        generate_hashtags = False
+    us = ctx.user_settings or {}
+
+    # Read user's own on/off toggles — support both snake_case and camelCase DB columns
+    generate_title   = bool(us.get("auto_captions")   or us.get("autoCaptions",   False))
+    generate_caption = bool(us.get("auto_captions")   or us.get("autoCaptions",   False))
+    generate_hashtags = bool(us.get("ai_hashtags_enabled") or us.get("aiHashtagsEnabled", False))
+
+    # Explicit override keys (settings page may send these)
+    if us.get("auto_generate_captions") is not None:
+        generate_caption = bool(us["auto_generate_captions"])
+        generate_title   = generate_caption  # title follows caption toggle
+    if us.get("auto_generate_hashtags") is not None:
+        generate_hashtags = bool(us["auto_generate_hashtags"])
 
     if not (generate_title or generate_caption or generate_hashtags):
-        raise SkipStage("AI generation not enabled for this tier", stage="captions")
+        raise SkipStage("AI generation not enabled by user settings", stage="captions")
 
     if not ctx.local_video_path or not ctx.local_video_path.exists():
         raise SkipStage("No local video file", stage="captions")
@@ -374,9 +385,13 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
         if not frames:
             logger.warning("No frames extracted — generating captions without visual context")
 
-        max_hashtags = get_max_hashtags(ctx.entitlements)
-        default_count = int(ctx.user_settings.get("default_hashtag_count", 5))
-        hashtag_count = min(default_count, max_hashtags) if generate_hashtags else 0
+        # ── Hashtag count: max_hashtags from user settings, entitlements as ceiling ──
+        # user_settings.max_hashtags = user's preference (e.g. 20)
+        # entitlements has no hard cap field; plan cap is enforced elsewhere
+        us = ctx.user_settings or {}
+        pref_max = int(us.get("max_hashtags") or us.get("maxHashtags") or us.get("ai_hashtag_count") or us.get("aiHashtagCount") or 15)
+        pref_max = max(1, min(pref_max, 50))  # sane bounds
+        hashtag_count = pref_max if generate_hashtags else 0
 
         # Pull Trill context if available
         trill_score_val: Optional[int] = None
@@ -422,7 +437,7 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
             logger.info(f"AI caption: {ctx.ai_caption[:80]}")
 
         if result.get("hashtags") and generate_hashtags:
-            ctx.ai_hashtags = result["hashtags"][:max_hashtags]
+            ctx.ai_hashtags = result["hashtags"][:pref_max]
             logger.info(f"AI hashtags ({len(ctx.ai_hashtags)}): {ctx.ai_hashtags}")
 
         tokens_used = result.get("tokens", {})

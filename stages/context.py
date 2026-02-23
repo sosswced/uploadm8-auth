@@ -39,23 +39,6 @@ class TelemetryData:
     location_road: Optional[str] = None     # road/highway name if available
 
     # -------------------------
-    # Pandas-enriched performance stats
-    # Populated by telemetry_stage after DataFrame analysis.
-    # Consumed by caption_stage via _safe_attr() to build natural language.
-    # Declared with init=False so constructor signatures stay clean —
-    # these are internal pipeline attrs, not user-supplied inputs.
-    # -------------------------
-    _speed_p95: Optional[float] = field(default=None, init=False, repr=False)
-    _speed_p50: Optional[float] = field(default=None, init=False, repr=False)
-    _accel_events: Optional[int] = field(default=None, init=False, repr=False)
-    _speed_std: Optional[float] = field(default=None, init=False, repr=False)
-    _pandas_loaded: bool = field(default=False, init=False, repr=False)
-    # NOTE: _df (the raw pandas DataFrame) is intentionally NOT declared here.
-    # It is set directly by telemetry_stage and accessed via getattr(..., None).
-    # DataFrames are large, non-serialisable objects — keeping them out of the
-    # dataclass definition prevents accidental serialisation and keeps repr clean.
-
-    # -------------------------
     # Back-compat aliases used by older stages
     # -------------------------
     @property
@@ -272,92 +255,8 @@ class JobContext:
     def get_effective_caption(self) -> str:
         return self.ai_caption or self.caption or ""
 
-    def get_effective_hashtags(self, platform: Optional[str] = None) -> List[str]:
-        """
-        Build the final deduplicated hashtag list for a given platform, applying:
-          1. AI-generated hashtags (or upload-level hashtags as fallback)
-          2. Always-add hashtags from user_settings (prepended, always present)
-          3. Platform-specific extra hashtags from user_settings
-          4. Blocked hashtags removed
-          5. Max hashtags cap from user_settings (default 15)
-
-        Args:
-            platform: Optional platform name ('tiktok', 'youtube', 'instagram', 'facebook').
-                      When provided, platform_hashtags for that platform are added.
-
-        Returns:
-            List[str] — each tag starts with '#', deduplicated, capped at max_hashtags.
-        """
-        us = self.user_settings or {}
-
-        # ── 1. Base hashtags: AI-generated > upload-level fallback ──────────
-        base_tags: List[str] = list(self.ai_hashtags) if self.ai_hashtags else list(self.hashtags or [])
-
-        # ── 2. Preference lists ──────────────────────────────────────────────
-        def _to_list(v) -> List[str]:
-            """Normalise a preference value to a clean list of strings."""
-            if not v:
-                return []
-            if isinstance(v, str):
-                import json as _json
-                try:
-                    parsed = _json.loads(v)
-                    if isinstance(parsed, list):
-                        v = parsed
-                    else:
-                        v = [str(parsed)]
-                except Exception:
-                    v = [t.strip() for t in v.replace(",", " ").split() if t.strip()]
-            if isinstance(v, list):
-                return [str(t).strip() for t in v if t and str(t).strip()]
-            return []
-
-        always_tags:  List[str] = _to_list(us.get("always_hashtags") or us.get("alwaysHashtags"))
-        blocked_tags: List[str] = _to_list(us.get("blocked_hashtags") or us.get("blockedHashtags"))
-        platform_extra: List[str] = []
-
-        if platform:
-            ph = us.get("platform_hashtags") or us.get("platformHashtags") or {}
-            if isinstance(ph, str):
-                try:
-                    import json as _json
-                    ph = _json.loads(ph)
-                except Exception:
-                    ph = {}
-            platform_extra = _to_list(ph.get(platform) or ph.get(platform.lower()))
-
-        # ── 3. Blocked set (normalised, no # prefix) ─────────────────────────
-        blocked_set = {t.lstrip("#").lower() for t in blocked_tags if t}
-
-        # ── 4. Normalise all tags → ensure '#' prefix, lowercase ─────────────
-        def _normalise(tags: List[str]) -> List[str]:
-            out = []
-            for t in tags:
-                t = t.strip().lstrip("#").lower()
-                if t and t not in blocked_set:
-                    out.append(f"#{t}")
-            return out
-
-        # ── 5. Assemble: always_tags (front) + base + platform_extra ─────────
-        ordered: List[str] = []
-        seen: set = set()
-
-        def _add(tags: List[str]):
-            for t in _normalise(tags):
-                key = t.lstrip("#").lower()
-                if key not in seen:
-                    seen.add(key)
-                    ordered.append(t)
-
-        _add(always_tags)    # always appear first
-        _add(base_tags)      # AI / upload hashtags
-        _add(platform_extra) # platform-specific extras
-
-        # ── 6. Cap at max_hashtags from user settings ─────────────────────────
-        max_h = int(us.get("max_hashtags") or us.get("maxHashtags") or 15)
-        max_h = max(1, min(max_h, 50))  # sane bounds
-
-        return ordered[:max_h]
+    def get_effective_hashtags(self) -> List[str]:
+        return self.ai_hashtags if self.ai_hashtags else self.hashtags
 
     def is_success(self) -> bool:
         return any(r.success for r in self.platform_results)
@@ -369,6 +268,36 @@ class JobContext:
 
     def get_success_platforms(self) -> List[str]:
         return [r.platform for r in self.platform_results if r.success]
+
+    # ── Convenience location properties ───────────────────────────────────────
+    # The worker and some pipeline stages access ctx.location_name directly.
+    # These proxy the TelemetryData fields so callers don't need to drill into
+    # ctx.telemetry — and they're always safe (return None when no telemetry).
+
+    @property
+    def location_name(self) -> Optional[str]:
+        """Reverse-geocoded display string, e.g. 'Kansas City, MO'.
+        Proxies TelemetryData.location_display."""
+        t = self.telemetry or self.telemetry_data
+        return t.location_display if t else None
+
+    @property
+    def location_city(self) -> Optional[str]:
+        """City from reverse geocoding."""
+        t = self.telemetry or self.telemetry_data
+        return t.location_city if t else None
+
+    @property
+    def location_state(self) -> Optional[str]:
+        """State/region from reverse geocoding."""
+        t = self.telemetry or self.telemetry_data
+        return t.location_state if t else None
+
+    @property
+    def location_road(self) -> Optional[str]:
+        """Road/highway name from reverse geocoding."""
+        t = self.telemetry or self.telemetry_data
+        return t.location_road if t else None
 
 
 def create_context(job_data: dict, upload_record: dict, user_settings: dict, entitlements: Entitlements) -> JobContext:

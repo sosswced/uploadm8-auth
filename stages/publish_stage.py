@@ -26,6 +26,7 @@ import json
 import asyncio
 import logging
 import base64
+import math
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -223,18 +224,15 @@ def _get_caption(ctx: JobContext) -> str:
     )
 
 
-def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
-    """
-    Get the final hashtag string for a platform, applying user preferences:
-      - always_hashtags (prepended)
-      - platform-specific extras
-      - blocked_hashtags removed
-      - max_hashtags cap
+def _get_hashtags(ctx: JobContext) -> str:
+    """Get hashtag string for publishing.
 
-    Tags returned with '#' prefix, space-separated.
+    Tags are stored without the '#' prefix (stripped at save time).
+    We always add '#' here so captions look correct on every platform.
     """
+    tags = []
     if hasattr(ctx, "get_effective_hashtags"):
-        tags = ctx.get_effective_hashtags(platform=platform or None)
+        tags = ctx.get_effective_hashtags()
     else:
         tags = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
 
@@ -250,46 +248,36 @@ def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
     return " ".join(normalised) if normalised else ""
 
 
-def _build_full_caption(ctx: JobContext, platform: str = "") -> str:
+def _build_full_caption(ctx: JobContext) -> str:
     """Build caption + hashtags combined (for IG/FB/YouTube).
 
     Respects the user's hashtag_position preference:
       - 'start' → hashtags appear before the caption text
       - 'end'   → hashtags appear after the caption text (default)
 
-    The position is read from ctx.user_settings (primary) or ctx.user_preferences (legacy).
+    The position is stored in ctx.user_preferences (JSONB saved at presign time).
     """
     caption = _get_caption(ctx)
-    hashtags = _get_hashtags(ctx, platform=platform)
+    hashtags = _get_hashtags(ctx)
 
     if not hashtags:
         return caption or ""
     if not caption:
         return hashtags
 
-    # Resolve hashtag position from user_settings (primary) or legacy user_preferences
+    # Resolve hashtag position from stored user preferences
     hashtag_position = "end"  # safe default
     try:
-        # Primary: user_settings (dict from DB row)
-        us = getattr(ctx, "user_settings", None) or {}
-        if isinstance(us, dict) and us:
+        up = getattr(ctx, "user_preferences", None)
+        if isinstance(up, str):
+            import json as _json
+            up = _json.loads(up)
+        if isinstance(up, dict):
             hashtag_position = (
-                us.get("hashtag_position")
-                or us.get("hashtagPosition")
+                up.get("hashtag_position")
+                or up.get("hashtagPosition")
                 or "end"
             ).lower()
-        else:
-            # Legacy: user_preferences (JSONB blob)
-            up = getattr(ctx, "user_preferences", None)
-            if isinstance(up, str):
-                import json as _json
-                up = _json.loads(up)
-            if isinstance(up, dict):
-                hashtag_position = (
-                    up.get("hashtag_position")
-                    or up.get("hashtagPosition")
-                    or "end"
-                ).lower()
     except Exception:
         pass
 
@@ -589,41 +577,52 @@ async def publish_to_tiktok(
         )
 
     title = _get_title(ctx)
-    caption = _build_full_caption(ctx, platform="tiktok")
-    # TikTok post_info fields:
-    #   title       – max 150 chars, shown in TikTok Studio / For You caption
-    #   description – full caption + hashtags (up to 2200 chars), shown on post
-    tiktok_title = title[:150] if title else (caption[:150] if caption else "")
-    tiktok_description = caption[:2200] if caption else ""
+    caption = _build_full_caption(ctx)
+    # TikTok uses title field (max 150 chars), caption goes in description
+    tiktok_title = (caption or title)[:150]
 
     try:
         file_size = video_path.stat().st_size
-        # TikTok chunk rules:
-        # - Each chunk must be 5MB–64MB, except the final chunk (up to 128MB)
-        # - For files ≤ 64MB: single chunk (chunk_size = file_size, total_chunk_count = 1)
-        # - For files > 64MB: use 64MB chunks
-        CHUNK_SIZE = 64 * 1024 * 1024  # 64MB
-        if file_size <= CHUNK_SIZE:
+
+        # TikTok Content Posting API v2 chunk rules:
+        #   - Each chunk must be between 5 MB and 64 MB (inclusive)
+        #   - The LAST chunk may be smaller than chunk_size but must be ≥ 5 MB
+        #     UNLESS it is the only chunk (single-chunk upload for files ≤ 64 MB)
+        #   - TikTok validates: chunk_size * (total_chunk_count - 1) < video_size
+        #                                ≤ chunk_size * total_chunk_count
+        #
+        # ROOT CAUSE OF PREVIOUS FAILURE:
+        #   Using chunk_size=64 MB and computing total_chunk_count via ceiling
+        #   division sent chunk_size * total_chunk_count = 128 MB for an 88 MB
+        #   file.  TikTok sees the declared chunk_size doesn't divide evenly into
+        #   video_size and rejects with "total chunk count is invalid".
+        #
+        # FIX: Compute total_chunk_count first (targeting ~32 MB chunks, well
+        #   inside TikTok's 5-64 MB range), then derive chunk_size as
+        #   ceil(file_size / total_chunk_count).  This guarantees:
+        #     chunk_size * total_chunk_count ≥ file_size  (last chunk ≤ chunk_size)
+        #     chunk_size * (total_chunk_count-1) < file_size  (total_count not over-counted)
+        #   All chunks are ~30 MB — safely within both bounds on every file size.
+
+        _64MB  = 64 * 1024 * 1024
+        _5MB   = 5  * 1024 * 1024
+        TARGET = 32 * 1024 * 1024   # aim for ~32 MB chunks
+
+        if file_size <= _64MB:
+            # Single-chunk upload — simplest case, always accepted
             chunk_size = file_size
             total_chunk_count = 1
         else:
-            chunk_size = CHUNK_SIZE
-            total_chunk_count = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE  # ceiling division
+            # Compute how many chunks we need at ~32 MB each
+            total_chunk_count = math.ceil(file_size / TARGET)
+            # Derive chunk_size so it evenly covers the whole file.
+            # ceil division ensures chunk_size * total_chunk_count >= file_size.
+            chunk_size = math.ceil(file_size / total_chunk_count)
+            # Safety clamp — chunk_size must be in [5 MB, 64 MB]
+            chunk_size = max(_5MB, min(_64MB, chunk_size))
 
         async with httpx.AsyncClient(timeout=120) as client:
             # Step 1: Initialize upload
-            post_info_payload: Dict[str, Any] = {
-                "title": tiktok_title,
-                "privacy_level": resolve_privacy_level(
-                    getattr(ctx, "privacy", None) or "public",
-                    "tiktok",
-                ),
-            }
-            # Only include description when we actually have content — TikTok
-            # rejects the field if it is an empty string on some account types.
-            if tiktok_description:
-                post_info_payload["description"] = tiktok_description
-
             init_resp = await client.post(
                 "https://open.tiktokapis.com/v2/post/publish/video/init/",
                 headers={
@@ -631,7 +630,13 @@ async def publish_to_tiktok(
                     "Content-Type": "application/json; charset=UTF-8"
                 },
                 json={
-                    "post_info": post_info_payload,
+                    "post_info": {
+                        "title": tiktok_title,
+                        "privacy_level": resolve_privacy_level(
+                            getattr(ctx, "privacy", None) or "public",
+                            "tiktok",
+                        ),
+                    },
                     "source_info": {
                         "source": "FILE_UPLOAD",
                         "video_size": file_size,
@@ -787,7 +792,7 @@ async def publish_to_youtube(
         )
 
     title = _get_title(ctx)[:100]
-    caption = _build_full_caption(ctx, platform="youtube")
+    caption = _build_full_caption(ctx)
     description = caption[:5000] if caption else ""
 
     try:
@@ -942,7 +947,7 @@ async def publish_to_instagram(
             error_message="Instagram requires a public video URL. Configure R2_PUBLIC_URL or ensure presigned URLs work."
         )
 
-    caption = _build_full_caption(ctx, platform="instagram")
+    caption = _build_full_caption(ctx)
     ig_privacy = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "instagram")
 
     try:
@@ -1129,7 +1134,7 @@ async def publish_to_facebook(
             error_message="No Facebook page ID found in token data"
         )
 
-    description = _build_full_caption(ctx, platform="facebook")
+    description = _build_full_caption(ctx)
     fb_privacy_value = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "facebook")
     fb_privacy_param = {"value": fb_privacy_value}  # FB Graph API format: {"value": "EVERYONE"}
 

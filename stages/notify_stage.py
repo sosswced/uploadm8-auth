@@ -81,10 +81,10 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
         # Add platform results
         for result in ctx.platform_results:
             status = "✅" if result.success else "❌"
-            value = result.platform_url if result.success else (result.error_message or "Failed")
+            value = (result.platform_url or result.publish_id or "Published") if result.success else (result.error_message or "Failed")
             fields.append({
                 "name": f"{status} {result.platform.title()}",
-                "value": value[:100],
+                "value": str(value or "")[:100],
                 "inline": False
             })
         

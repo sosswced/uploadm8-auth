@@ -309,6 +309,13 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                     if token_data:
                         if isinstance(token_data, str):
                             parsed = json.loads(token_data)
+                            # Double-encoded: json.loads returned a string instead of dict
+                            # e.g. token_data = '"{\access_token\:\...\}"'
+                            if isinstance(parsed, str):
+                                try:
+                                    parsed = json.loads(parsed)
+                                except Exception:
+                                    pass
                         else:
                             parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
                         # Inject platform-specific IDs from the DB row's account_id column
@@ -358,6 +365,12 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                     if token_data:
                         if isinstance(token_data, str):
                             parsed = json.loads(token_data)
+                            # Double-encoded guard
+                            if isinstance(parsed, str):
+                                try:
+                                    parsed = json.loads(parsed)
+                                except Exception:
+                                    pass
                         else:
                             parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
                         if account_id_col and isinstance(parsed, dict):

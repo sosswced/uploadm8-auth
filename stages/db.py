@@ -651,111 +651,135 @@ async def save_refreshed_token(
     """
     Persist a refreshed platform OAuth token back to the database.
 
-    Called by publish_stage after a successful token refresh so future jobs
-    use the new access_token rather than the expired one.
+    CRITICAL FIX: token_blob is stored as TEXT (json.dumps of encrypted blob).
+    Previous version used JSONB || operator which does STRING CONCATENATION on
+    TEXT columns — producing '{"kid":"v1"...}{"access_token":"new"}' garbage.
 
-    Updates token_blob JSONB in platform_tokens (or connected_accounts fallback).
-    Only updates fields that are provided — does not overwrite fields not passed.
+    Correct approach:
+      1. Read current token_blob TEXT from DB
+      2. Parse it: json.loads -> encrypted dict {kid, nonce, ciphertext}
+      3. Decrypt -> plaintext token dict
+      4. Merge new fields into plaintext dict
+      5. Re-encrypt -> new encrypted blob
+      6. Write back as json.dumps(new_encrypted_blob)  — clean TEXT overwrite
 
-    Args:
-        pool:          asyncpg connection pool
-        user_id:       User UUID string
-        platform:      Platform key ("tiktok", "youtube", "instagram", "facebook")
-        access_token:  New access token string
-        refresh_token: New refresh token (optional — not all refreshes return one)
-        open_id:       TikTok open_id (optional)
+    This ensures the stored value is always a single valid JSON string.
     """
     if not pool or not access_token:
         return
 
     try:
-        async with pool.acquire() as conn:
-            # Build the minimal patch dict — only fields we have new values for
-            patch: Dict[str, Any] = {"access_token": access_token}
-            if refresh_token:
-                patch["refresh_token"] = refresh_token
-            if open_id:
-                patch["open_id"] = open_id
+        # Import encrypt/decrypt from publish_stage (same module that reads tokens)
+        # We do a lazy import to avoid circular dependency
+        from .publish_stage import decrypt_token_blob, init_enc_keys
 
-            patch_json = json.dumps(patch)
+        # Also need encrypt_blob — import from app context via env-based reimplementation
+        import os, base64, secrets as _secrets
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
 
-            # Try platform_tokens table first
-            try:
-                updated = await conn.fetchval(
-                    """
-                    UPDATE platform_tokens
-                    SET token_blob = token_blob || $3::jsonb,
-                        updated_at = NOW()
-                    WHERE user_id = $1 AND platform = $2
-                    RETURNING id
-                    """,
-                    user_id,
-                    platform,
-                    patch_json,
-                )
-                if updated:
-                    logger.debug(f"save_refreshed_token: updated platform_tokens for {platform} user={user_id}")
-                    return
-            except asyncpg.exceptions.UndefinedTableError:
-                pass
-            except asyncpg.exceptions.UndefinedColumnError:
-                # token_blob column may not exist — try token_data column
+        TOKEN_ENC_KEYS_RAW = os.environ.get("TOKEN_ENC_KEYS", "")
+        _enc_keys: Dict[str, bytes] = {}
+        _current_kid = "v1"
+
+        if TOKEN_ENC_KEYS_RAW:
+            clean = TOKEN_ENC_KEYS_RAW.strip().strip('"').replace("\n", "")
+            for part in [p.strip() for p in clean.split(",") if p.strip()]:
+                if ":" not in part:
+                    continue
+                kid, b64key = part.split(":", 1)
                 try:
-                    updated = await conn.fetchval(
-                        """
-                        UPDATE platform_tokens
-                        SET token_data = token_data || $3::jsonb,
-                            updated_at = NOW()
-                        WHERE user_id = $1 AND platform = $2
-                        RETURNING id
-                        """,
-                        user_id,
-                        platform,
-                        patch_json,
-                    )
-                    if updated:
-                        logger.debug(f"save_refreshed_token: updated platform_tokens.token_data for {platform}")
-                        return
+                    raw = base64.b64decode(b64key.strip())
+                    if len(raw) == 32:
+                        _enc_keys[kid.strip()] = raw
+                        _current_kid = kid.strip()
                 except Exception:
                     pass
 
-            # Fallback: connected_accounts table
-            try:
-                updated = await conn.fetchval(
-                    """
-                    UPDATE connected_accounts
-                    SET token_blob = token_blob || $3::jsonb,
-                        updated_at = NOW()
-                    WHERE user_id = $1 AND platform = $2
-                    RETURNING id
-                    """,
-                    user_id,
-                    platform,
-                    patch_json,
-                )
-                if updated:
-                    logger.debug(f"save_refreshed_token: updated connected_accounts for {platform}")
-                    return
-            except asyncpg.exceptions.UndefinedTableError:
-                pass
-            except asyncpg.exceptions.UndefinedColumnError:
+        def _encrypt(data: dict) -> str:
+            """Re-encrypt a token dict and return json.dumps of the encrypted blob."""
+            if not _enc_keys:
+                return json.dumps(data)  # no keys — store plaintext (dev mode)
+            key = _enc_keys[_current_kid]
+            aesgcm = _AESGCM(key)
+            nonce = _secrets.token_bytes(12)
+            ct = aesgcm.encrypt(nonce, json.dumps(data).encode(), None)
+            blob = {
+                "kid": _current_kid,
+                "nonce": base64.b64encode(nonce).decode(),
+                "ciphertext": base64.b64encode(ct).decode(),
+            }
+            return json.dumps(blob)
+
+        async with pool.acquire() as conn:
+            # ── Try platform_tokens ───────────────────────────────────────
+            for table in ("platform_tokens", "connected_accounts"):
+                try:
+                    row = await conn.fetchrow(
+                        f"SELECT id, token_blob FROM {table} "
+                        f"WHERE user_id = $1 AND platform = $2 "
+                        f"ORDER BY updated_at DESC LIMIT 1",
+                        user_id, platform,
+                    )
+                except asyncpg.exceptions.UndefinedTableError:
+                    continue
+                except Exception:
+                    continue
+
+                if not row:
+                    continue
+
+                row_id = row["id"]
+                raw_blob = row["token_blob"]
+
+                # Parse the current stored blob (TEXT or JSONB both handled)
+                current_encrypted: Optional[dict] = None
+                try:
+                    if isinstance(raw_blob, str):
+                        current_encrypted = json.loads(raw_blob)
+                        # Handle double-encoded
+                        if isinstance(current_encrypted, str):
+                            current_encrypted = json.loads(current_encrypted)
+                    elif isinstance(raw_blob, dict):
+                        current_encrypted = dict(raw_blob)
+                    else:
+                        current_encrypted = dict(raw_blob) if raw_blob else None
+                except Exception:
+                    current_encrypted = None
+
+                # Decrypt to get plaintext token fields
+                current_plain: dict = {}
+                if current_encrypted:
+                    try:
+                        init_enc_keys()
+                        current_plain = decrypt_token_blob(current_encrypted) or {}
+                    except Exception:
+                        # If decrypt fails, start fresh with just the new token
+                        current_plain = {}
+
+                # Merge new values into plaintext
+                current_plain["access_token"] = access_token
+                if refresh_token:
+                    current_plain["refresh_token"] = refresh_token
+                if open_id:
+                    current_plain["open_id"] = open_id
+
+                # Re-encrypt and write back as clean TEXT
+                new_blob_str = _encrypt(current_plain)
+
                 try:
                     await conn.execute(
-                        """
-                        UPDATE connected_accounts
-                        SET token_data = token_data || $3::jsonb,
-                            updated_at = NOW()
-                        WHERE user_id = $1 AND platform = $2
-                        """,
-                        user_id,
-                        platform,
-                        patch_json,
+                        f"UPDATE {table} SET token_blob = $1, updated_at = NOW() "
+                        f"WHERE id = $2",
+                        new_blob_str,
+                        row_id,
                     )
-                except Exception:
-                    pass
+                    logger.info(f"save_refreshed_token: persisted {platform} token for user={user_id} table={table}")
+                    return
+                except Exception as write_err:
+                    logger.warning(f"save_refreshed_token: write failed on {table}: {write_err}")
+                    continue
 
-            logger.warning(f"save_refreshed_token: no rows updated for {platform} user={user_id}")
+            logger.warning(f"save_refreshed_token: no row found for {platform} user={user_id}")
 
     except Exception as e:
-        # Non-fatal — token refresh persisting is best-effort
         logger.warning(f"save_refreshed_token failed (non-fatal) for {platform} user={user_id}: {e}")

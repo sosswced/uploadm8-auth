@@ -826,7 +826,7 @@ async def get_existing_scheduled_days(conn, user_id: str, num_days: int = 7) -> 
         WHERE user_id = $1 
         AND scheduled_time >= $2 
         AND scheduled_time <= $3 
-        AND status IN ('pending', 'queued', 'scheduled', 'staged', 'ready_to_publish')
+        AND status IN ('pending', 'queued', 'scheduled')
     """, user_id, now, end_date)
     
     used_days = set()
@@ -1157,11 +1157,6 @@ async def run_migrations():
         data      JSONB NOT NULL DEFAULT '{}'::jsonb
     );
 """),
-(604, """
-    ALTER TABLE uploads
-        ADD COLUMN IF NOT EXISTS staged_at TIMESTAMPTZ;
-"""),
-
 ]
         
         for version, sql in migrations:
@@ -2571,28 +2566,7 @@ async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = 
 
 @app.post("/api/uploads/{upload_id}/complete")
 async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)):
-    """
-    Finalize upload after files land in R2.
-
-    IMMEDIATE uploads (schedule_mode = "immediate"):
-      → status = queued → enqueue_job fired → worker processes NOW
-
-    SCHEDULED/SMART uploads (schedule_mode = "scheduled" or "smart"):
-      → status = staged → NO worker job fired
-      → Scheduler loop in worker.py polls every 60s
-      → When scheduled_time - NOW <= PROCESSING_WINDOW (15 min default):
-           worker fires processing pipeline (transcode/caption/etc.)
-           marks status = ready_to_publish
-      → When scheduled_time arrives:
-           worker fires publish-only pipeline
-           marks status = completed
-
-    REFRESH SAFETY:
-      Files are already in R2 before /complete is called.
-      If the browser refreshes after /complete, the DB row exists
-      with status=staged|queued. queue.html will show it.
-      No data is lost on refresh.
-    """
+    """Complete upload and enqueue with preferences"""
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
             "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
@@ -2601,74 +2575,38 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
         if not upload:
             raise HTTPException(404, "Upload not found")
 
+        # Fetch preferences again (in case they changed)
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
-        schedule_mode = (upload["schedule_mode"] or "immediate")
 
-        if schedule_mode == "immediate":
-            # Fire immediately — update to queued and dispatch Redis job
-            await conn.execute(
-                "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
-                upload_id
-            )
-        else:
-            # Deferred: files in R2, waiting for scheduler to trigger processing
-            await conn.execute(
-                """
-                UPDATE uploads
-                SET status = 'staged',
-                    staged_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                upload_id
-            )
+        await conn.execute(
+            "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
+            upload_id
+        )
 
     plan = get_plan(user.get("subscription_tier", "free"))
 
-    if schedule_mode == "immediate":
-        job_data = {
-            "upload_id": upload_id,
-            "user_id": str(user["id"]),
-            "preferences": user_prefs,
-            "plan_features": {
-                "ai": plan.get("ai", False),
-                "priority": plan.get("priority", False),
-                "watermark": plan.get("watermark", True)
-            },
-            "deferred": False,
+    job_data = {
+        "upload_id": upload_id,
+        "user_id": str(user["id"]),
+        "preferences": user_prefs,
+        "plan_features": {
+            "ai": plan.get("ai", False),
+            "priority": plan.get("priority", False),
+            "watermark": plan.get("watermark", True)
         }
-        await enqueue_job(job_data, priority=plan.get("priority", False))
+    }
 
-        return {
-            "status": "queued",
-            "upload_id": upload_id,
-            "mode": "immediate",
-            "processing_features": {
-                "auto_captions": bool(user_prefs.get("auto_captions")) if plan.get("ai") else False,
-                "auto_thumbnails": bool(user_prefs.get("auto_thumbnails")) if plan.get("ai") else False,
-                "ai_hashtags": bool(user_prefs.get("ai_hashtags_enabled")) if plan.get("ai") else False
-            }
+    await enqueue_job(job_data, priority=plan.get("priority", False))
+
+    return {
+        "status": "queued",
+        "upload_id": upload_id,
+        "processing_features": {
+            "auto_captions": bool(user_prefs.get("auto_captions")) if plan.get("ai") else False,
+            "auto_thumbnails": bool(user_prefs.get("auto_thumbnails")) if plan.get("ai") else False,
+            "ai_hashtags": bool(user_prefs.get("ai_hashtags_enabled")) if plan.get("ai") else False
         }
-    else:
-        # Staged — tell client when processing will begin
-        scheduled_time = upload["scheduled_time"]
-        processing_window_minutes = int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15"))
-
-        processing_starts_at = None
-        if scheduled_time:
-            processing_starts_at = (scheduled_time - timedelta(minutes=processing_window_minutes)).isoformat()
-
-        return {
-            "status": "staged",
-            "upload_id": upload_id,
-            "mode": schedule_mode,
-            "scheduled_time": scheduled_time.isoformat() if scheduled_time else None,
-            "processing_starts_at": processing_starts_at,
-            "message": (
-                f"Files uploaded. Processing will begin ~{processing_window_minutes} min "
-                f"before your scheduled publish time."
-            )
-        }
+    }
 
 
 @app.post("/api/uploads/{upload_id}/reprepare")
@@ -2884,7 +2822,7 @@ async def get_scheduled(user: dict = Depends(get_current_user)):
     """Get scheduled uploads"""
     async with db_pool.acquire() as conn:
         uploads = await conn.fetch("""
-            SELECT * FROM uploads WHERE user_id = $1 AND schedule_mode = 'scheduled' AND status IN ('pending', 'queued', 'scheduled', 'staged', 'ready_to_publish')
+            SELECT * FROM uploads WHERE user_id = $1 AND schedule_mode = 'scheduled' AND status IN ('pending', 'queued', 'scheduled')
             ORDER BY scheduled_time ASC
         """, user["id"])
     return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None} for u in uploads]
@@ -2917,7 +2855,7 @@ async def get_scheduled_stats(user: dict = Depends(get_current_user)):
             WHERE user_id = $1 
             AND scheduled_time IS NOT NULL 
             AND scheduled_time > $2
-            AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
+            AND status IN ('pending', 'scheduled', 'queued')
         """, user["id"], now)
         
         # Count uploads today
@@ -2926,7 +2864,7 @@ async def get_scheduled_stats(user: dict = Depends(get_current_user)):
             WHERE user_id = $1 
             AND scheduled_time >= $2 
             AND scheduled_time < $3
-            AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
+            AND status IN ('pending', 'scheduled', 'queued')
         """, user["id"], today_start, today_end)
         
         # Count uploads this week
@@ -2935,7 +2873,7 @@ async def get_scheduled_stats(user: dict = Depends(get_current_user)):
             WHERE user_id = $1 
             AND scheduled_time >= $2 
             AND scheduled_time < $3
-            AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
+            AND status IN ('pending', 'scheduled', 'queued')
         """, user["id"], now, week_end)
         
     return {
@@ -2959,7 +2897,7 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
             WHERE user_id = $1 
             AND scheduled_time IS NOT NULL 
             AND scheduled_time > $2
-            AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
+            AND status IN ('pending', 'scheduled', 'queued')
             ORDER BY scheduled_time ASC
         """, user["id"], now)
         
@@ -4266,12 +4204,12 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     await conn.execute("""
                         UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3, 
                         account_avatar = $4, updated_at = NOW() WHERE id = $5
-                    """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
+                    """, token_blob, account_name, account_username, account_avatar, existing["id"])
                 else:
                     await conn.execute("""
                         INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
                         VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
+                    """, user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
             
             return popup_response(True, platform)
     

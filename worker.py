@@ -88,6 +88,7 @@ from stages.telemetry_stage import run_telemetry_stage
 from stages.transcode_stage import (
     run_transcode_stage, PLATFORM_SPECS,
     get_video_info, needs_transcode, build_ffmpeg_command,
+    resolve_reframe_action,
 )
 from stages.thumbnail_stage import run_thumbnail_stage
 from stages.caption_stage import run_caption_stage
@@ -233,17 +234,19 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
         return await run_transcode_stage(ctx)
 
     groups = _group_platforms_by_spec(platforms)
+    reframe_mode = getattr(ctx, "reframe_mode", "auto") or "auto"
     ctx.platform_videos = {}
 
     for fingerprint, group_platforms in groups.items():
         canonical = group_platforms[0]
-        needs_tc, reasons = needs_transcode(info, canonical)
+        reframe_action = resolve_reframe_action(info, reframe_mode, canonical)
+        needs_tc, reasons = needs_transcode(info, canonical, reframe_action)
 
         if needs_tc:
             logger.info(f"[{ctx.upload_id}] Transcode [{canonical}] shared by {group_platforms}: {', '.join(reasons)}")
             output_path = ctx.temp_dir / f"transcoded_{canonical}.mp4"
             try:
-                cmd = build_ffmpeg_command(source_video, output_path, info, canonical)
+                cmd = build_ffmpeg_command(source_video, output_path, info, canonical, reframe_action)
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,

@@ -2566,7 +2566,14 @@ async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = 
 
 @app.post("/api/uploads/{upload_id}/complete")
 async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)):
-    """Complete upload and enqueue with preferences"""
+    """
+    Complete upload and either enqueue immediately (immediate mode) or stage
+    for deferred processing (scheduled / smart mode).
+
+    IMMEDIATE  → status=queued, pushed to Redis → worker fires NOW
+    SCHEDULED  → status=staged, NOT pushed to Redis → scheduler fires at scheduled_time - processing_window
+    SMART      → status=staged, NOT pushed to Redis → scheduler fires at first scheduled_time - processing_window
+    """
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
             "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
@@ -2575,32 +2582,59 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
         if not upload:
             raise HTTPException(404, "Upload not found")
 
-        # Fetch preferences again (in case they changed)
+        # Fetch preferences (fresher than what presign stored)
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
 
-        await conn.execute(
-            "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
-            upload_id
-        )
+        schedule_mode = upload.get("schedule_mode") or "immediate"
+
+        # ── Determine status and whether to enqueue ──────────────────
+        if schedule_mode in ("scheduled", "smart"):
+            # DO NOT touch the Redis queue — scheduler loop handles this.
+            # Mark as 'staged' so the scheduler knows files are ready.
+            new_status = "staged"
+            await conn.execute(
+                "UPDATE uploads SET status = 'staged', updated_at = NOW() WHERE id = $1",
+                upload_id
+            )
+        else:
+            # Immediate publish — enqueue to Redis right now.
+            new_status = "queued"
+            await conn.execute(
+                "UPDATE uploads SET status = 'queued', updated_at = NOW() WHERE id = $1",
+                upload_id
+            )
 
     plan = get_plan(user.get("subscription_tier", "free"))
 
-    job_data = {
-        "upload_id": upload_id,
-        "user_id": str(user["id"]),
-        "preferences": user_prefs,
-        "plan_features": {
-            "ai": plan.get("ai", False),
-            "priority": plan.get("priority", False),
-            "watermark": plan.get("watermark", True)
+    if schedule_mode not in ("scheduled", "smart"):
+        job_data = {
+            "upload_id": upload_id,
+            "user_id": str(user["id"]),
+            "preferences": user_prefs,
+            "plan_features": {
+                "ai": plan.get("ai", False),
+                "priority": plan.get("priority", False),
+                "watermark": plan.get("watermark", True)
+            }
         }
-    }
+        await enqueue_job(job_data, priority=plan.get("priority", False))
 
-    await enqueue_job(job_data, priority=plan.get("priority", False))
+    # Compute scheduled_time display for smart schedules
+    schedule_metadata = upload.get("schedule_metadata")
+    smart_schedule_display = None
+    if schedule_mode == "smart" and schedule_metadata:
+        try:
+            sm = schedule_metadata if isinstance(schedule_metadata, dict) else json.loads(schedule_metadata)
+            smart_schedule_display = {p: v for p, v in sm.items()}
+        except Exception:
+            pass
 
     return {
-        "status": "queued",
+        "status": new_status,
         "upload_id": upload_id,
+        "schedule_mode": schedule_mode,
+        "scheduled_time": upload["scheduled_time"].isoformat() if upload.get("scheduled_time") else None,
+        "smart_schedule": smart_schedule_display,
         "processing_features": {
             "auto_captions": bool(user_prefs.get("auto_captions")) if plan.get("ai") else False,
             "auto_thumbnails": bool(user_prefs.get("auto_thumbnails")) if plan.get("ai") else False,
@@ -2847,15 +2881,17 @@ async def get_uploads(
 
 
 @app.get("/api/scheduled")
-@app.get("/api/scheduled")
 async def get_scheduled(user: dict = Depends(get_current_user)):
-    """Get scheduled uploads"""
+    """Get scheduled uploads (scheduled + smart modes, all pending statuses)"""
     async with db_pool.acquire() as conn:
         uploads = await conn.fetch("""
-            SELECT * FROM uploads WHERE user_id = $1 AND schedule_mode = 'scheduled' AND status IN ('pending', 'queued', 'scheduled')
+            SELECT * FROM uploads
+            WHERE user_id = $1
+              AND schedule_mode IN ('scheduled', 'smart')
+              AND status IN ('pending', 'queued', 'scheduled', 'staged', 'ready_to_publish')
             ORDER BY scheduled_time ASC
         """, user["id"])
-    return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None} for u in uploads]
+    return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "schedule_mode": u["schedule_mode"]} for u in uploads]
 
 @app.delete("/api/uploads/{upload_id}")
 async def delete_upload(upload_id: str, user: dict = Depends(get_current_user)):
@@ -2922,12 +2958,13 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
             SELECT 
                 id, title, scheduled_time, platforms, 
                 thumbnail_r2_key, caption, status, 
-                created_at, timezone
+                created_at, timezone, schedule_mode, schedule_metadata
             FROM uploads 
             WHERE user_id = $1 
             AND scheduled_time IS NOT NULL 
             AND scheduled_time > $2
-            AND status IN ('pending', 'scheduled', 'queued')
+            AND schedule_mode IN ('scheduled', 'smart')
+            AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
             ORDER BY scheduled_time ASC
         """, user["id"], now)
         
@@ -2946,6 +2983,15 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
             except:
                 pass
         
+        # Parse smart schedule metadata for per-platform times
+        smart_schedule = None
+        try:
+            sm = upload["schedule_metadata"]
+            if sm and upload["schedule_mode"] == "smart":
+                smart_schedule = sm if isinstance(sm, dict) else json.loads(sm)
+        except Exception:
+            pass
+
         result.append({
             "id": str(upload["id"]),
             "title": upload["title"] or "Untitled",
@@ -2955,6 +3001,8 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
             "thumbnail": thumbnail_url,
             "caption": upload["caption"],
             "status": upload["status"],
+            "schedule_mode": upload["schedule_mode"] or "scheduled",
+            "smart_schedule": smart_schedule,
             "created_at": upload["created_at"].isoformat() if upload["created_at"] else None
         })
     

@@ -109,7 +109,7 @@ import stripe
 import redis.asyncio as aioredis
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request, UploadFile, File, Body
-from fastapi.responses import RedirectResponse, StreamingResponse, HTMLResponse, JSONResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from contextlib import asynccontextmanager
@@ -4204,12 +4204,12 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     await conn.execute("""
                         UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3, 
                         account_avatar = $4, updated_at = NOW() WHERE id = $5
-                    """, token_blob, account_name, account_username, account_avatar, existing["id"])
+                    """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
                 else:
                     await conn.execute("""
                         INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
                         VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    """, user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
+                    """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
             
             return popup_response(True, platform)
     
@@ -4732,22 +4732,160 @@ async def admin_tiktok_webhook_log(
 
 
 # ============================================================
+# Facebook / Instagram Webhooks
+# ============================================================
+# Meta calls GET to verify the endpoint (hub challenge), then POST for events.
+#
+# Setup in Meta Developer Console:
+#   Callback URL : https://auth.uploadm8.com/api/webhooks/facebook
+#   Verify Token : value of FACEBOOK_WEBHOOK_VERIFY_TOKEN env var
+#
+# Required env var:
+#   FACEBOOK_WEBHOOK_VERIFY_TOKEN  — any secret string you set in the console
+#
+# Meta docs: https://developers.facebook.com/docs/graph-api/webhooks/getting-started
+# ============================================================
+
+FACEBOOK_WEBHOOK_VERIFY_TOKEN = os.environ.get("FACEBOOK_WEBHOOK_VERIFY_TOKEN", "")
+
+
+@app.get("/api/webhooks/facebook")
+async def facebook_webhook_challenge(
+    hub_mode: Optional[str]      = Query(None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    hub_challenge: Optional[str]  = Query(None, alias="hub.challenge"),
+):
+    """
+    Meta calls this GET endpoint when you click 'Verify and save' in the
+    developer console.  We must:
+      1. Confirm hub.mode == 'subscribe'
+      2. Confirm hub.verify_token matches our secret
+      3. Return hub.challenge as plain text with HTTP 200
+    """
+    if hub_mode == "subscribe" and hub_verify_token:
+        expected = FACEBOOK_WEBHOOK_VERIFY_TOKEN
+        if expected and hub_verify_token == expected:
+            logger.info("[facebook-webhook] challenge verified OK")
+            return PlainTextResponse(hub_challenge or "")
+        else:
+            logger.warning(
+                f"[facebook-webhook] verify token mismatch — "
+                f"got={hub_verify_token[:20]}… expected={'(not set)' if not expected else '***'}"
+            )
+            raise HTTPException(403, "Verify token mismatch")
+
+    # Health check (no params)
+    return JSONResponse({"status": "facebook-webhook-endpoint-ok"})
+
+
+@app.post("/api/webhooks/facebook")
+async def facebook_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Receives real-time event notifications from Meta (Facebook & Instagram).
+
+    Security
+    --------
+    Signature is verified using X-Hub-Signature-256: sha256=<hmac>
+    computed with META_APP_SECRET as the key over the raw request body.
+    Events that fail signature verification are rejected with 403.
+    We return 200 immediately and process in a BackgroundTask.
+
+    Subscribed fields to configure in Meta console (under 'Webhook Fields'):
+      - For Page events: feed, video_feeds
+      - For Instagram: mentions, story_insights, comments, live_comments
+    """
+    raw_body = await request.body()
+
+    # ── Verify signature ────────────────────────────────────────────────────
+    sig_header = request.headers.get("X-Hub-Signature-256", "")
+    if META_APP_SECRET and sig_header:
+        import hmac as _hmac
+        expected_sig = "sha256=" + _hmac.new(
+            META_APP_SECRET.encode(), raw_body, hashlib.sha256
+        ).hexdigest()
+        if not _hmac.compare_digest(expected_sig, sig_header):
+            logger.warning(f"[facebook-webhook] signature mismatch — header={sig_header[:60]}")
+            raise HTTPException(403, "Invalid signature")
+    elif META_APP_SECRET and not sig_header:
+        # Signature header missing entirely — reject in production
+        logger.warning("[facebook-webhook] missing X-Hub-Signature-256 header")
+        raise HTTPException(400, "Missing signature")
+
+    # ── Parse payload ───────────────────────────────────────────────────────
+    try:
+        payload = json.loads(raw_body)
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+
+    object_type = payload.get("object", "")
+    entries     = payload.get("entry", []) or []
+
+    logger.info(
+        f"[facebook-webhook] received object={object_type} entries={len(entries)}"
+    )
+
+    async def _process_fb_events():
+        for entry in entries:
+            entry_id   = entry.get("id", "")
+            changes    = entry.get("changes", []) or []
+            messaging  = entry.get("messaging", []) or []
+
+            for change in changes:
+                field  = change.get("field", "")
+                value  = change.get("value", {}) or {}
+
+                # ── Video published (Page feed) ─────────────────────────
+                if object_type == "page" and field in ("feed", "video_feeds"):
+                    item = value.get("item", "")
+                    verb = value.get("verb", "")
+                    video_id = value.get("video_id") or value.get("post_id", "")
+                    logger.info(
+                        f"[facebook-webhook] page={entry_id} field={field} "
+                        f"item={item} verb={verb} video_id={video_id}"
+                    )
+
+                # ── Instagram media / comments ──────────────────────────
+                elif object_type == "instagram":
+                    media_id = (
+                        value.get("media_id")
+                        or value.get("id")
+                        or value.get("item_id", "")
+                    )
+                    logger.info(
+                        f"[facebook-webhook] instagram field={field} "
+                        f"media_id={media_id} value_keys={list(value.keys())}"
+                    )
+
+            # ── (Optional) Messenger events — ignored for now ───────────
+            if messaging:
+                logger.debug(
+                    f"[facebook-webhook] messaging events={len(messaging)} (not handled)"
+                )
+
+    background_tasks.add_task(_process_fb_events)
+
+    # Meta requires a fast 200 response
+    return JSONResponse({"status": "ok"})
+
+
+# ============================================================
 # Analytics
 # ============================================================
 @app.get("/api/analytics")
 async def get_analytics(range: str = "30d", user: dict = Depends(get_current_user)):
-    minutes = {"30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440, 
-               "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600}.get(range, 43200)
+    # 'all' maps to 1y (largest supported window). 'partial' = at least one platform succeeded.
+    minutes = {"30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440,
+               "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600, "all": 525600}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
 
     async with db_pool.acquire() as conn:
         try:
             stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, 
-                   SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
-                   COALESCE(SUM(views), 0)::bigint AS views, 
+            SELECT COUNT(*)::int AS total,
+                   SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
+                   COALESCE(SUM(views), 0)::bigint AS views,
                    COALESCE(SUM(likes), 0)::bigint AS likes,
-                   COALESCE(SUM(put_spent), 0)::int AS put_used, 
+                   COALESCE(SUM(put_spent), 0)::int AS put_used,
                    COALESCE(SUM(aic_spent), 0)::int AS aic_used
             FROM uploads WHERE user_id = $1 AND created_at >= $2
             """, user["id"], since)
@@ -4755,8 +4893,8 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
             if e.__class__.__name__ != "UndefinedColumnError":
                 raise
             stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, 
-                   SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
+            SELECT COUNT(*)::int AS total,
+                   SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
                    0::bigint AS views, 0::bigint AS likes,
                    0::int AS put_used, 0::int AS aic_used
             FROM uploads WHERE user_id = $1 AND created_at >= $2
@@ -4771,7 +4909,8 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
         platforms = await conn.fetch(
             "SELECT unnest(platforms) AS platform, COUNT(*)::int AS count "
             "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
-            "GROUP BY platform", 
+            "AND status IN ('completed','succeeded','partial') "
+            "GROUP BY platform",
             user["id"], since
         )
 

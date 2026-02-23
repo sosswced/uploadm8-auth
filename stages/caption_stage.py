@@ -43,7 +43,6 @@ import httpx
 
 from .context import JobContext, TelemetryData, TrillScore
 from .errors import SkipStage, StageError, ErrorCode
-from .entitlements import get_max_hashtags
 
 logger = logging.getLogger("uploadm8-worker.caption")
 
@@ -804,13 +803,14 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
         f"generate: title={do_title} caption={do_caption} hashtags={do_hashtags}"
     )
 
-    # ── Max hashtags from entitlements ────────────────────────────────────────
-    max_tags = 25
+    # ── Max hashtags — tier-based limits ──────────────────────────────────────
+    max_tags = 15
     if ctx.entitlements:
-        try:
-            max_tags = get_max_hashtags(ctx.entitlements)
-        except Exception:
-            pass
+        tier = getattr(ctx.entitlements, "tier", "free")
+        if tier in ("master_admin", "friends_family", "lifetime"):
+            max_tags = 50
+        elif getattr(ctx.entitlements, "can_ai", False):
+            max_tags = 30
     max_tags = min(max_tags, int(ctx.user_settings.get("maxHashtags", max_tags)))
 
     # ── Fire generators concurrently where safe ────────────────────────────────

@@ -215,7 +215,16 @@ R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
 
 # Redis
 REDIS_URL = os.environ.get("REDIS_URL", "")
-UPLOAD_JOB_QUEUE = os.environ.get("UPLOAD_JOB_QUEUE", "uploadm8:jobs")
+
+# ── 4-Lane Queue Architecture ─────────────────────────────────
+# process lanes: FFmpeg-heavy jobs (WORKER_CONCURRENCY=3 slots)
+PROCESS_PRIORITY_QUEUE = os.environ.get("PROCESS_PRIORITY_QUEUE", "uploadm8:process:priority")
+PROCESS_NORMAL_QUEUE   = os.environ.get("PROCESS_NORMAL_QUEUE",   "uploadm8:process:normal")
+# publish lanes: API-light jobs (PUBLISH_CONCURRENCY=5 slots)
+PUBLISH_PRIORITY_QUEUE = os.environ.get("PUBLISH_PRIORITY_QUEUE", "uploadm8:publish:priority")
+PUBLISH_NORMAL_QUEUE   = os.environ.get("PUBLISH_NORMAL_QUEUE",   "uploadm8:publish:normal")
+# Legacy env vars kept for backward compat
+UPLOAD_JOB_QUEUE   = os.environ.get("UPLOAD_JOB_QUEUE",   "uploadm8:jobs")
 PRIORITY_JOB_QUEUE = os.environ.get("PRIORITY_JOB_QUEUE", "uploadm8:priority")
 
 # Stripe
@@ -301,29 +310,28 @@ admin_settings_cache: Dict[str, Any] = {"demo_data_enabled": False, "billing_mod
 # ============================================================
 # Plan Configuration (PUT/AIC based)
 # ============================================================
-PLAN_CONFIG = {
-    "free": {"name": "Free", "price": 0, "put_daily": 1, "put_monthly": 30, "aic_monthly": 0, "max_accounts": 1, "watermark": True, "ads": True, "ai": False, "scheduling": False, "webhooks": False, "white_label": False, "excel": False, "priority": False, "flex": False},
-    "launch": {"name": "Launch", "price": 29, "put_daily": 5, "put_monthly": 600, "aic_monthly": 30, "max_accounts": 4, "watermark": True, "ads": False, "ai": True, "scheduling": False, "webhooks": False, "white_label": False, "excel": False, "priority": False, "flex": False},
-    "creator_pro": {"name": "Creator Pro", "price": 59, "put_daily": 10, "put_monthly": 1200, "aic_monthly": 300, "max_accounts": 8, "watermark": False, "ads": False, "ai": True, "scheduling": True, "webhooks": True, "white_label": False, "excel": False, "priority": False, "flex": False},
-    "studio": {"name": "Studio", "price": 99, "put_daily": 25, "put_monthly": 3000, "aic_monthly": 1000, "max_accounts": 20, "watermark": False, "ads": False, "ai": True, "scheduling": True, "webhooks": True, "white_label": True, "excel": True, "priority": False, "flex": False},
-    "agency": {"name": "Agency", "price": 199, "put_daily": 75, "put_monthly": 9000, "aic_monthly": 3000, "max_accounts": 60, "watermark": False, "ads": False, "ai": True, "scheduling": True, "webhooks": True, "white_label": True, "excel": True, "priority": True, "flex": False},
-    "master_admin": {"name": "Admin", "price": 0, "put_daily": 9999, "put_monthly": 999999, "aic_monthly": 999999, "max_accounts": 999, "watermark": False, "ads": False, "ai": True, "scheduling": True, "webhooks": True, "white_label": True, "excel": True, "priority": True, "flex": True, "internal": True},
-    "friends_family": {"name": "Friends", "price": 0, "put_daily": 100, "put_monthly": 12000, "aic_monthly": 5000, "max_accounts": 80, "watermark": False, "ads": False, "ai": True, "scheduling": True, "webhooks": True, "white_label": True, "excel": True, "priority": True, "flex": True, "internal": True},
-    "lifetime": {"name": "Lifetime", "price": 0, "put_daily": 100, "put_monthly": 12000, "aic_monthly": 5000, "max_accounts": 80, "watermark": False, "ads": False, "ai": True, "scheduling": True, "webhooks": True, "white_label": True, "excel": True, "priority": True, "flex": True, "internal": True},
-}
-
-STRIPE_LOOKUP_TO_TIER = {"uploadm8_launch_monthly": "launch", "uploadm8_creatorpro_monthly": "creator_pro", "uploadm8_studio_monthly": "studio", "uploadm8_agency_monthly": "agency"}
-TOPUP_PRODUCTS = {
-    "uploadm8_put_100": {"wallet": "put", "amount": 100, "price": 15},
-    "uploadm8_put_500": {"wallet": "put", "amount": 500, "price": 59},
-    "uploadm8_put_2000": {"wallet": "put", "amount": 2000, "price": 199},
-    "uploadm8_aic_50": {"wallet": "aic", "amount": 50, "price": 12},
-    "uploadm8_aic_250": {"wallet": "aic", "amount": 250, "price": 49},
-    "uploadm8_aic_1000": {"wallet": "aic", "amount": 1000, "price": 149},
-}
+# ── Entitlements: single source of truth ──────────────────────
+# PLAN_CONFIG removed. All tier data lives in entitlements.py.
+# Import everything we need from there.
+from entitlements import (
+    TIER_CONFIG,
+    STRIPE_LOOKUP_TO_TIER,
+    TOPUP_PRODUCTS,
+    PRIORITY_QUEUE_CLASSES,
+    get_entitlements_for_tier,
+    get_entitlements_from_user,
+    entitlements_to_dict,
+    get_tier_from_lookup_key,
+    get_priority_lane,
+    check_queue_depth,
+)
 
 def get_plan(tier: str) -> dict:
-    return PLAN_CONFIG.get(tier.lower(), PLAN_CONFIG["free"])
+    """
+    Backward-compat shim — returns entitlements_to_dict() so existing callers
+    that do plan.get("ai") / plan.get("watermark") keep working unchanged.
+    """
+    return entitlements_to_dict(get_entitlements_for_tier(tier))
 
 # ============================================================
 # Helpers
@@ -523,14 +531,14 @@ async def transfer_tokens(conn, user_id: str, from_platform: str, to_platform: s
     return True
 
 async def daily_refill(conn, user_id: str, tier: str):
-    plan = get_plan(tier)
-    daily = plan.get("put_daily", 1) * 4  # 4 platforms
+    ent = get_entitlements_for_tier(tier)
+    daily = ent.put_daily * 4  # 4 platforms
     wallet = await get_wallet(conn, user_id)
     last_refill = wallet.get("last_refill_date")
     today = _now_utc().date()
     if last_refill and last_refill >= today:
         return
-    monthly_cap = plan.get("put_monthly", 30)
+    monthly_cap = ent.put_monthly
     current = wallet["put_balance"]
     if current < monthly_cap:
         add = min(daily, monthly_cap - current)
@@ -560,17 +568,53 @@ def generate_presigned_upload_url(key: str, content_type: str, ttl: int = 3600) 
     return s3.generate_presigned_url("put_object", Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type}, ExpiresIn=ttl)
 
 # ============================================================
-# Redis Queue
+# Redis Queue — 4-Lane Architecture
 # ============================================================
-async def enqueue_job(job_data: dict, priority: bool = False):
-    if not redis_client: return False
-    queue = PRIORITY_JOB_QUEUE if priority else UPLOAD_JOB_QUEUE
-    job_data["enqueued_at"] = _now_utc().isoformat()
-    job_data["job_id"] = str(uuid.uuid4())
+async def enqueue_job(
+    job_data: dict,
+    lane: str = "process",
+    priority_class: str = "p4",
+) -> bool:
+    """
+    Push a job to the correct Redis lane based on job type and tier priority.
+
+    Args:
+        job_data:       Job payload dict. upload_id required.
+        lane:           "process" (FFmpeg-heavy) or "publish" (API-light).
+        priority_class: Tier priority class p0-p4. p0/p1/p2 → priority queue.
+                        p3/p4 → normal queue.
+
+    Queue routing:
+        process + priority_class in {p0,p1,p2} → PROCESS_PRIORITY_QUEUE
+        process + priority_class in {p3,p4}    → PROCESS_NORMAL_QUEUE
+        publish + priority_class in {p0,p1,p2} → PUBLISH_PRIORITY_QUEUE
+        publish + priority_class in {p3,p4}    → PUBLISH_NORMAL_QUEUE
+    """
+    if not redis_client:
+        logger.warning("enqueue_job called but redis_client is None")
+        return False
+
+    is_priority = priority_class in PRIORITY_QUEUE_CLASSES
+
+    if lane == "publish":
+        queue = PUBLISH_PRIORITY_QUEUE if is_priority else PUBLISH_NORMAL_QUEUE
+    else:
+        queue = PROCESS_PRIORITY_QUEUE if is_priority else PROCESS_NORMAL_QUEUE
+
+    job_data["enqueued_at"]    = _now_utc().isoformat()
+    job_data["job_id"]         = str(uuid.uuid4())
+    job_data["lane"]           = lane
+    job_data["priority_class"] = priority_class
+
     try:
         await redis_client.lpush(queue, json.dumps(job_data))
+        logger.debug(
+            f"[{job_data.get('upload_id', '?')}] Enqueued → {queue} "            f"(lane={lane} priority_class={priority_class})"
+        )
         return True
-    except: return False
+    except Exception as e:
+        logger.error(f"enqueue_job failed: {e}")
+        return False
 
 
 # ============================================================
@@ -2474,6 +2518,21 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
         if aic_cost > 0 and aic_avail < aic_cost:
             raise HTTPException(429, f"Insufficient AIC credits ({aic_avail} available, {aic_cost} needed)")
 
+        # ── Queue depth guard ─────────────────────────────────────────
+        pending_count = await conn.fetchval(
+            """SELECT COUNT(*) FROM uploads
+               WHERE user_id = $1
+               AND status IN ('pending','staged','queued','processing','ready_to_publish')""",
+            user["id"]
+        )
+        ent_check = get_entitlements_for_tier(user.get("subscription_tier", "free"))
+        if pending_count >= ent_check.queue_depth:
+            raise HTTPException(
+                429,
+                f"Queue limit reached ({pending_count}/{ent_check.queue_depth} uploads pending). "
+                "Wait for existing uploads to complete or upgrade your plan."
+            )
+
         upload_id = str(uuid.uuid4())
         r2_key = f"uploads/{user['id']}/{upload_id}/{data.filename}"
 
@@ -2604,7 +2663,8 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
                 upload_id
             )
 
-    plan = get_plan(user.get("subscription_tier", "free"))
+    # Resolve full entitlements — drives queue routing, AI depth, priority class
+    ent = get_entitlements_for_tier(user.get("subscription_tier", "free"))
 
     if schedule_mode not in ("scheduled", "smart"):
         job_data = {
@@ -2612,12 +2672,15 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
             "user_id": str(user["id"]),
             "preferences": user_prefs,
             "plan_features": {
-                "ai": plan.get("ai", False),
-                "priority": plan.get("priority", False),
-                "watermark": plan.get("watermark", True)
-            }
+                "ai":           ent.can_ai,
+                "priority":     ent.can_priority,
+                "watermark":    ent.can_watermark,
+                "ai_depth":     ent.ai_depth,
+                "caption_frames": ent.max_caption_frames,
+            },
+            "priority_class": ent.priority_class,
         }
-        await enqueue_job(job_data, priority=plan.get("priority", False))
+        await enqueue_job(job_data, lane="process", priority_class=ent.priority_class)
 
     # Compute scheduled_time display for smart schedules
     schedule_metadata = upload.get("schedule_metadata")

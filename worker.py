@@ -112,12 +112,23 @@ logger = logging.getLogger("uploadm8-worker")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 REDIS_URL = os.environ.get("REDIS_URL", "")
-UPLOAD_JOB_QUEUE = os.environ.get("UPLOAD_JOB_QUEUE", "uploadm8:jobs")
+
+# ── 4-Lane Queue Names (must match app.py env vars) ──────────────
+PROCESS_PRIORITY_QUEUE = os.environ.get("PROCESS_PRIORITY_QUEUE", "uploadm8:process:priority")
+PROCESS_NORMAL_QUEUE   = os.environ.get("PROCESS_NORMAL_QUEUE",   "uploadm8:process:normal")
+PUBLISH_PRIORITY_QUEUE = os.environ.get("PUBLISH_PRIORITY_QUEUE", "uploadm8:publish:priority")
+PUBLISH_NORMAL_QUEUE   = os.environ.get("PUBLISH_NORMAL_QUEUE",   "uploadm8:publish:normal")
+# Legacy queue names kept so old Redis entries dont get lost during transition
+UPLOAD_JOB_QUEUE   = os.environ.get("UPLOAD_JOB_QUEUE",   "uploadm8:jobs")
 PRIORITY_JOB_QUEUE = os.environ.get("PRIORITY_JOB_QUEUE", "uploadm8:priority")
+
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
 
-# Concurrency: jobs processed simultaneously
-WORKER_CONCURRENCY = int(os.environ.get("WORKER_CONCURRENCY", "3"))
+# ── Concurrency ───────────────────────────────────────────────────
+# WORKER_CONCURRENCY  = FFmpeg-heavy process jobs (CPU-bound, default 3)
+# PUBLISH_CONCURRENCY = API-light publish jobs   (I/O-bound, default 5)
+WORKER_CONCURRENCY  = int(os.environ.get("WORKER_CONCURRENCY",  "3"))
+PUBLISH_CONCURRENCY = int(os.environ.get("PUBLISH_CONCURRENCY", "5"))
 
 # Scheduler: how far in advance to start processing a scheduled upload (minutes)
 PROCESSING_WINDOW_MINUTES = int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15"))
@@ -133,6 +144,15 @@ db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[redis.Redis] = None
 shutdown_requested = False
 shutdown_event: Optional[asyncio.Event] = None
+
+# ── Separate semaphores for each lane ────────────────────────────
+# Process semaphore: guards FFmpeg transcode slots (CPU-bound)
+# Publish semaphore: guards platform API call slots (I/O-bound)
+# Keeping them separate means a 10-minute transcode CANNOT block
+# a 10-second TikTok API publish call.
+_process_semaphore: Optional[asyncio.Semaphore] = None
+_publish_semaphore: Optional[asyncio.Semaphore] = None
+# Legacy alias — some internal helpers still reference _job_semaphore
 _job_semaphore: Optional[asyncio.Semaphore] = None
 
 
@@ -793,6 +813,16 @@ async def run_scheduler_loop() -> None:
                 # --------------------------------------------------------
                 # CHECK 1: staged jobs entering processing window
                 # --------------------------------------------------------
+                # ── Capacity-aware dispatch ────────────────────────────────
+                # Only pull as many staged jobs as there are free process slots.
+                # This prevents dispatching 500-job batches into memory when
+                # workers are already saturated.
+                free_slots = WORKER_CONCURRENCY - (
+                    WORKER_CONCURRENCY - _process_semaphore._value
+                    if _process_semaphore else WORKER_CONCURRENCY
+                )
+                dispatch_limit = max(1, free_slots)
+
                 staged_jobs = await conn.fetch(
                     """
                     SELECT u.id AS upload_id, u.user_id
@@ -801,9 +831,10 @@ async def run_scheduler_loop() -> None:
                       AND u.scheduled_time IS NOT NULL
                       AND u.scheduled_time <= $1
                     ORDER BY u.scheduled_time ASC
-                    LIMIT 50
+                    LIMIT $2
                     """,
                     process_cutoff,
+                    dispatch_limit,
                 )
 
                 for row in staged_jobs:
@@ -899,8 +930,11 @@ async def run_scheduler_loop() -> None:
 
 
 async def _run_job_with_semaphore(job_data: dict) -> None:
-    """Wrapper: run processing pipeline inside the concurrency semaphore."""
-    async with _job_semaphore:
+    """
+    Wrapper: run processing pipeline (FFmpeg-heavy) inside the PROCESS semaphore.
+    Uses _process_semaphore (WORKER_CONCURRENCY=3 slots by default).
+    """
+    async with _process_semaphore:
         try:
             await run_processing_pipeline(job_data)
         except Exception as e:
@@ -908,8 +942,12 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
 
 
 async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> None:
-    """Wrapper: run deferred publish inside the concurrency semaphore."""
-    async with _job_semaphore:
+    """
+    Wrapper: run deferred publish (API-light) inside the PUBLISH semaphore.
+    Uses _publish_semaphore (PUBLISH_CONCURRENCY=5 slots by default).
+    This NEVER blocks on FFmpeg transcode slots — separate lane entirely.
+    """
+    async with _publish_semaphore:
         try:
             await run_deferred_publish(upload_id, user_id)
         except Exception as e:
@@ -926,7 +964,7 @@ async def _process_one_job(job_json: str) -> None:
     except json.JSONDecodeError as e:
         logger.error(f"Invalid job JSON: {e}")
         return
-    async with _job_semaphore:
+    async with _process_semaphore:
         try:
             await run_processing_pipeline(job_data)
         except Exception as e:
@@ -935,16 +973,26 @@ async def _process_one_job(job_json: str) -> None:
 
 async def process_jobs() -> None:
     """
-    Consume immediate jobs from Redis queues.
+    Consume process-lane jobs from Redis (FFmpeg-heavy).
+    Reads from [process:priority, process:normal] + legacy queues.
     Scheduled/staged jobs are handled by run_scheduler_loop() instead.
     """
-    global shutdown_requested, redis_client, _job_semaphore
+    global shutdown_requested, redis_client, _process_semaphore, _publish_semaphore, _job_semaphore
 
-    _job_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
+    _process_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
+    _publish_semaphore = asyncio.Semaphore(PUBLISH_CONCURRENCY)
+    _job_semaphore     = _process_semaphore  # legacy alias
+
+    # All queues worker should drain — priority first, then normal, then legacy
+    all_process_queues = [
+        PROCESS_PRIORITY_QUEUE,
+        PROCESS_NORMAL_QUEUE,
+        PRIORITY_JOB_QUEUE,   # legacy
+        UPLOAD_JOB_QUEUE,     # legacy
+    ]
 
     logger.info(
-        f"Job consumer started | concurrency={WORKER_CONCURRENCY} | "
-        f"queues={PRIORITY_JOB_QUEUE}, {UPLOAD_JOB_QUEUE}"
+        f"Job consumer started | "        f"process_concurrency={WORKER_CONCURRENCY} | "        f"publish_concurrency={PUBLISH_CONCURRENCY} | "        f"process_queues={PROCESS_PRIORITY_QUEUE}, {PROCESS_NORMAL_QUEUE}"
     )
 
     consecutive_redis_errors = 0
@@ -955,7 +1003,7 @@ async def process_jobs() -> None:
 
         try:
             job_raw = await redis_client.brpop(
-                [PRIORITY_JOB_QUEUE, UPLOAD_JOB_QUEUE],
+                all_process_queues,
                 timeout=int(POLL_INTERVAL),
             )
             consecutive_redis_errors = 0
@@ -1017,8 +1065,9 @@ async def main() -> None:
         logger.error("REDIS_URL not set")
         sys.exit(1)
 
-    db_min = max(2, WORKER_CONCURRENCY)
-    db_max = max(10, WORKER_CONCURRENCY * 4)
+    total_concurrency = WORKER_CONCURRENCY + PUBLISH_CONCURRENCY
+    db_min = max(2, total_concurrency)
+    db_max = max(15, total_concurrency * 3)
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=db_min, max_size=db_max)
     logger.info(f"Database connected | pool={db_min}-{db_max}")
 

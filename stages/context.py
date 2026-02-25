@@ -263,24 +263,49 @@ class JobContext:
 
     def get_effective_hashtags(self) -> List[str]:
         """
-        Merge base hashtags (always_hashtags already baked in at presign time)
-        with AI-generated hashtags. AI hashtags are ADDITIVE — they never replace
-        the user's always/preset tags.
+        Build the final hashtag list for publishing.
 
-        Deduplicates while preserving order: base/always tags come first,
-        then AI additions that aren't already present.
+        Merge order: always_hashtags (FIRST) → base upload hashtags → AI additions.
+        blocked_hashtags are filtered out at every level.
+
+        always_hashtags and blocked_hashtags are read directly from
+        self.user_settings, which is now populated from users.preferences JSONB
+        by db.load_user_settings() — so frontend settings page values always apply.
         """
+        us = self.user_settings or {}
+
+        # ── Always-on hashtags from settings page ────────────────────────
+        raw_always = us.get("alwaysHashtags") or us.get("always_hashtags") or []
+        if isinstance(raw_always, str):
+            raw_always = [
+                t.strip() for t in raw_always.replace(",", " ").split() if t.strip()
+            ]
+        always_tags: List[str] = list(raw_always) if isinstance(raw_always, list) else []
+
+        # ── Blocked hashtags from settings page ──────────────────────────
+        raw_blocked = us.get("blockedHashtags") or us.get("blocked_hashtags") or []
+        if isinstance(raw_blocked, str):
+            raw_blocked = [
+                t.strip() for t in raw_blocked.replace(",", " ").split() if t.strip()
+            ]
+        blocked_set = {
+            str(t).strip().lstrip("#").lower()
+            for t in (raw_blocked if isinstance(raw_blocked, list) else [])
+        }
+
+        # ── Merge: always → base → AI (additive, deduplicated, filtered) ─
         base = list(self.hashtags or [])
-        ai = list(self.ai_hashtags or [])
+        ai   = list(self.ai_hashtags or [])
 
         seen: set = set()
         merged: List[str] = []
-        for tag in base + ai:
+
+        for tag in always_tags + base + ai:
             t = str(tag).strip().lstrip("#").lower()
-            if t and t not in seen:
-                seen.add(t)
-                # Normalise: ensure leading #
-                merged.append(tag if str(tag).startswith("#") else f"#{tag}")
+            if not t or t in seen or t in blocked_set:
+                continue
+            seen.add(t)
+            merged.append(tag if str(tag).startswith("#") else f"#{tag}")
 
         return merged
 

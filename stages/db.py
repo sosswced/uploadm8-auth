@@ -38,25 +38,94 @@ async def load_user(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
 
 
 async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
-    """Load user settings/preferences, returning defaults if none exist."""
+    """
+    Load user settings/preferences, returning defaults if none exist.
+
+    CRITICAL: The frontend saves ALL hashtag preferences — alwaysHashtags,
+    blockedHashtags, platformHashtags, aiHashtagCount — to the users.preferences
+    JSONB column via /api/me/preferences.  We MUST read that column here or
+    zero hashtag enforcement will ever apply.
+
+    Query order:
+      1. user_settings table   (worker-side settings, snake_case keys)
+      2. user_preferences table (fallback, legacy)
+      3. users.preferences JSONB (frontend-saved settings, camelCase keys)
+         → merged on top so frontend values always win for hashtag fields
+    """
+    result: dict = {}
+
     async with pool.acquire() as conn:
-        # Try user_settings first
+        # ── 1. user_settings table ────────────────────────────────────────
         try:
-            row = await conn.fetchrow("SELECT * FROM user_settings WHERE user_id = $1", user_id)
+            row = await conn.fetchrow(
+                "SELECT * FROM user_settings WHERE user_id = $1", user_id
+            )
             if row:
-                return dict(row)
+                result = dict(row)
         except asyncpg.exceptions.UndefinedTableError:
             pass
 
-        # Try user_preferences as fallback
-        try:
-            row = await conn.fetchrow("SELECT * FROM user_preferences WHERE user_id = $1", user_id)
-            if row:
-                return dict(row)
-        except asyncpg.exceptions.UndefinedTableError:
-            pass
+        # ── 2. user_preferences fallback ─────────────────────────────────
+        if not result:
+            try:
+                row = await conn.fetchrow(
+                    "SELECT * FROM user_preferences WHERE user_id = $1", user_id
+                )
+                if row:
+                    result = dict(row)
+            except asyncpg.exceptions.UndefinedTableError:
+                pass
 
-    return {}
+        # ── 3. users.preferences JSONB — the source of truth for hashtag prefs ──
+        # The settings page saves everything here via /api/me/preferences.
+        # We merge these on top so frontend values always override stale rows.
+        try:
+            prefs_val = await conn.fetchval(
+                "SELECT preferences FROM users WHERE id = $1", user_id
+            )
+            if prefs_val:
+                if isinstance(prefs_val, str):
+                    prefs = json.loads(prefs_val)
+                elif hasattr(prefs_val, "keys"):
+                    prefs = dict(prefs_val)
+                else:
+                    prefs = {}
+
+                if isinstance(prefs, dict) and prefs:
+                    # Normalise: store both camelCase and snake_case versions of
+                    # every hashtag/caption field so the pipeline can use either.
+                    FIELD_MAP = {
+                        "alwaysHashtags":   "always_hashtags",
+                        "blockedHashtags":  "blocked_hashtags",
+                        "platformHashtags": "platform_hashtags",
+                        "aiHashtagCount":   "ai_hashtag_count",
+                        "aiHashtagsEnabled":"ai_hashtags_enabled",
+                        "aiHashtagStyle":   "ai_hashtag_style",
+                        "autoCaptions":     "auto_captions",
+                        "captionStyle":     "caption_style",
+                        "captionTone":      "caption_tone",
+                        "captionFrameCount":"caption_frame_count",
+                        "maxHashtags":      "max_hashtags",
+                        "trillOpenaiModel": "openai_model",
+                    }
+                    for camel, snake in FIELD_MAP.items():
+                        val = prefs.get(camel)
+                        if val is None:
+                            val = prefs.get(snake)
+                        if val is not None:
+                            # Frontend values override worker-side settings rows
+                            result[camel] = val
+                            result[snake] = val
+
+                    # Merge any remaining keys that weren't in our map
+                    for k, v in prefs.items():
+                        if k not in result:
+                            result[k] = v
+
+        except Exception as e:
+            logger.debug(f"Could not read users.preferences for {user_id} (non-fatal): {e}")
+
+    return result
 
 
 async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:

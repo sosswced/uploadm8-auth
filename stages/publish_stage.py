@@ -51,6 +51,74 @@ IG_POLL_MAX_ATTEMPTS = 36  # 3 minutes max (36 * 5s)
 # Presigned URL expiry for Meta uploads (1 hour)
 PRESIGNED_URL_EXPIRY = 3600
 
+
+# =====================================================================
+# Platform Thumbnail Push
+# =====================================================================
+
+async def _push_thumbnail_to_platform(
+    platform: str,
+    video_id: str,
+    thumbnail_path: Optional[Path],
+    access_token: str,
+    client: httpx.AsyncClient,
+) -> bool:
+    """
+    Upload the local thumbnail JPEG to the platform as the video cover.
+    Called right after a successful video publish.
+    Non-fatal — a failure here never blocks the upload result.
+
+    YouTube:   POST /thumbnails/set  (multipart, requires verified channel)
+    TikTok:    Cover API not available to 3rd-party apps — skipped.
+    Instagram: Cover must be set at container creation time (handled there).
+    Facebook:  POST /{video_id}  with thumb= multipart field.
+    """
+    if not thumbnail_path or not thumbnail_path.exists():
+        return False
+    try:
+        if platform == "youtube":
+            with open(thumbnail_path, "rb") as f:
+                thumb_bytes = f.read()
+            resp = await client.post(
+                f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
+                f"?videoId={video_id}&uploadType=media",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "image/jpeg",
+                    "Content-Length": str(len(thumb_bytes)),
+                },
+                content=thumb_bytes,
+                timeout=60,
+            )
+            if resp.status_code in (200, 201):
+                logger.info(f"YouTube thumbnail set: video_id={video_id}")
+                return True
+            logger.warning(f"YouTube thumbnail failed: {resp.status_code} {resp.text[:200]}")
+            return False
+
+        elif platform == "facebook":
+            with open(thumbnail_path, "rb") as f:
+                thumb_bytes = f.read()
+            resp = await client.post(
+                f"https://graph.facebook.com/{META_API_VERSION}/{video_id}",
+                params={"access_token": access_token},
+                files={"thumb": ("thumbnail.jpg", thumb_bytes, "image/jpeg")},
+                timeout=60,
+            )
+            if resp.status_code == 200 and resp.json().get("success"):
+                logger.info(f"Facebook thumbnail set: video_id={video_id}")
+                return True
+            logger.warning(f"Facebook thumbnail failed: {resp.status_code} {resp.text[:200]}")
+            return False
+
+        # TikTok: cover API restricted — platform auto-selects from video
+        # Instagram: cover_url injected into container creation payload
+        return False
+    except Exception as e:
+        logger.warning(f"Thumbnail push {platform} failed (non-fatal): {e}")
+        return False
+
+
 # =====================================================================
 # Privacy Level Resolution — single source of truth
 # =====================================================================
@@ -894,6 +962,11 @@ async def publish_to_youtube(
             platform_url = f"https://youtube.com/shorts/{video_id}" if video_id else None
 
             logger.info(f"YouTube publish accepted: video_id={video_id}, url={platform_url}")
+            # Push thumbnail to YouTube (non-fatal — requires verified channel)
+            if video_id and getattr(ctx, "thumbnail_path", None):
+                await _push_thumbnail_to_platform(
+                    "youtube", video_id, ctx.thumbnail_path, access_token, client
+                )
             return PlatformResult(
                 platform="youtube",
                 success=True,
@@ -989,6 +1062,16 @@ async def publish_to_instagram(
                 "caption": caption[:2200] if caption else "",
                 "share_to_feed": "true" if ig_privacy == "public" else "false",
             }
+            # Instagram cover_url must be set at creation time — cannot change after publish.
+            # We generate a short-lived presigned URL for our R2 thumbnail.
+            if getattr(ctx, "thumbnail_r2_key", None):
+                try:
+                    from . import r2 as _r2
+                    thumb_cover_url = _r2.generate_presigned_url(ctx.thumbnail_r2_key, expires=3600)
+                    ig_params["cover_url"] = thumb_cover_url
+                    logger.info(f"Instagram: cover_url set from R2 thumbnail")
+                except Exception as _e:
+                    logger.warning(f"Instagram: could not set cover_url: {_e}")
             create_resp = await client.post(
                 f"https://graph.facebook.com/{META_API_VERSION}/{ig_user_id}/media",
                 params=ig_params
@@ -1213,6 +1296,11 @@ async def publish_to_facebook(
             video_id = resp.json().get("id")
             platform_url = f"https://www.facebook.com/video/{video_id}" if video_id else None
             logger.info(f"Facebook publish accepted: video_id={video_id}, url={platform_url}")
+            # Push thumbnail to Facebook (non-fatal)
+            if video_id and getattr(ctx, "thumbnail_path", None):
+                await _push_thumbnail_to_platform(
+                    "facebook", video_id, ctx.thumbnail_path, access_token, client
+                )
             return PlatformResult(
                 platform="facebook",
                 success=True,

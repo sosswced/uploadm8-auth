@@ -10,6 +10,7 @@ Complete implementation with:
 """
 
 import os
+import pathlib
 import csv
 import io
 import json
@@ -3003,6 +3004,138 @@ async def get_scheduled(user: dict = Depends(get_current_user)):
             ORDER BY scheduled_time ASC
         """, user["id"])
     return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "schedule_mode": u["schedule_mode"]} for u in uploads]
+
+
+@app.post("/api/uploads/{upload_id}/generate-thumbnail")
+async def generate_thumbnail_for_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Backfill / regenerate the thumbnail for an existing upload.
+
+    Workflow:
+      1. Fetch the video from R2 to a temp file
+      2. Run FFmpeg to extract a frame at 30% into the video
+      3. Upload the JPEG to R2 at thumbnails/{user_id}/{upload_id}/thumbnail.jpg
+      4. Update thumbnail_r2_key in the uploads row
+      5. Return a fresh presigned URL
+
+    This fixes the gap where uploads processed before the worker fix
+    have thumbnail_r2_key = NULL in the database.
+    """
+    import tempfile, subprocess
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, r2_key, thumbnail_r2_key, status FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"]
+        )
+    if not row:
+        raise HTTPException(404, "Upload not found")
+
+    # If thumbnail already exists, just return the presigned URL
+    if row.get("thumbnail_r2_key"):
+        try:
+            s3 = get_s3_client()
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(row["thumbnail_r2_key"])},
+                ExpiresIn=3600,
+            )
+            return {"thumbnail_url": url, "r2_key": row["thumbnail_r2_key"], "generated": False}
+        except Exception:
+            pass  # fall through and regenerate
+
+    r2_key = row.get("r2_key")
+    if not r2_key:
+        raise HTTPException(400, "No video file key found for this upload")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        video_path = tmp_path / "video.mp4"
+        thumb_path = tmp_path / "thumbnail.jpg"
+
+        # 1. Download video from R2
+        try:
+            s3 = get_s3_client()
+            s3.download_file(R2_BUCKET_NAME, _normalize_r2_key(r2_key), str(video_path))
+        except Exception as e:
+            raise HTTPException(500, f"Could not download video from storage: {e}")
+
+        # 2. Get duration then extract frame at 30%
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(video_path)],
+                capture_output=True, text=True, timeout=30
+            )
+            duration = 10.0
+            if probe.returncode == 0:
+                import json as _json
+                for stream in _json.loads(probe.stdout).get("streams", []):
+                    if stream.get("codec_type") == "video":
+                        duration = float(stream.get("duration", 10) or 10)
+                        break
+            offset = max(0.5, duration * 0.30)
+        except Exception:
+            offset = 5.0
+
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", f"{offset:.3f}",
+                    "-i", str(video_path),
+                    "-vframes", "1",
+                    "-q:v", "2",
+                    "-vf", "scale=1080:-2",
+                    str(thumb_path),
+                ],
+                capture_output=True, timeout=60
+            )
+            if result.returncode != 0 or not thumb_path.exists():
+                # Fallback: try at 1 second
+                subprocess.run(
+                    ["ffmpeg", "-y", "-ss", "1", "-i", str(video_path),
+                     "-vframes", "1", "-q:v", "2", "-vf", "scale=1080:-2", str(thumb_path)],
+                    capture_output=True, timeout=30
+                )
+        except Exception as e:
+            raise HTTPException(500, f"FFmpeg thumbnail extraction failed: {e}")
+
+        if not thumb_path.exists():
+            raise HTTPException(500, "Thumbnail extraction produced no output")
+
+        # 3. Upload to R2
+        thumb_r2_key = f"thumbnails/{user['id']}/{upload_id}/thumbnail.jpg"
+        try:
+            s3.upload_file(
+                str(thumb_path), R2_BUCKET_NAME, thumb_r2_key,
+                ExtraArgs={"ContentType": "image/jpeg"}
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Failed to upload thumbnail to storage: {e}")
+
+        # 4. Update DB
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE uploads SET thumbnail_r2_key = $1, updated_at = NOW() WHERE id = $2",
+                thumb_r2_key, upload_id
+            )
+
+        # 5. Return presigned URL
+        try:
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": R2_BUCKET_NAME, "Key": thumb_r2_key},
+                ExpiresIn=3600,
+            )
+        except Exception:
+            url = None
+
+        return {
+            "thumbnail_url": url,
+            "r2_key": thumb_r2_key,
+            "generated": True,
+            "offset_seconds": offset,
+        }
+
 
 @app.post("/api/uploads/{upload_id}/sync-analytics")
 async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current_user)):

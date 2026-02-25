@@ -5431,11 +5431,18 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            # 1) Video list (requires video.list)
+            # 1) Video list — `fields` is REQUIRED; without it TikTok returns
+            #    videos but every stat field (view_count, like_count, …) is 0.
             resp = await client.post(
                 "https://open.tiktokapis.com/v2/video/list/",
                 headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                json={"max_count": 20},
+                json={
+                    "max_count": 20,
+                    "fields": [
+                        "id", "title", "view_count", "like_count",
+                        "comment_count", "share_count", "duration", "create_time",
+                    ],
+                },
             )
             if resp.status_code != 200:
                 logger.warning(f"TikTok video list HTTP {resp.status_code}: {resp.text[:200]}")
@@ -5449,15 +5456,15 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
                 except Exception:
                     return 0
 
-            views = sum(_i(v.get("view_count")) for v in videos)
-            likes = sum(_i(v.get("like_count")) for v in videos)
+            views    = sum(_i(v.get("view_count"))    for v in videos)
+            likes    = sum(_i(v.get("like_count"))    for v in videos)
             comments = sum(_i(v.get("comment_count")) for v in videos)
-            shares = sum(_i(v.get("share_count")) for v in videos)
+            shares   = sum(_i(v.get("share_count"))   for v in videos)
 
-            durs = [_i(v.get("duration")) for v in videos if v.get("duration") is not None]
+            durs      = [_i(v.get("duration")) for v in videos if v.get("duration") is not None]
             avg_watch = round(sum(durs) / len(durs), 1) if durs else None
 
-            # 2) User info stats (requires user.info.stats)
+            # 2) User info stats (requires user.info.stats scope)
             followers = following = total_likes = video_count = None
             ui = await client.get(
                 "https://open.tiktokapis.com/v2/user/info/",
@@ -5465,25 +5472,27 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             if ui.status_code == 200:
-                user_obj = ((ui.json().get("data", {}) or {}).get("user", {}) or {})
-                followers = user_obj.get("follower_count")
-                following = user_obj.get("following_count")
+                user_obj    = ((ui.json().get("data", {}) or {}).get("user", {}) or {})
+                followers   = user_obj.get("follower_count")
+                following   = user_obj.get("following_count")
                 total_likes = user_obj.get("likes_count")
                 video_count = user_obj.get("video_count")
             else:
-                # Do not fail KPI entirely if stats scope isn't approved yet.
-                logger.warning(f"TikTok user info HTTP {ui.status_code}: {ui.text[:200]}")
+                # Scope not yet approved — don't fail the whole card
+                logger.warning(f"TikTok user.info.stats HTTP {ui.status_code}: {ui.text[:200]}")
 
             return {
                 "status": "live",
-                "followers": _i(followers) if followers is not None else None,
-                "following": _i(following) if following is not None else None,
+                # analytics_source tells the frontend which scopes returned real data
+                "analytics_source": "video.list+user.info.stats",
+                "followers":   _i(followers)   if followers   is not None else None,
+                "following":   _i(following)   if following   is not None else None,
                 "total_likes": _i(total_likes) if total_likes is not None else None,
                 "video_count": _i(video_count) if video_count is not None else len(videos),
-                "views": views,
-                "likes": likes,
+                "views":    views,
+                "likes":    likes,
                 "comments": comments,
-                "shares": shares,
+                "shares":   shares,
                 "avg_watch_seconds": avg_watch,
             }
 
@@ -5494,65 +5503,103 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
 
 
 async def _fetch_youtube_metrics(access_token: str) -> dict:
-    """YouTube Data API v3 + (optional) YouTube Analytics API."""
+    """YouTube Data API v3 + YouTube Analytics API (yt-analytics.readonly scope).
+
+    analytics_source in return value:
+      "yt-analytics"           — Analytics API succeeded, 30-day per-day data
+      "channel_stats_fallback" — Analytics API returned 403 (scope not on token)
+                                 or no rows; falls back to channel-level lifetime totals
+    """
     if not access_token:
         return {"status": "not_connected"}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
+            # ── Step 1: Channel statistics (always available with youtube.readonly) ──
             ch = await client.get(
                 "https://www.googleapis.com/youtube/v3/channels",
                 params={"part": "statistics", "mine": "true"},
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             if ch.status_code != 200:
-                return {"status": "error", "error": f"HTTP {ch.status_code}"}
+                return {"status": "error", "error": f"channel_http_{ch.status_code}"}
 
             items = ch.json().get("items", []) or []
             stats = items[0].get("statistics", {}) if items else {}
 
             views = likes = comments = shares = 0
             avg_watch = minutes_watched = None
+            analytics_source = "channel_stats_fallback"
+
+            # ── Step 2: Analytics API (requires yt-analytics.readonly scope) ─────
             try:
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 thirty = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
                 an = await client.get(
                     "https://youtubeanalytics.googleapis.com/v2/reports",
                     params={
-                        "ids": "channel==MINE",
-                        "startDate": thirty,
-                        "endDate": today,
-                        "metrics": "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
+                        "ids":        "channel==MINE",
+                        "startDate":  thirty,
+                        "endDate":    today,
+                        # dimensions=day is CRITICAL — without it column order is
+                        # undefined and r[0] returns a date string not a view count
+                        "dimensions": "day",
+                        "metrics":    "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
+                        "sort":       "day",
                     },
                     headers={"Authorization": f"Bearer {access_token}"},
                 )
                 if an.status_code == 200:
                     rows = an.json().get("rows", []) or []
                     if rows:
-                        views = sum(r[0] for r in rows)
-                        likes = sum(r[1] for r in rows)
-                        comments = sum(r[2] for r in rows)
-                        shares = sum(r[3] for r in rows)
-                        avg_watch = round(sum(r[4] for r in rows) / len(rows), 1)
-                        minutes_watched = int(sum(r[5] for r in rows))
-                else:
-                    views = int(stats.get("viewCount", 0))
-                    likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else 0
+                        # With dimensions=day columns are fixed:
+                        # [0]=day [1]=views [2]=likes [3]=comments [4]=shares
+                        # [5]=averageViewDuration [6]=estimatedMinutesWatched
+                        views           = sum(int(r[1] or 0) for r in rows)
+                        likes           = sum(int(r[2] or 0) for r in rows)
+                        comments        = sum(int(r[3] or 0) for r in rows)
+                        shares          = sum(int(r[4] or 0) for r in rows)
+                        dur_vals        = [float(r[5]) for r in rows if r[5]]
+                        avg_watch       = round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else None
+                        minutes_watched = int(sum(float(r[6] or 0) for r in rows))
+                        analytics_source = "yt-analytics"
+                    else:
+                        # Authenticated but no data in date range — use channel totals
+                        views    = int(stats.get("viewCount",    0))
+                        likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
+                        comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+                elif an.status_code == 403:
+                    # yt-analytics.readonly not on this token — user must reconnect
+                    # to grant the scope. Fall back to channel lifetime totals.
+                    logger.warning(
+                        f"YouTube Analytics 403 — yt-analytics.readonly missing from token; "
+                        f"falling back to channel stats. User must reconnect to grant scope."
+                    )
+                    views    = int(stats.get("viewCount",    0))
+                    likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
                     comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
-            except Exception:
-                views = int(stats.get("viewCount", 0))
-                likes = int(stats.get("likeCount", 0)) if "likeCount" in stats else 0
+                else:
+                    views    = int(stats.get("viewCount",    0))
+                    likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
+                    comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+            except Exception as ae:
+                logger.warning(f"YouTube Analytics call failed (non-fatal): {ae}")
+                views    = int(stats.get("viewCount",    0))
+                likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
                 comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
 
             return {
                 "status": "live",
-                "views": views,
-                "likes": likes,
-                "comments": comments,
-                "shares": shares,
-                "subscribers": int(stats.get("subscriberCount", 0)) if "subscriberCount" in stats else 0,
+                # "yt-analytics" = Analytics API succeeded with yt-analytics.readonly scope
+                # "channel_stats_fallback" = scope missing/403, showing lifetime channel totals
+                "analytics_source": analytics_source,
+                "views":           views,
+                "likes":           likes,
+                "comments":        comments,
+                "shares":          shares,
+                "subscribers":     int(stats.get("subscriberCount", 0)) if "subscriberCount" in stats else 0,
                 "avg_watch_seconds": avg_watch,
                 "minutes_watched": minutes_watched,
-                "video_count": int(stats.get("videoCount", 0)) if "videoCount" in stats else 0,
+                "video_count":     int(stats.get("videoCount", 0)) if "videoCount" in stats else 0,
             }
     except Exception as e:
         logger.error(f"YouTube metrics error: {e}")
@@ -5560,7 +5607,16 @@ async def _fetch_youtube_metrics(access_token: str) -> dict:
 
 
 async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
-    """Instagram Graph API — Reels insights."""
+    """Instagram Graph API — Reels + post insights (requires instagram_manage_insights).
+
+    analytics_source in return value:
+      "instagram_manage_insights" — insights loaded successfully
+      None                        — scope not yet approved (partial data)
+
+    Key fix: requesting "plays" on IMAGE or CAROUSEL_ALBUM posts silently
+    causes the entire /insights call to fail (Meta Graph API quirk).
+    We check media_type first and request the correct metric set.
+    """
     if not access_token or not ig_user_id:
         return {"status": "not_connected"}
     try:
@@ -5570,49 +5626,64 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
                 params={"access_token": access_token, "fields": "id,media_type,timestamp", "limit": 20},
             )
             if media.status_code != 200:
-                return {"status": "error", "error": f"HTTP {media.status_code}"}
+                return {"status": "error", "error": f"media_http_{media.status_code}"}
 
             items = media.json().get("data", []) or []
             if not items:
-                return {"status": "live", "views": 0, "likes": 0, "comments": 0, "saves": 0, "reach": 0, "shares": 0, "video_count": 0}
+                return {
+                    "status": "live",
+                    "analytics_source": "instagram_manage_insights",
+                    "views": 0, "likes": 0, "comments": 0,
+                    "saves": 0, "reach": 0, "shares": 0, "video_count": 0,
+                }
 
             total_views = total_likes = total_comments = 0
-            total_saves = total_reach = total_shares = 0
+            total_saves = total_reach = total_shares   = 0
+            analytics_source = None  # set to real value if any insight call succeeds
 
             for item in items[:10]:
+                media_type = (item.get("media_type") or "IMAGE").upper()
+
+                # Metric names differ by content type.
+                # "plays" on IMAGE/CAROUSEL → Graph API silently returns nothing.
+                if media_type in ("VIDEO", "REELS"):
+                    metric_str = "plays,reach,saved,shares,comments,likes"
+                    view_key   = "plays"
+                else:
+                    metric_str = "impressions,reach,saved,shares,comments,likes"
+                    view_key   = "impressions"
+
                 ins = await client.get(
                     f"https://graph.facebook.com/v21.0/{item['id']}/insights",
-                    params={"access_token": access_token, "metric": "plays,likes,comments,saved,reach,shares"},
+                    params={"access_token": access_token, "metric": metric_str},
                 )
                 if ins.status_code != 200:
                     continue
+
+                analytics_source = "instagram_manage_insights"  # at least one succeeded
                 for m in ins.json().get("data", []) or []:
                     name = m.get("name", "")
                     vals = m.get("values", [])
-                    val = vals[-1].get("value", 0) if vals else m.get("value", 0)
+                    val  = vals[-1].get("value", 0) if vals else m.get("value", 0)
                     if isinstance(val, dict):
                         val = sum(val.values())
-                    if name == "plays":
-                        total_views += val
-                    elif name == "likes":
-                        total_likes += val
-                    elif name == "comments":
-                        total_comments += val
-                    elif name == "saved":
-                        total_saves += val
-                    elif name == "reach":
-                        total_reach += val
-                    elif name == "shares":
-                        total_shares += val
+                    val = int(val or 0)
+                    if name == view_key:       total_views    += val
+                    elif name == "likes":      total_likes    += val
+                    elif name == "comments":   total_comments += val
+                    elif name == "saved":      total_saves    += val
+                    elif name == "reach":      total_reach    += val
+                    elif name == "shares":     total_shares   += val
 
             return {
                 "status": "live",
-                "views": total_views,
-                "likes": total_likes,
+                "analytics_source": analytics_source,  # None = scope not approved yet
+                "views":    total_views,
+                "likes":    total_likes,
                 "comments": total_comments,
-                "saves": total_saves,
-                "reach": total_reach,
-                "shares": total_shares,
+                "saves":    total_saves,
+                "reach":    total_reach,
+                "shares":   total_shares,
                 "video_count": len(items),
             }
     except Exception as e:
@@ -5621,7 +5692,12 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
 
 
 async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
-    """Facebook Graph API — Page video insights."""
+    """Facebook Graph API — Page video insights (requires read_insights + pages_read_engagement).
+
+    analytics_source in return value:
+      "read_insights+pages_read_engagement" — insights loaded successfully
+      None                                   — scope not yet approved (partial)
+    """
     if not access_token or not page_id:
         return {"status": "not_connected"}
     try:
@@ -5631,56 +5707,73 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
                 params={"access_token": access_token, "fields": "id,created_time", "limit": 15},
             )
             if vids.status_code != 200:
-                return {"status": "error", "error": f"HTTP {vids.status_code}"}
+                return {"status": "error", "error": f"videos_http_{vids.status_code}"}
 
             videos = vids.json().get("data", []) or []
             if not videos:
-                return {"status": "live", "views": 0, "reactions": 0, "comments": 0, "shares": 0, "followers": 0, "video_count": 0}
+                return {
+                    "status": "live",
+                    "analytics_source": "read_insights+pages_read_engagement",
+                    "views": 0, "reactions": 0, "comments": 0,
+                    "shares": 0, "followers": 0, "video_count": 0,
+                }
 
             total_views = total_reactions = total_comments = total_shares = 0
+            analytics_source = None  # set when at least one insight call succeeds
 
             for vid in videos[:10]:
-                ins = await client.get(
-                    f"https://graph.facebook.com/v21.0/{vid['id']}",
-                    params={
-                        "access_token": access_token,
-                        "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_shares,total_video_comments)",
-                    },
-                )
-                if ins.status_code != 200:
+                try:
+                    ins = await client.get(
+                        f"https://graph.facebook.com/v21.0/{vid['id']}",
+                        params={
+                            "access_token": access_token,
+                            "fields": (
+                                "insights.metric("
+                                "total_video_views,"
+                                "total_video_reactions_by_type_total,"
+                                "total_video_shares,"
+                                "total_video_comments)"
+                            ),
+                        },
+                    )
+                    if ins.status_code != 200:
+                        continue
+                    analytics_source = "read_insights+pages_read_engagement"
+                    for m in ins.json().get("insights", {}).get("data", []) or []:
+                        name = m.get("name", "")
+                        vals = m.get("values", [{}])
+                        val  = vals[-1].get("value", 0) if vals else 0
+                        if isinstance(val, dict):
+                            val = sum(val.values())
+                        val = int(val or 0)
+                        if   name == "total_video_views":                     total_views     += val
+                        elif name == "total_video_reactions_by_type_total":   total_reactions += val
+                        elif name == "total_video_shares":                    total_shares    += val
+                        elif name == "total_video_comments":                  total_comments  += val
+                except Exception as ve:
+                    logger.warning(f"Facebook video insight error for {vid.get('id')} (skipping): {ve}")
                     continue
-                for m in ins.json().get("insights", {}).get("data", []) or []:
-                    name = m.get("name", "")
-                    vals = m.get("values", [{}])
-                    val = vals[-1].get("value", 0) if vals else 0
-                    if isinstance(val, dict):
-                        val = sum(val.values())
-                    if name == "total_video_views":
-                        total_views += val
-                    elif name == "total_video_reactions_by_type_total":
-                        total_reactions += val
-                    elif name == "total_video_shares":
-                        total_shares += val
-                    elif name == "total_video_comments":
-                        total_comments += val
 
+            # followers_count is more accurate for Pages; fan_count as fallback
             followers = 0
             try:
                 pg = await client.get(
                     f"https://graph.facebook.com/v21.0/{page_id}",
-                    params={"access_token": access_token, "fields": "fan_count"},
+                    params={"access_token": access_token, "fields": "followers_count,fan_count"},
                 )
                 if pg.status_code == 200:
-                    followers = pg.json().get("fan_count", 0)
-            except Exception:
-                pass
+                    pg_data   = pg.json()
+                    followers = pg_data.get("followers_count") or pg_data.get("fan_count") or 0
+            except Exception as fe:
+                logger.warning(f"Facebook followers fetch error (non-fatal): {fe}")
 
             return {
                 "status": "live",
-                "views": total_views,
+                "analytics_source": analytics_source,  # None = scope pending approval
+                "views":     total_views,
                 "reactions": total_reactions,
-                "comments": total_comments,
-                "shares": total_shares,
+                "comments":  total_comments,
+                "shares":    total_shares,
                 "followers": followers,
                 "video_count": len(videos),
             }

@@ -1201,6 +1201,12 @@ async def run_migrations():
         data      JSONB NOT NULL DEFAULT '{}'::jsonb
     );
 """),
+
+# ── Per-upload engagement metrics (comments + shares) ──────────────────────
+(604, """
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS comments BIGINT DEFAULT 0;
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS shares   BIGINT DEFAULT 0;
+"""),
 ]
         
         for version, sql in migrations:
@@ -2808,7 +2814,7 @@ async def get_uploads(
         "thumbnail_r2_key","platform_results","file_size",
         "processing_started_at","processing_finished_at",
         "processing_stage","processing_progress",
-        "views","likes",
+        "views","likes","comments","shares",
         # AI fields (older/newer schema variants)
         "ai_title","ai_caption",
         "ai_generated_title","ai_generated_caption","ai_generated_hashtags",
@@ -2929,8 +2935,10 @@ async def get_uploads(
             "platform_results": platform_results,
 
             "file_size": d.get("file_size"),
-            "views": int(d.get("views") or 0),
-            "likes": int(d.get("likes") or 0),
+            "views":    int(d.get("views")    or 0),
+            "likes":    int(d.get("likes")    or 0),
+            "comments": int(d.get("comments") or 0),
+            "shares":   int(d.get("shares")   or 0),
 
             "progress": int(d.get("processing_progress") or 0),
             "current_stage": d.get("processing_stage"),
@@ -2955,6 +2963,256 @@ async def get_scheduled(user: dict = Depends(get_current_user)):
             ORDER BY scheduled_time ASC
         """, user["id"])
     return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "schedule_mode": u["schedule_mode"]} for u in uploads]
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """Return a single upload record by ID — same field shape as /api/uploads list."""
+    cols = await _load_uploads_columns(db_pool)
+    wanted = [
+        "id","filename","platforms","status","privacy",
+        "title","caption","hashtags",
+        "scheduled_time","created_at","completed_at",
+        "put_reserved","aic_reserved",
+        "error_code","error_detail",
+        "thumbnail_r2_key","platform_results","file_size",
+        "processing_started_at","processing_finished_at",
+        "processing_stage","processing_progress",
+        "views","likes","comments","shares",
+        "ai_title","ai_caption",
+        "ai_generated_title","ai_generated_caption","ai_generated_hashtags",
+    ]
+    select_cols = _pick_cols(wanted, cols) or ["id","filename","platforms","status","created_at"]
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT {', '.join(select_cols)} FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"],
+        )
+    if not row:
+        raise HTTPException(404, "Upload not found")
+
+    d = dict(row)
+    ai_title   = (d.get("ai_title")   or d.get("ai_generated_title")   or "") or ""
+    ai_caption = (d.get("ai_caption") or d.get("ai_generated_caption") or "") or ""
+    title   = (d.get("title")   or "").strip() or ai_title
+    caption = (d.get("caption") or "").strip() or ai_caption
+
+    def _norm_pr(raw):
+        pr = _safe_json(raw, [])
+        if isinstance(pr, list):  return [x for x in pr if isinstance(x, dict)]
+        if isinstance(pr, dict):
+            return [{"platform": k, **v} if isinstance(v, dict) else {"platform": k, "value": v} for k, v in pr.items()]
+        return []
+
+    def _norm_ht(raw):
+        tags = _safe_json(raw, [])
+        if isinstance(tags, list): return [str(t) for t in tags if t]
+        if isinstance(tags, str) and tags.strip(): return [tags.strip()]
+        return []
+
+    thumbnail_url = None
+    thumb_key = d.get("thumbnail_r2_key")
+    if thumb_key:
+        try:
+            s3 = get_s3_client()
+            thumbnail_url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(thumb_key)},
+                ExpiresIn=3600,
+            )
+        except Exception:
+            pass
+
+    return {
+        "id": str(d.get("id")),
+        "filename": d.get("filename"),
+        "platforms": list(d.get("platforms") or []),
+        "status": d.get("status"),
+        "privacy": d.get("privacy", "public"),
+        "title": title, "caption": caption,
+        "hashtags": _norm_ht(d.get("hashtags")),
+        "ai_title": ai_title, "ai_caption": ai_caption,
+        "ai_hashtags": _norm_ht(d.get("ai_generated_hashtags")),
+        "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
+        "created_at":  d.get("created_at").isoformat()  if d.get("created_at")  else None,
+        "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
+        "put_cost": int(d.get("put_reserved") or 0),
+        "aic_cost": int(d.get("aic_reserved") or 0),
+        "error_code": d.get("error_code"),
+        "error": d.get("error_detail") or d.get("error_code") or None,
+        "thumbnail_url": thumbnail_url,
+        "platform_results": _norm_pr(d.get("platform_results")),
+        "file_size": d.get("file_size"),
+        "views":    int(d.get("views")    or 0),
+        "likes":    int(d.get("likes")    or 0),
+        "comments": int(d.get("comments") or 0),
+        "shares":   int(d.get("shares")   or 0),
+        "progress": int(d.get("processing_progress") or 0),
+        "current_stage": d.get("processing_stage"),
+    }
+
+
+@app.post("/api/uploads/{upload_id}/sync-analytics")
+async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Fetch latest engagement stats for a single completed upload from platform APIs.
+    Uses the video IDs stored in platform_results to query per-video metrics.
+    Updates the uploads table (views, likes, comments, shares) and returns fresh data.
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, platforms, platform_results, status FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"],
+        )
+    if not row:
+        raise HTTPException(404, "Upload not found")
+
+    if row["status"] not in ("completed", "succeeded", "partial"):
+        return {"synced": False, "reason": "not_completed", "views": 0, "likes": 0, "comments": 0, "shares": 0}
+
+    # Parse platform_results to get per-platform video IDs
+    raw_pr = _safe_json(row["platform_results"], [])
+    pr_list = []
+    if isinstance(raw_pr, list):
+        pr_list = [x for x in raw_pr if isinstance(x, dict)]
+    elif isinstance(raw_pr, dict):
+        pr_list = [{"platform": k, **v} if isinstance(v, dict) else {"platform": k} for k, v in raw_pr.items()]
+
+    # Get tokens for all connected platforms
+    async with db_pool.acquire() as conn:
+        token_rows = await conn.fetch(
+            "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            user["id"],
+        )
+
+    token_map = {}
+    for tr in token_rows:
+        try:
+            dec = decrypt_blob(tr["token_blob"])
+            if dec:
+                if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
+                    dec["ig_user_id"] = str(tr["account_id"])
+                if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
+                    dec["page_id"] = str(tr["account_id"])
+                token_map[tr["platform"]] = dec
+        except Exception:
+            pass
+
+    total_views = total_likes = total_comments = total_shares = 0
+    platform_stats = {}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        for pr in pr_list:
+            plat = str(pr.get("platform") or "").lower()
+            ok   = pr.get("success") == True or str(pr.get("status","")).lower() in ("published","succeeded","success")
+            if not ok:
+                continue
+
+            tok = token_map.get(plat, {})
+            access_token = tok.get("access_token", "")
+            if not access_token:
+                continue
+
+            video_id = (pr.get("video_id") or pr.get("videoId") or pr.get("id")
+                        or pr.get("media_id") or pr.get("post_id") or pr.get("share_id"))
+
+            try:
+                if plat == "tiktok" and video_id:
+                    resp = await client.post(
+                        "https://open.tiktokapis.com/v2/video/query/",
+                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                        json={"filters": {"video_ids": [str(video_id)]},
+                              "fields": ["id","view_count","like_count","comment_count","share_count"]},
+                    )
+                    if resp.status_code == 200:
+                        vids = resp.json().get("data", {}).get("videos", []) or []
+                        if vids:
+                            v = vids[0]
+                            s = {"views": int(v.get("view_count") or 0), "likes": int(v.get("like_count") or 0),
+                                 "comments": int(v.get("comment_count") or 0), "shares": int(v.get("share_count") or 0)}
+                            platform_stats["tiktok"] = s
+                            total_views    += s["views"];    total_likes   += s["likes"]
+                            total_comments += s["comments"]; total_shares  += s["shares"]
+
+                elif plat == "youtube" and video_id:
+                    resp = await client.get(
+                        "https://www.googleapis.com/youtube/v3/videos",
+                        params={"part": "statistics", "id": str(video_id)},
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    )
+                    if resp.status_code == 200:
+                        items = resp.json().get("items", []) or []
+                        if items:
+                            st = items[0].get("statistics", {})
+                            s = {"views": int(st.get("viewCount") or 0), "likes": int(st.get("likeCount") or 0),
+                                 "comments": int(st.get("commentCount") or 0), "shares": 0}
+                            platform_stats["youtube"] = s
+                            total_views    += s["views"];    total_likes   += s["likes"]
+                            total_comments += s["comments"]
+
+                elif plat == "instagram" and video_id:
+                    shortcode = pr.get("shortcode") or video_id
+                    resp = await client.get(
+                        f"https://graph.facebook.com/v21.0/{shortcode}/insights",
+                        params={"access_token": access_token,
+                                "metric": "plays,likes,comments,saved,shares,reach"},
+                    )
+                    if resp.status_code == 200:
+                        s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                        for m in resp.json().get("data", []) or []:
+                            name = m.get("name", "")
+                            vals = m.get("values", [])
+                            val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
+                            if name == "plays":       s["views"]    += val
+                            elif name == "likes":     s["likes"]    += val
+                            elif name == "comments":  s["comments"] += val
+                            elif name == "shares":    s["shares"]   += val
+                        platform_stats["instagram"] = s
+                        total_views    += s["views"];    total_likes   += s["likes"]
+                        total_comments += s["comments"]; total_shares  += s["shares"]
+
+                elif plat == "facebook" and video_id:
+                    page_id = tok.get("page_id", "")
+                    resp = await client.get(
+                        f"https://graph.facebook.com/v21.0/{video_id}",
+                        params={"access_token": access_token,
+                                "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)"},
+                    )
+                    if resp.status_code == 200:
+                        s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                        for m in resp.json().get("insights", {}).get("data", []) or []:
+                            name = m.get("name", "")
+                            vals = m.get("values", [{}])
+                            val  = vals[-1].get("value", 0) if vals else 0
+                            if isinstance(val, dict): val = sum(val.values())
+                            val = int(val or 0)
+                            if name == "total_video_views":                      s["views"]    += val
+                            elif name == "total_video_reactions_by_type_total":  s["likes"]    += val
+                            elif name == "total_video_comments":                  s["comments"] += val
+                            elif name == "total_video_shares":                    s["shares"]   += val
+                        platform_stats["facebook"] = s
+                        total_views    += s["views"];    total_likes   += s["likes"]
+                        total_comments += s["comments"]; total_shares  += s["shares"]
+
+            except Exception as e:
+                logger.warning(f"sync-analytics error for {plat}/{video_id}: {e}")
+                continue
+
+    # Persist to DB
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE uploads SET views=$1, likes=$2, comments=$3, shares=$4, updated_at=NOW()
+               WHERE id=$5 AND user_id=$6""",
+            total_views, total_likes, total_comments, total_shares,
+            upload_id, user["id"],
+        )
+
+    return {
+        "synced": True,
+        "views": total_views, "likes": total_likes,
+        "comments": total_comments, "shares": total_shares,
+        "platform_stats": platform_stats,
+    }
+
 
 @app.delete("/api/uploads/{upload_id}")
 async def delete_upload(upload_id: str, user: dict = Depends(get_current_user)):

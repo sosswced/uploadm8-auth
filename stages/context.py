@@ -175,7 +175,13 @@ class JobContext:
     local_video_path: Optional[Path] = None
     local_telemetry_path: Optional[Path] = None
     processed_video_path: Optional[Path] = None
+
+    # Single best thumbnail (auto-selected by quality score)
     thumbnail_path: Optional[Path] = None
+    # All candidate thumbnails generated (user can pick preferred later)
+    thumbnail_paths: List[Path] = field(default_factory=list)
+    # Sharpness scores keyed by str(path) — higher = sharper
+    thumbnail_scores: Dict[str, float] = field(default_factory=dict)
 
     platform_videos: Dict[str, Path] = field(default_factory=dict)
     video_info: Dict[str, Any] = field(default_factory=dict)
@@ -256,7 +262,27 @@ class JobContext:
         return self.ai_caption or self.caption or ""
 
     def get_effective_hashtags(self) -> List[str]:
-        return self.ai_hashtags if self.ai_hashtags else self.hashtags
+        """
+        Merge base hashtags (always_hashtags already baked in at presign time)
+        with AI-generated hashtags. AI hashtags are ADDITIVE — they never replace
+        the user's always/preset tags.
+
+        Deduplicates while preserving order: base/always tags come first,
+        then AI additions that aren't already present.
+        """
+        base = list(self.hashtags or [])
+        ai = list(self.ai_hashtags or [])
+
+        seen: set = set()
+        merged: List[str] = []
+        for tag in base + ai:
+            t = str(tag).strip().lstrip("#").lower()
+            if t and t not in seen:
+                seen.add(t)
+                # Normalise: ensure leading #
+                merged.append(tag if str(tag).startswith("#") else f"#{tag}")
+
+        return merged
 
     def is_success(self) -> bool:
         return any(r.success for r in self.platform_results)

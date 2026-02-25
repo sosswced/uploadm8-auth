@@ -224,17 +224,45 @@ def _get_caption(ctx: JobContext) -> str:
     )
 
 
-def _get_hashtags(ctx: JobContext) -> str:
+def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
     """Get hashtag string for publishing.
+
+    Merges base hashtags (always_hashtags + AI tags via get_effective_hashtags)
+    with any platform-specific hashtags from user_settings.
 
     Tags are stored without the '#' prefix (stripped at save time).
     We always add '#' here so captions look correct on every platform.
     """
-    tags = []
+    # Base tags: get_effective_hashtags merges always_hashtags + ai_hashtags
+    tags: list = []
     if hasattr(ctx, "get_effective_hashtags"):
-        tags = ctx.get_effective_hashtags()
+        tags = list(ctx.get_effective_hashtags())
     else:
-        tags = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
+        tags = list(getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or [])
+
+    # Add platform-specific hashtags when a platform is specified
+    if platform:
+        try:
+            us = ctx.user_settings or {}
+            platform_hashtags = us.get("platformHashtags") or us.get("platform_hashtags") or {}
+            if isinstance(platform_hashtags, str):
+                import json as _pjson
+                platform_hashtags = _pjson.loads(platform_hashtags)
+            extra = (
+                platform_hashtags.get(platform)
+                or platform_hashtags.get(platform.lower())
+                or []
+            )
+            if isinstance(extra, str):
+                extra = extra.split()
+            existing_lower = {str(t).lstrip("#").lower() for t in tags}
+            for tag in extra:
+                t = str(tag).strip().lstrip("#")
+                if t and t.lower() not in existing_lower:
+                    existing_lower.add(t.lower())
+                    tags.append(f"#{t}")
+        except Exception:
+            pass
 
     # Normalise: ensure each tag starts with '#' and contains no whitespace
     normalised = []
@@ -248,42 +276,42 @@ def _get_hashtags(ctx: JobContext) -> str:
     return " ".join(normalised) if normalised else ""
 
 
-def _build_full_caption(ctx: JobContext) -> str:
-    """Build caption + hashtags combined (for IG/FB/YouTube).
+def _build_platform_caption(ctx: JobContext, platform: str) -> str:
+    """Build caption + hashtags for a specific platform.
 
-    Respects the user's hashtag_position preference:
-      - 'start' → hashtags appear before the caption text
-      - 'end'   → hashtags appear after the caption text (default)
-
-    The position is stored in ctx.user_preferences (JSONB saved at presign time).
+    Includes platform-specific hashtags from user_settings.
+    Respects the user's hashtag_position preference (start / end).
     """
     caption = _get_caption(ctx)
-    hashtags = _get_hashtags(ctx)
+    hashtags = _get_hashtags(ctx, platform=platform)
 
     if not hashtags:
         return caption or ""
     if not caption:
         return hashtags
 
-    # Resolve hashtag position from stored user preferences
-    hashtag_position = "end"  # safe default
+    # Resolve hashtag position from user preferences
+    hashtag_position = "end"
     try:
-        up = getattr(ctx, "user_preferences", None)
-        if isinstance(up, str):
-            import json as _json
-            up = _json.loads(up)
-        if isinstance(up, dict):
-            hashtag_position = (
-                up.get("hashtag_position")
-                or up.get("hashtagPosition")
-                or "end"
-            ).lower()
+        us = ctx.user_settings or {}
+        hashtag_position = (
+            us.get("hashtagPosition")
+            or us.get("hashtag_position")
+            or "end"
+        ).lower()
+        if hashtag_position not in ("start", "end"):
+            hashtag_position = "end"
     except Exception:
         pass
 
     if hashtag_position == "start":
         return f"{hashtags}\n\n{caption}"
     return f"{caption}\n\n{hashtags}"
+
+
+def _build_full_caption(ctx: JobContext) -> str:
+    """Backward-compat alias — no platform-specific hashtags."""
+    return _build_platform_caption(ctx, platform="")
 
 
 def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
@@ -577,7 +605,7 @@ async def publish_to_tiktok(
         )
 
     title = _get_title(ctx)
-    caption = _build_full_caption(ctx)
+    caption = _build_platform_caption(ctx, "tiktok")
     # TikTok uses title field (max 150 chars), caption goes in description
     tiktok_title = (caption or title)[:150]
 
@@ -792,7 +820,7 @@ async def publish_to_youtube(
         )
 
     title = _get_title(ctx)[:100]
-    caption = _build_full_caption(ctx)
+    caption = _build_platform_caption(ctx, "youtube")
     description = caption[:5000] if caption else ""
 
     try:
@@ -947,7 +975,7 @@ async def publish_to_instagram(
             error_message="Instagram requires a public video URL. Configure R2_PUBLIC_URL or ensure presigned URLs work."
         )
 
-    caption = _build_full_caption(ctx)
+    caption = _build_platform_caption(ctx, "instagram")
     ig_privacy = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "instagram")
 
     try:
@@ -1134,7 +1162,7 @@ async def publish_to_facebook(
             error_message="No Facebook page ID found in token data"
         )
 
-    description = _build_full_caption(ctx)
+    description = _build_platform_caption(ctx, "facebook")
     fb_privacy_value = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "facebook")
     fb_privacy_param = {"value": fb_privacy_value}  # FB Graph API format: {"value": "EVERYONE"}
 
@@ -1183,11 +1211,13 @@ async def publish_to_facebook(
                 )
 
             video_id = resp.json().get("id")
-            logger.info(f"Facebook publish accepted: video_id={video_id}")
+            platform_url = f"https://www.facebook.com/video/{video_id}" if video_id else None
+            logger.info(f"Facebook publish accepted: video_id={video_id}, url={platform_url}")
             return PlatformResult(
                 platform="facebook",
                 success=True,
                 platform_video_id=video_id,
+                platform_url=platform_url,
                 verify_status="pending",
             )
 

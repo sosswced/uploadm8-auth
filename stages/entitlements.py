@@ -45,6 +45,11 @@ MAX CAPTION FRAMES:
   Always anchored at beginning (5%), middle (50%), end (95%).
   Additional frames fill between anchors up to this limit.
   Free = 3 (anchors only). Studio/Agency = 15 (dense AI scan).
+
+MAX THUMBNAILS:
+  Number of candidate thumbnail frames generated per video.
+  The sharpest frame is auto-selected; all candidates stored for user pick.
+  Free = 1 (single frame). Agency/internal = 20 (dense scan, best quality).
 """
 
 from __future__ import annotations
@@ -68,6 +73,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p4", "queue_depth": 25, "lookahead_hours": 2,
         "max_caption_frames": 3, "ai_depth": "basic",
         "team_seats": 1, "analytics": "basic",
+        "max_thumbnails": 1,
     },
 
     "creator_lite": {
@@ -80,6 +86,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p3", "queue_depth": 500, "lookahead_hours": 12,
         "max_caption_frames": 5, "ai_depth": "enhanced",
         "team_seats": 1, "analytics": "standard",
+        "max_thumbnails": 3,
     },
 
     "creator_pro": {
@@ -92,6 +99,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p2", "queue_depth": 5000, "lookahead_hours": 24,
         "max_caption_frames": 8, "ai_depth": "advanced",
         "team_seats": 3, "analytics": "full",
+        "max_thumbnails": 5,
     },
 
     "studio": {
@@ -104,6 +112,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p1", "queue_depth": 25000, "lookahead_hours": 48,
         "max_caption_frames": 15, "ai_depth": "max",
         "team_seats": 10, "analytics": "full_export",
+        "max_thumbnails": 10,
     },
 
     "agency": {
@@ -116,6 +125,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
         "max_caption_frames": 15, "ai_depth": "max",
         "team_seats": 25, "analytics": "full_export",
+        "max_thumbnails": 15,
     },
 
     "friends_family": {
@@ -128,6 +138,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 999, "analytics": "full_export",
+        "max_thumbnails": 20,
     },
 
     "lifetime": {
@@ -140,6 +151,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 999, "analytics": "full_export",
+        "max_thumbnails": 20,
     },
 
     "master_admin": {
@@ -152,6 +164,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 9999, "analytics": "full_export",
+        "max_thumbnails": 20,
     },
 }
 
@@ -216,6 +229,9 @@ class Entitlements:
     max_caption_frames: int = 3
     ai_depth: str = "basic"
 
+    # Thumbnails
+    max_thumbnails: int = 1
+
     # Team / reporting
     team_seats: int = 1
     analytics: str = "basic"
@@ -258,6 +274,7 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         lookahead_hours=cfg.get("lookahead_hours", 2),
         max_caption_frames=cfg.get("max_caption_frames", 3),
         ai_depth=cfg.get("ai_depth", "basic"),
+        max_thumbnails=cfg.get("max_thumbnails", 1),
         team_seats=cfg.get("team_seats", 1),
         analytics=cfg.get("analytics", "basic"),
         is_internal=cfg.get("internal", False),
@@ -298,6 +315,7 @@ def get_entitlements_from_user(
         _ov(ent, overrides, "queue_depth",               int)
         _ov(ent, overrides, "lookahead_hours",           int)
         _ov(ent, overrides, "max_caption_frames",        int)
+        _ov(ent, overrides, "max_thumbnails",            int)
         _ov(ent, overrides, "priority_class",            str)
         ent.custom_overrides = dict(overrides)
 
@@ -343,6 +361,7 @@ def entitlements_to_dict(ent: Entitlements) -> dict:
         "lookahead_hours":           ent.lookahead_hours,
         "max_caption_frames":        ent.max_caption_frames,
         "ai_depth":                  ent.ai_depth,
+        "max_thumbnails":            ent.max_thumbnails,
         "team_seats":                ent.team_seats,
         "analytics":                 ent.analytics,
         "is_internal":               ent.is_internal,

@@ -493,7 +493,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         await maybe_cancel(ctx, "transcode")
 
         # ============================================================
-        # STAGE 6: Thumbnail
+        # STAGE 6: Thumbnail — extract frame then immediately upload to R2
         # ============================================================
         try:
             ctx = await run_thumbnail_stage(ctx)
@@ -501,6 +501,51 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             logger.info(f"[{upload_id}] Thumbnail skipped: {e.reason}")
         except StageError as e:
             logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
+
+        # ── Upload the best thumbnail to R2 and record its key ─────────────
+        # thumbnail_stage sets ctx.thumbnail_path but never uploads it.
+        # We do it here so thumbnail_r2_key is persisted to the DB and the
+        # API can return a presigned URL for the dashboard to display.
+        if ctx.thumbnail_path and Path(ctx.thumbnail_path).exists():
+            thumb_r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/thumbnail.jpg"
+            try:
+                await r2_stage.upload_file(
+                    Path(ctx.thumbnail_path),
+                    thumb_r2_key,
+                    "image/jpeg",
+                )
+                ctx.thumbnail_r2_key = thumb_r2_key
+                # Persist immediately so the API can serve it even before the
+                # pipeline finishes (user sees the thumbnail as soon as it's ready).
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE uploads SET thumbnail_r2_key = $1, updated_at = NOW() WHERE id = $2",
+                        thumb_r2_key,
+                        upload_id,
+                    )
+                logger.info(f"[{upload_id}] Thumbnail uploaded to R2: {thumb_r2_key}")
+            except Exception as e:
+                logger.warning(f"[{upload_id}] Thumbnail R2 upload failed (non-fatal): {e}")
+
+        # Also upload any additional candidate thumbnails (for tier users who can pick)
+        if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
+            candidate_keys = []
+            for i, cpath in enumerate(ctx.thumbnail_paths):
+                if not cpath or not Path(cpath).exists():
+                    continue
+                if str(cpath) == str(ctx.thumbnail_path):
+                    candidate_keys.append(ctx.thumbnail_r2_key or "")
+                    continue
+                ckey = f"thumbnails/{ctx.user_id}/{upload_id}/candidate_{i:02d}.jpg"
+                try:
+                    await r2_stage.upload_file(Path(cpath), ckey, "image/jpeg")
+                    candidate_keys.append(ckey)
+                    logger.debug(f"[{upload_id}] Candidate thumb {i} → {ckey}")
+                except Exception as e:
+                    logger.debug(f"[{upload_id}] Candidate thumb {i} upload failed: {e}")
+            if candidate_keys:
+                ctx.output_artifacts["thumbnail_r2_candidates"] = json.dumps(candidate_keys)
+
         await maybe_cancel(ctx, "thumbnail")
 
         # ============================================================

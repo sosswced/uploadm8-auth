@@ -7353,5 +7353,12 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "progress": int(d.get("processing_progress") or 0),
         "current_stage": d.get("processing_stage"),
         "duration_seconds": duration_seconds,
+
+        # camelCase aliases required by upload.html pollUpload() tick loop
+        # The poller keys on processingStartedAt to flip from Queued -> Processing
+        "processingStartedAt":  d.get("processing_started_at").isoformat() if d.get("processing_started_at") else None,
+        "processingFinishedAt": d.get("processing_finished_at").isoformat() if d.get("processing_finished_at") else None,
+        "processingProgress":   int(d.get("processing_progress") or 0),
+        "processingStage":      d.get("processing_stage"),
     }
 

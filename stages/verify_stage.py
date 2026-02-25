@@ -28,14 +28,19 @@ VERIFY_INTERVAL_SECONDS = int(os.environ.get("VERIFY_INTERVAL_SECONDS", "60"))
 VERIFY_MAX_AGE_HOURS = int(os.environ.get("VERIFY_MAX_AGE_HOURS", "24"))
 
 
-async def verify_tiktok(publish_id: str, token_data: dict) -> str:
+async def verify_tiktok(publish_id: str, token_data: dict):
     """
     Check TikTok publish status.
-    Returns: 'confirmed', 'rejected', 'pending', or 'unknown'.
+    Returns: (status_str, video_id_or_None)
+      status: 'confirmed', 'rejected', 'pending', or 'unknown'
+      video_id: the real TikTok video_id when PUBLISH_COMPLETE (None otherwise)
+
+    TikTok's status response includes published_element.video_id once live.
+    We capture it so sync-analytics can query per-video metrics later.
     """
     access_token = token_data.get("access_token")
     if not access_token or not publish_id:
-        return "unknown"
+        return "unknown", None
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -49,23 +54,31 @@ async def verify_tiktok(publish_id: str, token_data: dict) -> str:
             )
 
             if resp.status_code != 200:
-                return "unknown"
+                return "unknown", None
 
             data = resp.json().get("data", {})
             status = data.get("status", "").upper()
+            # TikTok includes the real video_id once publishing is complete
+            video_id = (
+                data.get("published_element", {}).get("video_id")
+                or data.get("video_id")
+                or None
+            )
+            if video_id:
+                video_id = str(video_id)
 
             if status == "PUBLISH_COMPLETE":
-                return "confirmed"
+                return "confirmed", video_id
             elif status in ("FAILED", "UPLOAD_ERROR"):
-                return "rejected"
+                return "rejected", None
             elif status in ("PROCESSING_UPLOAD", "PROCESSING_DOWNLOAD", "SENDING_TO_USER_INBOX"):
-                return "pending"
+                return "pending", None
             else:
-                return "unknown"
+                return "unknown", None
 
     except Exception as e:
         logger.debug(f"TikTok verify failed: {e}")
-        return "unknown"
+        return "unknown", None
 
 
 async def verify_youtube(video_id: str, token_data: dict) -> str:
@@ -152,18 +165,56 @@ async def verify_single_attempt(
 
     # Platform-specific verification
     verify_status = "unknown"
+    tiktok_video_id: Optional[str] = None
 
     if platform == "tiktok" and publish_id:
-        verify_status = await verify_tiktok(publish_id, token_data)
+        verify_status, tiktok_video_id = await verify_tiktok(publish_id, token_data)
     elif platform == "youtube" and platform_post_id:
         verify_status = await verify_youtube(platform_post_id, token_data)
     else:
         # Instagram/Facebook verification not yet implemented
         verify_status = "unknown"
 
-    # Update DB
+    # Update publish_attempts row
     await db_stage.update_publish_attempt_verified(db_pool, attempt_id, verify_status)
     logger.debug(f"Verify {platform}/{attempt_id}: {verify_status}")
+
+    # When TikTok confirms, save the real video_id back into platform_results on the uploads row.
+    # The initial publish only returns a publish_id — the video_id is only available after
+    # PUBLISH_COMPLETE.  Without it, sync-analytics can't query TikTok metrics.
+    if platform == "tiktok" and verify_status == "confirmed" and tiktok_video_id:
+        upload_id = str(attempt.get("upload_id", ""))
+        if upload_id:
+            try:
+                async with db_pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT platform_results FROM uploads WHERE id = $1", upload_id
+                    )
+                    if row:
+                        import json as _json
+                        pr = row["platform_results"]
+                        pr_list = _json.loads(pr) if isinstance(pr, str) else (pr or [])
+                        if isinstance(pr_list, list):
+                            updated = False
+                            for item in pr_list:
+                                if isinstance(item, dict) and item.get("platform") == "tiktok":
+                                    item["platform_video_id"] = tiktok_video_id
+                                    item["video_id"] = tiktok_video_id
+                                    # Build the TikTok video URL
+                                    item["platform_url"] = f"https://www.tiktok.com/video/{tiktok_video_id}"
+                                    item["url"] = item["platform_url"]
+                                    updated = True
+                            if updated:
+                                await conn.execute(
+                                    "UPDATE uploads SET platform_results = $1::jsonb, updated_at = NOW() WHERE id = $2",
+                                    _json.dumps(pr_list), upload_id
+                                )
+                                logger.info(
+                                    f"Saved TikTok video_id={tiktok_video_id} back to "
+                                    f"platform_results for upload={upload_id}"
+                                )
+            except Exception as e:
+                logger.warning(f"Could not save TikTok video_id to platform_results: {e}")
 
 
 async def run_verification_loop(

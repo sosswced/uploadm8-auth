@@ -650,6 +650,27 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
         return token_data
 
 
+
+def _instagram_media_id_to_shortcode(media_id: str) -> Optional[str]:
+    """
+    Convert an Instagram numeric media_id to its public shortcode.
+    Instagram shortcodes are base62 encoded from the lower 64 bits of
+    the media_id (specifically the portion after stripping the shard ID).
+    Used to construct valid instagram.com/reel/{shortcode}/ URLs.
+    """
+    ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    try:
+        n = int(media_id.split("_")[0])  # strip user_id suffix if present
+        # Instagram shortcode = base62 encoding of media_id
+        result = []
+        while n > 0:
+            result.append(ALPHABET[n % 62])
+            n //= 62
+        return "".join(reversed(result)) if result else None
+    except Exception:
+        return None
+
+
 async def publish_to_tiktok(
     video_path: Path,
     ctx: JobContext,
@@ -1173,7 +1194,10 @@ async def publish_to_instagram(
                 )
 
             media_id = publish_resp.json().get("id")
-            platform_url = f"https://www.instagram.com/reel/{media_id}/" if media_id else None
+            # Build Instagram URL using shortcode (base62 of media_id)
+            # instagram.com/reel/{numeric_id} doesn't work — must use shortcode
+            ig_shortcode = _instagram_media_id_to_shortcode(str(media_id)) if media_id else None
+            platform_url = f"https://www.instagram.com/reel/{ig_shortcode}/" if ig_shortcode else None
 
             logger.info(f"Instagram publish accepted: media_id={media_id}")
             return PlatformResult(

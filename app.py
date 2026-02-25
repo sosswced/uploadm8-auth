@@ -2844,6 +2844,10 @@ async def get_uploads(
         "processing_started_at","processing_finished_at",
         "processing_stage","processing_progress",
         "views","likes","comments","shares",
+        # Schedule fields — required by dashboard to distinguish smart vs manual
+        "schedule_mode","schedule_metadata",
+        # Direct video URL (populated by worker after successful upload)
+        "video_url",
         # AI fields (older/newer schema variants)
         "ai_title","ai_caption",
         "ai_generated_title","ai_generated_caption","ai_generated_hashtags",
@@ -2971,6 +2975,13 @@ async def get_uploads(
 
             "progress": int(d.get("processing_progress") or 0),
             "current_stage": d.get("processing_stage"),
+
+            # Schedule fields — lets frontend distinguish smart vs manual scheduled
+            "schedule_mode":     d.get("schedule_mode") or "immediate",
+            "schedule_metadata": _safe_json(d.get("schedule_metadata"), None),
+
+            # Direct video URL if stored by worker
+            "video_url": d.get("video_url"),
         }
         out.append(item)
 

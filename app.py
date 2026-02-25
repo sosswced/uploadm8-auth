@@ -313,7 +313,7 @@ admin_settings_cache: Dict[str, Any] = {"demo_data_enabled": False, "billing_mod
 # ── Entitlements: single source of truth ──────────────────────
 # PLAN_CONFIG removed. All tier data lives in entitlements.py.
 # Import everything we need from there.
-from entitlements import (
+from stages.entitlements import (
     TIER_CONFIG,
     STRIPE_LOOKUP_TO_TIER,
     TOPUP_PRODUCTS,
@@ -4007,25 +4007,50 @@ OAUTH_CONFIG = {
     "tiktok": {
         "auth_url": "https://www.tiktok.com/v2/auth/authorize/",
         "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
-        "scope": "user.info.basic,video.publish,video.upload",
+        # Added:
+        # - video.list (required for /v2/video/list/ stats reads)
+        # - user.info.stats (required to fetch follower_count, etc via /v2/user/info/)
+        "scope": "user.info.basic,user.info.stats,video.publish,video.upload,video.list",
     },
     "youtube": {
         "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_url": "https://oauth2.googleapis.com/token",
-        "scope": "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly",
+        # Added yt-analytics.readonly because _fetch_youtube_metrics() calls youtubeanalytics.googleapis.com/v2/reports
+        "scope": (
+            "https://www.googleapis.com/auth/youtube.upload "
+            "https://www.googleapis.com/auth/youtube.readonly "
+            "https://www.googleapis.com/auth/yt-analytics.readonly"
+        ),
     },
     "instagram": {
         # Instagram Graph API uses Facebook OAuth (for publishing Reels)
         "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
         "token_url": "https://graph.facebook.com/v18.0/oauth/access_token",
-        "scope": "instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement,business_management",
+        # Added instagram_manage_insights for full Insights API access
+        "scope": (
+            "instagram_basic,"
+            "instagram_content_publish,"
+            "instagram_manage_insights,"
+            "pages_show_list,"
+            "pages_read_engagement,"
+            "business_management"
+        ),
     },
     "facebook": {
         "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
         "token_url": "https://graph.facebook.com/v18.0/oauth/access_token",
-        "scope": "pages_manage_posts,pages_read_engagement,pages_show_list,publish_video",
+        # Added read_insights + pages_read_user_content to harden page/video insights + video listing
+        "scope": (
+            "pages_manage_posts,"
+            "pages_read_engagement,"
+            "pages_read_user_content,"
+            "pages_show_list,"
+            "publish_video,"
+            "read_insights"
+        ),
     },
 }
+
 
 # OAuth state storage (in production, use Redis)
 oauth_states: Dict[str, dict] = {}
@@ -5142,11 +5167,13 @@ _PLATFORM_CACHE_TTL = 3 * 60 * 60  # 3 hours
 
 
 async def _fetch_tiktok_metrics(access_token: str) -> dict:
-    """TikTok Content API — video list + basic totals."""
+    """TikTok Content API — video list totals + follower stats (requires video.list + user.info.stats)."""
     if not access_token:
         return {"status": "not_connected"}
+
     try:
         async with httpx.AsyncClient(timeout=20) as client:
+            # 1) Video list (requires video.list)
             resp = await client.post(
                 "https://open.tiktokapis.com/v2/video/list/",
                 headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
@@ -5154,28 +5181,58 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
             )
             if resp.status_code != 200:
                 logger.warning(f"TikTok video list HTTP {resp.status_code}: {resp.text[:200]}")
-                return {"status": "error", "error": f"HTTP {resp.status_code}"}
+                return {"status": "error", "error": f"video_list_http_{resp.status_code}"}
 
-            videos = resp.json().get("data", {}).get("videos", []) or []
-            views = sum(v.get("view_count", 0) for v in videos)
-            likes = sum(v.get("like_count", 0) for v in videos)
-            comments = sum(v.get("comment_count", 0) for v in videos)
-            shares = sum(v.get("share_count", 0) for v in videos)
-            durs = [v.get("duration", 0) for v in videos if v.get("duration")]
+            videos = (resp.json().get("data", {}) or {}).get("videos", []) or []
+
+            def _i(v):
+                try:
+                    return int(v or 0)
+                except Exception:
+                    return 0
+
+            views = sum(_i(v.get("view_count")) for v in videos)
+            likes = sum(_i(v.get("like_count")) for v in videos)
+            comments = sum(_i(v.get("comment_count")) for v in videos)
+            shares = sum(_i(v.get("share_count")) for v in videos)
+
+            durs = [_i(v.get("duration")) for v in videos if v.get("duration") is not None]
             avg_watch = round(sum(durs) / len(durs), 1) if durs else None
+
+            # 2) User info stats (requires user.info.stats)
+            followers = following = total_likes = video_count = None
+            ui = await client.get(
+                "https://open.tiktokapis.com/v2/user/info/",
+                params={"fields": "follower_count,following_count,likes_count,video_count"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if ui.status_code == 200:
+                user_obj = ((ui.json().get("data", {}) or {}).get("user", {}) or {})
+                followers = user_obj.get("follower_count")
+                following = user_obj.get("following_count")
+                total_likes = user_obj.get("likes_count")
+                video_count = user_obj.get("video_count")
+            else:
+                # Do not fail KPI entirely if stats scope isn't approved yet.
+                logger.warning(f"TikTok user info HTTP {ui.status_code}: {ui.text[:200]}")
 
             return {
                 "status": "live",
+                "followers": _i(followers) if followers is not None else None,
+                "following": _i(following) if following is not None else None,
+                "total_likes": _i(total_likes) if total_likes is not None else None,
+                "video_count": _i(video_count) if video_count is not None else len(videos),
                 "views": views,
                 "likes": likes,
                 "comments": comments,
                 "shares": shares,
                 "avg_watch_seconds": avg_watch,
-                "video_count": len(videos),
             }
+
     except Exception as e:
         logger.error(f"TikTok metrics error: {e}")
         return {"status": "error", "error": str(e)}
+
 
 
 async def _fetch_youtube_metrics(access_token: str) -> dict:

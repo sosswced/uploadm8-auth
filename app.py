@@ -2887,20 +2887,37 @@ async def get_uploads(
           - list: [{platform:..., status:..., url:...}, ...]
           - dict: {"tiktok": {...}, "youtube": {...}}
         Always return list[dict].
+
+        Field aliasing (frontend-safe):
+          platform_video_id → video_id   (canonical worker field)
+          platform_url      → url        (canonical worker field)
+        Both original fields are kept so nothing breaks.
         """
         pr = _safe_json(raw, [])
         if isinstance(pr, list):
-            return [x for x in pr if isinstance(x, dict)]
-        if isinstance(pr, dict):
-            out = []
+            items = [x for x in pr if isinstance(x, dict)]
+        elif isinstance(pr, dict):
+            items = []
             for k, v in pr.items():
                 if isinstance(v, dict):
-                    item = {"platform": k, **v}
+                    items.append({"platform": k, **v})
                 else:
-                    item = {"platform": k, "value": v}
-                out.append(item)
-            return out
-        return []
+                    items.append({"platform": k, "value": v})
+        else:
+            return []
+
+        # Alias platform_video_id → video_id and platform_url → url
+        # so buildPlatformUrl() in the frontend finds them with its
+        # existing entry.video_id / entry.url lookups.
+        out = []
+        for item in items:
+            d = dict(item)
+            if d.get("platform_video_id") and not d.get("video_id"):
+                d["video_id"] = d["platform_video_id"]
+            if d.get("platform_url") and not d.get("url"):
+                d["url"] = d["platform_url"]
+            out.append(d)
+        return out
 
     def _normalize_hashtags(raw):
         tags = _safe_json(raw, [])
@@ -3162,6 +3179,12 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
         pr_list = [x for x in raw_pr if isinstance(x, dict)]
     elif isinstance(raw_pr, dict):
         pr_list = [{"platform": k, **v} if isinstance(v, dict) else {"platform": k} for k, v in raw_pr.items()]
+    # Alias canonical worker fields so lookups below find them
+    for pr in pr_list:
+        if pr.get("platform_video_id") and not pr.get("video_id"):
+            pr["video_id"] = pr["platform_video_id"]
+        if pr.get("platform_url") and not pr.get("url"):
+            pr["url"] = pr["platform_url"]
 
     # Get tokens for all connected platforms
     async with db_pool.acquire() as conn:
@@ -3198,8 +3221,13 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
             if not access_token:
                 continue
 
-            video_id = (pr.get("video_id") or pr.get("videoId") or pr.get("id")
-                        or pr.get("media_id") or pr.get("post_id") or pr.get("share_id"))
+            # platform_video_id is the canonical field written by db.py/mark_processing_completed
+            # video_id / media_id / share_id etc. are legacy / webhook-written variants
+            video_id = (
+                pr.get("platform_video_id")  # canonical (worker pipeline)
+                or pr.get("video_id") or pr.get("videoId") or pr.get("id")
+                or pr.get("media_id") or pr.get("post_id") or pr.get("share_id")
+            )
 
             try:
                 if plat == "tiktok" and video_id:
@@ -7703,16 +7731,25 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
     def _normalize_platform_results(raw):
         pr = _safe_json(raw, [])
         if isinstance(pr, list):
-            return [x for x in pr if isinstance(x, dict)]
-        if isinstance(pr, dict):
-            out = []
+            items = [x for x in pr if isinstance(x, dict)]
+        elif isinstance(pr, dict):
+            items = []
             for k, v in pr.items():
                 if isinstance(v, dict):
-                    out.append({"platform": k, **v})
+                    items.append({"platform": k, **v})
                 else:
-                    out.append({"platform": k, "value": v})
-            return out
-        return []
+                    items.append({"platform": k, "value": v})
+        else:
+            return []
+        out = []
+        for item in items:
+            d = dict(item)
+            if d.get("platform_video_id") and not d.get("video_id"):
+                d["video_id"] = d["platform_video_id"]
+            if d.get("platform_url") and not d.get("url"):
+                d["url"] = d["platform_url"]
+            out.append(d)
+        return out
 
     def _normalize_hashtags(raw):
         tags = _safe_json(raw, [])

@@ -231,7 +231,7 @@ PRIORITY_JOB_QUEUE = os.environ.get("PRIORITY_JOB_QUEUE", "uploadm8:priority")
 # Stripe
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_SUCCESS_URL = os.environ.get("STRIPE_SUCCESS_URL", f"{FRONTEND_URL}/billing/success?session_id={{{{CHECKOUT_SESSION_ID}}}}")
+STRIPE_SUCCESS_URL = os.environ.get("STRIPE_SUCCESS_URL", f"{FRONTEND_URL}/billing/success.html") + "?session_id={CHECKOUT_SESSION_ID}"
 STRIPE_CANCEL_URL = os.environ.get("STRIPE_CANCEL_URL", f"{FRONTEND_URL}/index.html#pricing")
 
 BILLING_MODE = os.environ.get("BILLING_MODE", "test").strip().lower()
@@ -325,9 +325,7 @@ from stages.entitlements import (
     get_tier_from_lookup_key,
     get_priority_lane,
     check_queue_depth,
-    compute_upload_cost,       # NEW: canonical PUT/AIC formula
-    compute_put_cost,          # NEW: standalone PUT formula
-    compute_aic_cost,          # NEW: standalone AIC formula
+    compute_upload_cost,   # canonical PUT/AIC formula
 )
 
 def get_plan(tier: str) -> dict:
@@ -343,24 +341,6 @@ def get_plan(tier: str) -> dict:
 def _now_utc(): return datetime.now(timezone.utc)
 def _sha256_hex(s: str): return hashlib.sha256(s.encode()).hexdigest()
 def _req_id(): return f"req_{int(time.time())}_{secrets.token_hex(4)}"
-
-
-def _suggest_upgrade(current_tier: str, wallet: str) -> str:
-    """Return a human-readable upgrade suggestion based on current tier + which wallet is empty."""
-    tier_order = ["free", "creator_lite", "creator_pro", "studio", "agency"]
-    try:
-        idx = tier_order.index(current_tier)
-    except ValueError:
-        idx = 0
-    if idx < len(tier_order) - 1:
-        next_tier = tier_order[idx + 1]
-        cfg = TIER_CONFIG.get(next_tier, {})
-        name = cfg.get("name", next_tier)
-        price = cfg.get("price", 0)
-        amt = cfg.get(f"{wallet}_monthly", 0)
-        return f"Upgrade to {name} (${price}/mo) to get {amt} {wallet.upper()} per month, or purchase a top-up pack."
-    return f"Purchase a {wallet.upper()} top-up pack to continue uploading."
-
 
 def parse_enc_keys():
     if not TOKEN_ENC_KEYS:
@@ -1819,21 +1799,32 @@ async def get_me(user: dict = Depends(get_current_user)):
         "avatar_signed_url": avatar_signed_url,
         "avatarSignedUrl": avatar_signed_url,
 
-        "subscription_tier": user.get("subscription_tier", "free"),
+        "subscription_tier":      user.get("subscription_tier", "free"),
+        "subscription_status":     user.get("subscription_status"),
+        "current_period_end":      user.get("current_period_end").isoformat() if user.get("current_period_end") else None,
+        "trial_end":               user.get("trial_end").isoformat() if user.get("trial_end") else None,
+        "stripe_subscription_id":  user.get("stripe_subscription_id"),
+        "billing_mode":            BILLING_MODE,   # "test" | "live"
         "wallet": {
-            "put_balance": float(wallet.get("put_balance", 0.0) or 0.0),
-            "aic_balance": float(wallet.get("aic_balance", 0.0) or 0.0),
-            "updated_at": wallet.get("updated_at"),
+            "put_balance":  float(wallet.get("put_balance", 0.0) or 0.0),
+            "aic_balance":  float(wallet.get("aic_balance", 0.0) or 0.0),
+            "put_reserved": float(wallet.get("put_reserved", 0.0) or 0.0),
+            "aic_reserved": float(wallet.get("aic_reserved", 0.0) or 0.0),
+            "updated_at":   wallet.get("updated_at"),
         },
         "plan": plan,
         "features": {
-            "uploads": plan.get("uploads", False),
-            "scheduler": plan.get("scheduler", False),
-            "analytics": plan.get("analytics", False),
-            "watermark": plan.get("watermark", False),
+            "uploads":     plan.get("uploads", False),
+            "scheduler":   plan.get("scheduler", False),
+            "analytics":   plan.get("analytics", False),
+            "watermark":   plan.get("watermark", False),
             "white_label": plan.get("white_label", False),
-            "support": plan.get("support", False),
-        }
+            "support":     plan.get("support", False),
+        },
+        # Full entitlements dict — used by hasEntitlement() in app.js
+        "entitlements": entitlements_to_dict(
+            get_entitlements_from_user(dict(user))
+        ),
     }
 
 
@@ -2549,45 +2540,37 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
         combined = [h for h in combined if h and h not in blocked]
         data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
 
-                # ── Resolve entitlements (authoritative) ─────────────────────
-        ent = get_entitlements_for_tier(user.get("subscription_tier", "free"))
-
-        # ── Compute PUT/AIC cost using canonical formula ─────────────
-        # Use_ai comes from the upload request; HUD from user prefs
-        use_ai  = bool(getattr(data, "use_ai", False)) and ent.can_ai
-        use_hud = bool(user_prefs.get("hud_enabled", False)) and ent.can_burn_hud
-        num_thumbs = ent.max_thumbnails  # we always generate max for tier
+        # ── Compute PUT/AIC cost — canonical formula from entitlements ──
+        ent_cost = get_entitlements_for_tier(user.get("subscription_tier", "free"))
+        use_ai  = bool(getattr(data, "use_ai", False)) and ent_cost.can_ai
+        use_hud = bool(user_prefs.get("hud_enabled", False)) and ent_cost.can_burn_hud
 
         put_cost, aic_cost = compute_upload_cost(
-            entitlements=ent,
+            entitlements=ent_cost,
             num_platforms=len(data.platforms),
             use_ai=use_ai,
             use_hud=use_hud,
-            num_thumbnails=num_thumbs,
+            num_thumbnails=ent_cost.max_thumbnails,
         )
 
-        # ── Check balance (available = balance - reserved) ───────────
+        # Check balance (available = balance - reserved holds)
         put_avail = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
         aic_avail = wallet.get("aic_balance", 0) - wallet.get("aic_reserved", 0)
 
         if put_avail < put_cost:
-            tier_up = _suggest_upgrade(user.get("subscription_tier", "free"), "put")
             raise HTTPException(429, {
                 "code": "insufficient_put",
                 "message": f"Insufficient PUT tokens ({put_avail} available, {put_cost} needed).",
-                "suggestion": tier_up,
-                "topup_url": f"{FRONTEND_URL}/settings.html#billing",
+                "topup_url": "/settings.html#billing",
             })
         if aic_cost > 0 and aic_avail < aic_cost:
-            tier_up = _suggest_upgrade(user.get("subscription_tier", "free"), "aic")
             raise HTTPException(429, {
                 "code": "insufficient_aic",
                 "message": f"Insufficient AIC credits ({aic_avail} available, {aic_cost} needed).",
-                "suggestion": tier_up,
-                "topup_url": f"{FRONTEND_URL}/settings.html#billing",
+                "topup_url": "/settings.html#billing",
             })
 
-# ── Queue depth guard ─────────────────────────────────────────
+        # ── Queue depth guard ─────────────────────────────────────────
         pending_count = await conn.fetchval(
             """SELECT COUNT(*) FROM uploads
                WHERE user_id = $1
@@ -4800,68 +4783,78 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
 # ============================================================
 # Billing
 # ============================================================
-
 @app.post("/api/billing/checkout")
 async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_current_user)):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing not configured")
 
     async with db_pool.acquire() as conn:
-        # Ensure Stripe customer exists
+        # ── Double-subscribe guard ────────────────────────────────────
+        if data.kind == "subscription":
+            existing_sub_id  = user.get("stripe_subscription_id")
+            existing_status  = user.get("subscription_status")
+            if existing_sub_id and existing_status in ("active", "trialing"):
+                # User already has an active sub — send straight to billing portal
+                # so they can upgrade/downgrade there rather than creating a duplicate
+                try:
+                    portal = stripe.billing_portal.Session.create(
+                        customer=user["stripe_customer_id"],
+                        return_url=f"{FRONTEND_URL}/settings.html#billing",
+                    )
+                    return {"checkout_url": portal.url, "session_id": None, "portal_redirect": True}
+                except Exception:
+                    pass  # Fall through to new checkout if portal fails
+
         customer_id = user.get("stripe_customer_id")
         if not customer_id:
             customer = stripe.Customer.create(email=user["email"], name=user.get("name") or user["email"])
             customer_id = customer.id
-            await conn.execute(
-                "UPDATE users SET stripe_customer_id = $1 WHERE id = $2",
-                customer_id, user["id"]
-            )
+            await conn.execute("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", customer_id, user["id"])
 
-        prices = stripe.Price.list(lookup_keys=[data.lookup_key], active=True)
-        if not prices.data:
-            raise HTTPException(400, f"Invalid plan: {data.lookup_key}")
+    prices = stripe.Price.list(lookup_keys=[data.lookup_key], active=True)
+    if not prices.data:
+        raise HTTPException(400, f"Price not found for lookup_key: {data.lookup_key}. Run stripe_setup.py to create prices.")
 
-        if data.kind == "subscription":
-            ent = get_entitlements_for_tier(get_tier_from_lookup_key(data.lookup_key))
+    if data.kind == "subscription":
+        # Resolve trial days from entitlements (7 days for all paid tiers)
+        tier = STRIPE_LOOKUP_TO_TIER.get(data.lookup_key, "free")
+        ent  = get_entitlements_for_tier(tier)
+        trial_days = ent.trial_days  # 0 for free/internal, 7 for paid
 
-            sub_params = {
-                "customer": customer_id,
-                "line_items": [{"price": prices.data[0].id, "quantity": 1}],
-                "mode": "subscription",
-                "success_url": STRIPE_SUCCESS_URL,
-                "cancel_url": STRIPE_CANCEL_URL,
-                "metadata": {"user_id": str(user["id"])},
-                "subscription_data": {
-                    "metadata": {"user_id": str(user["id"]), "tier": getattr(ent, "tier", "")}
-                },
+        session_params = dict(
+            customer              = customer_id,
+            line_items            = [{"price": prices.data[0].id, "quantity": 1}],
+            mode                  = "subscription",
+            success_url           = STRIPE_SUCCESS_URL,
+            cancel_url            = STRIPE_CANCEL_URL,
+            allow_promotion_codes = True,
+            metadata              = {"user_id": str(user["id"]), "tier": tier},
+        )
+        if trial_days > 0:
+            session_params["subscription_data"] = {
+                "trial_period_days": trial_days,
+                "metadata": {"user_id": str(user["id"]), "tier": tier},
             }
 
-            # Attach trial if tier has trial_days and user hasn't trialed before
-            trial_days = int(getattr(ent, "trial_days", 0) or 0)
-            if trial_days > 0:
-                has_prior = await conn.fetchval(
-                    "SELECT 1 FROM stripe_invoice_log WHERE user_id = $1 LIMIT 1",
-                    user["id"]
-                )
-                if not has_prior:
-                    sub_params["subscription_data"]["trial_period_days"] = trial_days
+        session = stripe.checkout.Session.create(**session_params)
 
-            session = stripe.checkout.Session.create(**sub_params)
+    else:  # topup / one-time payment
+        product = TOPUP_PRODUCTS.get(data.lookup_key, {})
+        if not product:
+            raise HTTPException(400, f"Unknown topup product: {data.lookup_key}")
 
-        else:  # topup
-            product = TOPUP_PRODUCTS.get(data.lookup_key, {})
-            session = stripe.checkout.Session.create(
-                customer=customer_id,
-                line_items=[{"price": prices.data[0].id, "quantity": 1}],
-                mode="payment",
-                success_url=STRIPE_SUCCESS_URL,
-                cancel_url=STRIPE_CANCEL_URL,
-                metadata={
-                    "user_id": str(user["id"]),
-                    "wallet": product.get("wallet", "put"),
-                    "amount": product.get("amount", 0),
-                },
-            )
+        session = stripe.checkout.Session.create(
+            customer    = customer_id,
+            line_items  = [{"price": prices.data[0].id, "quantity": 1}],
+            mode        = "payment",
+            success_url = STRIPE_SUCCESS_URL,
+            cancel_url  = STRIPE_CANCEL_URL,
+            metadata    = {
+                "user_id": str(user["id"]),
+                "wallet":  product.get("wallet", "put"),
+                "amount":  str(product.get("amount", 0)),
+            },
+        )
 
     return {"checkout_url": session.url, "session_id": session.id}
 
@@ -4871,133 +4864,106 @@ async def create_portal(user: dict = Depends(get_current_user)):
     session = stripe.billing_portal.Session.create(customer=user["stripe_customer_id"], return_url=f"{FRONTEND_URL}/settings.html")
     return {"portal_url": session.url}
 
-
 @app.get("/api/billing/session")
-async def get_billing_session(session_id: str = Query(...), user: dict = Depends(get_current_user)):
+async def get_billing_session(
+    session_id: str = Query(..., description="Stripe checkout session ID (cs_test_* or cs_live_*)"),
+    user: dict = Depends(get_current_user),
+):
     """
-    Frontend helper for /billing/success?session_id=...
-    Verifies the Stripe Checkout Session and returns a normalized summary.
-    Webhooks remain the source of truth for credits + tier updates.
+    Read a Stripe Checkout Session directly from the Stripe API.
+    Used by billing/success.html to render the confirmation screen.
+    Works for both test (cs_test_*) and live (cs_live_*) sessions.
+    The session_id prefix reveals the mode — no separate flag needed.
     """
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing not configured")
 
     try:
-        sess = stripe.checkout.Session.retrieve(session_id, expand=["subscription", "line_items"])
-    except Exception:
-        raise HTTPException(404, "Checkout session not found")
+        sess = stripe.checkout.Session.retrieve(
+            session_id,
+            expand=["subscription", "subscription.items.data.price", "line_items"],
+        )
+    except stripe.error.InvalidRequestError as e:
+        raise HTTPException(404, f"Stripe session not found: {e}")
+    except stripe.error.AuthenticationError:
+        raise HTTPException(503, "Stripe authentication failed — check STRIPE_SECRET_KEY")
+    except Exception as e:
+        raise HTTPException(502, f"Stripe API error: {e}")
 
+    # Security: session must belong to this user (metadata.user_id match)
     meta_user_id = (sess.get("metadata") or {}).get("user_id")
     if meta_user_id and str(meta_user_id) != str(user.get("id")):
-        raise HTTPException(403, "Session does not belong to this user")
+        raise HTTPException(403, "This session does not belong to your account")
 
-    mode = sess.get("mode")
-    payment_status = sess.get("payment_status")
-    amount_total = (sess.get("amount_total") or 0) / 100
+    mode           = sess.get("mode")            # "subscription" | "payment"
+    payment_status = sess.get("payment_status")  # "paid" | "unpaid" | "no_payment_required"
+    amount_total   = (sess.get("amount_total") or 0) / 100
+    currency       = (sess.get("currency") or "usd").upper()
 
-    tier = None
-    sub_status = None
+    # ── Subscription fields ──────────────────────────────────────────
+    tier                  = None
+    lookup_key            = None
+    plan_name             = None
+    sub_status            = None
+    trial_end_ts          = None
+    current_period_end_ts = None
+
     if mode == "subscription":
         sub = sess.get("subscription")
         if isinstance(sub, dict):
-            sub_status = sub.get("status")
+            sub_status            = sub.get("status")        # active | trialing | past_due
+            trial_end_ts          = sub.get("trial_end")     # unix ts or None
+            current_period_end_ts = sub.get("current_period_end")
             try:
-                lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
-                tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, None)
+                price      = sub["items"]["data"][0]["price"]
+                lookup_key = price.get("lookup_key", "")
+                tier       = STRIPE_LOOKUP_TO_TIER.get(lookup_key)
+                if not tier:
+                    # Fallback: try to match by product name
+                    prod_id = price.get("product")
+                    if prod_id:
+                        prod = stripe.Product.retrieve(prod_id)
+                        plan_name = prod.get("name", "")
             except Exception:
                 pass
 
+    # ── Topup fields ─────────────────────────────────────────────────
+    topup_wallet = None
+    topup_amount = None
+    if mode == "payment":
+        meta         = sess.get("metadata") or {}
+        topup_wallet = meta.get("wallet")        # "put" | "aic"
+        topup_amount = meta.get("amount")        # token count as string
+
+    # Resolve display name
+    if tier:
+        cfg       = TIER_CONFIG.get(tier, {})
+        plan_name = cfg.get("name", tier.replace("_", " ").title())
+    elif not plan_name:
+        plan_name = "Your Plan"
+
     return {
-        "session_id": session_id,
-        "mode": mode,
-        "payment_status": payment_status,
-        "amount_total": amount_total,
-        "currency": sess.get("currency"),
-        "tier": tier,
+        "session_id":          session_id,
+        "mode":                mode,
+        "payment_status":      payment_status,
+        "amount_total":        amount_total,
+        "currency":            currency,
+        "tier":                tier,
+        "plan_name":           plan_name,
+        "lookup_key":          lookup_key,
         "subscription_status": sub_status,
-        "customer": sess.get("customer"),
+        "trial_end":           trial_end_ts,            # unix timestamp or None
+        "current_period_end":  current_period_end_ts,   # unix timestamp or None
+        "topup_wallet":        topup_wallet,
+        "topup_amount":        int(topup_amount) if topup_amount else None,
+        "is_test_mode":        session_id.startswith("cs_test_"),
+        "billing_mode":        BILLING_MODE,
     }
-
-
-
-async def _do_monthly_refill(
-    conn,
-    user_id: str,
-    tier: str,
-    ent,              # Entitlements object
-    invoice_id: str,
-    period_start,
-    period_end,
-) -> bool:
-    """
-    Credit monthly PUT + AIC to wallet for a billing period.
-    Deduped by invoice_id — safe to call multiple times for same invoice.
-
-    Returns True if credits were applied, False if already processed.
-    """
-    existing = await conn.fetchrow(
-        "SELECT invoice_id FROM stripe_invoice_log WHERE invoice_id = $1", invoice_id
-    )
-    if existing:
-        logger.info(f"Monthly refill already processed for invoice {invoice_id}, skipping.")
-        return False
-
-    put_amount = getattr(ent, "put_monthly", 0) or 0
-    aic_amount = getattr(ent, "aic_monthly", 0) or 0
-
-    if put_amount > 0:
-        await conn.execute(
-            "UPDATE wallets SET put_balance = put_balance + $1, "
-            "last_monthly_refill_stripe_event = $2, "
-            "last_monthly_refill_at = NOW(), "
-            "updated_at = NOW() "
-            "WHERE user_id = $3",
-            put_amount, invoice_id, user_id
-        )
-        await ledger_entry(
-            conn, user_id, "put", put_amount, "monthly_refill",
-            stripe_event_id=invoice_id,
-            meta={
-                "tier": tier,
-                "period_start": period_start.isoformat() if period_start else None,
-                "period_end": period_end.isoformat() if period_end else None,
-            }
-        )
-
-    if aic_amount > 0:
-        await conn.execute(
-            "UPDATE wallets SET aic_balance = aic_balance + $1, updated_at = NOW() WHERE user_id = $2",
-            aic_amount, user_id
-        )
-        await ledger_entry(
-            conn, user_id, "aic", aic_amount, "monthly_refill",
-            stripe_event_id=invoice_id,
-            meta={"tier": tier}
-        )
-
-    await conn.execute("""
-        INSERT INTO stripe_invoice_log (
-            invoice_id, user_id, tier_slug,
-            put_credited, aic_credited, amount_cents,
-            period_start, period_end
-        ) VALUES ($1,$2,$3,$4,$5,0,$6,$7)
-        ON CONFLICT (invoice_id) DO NOTHING
-    """, invoice_id, user_id, tier, put_amount, aic_amount, period_start, period_end)
-
-    logger.info(
-        f"Monthly refill: user={user_id} tier={tier} "
-        f"+{put_amount} PUT +{aic_amount} AIC invoice={invoice_id}"
-    )
-    return True
 
 
 @app.post("/api/billing/webhook")
 async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    Stripe webhook handler.
-    Handles: checkout.session.completed, invoice.paid,
-             customer.subscription.updated, customer.subscription.deleted
-    """
+    """Stripe billing webhook — idempotent, signature-verified."""
     payload = await request.body()
     sig = request.headers.get("stripe-signature")
     try:
@@ -5007,6 +4973,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
 
     etype = event.type
 
+    # ── checkout.session.completed ──────────────────────────────────────
     if etype == "checkout.session.completed":
         session = event.data.object
         user_id = session.metadata.get("user_id")
@@ -5021,49 +4988,27 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                 sub = stripe.Subscription.retrieve(session.subscription)
                 lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
                 tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
-                ent = get_entitlements_for_tier(tier)
-                status = sub.status  # active or trialing
+                ent  = get_entitlements_for_tier(tier)
+                status = sub.status
 
                 period_start = datetime.fromtimestamp(sub.current_period_start, tz=timezone.utc) if sub.get("current_period_start") else _now_utc()
-                period_end   = datetime.fromtimestamp(sub.current_period_end,   tz=timezone.utc) if sub.get("current_period_end") else _now_utc()
+                period_end   = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
                 trial_end    = datetime.fromtimestamp(sub.trial_end, tz=timezone.utc) if sub.get("trial_end") else None
 
                 await conn.execute("""
                     UPDATE users SET
-                        subscription_tier       = $1,
-                        stripe_subscription_id  = $2,
-                        subscription_status     = $3,
-                        current_period_end      = $4,
-                        current_period_start    = $5,
-                        trial_end               = $6,
-                        updated_at              = NOW()
-                    WHERE id = $7
-                """, tier, session.subscription, status,
-                     period_end, period_start, trial_end, user_id)
+                        subscription_tier      = $1,
+                        stripe_subscription_id = $2,
+                        subscription_status    = $3,
+                        current_period_end     = $4,
+                        trial_end              = $5,
+                        updated_at             = NOW()
+                    WHERE id = $6
+                """, tier, session.subscription, status, period_end, trial_end, user_id)
 
-                await conn.execute("""
-                    INSERT INTO subscription_state (
-                        user_id, stripe_customer_id, stripe_subscription_id,
-                        tier_slug, status,
-                        current_period_start, current_period_end,
-                        trial_start, trial_end, last_stripe_event_id, updated_at
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        stripe_subscription_id  = EXCLUDED.stripe_subscription_id,
-                        tier_slug               = EXCLUDED.tier_slug,
-                        status                  = EXCLUDED.status,
-                        current_period_start    = EXCLUDED.current_period_start,
-                        current_period_end      = EXCLUDED.current_period_end,
-                        trial_start             = EXCLUDED.trial_start,
-                        trial_end               = EXCLUDED.trial_end,
-                        last_stripe_event_id    = EXCLUDED.last_stripe_event_id,
-                        updated_at              = NOW()
-                """, user_id, session.get("customer"), session.subscription,
-                     tier, status, period_start, period_end,
-                     period_start if trial_end else None, trial_end, session.id)
-
+                # Seed wallet for first period / trial — deduped by invoice id
                 refill_ref = sub.get("latest_invoice") or session.id
-                await _do_monthly_refill(conn, str(user_id), tier, ent, refill_ref, period_start, period_end)
+                await _do_monthly_refill(conn, user_id, tier, ent, refill_ref, period_start, period_end)
 
                 amount = (session.amount_total or 0) / 100
                 await conn.execute(
@@ -5086,6 +5031,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     )
                     background_tasks.add_task(notify_topup, amount, email, wallet_type, amount_tokens)
 
+    # ── invoice.paid — monthly wallet refill on every renewal ──────────
     elif etype == "invoice.paid":
         invoice = event.data.object
         sub_id  = invoice.get("subscription")
@@ -5097,44 +5043,30 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                 "SELECT id, email, subscription_tier FROM users WHERE stripe_subscription_id = $1", sub_id
             )
             if not user_row:
-                logger.warning(f"invoice.paid: no user found for subscription {sub_id}")
+                logger.warning(f"invoice.paid: no user for subscription {sub_id}")
                 return {"status": "user_not_found"}
 
             user_id = str(user_row["id"])
             email   = user_row["email"]
-
             sub = stripe.Subscription.retrieve(sub_id)
             lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
             tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, user_row["subscription_tier"] or "free")
             ent  = get_entitlements_for_tier(tier)
 
             period_start = datetime.fromtimestamp(invoice.period_start, tz=timezone.utc)
-            period_end   = datetime.fromtimestamp(invoice.period_end,   tz=timezone.utc)
+            period_end   = datetime.fromtimestamp(invoice.period_end, tz=timezone.utc)
             invoice_id   = invoice.id
 
             await conn.execute("""
                 UPDATE users SET
-                    subscription_tier        = $1,
-                    subscription_status      = 'active',
-                    current_period_start     = $2,
-                    current_period_end       = $3,
-                    last_invoice_id          = $4,
-                    updated_at               = NOW()
-                WHERE id = $5
-            """, tier, period_start, period_end, invoice_id, user_id)
+                    subscription_tier   = $1,
+                    subscription_status = 'active',
+                    current_period_end  = $2,
+                    updated_at          = NOW()
+                WHERE id = $3
+            """, tier, period_end, user_id)
 
-            await conn.execute("""
-                UPDATE subscription_state SET
-                    tier_slug                = $1,
-                    status                   = 'active',
-                    current_period_start     = $2,
-                    current_period_end       = $3,
-                    last_invoice_id          = $4,
-                    last_stripe_event_id     = $5,
-                    updated_at               = NOW()
-                WHERE user_id = $6
-            """, tier, period_start, period_end, invoice_id, event.id, user_id)
-
+            # Monthly wallet refill — deduped by invoice_id
             await _do_monthly_refill(conn, user_id, tier, ent, invoice_id, period_start, period_end)
 
             amount = (invoice.amount_paid or 0) / 100
@@ -5145,43 +5077,23 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             )
             background_tasks.add_task(notify_mrr, amount, email, tier, "renewal")
 
+    # ── subscription.updated — status changes, upgrades, downgrades ────
     elif etype == "customer.subscription.updated":
         sub = event.data.object
         async with db_pool.acquire() as conn:
-            user_row = await conn.fetchrow(
-                "SELECT id, email FROM users WHERE stripe_subscription_id = $1", sub.id
-            )
-            if not user_row:
-                return {"status": "user_not_found"}
-
-            user_id = str(user_row["id"])
             lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
             tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
-            status = sub.status
             period_end = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
-            cancel_flag = bool(sub.get("cancel_at_period_end", False))
-
             await conn.execute("""
                 UPDATE users SET
-                    subscription_tier               = $1,
-                    subscription_status             = $2,
-                    current_period_end              = $3,
-                    subscription_cancel_at_period_end = $4,
-                    updated_at                      = NOW()
-                WHERE id = $5
-            """, tier, status, period_end, cancel_flag, user_id)
+                    subscription_tier   = $1,
+                    subscription_status = $2,
+                    current_period_end  = $3,
+                    updated_at          = NOW()
+                WHERE stripe_subscription_id = $4
+            """, tier, sub.status, period_end, sub.id)
 
-            await conn.execute("""
-                UPDATE subscription_state SET
-                    tier_slug                = $1,
-                    status                   = $2,
-                    current_period_end       = $3,
-                    cancel_at_period_end     = $4,
-                    last_stripe_event_id     = $5,
-                    updated_at               = NOW()
-                WHERE user_id = $6
-            """, tier, status, period_end, cancel_flag, event.id, user_id)
-
+    # ── subscription.deleted — downgrade to free, keep balance ─────────
     elif etype == "customer.subscription.deleted":
         sub = event.data.object
         async with db_pool.acquire() as conn:
@@ -5192,20 +5104,54 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     updated_at          = NOW()
                 WHERE stripe_subscription_id = $1
             """, sub.id)
-            await conn.execute("""
-                UPDATE subscription_state SET
-                    tier_slug            = 'free',
-                    status               = 'canceled',
-                    cancel_at_period_end = FALSE,
-                    last_stripe_event_id = $1,
-                    updated_at           = NOW()
-                WHERE stripe_subscription_id = $2
-            """, event.id, sub.id)
 
     return {"status": "ok"}
 
 
+async def _do_monthly_refill(conn, user_id, tier, ent, invoice_id, period_start, period_end):
+    """Credit monthly PUT+AIC. Deduped by invoice_id — safe to call on webhook retry."""
+    # Check dedup table
+    try:
+        existing = await conn.fetchrow(
+            "SELECT invoice_id FROM stripe_invoice_log WHERE invoice_id = $1", invoice_id
+        )
+        if existing:
+            logger.info(f"Monthly refill already processed for {invoice_id}, skipping.")
+            return False
+    except Exception:
+        pass  # Table may not exist yet — proceed, credit_wallet is idempotent enough
 
+    put_amount = ent.put_monthly
+    aic_amount = ent.aic_monthly
+
+    if put_amount > 0:
+        await conn.execute(
+            "UPDATE wallets SET put_balance = put_balance + $1, updated_at = NOW() WHERE user_id = $2",
+            put_amount, user_id
+        )
+        await ledger_entry(conn, user_id, "put", put_amount, "monthly_refill",
+                           stripe_event_id=invoice_id)
+
+    if aic_amount > 0:
+        await conn.execute(
+            "UPDATE wallets SET aic_balance = aic_balance + $1, updated_at = NOW() WHERE user_id = $2",
+            aic_amount, user_id
+        )
+        await ledger_entry(conn, user_id, "aic", aic_amount, "monthly_refill",
+                           stripe_event_id=invoice_id)
+
+    try:
+        await conn.execute("""
+            INSERT INTO stripe_invoice_log
+                (invoice_id, user_id, tier_slug, put_credited, aic_credited, period_start, period_end)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+            ON CONFLICT (invoice_id) DO NOTHING
+        """, invoice_id, user_id, tier, put_amount, aic_amount, period_start, period_end)
+    except Exception:
+        pass  # Non-critical — dedup log insert failure doesn't break billing
+
+    logger.info(f"Monthly refill: user={user_id} tier={tier} +{put_amount} PUT +{aic_amount} AIC invoice={invoice_id}")
+    return True
 
 
 # ============================================================

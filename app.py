@@ -231,7 +231,10 @@ PRIORITY_JOB_QUEUE = os.environ.get("PRIORITY_JOB_QUEUE", "uploadm8:priority")
 # Stripe
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_SUCCESS_URL = os.environ.get("STRIPE_SUCCESS_URL", f"{FRONTEND_URL}/billing/success.html") + "?session_id={CHECKOUT_SESSION_ID}"
+STRIPE_SUCCESS_URL = os.environ.get(
+    "STRIPE_SUCCESS_URL",
+    f"{FRONTEND_URL}/billing/success.html?session_id={{CHECKOUT_SESSION_ID}}"
+)
 STRIPE_CANCEL_URL = os.environ.get("STRIPE_CANCEL_URL", f"{FRONTEND_URL}/index.html#pricing")
 
 BILLING_MODE = os.environ.get("BILLING_MODE", "test").strip().lower()

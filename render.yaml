@@ -29,7 +29,7 @@ services:
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
       - key: STRIPE_SUCCESS_URL
-        value: https://app.uploadm8.com/billing/success?session_id={CHECKOUT_SESSION_ID}
+        value: https://app.uploadm8.com/billing/success.html?session_id={CHECKOUT_SESSION_ID}
       - key: STRIPE_CANCEL_URL
         value: https://app.uploadm8.com/index.html#pricing
       - key: FRONTEND_URL

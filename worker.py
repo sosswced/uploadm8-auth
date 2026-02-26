@@ -142,6 +142,106 @@ REDIS_MAX_RETRIES = 10
 
 db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[redis.Redis] = None
+
+# ── Wallet helpers (worker-side) ─────────────────────────────────────────────
+async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost: int):
+    """
+    Confirm a hold: move reserved → actual spend.
+    Called on successful job completion.
+    """
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        # Debit balance and clear reservation simultaneously
+        await conn.execute("""
+            UPDATE wallets SET
+                put_balance  = put_balance  - $1,
+                aic_balance  = aic_balance  - $2,
+                put_reserved = put_reserved - $1,
+                aic_reserved = aic_reserved - $2,
+                updated_at   = NOW()
+            WHERE user_id = $3
+              AND put_reserved >= $1
+              AND aic_reserved >= $2
+        """, put_cost, aic_cost, user_id)
+
+        # Ledger entries
+        if put_cost > 0:
+            await conn.execute("""
+                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                VALUES ($1, 'put', $2, 'upload_debit', $3, 'upload')
+            """, user_id, -put_cost, upload_id)
+        if aic_cost > 0:
+            await conn.execute("""
+                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                VALUES ($1, 'aic', $2, 'upload_debit', $3, 'upload')
+            """, user_id, -aic_cost, upload_id)
+
+        # Update wallet_holds record
+        await conn.execute("""
+            UPDATE wallet_holds SET status = 'captured', resolved_at = NOW()
+            WHERE upload_id = $1 AND status = 'held'
+        """, upload_id)
+
+        # Mark upload hold_status
+        await conn.execute("""
+            UPDATE uploads SET hold_status = 'captured' WHERE id = $1
+        """, upload_id)
+
+
+async def _release_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost: int, reason: str = "release"):
+    """
+    Release a hold without spending: restore reserved tokens back to available.
+    Called on job failure or cancel.
+    """
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE wallets SET
+                put_reserved = GREATEST(0, put_reserved - $1),
+                aic_reserved = GREATEST(0, aic_reserved - $2),
+                updated_at   = NOW()
+            WHERE user_id = $3
+        """, put_cost, aic_cost, user_id)
+
+        if put_cost > 0:
+            await conn.execute("""
+                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                VALUES ($1, 'put', $2, $3, $4, 'upload')
+            """, user_id, put_cost, reason, upload_id)  # positive delta = refund
+        if aic_cost > 0:
+            await conn.execute("""
+                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                VALUES ($1, 'aic', $2, $3, $4, 'upload')
+            """, user_id, aic_cost, reason, upload_id)
+
+        await conn.execute("""
+            UPDATE wallet_holds SET status = 'released', resolved_at = NOW()
+            WHERE upload_id = $1 AND status = 'held'
+        """, upload_id)
+
+        await conn.execute("""
+            UPDATE uploads SET hold_status = 'released' WHERE id = $1
+        """, upload_id)
+
+
+async def _get_upload_costs(upload_id: str):
+    """Fetch the stored put_cost / aic_cost for an upload."""
+    if not db_pool:
+        return 0, 0
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT put_cost, aic_cost, put_reserved, aic_reserved, user_id FROM uploads WHERE id = $1",
+            upload_id
+        )
+        if not row:
+            return 0, 0
+        # Use put_cost column if populated, else fall back to put_reserved
+        put = row["put_cost"] or row["put_reserved"] or 0
+        aic = row["aic_cost"] or row["aic_reserved"] or 0
+        return int(put), int(aic)
+
 shutdown_requested = False
 shutdown_event: Optional[asyncio.Event] = None
 
@@ -386,6 +486,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         entitlements = get_entitlements_from_user(user_record, overrides)
 
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
+        ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
         ctx.user_settings["_openai_model_override"] = (
@@ -393,6 +494,36 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             or ctx.user_settings.get("trill_openai_model")
             or "gpt-4o"
         )
+
+        # ── Server-side entitlement cap enforcement ───────────────────────
+        # Re-resolve entitlements from DB (authoritative — not from job_data).
+        # This prevents any client or stale job_data from bypassing tier limits.
+        if ctx.user_record and ctx.entitlements:
+            ent = ctx.entitlements
+
+            # Cap thumbnails to tier max
+            if hasattr(ctx, "num_thumbnails") and ctx.num_thumbnails > ent.max_thumbnails:
+                logger.info(
+                    f"[{ctx.upload_id}] Clamping thumbnails {ctx.num_thumbnails} → {ent.max_thumbnails} (tier cap)"
+                )
+                ctx.num_thumbnails = ent.max_thumbnails
+
+            # Cap caption frames
+            if hasattr(ctx, "caption_frames") and ctx.caption_frames > ent.max_caption_frames:
+                ctx.caption_frames = ent.max_caption_frames
+
+            # Enforce HUD — if can_burn_hud is False, skip HUD stage
+            if not ent.can_burn_hud and hasattr(ctx, "hud_enabled"):
+                ctx.hud_enabled = False
+
+            # Enforce watermark — if can_watermark=True (free tier), force it on
+            if ent.can_watermark and hasattr(ctx, "watermark_text"):
+                if not ctx.watermark_text:
+                    ctx.watermark_text = "UploadM8"
+
+            # Enforce AI depth
+            if not ent.can_ai and hasattr(ctx, "use_ai"):
+                ctx.use_ai = False
 
         await db_stage.mark_processing_started(db_pool, ctx)
         # Record processing_started_at for staged jobs
@@ -637,12 +768,28 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
     except CancelRequested:
         logger.info(f"[{upload_id}] Pipeline cancelled")
+        # ── Release wallet hold on failure ───────────────────────────────────
+        try:
+            put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
+            user_id_str = str(ctx.user_id) if ctx.user_id else None
+            if user_id_str and (put_cost > 0 or aic_cost > 0):
+                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
+        except Exception as wallet_err:
+            logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
         return False
     except Exception as e:
         logger.exception(f"[{upload_id}] Processing failed: {e}")
         if ctx:
             ctx.mark_error("INTERNAL", str(e))
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
+        # ── Release wallet hold on failure ───────────────────────────────────
+        try:
+            put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
+            user_id_str = str(ctx.user_id) if ctx.user_id else None
+            if user_id_str and (put_cost > 0 or aic_cost > 0):
+                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
+        except Exception as wallet_err:
+            logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
         await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
         return False
     finally:
@@ -682,6 +829,19 @@ async def run_publish_and_notify(
         ctx.state = "failed"
 
     await db_stage.mark_processing_completed(db_pool, ctx)
+
+    # ── Finalize wallet hold (capture on success/partial, release on failure) ──
+    try:
+        put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
+        user_id_str = str(ctx.user_id) if ctx.user_id else None
+        if user_id_str and (put_cost > 0 or aic_cost > 0):
+            if ctx.is_success() or ctx.is_partial_success():
+                await _capture_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost)
+            else:
+                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
+    except Exception as wallet_err:
+        # Never let wallet accounting crash the job finalization
+        logger.error(f"[{ctx.upload_id}] Wallet finalize failed (non-fatal): {wallet_err}")
 
     if ctx.is_success():
         await db_stage.increment_upload_count(db_pool, user_id)
@@ -725,8 +885,40 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             "job_id": f"deferred-publish-{upload_id}",
         }
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
+        ctx.user_record = user_record
+        ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
+
+        # ── Server-side entitlement cap enforcement ───────────────────────
+        # Re-resolve entitlements from DB (authoritative — not from job_data).
+        # This prevents any client or stale job_data from bypassing tier limits.
+        if ctx.user_record and ctx.entitlements:
+            ent = ctx.entitlements
+
+            # Cap thumbnails to tier max
+            if hasattr(ctx, "num_thumbnails") and ctx.num_thumbnails > ent.max_thumbnails:
+                logger.info(
+                    f"[{ctx.upload_id}] Clamping thumbnails {ctx.num_thumbnails} → {ent.max_thumbnails} (tier cap)"
+                )
+                ctx.num_thumbnails = ent.max_thumbnails
+
+            # Cap caption frames
+            if hasattr(ctx, "caption_frames") and ctx.caption_frames > ent.max_caption_frames:
+                ctx.caption_frames = ent.max_caption_frames
+
+            # Enforce HUD — if can_burn_hud is False, skip HUD stage
+            if not ent.can_burn_hud and hasattr(ctx, "hud_enabled"):
+                ctx.hud_enabled = False
+
+            # Enforce watermark — if can_watermark=True (free tier), force it on
+            if ent.can_watermark and hasattr(ctx, "watermark_text"):
+                if not ctx.watermark_text:
+                    ctx.watermark_text = "UploadM8"
+
+            # Enforce AI depth
+            if not ent.can_ai and hasattr(ctx, "use_ai"):
+                ctx.use_ai = False
 
         # Mark processing started again (publish phase)
         await db_stage.mark_processing_started(db_pool, ctx)

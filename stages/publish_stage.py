@@ -301,12 +301,25 @@ def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
     Tags are stored without the '#' prefix (stripped at save time).
     We always add '#' here so captions look correct on every platform.
     """
-    # Base tags: get_effective_hashtags merges always_hashtags + ai_hashtags
-    tags: list = []
-    if hasattr(ctx, "get_effective_hashtags"):
-        tags = list(ctx.get_effective_hashtags())
-    else:
-        tags = list(getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or [])
+
+# Base tags: get_effective_hashtags merges always_hashtags + ai_hashtags.
+tags: list = []
+base = None
+if hasattr(ctx, "get_effective_hashtags"):
+    base = ctx.get_effective_hashtags()
+else:
+    base = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
+
+# Guard: strings are iterable character-by-character — normalize into token list.
+if isinstance(base, str):
+    # Accept comma/space/newline separated inputs
+    raw = base.replace("
+", " ").replace(",", " ")
+    tags = [t for t in (p.strip() for p in raw.split()) if t]
+elif isinstance(base, (list, tuple, set)):
+    tags = [t for t in base if t]
+else:
+    tags = []
 
     # Add platform-specific hashtags when a platform is specified
     if platform:

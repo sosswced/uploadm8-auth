@@ -1298,7 +1298,7 @@ async def run_analytics_sync_loop() -> None:
                     """
                     SELECT u.id AS upload_id, u.user_id, u.platform_results, u.platforms
                       FROM uploads u
-                     WHERE u.status IN ('completed', 'succeeded', 'partial')
+                     WHERE u.status = 'completed'
                        AND u.created_at >= $1
                        AND (u.analytics_synced_at IS NULL OR u.analytics_synced_at < $2)
                      ORDER BY u.analytics_synced_at ASC NULLS FIRST, u.created_at DESC

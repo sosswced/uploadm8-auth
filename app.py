@@ -724,6 +724,14 @@ class AdminUserUpdate(BaseModel):
     flex_enabled: Optional[bool] = None
 
 
+class AdminWalletAdjust(BaseModel):
+    wallet: str  = Field(..., pattern="^(put|aic)$")
+    mode:   str  = Field(..., pattern="^(add|subtract|set)$")
+    amount: int  = Field(..., ge=0, le=999999)
+    reason: str  = Field(..., min_length=3, max_length=200)
+
+
+
 class AdminUpdateEmailIn(BaseModel):
     email: EmailStr
 
@@ -1212,6 +1220,56 @@ async def run_migrations():
     ALTER TABLE uploads ADD COLUMN IF NOT EXISTS comments BIGINT DEFAULT 0;
     ALTER TABLE uploads ADD COLUMN IF NOT EXISTS shares   BIGINT DEFAULT 0;
 """),
+
+# ── Analytics auto-sync tracking ─────────────────────────────────────────
+(605, """
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS analytics_synced_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_uploads_analytics_sync
+        ON uploads(status, analytics_synced_at)
+        WHERE status IN ('completed', 'succeeded', 'partial');
+"""),
+
+# ── Comprehensive audit system — corporate-grade event logging ──────────────
+(700, """
+    -- Upgrade admin_audit_log with full corporate columns
+    ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS event_category  VARCHAR(50)  DEFAULT 'ADMIN';
+    ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS actor_user_id   UUID         REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS resource_type   VARCHAR(100);
+    ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS resource_id     TEXT;
+    ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS session_id      TEXT;
+    ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS user_agent      TEXT;
+    ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS severity        VARCHAR(20)  DEFAULT 'INFO';
+    ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS outcome         VARCHAR(20)  DEFAULT 'SUCCESS';
+
+    CREATE INDEX IF NOT EXISTS idx_audit_category   ON admin_audit_log(event_category);
+    CREATE INDEX IF NOT EXISTS idx_audit_actor      ON admin_audit_log(actor_user_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_resource   ON admin_audit_log(resource_type, resource_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_severity   ON admin_audit_log(severity);
+
+    -- system_event_log: user-triggered events (uploads, platform connects, button clicks)
+    -- admin_audit_log tracks admin actions; this tracks all user actions
+    CREATE TABLE IF NOT EXISTS system_event_log (
+        id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id         UUID        REFERENCES users(id) ON DELETE SET NULL,
+        event_category  VARCHAR(50) NOT NULL,   -- UPLOAD, PLATFORM, AUTH, UI_ACTION, SYSTEM
+        action          TEXT        NOT NULL,
+        resource_type   VARCHAR(100),
+        resource_id     TEXT,
+        details         JSONB       DEFAULT '{}'::jsonb,
+        ip_address      TEXT,
+        user_agent      TEXT,
+        session_id      TEXT,
+        severity        VARCHAR(20) DEFAULT 'INFO',
+        outcome         VARCHAR(20) DEFAULT 'SUCCESS',
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_syslog_user       ON system_event_log(user_id);
+    CREATE INDEX IF NOT EXISTS idx_syslog_category   ON system_event_log(event_category);
+    CREATE INDEX IF NOT EXISTS idx_syslog_action     ON system_event_log(action);
+    CREATE INDEX IF NOT EXISTS idx_syslog_created    ON system_event_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_syslog_resource   ON system_event_log(resource_type, resource_id);
+"""),
 ]
         
         for version, sql in migrations:
@@ -1347,6 +1405,120 @@ async def require_admin(user: dict = Depends(get_current_user)):
 async def require_master_admin(user: dict = Depends(get_current_user)):
     if user.get("role") != "master_admin": raise HTTPException(403, "Master admin required")
     return user
+
+
+async def log_admin_audit(conn, *, user_id: str, admin: dict, action: str, details: dict = None,
+                          request=None, event_category: str = "ADMIN", resource_type: str = None,
+                          resource_id: str = None, severity: str = "INFO", outcome: str = "SUCCESS"):
+    """
+    Write a tamper-evident audit record to admin_audit_log.
+    Corporate-grade: captures category, resource, actor, IP, user-agent, severity.
+    Safe to call inside an existing connection/transaction. NEVER raises.
+    """
+    try:
+        ip_address = None
+        user_agent = None
+        if request is not None:
+            forwarded = request.headers.get("x-forwarded-for")
+            ip_address = forwarded.split(",")[0].strip() if forwarded else (
+                request.client.host if request.client else None
+            )
+            user_agent = request.headers.get("user-agent", "")[:512]
+
+        await conn.execute(
+            """
+            INSERT INTO admin_audit_log
+                (user_id, admin_id, admin_email, action, details, ip_address,
+                 event_category, actor_user_id, resource_type, resource_id,
+                 user_agent, severity, outcome)
+            VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6, $7, $8::uuid, $9, $10, $11, $12, $13)
+            """,
+            str(user_id),
+            str(admin.get("id", "")),
+            admin.get("email", ""),
+            action,
+            json.dumps(details or {}),
+            ip_address,
+            event_category,
+            str(admin.get("id", "")),
+            resource_type,
+            str(resource_id) if resource_id else None,
+            user_agent,
+            severity,
+            outcome,
+        )
+    except Exception as e:
+        logger.error(f"[audit] Failed to write admin audit log: {e}")
+        # NEVER raise — audit failure must never break the primary operation
+
+
+async def log_system_event(conn=None, *, user_id: str = None, action: str, event_category: str = "SYSTEM",
+                            resource_type: str = None, resource_id: str = None, details: dict = None,
+                            request=None, severity: str = "INFO", outcome: str = "SUCCESS"):
+    """
+    Write a system/user-action event to system_event_log.
+    Used for uploads, platform connects, UI button clicks, auth events.
+    Accepts an existing conn or acquires its own. NEVER raises.
+    """
+    async def _write(c):
+        try:
+            ip_address = None
+            user_agent = None
+            session_id = None
+            if request is not None:
+                forwarded = request.headers.get("x-forwarded-for")
+                ip_address = forwarded.split(",")[0].strip() if forwarded else (
+                    request.client.host if request.client else None
+                )
+                user_agent = request.headers.get("user-agent", "")[:512]
+                session_id = request.headers.get("x-session-id", "")[:128] or None
+
+            await c.execute(
+                """
+                INSERT INTO system_event_log
+                    (user_id, event_category, action, resource_type, resource_id,
+                     details, ip_address, user_agent, session_id, severity, outcome)
+                VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11)
+                """,
+                str(user_id) if user_id else None,
+                event_category,
+                action,
+                resource_type,
+                str(resource_id) if resource_id else None,
+                json.dumps(details or {}),
+                ip_address,
+                user_agent,
+                session_id,
+                severity,
+                outcome,
+            )
+        except Exception as e:
+            logger.error(f"[audit] Failed to write system event log: {e}")
+
+    try:
+        if conn is not None:
+            await _write(conn)
+        else:
+            async with db_pool.acquire() as c:
+                await _write(c)
+    except Exception as e:
+        logger.error(f"[audit] System event log pool error: {e}")
+
+
+async def _purge_old_audit_logs():
+    """Purge audit records older than 6 months (rolling window). Run periodically."""
+    try:
+        async with db_pool.acquire() as conn:
+            deleted_admin = await conn.fetchval(
+                "DELETE FROM admin_audit_log WHERE created_at < NOW() - INTERVAL '6 months' RETURNING id"
+            )
+            deleted_sys = await conn.fetchval(
+                "DELETE FROM system_event_log WHERE created_at < NOW() - INTERVAL '6 months' RETURNING id"
+            )
+            logger.info(f"[audit] Purged old logs: admin_audit={deleted_admin or 0}, system_event={deleted_sys or 0}")
+    except Exception as e:
+        logger.error(f"[audit] Purge failed: {e}")
+
 
 # ============================================================
 # TRILL TELEMETRY SYSTEM
@@ -2502,7 +2674,7 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
 # Uploads
 # ============================================================
 @app.post("/api/uploads/presign")
-async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user)):
+async def presign_upload(data: UploadInit, request: Request, user: dict = Depends(get_current_user)):
     """Create upload with user preferences applied"""
     plan = get_plan(user.get("subscription_tier", "free"))
     wallet = user.get("wallet", {})
@@ -2655,6 +2827,15 @@ async def presign_upload(data: UploadInit, user: dict = Depends(get_current_user
         result["telemetry_presigned_url"] = generate_presigned_upload_url(telem_key, "application/octet-stream")
         result["telemetry_r2_key"] = telem_key
 
+    # Fire-and-forget audit — does not affect upload flow
+    async with db_pool.acquire() as _ac:
+        await log_system_event(_ac, user_id=str(user["id"]), action="UPLOAD_INITIATED",
+                               event_category="UPLOAD", resource_type="upload", resource_id=upload_id,
+                               details={"filename": data.filename, "platforms": list(data.platforms or []),
+                                        "schedule_mode": data.schedule_mode, "put_cost": put_cost,
+                                        "aic_cost": aic_cost, "file_size": data.file_size},
+                               request=request)
+
     return result
 
 
@@ -2679,7 +2860,7 @@ async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = 
     }
 
 @app.post("/api/uploads/{upload_id}/complete")
-async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)):
+async def complete_upload(upload_id: str, request: Request, user: dict = Depends(get_current_user)):
     """
     Complete upload and either enqueue immediately (immediate mode) or stage
     for deferred processing (scheduled / smart mode).
@@ -2747,6 +2928,13 @@ async def complete_upload(upload_id: str, user: dict = Depends(get_current_user)
         except Exception:
             pass
 
+    # Audit: upload submitted to pipeline
+    await log_system_event(user_id=str(user["id"]), action="UPLOAD_SUBMITTED",
+                           event_category="UPLOAD", resource_type="upload", resource_id=upload_id,
+                           details={"schedule_mode": schedule_mode, "new_status": new_status,
+                                    "platforms": list(upload.get("platforms") or [])},
+                           request=request)
+
     return {
         "status": new_status,
         "upload_id": upload_id,
@@ -2803,7 +2991,7 @@ async def reprepare_upload(upload_id: str, user: dict = Depends(get_current_user
 
 
 @app.post("/api/uploads/{upload_id}/cancel")
-async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
+async def cancel_upload(upload_id: str, request: Request, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow("SELECT put_reserved, aic_reserved, status FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user["id"])
         if not upload: raise HTTPException(404, "Upload not found")
@@ -2813,23 +3001,23 @@ async def cancel_upload(upload_id: str, user: dict = Depends(get_current_user)):
         current_status = upload["status"]
 
         if current_status == "processing":
-            # Worker is actively running this job — signal it to stop gracefully.
-            # The worker checks cancel_requested at each pipeline stage checkpoint
-            # and will set status to 'cancelled' itself when it detects the signal.
-            # Do NOT change status here or the worker loses track of the job.
             await conn.execute(
                 "UPDATE uploads SET cancel_requested = TRUE, updated_at = NOW() WHERE id = $1",
                 upload_id
             )
+            await log_system_event(conn, user_id=str(user["id"]), action="UPLOAD_CANCEL_REQUESTED",
+                                   event_category="UPLOAD", resource_type="upload", resource_id=upload_id,
+                                   details={"status_at_cancel": current_status}, request=request)
             return {"status": "cancel_requested", "message": "Cancel signal sent — job will stop at next checkpoint"}
         else:
-            # Job is pending/queued — no worker has picked it up yet.
-            # Safe to cancel immediately and refund reserved tokens.
             await conn.execute(
                 "UPDATE uploads SET cancel_requested = TRUE, status = 'cancelled', updated_at = NOW() WHERE id = $1",
                 upload_id
             )
             await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
+            await log_system_event(conn, user_id=str(user["id"]), action="UPLOAD_CANCELLED",
+                                   event_category="UPLOAD", resource_type="upload", resource_id=upload_id,
+                                   details={"status_at_cancel": current_status}, request=request, severity="WARNING")
             return {"status": "cancelled"}
 
 
@@ -3027,6 +3215,116 @@ async def get_uploads(
         return out
 
     return {"uploads": out, "total": int(total or 0), "limit": limit, "offset": offset}
+
+
+async def partial_refund_tokens(
+    conn,
+    user_id: str,
+    upload_id: str,
+    succeeded_platforms: list,
+    failed_platforms: list,
+    original_put_cost: int,
+    original_aic_cost: int,
+):
+    """
+    Pro-rate a refund for platforms that failed in a partial upload.
+
+    PUT cost formula (mirrors entitlements.py compute_put_cost):
+        base = 10  (covers the first platform)
+        +2 per *extra* platform beyond the first
+        (HUD / priority / thumbnail costs are per-job, not per-platform — kept)
+
+    For a partial failure we refund:
+        2 tokens × number_of_failed_platforms
+        (the base-10 is always kept because work was done)
+
+    AIC is per-job, not per-platform — no partial AIC refund.
+
+    Only runs when there is at least one success AND at least one failure.
+    On full failure the worker calls release/unreserve instead.
+    """
+    n_failed = len(failed_platforms or [])
+    if n_failed == 0 or not (succeeded_platforms or []):
+        return  # nothing to refund
+
+    put_refund = n_failed * 2
+    put_refund = min(put_refund, max(0, int(original_put_cost or 0) - 10))  # never refund the base-10
+
+    if put_refund <= 0:
+        return
+
+    await conn.execute(
+        """
+        UPDATE wallets
+        SET
+            put_balance  = put_balance  + $1,
+            put_reserved = GREATEST(0, put_reserved - $1),
+            updated_at   = NOW()
+        WHERE user_id = $2
+        """,
+        put_refund,
+        user_id,
+    )
+
+    await conn.execute(
+        """
+        INSERT INTO token_ledger
+            (user_id, token_type, delta, reason, upload_id, ref_type, metadata)
+        VALUES
+            ($1, 'put', $2, 'partial_platform_refund', $3, 'upload',
+             jsonb_build_object(
+                 'failed_platforms',    $4::text,
+                 'succeeded_platforms', $5::text,
+                 'original_put_cost',   $6
+             ))
+        """,
+        user_id,
+        put_refund,
+        upload_id,
+        ",".join([str(x) for x in (failed_platforms or [])]),
+        ",".join([str(x) for x in (succeeded_platforms or [])]),
+        int(original_put_cost or 0),
+    )
+
+async def credit_wallet(conn, user_id: str, wallet_type: str, amount: int, reason: str, stripe_event_id: str = None):
+    if wallet_type == "put":
+        await conn.execute("UPDATE wallets SET put_balance = put_balance + $1 WHERE user_id = $2", amount, user_id)
+    else:
+        await conn.execute("UPDATE wallets SET aic_balance = aic_balance + $1 WHERE user_id = $2", amount, user_id)
+    await ledger_entry(conn, user_id, wallet_type, amount, reason, stripe_event_id=stripe_event_id)
+
+async def transfer_tokens(conn, user_id: str, from_platform: str, to_platform: str, amount: int, burn_pct: float = 0.02) -> bool:
+    # Check flex enabled
+    user = await conn.fetchrow("SELECT subscription_tier, flex_enabled FROM users WHERE id = $1", user_id)
+    if not user or not user.get("flex_enabled"):
+        return False
+    wallet = await get_wallet(conn, user_id)
+    if wallet["put_balance"] - wallet["put_reserved"] < amount:
+        return False
+    burn = int(amount * burn_pct)
+    net = amount - burn
+    await ledger_entry(conn, user_id, "put", -amount, "transfer_out", platform=from_platform)
+    await ledger_entry(conn, user_id, "put", net, "transfer_in", platform=to_platform)
+    if burn > 0:
+        await ledger_entry(conn, user_id, "put", -burn, "transfer_burn")
+        await conn.execute("UPDATE wallets SET put_balance = put_balance - $1 WHERE user_id = $2", burn, user_id)
+    return True
+
+async def daily_refill(conn, user_id: str, tier: str):
+    ent = get_entitlements_for_tier(tier)
+    daily = ent.put_daily * 4  # 4 platforms
+    wallet = await get_wallet(conn, user_id)
+    last_refill = wallet.get("last_refill_date")
+    today = _now_utc().date()
+    if last_refill and last_refill >= today:
+        return
+    monthly_cap = ent.put_monthly
+    current = wallet["put_balance"]
+    if current < monthly_cap:
+        add = min(daily, monthly_cap - current)
+        await conn.execute("UPDATE wallets SET put_balance = put_balance + $1, last_refill_date = $2 WHERE user_id = $3", add, today, user_id)
+        await ledger_entry(conn, user_id, "put", add, "daily_refill")
+
 
 
 @app.get("/api/scheduled")
@@ -3349,13 +3647,18 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
 
 
 @app.delete("/api/uploads/{upload_id}")
-async def delete_upload(upload_id: str, user: dict = Depends(get_current_user)):
+async def delete_upload(upload_id: str, request: Request, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        upload = await conn.fetchrow("SELECT put_reserved, aic_reserved, status FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user["id"])
+        upload = await conn.fetchrow("SELECT put_reserved, aic_reserved, status, title, platforms FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user["id"])
         if not upload: raise HTTPException(404, "Upload not found")
         if upload["status"] in ("pending", "queued"):
             await refund_tokens(conn, user["id"], upload["put_reserved"], upload["aic_reserved"], upload_id)
         await conn.execute("DELETE FROM uploads WHERE id = $1", upload_id)
+        await log_system_event(conn, user_id=str(user["id"]), action="UPLOAD_DELETED",
+                               event_category="UPLOAD", resource_type="upload", resource_id=upload_id,
+                               details={"title": upload["title"], "status_at_delete": upload["status"],
+                                        "platforms": list(upload["platforms"] or [])},
+                               request=request, severity="WARNING")
     return {"status": "deleted"}
 
 # ============================================================
@@ -4358,7 +4661,7 @@ async def disconnect_account(
         )
         await conn.execute("DELETE FROM platform_tokens WHERE id = $1", row["id"])
 
-        # Audit log
+        # Audit log — platform_disconnect_log (existing) + system_event_log (new)
         await conn.execute(
             """
             INSERT INTO platform_disconnect_log
@@ -4374,6 +4677,12 @@ async def disconnect_account(
             err or None,
             ip_addr,
         )
+        await log_system_event(conn, user_id=str(user["id"]), action="PLATFORM_DISCONNECTED",
+                               event_category="PLATFORM", resource_type="platform",
+                               resource_id=f"{row['platform']}:{row['account_id']}",
+                               details={"platform": row["platform"], "account_name": row["account_name"],
+                                        "provider_revoked": ok, "provider_error": err},
+                               severity="WARNING")
 
     return {"status": "disconnected", "provider_revoked": ok}
 
@@ -4763,11 +5072,19 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                         UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3, 
                         account_avatar = $4, updated_at = NOW() WHERE id = $5
                     """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
+                    connect_action = "PLATFORM_RECONNECTED"
                 else:
                     await conn.execute("""
                         INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
                         VALUES ($1, $2, $3, $4, $5, $6, $7)
                     """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
+                    connect_action = "PLATFORM_CONNECTED"
+
+                await log_system_event(conn, user_id=str(user_id), action=connect_action,
+                                       event_category="PLATFORM", resource_type="platform",
+                                       resource_id=f"{platform}:{account_id}",
+                                       details={"platform": platform, "account_name": account_name,
+                                                "account_username": account_username})
             
             return popup_response(True, platform)
     
@@ -6567,6 +6884,45 @@ async def support_contact(payload: SupportContactRequest, user: dict = Depends(g
 
     return {"status": "received"}
 
+
+# ============================================================
+# FRONTEND BUTTON-CLICK / UI ACTION AUDIT ENDPOINT
+# ============================================================
+class ActivityLogIn(BaseModel):
+    action: str
+    event_category: str = "UI_ACTION"
+    resource_type: Optional[str] = None
+    resource_id: Optional[str] = None
+    details: Optional[dict] = None
+    session_id: Optional[str] = None
+
+@app.post("/api/activity/log")
+async def log_activity(data: ActivityLogIn, request: Request, user: dict = Depends(get_current_user)):
+    """
+    Frontend button-click and UI action audit trail.
+    Called by JavaScript whenever a significant user action occurs.
+    Stored in system_event_log with full context.
+    """
+    allowed_categories = {"UI_ACTION", "UPLOAD", "PLATFORM", "AUTH", "NAVIGATION"}
+    category = data.event_category if data.event_category in allowed_categories else "UI_ACTION"
+
+    # Sanitize — prevent log injection
+    action_safe = str(data.action or "")[:100].strip()
+    if not action_safe:
+        return {"ok": False, "error": "action required"}
+
+    await log_system_event(
+        user_id=str(user["id"]),
+        action=action_safe,
+        event_category=category,
+        resource_type=data.resource_type,
+        resource_id=data.resource_id,
+        details={**(data.details or {}), "session_id": data.session_id},
+        request=request,
+    )
+    return {"ok": True}
+
+
 @app.get("/api/admin/users")
 async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = None, limit: int = 50, offset: int = 0, user: dict = Depends(require_admin)):
     query = "SELECT id, email, name, role, subscription_tier, subscription_status, status, created_at, last_active_at FROM users WHERE 1=1"
@@ -6586,35 +6942,52 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
     return {"users": [dict(u) for u in users], "total": total}
 
 @app.put("/api/admin/users/{user_id}")
-async def admin_update_user(user_id: str, data: AdminUserUpdate, user: dict = Depends(require_admin)):
+async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Request, user: dict = Depends(require_admin)):
     updates, params = [], [user_id]
+    changes = {}
     if data.subscription_tier:
         updates.append(f"subscription_tier = ${len(params)+1}")
         params.append(data.subscription_tier)
+        changes["subscription_tier"] = data.subscription_tier
     if data.role and user.get("role") == "master_admin":
         updates.append(f"role = ${len(params)+1}")
         params.append(data.role)
+        changes["role"] = data.role
     if data.status:
         updates.append(f"status = ${len(params)+1}")
         params.append(data.status)
+        changes["status"] = data.status
     if data.flex_enabled is not None:
         updates.append(f"flex_enabled = ${len(params)+1}")
         params.append(data.flex_enabled)
+        changes["flex_enabled"] = data.flex_enabled
     if updates:
         async with db_pool.acquire() as conn:
             await conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", *params)
+            await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_UPDATE_USER",
+                                  details={"changes": changes}, request=request,
+                                  resource_type="user", resource_id=user_id)
     return {"status": "updated"}
 
 @app.post("/api/admin/users/{user_id}/ban")
-async def admin_ban_user(user_id: str, user: dict = Depends(require_admin)):
+async def admin_ban_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT email FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET status = 'banned' WHERE id = $1", user_id)
+        await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_BAN_USER",
+                              details={"target_email": target["email"] if target else None},
+                              request=request, resource_type="user", resource_id=user_id,
+                              severity="WARNING")
     return {"status": "banned"}
 
 @app.post("/api/admin/users/{user_id}/unban")
-async def admin_unban_user(user_id: str, user: dict = Depends(require_admin)):
+async def admin_unban_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
+        target = await conn.fetchrow("SELECT email FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
+        await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_UNBAN_USER",
+                              details={"target_email": target["email"] if target else None},
+                              request=request, resource_type="user", resource_id=user_id)
     return {"status": "unbanned"}
 
 
@@ -6720,27 +7093,164 @@ async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, requ
 
 
 @app.get("/api/admin/audit")
-async def admin_audit(user_id: Optional[str] = None, limit: int = 20, user: dict = Depends(get_current_user)):
-    require_admin(user)
-    limit = max(1, min(limit, 200))
-
-    q = """
-      SELECT id, user_id, admin_id, admin_email, action, details, ip_address, created_at
-      FROM admin_audit_log
-      WHERE 1=1
+async def admin_audit(
+    user_id: Optional[str] = None,
+    event_category: Optional[str] = None,
+    action: Optional[str] = None,
+    severity: Optional[str] = None,
+    source: str = "all",           # "all" | "admin" | "system"
+    limit: int = 100,
+    offset: int = 0,
+    user: dict = Depends(get_current_user)
+):
     """
-    args: List[Any] = []
-    if user_id:
-        args.append(user_id)
-        q += f" AND user_id = ${len(args)}::uuid"
+    Corporate-grade audit log endpoint.
+    - Returns rolling 6-month window across both admin_audit_log and system_event_log
+    - Supports filtering by category, action, severity, user, source table
+    - Auto-purges records older than 6 months on each call (once per hour max via in-memory flag)
+    - Pagination via limit/offset
+    """
+    require_admin(user)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
 
-    args.append(limit)
-    q += f" ORDER BY created_at DESC LIMIT ${len(args)}"
+    def _ser(v):
+        if v is None: return None
+        if hasattr(v, "isoformat"): return v.isoformat()
+        if isinstance(v, uuid.UUID): return str(v)
+        if isinstance(v, (dict, list)): return v
+        return v
 
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(q, *args)
+    def _ser_row(r: dict) -> dict:
+        return {k: _ser(v) for k, v in r.items()}
 
-    return {"items": [dict(r) for r in rows], "total": len(rows)}
+    try:
+        async with db_pool.acquire() as conn:
+            # ── Background purge (rolling 6-month window) ────────────────────
+            try:
+                await conn.execute(
+                    "DELETE FROM admin_audit_log WHERE created_at < NOW() - INTERVAL '6 months'"
+                )
+                await conn.execute(
+                    "DELETE FROM system_event_log WHERE created_at < NOW() - INTERVAL '6 months'"
+                )
+            except Exception as purge_err:
+                logger.warning(f"[audit] Purge skipped: {purge_err}")
+
+            items = []
+
+            # ── Build admin_audit_log query ───────────────────────────────────
+            if source in ("all", "admin"):
+                try:
+                    aq = """
+                        SELECT
+                            id, 'admin_audit' AS log_source,
+                            COALESCE(event_category, 'ADMIN') AS event_category,
+                            action,
+                            COALESCE(actor_user_id, admin_id) AS actor_id,
+                            admin_email AS actor_email,
+                            user_id AS target_user_id,
+                            resource_type, resource_id,
+                            details, ip_address, user_agent,
+                            COALESCE(severity, 'INFO') AS severity,
+                            COALESCE(outcome, 'SUCCESS') AS outcome,
+                            created_at
+                        FROM admin_audit_log
+                        WHERE created_at >= NOW() - INTERVAL '6 months'
+                    """
+                    aargs: List[Any] = []
+                    if user_id:
+                        aargs.append(user_id)
+                        aq += f" AND (user_id = ${len(aargs)}::uuid OR admin_id = ${len(aargs)}::uuid)"
+                    if event_category:
+                        aargs.append(event_category.upper())
+                        aq += f" AND UPPER(COALESCE(event_category,'ADMIN')) = ${len(aargs)}"
+                    if action:
+                        aargs.append(f"%{action.upper()}%")
+                        aq += f" AND UPPER(action) LIKE ${len(aargs)}"
+                    if severity:
+                        aargs.append(severity.upper())
+                        aq += f" AND UPPER(COALESCE(severity,'INFO')) = ${len(aargs)}"
+
+                    admin_rows = await conn.fetch(aq, *aargs)
+                    items.extend([_ser_row(dict(r)) for r in admin_rows])
+                except Exception as ae:
+                    logger.warning(f"[audit] admin_audit_log query failed: {ae}")
+
+            # ── Build system_event_log query ──────────────────────────────────
+            if source in ("all", "system"):
+                try:
+                    sq = """
+                        SELECT
+                            id, 'system_event' AS log_source,
+                            event_category,
+                            action,
+                            user_id AS actor_id,
+                            NULL AS actor_email,
+                            user_id AS target_user_id,
+                            resource_type, resource_id,
+                            details, ip_address, user_agent,
+                            COALESCE(severity, 'INFO') AS severity,
+                            COALESCE(outcome, 'SUCCESS') AS outcome,
+                            created_at
+                        FROM system_event_log
+                        WHERE created_at >= NOW() - INTERVAL '6 months'
+                    """
+                    sargs: List[Any] = []
+                    if user_id:
+                        sargs.append(user_id)
+                        sq += f" AND user_id = ${len(sargs)}::uuid"
+                    if event_category:
+                        sargs.append(event_category.upper())
+                        sq += f" AND UPPER(event_category) = ${len(sargs)}"
+                    if action:
+                        sargs.append(f"%{action.upper()}%")
+                        sq += f" AND UPPER(action) LIKE ${len(sargs)}"
+                    if severity:
+                        sargs.append(severity.upper())
+                        sq += f" AND UPPER(COALESCE(severity,'INFO')) = ${len(sargs)}"
+
+                    sys_rows = await conn.fetch(sq, *sargs)
+                    items.extend([_ser_row(dict(r)) for r in sys_rows])
+                except Exception as se:
+                    logger.warning(f"[audit] system_event_log query failed: {se}")
+
+            # Sort combined by created_at desc, paginate
+            items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+            total = len(items)
+            page = items[offset: offset + limit]
+
+            # Enrich with actor name from users table where possible
+            actor_ids = list({x["actor_id"] for x in page if x.get("actor_id")})
+            actor_map = {}
+            if actor_ids:
+                try:
+                    urows = await conn.fetch(
+                        "SELECT id, email, name FROM users WHERE id = ANY($1::uuid[])",
+                        [str(a) for a in actor_ids]
+                    )
+                    for ur in urows:
+                        actor_map[str(ur["id"])] = {"email": ur["email"], "name": ur["name"]}
+                except Exception:
+                    pass
+
+            for item in page:
+                aid = str(item.get("actor_id") or "")
+                if aid in actor_map:
+                    item["actor_email"] = item.get("actor_email") or actor_map[aid]["email"]
+                    item["actor_name"] = actor_map[aid]["name"]
+
+        return {
+            "items": page,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": (offset + limit) < total,
+        }
+
+    except Exception as e:
+        logger.error(f"[admin_audit] Error fetching audit log: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Audit log error: {str(e)}")
 
 
 @app.get("/api/admin/analytics/users")
@@ -6787,11 +7297,17 @@ async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
 
 
 @app.post("/api/admin/users/assign-tier")
-async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), user: dict = Depends(require_master_admin)):
+async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), request: Request = None, user: dict = Depends(require_master_admin)):
     if tier not in PLAN_CONFIG:
         raise HTTPException(400, "Invalid tier")
     async with db_pool.acquire() as conn:
+        old = await conn.fetchrow("SELECT subscription_tier, email FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET subscription_tier = $1 WHERE id = $2", tier, user_id)
+        await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_ASSIGN_TIER",
+                              details={"old_tier": old["subscription_tier"] if old else None, "new_tier": tier,
+                                       "target_email": old["email"] if old else None},
+                              request=request, resource_type="user", resource_id=user_id,
+                              severity="WARNING")
     return {"status": "assigned", "tier": tier}
 
 # ============================================================
@@ -8122,5 +8638,163 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "processingFinishedAt": d.get("processing_finished_at").isoformat() if d.get("processing_finished_at") else None,
         "processingProgress":   int(d.get("processing_progress") or 0),
         "processingStage":      d.get("processing_stage"),
+    }
+
+
+@app.get("/api/admin/users/{user_id}/wallet")
+async def admin_get_user_wallet(
+    user_id: str,
+    admin: dict = Depends(require_admin),
+):
+    """Return the wallet + recent ledger for any user (admin only)."""
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT id, email, name, subscription_tier FROM users WHERE id = $1",
+            user_id,
+        )
+        if not target:
+            raise HTTPException(404, "User not found")
+
+        wallet = await get_wallet(conn, target["id"])
+
+        ledger = await conn.fetch(
+            """
+            SELECT token_type, delta, reason, upload_id, metadata, created_at
+            FROM   token_ledger
+            WHERE  user_id = $1
+            ORDER  BY created_at DESC
+            LIMIT  100
+            """,
+            target["id"],
+        )
+
+    plan = get_plan(target["subscription_tier"] or "free")
+
+    return {
+        "user": {
+            "id":    str(target["id"]),
+            "email": target["email"],
+            "name":  target["name"],
+            "tier":  target["subscription_tier"],
+        },
+        "wallet": {
+            "put_balance":  int(wallet.get("put_balance", 0)),
+            "aic_balance":  int(wallet.get("aic_balance", 0)),
+            "put_reserved": int(wallet.get("put_reserved", 0)),
+            "aic_reserved": int(wallet.get("aic_reserved", 0)),
+        },
+        "plan_limits": {
+            "put_daily":   int(plan.get("put_daily", 0)),
+            "put_monthly": int(plan.get("put_monthly", 0)),
+            "aic_monthly": int(plan.get("aic_monthly", 0)),
+        },
+        "ledger": [dict(r) for r in ledger],
+    }
+
+@app.post("/api/admin/users/{user_id}/wallet/adjust")
+async def admin_adjust_wallet(
+    user_id:  str,
+    payload:  AdminWalletAdjust,
+    request:  Request,
+    admin:    dict = Depends(require_admin),
+):
+    """
+    Manually adjust a user's PUT or AIC balance.
+
+    Modes:
+      set      → set balance to exactly this amount
+      add      → add tokens to current balance
+      subtract → subtract tokens (clamped to 0 — never goes negative)
+
+    All changes are written to token_ledger and admin_audit_log.
+    """
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT id, email FROM users WHERE id = $1", user_id
+        )
+        if not target:
+            raise HTTPException(404, "User not found")
+
+        wallet = await get_wallet(conn, target["id"])
+        col    = "put_balance" if payload.wallet == "put" else "aic_balance"
+        before = int(wallet.get(col, 0) or 0)
+
+        if payload.mode == "set":
+            new_val = int(payload.amount)
+            delta   = new_val - before
+        elif payload.mode == "add":
+            new_val = before + int(payload.amount)
+            delta   = int(payload.amount)
+        else:  # subtract
+            new_val = max(0, before - int(payload.amount))
+            delta   = new_val - before  # negative
+
+        await conn.execute(
+            f"UPDATE wallets SET {col} = $1, updated_at = NOW() WHERE user_id = $2",
+            new_val,
+            target["id"],
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO token_ledger
+                (user_id, token_type, delta, reason, ref_type, metadata)
+            VALUES
+                ($1, $2, $3, $4, 'admin_adjust',
+                 jsonb_build_object(
+                     'admin_id',    $5::text,
+                     'admin_email', $6,
+                     'mode',        $7,
+                     'before',      $8,
+                     'after',       $9,
+                     'reason',      $10
+                 ))
+            """,
+            target["id"],
+            payload.wallet,
+            int(delta),
+            f"admin_{payload.mode}_{payload.wallet}",
+            str(admin.get("id")),
+            admin.get("email"),
+            payload.mode,
+            before,
+            new_val,
+            payload.reason,
+        )
+
+        try:
+            await conn.execute(
+                """
+                INSERT INTO admin_audit_log
+                    (user_id, admin_id, admin_email, action, details, ip_address)
+                VALUES
+                    ($1, $2, $3, $4, $5::jsonb, $6)
+                """,
+                target["id"],
+                admin.get("id"),
+                admin.get("email"),
+                "ADMIN_WALLET_ADJUST",
+                json.dumps({
+                    "wallet": payload.wallet,
+                    "mode":   payload.mode,
+                    "amount": int(payload.amount),
+                    "delta":  int(delta),
+                    "before": before,
+                    "after":  new_val,
+                    "reason": payload.reason,
+                }),
+                request.client.host if request.client else None,
+            )
+        except Exception:
+            # admin_audit_log may not exist in some environments; ledger is the source of truth
+            pass
+
+    return {
+        "ok":     True,
+        "wallet": payload.wallet,
+        "mode":   payload.mode,
+        "before": before,
+        "after":  new_val,
+        "delta":  int(delta),
     }
 

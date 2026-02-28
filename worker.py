@@ -136,6 +136,14 @@ PROCESSING_WINDOW_MINUTES = int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15"
 # How often the scheduler polls the DB for staged/ready jobs (seconds)
 SCHEDULER_POLL_INTERVAL = int(os.environ.get("SCHEDULER_POLL_INTERVAL", "60"))
 
+# ── Analytics auto-sync ──────────────────────────────────────────
+# How often the analytics sync loop runs (seconds). Default: 6 hours.
+ANALYTICS_SYNC_INTERVAL = int(os.environ.get("ANALYTICS_SYNC_INTERVAL_SECONDS", str(6 * 3600)))
+# How many uploads to sync per cycle (avoids platform API rate-limit hammering)
+ANALYTICS_SYNC_BATCH    = int(os.environ.get("ANALYTICS_SYNC_BATCH_SIZE", "20"))
+# Only re-sync uploads whose analytics_synced_at is older than this many hours
+ANALYTICS_RESYNC_HOURS  = int(os.environ.get("ANALYTICS_RESYNC_HOURS", "6"))
+
 # Redis resilience
 REDIS_RETRY_DELAY = 5.0
 REDIS_MAX_RETRIES = 10
@@ -1083,6 +1091,338 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         return False
 
 
+
+# ---------------------------------------------------------------------------
+# ANALYTICS SYNC LOOP
+# ---------------------------------------------------------------------------
+
+async def _sync_one_upload_analytics(
+    conn: asyncpg.Connection,
+    upload_id: str,
+    user_id: str,
+    pr_list: list,
+    token_map: dict,
+) -> dict:
+    """
+    Pull engagement stats for one completed upload from each platform API.
+    Returns totals dict and writes them + analytics_synced_at to DB.
+    """
+    import httpx as _httpx
+    from stages.publish_stage import decrypt_token
+
+    total_views = total_likes = total_comments = total_shares = 0
+    platform_stats = {}
+
+    async with _httpx.AsyncClient(timeout=15) as client:
+        for pr in pr_list:
+            plat = str(pr.get("platform") or "").lower()
+            ok = (
+                pr.get("success") is True
+                or str(pr.get("status", "")).lower() in ("published", "succeeded", "success")
+            )
+            if not ok:
+                continue
+
+            tok = token_map.get(plat, {})
+            access_token = tok.get("access_token", "")
+            if not access_token:
+                continue
+
+            video_id = (
+                pr.get("platform_video_id")
+                or pr.get("video_id") or pr.get("videoId") or pr.get("id")
+                or pr.get("media_id") or pr.get("post_id") or pr.get("share_id")
+            )
+
+            try:
+                if plat == "tiktok" and video_id:
+                    resp = await client.post(
+                        "https://open.tiktokapis.com/v2/video/query/",
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "filters": {"video_ids": [str(video_id)]},
+                            "fields": ["id", "view_count", "like_count", "comment_count", "share_count"],
+                        },
+                    )
+                    if resp.status_code == 200:
+                        vids = resp.json().get("data", {}).get("videos", []) or []
+                        if vids:
+                            v = vids[0]
+                            s = {
+                                "views":    int(v.get("view_count")    or 0),
+                                "likes":    int(v.get("like_count")     or 0),
+                                "comments": int(v.get("comment_count") or 0),
+                                "shares":   int(v.get("share_count")   or 0),
+                            }
+                            platform_stats["tiktok"] = s
+                            total_views    += s["views"];    total_likes    += s["likes"]
+                            total_comments += s["comments"]; total_shares   += s["shares"]
+                    else:
+                        logger.debug(f"[analytics-sync] TikTok HTTP {resp.status_code} for {upload_id}")
+
+                elif plat == "youtube" and video_id:
+                    resp = await client.get(
+                        "https://www.googleapis.com/youtube/v3/videos",
+                        params={"part": "statistics", "id": str(video_id)},
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    )
+                    if resp.status_code == 200:
+                        items = resp.json().get("items", []) or []
+                        if items:
+                            st = items[0].get("statistics", {})
+                            s = {
+                                "views":    int(st.get("viewCount")    or 0),
+                                "likes":    int(st.get("likeCount")    or 0),
+                                "comments": int(st.get("commentCount") or 0),
+                                "shares":   0,
+                            }
+                            platform_stats["youtube"] = s
+                            total_views    += s["views"]; total_likes    += s["likes"]
+                            total_comments += s["comments"]
+                    else:
+                        logger.debug(f"[analytics-sync] YouTube HTTP {resp.status_code} for {upload_id}")
+
+                elif plat == "instagram" and video_id:
+                    shortcode = pr.get("shortcode") or video_id
+                    resp = await client.get(
+                        f"https://graph.facebook.com/v21.0/{shortcode}/insights",
+                        params={
+                            "access_token": access_token,
+                            "metric": "plays,likes,comments,saved,shares,reach",
+                        },
+                    )
+                    if resp.status_code == 200:
+                        s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                        for m in resp.json().get("data", []) or []:
+                            name = m.get("name", "")
+                            vals = m.get("values", [])
+                            val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
+                            if name == "plays":      s["views"]    += val
+                            elif name == "likes":    s["likes"]    += val
+                            elif name == "comments": s["comments"] += val
+                            elif name == "shares":   s["shares"]   += val
+                        platform_stats["instagram"] = s
+                        total_views    += s["views"];    total_likes    += s["likes"]
+                        total_comments += s["comments"]; total_shares   += s["shares"]
+                    else:
+                        logger.debug(f"[analytics-sync] Instagram HTTP {resp.status_code} for {upload_id}")
+
+                elif plat == "facebook" and video_id:
+                    resp = await client.get(
+                        f"https://graph.facebook.com/v21.0/{video_id}",
+                        params={
+                            "access_token": access_token,
+                            "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)",
+                        },
+                    )
+                    if resp.status_code == 200:
+                        s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                        for m in (resp.json().get("insights", {}) or {}).get("data", []) or []:
+                            name = m.get("name", "")
+                            vals = m.get("values", [{}])
+                            val  = vals[-1].get("value", 0) if vals else 0
+                            if isinstance(val, dict):
+                                val = sum(val.values())
+                            val = int(val or 0)
+                            if name == "total_video_views":                     s["views"]    += val
+                            elif name == "total_video_reactions_by_type_total": s["likes"]    += val
+                            elif name == "total_video_comments":                 s["comments"] += val
+                            elif name == "total_video_shares":                   s["shares"]   += val
+                        platform_stats["facebook"] = s
+                        total_views    += s["views"];    total_likes    += s["likes"]
+                        total_comments += s["comments"]; total_shares   += s["shares"]
+                    else:
+                        logger.debug(f"[analytics-sync] Facebook HTTP {resp.status_code} for {upload_id}")
+
+            except Exception as e:
+                logger.warning(f"[analytics-sync] {plat}/{upload_id}: {e}")
+                continue
+
+    # Persist results + stamp analytics_synced_at regardless (even if all zeros)
+    # so we dont endlessly retry uploads whose scopes arent approved yet
+    await conn.execute(
+        """UPDATE uploads
+               SET views=, likes=, comments=, shares=,
+                   analytics_synced_at=NOW(), updated_at=NOW()
+             WHERE id= AND user_id=""",
+        total_views, total_likes, total_comments, total_shares,
+        upload_id, user_id,
+    )
+
+    return {
+        "views": total_views, "likes": total_likes,
+        "comments": total_comments, "shares": total_shares,
+        "platform_stats": platform_stats,
+    }
+
+
+async def run_analytics_sync_loop() -> None:
+    """
+    Background loop that periodically fetches engagement stats from platform APIs
+    for all completed uploads and writes them back to the DB.
+
+    Config (env vars):
+      ANALYTICS_SYNC_INTERVAL_SECONDS  How often to run (default: 21600 = 6h)
+      ANALYTICS_SYNC_BATCH_SIZE        Uploads per cycle   (default: 20)
+      ANALYTICS_RESYNC_HOURS           Re-sync every N hrs (default: 6)
+
+    Only syncs uploads where:
+      • status IN (completed, succeeded, partial)
+      • analytics_synced_at IS NULL  OR  analytics_synced_at < NOW() - resync_interval
+      • created_at within the last 90 days (older content rarely changes)
+
+    Intentionally sequential — no concurrency within the batch to stay well
+    inside platform rate limits.
+    """
+    from stages.publish_stage import decrypt_token
+
+    global shutdown_requested
+
+    logger.info(
+        f"[analytics-sync] loop started | "        f"interval={ANALYTICS_SYNC_INTERVAL}s | "        f"batch={ANALYTICS_SYNC_BATCH} | "        f"resync_every={ANALYTICS_RESYNC_HOURS}h"
+    )
+
+    # Stagger startup — let the worker settle before hitting platform APIs
+    await asyncio.sleep(60)
+
+    while not shutdown_requested:
+        try:
+            resync_cutoff = _now_utc() - timedelta(hours=ANALYTICS_RESYNC_HOURS)
+            window_start  = _now_utc() - timedelta(days=90)
+
+            async with db_pool.acquire() as conn:
+                uploads = await conn.fetch(
+                    """
+                    SELECT u.id AS upload_id, u.user_id, u.platform_results, u.platforms
+                      FROM uploads u
+                     WHERE u.status IN ('completed', 'succeeded', 'partial')
+                       AND u.created_at >= $1
+                       AND (u.analytics_synced_at IS NULL OR u.analytics_synced_at < $2)
+                     ORDER BY u.analytics_synced_at ASC NULLS FIRST, u.created_at DESC
+                     LIMIT $3
+                    """,
+                    window_start,
+                    resync_cutoff,
+                    ANALYTICS_SYNC_BATCH,
+                )
+
+            if not uploads:
+                logger.debug("[analytics-sync] nothing to sync this cycle")
+            else:
+                logger.info(f"[analytics-sync] syncing {len(uploads)} upload(s)")
+                synced = errors = 0
+
+                for row in uploads:
+                    if shutdown_requested:
+                        break
+
+                    upload_id = str(row["upload_id"])
+                    user_id   = str(row["user_id"])
+
+                    # Parse platform_results
+                    try:
+                        raw_pr = row["platform_results"]
+                        if isinstance(raw_pr, str):
+                            raw_pr = json.loads(raw_pr)
+                    except Exception:
+                        raw_pr = []
+
+                    pr_list = []
+                    if isinstance(raw_pr, list):
+                        pr_list = [x for x in raw_pr if isinstance(x, dict)]
+                    elif isinstance(raw_pr, dict):
+                        pr_list = [
+                            {"platform": k, **(v if isinstance(v, dict) else {})}
+                            for k, v in raw_pr.items()
+                        ]
+                    # Normalise canonical field aliases
+                    for pr in pr_list:
+                        if pr.get("platform_video_id") and not pr.get("video_id"):
+                            pr["video_id"] = pr["platform_video_id"]
+
+                    if not pr_list:
+                        # No platform results to query — stamp and skip
+                        async with db_pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
+                                row["upload_id"],
+                            )
+                        continue
+
+                    # Fetch active tokens for this user
+                    async with db_pool.acquire() as conn:
+                        token_rows = await conn.fetch(
+                            """SELECT platform, token_blob, account_id
+                                  FROM platform_tokens
+                                 WHERE user_id= AND revoked_at IS NULL""",
+                            row["user_id"],
+                        )
+
+                    token_map = {}
+                    for tr in token_rows:
+                        try:
+                            blob = tr["token_blob"]
+                            if isinstance(blob, str):
+                                blob = json.loads(blob)
+                            dec = decrypt_token(blob)
+                            if dec:
+                                if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
+                                    dec["ig_user_id"] = str(tr["account_id"])
+                                if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
+                                    dec["page_id"] = str(tr["account_id"])
+                                token_map[tr["platform"]] = dec
+                        except Exception:
+                            pass
+
+                    if not token_map:
+                        # User has no active tokens — stamp and skip
+                        async with db_pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
+                                row["upload_id"],
+                            )
+                        continue
+
+                    try:
+                        async with db_pool.acquire() as conn:
+                            result = await _sync_one_upload_analytics(
+                                conn, upload_id, user_id, pr_list, token_map
+                            )
+                        synced += 1
+                        logger.debug(
+                            f"[analytics-sync] {upload_id}: "                            f"views={result['views']} likes={result['likes']} "                            f"comments={result['comments']} shares={result['shares']}"                        )
+                    except Exception as e:
+                        errors += 1
+                        logger.warning(f"[analytics-sync] {upload_id} failed: {e}")
+
+                    # Small delay between API calls — be a good citizen
+                    await asyncio.sleep(1)
+
+                logger.info(
+                    f"[analytics-sync] cycle complete | synced={synced} errors={errors}"
+                )
+
+        except asyncpg.PostgresError as e:
+            logger.warning(f"[analytics-sync] DB error: {e}")
+        except Exception as e:
+            logger.exception(f"[analytics-sync] unexpected error: {e}")
+
+        # Sleep until next cycle, but wake early on shutdown
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=ANALYTICS_SYNC_INTERVAL,
+            )
+            break  # shutdown signalled
+        except asyncio.TimeoutError:
+            pass  # normal — continue loop
+
+    logger.info("[analytics-sync] loop stopped")
+
+
 # ---------------------------------------------------------------------------
 # SCHEDULER LOOP
 # ---------------------------------------------------------------------------
@@ -1392,14 +1732,16 @@ async def main() -> None:
 
     shutdown_event = asyncio.Event()
 
-    # Four concurrent loops:
-    # 1. process_jobs     — Redis consumer for immediate uploads
-    # 2. run_scheduler_loop — polls DB for staged/ready_to_publish jobs
+    # Five concurrent loops:
+    # 1. process_jobs          — Redis consumer for immediate uploads
+    # 2. run_scheduler_loop    — polls DB for staged/ready_to_publish jobs
     # 3. run_verification_loop — delivery verification polling
+    # 4. run_analytics_sync_loop — periodic engagement stats fetch from platform APIs
     tasks = [
         asyncio.create_task(process_jobs()),
         asyncio.create_task(run_scheduler_loop()),
         asyncio.create_task(run_verification_loop(db_pool, shutdown_event)),
+        asyncio.create_task(run_analytics_sync_loop()),
     ]
 
     try:

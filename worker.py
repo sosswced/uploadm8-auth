@@ -895,6 +895,7 @@ async def run_publish_and_notify(
 
     await db_stage.mark_processing_completed(db_pool, ctx)
 
+
 # ── Finalize wallet hold (capture on success/partial, release on failure) ──
 try:
     put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
@@ -929,15 +930,15 @@ except Exception as wallet_err:
     # Never let wallet accounting crash the job finalization
     logger.error(f"[{ctx.upload_id}] Wallet finalize failed (non-fatal): {wallet_err}")
 
-    if ctx.is_success():
-        await db_stage.increment_upload_count(db_pool, user_id)
+if ctx.is_success():
+    await db_stage.increment_upload_count(db_pool, user_id)
 
-    elapsed = (ctx.finished_at - ctx.started_at).total_seconds() if ctx.started_at else 0
-    logger.info(
-        f"[{upload_id}] Pipeline {ctx.state} in {elapsed:.1f}s | "
-        f"ok={ctx.get_success_platforms()} fail={ctx.get_failed_platforms()}"
-    )
-    return ctx.is_success()
+elapsed = (ctx.finished_at - ctx.started_at).total_seconds() if ctx.started_at else 0
+logger.info(
+    f"[{upload_id}] Pipeline {ctx.state} in {elapsed:.1f}s | "
+    f"ok={ctx.get_success_platforms()} fail={ctx.get_failed_platforms()}"
+)
+return ctx.is_success()
 
 
 # ---------------------------------------------------------------------------

@@ -242,6 +242,63 @@ async def _get_upload_costs(upload_id: str):
         aic = row["aic_cost"] or row["aic_reserved"] or 0
         return int(put), int(aic)
 
+
+async def partial_refund_tokens(
+    conn,
+    user_id: str,
+    upload_id: str,
+    succeeded_platforms: list,
+    failed_platforms: list,
+    original_put_cost: int,
+):
+    """
+    Pro-rate a PUT refund for platforms that failed in a partial upload.
+
+    PUT cost formula (mirrors entitlements.py compute_put_cost):
+      base = 10 (covers the first platform)
+      +2 per extra platform beyond the first
+
+    For partial failure we refund:
+      2 tokens × number_of_failed_platforms
+      (base-10 is always kept because work was done)
+
+    Note: In the worker flow we capture the full hold first (reserved → spent),
+    so this refund credits *put_balance* back (no reserved adjustment).
+    """
+    n_failed = len(failed_platforms or [])
+    if n_failed == 0 or not (succeeded_platforms or []):
+        return
+
+    put_refund = n_failed * 2
+    put_refund = min(int(put_refund), max(0, int(original_put_cost) - 10))  # never refund the base-10
+
+    if put_refund <= 0:
+        return
+
+    await conn.execute(
+        """
+        UPDATE wallets
+        SET
+            put_balance = put_balance + $1,
+            updated_at  = NOW()
+        WHERE user_id = $2
+        """,
+        put_refund,
+        user_id,
+    )
+
+    # Ledger entry — positive delta = credit back
+    await conn.execute(
+        """
+        INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+        VALUES ($1, 'put', $2, 'partial_platform_refund', $3, 'upload')
+        """,
+        user_id,
+        put_refund,
+        upload_id,
+    )
+
+
 shutdown_requested = False
 shutdown_event: Optional[asyncio.Event] = None
 
@@ -830,18 +887,39 @@ async def run_publish_and_notify(
 
     await db_stage.mark_processing_completed(db_pool, ctx)
 
-    # ── Finalize wallet hold (capture on success/partial, release on failure) ──
-    try:
-        put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
-        user_id_str = str(ctx.user_id) if ctx.user_id else None
-        if user_id_str and (put_cost > 0 or aic_cost > 0):
-            if ctx.is_success() or ctx.is_partial_success():
-                await _capture_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost)
-            else:
-                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
-    except Exception as wallet_err:
-        # Never let wallet accounting crash the job finalization
-        logger.error(f"[{ctx.upload_id}] Wallet finalize failed (non-fatal): {wallet_err}")
+# ── Finalize wallet hold (capture on success/partial, release on failure) ──
+try:
+    put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
+    user_id_str = str(ctx.user_id) if ctx.user_id else None
+    if user_id_str and (put_cost > 0 or aic_cost > 0):
+        if ctx.is_success():
+            await _capture_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost)
+
+        elif ctx.is_partial_success():
+            # Capture full cost first, then refund failed-platform slots (PUT only)
+            await _capture_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost)
+            async with db_pool.acquire() as _wconn:
+                await partial_refund_tokens(
+                    _wconn,
+                    user_id=user_id_str,
+                    upload_id=ctx.upload_id,
+                    succeeded_platforms=ctx.get_success_platforms(),
+                    failed_platforms=ctx.get_failed_platforms(),
+                    original_put_cost=put_cost,
+                )
+
+        else:  # full failure
+            await _release_tokens(
+                ctx.upload_id,
+                user_id_str,
+                put_cost,
+                aic_cost,
+                reason="upload_failed_refund",
+            )
+
+except Exception as wallet_err:
+    # Never let wallet accounting crash the job finalization
+    logger.error(f"[{ctx.upload_id}] Wallet finalize failed (non-fatal): {wallet_err}")
 
     if ctx.is_success():
         await db_stage.increment_upload_count(db_pool, user_id)

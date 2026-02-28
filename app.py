@@ -4233,9 +4233,9 @@ async def save_user_preferences(
                 return {k: lst[:] for k in default_map.keys()}
         return default_map
 
-    always = _coerce_hashtag_list(p.get("always_hashtags"))
-    blocked = _coerce_hashtag_list(p.get("blocked_hashtags"))
-    platform = _coerce_platform_map(p.get("platform_hashtags"))
+    always = _coerce_hashtag_list(p.get("always_hashtags") or p.get("alwaysHashtags"))
+    blocked = _coerce_hashtag_list(p.get("blocked_hashtags") or p.get("blockedHashtags"))
+    platform = _coerce_platform_map(p.get("platform_hashtags") or p.get("platformHashtags"))
     
     # DEBUG: Log what we're about to save
     logger.info(f"Saving preferences for user {user['id']}")
@@ -8561,7 +8561,11 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         if isinstance(tags, list):
             return [str(t) for t in tags if t]
         if isinstance(tags, str) and tags.strip():
-            return [tags.strip()]
+            # Support single string containing many tags
+            s = tags.strip().replace('
+', ' ').replace(',', ' ')
+            parts = [p.strip() for p in s.split() if p.strip()]
+            return parts
         return []
 
     ai_title = (d.get("ai_title") or d.get("ai_generated_title") or "") or ""
@@ -8659,7 +8663,7 @@ async def admin_get_user_wallet(
 
         ledger = await conn.fetch(
             """
-            SELECT token_type, delta, reason, upload_id, metadata, created_at
+            SELECT token_type, delta, reason, upload_id, meta, created_at
             FROM   token_ledger
             WHERE  user_id = $1
             ORDER  BY created_at DESC
@@ -8738,10 +8742,11 @@ async def admin_adjust_wallet(
         await conn.execute(
             """
             INSERT INTO token_ledger
-                (user_id, token_type, delta, reason, ref_type, metadata)
+                (user_id, token_type, delta, reason, meta)
             VALUES
-                ($1, $2, $3, $4, 'admin_adjust',
+                ($1, $2, $3, $4,
                  jsonb_build_object(
+                     'ref_type',    'admin_adjust',
                      'admin_id',    $5::text,
                      'admin_email', $6,
                      'mode',        $7,

@@ -301,26 +301,40 @@ def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
     Tags are stored without the '#' prefix (stripped at save time).
     We always add '#' here so captions look correct on every platform.
     """
+    # Base tags: get_effective_hashtags merges always_hashtags + ai_hashtags
+    # Base tags: get_effective_hashtags merges always_hashtags + ai_hashtags
+    tags: list = []
 
-# Base tags: get_effective_hashtags merges always_hashtags + ai_hashtags.
-tags: list = []
-base = None
-if hasattr(ctx, "get_effective_hashtags"):
-    base = ctx.get_effective_hashtags()
-else:
-    base = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
+    def _split_tags(v):
+        if v is None:
+            return []
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            try:
+                import json as _hjson
+                maybe = _hjson.loads(s)
+                if isinstance(maybe, list):
+                    v = maybe
+                else:
+                    v = s
+            except Exception:
+                v = s
+        if isinstance(v, str):
+            import re as _hre
+            return [p for p in _hre.split(r"[\s,]+", v.strip()) if p]
+        if isinstance(v, (list, tuple, set)):
+            return [str(x) for x in v if str(x).strip()]
+        s = str(v).strip()
+        return [s] if s else []
 
-# Guard: strings are iterable character-by-character — normalize into token list.
-if isinstance(base, str):
-    # Accept comma/space/newline separated inputs
-    raw = base.replace("
-", " ").replace(",", " ")
-    tags = [t for t in (p.strip() for p in raw.split()) if t]
-elif isinstance(base, (list, tuple, set)):
-    tags = [t for t in base if t]
-else:
-    tags = []
-
+    if hasattr(ctx, "get_effective_hashtags"):
+        raw = ctx.get_effective_hashtags()
+        tags = _split_tags(raw)
+    else:
+        raw = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
+        tags = _split_tags(raw)
     # Add platform-specific hashtags when a platform is specified
     if platform:
         try:

@@ -2639,16 +2639,84 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
     """Update user preferences including hashtag settings"""
     prefs = await request.json()
     
-    # Validate and sanitize hashtag data
-    if "alwaysHashtags" in prefs:
-        prefs["alwaysHashtags"] = [str(h).lower().strip()[:50] for h in prefs["alwaysHashtags"][:100]]
-    if "blockedHashtags" in prefs:
-        prefs["blockedHashtags"] = [str(h).lower().strip()[:50] for h in prefs["blockedHashtags"][:100]]
-    if "platformHashtags" in prefs:
+    # Validate and sanitize hashtag data (string-safe; avoids list('#tag') char-splitting)
+    def _split_tags(v):
+        if v is None:
+            return []
+        # Accept JSON string list
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            try:
+                maybe = json.loads(s)
+                if isinstance(maybe, list):
+                    v = maybe
+                else:
+                    v = s
+            except Exception:
+                v = s
+        if isinstance(v, str):
+            parts = re.split(r"[\s,]+", v.strip())
+            return [p for p in parts if p]
+        if isinstance(v, (list, tuple, set)):
+            out = []
+            for x in v:
+                sx = str(x).strip()
+                if sx:
+                    out.append(sx)
+            return out
+        sx = str(v).strip()
+        return [sx] if sx else []
+
+    def _clean_tag_list(v, limit):
+        out = []
+        for t in _split_tags(v)[:limit]:
+            t = str(t).strip().lower().lstrip("#")[:50]
+            if t:
+                out.append(t)
+        return out
+
+    # Support both camelCase (frontend) and snake_case (backend/worker) keys
+    if "alwaysHashtags" in prefs or "always_hashtags" in prefs:
+        v = prefs.get("alwaysHashtags", None)
+        if v is None:
+            v = prefs.get("always_hashtags", None)
+        clean = _clean_tag_list(v, 100)
+        prefs["alwaysHashtags"] = [f"#{t}" for t in clean]  # UI-friendly
+        prefs["always_hashtags"] = clean                   # worker-friendly (no '#')
+
+    if "blockedHashtags" in prefs or "blocked_hashtags" in prefs:
+        v = prefs.get("blockedHashtags", None)
+        if v is None:
+            v = prefs.get("blocked_hashtags", None)
+        clean = _clean_tag_list(v, 100)
+        prefs["blockedHashtags"] = [f"#{t}" for t in clean]
+        prefs["blocked_hashtags"] = clean
+
+    if "platformHashtags" in prefs or "platform_hashtags" in prefs:
+        ph = prefs.get("platformHashtags", None)
+        if ph is None:
+            ph = prefs.get("platform_hashtags", None)
+
+        if isinstance(ph, str):
+            try:
+                ph = json.loads(ph)
+            except Exception:
+                ph = {}
+        if not isinstance(ph, dict):
+            ph = {}
+
+        cleaned_ui = {}
+        cleaned_worker = {}
         for platform in ["tiktok", "youtube", "instagram", "facebook"]:
-            if platform in prefs["platformHashtags"]:
-                prefs["platformHashtags"][platform] = [str(h).lower().strip()[:50] for h in prefs["platformHashtags"][platform][:50]]
-    
+            raw = ph.get(platform)
+            clean = _clean_tag_list(raw, 50)
+            cleaned_ui[platform] = [f"#{t}" for t in clean]
+            cleaned_worker[platform] = clean
+
+        prefs["platformHashtags"] = cleaned_ui
+        prefs["platform_hashtags"] = cleaned_worker
     # Validate numeric hashtag settings
     if "maxHashtags" in prefs:
         prefs["maxHashtags"] = max(1, min(50, int(prefs["maxHashtags"])))
@@ -2696,14 +2764,48 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         # --- Hashtag assembly ---
         # Step 1: Always merge always_hashtags + platform-specific hashtags.
         #         These are manual user settings — work on every plan, no AI flag needed.
-        combined = list(data.hashtags) + list(user_prefs.get("always_hashtags", []) or [])
+        def _split_tags(v):
+            if v is None:
+                return []
+            if isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    return []
+                try:
+                    maybe = json.loads(s)
+                    if isinstance(maybe, list):
+                        v = maybe
+                    else:
+                        v = s
+                except Exception:
+                    v = s
+            if isinstance(v, str):
+                return [p for p in re.split(r"[\s,]+", v.strip()) if p]
+            if isinstance(v, (list, tuple, set)):
+                return [str(x).strip() for x in v if str(x).strip()]
+            s = str(v).strip()
+            return [s] if s else []
 
-        platform_hashtags = user_prefs.get("platform_hashtags") or {}
+        def _to_hash_tags(v):
+            out = []
+            for t in _split_tags(v):
+                t = str(t).strip()
+                if not t:
+                    continue
+                t = t.lower().lstrip("#")[:50]
+                if t:
+                    out.append(f"#{t}")
+            return out
+
+        # Normalize client hashtags + always/platform preferences safely
+        combined = _to_hash_tags(getattr(data, "hashtags", []) or [])
+        combined.extend(_to_hash_tags(user_prefs.get("always_hashtags", []) or user_prefs.get("alwaysHashtags", [])))
+
+        platform_hashtags = user_prefs.get("platform_hashtags") or user_prefs.get("platformHashtags") or {}
         for platform in data.platforms:
             if isinstance(platform_hashtags, dict):
                 tags = platform_hashtags.get(platform) or platform_hashtags.get(platform.lower()) or []
-                if tags:
-                    combined.extend(tags)
+                combined.extend(_to_hash_tags(tags))
 
         # Step 2: AI-generated hashtag injection — gated on plan + user toggle.
         #         Actual AI generation happens later in caption_stage.
@@ -2711,7 +2813,7 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
             pass  # ai_hashtags merged into ctx later by caption_stage
 
         # Step 3: Deduplicate, strip blocked, enforce limit — always runs.
-        blocked = set(user_prefs.get("blocked_hashtags", []) or [])
+        blocked = set(_to_hash_tags(user_prefs.get("blocked_hashtags", []) or user_prefs.get("blockedHashtags", [])))
         combined = [h for h in combined if h and h not in blocked]
         data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
 
@@ -4233,9 +4335,9 @@ async def save_user_preferences(
                 return {k: lst[:] for k in default_map.keys()}
         return default_map
 
-    always = _coerce_hashtag_list(p.get("always_hashtags") or p.get("alwaysHashtags"))
-    blocked = _coerce_hashtag_list(p.get("blocked_hashtags") or p.get("blockedHashtags"))
-    platform = _coerce_platform_map(p.get("platform_hashtags") or p.get("platformHashtags"))
+    always = _coerce_hashtag_list(p.get("always_hashtags"))
+    blocked = _coerce_hashtag_list(p.get("blocked_hashtags"))
+    platform = _coerce_platform_map(p.get("platform_hashtags"))
     
     # DEBUG: Log what we're about to save
     logger.info(f"Saving preferences for user {user['id']}")
@@ -8561,11 +8663,7 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         if isinstance(tags, list):
             return [str(t) for t in tags if t]
         if isinstance(tags, str) and tags.strip():
-            # Support single string containing many tags
-            s = tags.strip().replace('
-', ' ').replace(',', ' ')
-            parts = [p.strip() for p in s.split() if p.strip()]
-            return parts
+            return [tags.strip()]
         return []
 
     ai_title = (d.get("ai_title") or d.get("ai_generated_title") or "") or ""
@@ -8802,4 +8900,3 @@ async def admin_adjust_wallet(
         "after":  new_val,
         "delta":  int(delta),
     }
-

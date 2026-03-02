@@ -1,0 +1,1300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+</head>
+<body>
+<div class="app-layout">
+
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <a href="dashboard.html" class="sidebar-logo">
+                <img src="images/logo.png" alt="UploadM8">
+                <span>UploadM8</span>
+            </a>
+        </div>
+        <nav class="sidebar-nav">
+            <div class="nav-section">
+                <div class="nav-section-title">Main</div>
+                <a href="dashboard.html" class="nav-link active"><i class="fas fa-home"></i><span>Dashboard</span></a>
+                <a href="upload.html"    class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
+                <a href="queue.html"     class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
+                <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">Platforms</div>
+                <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
+                <a href="groups.html"    class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">Insights</div>
+                <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
+            </div>
+            <div class="nav-section admin-only" id="adminSection" style="display:none;">
+                <div class="nav-section-title">Admin</div>
+                <a href="admin.html"              class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
+                <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
+                <a href="admin-kpi.html"          class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
+                <a href="admin-calculator.html"   class="nav-link"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
+                <a href="admin-wallet.html"       class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">Account</div>
+                <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
+                <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
+            </div>
+        </nav>
+        <div class="sidebar-footer">
+            <div class="user-info">
+                <div class="user-avatar" id="userAvatar">U</div>
+                <div class="user-details">
+                    <div class="user-name" id="userName">User</div>
+                    <div class="user-tier" id="userTier">Free</div>
+                </div>
+                <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
+                    <i class="fas fa-sign-out-alt"></i>
+                </button>
+            </div>
+        </div>
+    </aside>
+
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+
+    <header class="top-bar">
+        <button class="menu-toggle" id="menuToggle"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
+        <div class="top-bar-actions">
+            <button class="theme-toggle" onclick="toggleTheme()"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main-content">
+        <div class="page-header">
+            <div>
+                <h1 class="page-title">Welcome back, <span id="welcomeName">User</span>!</h1>
+                <p class="page-subtitle">Here's what's happening with your uploads</p>
+            </div>
+            <div class="flex gap-2">
+                <button class="theme-toggle" id="themeToggleDesktop" onclick="toggleTheme()">
+                    <i class="fas fa-moon" id="themeToggleIconDesktop"></i>
+                </button>
+                <a href="upload.html" class="btn btn-primary"><i class="fas fa-plus"></i> New Upload</a>
+            </div>
+        </div>
+
+        <!-- Quota Card -->
+        <div class="card mb-4" style="background:linear-gradient(135deg,rgba(249,115,22,.1),rgba(139,92,246,.1));">
+            <div class="flex items-center justify-between flex-wrap gap-4">
+                <div>
+                    <div class="text-sm text-secondary mb-1">Monthly Upload Quota</div>
+                    <div class="text-2xl font-bold">
+                        <span id="quotaUsed">0</span> / <span id="quotaTotal">10</span>
+                    </div>
+                </div>
+                <div style="flex:1;max-width:400px;">
+                    <div class="quota-bar-bg">
+                        <div class="quota-bar bg-orange" id="quotaBar" style="width:0%;"></div>
+                    </div>
+                </div>
+                <a href="settings.html#billing" class="btn btn-secondary btn-sm">
+                    <i class="fas fa-arrow-up"></i> Upgrade Plan
+                </a>
+            </div>
+        </div>
+
+        <!-- Stats Grid -->
+        <div class="grid grid-4 mb-4" id="dashboardGrid">
+            <div class="card stat-card" data-card-id="total-uploads">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-upload"></i> Total Uploads</div>
+                <div class="stat-value" id="statTotalUploads">-</div>
+                <div class="stat-change positive" id="statUploadsChange">
+                    <i class="fas fa-arrow-up"></i> <span>0%</span> vs last month
+                </div>
+            </div>
+            <div class="card stat-card" data-card-id="success-rate">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-check-circle"></i> Success Rate</div>
+                <div class="stat-value" id="statSuccessRate">-</div>
+                <div class="stat-label">Across all platforms</div>
+            </div>
+            <div class="card stat-card" data-card-id="connected-accounts">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-plug"></i> Connected Accounts</div>
+                <div class="stat-value" id="statAccounts">-</div>
+                <div class="stat-label"><span id="statAccountsMax">0</span> max allowed</div>
+            </div>
+            <div class="card stat-card" data-card-id="scheduled">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-calendar"></i> Scheduled</div>
+                <div class="stat-value" id="statScheduled">-</div>
+                <div class="stat-label">Pending uploads</div>
+            </div>
+        </div>
+
+        <!-- Upload History (full, scrollable, richly rendered) -->
+        <style>
+            .uploads-scroll { max-height:560px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--border-color) transparent; }
+            .uploads-scroll::-webkit-scrollbar { width:5px; }
+            .uploads-scroll::-webkit-scrollbar-track { background:transparent; }
+            .uploads-scroll::-webkit-scrollbar-thumb { background:var(--border-color); border-radius:3px; }
+            .upload-row { display:flex; align-items:flex-start; gap:12px; padding:10px 12px; border-radius:8px; margin-bottom:5px; background:var(--bg-input); transition:background .15s; }
+            .upload-row:hover { background:var(--bg-hover,rgba(255,255,255,.06)); }
+            .upload-row:last-child { margin-bottom:0; }
+            .upload-thumb { width:100px; height:60px; border-radius:6px; flex-shrink:0; background:rgba(0,0,0,.3); display:flex; align-items:center; justify-content:center; overflow:hidden; border:1px solid var(--border-color); position:relative; text-decoration:none !important; }
+            .upload-thumb img { width:100%; height:100%; object-fit:cover; border-radius:5px; }
+            .upload-thumb-placeholder { color:var(--text-secondary); font-size:1.5rem; }
+            .upload-thumb::after { content:''; position:absolute; inset:0; background:rgba(0,0,0,0); transition:background .2s; border-radius:5px; }
+            .upload-thumb:hover::after { background:rgba(0,0,0,.35); }
+            .upload-thumb .play-icon { position:absolute; font-size:1rem; color:rgba(255,255,255,0); transition:color .2s; z-index:1; pointer-events:none; }
+            .upload-thumb:hover .play-icon { color:rgba(255,255,255,.9); }
+            .upload-info { flex:1; min-width:0; }
+            .upload-title { font-weight:600; font-size:.875rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:4px; color:var(--text-primary,#fff); }
+            .upload-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:5px; }
+            .upload-time { font-size:.72rem; color:var(--text-secondary); }
+            .status-pill { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:12px; font-size:.62rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em; flex-shrink:0; }
+            .pill-success { background:rgba(34,197,94,.15); color:#22c55e; border:1px solid rgba(34,197,94,.3); }
+            .pill-failed  { background:rgba(239,68,68,.15); color:#ef4444; border:1px solid rgba(239,68,68,.3); }
+            .pill-staged  { background:rgba(251,191,36,.15); color:#fbbf24; border:1px solid rgba(251,191,36,.35); }
+            .pill-smart   { background:rgba(139,92,246,.15); color:#a78bfa; border:1px solid rgba(139,92,246,.35); }
+            .pill-unknown { background:rgba(150,150,150,.1); color:#888; border:1px solid rgba(150,150,150,.2); }
+            /* Countdown */
+            .countdown-block { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
+            .countdown-timer { display:inline-flex; align-items:center; gap:5px; background:rgba(251,191,36,.1); border:1px solid rgba(251,191,36,.35); color:#fbbf24; border-radius:8px; padding:3px 10px; font-size:.72rem; font-variant-numeric:tabular-nums; }
+            .countdown-timer.countdown-smart { background:rgba(139,92,246,.1); border-color:rgba(139,92,246,.35); color:#a78bfa; }
+            .countdown-timer strong { font-weight:700; }
+            .countdown-timer i { font-size:.63rem; }
+            .scheduled-at-label { font-size:.68rem; color:var(--text-secondary); }
+            /* Stats bar */
+            .stats-bar { display:flex; align-items:center; gap:5px; flex-wrap:wrap; margin-bottom:5px; }
+            .stat-chip { display:inline-flex; align-items:center; gap:3px; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.1); border-radius:8px; padding:2px 7px; font-size:.68rem; color:var(--text-secondary); }
+            .stat-chip i { font-size:.6rem; opacity:.7; }
+            .stat-chip.no-stats { opacity:.5; font-style:italic; font-size:.65rem; }
+            .sync-btn { display:inline-flex; align-items:center; gap:4px; background:rgba(249,115,22,.1); border:1px solid rgba(249,115,22,.25); color:#f97316; border-radius:8px; padding:2px 8px; font-size:.65rem; cursor:pointer; transition:all .15s; }
+            .sync-btn:hover { background:rgba(249,115,22,.2); }
+            .sync-btn:disabled { opacity:.5; cursor:not-allowed; }
+            .sync-btn i { font-size:.6rem; }
+            /* Platform chips */
+            .platform-chips { display:flex; flex-wrap:wrap; gap:5px; }
+            .platform-chip { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; border-radius:20px; font-size:.68rem; font-weight:500; text-decoration:none; border:1px solid transparent; transition:opacity .15s, transform .12s, box-shadow .12s; cursor:pointer; white-space:nowrap; }
+            .platform-chip:hover { opacity:.9; transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,.25); text-decoration:none; }
+            .chip-youtube   { background:rgba(255,0,0,.12);    color:#ff4444; border-color:rgba(255,0,0,.3); }
+            .chip-tiktok    { background:rgba(105,201,208,.12); color:#69C9D0; border-color:rgba(105,201,208,.3); }
+            .chip-instagram { background:rgba(225,48,108,.12);  color:#E1306C; border-color:rgba(225,48,108,.3); }
+            .chip-facebook  { background:rgba(24,119,242,.12);  color:#4a9eff; border-color:rgba(24,119,242,.3); }
+            .chip-default   { background:rgba(150,150,150,.1);  color:#aaa; border-color:rgba(150,150,150,.2); }
+            .chip-ext { font-size:.5rem; opacity:.5; }
+            /* Chip with no link yet — slightly dimmed, dashed border */
+            .chip-no-link { opacity:.65; border-style: dashed !important; cursor:default; }
+            /* Real account avatar inside platform chip */
+            .chip-avatar {
+                width: 16px; height: 16px;
+                border-radius: 50%;
+                object-fit: cover;
+                flex-shrink: 0;
+                border: 1px solid rgba(255,255,255,.2);
+                vertical-align: middle;
+            }
+            /* Filter bar */
+            .uploads-filter-bar { display:flex; align-items:center; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
+            .filter-chip { padding:3px 11px; border-radius:16px; font-size:.72rem; font-weight:500; border:1px solid var(--border-color); background:transparent; color:var(--text-secondary); cursor:pointer; transition:all .15s; }
+            .filter-chip:hover, .filter-chip.active { background:rgba(249,115,22,.15); border-color:rgba(249,115,22,.4); color:#f97316; }
+            .filter-chip.active-smart { background:rgba(139,92,246,.15); border-color:rgba(139,92,246,.4); color:#a78bfa; }
+            .uploads-count-badge { margin-left:auto; font-size:.72rem; color:var(--text-secondary); }
+        </style>
+
+        <div class="card mb-4">
+            <div class="card-header" style="padding-bottom:8px;">
+                <h3 class="card-title">
+                    <i class="fas fa-history" style="color:#f97316;"></i> Upload History
+                </h3>
+                <div class="flex gap-2 items-center">
+                    <span class="uploads-count-badge" id="uploadsCountBadge">— uploads</span>
+                    <a href="queue.html" class="btn btn-ghost btn-sm">View Queue</a>
+                </div>
+            </div>
+            <div class="card-body" style="padding-top:8px;">
+                <div class="uploads-filter-bar">
+                    <button class="filter-chip active" onclick="filterUploads('all',this)">All</button>
+                    <button class="filter-chip" onclick="filterUploads('succeeded',this)">
+                        <i class="fas fa-check-circle" style="font-size:.6rem;"></i> Succeeded
+                    </button>
+                    <button class="filter-chip" onclick="filterUploads('staged',this)">
+                        <i class="fas fa-clock" style="font-size:.6rem;"></i> Staged / Pending
+                    </button>
+                    <button class="filter-chip" onclick="filterUploads('smart',this)">
+                        <i class="fas fa-magic" style="font-size:.6rem;"></i> Smart Schedule
+                    </button>
+                    <button class="filter-chip" onclick="filterUploads('failed',this)">
+                        <i class="fas fa-times-circle" style="font-size:.6rem;"></i> Failed
+                    </button>
+                </div>
+                <div class="uploads-scroll" id="recentUploads">
+                    <div class="flex items-center justify-center py-8 text-secondary">
+                        <i class="fas fa-spinner fa-spin mr-2"></i> Loading uploads…
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Quick Actions -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3 class="card-title"><i class="fas fa-bolt"></i> Quick Actions</h3>
+            </div>
+            <div class="card-body">
+                <div class="flex gap-2 flex-wrap">
+                    <a href="upload.html"    class="btn btn-secondary"><i class="fas fa-cloud-upload-alt text-orange"></i> Upload New Video</a>
+                    <a href="platforms.html" class="btn btn-secondary"><i class="fas fa-plug" style="color:#60a5fa;"></i> Connect Platform</a>
+                    <a href="groups.html"    class="btn btn-secondary"><i class="fas fa-layer-group" style="color:#a78bfa;"></i> Create Account Group</a>
+                    <a href="scheduled.html" class="btn btn-secondary"><i class="fas fa-calendar-alt" style="color:#34d399;"></i> View Scheduled</a>
+                    <a href="analytics.html" class="btn btn-secondary"><i class="fas fa-chart-line text-orange"></i> View Analytics</a>
+                </div>
+            </div>
+        </div>
+
+        <div class="ad-banner mt-4" id="adBanner">
+            <i class="fas fa-ad"></i> Ad space - Upgrade to Pro to remove ads
+        </div>
+    </main>
+</div>
+
+<!-- Confirm Modal -->
+<div class="modal hidden" id="confirmModal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 class="modal-title" id="confirmTitle">Confirm</h3>
+            <button class="modal-close" onclick="hideModal('confirmModal')"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="modal-body"><p id="confirmMessage">Are you sure?</p></div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="hideModal('confirmModal')">Cancel</button>
+            <button class="btn btn-primary"   id="confirmAction">Confirm</button>
+        </div>
+    </div>
+</div>
+
+<div id="toastContainer"></div>
+
+<script src="app.js"></script>
+<script src="auth-core.js"></script>
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   STATUS DEFINITIONS  (matches every value your FastAPI worker uses)
+═══════════════════════════════════════════════════════════════════ */
+const SUCCESSFUL_STATUSES = ['completed','complete','success','succeeded',
+    'published','publish','uploaded','done','finished','delivered'];
+
+const STAGED_STATUSES = ['staged','scheduled','queued','pending','processing',
+    'in_progress','uploading','waiting','preparing','encoding','transcoding','ready'];
+
+// Smart-schedule is detected via schedule_mode field, NOT status.
+// But keep these as a fallback in case backend ever writes them to status:
+const SMART_STATUS_WORDS = ['smart_scheduled','smart_schedule','smart',
+    'auto_scheduled','ai_scheduled','optimal','optimized'];
+
+const FAILED_STATUSES = ['failed','error','cancelled','canceled','rejected','timeout'];
+
+/* ═══════════════════════════════════════════════════════════════════
+   PLATFORM NORMALISATION  — every backend variant → canonical key
+═══════════════════════════════════════════════════════════════════ */
+const PLATFORM_ALIASES = {
+    youtube:'youtube', youtube_shorts:'youtube', youtubeshorts:'youtube',
+    yt:'youtube', yt_shorts:'youtube',
+    tiktok:'tiktok', tiktok_video:'tiktok', tiktokvideo:'tiktok', tt:'tiktok',
+    instagram:'instagram', instagram_reels:'instagram', instagramreels:'instagram',
+    ig:'instagram', ig_reels:'instagram', reels:'instagram',
+    facebook:'facebook', facebook_reels:'facebook', facebookreels:'facebook',
+    fb:'facebook', fb_reels:'facebook',
+};
+function normalizePlatform(raw) {
+    if (!raw) return null;
+    return PLATFORM_ALIASES[String(raw).toLowerCase().trim()] || String(raw).toLowerCase().trim();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SAFE ARRAY EXTRACTOR
+═══════════════════════════════════════════════════════════════════ */
+function extractArray(res, key = 'uploads') {
+    if (!res) return [];
+    if (Array.isArray(res)) return res;
+    for (const k of [key,'uploads','jobs','items','data','results'])
+        if (Array.isArray(res[k])) return res[k];
+    return [];
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PLATFORM URL BUILDER
+   platform_results is a LIST: [{platform:"tiktok", video_id:"...", ...}]
+   We search the list for the matching platform entry, then build URL.
+═══════════════════════════════════════════════════════════════════ */
+function buildPlatformUrl(platform, upload) {
+    // 1) top-level video_url (direct field from DB)
+    if (upload.video_url) return upload.video_url;
+
+    // 2) explicit platform_urls map (if ever returned)
+    if (upload.platform_urls?.[platform]) return upload.platform_urls[platform];
+
+    // 3) search platform_results LIST for this platform entry
+    const pr = Array.isArray(upload.platform_results) ? upload.platform_results : [];
+    const entry = pr.find(r => normalizePlatform(r.platform) === platform) || {};
+
+    // 3a) canonical pre-built URLs (set by worker pipeline or verify stage)
+    const directUrl = entry.platform_url || entry.url || entry.video_url
+                   || entry.post_url || entry.share_url || entry.permalink;
+    if (directUrl) return directUrl;
+
+    // 3b) construct from ID fields
+    // platform_video_id is canonical (worker); video_id/media_id etc. are aliases/legacy
+    const vid = entry.platform_video_id
+             || entry.video_id || entry.videoId || entry.id
+             || entry.media_id || entry.post_id || entry.share_id || entry.item_id;
+    if (vid) {
+        if (platform === 'youtube')   return `https://www.youtube.com/shorts/${vid}`;
+        if (platform === 'facebook')  return `https://www.facebook.com/reel/${vid}`;
+        if (platform === 'tiktok')    return `https://www.tiktok.com/video/${vid}`;
+        if (platform === 'instagram') {
+            // Instagram URLs use a base62 shortcode, not the raw numeric ID.
+            // If shortcode is available use it; otherwise fall through to null
+            // (shortcode is saved by publish_stage after the fix).
+            const shortcode = entry.shortcode || entry.ig_shortcode;
+            return shortcode ? `https://www.instagram.com/reel/${shortcode}/` : null;
+        }
+    }
+    return null;
+}
+
+/**
+ * Get a human-readable reason why a platform URL is not available yet.
+ * Used for chip tooltips.
+ */
+function getPlatformLinkReason(platform, upload) {
+    const pr = Array.isArray(upload.platform_results) ? upload.platform_results : [];
+    const entry = pr.find(r => normalizePlatform(r.platform) === platform);
+    if (!entry) return 'Not published to this platform';
+    if (!entry.success && entry.success !== undefined) {
+        return entry.error_message ? `Failed: ${entry.error_message}` : 'Publish failed';
+    }
+    if (entry.platform_video_id || entry.video_id) {
+        // Has ID but no URL — still processing or URL construction issue
+        if (platform === 'tiktok') return 'TikTok is still processing — link coming soon';
+        if (platform === 'instagram') return 'Instagram shortcode not yet available';
+    }
+    if (entry.publish_id && !entry.platform_video_id) {
+        return 'Upload accepted — waiting for platform to confirm video ID';
+    }
+    return 'Link not yet available';
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   VIEWS / LIKES / COMMENTS / SHARES
+   These are TOP-LEVEL fields on the upload object (aggregated totals).
+   The backend stores them directly in the uploads table and they are
+   returned as upload.views, upload.likes, upload.comments, upload.shares.
+   Per-platform breakdown lives in platform_results but is only
+   available after calling /api/uploads/{id}/sync-analytics.
+═══════════════════════════════════════════════════════════════════ */
+function getUploadStats(upload) {
+    return {
+        views:    upload.views    || 0,
+        likes:    upload.likes    || 0,
+        comments: upload.comments || 0,
+        shares:   upload.shares   || 0,
+    };
+}
+
+function fmtNum(n) {
+    if (!n) return null;
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'K';
+    return String(n);
+}
+
+function fmtDate(iso) {
+    if (!iso) return '';
+    try {
+        const d = new Date(iso);
+        return d.toLocaleDateString(undefined, {month:'short', day:'numeric'})
+             + ' at ' + d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
+    } catch { return iso; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   LIVE COUNTDOWN ENGINE
+   Ticks every second. Handles days / hours / minutes / seconds.
+   Automatically refreshes the list when a timer expires.
+═══════════════════════════════════════════════════════════════════ */
+const _timers = {};
+
+function stopAllTimers() {
+    Object.keys(_timers).forEach(id => {
+        clearInterval(_timers[id]);
+        delete _timers[id];
+    });
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   AUTO-FETCH MISSING THUMBNAILS
+   After rendering, any successful upload that has no thumbnail_url
+   gets a background call to /api/uploads/{id}/generate-thumbnail
+   which runs FFmpeg on the server and returns a fresh presigned URL.
+   The <img> is swapped in-place without re-rendering the whole list.
+═══════════════════════════════════════════════════════════════════ */
+async function fetchMissingThumbnails(uploads) {
+    const missing = uploads.filter(u => {
+        const isSuccess = SUCCESSFUL_STATUSES.includes((u.status || '').toLowerCase());
+        return isSuccess && !u.thumbnail_url && !u.thumbnail && !u.cover_url;
+    });
+    if (!missing.length) return;
+
+    // Stagger requests so we don't hammer the server
+    for (let i = 0; i < missing.length; i++) {
+        const upload = missing[i];
+        const imgEl = document.getElementById(`thumb-img-${upload.id}`);
+        // Fire and forget — replace img src when done
+        (async () => {
+            try {
+                const res = await apiCall(
+                    `/api/uploads/${upload.id}/generate-thumbnail`,
+                    { method: 'POST' }
+                );
+                if (res?.thumbnail_url) {
+                    const el = document.getElementById(`thumb-img-${upload.id}`);
+                    if (el) {
+                        el.src = res.thumbnail_url;
+                        el.style.cssText = '';  // remove avatar circular styles
+                        // Remove spinner sibling if present
+                        const spinner = el.parentElement?.querySelector('.fa-spinner');
+                        if (spinner) spinner.remove();
+                    }
+                    // Cache on upload object so filter re-renders show it
+                    upload.thumbnail_url = res.thumbnail_url;
+                }
+            } catch (_) {
+                // Silent fail — just leave placeholder
+            }
+        })();
+        // 300ms gap between requests to avoid hammering
+        if (i < missing.length - 1) await new Promise(r => setTimeout(r, 300));
+    }
+}
+
+
+function startCountdown(elementId, targetIso, isSmart) {
+    if (_timers[elementId]) clearInterval(_timers[elementId]);
+
+    function tick() {
+        const el = document.getElementById(elementId);
+        if (!el) { clearInterval(_timers[elementId]); delete _timers[elementId]; return; }
+
+        const diff = new Date(targetIso) - Date.now();
+
+        if (diff <= 0) {
+            el.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Uploading now…`;
+            el.className = el.className.replace('countdown-smart','').trim() + ' countdown-live';
+            clearInterval(_timers[elementId]);
+            delete _timers[elementId];
+            // Re-poll after 15 s to pick up new status
+            setTimeout(() => loadDashboardData(), 15000);
+            return;
+        }
+
+        const totalSec = Math.floor(diff / 1000);
+        const days = Math.floor(totalSec / 86400);
+        const hrs  = Math.floor((totalSec % 86400) / 3600);
+        const mins = Math.floor((totalSec % 3600)  / 60);
+        const secs = totalSec % 60;
+
+        let parts;
+        if (days > 0)     parts = [`${days}d`, `${hrs}h`, `${mins}m`];
+        else if (hrs > 0) parts = [`${hrs}h`, `${mins}m`, `${secs}s`];
+        else              parts = [`${mins}m`, `${secs}s`];
+
+        const prefix = isSmart ? '✦ Smart upload in' : 'Uploading in';
+        el.innerHTML = `<i class="fas fa-clock"></i> ${prefix} <strong>${parts.join(' ')}</strong>`;
+    }
+
+    tick();
+    _timers[elementId] = setInterval(tick, 1000);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SYNC ANALYTICS  — calls /api/uploads/{id}/sync-analytics then
+   updates the row in-place without a full page reload.
+═══════════════════════════════════════════════════════════════════ */
+async function syncStats(uploadId, btnEl) {
+    btnEl.disabled = true;
+    btnEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+    try {
+        const res = await apiCall(`/api/uploads/${uploadId}/sync-analytics`, { method: 'POST' });
+        if (res.synced) {
+            // Update the stat badges in this row
+            const row = btnEl.closest('.upload-row');
+            if (row) {
+                const update = (cls, val) => {
+                    const el = row.querySelector(cls);
+                    if (el && val != null) el.textContent = fmtNum(val) || '0';
+                };
+                update('.stat-views',    res.views);
+                update('.stat-likes',    res.likes);
+                update('.stat-comments', res.comments);
+                update('.stat-shares',   res.shares);
+            }
+            btnEl.innerHTML = '<i class="fas fa-check"></i>';
+            setTimeout(() => { btnEl.innerHTML = '<i class="fas fa-sync-alt"></i>'; btnEl.disabled = false; }, 2000);
+        } else {
+            btnEl.innerHTML = '<i class="fas fa-sync-alt"></i>';
+            btnEl.disabled = false;
+            showToast('Stats sync unavailable — try again later', 'warning');
+        }
+    } catch (e) {
+        btnEl.innerHTML = '<i class="fas fa-sync-alt"></i>';
+        btnEl.disabled = false;
+        showToast('Failed to sync stats', 'error');
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   INIT
+═══════════════════════════════════════════════════════════════════ */
+document.addEventListener('DOMContentLoaded', async () => {
+    const user = await initApp('dashboard');
+    if (!user) return;
+    updateThemeIcons();
+    loadDashboardData();
+    if (hasEntitlement('no_ads'))
+        document.getElementById('adBanner').classList.add('hidden');
+});
+
+function updateThemeIcons() {
+    const cls = getTheme() === 'dark' ? 'fas fa-moon' : 'fas fa-sun';
+    document.querySelectorAll('#themeToggleIconMobile,#themeToggleIconDesktop')
+            .forEach(i => i.className = cls);
+}
+const _origToggle = window.toggleTheme;
+window.toggleTheme = function () { _origToggle(); updateThemeIcons(); };
+
+/* ═══════════════════════════════════════════════════════════════════
+   MAIN DATA LOADER
+═══════════════════════════════════════════════════════════════════ */
+async function loadDashboardData() {
+    const user = window.currentUser;
+    if (!user) return;
+
+    // ── 1. All uploads ────────────────────────────────────────────
+    let allUploads = [];
+    try {
+        const raw = await apiCall('/api/uploads?limit=500');
+        allUploads = extractArray(raw, 'uploads');
+        if (allUploads.length) {
+            // Debug: log what comes back so Earl can inspect
+            const statuses  = [...new Set(allUploads.map(u => u.status))];
+            const schedModes = [...new Set(allUploads.map(u => u.schedule_mode).filter(Boolean))];
+            const platforms = [...new Set(allUploads.flatMap(u => u.platforms || []))];
+            console.log('[Dashboard] statuses:', statuses, '| schedule_modes:', schedModes, '| platforms:', platforms);
+            // Log a sample platform_results entry
+            const sample = allUploads.find(u => u.platform_results?.length);
+            if (sample) console.log('[Dashboard] sample platform_results:', sample.platform_results);
+        }
+    } catch (e) {
+        console.error('[Dashboard] /api/uploads failed:', e);
+        showToast('Could not load upload history', 'warning');
+    }
+
+    const successful = allUploads.filter(u => SUCCESSFUL_STATUSES.includes((u.status||'').toLowerCase()));
+    document.getElementById('statTotalUploads').textContent = successful.length;
+
+    // MoM change
+    try {
+        const now    = new Date();
+        const mStart = new Date(now.getFullYear(), now.getMonth(), 1);
+        const lStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const thisM  = successful.filter(u => new Date(u.created_at) >= mStart).length;
+        const lastM  = successful.filter(u => { const d = new Date(u.created_at); return d >= lStart && d < mStart; }).length;
+        const el     = document.getElementById('statUploadsChange');
+        if (lastM === 0) {
+            el.innerHTML = `<i class="fas fa-minus"></i> <span>No prior data</span>`;
+            el.className = 'stat-change';
+        } else {
+            const pct = Math.round(((thisM - lastM) / lastM) * 100);
+            el.innerHTML = `<i class="fas fa-arrow-${pct >= 0 ? 'up' : 'down'}"></i> <span>${Math.abs(pct)}%</span> vs last month`;
+            el.className = `stat-change ${pct >= 0 ? 'positive' : 'negative'}`;
+        }
+    } catch (_) {}
+
+    // ── 2. Success rate ───────────────────────────────────────────
+    try {
+        const a     = await apiCall('/api/analytics?range=30d');
+        const total = a.total_uploads || allUploads.length || 0;
+        const done  = a.completed ?? successful.length;
+        document.getElementById('statSuccessRate').textContent =
+            (total > 0 ? Math.round((done / total) * 100) : (allUploads.length === 0 ? 100 : 0)) + '%';
+    } catch (_) {
+        const t = allUploads.length;
+        document.getElementById('statSuccessRate').textContent =
+            (t > 0 ? Math.round((successful.length / t) * 100) : 100) + '%';
+    }
+
+    // ── 3. Connected accounts (also builds platform avatar map) ──────
+    let acct = 0;
+    window._platformAvatars = {};
+    try {
+        const pd = await apiCall('/api/platforms');
+        if (pd?.platforms) {
+            Object.entries(pd.platforms).forEach(([p, accounts]) => {
+                const arr = Array.isArray(accounts) ? accounts : [];
+                acct += arr.length;
+                // primary account first, then fallback to first account
+                const primary = arr.find(a => a.is_primary) || arr[0];
+                if (primary) {
+                    window._platformAvatars[p] = {
+                        avatar:   primary.avatar || primary.account_avatar_url || null,
+                        name:     primary.name   || primary.account_name       || p,
+                        username: primary.username || primary.account_username || '',
+                    };
+                }
+            });
+        } else if (Array.isArray(pd)) {
+            acct = pd.length;
+            pd.forEach(a => {
+                const p = (a.platform || '').toLowerCase();
+                if (p && !window._platformAvatars[p]) {
+                    window._platformAvatars[p] = {
+                        avatar:   a.avatar || a.account_avatar_url || null,
+                        name:     a.name   || a.account_name       || p,
+                        username: a.username || a.account_username || '',
+                    };
+                }
+            });
+        } else {
+            acct = user.accounts_connected || 0;
+        }
+        console.log('[Dashboard] Platform avatars loaded:', window._platformAvatars);
+    } catch (_) { acct = user.accounts_connected || 0; }
+
+    const tier   = (user.tier || '').toLowerCase();
+    const role   = (user.role || '').toLowerCase();
+    let maxAcc   = user.max_accounts || user.entitlements?.max_accounts || 1;
+    if (role === 'master_admin' || tier === 'family_and_friends') maxAcc = '∞';
+    document.getElementById('statAccounts').textContent    = acct;
+    document.getElementById('statAccountsMax').textContent = maxAcc;
+
+    // ── 4. Scheduled count ────────────────────────────────────────
+    try {
+        const sr  = await apiCall('/api/scheduled');
+        document.getElementById('statScheduled').textContent = extractArray(sr, 'scheduled').length;
+    } catch (_) {
+        document.getElementById('statScheduled').textContent =
+            allUploads.filter(u => STAGED_STATUSES.includes((u.status || '').toLowerCase())).length;
+    }
+
+    // ── 5. Quota ──────────────────────────────────────────────────
+    try {
+        const quota = user.entitlements?.monthly_uploads ?? user.monthly_upload_limit ?? null;
+        const used  = user.uploads_this_month ?? successful.filter(u => {
+            const d = new Date(u.created_at), n = new Date();
+            return d.getMonth() === n.getMonth() && d.getFullYear() === n.getFullYear();
+        }).length;
+        document.getElementById('quotaUsed').textContent  = used;
+        document.getElementById('quotaTotal').textContent = (!quota || quota === -1) ? '∞' : quota;
+        const pct = (!quota || quota === -1) ? 5 : Math.min(100, Math.round((used / quota) * 100));
+        document.getElementById('quotaBar').style.width = pct + '%';
+    } catch (_) {}
+
+    // ── 6. Render full history ────────────────────────────────────
+    const sorted = [...allUploads].sort((a, b) =>
+        new Date(b.created_at || b.uploaded_at || 0) - new Date(a.created_at || a.uploaded_at || 0)
+    );
+    window._allUploadsData = sorted;
+    document.getElementById('uploadsCountBadge').textContent =
+        `${sorted.length} upload${sorted.length !== 1 ? 's' : ''}`;
+    renderRecentUploads(sorted);
+    // Silently backfill thumbnails for completed uploads missing one
+    fetchMissingThumbnails(sorted);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   FILTER
+═══════════════════════════════════════════════════════════════════ */
+function filterUploads(filter, btn) {
+    document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active', 'active-smart'));
+    btn.classList.add(filter === 'smart' ? 'active-smart' : 'active');
+
+    const all = window._allUploadsData || [];
+    const map = {
+        all:       () => all,
+        succeeded: () => all.filter(u => SUCCESSFUL_STATUSES.includes((u.status || '').toLowerCase())),
+        staged:    () => all.filter(u => {
+            const s = (u.status || '').toLowerCase();
+            const m = (u.schedule_mode || '').toLowerCase();
+            return STAGED_STATUSES.includes(s) && m !== 'smart';
+        }),
+        smart:     () => all.filter(u => {
+            const m = (u.schedule_mode || '').toLowerCase();
+            const s = (u.status || '').toLowerCase();
+            return m === 'smart' || SMART_STATUS_WORDS.includes(s);
+        }),
+        failed:    () => all.filter(u => FAILED_STATUSES.includes((u.status || '').toLowerCase())),
+    };
+    renderRecentUploads((map[filter] || map.all)());
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   RENDER UPLOAD ROWS
+═══════════════════════════════════════════════════════════════════ */
+function renderRecentUploads(uploads) {
+    const container = document.getElementById('recentUploads');
+    stopAllTimers();
+
+    if (!uploads || uploads.length === 0) {
+        container.innerHTML = `
+            <div style="padding:2.5rem 0;text-align:center;color:var(--text-secondary);">
+                <i class="fas fa-cloud-upload-alt" style="font-size:2.5rem;display:block;margin-bottom:.75rem;"></i>
+                <p style="margin-bottom:.75rem;">No uploads found for this filter</p>
+                <a href="upload.html" class="btn btn-primary btn-sm">Upload your first video</a>
+            </div>`;
+        return;
+    }
+
+    const ICON  = {
+        youtube:   '<i class="fab fa-youtube"></i>',
+        tiktok:    '<i class="fab fa-tiktok"></i>',
+        instagram: '<i class="fab fa-instagram"></i>',
+        facebook:  '<i class="fab fa-facebook"></i>',
+    };
+    const LABEL = { youtube:'YouTube', tiktok:'TikTok', instagram:'Instagram', facebook:'Facebook' };
+
+    container.innerHTML = uploads.map((upload, idx) => {
+        const rawStatus   = (upload.status || 'unknown').toLowerCase();
+        const schedMode   = (upload.schedule_mode || 'immediate').toLowerCase();
+        const isSmart     = schedMode === 'smart' || SMART_STATUS_WORDS.includes(rawStatus);
+        const isStaged    = STAGED_STATUSES.includes(rawStatus) && !SUCCESSFUL_STATUSES.includes(rawStatus);
+        const isSuccess   = SUCCESSFUL_STATUSES.includes(rawStatus);
+        const isFailed    = FAILED_STATUSES.includes(rawStatus);
+
+        const title       = upload.title || upload.filename || upload.original_filename || 'Untitled';
+        const timestamp   = upload.created_at || upload.uploaded_at || upload.timestamp;
+        const platforms   = (upload.platforms || []).map(p => normalizePlatform(p)).filter(Boolean);
+        // Use scheduled_time (from DB) as the countdown target
+        const scheduledAt = upload.scheduled_time || upload.scheduled_at || upload.publish_time || null;
+
+        // ── Stats (top-level fields from the uploads table) ──
+        const stats   = getUploadStats(upload);
+        const hasStats = isSuccess && (stats.views || stats.likes || stats.comments || stats.shares);
+
+        // ── Status pill ──
+        let pillCls, pillIco, pillLbl;
+        if      (isSuccess)                  { pillCls = 'pill-success'; pillIco = 'fa-check-circle'; pillLbl = 'succeeded'; }
+        else if (isFailed)                   { pillCls = 'pill-failed';  pillIco = 'fa-times-circle'; pillLbl = 'failed'; }
+        else if (isSmart  && isStaged)       { pillCls = 'pill-smart';   pillIco = 'fa-magic';        pillLbl = 'smart schedule'; }
+        else if (isStaged)                   { pillCls = 'pill-staged';  pillIco = 'fa-clock';        pillLbl = rawStatus; }
+        else                                 { pillCls = 'pill-unknown'; pillIco = 'fa-question-circle'; pillLbl = rawStatus; }
+
+        // ── Countdown block — only for staged/smart with a scheduled time ──
+        const cId    = `countdown-${idx}`;
+        let cdHtml   = '';
+        if (isStaged) {
+            const timerCls = isSmart ? 'countdown-timer countdown-smart' : 'countdown-timer';
+            if (scheduledAt) {
+                cdHtml = `
+                <div class="countdown-block">
+                    <span class="${timerCls}" id="${cId}">
+                        <i class="fas fa-clock"></i> Calculating…
+                    </span>
+                    <span class="scheduled-at-label">
+                        <i class="fas fa-calendar-alt"></i> ${fmtDate(scheduledAt)}
+                    </span>
+                </div>`;
+            } else {
+                cdHtml = `
+                <div class="countdown-block">
+                    <span class="${isSmart ? 'countdown-timer countdown-smart' : 'countdown-timer'}">
+                        <i class="fas fa-hourglass-half"></i>
+                        ${isSmart ? '✦ Awaiting optimal time' : 'Awaiting schedule time'}
+                    </span>
+                </div>`;
+            }
+        }
+
+        // ── Platform avatar map (loaded once when platforms API is called) ──
+        const avatarMap = window._platformAvatars || {};
+
+        // ── Thumbnail ──
+        // Priority: video thumbnail → first platform's account avatar → film icon
+        const thumb    = upload.thumbnail_url || upload.thumbnail || upload.cover_url || null;
+        const firstUrl = platforms.length ? buildPlatformUrl(platforms[0], upload) : null;
+        const firstAv  = platforms.length ? (avatarMap[platforms[0]]?.avatar || null) : null;
+        const thumbId  = `thumb-img-${upload.id}`;
+
+        let imgInner;
+        if (thumb) {
+            // We have a real video thumbnail from R2
+            imgInner = `<img id="${thumbId}" src="${thumb}" alt="thumb"
+                             onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+                        <i class="fas fa-film upload-thumb-placeholder" style="display:none;"></i>`;
+        } else if (isSuccess) {
+            // Completed upload but no thumbnail yet — auto-request generation in background
+            // Show account avatar as placeholder while it loads
+            const placeholderSrc = firstAv || '';
+            imgInner = placeholderSrc
+                ? `<img id="${thumbId}" src="${placeholderSrc}" alt="avatar"
+                         style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;"
+                         onerror="this.style.display='none';">
+                   <i class="fas fa-spinner fa-spin" style="position:absolute;font-size:.8rem;color:var(--text-secondary);bottom:4px;right:4px;"></i>`
+                : `<i class="fas fa-spinner fa-spin upload-thumb-placeholder" style="font-size:1.2rem;opacity:.4;"></i>`;
+        } else if (firstAv) {
+            imgInner = `<img src="${firstAv}" alt="avatar"
+                             style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;"
+                             onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+                        <i class="fas fa-film upload-thumb-placeholder" style="display:none;"></i>`;
+        } else {
+            imgInner = `<i class="fas fa-film upload-thumb-placeholder"></i>`;
+        }
+
+        const thumbHtml = (isSuccess && firstUrl)
+            ? `<a href="${firstUrl}" target="_blank" rel="noopener"
+                  class="upload-thumb" title="Open ${LABEL[platforms[0]] || platforms[0]} video">
+                   ${imgInner}<i class="fas fa-external-link-alt play-icon"></i>
+               </a>`
+            : `<div class="upload-thumb">${imgInner}</div>`;
+
+        // ── Stats bar (views / likes / comments / shares) ──
+        // Determine if any platform has a video_id so we know if sync is even possible
+        const prList = Array.isArray(upload.platform_results) ? upload.platform_results : [];
+        const hasAnyVideoId = prList.some(r => {
+            return r.success && (r.platform_video_id || r.video_id || r.media_id
+                               || r.post_id || r.share_id || r.platform_url);
+        });
+
+        let statsHtml = '';
+        if (hasStats) {
+            // Has real numbers — show them with a sync button
+            statsHtml = `
+            <div class="stats-bar">
+                ${stats.views    ? `<span class="stat-chip"><i class="fas fa-eye"></i><span class="stat-views">${fmtNum(stats.views)}</span></span>` : ''}
+                ${stats.likes    ? `<span class="stat-chip"><i class="fas fa-heart"></i><span class="stat-likes">${fmtNum(stats.likes)}</span></span>` : ''}
+                ${stats.comments ? `<span class="stat-chip"><i class="fas fa-comment"></i><span class="stat-comments">${fmtNum(stats.comments)}</span></span>` : ''}
+                ${stats.shares   ? `<span class="stat-chip"><i class="fas fa-share"></i><span class="stat-shares">${fmtNum(stats.shares)}</span></span>` : ''}
+                <button class="sync-btn" onclick="syncStats('${upload.id}', this)" title="Refresh stats">
+                    <i class="fas fa-sync-alt"></i>
+                </button>
+            </div>`;
+        } else if (isSuccess && hasAnyVideoId) {
+            // Has video IDs but stats are 0 — platform confirmed, try syncing
+            statsHtml = `
+            <div class="stats-bar">
+                <span class="stat-chip no-stats"><i class="fas fa-chart-bar" style="opacity:.4;"></i> Stats pending</span>
+                <button class="sync-btn" onclick="syncStats('${upload.id}', this)" title="Fetch stats from platform APIs">
+                    <i class="fas fa-sync-alt"></i> Sync
+                </button>
+            </div>`;
+        } else if (isSuccess && !hasAnyVideoId) {
+            // Upload succeeded but platform hasn't confirmed the video ID yet
+            statsHtml = `
+            <div class="stats-bar">
+                <span class="stat-chip no-stats" title="Platform is still confirming the video. Stats will appear once confirmed.">
+                    <i class="fas fa-hourglass-half" style="opacity:.4;"></i> Awaiting confirmation
+                </span>
+            </div>`;
+        }
+
+        // ── Per-platform chips with avatar + account name + direct link ──
+        const chipsHtml = platforms.length === 0 ? '' : `
+            <div class="platform-chips">
+                ${platforms.map(p => {
+                    const url      = buildPlatformUrl(p, upload);
+                    const chipCls  = ['youtube','tiktok','instagram','facebook'].includes(p) ? `chip-${p}` : 'chip-default';
+                    const pInfo    = avatarMap[p] || {};
+                    const av       = pInfo.avatar || null;
+                    const dispName = pInfo.username ? `@${pInfo.username}` : (pInfo.name || LABEL[p] || p);
+
+                    // Left icon: real account avatar if available, else platform icon
+                    const leftIcon = av
+                        ? `<img src="${av}" class="chip-avatar"
+                                alt="${dispName}"
+                                onerror="this.style.display='none';this.insertAdjacentHTML('afterend','${(ICON[p]||'<i class=\"fas fa-globe\"></i>').replace(/"/g,"'")}');">`
+                        : (ICON[p] || '<i class="fas fa-globe"></i>');
+
+                    const extIcon  = url ? ' <i class="fas fa-external-link-alt chip-ext"></i>' : '';
+                    const inner    = `${leftIcon} ${dispName}${extIcon}`;
+
+                    // Determine tooltip for missing link using detailed reason helper
+                    const noLinkTip = getPlatformLinkReason(p, upload);
+
+                    return url
+                        ? `<a href="${url}" target="_blank" rel="noopener" class="platform-chip ${chipCls}" title="Watch on ${LABEL[p] || p}">${inner}</a>`
+                        : `<span class="platform-chip ${chipCls} chip-no-link" title="${noLinkTip}">${inner}</span>`;
+                }).join('')}
+            </div>`;
+
+        return `
+            <div class="upload-row">
+                ${thumbHtml}
+                <div class="upload-info">
+                    <div class="upload-title" title="${title}">${title}</div>
+                    <div class="upload-meta">
+                        <span class="status-pill ${pillCls}"><i class="fas ${pillIco}"></i>${pillLbl}</span>
+                        <span class="upload-time">${timestamp ? formatRelativeTime(timestamp) : '—'}</span>
+                    </div>
+                    ${cdHtml}
+                    ${statsHtml}
+                    ${chipsHtml}
+                </div>
+            </div>`;
+    }).join('');
+
+    // ── Start live countdown timers after DOM is ready ──
+    uploads.forEach((upload, idx) => {
+        const rawStatus = (upload.status || '').toLowerCase();
+        const schedMode = (upload.schedule_mode || '').toLowerCase();
+        const isSmart   = schedMode === 'smart';
+        const isStaged  = STAGED_STATUSES.includes(rawStatus) && !SUCCESSFUL_STATUSES.includes(rawStatus);
+        const target    = upload.scheduled_time || upload.scheduled_at || upload.publish_time || null;
+        if (isStaged && target) {
+            startCountdown(`countdown-${idx}`, target, isSmart);
+        }
+    });
+}
+</script>
+</body>
+</html>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     BILLING SUCCESS MODAL — injected after page body
+     Triggered when URL has ?billing_success=1 (set by billing/success.html)
+═══════════════════════════════════════════════════════════════════ -->
+<div id="billingSuccessOverlay" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.75);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);align-items:center;justify-content:center;padding:1rem;">
+<div id="billingSuccessModal" style="position:relative;background:var(--bg-card,#1a1a24);border:1px solid rgba(249,115,22,.3);border-radius:20px;max-width:680px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 0 80px rgba(249,115,22,.15),0 30px 80px rgba(0,0,0,.5);">
+
+  <!-- Close btn -->
+  <button onclick="closeBillingModal()" style="position:sticky;top:12px;float:right;margin:12px 12px 0 0;width:32px;height:32px;border-radius:50%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);color:var(--text-secondary,#9ca3af);cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;z-index:10;" title="Close"><i class="fas fa-times"></i></button>
+
+  <!-- Header glow bar -->
+  <div style="height:3px;background:linear-gradient(90deg,#f97316,#a855f7,#3b82f6);border-radius:20px 20px 0 0;"></div>
+
+  <!-- Main content -->
+  <div style="padding:2rem 2.5rem 2.5rem;">
+
+    <!-- Confetti canvas -->
+    <canvas id="bsConfetti" style="position:absolute;inset:0;pointer-events:none;border-radius:20px;width:100%;height:100%;"></canvas>
+
+    <!-- Icon + headline -->
+    <div style="text-align:center;margin-bottom:2rem;">
+      <div id="bsCheckIcon" style="width:72px;height:72px;background:linear-gradient(135deg,#f97316,#ea580c);border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto .75rem;font-size:1.75rem;color:#fff;opacity:0;transform:scale(.5);transition:all .5s cubic-bezier(.16,1,.3,1);">
+        <i class="fas fa-check"></i>
+      </div>
+      <div id="bsEyebrow" style="font-size:.7rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:#f97316;margin-bottom:.4rem;opacity:0;transform:translateY(8px);transition:all .4s ease .2s;"></div>
+      <h2 id="bsHeadline" style="font-size:1.65rem;font-weight:700;line-height:1.2;margin-bottom:.5rem;opacity:0;transform:translateY(8px);transition:all .4s ease .3s;"></h2>
+      <p id="bsSub" style="font-size:.9rem;color:var(--text-secondary,#9ca3af);opacity:0;transform:translateY(8px);transition:all .4s ease .4s;"></p>
+    </div>
+
+    <!-- Wallet credits -->
+    <div id="bsWalletRow" style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.5rem;opacity:0;transform:translateY(8px);transition:all .4s ease .5s;">
+      <div style="background:rgba(249,115,22,.07);border:1px solid rgba(249,115,22,.2);border-radius:12px;padding:1rem;text-align:center;">
+        <div style="font-size:1.4rem;margin-bottom:.2rem;">⚡</div>
+        <div id="bsPUT" style="font-size:1.8rem;font-weight:700;color:#fff;line-height:1;">—</div>
+        <div style="font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:#f97316;margin-top:.25rem;">PUT Tokens</div>
+        <div style="font-size:.72rem;color:var(--text-secondary,#9ca3af);margin-top:.2rem;">Upload credits / month</div>
+      </div>
+      <div style="background:rgba(139,92,246,.07);border:1px solid rgba(139,92,246,.2);border-radius:12px;padding:1rem;text-align:center;">
+        <div style="font-size:1.4rem;margin-bottom:.2rem;">🤖</div>
+        <div id="bsAIC" style="font-size:1.8rem;font-weight:700;color:#fff;line-height:1;">—</div>
+        <div style="font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:#8b5cf6;margin-top:.25rem;">AI Credits</div>
+        <div style="font-size:.72rem;color:var(--text-secondary,#9ca3af);margin-top:.2rem;">AI analysis / month</div>
+      </div>
+    </div>
+
+    <!-- Trial notice -->
+    <div id="bsTrialBanner" style="display:none;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:10px;padding:.75rem 1rem;font-size:.82rem;color:#f59e0b;margin-bottom:1.5rem;display:flex;align-items:center;gap:.6rem;">
+      <i class="fas fa-hourglass-half"></i>
+      <span id="bsTrialText"></span>
+    </div>
+
+    <!-- Plan feature cards -->
+    <div style="margin-bottom:1.75rem;opacity:0;transform:translateY(8px);transition:all .4s ease .6s;" id="bsFeaturesSection">
+      <div style="font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted,#6b7280);margin-bottom:.75rem;">What's included</div>
+      <div id="bsFeatureGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;"></div>
+    </div>
+
+    <!-- Quickstart steps -->
+    <div style="margin-bottom:2rem;opacity:0;transform:translateY(8px);transition:all .4s ease .7s;" id="bsStepsSection">
+      <div style="font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted,#6b7280);margin-bottom:.75rem;">Get started in 3 steps</div>
+      <div style="display:flex;flex-direction:column;gap:.6rem;">
+        <a href="platforms.html" style="display:flex;align-items:center;gap:.875rem;padding:.75rem 1rem;background:var(--bg-input,rgba(255,255,255,.04));border:1px solid var(--border-color,rgba(255,255,255,.08));border-radius:10px;text-decoration:none;color:inherit;transition:border-color .15s;" onmouseover="this.style.borderColor='rgba(249,115,22,.4)'" onmouseout="this.style.borderColor=''">
+          <div style="width:32px;height:32px;background:rgba(249,115,22,.12);border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;"><span style="font-size:.75rem;font-weight:700;color:#f97316;">1</span></div>
+          <div><div style="font-size:.875rem;font-weight:600;">Connect your social accounts</div><div style="font-size:.775rem;color:var(--text-secondary,#9ca3af);">Link TikTok, YouTube, Instagram & Facebook</div></div>
+          <i class="fas fa-chevron-right" style="margin-left:auto;color:var(--text-muted,#6b7280);font-size:.75rem;"></i>
+        </a>
+        <a href="upload.html" style="display:flex;align-items:center;gap:.875rem;padding:.75rem 1rem;background:var(--bg-input,rgba(255,255,255,.04));border:1px solid var(--border-color,rgba(255,255,255,.08));border-radius:10px;text-decoration:none;color:inherit;transition:border-color .15s;" onmouseover="this.style.borderColor='rgba(249,115,22,.4)'" onmouseout="this.style.borderColor=''">
+          <div style="width:32px;height:32px;background:rgba(59,130,246,.12);border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;"><span style="font-size:.75rem;font-weight:700;color:#3b82f6;">2</span></div>
+          <div><div style="font-size:.875rem;font-weight:600;">Upload your first video</div><div style="font-size:.775rem;color:var(--text-secondary,#9ca3af);">One upload, publish to all platforms at once</div></div>
+          <i class="fas fa-chevron-right" style="margin-left:auto;color:var(--text-muted,#6b7280);font-size:.75rem;"></i>
+        </a>
+        <a href="guide.html" style="display:flex;align-items:center;gap:.875rem;padding:.75rem 1rem;background:var(--bg-input,rgba(255,255,255,.04));border:1px solid var(--border-color,rgba(255,255,255,.08));border-radius:10px;text-decoration:none;color:inherit;transition:border-color .15s;" onmouseover="this.style.borderColor='rgba(249,115,22,.4)'" onmouseout="this.style.borderColor=''">
+          <div style="width:32px;height:32px;background:rgba(34,197,94,.12);border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;"><span style="font-size:.75rem;font-weight:700;color:#22c55e;">3</span></div>
+          <div><div style="font-size:.875rem;font-weight:600;">Read the full feature guide</div><div style="font-size:.775rem;color:var(--text-secondary,#9ca3af);">Every feature explained with tips & best practices</div></div>
+          <i class="fas fa-chevron-right" style="margin-left:auto;color:var(--text-muted,#6b7280);font-size:.75rem;"></i>
+        </a>
+      </div>
+    </div>
+
+    <!-- CTA buttons -->
+    <div style="display:flex;gap:.75rem;flex-wrap:wrap;" id="bsCTARow">
+      <a href="upload.html" style="flex:1;min-width:160px;display:flex;align-items:center;justify-content:center;gap:.5rem;background:linear-gradient(135deg,#f97316,#ea580c);color:#fff;border:none;border-radius:10px;padding:.875rem 1.25rem;font-size:.95rem;font-weight:600;text-decoration:none;transition:transform .15s,box-shadow .15s;" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 8px 24px rgba(249,115,22,.35)'" onmouseout="this.style.transform='';this.style.boxShadow=''">
+        <i class="fas fa-cloud-upload-alt"></i> Start Uploading
+      </a>
+      <a href="guide.html" style="flex:1;min-width:160px;display:flex;align-items:center;justify-content:center;gap:.5rem;background:transparent;color:var(--text-primary,#fff);border:1px solid var(--border-color,rgba(255,255,255,.1));border-radius:10px;padding:.875rem 1.25rem;font-size:.95rem;font-weight:600;text-decoration:none;transition:border-color .15s;" onmouseover="this.style.borderColor='rgba(249,115,22,.4)'" onmouseout="this.style.borderColor=''">
+        <i class="fas fa-book-open"></i> Feature Guide
+      </a>
+    </div>
+
+  </div><!-- /padding wrapper -->
+</div><!-- /modal -->
+</div><!-- /overlay -->
+
+<style>
+/* Animate modal in */
+#billingSuccessOverlay.active { display: flex !important; }
+#billingSuccessModal { animation: bsModalIn .5s cubic-bezier(.16,1,.3,1) both; }
+@keyframes bsModalIn {
+    from { opacity:0; transform:scale(.95) translateY(20px); }
+    to   { opacity:1; transform:scale(1) translateY(0); }
+}
+#billingSuccessModal::-webkit-scrollbar { width:5px; }
+#billingSuccessModal::-webkit-scrollbar-track { background:transparent; }
+#billingSuccessModal::-webkit-scrollbar-thumb { background:rgba(255,255,255,.1); border-radius:3px; }
+@media (max-width: 500px) {
+    #billingSuccessModal { padding:0; }
+    #billingSuccessModal > div:last-child { padding:1.5rem 1.25rem; }
+    #bsWalletRow, #bsFeatureGrid { grid-template-columns:1fr; }
+    #bsCTARow a { min-width:100%; }
+}
+</style>
+
+<script>
+/* ════════════════════════════════════════════════════════════════
+   BILLING SUCCESS MODAL LOGIC
+════════════════════════════════════════════════════════════════ */
+(function() {
+
+const TIER_META = {
+    free:           { name:'Free',           color:'#9ca3af', put:60,    aic:10    },
+    launch:         { name:'Creator Lite',   color:'#f97316', put:300,   aic:80    },
+    creator_lite:   { name:'Creator Lite',   color:'#f97316', put:300,   aic:80    },
+    creator_pro:    { name:'Creator Pro',    color:'#8b5cf6', put:700,   aic:200   },
+    studio:         { name:'Studio',         color:'#3b82f6', put:2000,  aic:600   },
+    agency:         { name:'Agency',         color:'#22c55e', put:4500,  aic:1500  },
+    friends_family: { name:'Friends & Family',color:'#fbbf24',put:999999,aic:999999},
+    lifetime:       { name:'Lifetime',       color:'#fbbf24', put:999999,aic:999999},
+    master_admin:   { name:'Admin',          color:'#ef4444', put:999999,aic:999999},
+};
+
+// Features per tier — what to show as "included"
+const TIER_FEATURES = {
+    free: [
+        { icon:'fa-cloud-upload-alt', label:'Upload to 4 platforms',      ok:true  },
+        { icon:'fa-robot',            label:'AI captions',                 ok:false },
+        { icon:'fa-calendar-alt',     label:'Scheduled posts',             ok:false },
+        { icon:'fa-bolt',             label:'Priority processing',         ok:false },
+        { icon:'fa-film',             label:'HUD overlay',                 ok:false },
+        { icon:'fa-chart-line',       label:'Basic analytics',             ok:true  },
+    ],
+    creator_lite: [
+        { icon:'fa-cloud-upload-alt', label:'Upload to 8 accounts',        ok:true  },
+        { icon:'fa-robot',            label:'AI captions (enhanced)',       ok:true  },
+        { icon:'fa-calendar-alt',     label:'Scheduled posts',              ok:true  },
+        { icon:'fa-image',            label:'Up to 3 thumbnails',           ok:true  },
+        { icon:'fa-bell',             label:'Webhook notifications',        ok:true  },
+        { icon:'fa-chart-line',       label:'Standard analytics',           ok:true  },
+    ],
+    creator_pro: [
+        { icon:'fa-cloud-upload-alt', label:'20 accounts (5 per platform)', ok:true },
+        { icon:'fa-robot',            label:'Advanced AI (4 depth)',         ok:true },
+        { icon:'fa-film',             label:'HUD burn-in overlay',           ok:true },
+        { icon:'fa-bolt',             label:'Priority queue (p2)',           ok:true },
+        { icon:'fa-image',            label:'Up to 5 thumbnails',            ok:true },
+        { icon:'fa-users',            label:'3 team seats',                  ok:true },
+    ],
+    studio: [
+        { icon:'fa-cloud-upload-alt', label:'60 accounts (15 per platform)', ok:true },
+        { icon:'fa-robot',            label:'Max AI depth (15 frames)',       ok:true },
+        { icon:'fa-file-excel',       label:'Excel export reports',          ok:true },
+        { icon:'fa-bolt',             label:'Turbo priority queue (p1)',      ok:true },
+        { icon:'fa-film',             label:'HUD burn-in overlay',            ok:true },
+        { icon:'fa-users',            label:'10 team seats',                  ok:true },
+    ],
+    agency: [
+        { icon:'fa-cloud-upload-alt', label:'Unlimited accounts',            ok:true },
+        { icon:'fa-robot',            label:'Max AI + dense frame scan',      ok:true },
+        { icon:'fa-tag',              label:'White-label branding',           ok:true },
+        { icon:'fa-bolt',             label:'Top priority queue (p0)',        ok:true },
+        { icon:'fa-exchange-alt',     label:'Flex token transfers',           ok:true },
+        { icon:'fa-users',            label:'25 team seats',                  ok:true },
+    ],
+};
+
+function fmt(n) {
+    if (n >= 999999) return '∞';
+    return n.toLocaleString();
+}
+
+function closeModal() {
+    const ov = document.getElementById('billingSuccessOverlay');
+    if (ov) { ov.style.opacity='0'; ov.style.transition='opacity .3s'; setTimeout(()=>{ ov.style.display='none'; ov.classList.remove('active'); }, 300); }
+    // Clean URL so refresh doesn't re-open
+    try { history.replaceState(null,'',window.location.pathname); } catch(e){}
+    sessionStorage.removeItem('billing_session_id');
+}
+window.closeBillingModal = closeModal;
+
+// Close on backdrop click
+document.getElementById('billingSuccessOverlay').addEventListener('click', function(e) {
+    if (e.target === this) closeModal();
+});
+
+// Confetti
+function burst() {
+    var canvas = document.getElementById('bsConfetti');
+    if (!canvas) return;
+    var ctx = canvas.getContext('2d');
+    canvas.width  = canvas.offsetWidth  || 680;
+    canvas.height = canvas.offsetHeight || 500;
+    var pieces = [];
+    var colors = ['#f97316','#fbbf24','#22c55e','#3b82f6','#a855f7','#f43f5e'];
+    for (var i=0; i<80; i++) {
+        pieces.push({
+            x: Math.random() * canvas.width,
+            y: -10,
+            w: 6 + Math.random()*6, h: 4+Math.random()*4,
+            color: colors[Math.floor(Math.random()*colors.length)],
+            vx: (Math.random()-0.5)*4,
+            vy: 2+Math.random()*4,
+            rot: Math.random()*360,
+            vr: (Math.random()-0.5)*8,
+            life: 1,
+        });
+    }
+    var frame;
+    (function draw() {
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        var alive = false;
+        pieces.forEach(function(p) {
+            p.x  += p.vx; p.y  += p.vy; p.rot += p.vr; p.life -= 0.012;
+            if (p.life <= 0 || p.y > canvas.height) return;
+            alive = true;
+            ctx.save();
+            ctx.globalAlpha = Math.max(0, p.life);
+            ctx.translate(p.x, p.y);
+            ctx.rotate(p.rot * Math.PI/180);
+            ctx.fillStyle = p.color;
+            ctx.fillRect(-p.w/2, -p.h/2, p.w, p.h);
+            ctx.restore();
+        });
+        if (alive) frame = requestAnimationFrame(draw);
+    })();
+    setTimeout(function() { cancelAnimationFrame(frame); ctx.clearRect(0,0,canvas.width,canvas.height); }, 4000);
+}
+
+// Animate elements in
+function animateIn() {
+    ['bsCheckIcon','bsEyebrow','bsHeadline','bsSub','bsWalletRow','bsFeaturesSection','bsStepsSection'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) { el.style.opacity='1'; el.style.transform='none'; }
+    });
+}
+
+// Populate and show the modal
+function showBillingModal(user) {
+    var tier    = (user && user.subscription_tier) || 'creator_lite';
+    var status  = (user && user.subscription_status) || 'active';
+    var meta    = TIER_META[tier] || TIER_META.creator_lite;
+    var feats   = TIER_FEATURES[tier] || TIER_FEATURES.creator_lite;
+    var wallet  = (user && user.wallet) || {};
+    var put     = wallet.put_balance != null ? wallet.put_balance : meta.put;
+    var aic     = wallet.aic_balance != null ? wallet.aic_balance : meta.aic;
+    var isT     = status === 'trialing';
+
+    // Headline
+    document.getElementById('bsEyebrow').textContent   = isT ? '7-Day Free Trial Active' : 'Subscription Active';
+    document.getElementById('bsHeadline').textContent  = meta.name + (isT ? ' trial started.' : ' activated.');
+    document.getElementById('bsSub').textContent       = isT
+        ? 'Full ' + meta.name + ' access for 7 days — no charge until your trial ends. Cancel any time.'
+        : 'Your wallet has been loaded. Credits renew every billing period automatically.';
+
+    // Trial banner
+    if (isT) {
+        var trialEl = document.getElementById('bsTrialBanner');
+        document.getElementById('bsTrialText').textContent = 'Trial ends in 7 days. Card on file will be charged ' + (user && user.current_period_end ? 'on ' + new Date(user.current_period_end).toLocaleDateString('en-US',{month:'long',day:'numeric'}) : 'after trial') + '.';
+        trialEl.style.display = 'flex';
+    }
+
+    // Wallet
+    document.getElementById('bsPUT').textContent = fmt(put);
+    document.getElementById('bsAIC').textContent = fmt(aic);
+
+    // Features grid
+    var grid = document.getElementById('bsFeatureGrid');
+    grid.innerHTML = feats.map(function(f) {
+        return '<div style="display:flex;align-items:center;gap:.5rem;padding:.5rem .75rem;background:var(--bg-input,rgba(255,255,255,.04));border-radius:8px;font-size:.815rem;">'
+            + '<i class="fas ' + f.icon + '" style="width:14px;color:' + (f.ok ? '#22c55e':'#ef4444') + ';flex-shrink:0;"></i>'
+            + '<span style="color:' + (f.ok ? 'var(--text-primary,#fff)':'var(--text-muted,#6b7280)') + ';">' + f.label + '</span>'
+            + (f.ok ? '' : '<i class="fas fa-lock" style="margin-left:auto;font-size:.65rem;color:var(--text-muted,#6b7280);"></i>')
+            + '</div>';
+    }).join('');
+
+    // Show overlay
+    var ov = document.getElementById('billingSuccessOverlay');
+    ov.style.display = 'flex';
+    ov.classList.add('active');
+
+    // Stagger animations
+    setTimeout(animateIn, 80);
+    setTimeout(burst, 200);
+}
+
+// ── Entry point ──────────────────────────────────────────────
+function maybeShowModal() {
+    var params  = new URLSearchParams(window.location.search);
+    var trigger = params.get('billing_success') === '1';
+    var sid     = sessionStorage.getItem('billing_session_id') || '';
+
+    if (!trigger && !sid) return;  // Not a billing redirect
+
+    // Wait for user to be loaded (initApp already called /api/me)
+    function tryShow() {
+        if (window.currentUser) {
+            showBillingModal(window.currentUser);
+        } else {
+            // Poll until currentUser is available (max 6 seconds)
+            var attempts = 0;
+            var iv = setInterval(function() {
+                attempts++;
+                if (window.currentUser) { clearInterval(iv); showBillingModal(window.currentUser); }
+                else if (attempts >= 12) { clearInterval(iv); showBillingModal(null); }
+            }, 500);
+        }
+    }
+    tryShow();
+}
+
+// Run after DOM + app init
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() { setTimeout(maybeShowModal, 400); });
+} else {
+    setTimeout(maybeShowModal, 400);
+}
+// Also listen for the userLoaded event (fired by initApp)
+window.addEventListener('userLoaded', function(e) {
+    var p = new URLSearchParams(window.location.search);
+    if (p.get('billing_success') === '1' || sessionStorage.getItem('billing_session_id')) {
+        if (!document.getElementById('billingSuccessOverlay').classList.contains('active')) {
+            showBillingModal(e.detail || window.currentUser);
+        }
+    }
+});
+
+})();
+</script>

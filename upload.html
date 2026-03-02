@@ -1,0 +1,2486 @@
+<!-- upload.html (UPDATED)
+     Goal: hard-disable legacy static generation UI + make preferences panel ALWAYS visible.
+     Base: your current upload.html :contentReference[oaicite:0]{index=0}
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Upload - UploadM8</title>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link href="styles.css" rel="stylesheet" />
+
+  <style>
+    .upload-form { max-width: 800px; margin: 0 auto; }
+    .platform-select { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; }
+    .platform-option {
+      display: flex; align-items: center; gap: 0.75rem; padding: 1rem;
+      background: var(--bg-input); border: 2px solid var(--border-color);
+      border-radius: var(--radius-md); cursor: pointer; transition: all 0.2s;
+    }
+    .platform-option:hover { border-color: var(--border-hover); }
+    .platform-option.selected { border-color: var(--accent-orange); background: rgba(249, 115, 22, 0.1); }
+    .platform-option.disabled { opacity: 0.5; cursor: not-allowed; }
+    .platform-option input { display: none; }
+
+    .file-list { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 1rem; }
+    .file-item {
+      display: flex; align-items: center; gap: 1rem; padding: 1rem;
+      background: var(--bg-input); border-radius: var(--radius-md); border: 1px solid var(--border-color);
+    }
+    .file-item-icon { font-size: 1.5rem; color: var(--accent-orange); }
+    .file-item-info { flex: 1; }
+    .file-item-name { font-weight: 600; color: var(--text-primary); }
+    .file-item-size { font-size: 0.85rem; color: var(--text-secondary); }
+    .file-item-actions { display: flex; gap: 0.5rem; }
+
+    .paired-files {
+      display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem;
+      font-size: 0.85rem; color: var(--text-secondary);
+    }
+
+    /* AI Notice */
+    .ai-notice {
+      background: rgba(139, 92, 246, 0.1);
+      border: 1px solid rgba(139, 92, 246, 0.3);
+      border-radius: var(--radius-md);
+      padding: 1rem;
+      margin-top: 1rem;
+    }
+    .ai-notice-title {
+      display: flex; align-items: center; gap: 0.5rem;
+      font-weight: 700; color: #8b5cf6; margin-bottom: 0.75rem;
+    }
+    .ai-pref-box {
+      background: rgba(0,0,0,0.08);
+      border: 1px solid rgba(139, 92, 246, 0.25);
+      border-radius: var(--radius-md);
+      padding: 0.85rem;
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+      line-height: 1.45;
+    }
+    .ai-pref-row { display:flex; gap:0.5rem; align-items:flex-start; margin: 0.35rem 0; }
+    .ai-pref-row .k { min-width: 145px; font-weight: 700; color: var(--text-primary); }
+    .ai-pref-row .v { flex: 1; }
+    .ai-pref-muted { color: var(--text-secondary); margin-top: 0.75rem; font-size: 0.85rem; }
+
+    /* Legacy UI hard kill banner */
+    .legacy-kill {
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px solid rgba(239, 68, 68, 0.25);
+      border-radius: var(--radius-md);
+      padding: 0.75rem 1rem;
+      margin-top: 1rem;
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+    .legacy-kill strong { color: var(--text-primary); }
+
+    /* Scheduling */
+    .schedule-options { display: flex; flex-direction: column; gap: 0.75rem; }
+    .schedule-option {
+      display: flex; align-items: center; gap: 1rem; padding: 1rem;
+      background: var(--bg-input); border: 2px solid var(--border-color);
+      border-radius: var(--radius-md); cursor: pointer; transition: all 0.2s;
+    }
+    .schedule-option:hover { border-color: var(--border-hover); }
+    .schedule-option.selected { border-color: var(--accent-orange); background: rgba(249, 115, 22, 0.05); }
+    .schedule-option input[type="radio"] { display: none; }
+    .schedule-option-icon { font-size: 1.25rem; color: var(--accent-orange); }
+    .schedule-option-content { flex: 1; }
+    .schedule-option-title { font-weight: 600; margin-bottom: 0.25rem; }
+    .schedule-option-desc { font-size: 0.85rem; color: var(--text-secondary); }
+    .recommended-badge {
+      background: var(--success-color); color: white; padding: 0.25rem 0.5rem;
+      border-radius: 0.25rem; font-size: 0.7rem; font-weight: 600;
+    }
+
+    /* Upload Progress / Queue */
+    .upload-progress {
+      background: var(--bg-card); border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg); padding: 2rem; text-align: left;
+    }
+    .upload-queue-item {
+      padding: 1rem; background: var(--bg-input); border-radius: var(--radius-md);
+      border: 1px solid var(--border-color); margin-bottom: 0.75rem;
+    }
+    .upload-queue-item.uploading { border-color: var(--accent-orange); }
+    .upload-queue-item.success { border-color: var(--success-color); }
+    .upload-queue-item.error { border-color: var(--error-color); }
+
+    .queue-actions { display:flex; gap:0.5rem; margin-top:0.5rem; flex-wrap: wrap; }
+    .queue-actions .btn { padding: 0.45rem 0.7rem; }
+    .pill {
+      display:inline-flex; align-items:center; gap:0.35rem;
+      padding: 0.2rem 0.5rem; border-radius: 999px;
+      border: 1px solid var(--border-color); font-size: 0.75rem;
+      color: var(--text-secondary); background: var(--bg-card);
+      margin-left: 0.5rem;
+    }
+
+    /* Upload ID badge — shown immediately after presign so user can track */
+    .upload-id-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+      padding: 4px 10px;
+      background: rgba(59, 130, 246, 0.08);
+      border: 1px solid rgba(59, 130, 246, 0.2);
+      border-radius: 6px;
+      font-size: 0.75rem;
+      color: var(--accent-blue, #3b82f6);
+      cursor: pointer;
+      transition: background 0.2s;
+      user-select: all;
+    }
+    .upload-id-badge:hover {
+      background: rgba(59, 130, 246, 0.15);
+    }
+    .upload-id-badge code {
+      font-family: monospace;
+      font-size: 0.7rem;
+      color: inherit;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="app-layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <a href="dashboard.html" class="sidebar-logo">
+          <img src="images/logo.png" alt="UploadM8" /><span>UploadM8</span>
+        </a>
+      </div>
+      <nav class="sidebar-nav">
+        <div class="nav-section">
+          <div class="nav-section-title">Main</div>
+          <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
+          <a href="upload.html" class="nav-link active"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
+          <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
+          <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
+        </div>
+        <div class="nav-section">
+          <div class="nav-section-title">Platforms</div>
+          <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
+          <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
+        </div>
+        <div class="nav-section">
+          <div class="nav-section-title">Insights</div>
+          <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
+        </div>
+        <div class="nav-section admin-only" id="adminSection" style="display:none;">
+          <div class="nav-section-title">Admin</div>
+          <a href="admin.html" class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
+          <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
+          <a href="admin-kpi.html" class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
+          <a href="admin-calculator.html" class="nav-link"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
+          <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
+        </div>
+        <div class="nav-section">
+          <div class="nav-section-title">Account</div>
+          <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
+        </div>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="user-info">
+          <div class="user-avatar" id="userAvatar">U</div>
+          <div class="user-details">
+            <div class="user-name" id="userName">User</div>
+            <div class="user-tier" id="userTier">Free</div>
+          </div>
+          <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
+            <i class="fas fa-sign-out-alt"></i>
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+
+    <header class="top-bar">
+      <button class="menu-toggle" id="menuToggle"><i class="fas fa-bars"></i></button>
+      <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8" /><span>UploadM8</span></div>
+      <div class="top-bar-actions">
+        <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme">
+          <i class="fas fa-moon" id="themeToggleIconMobile"></i>
+        </button>
+      </div>
+    </header>
+
+    <main class="main-content">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Upload Video</h1>
+          <p class="page-subtitle">Upload once, publish everywhere</p>
+        </div>
+      </div>
+
+      <div class="upload-form" id="uploadForm">
+        <!-- File Selection -->
+        <div class="card mb-4">
+          <div class="card-header">
+            <h3 class="card-title"><i class="fas fa-file-video"></i> Select Files</h3>
+          </div>
+          <div class="card-body">
+            <div class="drop-zone" id="dropZone">
+              <i class="fas fa-cloud-upload-alt drop-zone-icon"></i>
+              <p class="drop-zone-text">Drag & drop video + telemetry (.map) files</p>
+              <p class="drop-zone-hint">or click to browse • MP4, MOV, AVI, MAP up to 5GB</p>
+              <input type="file" id="fileInput" accept="video/*,.map" multiple hidden />
+            </div>
+
+            <div class="file-list hidden" id="fileList"></div>
+
+            <!-- ALWAYS VISIBLE: AI + Preferences Notice -->
+            <div class="ai-notice" id="aiNotice">
+              <div class="ai-notice-title">
+                <i class="fas fa-robot"></i> AI Content Generation
+                <span class="pill" id="aiPlanPill">Plan: —</span>
+                <span class="pill" id="aiConcurrencyPill">Max parallel: —</span>
+              </div>
+
+              <div class="ai-pref-box" id="aiPrefBox">
+                <div class="ai-pref-row">
+                  <div class="k">Your preferences will be applied:</div>
+                  <div class="v">Loading…</div>
+                </div>
+              </div>
+
+              <div class="ai-pref-muted" id="aiPrefMuted">
+                AI generates titles/captions/hashtags during processing (post-upload). You can review/edit before publish.
+              </div>
+
+              <!-- Optional: visible kill-switch confirmation -->
+              <div class="legacy-kill" id="legacyKillBanner" style="display:none;">
+                <strong>Legacy AI generators are disabled.</strong> This page does not generate static titles/captions/hashtags before upload.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Platform Selection -->
+        <div class="card mb-4">
+          <div class="card-header">
+            <h3 class="card-title"><i class="fas fa-share-alt"></i> Select Platforms</h3>
+          </div>
+          <div class="card-body">
+            <div class="platform-select" id="platformSelect"></div>
+            <p class="text-sm text-secondary mt-3">Connect accounts in <a href="platforms.html">Platform Settings</a></p>
+          </div>
+        </div>
+
+        <!-- Account Groups -->
+        <div class="card mb-4" id="groupSelectorCard">
+          <div class="card-header">
+            <h3 class="card-title"><i class="fas fa-layer-group"></i> Account Groups <span class="text-xs text-secondary" style="font-weight:400; margin-left:0.5rem;">(optional)</span></h3>
+          </div>
+          <div class="card-body">
+            <p class="text-sm text-secondary mb-3">Target specific account groups instead of all connected accounts. Leave unselected to publish to all accounts on chosen platforms.</p>
+            <div class="platform-select" id="groupSelectorContainer">
+              <p class="text-sm text-secondary">Loading groups…</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Upload Defaults -->
+        <div class="card mb-4">
+          <div class="card-header">
+            <h3 class="card-title"><i class="fas fa-sliders-h"></i> Upload Defaults</h3>
+          </div>
+          <div class="card-body" style="display:grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+            <div>
+              <label class="form-label">Default Privacy</label>
+              <select id="privacySelect" class="form-input">
+                <option value="public">Public</option>
+                <option value="unlisted">Unlisted</option>
+                <option value="private">Private</option>
+              </select>
+              <div class="text-xs text-secondary mt-2">Pre-filled from Settings. Can override per batch.</div>
+            </div>
+            <div>
+              <label class="form-label">Batch Upload Mode</label>
+              <select id="batchMode" class="form-input">
+                <option value="sequential" selected>Sequential (safe)</option>
+                <option value="parallel">Parallel (faster)</option>
+              </select>
+              <div class="text-xs text-secondary mt-2">Parallel respects plan-based concurrency caps.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Scheduling -->
+        <div class="card mb-4">
+          <div class="card-header">
+            <h3 class="card-title"><i class="fas fa-clock"></i> Scheduling</h3>
+          </div>
+          <div class="card-body">
+            <div class="schedule-options">
+              <label class="schedule-option selected" data-mode="immediate">
+                <input type="radio" name="scheduleMode" value="immediate" checked />
+                <div class="schedule-option-icon"><i class="fas fa-bolt"></i></div>
+                <div class="schedule-option-content">
+                  <div class="schedule-option-title">Publish Now</div>
+                  <div class="schedule-option-desc">Upload immediately to all platforms</div>
+                </div>
+              </label>
+
+              <label class="schedule-option" data-mode="scheduled">
+                <input type="radio" name="scheduleMode" value="scheduled" />
+                <div class="schedule-option-icon"><i class="fas fa-calendar"></i></div>
+                <div class="schedule-option-content">
+                  <div class="schedule-option-title">Schedule</div>
+                  <div class="schedule-option-desc">Pick a specific date and time</div>
+                </div>
+              </label>
+
+              <label class="schedule-option" data-mode="smart">
+                <input type="radio" name="scheduleMode" value="smart" />
+                <div class="schedule-option-icon"><i class="fas fa-magic"></i></div>
+                <div class="schedule-option-content">
+                  <div class="schedule-option-title">
+                    Smart Schedule <span class="recommended-badge">Recommended</span>
+                  </div>
+                  <div class="schedule-option-desc">AI picks optimal times per platform, different days</div>
+                </div>
+              </label>
+            </div>
+
+            <div id="scheduleDateTime" class="mt-3 hidden">
+              <input type="datetime-local" id="scheduleTimeInput" class="form-input" />
+            </div>
+
+            <div id="smartScheduleDays" class="mt-3 hidden">
+              <label class="form-label">Scheduling Window (days)</label>
+              <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+                <input type="number" id="smartDaysInput" class="form-input" style="width: 120px;"
+                       min="1" max="730" value="14" placeholder="Days" />
+                <span class="text-sm text-secondary" id="smartDaysLabel">≈ 2 weeks</span>
+              </div>
+              <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap;">
+                <button type="button" class="btn btn-ghost btn-sm smart-days-preset" data-days="7">7d</button>
+                <button type="button" class="btn btn-ghost btn-sm smart-days-preset" data-days="14">14d</button>
+                <button type="button" class="btn btn-ghost btn-sm smart-days-preset" data-days="30">30d</button>
+                <button type="button" class="btn btn-ghost btn-sm smart-days-preset" data-days="90">90d</button>
+                <button type="button" class="btn btn-ghost btn-sm smart-days-preset" data-days="180">180d</button>
+                <button type="button" class="btn btn-ghost btn-sm smart-days-preset" data-days="365">1yr</button>
+              </div>
+              <div class="text-xs text-secondary mt-2">Enter any number of days (e.g. 180 for ~6 months, 700 for ~1.9 years). AI will spread uploads across this window.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Submit -->
+        <div class="flex gap-3 justify-end">
+          <a href="dashboard.html" class="btn btn-secondary">Cancel</a>
+          <button type="button" class="btn btn-primary btn-lg" id="uploadBtn" onclick="startUpload()" disabled>
+            <i class="fas fa-cloud-upload-alt"></i> Upload & Publish
+          </button>
+        </div>
+        <p class="text-sm text-secondary text-center mt-3" id="uploadHint">Select video files and platforms to continue</p>
+      </div>
+
+      <!-- Upload Progress -->
+      <div class="upload-progress hidden" id="uploadProgress">
+        <h3 class="text-xl font-semibold mb-2">Uploading Files</h3>
+        <div class="text-sm text-secondary mb-4" id="progressSubhead">Progress will update per file.</div>
+
+        <div class="queue-actions mb-3">
+          <button class="btn btn-secondary" id="retryFailedBtn" onclick="retryFailed()" style="display:none;">
+            <i class="fas fa-redo"></i> Retry Failed
+          </button>
+          <button class="btn btn-secondary" onclick="goToQueueFromUpload()">
+            <i class="fas fa-list"></i> Open Queue
+          </button>
+        </div>
+
+        <div id="uploadQueueList"></div>
+
+        <button class="btn btn-secondary mt-4 hidden" id="progressDone" onclick="goToQueueFromUpload()">
+          <i class="fas fa-list"></i> View Queue
+        </button>
+      </div>
+    </main>
+  </div>
+
+  <div id="toastContainer"></div>
+
+  <script src="auth-core.js"></script>
+  <script src="app.js"></script>
+<script src="upgrade-modal.js"></script>
+
+  <script>
+    // =========================
+    // STATE
+    // =========================
+    let filePairs = []; // { video: File, telemetry: File|null, uploadId: string|null, status: string, error: string|null, final: object|null }
+    let connectedAccounts = [];
+    let userPreferences = {};
+    let userPlan = {};
+    let selectedScheduleMode = 'immediate';
+    let loadedGroups = [];        // all groups from /api/groups
+    let selectedGroupIds = [];    // currently selected group IDs for upload
+
+    // =========================
+    // UPLOAD STATE PERSISTENCE (survives refresh)
+    // =========================
+    const ACTIVE_UPLOADS_KEY = 'uploadm8.activeUploads.v1';
+    const UPLOAD_SESSION_KEY = 'uploadm8.uploadSession';
+
+    function persistUploadSession(uploadIds, fileNames) {
+      // Save active upload IDs + metadata so queue page (or refresh) can pick them up
+      const existing = getUploadSession();
+      const ids = [...new Set([...(existing.ids || []), ...uploadIds])];
+      const names = Object.assign({}, existing.filenames || {});
+      uploadIds.forEach((id, i) => { if (fileNames[i]) names[id] = fileNames[i]; });
+
+      const session = { ids, filenames: names, ts: Date.now(), active: true };
+      try {
+        localStorage.setItem(UPLOAD_SESSION_KEY, JSON.stringify(session));
+        // Also update the shared registry that queue.html reads
+        localStorage.setItem(ACTIVE_UPLOADS_KEY, JSON.stringify({ ids, ts: Date.now() }));
+      } catch (_) {}
+    }
+
+    function updateUploadSessionStatus(uploadId, status) {
+      try {
+        const session = getUploadSession();
+        if (!session.statuses) session.statuses = {};
+        session.statuses[uploadId] = status;
+
+        // If all uploads are terminal, mark session inactive
+        const terminal = ['completed', 'failed', 'partial', 'cancelled'];
+        const allDone = session.ids.every(id => terminal.includes((session.statuses[id] || '').toLowerCase()));
+        if (allDone) session.active = false;
+
+        localStorage.setItem(UPLOAD_SESSION_KEY, JSON.stringify(session));
+      } catch (_) {}
+    }
+
+    function getUploadSession() {
+      try {
+        const raw = localStorage.getItem(UPLOAD_SESSION_KEY);
+        if (!raw) return { ids: [], filenames: {}, statuses: {}, active: false };
+        return JSON.parse(raw);
+      } catch (_) {
+        return { ids: [], filenames: {}, statuses: {}, active: false };
+      }
+    }
+
+    function clearUploadSession() {
+      try { localStorage.removeItem(UPLOAD_SESSION_KEY); } catch (_) {}
+    }
+
+    async function checkRedirectToQueue() {
+      // Escape hatch: ?noredirect or ?force skips entirely and clears session
+      const params = new URLSearchParams(window.location.search || '');
+      if (params.has('noredirect') || params.has('force')) {
+        clearUploadSession();
+        return false;
+      }
+
+      const session = getUploadSession();
+      if (!session.active || !session.ids.length) return false;
+
+      // Session stale if older than 40 minutes (max job runtime + headroom)
+      const age = Date.now() - (session.ts || 0);
+      if (age > 40 * 60 * 1000) {
+        clearUploadSession();
+        return false;
+      }
+
+      // Verify actual server status for each session ID before redirecting.
+      // This prevents a crash/OOM on the worker from locking the user out of
+      // upload.html forever — if the server says the job is terminal, clear it.
+      const terminal = ['completed', 'failed', 'partial', 'cancelled', 'error', 'succeeded'];
+      const statuses = session.statuses || {};
+
+      const liveIds = [];
+      for (const id of session.ids) {
+        const localSt = (statuses[id] || '').toLowerCase();
+        // If localStorage already says terminal, skip the API call
+        if (localSt && terminal.includes(localSt)) continue;
+
+        // Ask the server — if API says terminal, don't redirect for this ID
+        try {
+          const resp = await fetch(`/api/uploads/${id}`, { credentials: 'include' });
+          if (resp.ok) {
+            const data = await resp.json();
+            const serverSt = (data.status || '').toLowerCase();
+            if (terminal.includes(serverSt)) {
+              // Update localStorage so we don't hit the API again next time
+              updateUploadSessionStatus(id, serverSt);
+              continue; // skip — this job is done
+            }
+          } else if (resp.status === 404) {
+            // Upload deleted or never created — treat as terminal
+            updateUploadSessionStatus(id, 'failed');
+            continue;
+          }
+        } catch (_) {
+          // Network error — fall back to localStorage status only
+        }
+
+        // If no status at all OR status is non-terminal, job is still live
+        if (!localSt || !terminal.includes(localSt)) {
+          liveIds.push(id);
+        }
+      }
+
+      if (!liveIds.length) {
+        // Every job is terminal — clear session, stay on upload page
+        clearUploadSession();
+        return false;
+      }
+
+      // Genuinely in-flight uploads exist — redirect to queue
+      const focusId = liveIds[0];
+      window.location.href = `queue.html?focus=${encodeURIComponent(focusId)}&from_upload=true`;
+      return true;
+    }
+
+    // =========================
+    // LEGACY STATIC GENERATION HARD-KILL
+    // =========================
+    function disableLegacyStaticGeneration() {
+      // If older markup exists in some deployments, rip it out / disable it defensively.
+      const legacyIds = [
+        'videoTitle','videoCaption','videoHashtags',
+        'generateTitleBtn','generateCaptionBtn','generateHashtagsBtn',
+        'aiTitleBtn','aiCaptionBtn','aiHashtagsBtn',
+        'titleInput','captionInput','hashtagsInput'
+      ];
+
+      let found = false;
+
+      legacyIds.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        found = true;
+
+        // Disable inputs/buttons and hide containers if present.
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.tagName === 'BUTTON') {
+          el.disabled = true;
+        }
+        el.style.display = 'none';
+      });
+
+      // Also disable any buttons that contain "Generate" and reference hashtags/caption/title
+      document.querySelectorAll('button').forEach(btn => {
+        const t = (btn.textContent || '').toLowerCase();
+        if (t.includes('generate') && (t.includes('hashtag') || t.includes('caption') || t.includes('title') || t.includes('ai'))) {
+          btn.disabled = true;
+          btn.style.display = 'none';
+          found = true;
+        }
+      });
+
+      if (found) {
+        const b = document.getElementById('legacyKillBanner');
+        if (b) b.style.display = 'block';
+      }
+    }
+
+    // plan-based concurrency
+    function getConcurrencyCap() {
+      const tier = (userPlan && (userPlan.tier || userPlan.name || '')).toString().toLowerCase();
+      if (tier.includes('pro') || tier.includes('paid') || tier.includes('plus')) return 3;
+      return 1;
+    }
+
+    // =========================
+    // INIT
+    // =========================
+    document.addEventListener('DOMContentLoaded', async () => {
+      disableLegacyStaticGeneration();
+
+      // If uploads were in-flight and page was refreshed, redirect to queue
+      if (await checkRedirectToQueue()) return;
+
+      const user = await initApp('upload');
+      if (!user) return;
+
+      userPlan = user.plan || {};
+      await loadUserPreferences();   // renders preference panel (ALWAYS visible)
+      await loadAccounts();
+      await loadAllGroups();         // load account groups for multi-group selector
+      await applyGroupPreselectFromQuery();
+
+      setupDropZone();
+      setupScheduleOptions();
+
+      document.getElementById('aiPlanPill').textContent = `Plan: ${(userPlan.tier || 'free').toString().toUpperCase()}`;
+      document.getElementById('aiConcurrencyPill').textContent = `Max parallel: ${getConcurrencyCap()}`;
+
+      const privacy = (userPreferences.default_privacy || userPreferences.defaultPrivacy || 'public').toString().toLowerCase();
+      const privacySelect = document.getElementById('privacySelect');
+      if (['public','unlisted','private'].includes(privacy)) privacySelect.value = privacy;
+
+      validateForm();
+    });
+
+    // =========================
+    // API HELPERS
+    // =========================
+    async function loadUserPreferences() {
+      try {
+        const prefs = await apiCall('/api/settings/preferences');
+        userPreferences = normalizePrefs(prefs);
+      } catch (e1) {
+        try {
+          const resp = await apiCall('/api/settings');
+          const prefs = resp.settings || resp.preferences || resp;
+          userPreferences = normalizePrefs(prefs);
+        } catch (e2) {
+          console.warn('Preferences endpoint missing; using defaults:', e2);
+          userPreferences = normalizePrefs({});
+        }
+      }
+      renderPreferencesNotice(); // ALWAYS updates visible panel
+    }
+
+    function normalizePrefs(p) {
+      const prefs = p || {};
+      const always = prefs.always_hashtags || prefs.alwaysHashtags || [];
+      const blocked = prefs.blocked_hashtags || prefs.blockedHashtags || [];
+      const platform = prefs.platform_hashtags || prefs.platformHashtags || {};
+      const maxH = prefs.max_hashtags || prefs.maxHashtags || prefs.ai_hashtag_count || prefs.aiHashtagCount || 15;
+
+      const autoCaptions = (prefs.auto_generate_captions ?? prefs.autoCaptions ?? true);
+      const autoHashtags = (prefs.auto_generate_hashtags ?? prefs.ai_hashtags_enabled ?? prefs.aiHashtagsEnabled ?? true);
+      const autoThumbs = (prefs.auto_thumbnails ?? prefs.autoThumbnails ?? false);
+
+      const defaultPrivacy = prefs.default_privacy || prefs.defaultPrivacy || 'public';
+      const aiStyle = prefs.ai_hashtag_style || prefs.aiHashtagStyle || 'mixed';
+
+      return {
+        always_hashtags: Array.isArray(always) ? always : [],
+        blocked_hashtags: Array.isArray(blocked) ? blocked : [],
+        platform_hashtags: (platform && typeof platform === 'object') ? platform : {},
+        max_hashtags: Number.isFinite(+maxH) ? +maxH : 15,
+        auto_generate_captions: !!autoCaptions,
+        auto_generate_hashtags: !!autoHashtags,
+        auto_thumbnails: !!autoThumbs,
+        ai_hashtag_style: aiStyle,
+        default_privacy: defaultPrivacy
+      };
+    }
+
+    function fmtTags(arr) {
+      const tags = (arr || []).map(t => t.toString().trim()).filter(Boolean).map(t => t.startsWith('#') ? t : `#${t}`);
+      return tags.length ? tags.join(' ') : '—';
+    }
+
+    function fmtPlatformExtra(platformKey) {
+      const v = userPreferences.platform_hashtags?.[platformKey] || userPreferences.platform_hashtags?.[platformKey.toLowerCase()] || [];
+      if (Array.isArray(v)) return fmtTags(v);
+      if (typeof v === 'string') return fmtTags(v.split(/[,\s]+/).filter(Boolean));
+      return '—';
+    }
+
+    function renderPreferencesNotice() {
+      const box = document.getElementById('aiPrefBox');
+
+      const autoItems = [
+        userPreferences.auto_generate_captions ? 'captions' : '',
+        userPreferences.auto_generate_hashtags ? 'hashtags' : '',
+        userPreferences.auto_thumbnails ? 'thumbnails' : ''
+      ].filter(Boolean).join(', ') || '—';
+
+      box.innerHTML = `
+        <div class="ai-pref-row">
+          <div class="k">✅ Always add:</div>
+          <div class="v">${fmtTags(userPreferences.always_hashtags)}</div>
+        </div>
+        <div class="ai-pref-row">
+          <div class="k">🚫 Never use:</div>
+          <div class="v">${fmtTags(userPreferences.blocked_hashtags)}</div>
+        </div>
+        <div class="ai-pref-row">
+          <div class="k"># Max hashtags:</div>
+          <div class="v">${userPreferences.max_hashtags || 15}</div>
+        </div>
+        <div class="ai-pref-row">
+          <div class="k">✨ Auto-generate:</div>
+          <div class="v">${autoItems}</div>
+        </div>
+        <div id="platformPrefDivider" style="border-top:1px solid rgba(255,255,255,0.08); margin:0.5rem 0; display:none;"></div>
+        <div id="platformPrefEmpty" class="ai-pref-row" style="display:none;">
+          <div class="k">Platform extras:</div>
+          <div class="v" style="color:#888;">Select platforms below to see platform-specific hashtags</div>
+        </div>
+        <div id="platformPrefRows"></div>
+      `;
+    }
+
+    async function loadAccounts() {
+      try {
+        const response = await apiCall('/api/platform-accounts');
+        connectedAccounts = response.accounts || [];
+        renderPlatformSelect();
+      } catch (e) {
+        console.error('Failed to load accounts:', e);
+      }
+    }
+
+
+    // =========================
+    // GROUP PRESELECT (UPLOAD FROM GROUP)
+    // =========================
+    async function applyGroupPreselectFromQuery() {
+      try {
+        const params = new URLSearchParams(window.location.search || '');
+
+        // Support single and multiple group IDs from query params
+        let groupIds = params.getAll('group').concat(params.getAll('group_id'), params.getAll('groupId'));
+        // Also check comma-separated
+        const groupsParam = params.get('groups') || params.get('group_ids');
+        if (groupsParam) groupIds = groupIds.concat(groupsParam.split(',').map(s => s.trim()).filter(Boolean));
+
+        // Fallback: check sessionStorage (set by groups page "Upload to Group" button)
+        if (!groupIds.length) {
+          try {
+            const stored = sessionStorage.getItem('upload_selected_group_id');
+            if (stored) groupIds.push(stored);
+          } catch (_) {}
+          try {
+            const storedMulti = sessionStorage.getItem('upload_selected_group_ids');
+            if (storedMulti) groupIds = groupIds.concat(JSON.parse(storedMulti));
+          } catch (_) {}
+        }
+
+        // Deduplicate
+        groupIds = [...new Set(groupIds.filter(Boolean).map(String))];
+        if (!groupIds.length) return;
+
+        // Persist for refresh-resilience
+        try { sessionStorage.setItem('uploadm8_last_group_ids', JSON.stringify(groupIds)); } catch (_) {}
+
+        // Wait for groups to be loaded (they should be by now via loadAllGroups)
+        // Check each group against loaded groups
+        const validGroupIds = groupIds.filter(gid => loadedGroups.some(g => String(g.id) === gid));
+
+        if (!validGroupIds.length) {
+          // Try fetching individually for groups not in the loaded list
+          for (const gid of groupIds) {
+            const group = await fetchGroupById(gid);
+            if (group && !loadedGroups.some(g => String(g.id) === String(group.id))) {
+              loadedGroups.push(group);
+              validGroupIds.push(String(group.id));
+            }
+          }
+        }
+
+        if (!validGroupIds.length) return;
+
+        // Select the groups in the group selector UI
+        selectedGroupIds = validGroupIds;
+        renderGroupSelector(); // re-render to show selected state
+
+        // Auto-check platform checkboxes
+        syncGroupSelection();
+
+        // Show toast confirming
+        const names = validGroupIds.map(gid => {
+          const g = loadedGroups.find(x => String(x.id) === gid);
+          return g?.name || gid;
+        });
+        showToast(`Group${names.length > 1 ? 's' : ''} selected: ${names.join(', ')}`, 'success');
+
+        // Clear sessionStorage so this doesn't re-apply on fresh /upload visit
+        try { sessionStorage.removeItem('upload_selected_group_id'); } catch (_) {}
+        try { sessionStorage.removeItem('upload_selected_group_ids'); } catch (_) {}
+      } catch (e) {
+        console.warn('Group preselect failed:', e);
+      }
+    }
+
+    async function fetchGroupById(groupId) {
+      // Supports multiple backend shapes without breaking existing deployments
+      const candidates = [
+        `/api/groups/${encodeURIComponent(groupId)}`,
+        `/api/groups?id=${encodeURIComponent(groupId)}`,
+      ];
+      for (const url of candidates) {
+        try {
+          const resp = await apiCall(url);
+          if (!resp) continue;
+          // common shapes: {group:{...}} or {...} or {groups:[...]}
+          if (resp.group) return normalizeGroup(resp.group);
+          if (resp.groups && Array.isArray(resp.groups)) {
+            const g = resp.groups.find(x => String((x && x.id) || '') === String(groupId));
+            if (g) return normalizeGroup(g);
+          }
+          if (resp.id || resp.name || resp.account_ids || resp.accountIds) return normalizeGroup(resp);
+        } catch (_) {}
+      }
+
+      // Try list endpoint
+      try {
+        const resp = await apiCall('/api/groups');
+        const arr = (resp && (resp.groups || resp.items || resp)) || [];
+        if (Array.isArray(arr)) {
+          const g = arr.find(x => String((x && x.id) || '') === String(groupId));
+          if (g) return normalizeGroup(g);
+        }
+      } catch (_) {}
+
+      // Last resort: check localStorage cache (groups page caches here)
+      try {
+        const raw = localStorage.getItem('uploadm8_groups_cache');
+        if (raw) {
+          const cached = JSON.parse(raw);
+          if (Array.isArray(cached)) {
+            const g = cached.find(x => String((x && x.id) || '') === String(groupId));
+            if (g) return normalizeGroup(g);
+          }
+        }
+      } catch (_) {}
+
+      return null;
+    }
+
+    function normalizeGroup(g) {
+      if (!g) return null;
+      // flatten possible nesting {data:{...}}
+      if (g.data && typeof g.data === 'object') {
+        return Object.assign({}, g.data, { id: g.id ?? g.data.id, account_ids: g.account_ids ?? g.data.account_ids ?? g.data.accountIds });
+      }
+      return g;
+    }
+
+    // =========================
+    // SCHEDULING
+    // =========================
+    function setupScheduleOptions() {
+      document.querySelectorAll('.schedule-option').forEach(option => {
+        option.addEventListener('click', () => {
+          const mode = option.dataset.mode;
+          selectedScheduleMode = mode;
+
+          document.querySelectorAll('.schedule-option').forEach(o => o.classList.remove('selected'));
+          option.classList.add('selected');
+          option.querySelector('input').checked = true;
+
+          document.getElementById('scheduleDateTime').classList.toggle('hidden', mode !== 'scheduled');
+          document.getElementById('smartScheduleDays').classList.toggle('hidden', mode !== 'smart');
+
+          validateForm();
+        });
+      });
+
+      document.getElementById('scheduleTimeInput').addEventListener('change', validateForm);
+      document.getElementById('privacySelect').addEventListener('change', validateForm);
+      document.getElementById('batchMode').addEventListener('change', validateForm);
+
+      // Smart schedule: custom days input + preset buttons
+      const smartInput = document.getElementById('smartDaysInput');
+      smartInput.addEventListener('input', () => {
+        updateSmartDaysLabel();
+        validateForm();
+      });
+      smartInput.addEventListener('change', () => {
+        // Clamp value on blur
+        let v = parseInt(smartInput.value, 10);
+        if (isNaN(v) || v < 1) v = 1;
+        if (v > 730) v = 730;
+        smartInput.value = v;
+        updateSmartDaysLabel();
+        validateForm();
+      });
+
+      // Preset buttons
+      document.querySelectorAll('.smart-days-preset').forEach(btn => {
+        btn.addEventListener('click', () => {
+          smartInput.value = btn.dataset.days;
+          updateSmartDaysLabel();
+          validateForm();
+        });
+      });
+
+      updateSmartDaysLabel();
+    }
+
+    function updateSmartDaysLabel() {
+      const input = document.getElementById('smartDaysInput');
+      const label = document.getElementById('smartDaysLabel');
+      if (!input || !label) return;
+
+      const days = parseInt(input.value, 10) || 0;
+      if (days <= 0) { label.textContent = ''; return; }
+      if (days < 7) { label.textContent = `= ${days} day${days > 1 ? 's' : ''}`; return; }
+      if (days < 30) { const w = (days / 7).toFixed(1).replace(/\.0$/, ''); label.textContent = `≈ ${w} week${w == 1 ? '' : 's'}`; return; }
+      if (days < 365) { const m = (days / 30.44).toFixed(1).replace(/\.0$/, ''); label.textContent = `≈ ${m} month${m == 1 ? '' : 's'}`; return; }
+      const y = (days / 365.25).toFixed(1).replace(/\.0$/, ''); label.textContent = `≈ ${y} year${y == 1 ? '' : 's'}`;
+    }
+
+    // =========================
+    // PLATFORMS
+    // =========================
+    function getPlatformInfo(platform) {
+      const map = {
+        tiktok:    { name: 'TikTok',    icon: 'fab fa-tiktok',   color: '#ffffff' },
+        youtube:   { name: 'YouTube',   icon: 'fab fa-youtube',  color: '#ff0000' },
+        instagram: { name: 'Instagram', icon: 'fab fa-instagram',color: '#e1306c' },
+        facebook:  { name: 'Facebook',  icon: 'fab fa-facebook', color: '#1877f2' }
+      };
+      return map[platform] || { name: platform, icon: 'fas fa-share-alt', color: 'var(--text-secondary)' };
+    }
+
+    function renderPlatformSelect() {
+      const container = document.getElementById('platformSelect');
+      const platforms = ['tiktok', 'youtube', 'instagram', 'facebook'];
+
+      container.innerHTML = platforms.map(platform => {
+        const info = getPlatformInfo(platform);
+        const accounts = connectedAccounts.filter(a => a.platform === platform);
+        const hasAccount = accounts.length > 0;
+
+        return `
+          <label class="platform-option ${!hasAccount ? 'disabled' : ''}" data-platform="${platform}">
+            <input type="checkbox" name="platforms" value="${platform}" ${!hasAccount ? 'disabled' : ''}>
+            <i class="${info.icon}" style="color: ${info.color}; font-size: 1.5rem;"></i>
+            <div>
+              <div class="font-medium">${info.name}</div>
+              <div class="text-xs text-secondary">${hasAccount ? accounts.length + ' account(s)' : 'Not connected'}</div>
+            </div>
+          </label>
+        `;
+      }).join('');
+
+      container.querySelectorAll('.platform-option:not(.disabled)').forEach(option => {
+        option.addEventListener('click', () => {
+          const checkbox = option.querySelector('input');
+          checkbox.checked = !checkbox.checked;
+          option.classList.toggle('selected', checkbox.checked);
+          validateForm();
+        });
+      });
+    }
+
+    // =========================
+    // FILES + PAIRING
+    // =========================
+    function setupDropZone() {
+      const dropZone = document.getElementById('dropZone');
+      const fileInput = document.getElementById('fileInput');
+
+      dropZone.addEventListener('click', () => fileInput.click());
+
+      ['dragenter', 'dragover'].forEach(e => {
+        dropZone.addEventListener(e, (ev) => {
+          ev.preventDefault();
+          dropZone.classList.add('drag-over');
+        });
+      });
+
+      ['dragleave', 'drop'].forEach(e => {
+        dropZone.addEventListener(e, (ev) => {
+          ev.preventDefault();
+          dropZone.classList.remove('drag-over');
+        });
+      });
+
+      dropZone.addEventListener('drop', (e) => handleFiles(Array.from(e.dataTransfer.files)));
+      fileInput.addEventListener('change', (e) => handleFiles(Array.from(e.target.files)));
+    }
+
+    function baseName(name) {
+      return name.replace(/\.[^/.]+$/, '').toLowerCase();
+    }
+
+    function handleFiles(files) {
+      const validFiles = files.filter(file =>
+        file.type.startsWith('video/') || file.name.toLowerCase().endsWith('.map')
+      );
+
+      if (validFiles.length === 0) {
+        showToast('Please select valid video or .map files', 'error');
+        return;
+      }
+
+      const maxSize = 5 * 1024 * 1024 * 1024;
+      const oversizedFiles = validFiles.filter(f => f.size > maxSize);
+      if (oversizedFiles.length > 0) {
+        showToast(`${oversizedFiles.length} file(s) exceed 5GB limit`, 'error');
+        return;
+      }
+
+      const videos = validFiles.filter(f => f.type.startsWith('video/'));
+      const telemetryFiles = validFiles.filter(f => f.name.toLowerCase().endsWith('.map'));
+
+      if (videos.length === 0) {
+        showToast('Please select at least one video file', 'error');
+        return;
+      }
+
+      const telemetryByBase = new Map();
+      telemetryFiles.forEach(t => telemetryByBase.set(baseName(t.name), t));
+
+      filePairs = videos.map(videoFile => {
+        const vBase = baseName(videoFile.name);
+        const matchingTelemetry = telemetryByBase.get(vBase) || null;
+        return { video: videoFile, telemetry: matchingTelemetry, uploadId: null, status: 'pending', error: null, final: null };
+      });
+
+      renderFileList();
+      validateForm();
+    }
+
+    function formatFileSize(bytes) {
+      const units = ['B','KB','MB','GB','TB'];
+      let i = 0, n = bytes;
+      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+      return `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+    }
+
+    function renderFileList() {
+      const fileList = document.getElementById('fileList');
+      const dropZone = document.getElementById('dropZone');
+
+      if (filePairs.length === 0) {
+        fileList.classList.add('hidden');
+        dropZone.classList.remove('hidden');
+        return;
+      }
+
+      dropZone.classList.add('hidden');
+      fileList.classList.remove('hidden');
+
+      fileList.innerHTML = filePairs.map((pair, index) => {
+        const hasTelemetry = pair.telemetry !== null;
+        return `
+          <div class="file-item">
+            <i class="file-item-icon fas fa-film"></i>
+            <div class="file-item-info">
+              <div class="file-item-name">${pair.video.name}</div>
+              <div class="file-item-size">${formatFileSize(pair.video.size)}</div>
+              ${
+                hasTelemetry
+                  ? `<div class="paired-files">
+                      <i class="fas fa-link"></i>
+                      <span>Paired with: ${pair.telemetry.name}</span>
+                      <i class="fas fa-tachometer-alt" style="color: var(--accent-orange);" title="Telemetry attached (Trill analysis enabled)"></i>
+                    </div>`
+                  : `<div class="paired-files">
+                      <i class="fas fa-circle-info"></i>
+                      <span>No telemetry (.map) matched</span>
+                    </div>`
+              }
+            </div>
+            <div class="file-item-actions">
+              <button class="btn btn-ghost btn-sm" onclick="removeFilePair(${index})" title="Remove">
+                <i class="fas fa-times"></i>
+              </button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function removeFilePair(index) {
+      filePairs.splice(index, 1);
+      renderFileList();
+      validateForm();
+    }
+
+    // =========================
+    // VALIDATION
+    // =========================
+    function validateForm() {
+      const hasFiles = filePairs.length > 0;
+      const selectedPlatforms = Array.from(document.querySelectorAll('input[name="platforms"]:checked'));
+      const hasPlatforms = selectedPlatforms.length > 0;
+
+      let scheduleOk = true;
+      if (selectedScheduleMode === 'scheduled') {
+        scheduleOk = !!document.getElementById('scheduleTimeInput').value;
+      }
+
+      const isValid = hasFiles && hasPlatforms && scheduleOk;
+      document.getElementById('uploadBtn').disabled = !isValid;
+
+      const uploadHint = document.getElementById('uploadHint');
+      if (!hasFiles && !hasPlatforms) uploadHint.textContent = 'Select video files and platforms to continue';
+      else if (!hasFiles) uploadHint.textContent = 'Select at least one video file';
+      else if (!hasPlatforms) uploadHint.textContent = 'Select at least one platform';
+      else if (!scheduleOk) uploadHint.textContent = 'Select a date/time for scheduled publishing';
+      else uploadHint.textContent = `Ready to upload ${filePairs.length} video(s) to ${selectedPlatforms.length} platform(s)`;
+    }
+
+    // =========================
+    // UNLOAD GUARD — warns user before leaving mid-upload
+    // =========================
+    let _uploadsInFlight = false;
+
+    window.addEventListener('beforeunload', (e) => {
+        if (_uploadsInFlight) {
+            e.preventDefault();
+            e.returnValue = 'Uploads are in progress — your files will be lost if you leave. Are you sure?';
+            return e.returnValue;
+        }
+    });
+
+    // =========================
+    // UPLOAD FLOW
+    // =========================
+    async function startUpload() {
+      if (filePairs.length === 0) return showToast('Please select at least one video file', 'error');
+
+      const platforms = Array.from(document.querySelectorAll('input[name="platforms"]:checked')).map(cb => cb.value);
+      if (platforms.length === 0) return showToast('Please select at least one platform', 'error');
+
+      let scheduledTime = null;
+      let smartScheduleDays = 14;
+      if (selectedScheduleMode === 'scheduled') {
+        scheduledTime = document.getElementById('scheduleTimeInput').value;
+        if (!scheduledTime) return showToast('Please select a date and time', 'error');
+      } else if (selectedScheduleMode === 'smart') {
+        smartScheduleDays = parseInt(document.getElementById('smartDaysInput').value, 10);
+      }
+
+      const privacy = document.getElementById('privacySelect').value || 'public';
+      const targetAccountIds = resolveTargetAccountIds(platforms);
+
+      // Clear any previous session
+      try {
+        localStorage.removeItem(UPLOAD_SESSION_KEY);
+        localStorage.removeItem(ACTIVE_UPLOADS_KEY);
+      } catch (_) {}
+
+      document.getElementById('uploadForm').classList.add('hidden');
+      document.getElementById('uploadProgress').classList.remove('hidden');
+
+      filePairs.forEach(p => { p.status = 'pending'; p.error = null; p.final = null; p.uploadId = null; });
+      renderUploadQueue();
+
+      const uploadCtx = { platforms, scheduledTime, smartScheduleDays, privacy, targetAccountIds };
+
+      // ─────────────────────────────────────────────────────────────────
+      // PHASE 1: Pre-register ALL uploads simultaneously
+      // Get every upload_id BEFORE a single byte is transferred.
+      // This way a refresh at any point still has all IDs in localStorage.
+      // ─────────────────────────────────────────────────────────────────
+      document.getElementById('progressSubhead').textContent = 'Registering uploads…';
+
+      const presignResults = await Promise.allSettled(
+        filePairs.map((pair, idx) => presignOne(idx, uploadCtx))
+      );
+
+      // Save all IDs that were successfully registered
+      const registeredIds = filePairs.map(p => p.uploadId).filter(Boolean);
+      const registeredNames = filePairs.map(p => p.video.name);
+      if (registeredIds.length) {
+        persistUploadSession(registeredIds, registeredNames);
+      }
+
+      // Mark any that failed presign as errors immediately
+      const anyRegistered = presignResults.some(r => r.status === 'fulfilled');
+      if (!anyRegistered) {
+        showToast('Failed to register uploads — check your connection and try again', 'error');
+        document.getElementById('uploadForm').classList.remove('hidden');
+        document.getElementById('uploadProgress').classList.add('hidden');
+        return;
+      }
+
+      // ─────────────────────────────────────────────────────────────────
+      // PHASE 2: Transfer bytes + complete — now all IDs are already saved
+      // ─────────────────────────────────────────────────────────────────
+      const mode = document.getElementById('batchMode').value;
+      const cap = getConcurrencyCap();
+      const concurrency = (mode === 'parallel') ? cap : 1;
+      document.getElementById('progressSubhead').textContent = `Uploading ${filePairs.length} video(s) • Mode: ${mode.toUpperCase()} • Concurrency: ${concurrency}`;
+
+      _uploadsInFlight = true;
+
+      const tasks = filePairs
+        .map((pair, idx) => ({ pair, idx }))
+        .filter(({ pair }) => pair.uploadId && pair.status !== 'error') // skip failed presigns
+        .map(({ idx }) => () => transferAndComplete(idx, uploadCtx));
+
+      let successCount = 0;
+      if (concurrency === 1) {
+        for (const task of tasks) {
+          const ok = await task();
+          if (ok) successCount++;
+        }
+      } else {
+        const results = await promisePool(tasks, concurrency);
+        successCount = results.filter(Boolean).length;
+      }
+
+      _uploadsInFlight = false;
+
+      // Update session statuses
+      filePairs.forEach(pair => {
+        if (pair.uploadId) {
+          updateUploadSessionStatus(pair.uploadId, pair.status === 'success' ? 'completed' : pair.status);
+        }
+      });
+
+      const failedCount = filePairs.filter(p => p.status === 'error').length;
+      document.getElementById('retryFailedBtn').style.display = failedCount > 0 ? 'inline-flex' : 'none';
+      showToast(`Uploaded ${successCount}/${filePairs.length}. Failed: ${failedCount}.`, successCount > 0 ? 'success' : 'error');
+      document.getElementById('progressDone').classList.remove('hidden');
+    }
+
+    // Phase 1: call presign for one file, save upload_id, update UI
+    async function presignOne(index, ctx) {
+      const pair = filePairs[index];
+      updateUploadStatus(index, 'Registering…');
+
+      const presignBody = {
+        filename: pair.video.name,
+        file_size: pair.video.size,
+        content_type: pair.video.type || 'application/octet-stream',
+        platforms: ctx.platforms,
+        has_telemetry: pair.telemetry !== null,
+        schedule_mode: selectedScheduleMode,
+        scheduled_time: ctx.scheduledTime,
+        smart_schedule_days: ctx.smartScheduleDays,
+        privacy: ctx.privacy
+      };
+      if (ctx.targetAccountIds && ctx.targetAccountIds.length > 0) {
+        presignBody.account_ids = ctx.targetAccountIds;
+      }
+      if (selectedGroupIds.length > 0) {
+        presignBody.group_ids = selectedGroupIds;
+      }
+
+      try {
+        const resp = await apiCall('/api/uploads/presign', {
+          method: 'POST',
+          body: JSON.stringify(presignBody)
+        });
+        pair.uploadId = resp.upload_id;
+        pair._presignResp = resp; // store full response for phase 2
+        pair.status = 'pending';
+        updateUploadStatus(index, `Registered — waiting to upload…`);
+        renderUploadQueue(); // show ID immediately
+        return true;
+      } catch (err) {
+        // Check for billing 429 (insufficient PUT/AIC) — show upgrade modal
+        if (window.handleEntitlementError && window.handleEntitlementError(err)) {
+          pair.status = 'error';
+          pair.error = err.response?.message || err.message || 'Insufficient balance';
+          renderUploadQueue();
+          return false;
+        }
+        pair.status = 'error';
+        pair.error = `Failed to register: ${err.message || err}`;
+        renderUploadQueue();
+        return false;
+      }
+    }
+
+    // Phase 2: transfer bytes to R2 + call /complete + poll
+    async function transferAndComplete(index, ctx) {
+      const pair = filePairs[index];
+      const resp = pair._presignResp;
+      if (!resp) { pair.status = 'error'; pair.error = 'No presign data'; renderUploadQueue(); return false; }
+
+      pair.status = 'uploading';
+      renderUploadQueue();
+
+      try {
+        updateUploadStatus(index, 'Uploading video…');
+        await uploadToR2WithProgress(pair.video, resp.presigned_url, index);
+
+        if (pair.telemetry && resp.telemetry_presigned_url) {
+          updateUploadStatus(index, 'Uploading telemetry…');
+          await uploadToR2(pair.telemetry, resp.telemetry_presigned_url);
+        }
+
+        updateUploadStatus(index, 'Finalising…');
+
+        const completeBody = { platforms: ctx.platforms, privacy: ctx.privacy };
+        if (ctx.targetAccountIds && ctx.targetAccountIds.length > 0) {
+          completeBody.account_ids = ctx.targetAccountIds;
+        }
+        if (selectedGroupIds.length > 0) {
+          completeBody.group_ids = selectedGroupIds;
+        }
+
+        await apiCall(`/api/uploads/${pair.uploadId}/complete`, {
+          method: 'POST',
+          body: JSON.stringify(completeBody)
+        });
+
+        updateUploadStatus(index, 'Queued — polling status…');
+        updateUploadSessionStatus(pair.uploadId, 'processing');
+
+        const final = await safePollUpload(pair.uploadId, index);
+        pair.final = final;
+
+        if (!final) {
+          pair.status = 'success';
+          updateUploadStatus(index, 'Uploaded. Check Queue for processing status.');
+          updateUploadSessionStatus(pair.uploadId, 'processing');
+          renderUploadQueue();
+          return true;
+        }
+
+        const finalSt = (final.status || '').toLowerCase();
+        if (finalSt === 'completed' || finalSt === 'partial') {
+          pair.status = 'success';
+          pair.error = finalSt === 'partial' ? buildFailureMessage(final) : null;
+          updateUploadSessionStatus(pair.uploadId, finalSt);
+        } else if (finalSt === 'failed' || finalSt === 'cancelled') {
+          pair.status = 'error';
+          pair.error = buildFailureMessage(final);
+          updateUploadSessionStatus(pair.uploadId, 'failed');
+        } else {
+          pair.status = 'success';
+          updateUploadSessionStatus(pair.uploadId, 'completed');
+        }
+        renderUploadQueue();
+        return pair.status === 'success';
+
+      } catch (error) {
+        console.error(`Transfer failed for ${pair.video.name}:`, error);
+        pair.status = 'error';
+        pair.error = extractErrorMessage(error);
+        if (pair.uploadId) updateUploadSessionStatus(pair.uploadId, 'failed');
+        renderUploadQueue();
+        return false;
+      }
+    }
+
+    // R2 upload with XHR progress reporting
+    async function uploadToR2WithProgress(file, url, index) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.upload.addEventListener('progress', (e) => {
+          if (e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 100);
+            updateUploadStatus(index, `Uploading video… ${pct}%`);
+            updateUploadStatusProgress(index, `Uploading… ${pct}%`, pct * 0.4); // R2 upload = first 40% of overall bar
+          }
+        });
+        xhr.addEventListener('load', () => {
+          if (xhr.status >= 200 && xhr.status < 300) resolve();
+          else reject(new Error(`R2 upload failed: ${xhr.status}`));
+        });
+        xhr.addEventListener('error', () => reject(new Error('R2 upload network error')));
+        xhr.open('PUT', url);
+        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+        xhr.send(file);
+      });
+    }
+
+    async function promisePool(taskFns, concurrency) {
+      const results = new Array(taskFns.length);
+      let nextIndex = 0;
+
+      async function worker() {
+        while (nextIndex < taskFns.length) {
+          const i = nextIndex++;
+          try { results[i] = await taskFns[i](); }
+          catch { results[i] = false; }
+        }
+      }
+
+      const workers = Array.from({ length: Math.min(concurrency, taskFns.length) }, worker);
+      await Promise.all(workers);
+      return results;
+    }
+
+    function renderUploadQueue() {
+      const container = document.getElementById('uploadQueueList');
+
+      const statusIcon = {
+        pending:   '<i class="fas fa-clock" style="color:var(--text-secondary);"></i>',
+        uploading: '<i class="fas fa-arrow-up" style="color:var(--accent-orange);"></i>',
+        success:   '<i class="fas fa-check-circle" style="color:var(--success-color);"></i>',
+        error:     '<i class="fas fa-exclamation-circle" style="color:var(--error-color);"></i>'
+      };
+
+      container.innerHTML = filePairs.map((pair, index) => {
+        const statusText = {
+          pending:   pair.uploadId ? 'Registered — waiting to upload…' : 'Registering…',
+          uploading: 'Uploading…',
+          success:   pair.final
+            ? `Done: ${pair.final.status}${pair.final.video_url ? ' • URL ready' : ''}`
+            : 'Uploaded — processing will begin shortly',
+          error: `Error: ${pair.error || 'Upload failed'}`
+        }[pair.status] || 'Waiting…';
+
+        // Show upload ID badge as soon as we have it — before any bytes transfer
+        const idBadge = pair.uploadId
+          ? `<div class="upload-id-badge" title="Click to copy upload ID" onclick="copyUploadId('${pair.uploadId}')">
+               <i class="fas fa-fingerprint"></i>
+               <code>${pair.uploadId}</code>
+               <i class="fas fa-copy"></i>
+             </div>`
+          : '';
+
+        const actionBtns = `
+          <div class="queue-actions">
+            ${pair.status === 'error' ? `<button class="btn btn-secondary" onclick="retrySingleTransfer(${index})"><i class="fas fa-redo"></i> Retry</button>` : ''}
+            ${pair.uploadId ? `<button class="btn btn-secondary" onclick="openUploadInQueue('${pair.uploadId}')"><i class="fas fa-external-link-alt"></i> View in Queue</button>` : ''}
+          </div>
+        `;
+
+        return `
+          <div class="upload-queue-item ${pair.status}" id="uploadItem${index}">
+            <div style="display:flex; align-items:flex-start; gap:1rem;">
+              <div style="font-size:1.5rem; margin-top:2px;">${statusIcon[pair.status] || statusIcon.pending}</div>
+              <div style="flex:1;">
+                <div style="font-weight:700;">${pair.video.name}</div>
+                <div style="font-size:0.85rem; color: var(--text-secondary);" id="uploadStatus${index}">${statusText}</div>
+                ${idBadge}
+                ${actionBtns}
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function updateUploadStatus(index, message) {
+      const statusEl = document.getElementById(`uploadStatus${index}`);
+      if (statusEl) statusEl.textContent = message;
+    }
+
+    function openUploadInQueue(uploadId) {
+      window.location.href = `queue.html?focus=${encodeURIComponent(uploadId)}&from_upload=true`;
+    }
+
+    function copyUploadId(id) {
+      navigator.clipboard.writeText(id).then(() => showToast('Upload ID copied', 'success')).catch(() => {});
+    }
+
+    async function retrySingleTransfer(index) {
+      const pair = filePairs[index];
+      if (!pair) return;
+
+      const platforms = Array.from(document.querySelectorAll('input[name="platforms"]:checked')).map(cb => cb.value);
+      const privacy = document.getElementById('privacySelect').value || 'public';
+      let scheduledTime = null, smartScheduleDays = 14;
+      if (selectedScheduleMode === 'scheduled') scheduledTime = document.getElementById('scheduleTimeInput').value;
+      if (selectedScheduleMode === 'smart') smartScheduleDays = parseInt(document.getElementById('smartDaysInput').value, 10);
+      const targetAccountIds = resolveTargetAccountIds(platforms);
+      const ctx = { platforms, scheduledTime, smartScheduleDays, privacy, targetAccountIds };
+
+      if (pair.uploadId && pair._presignResp) {
+        // Already registered — just retry the R2 transfer using existing presign
+        // If presigned URL may have expired (>1 hour), fetch a fresh one
+        const presignAge = pair._presignTs ? (Date.now() - pair._presignTs) : Infinity;
+        if (presignAge > 55 * 60 * 1000) {
+          updateUploadStatus(index, 'Getting fresh upload URL…');
+          try {
+            const fresh = await apiCall(`/api/uploads/${pair.uploadId}/reprepare`, { method: 'POST' });
+            pair._presignResp = { ...pair._presignResp, ...fresh };
+          } catch (e) {
+            // If reprepare fails, fall through to full re-register
+            pair.uploadId = null;
+            pair._presignResp = null;
+          }
+        }
+      }
+
+      if (!pair.uploadId) {
+        // No ID yet — full presign + transfer
+        await presignOne(index, ctx);
+        persistUploadSession(filePairs.map(p => p.uploadId).filter(Boolean), filePairs.map(p => p.video.name));
+      }
+
+      if (pair.uploadId) {
+        _uploadsInFlight = true;
+        await transferAndComplete(index, ctx);
+        _uploadsInFlight = false;
+      }
+
+      const failedCount = filePairs.filter(p => p.status === 'error').length;
+      document.getElementById('retryFailedBtn').style.display = failedCount > 0 ? 'inline-flex' : 'none';
+    }
+
+    async function retryFailed() {
+      const failed = filePairs.map((p, i) => i).filter(i => filePairs[i].status === 'error');
+      if (!failed.length) return;
+      _uploadsInFlight = true;
+      for (const idx of failed) await retrySingleTransfer(idx);
+      _uploadsInFlight = false;
+      const failedCount = filePairs.filter(p => p.status === 'error').length;
+      document.getElementById('retryFailedBtn').style.display = failedCount > 0 ? 'inline-flex' : 'none';
+    }
+
+    function extractErrorMessage(err) {
+      if (!err) return 'Upload failed';
+      if (typeof err === 'string') return err;
+      return err.message || 'Upload failed';
+    }
+
+    function buildFailureMessage(u) {
+      const code = u.error_code || u.errorCode || 'FAILED';
+      const detail = u.error_detail || u.errorDetail || '';
+      if (detail) return `${code}: ${detail}`;
+      return code;
+    }
+
+    async function safePollUpload(uploadId, index) {
+      try {
+        return await pollUpload(uploadId, index);
+      } catch (e) {
+        console.warn('Polling failed:', e);
+        updateUploadStatus(index, 'Uploaded. Check Queue for processing status.');
+        return null;
+      }
+    }
+
+    // Terminal statuses: poll stops when any of these are reached.
+    // staged / ready_to_publish are EXIT conditions for the poll loop
+    // (the browser hands off to the queue page — no infinite spinner).
+    const TERMINAL_STATUSES = ['completed', 'succeeded', 'failed', 'partial', 'cancelled', 'staged', 'ready_to_publish'];
+
+    // Stage emoji labels — matches worker STAGE_PROGRESS keys
+    const STAGE_LABELS = {
+      init:      '⚙️ Initialising',
+      download:  '⬇️ Downloading',
+      telemetry: '📡 Reading telemetry',
+      hud:       '🎨 Applying HUD',
+      watermark: '🔏 Watermarking',
+      transcode: '🎬 Transcoding',
+      thumbnail: '🖼️ Generating thumbnail',
+      caption:   '✍️ Writing captions',
+      upload:    '☁️ Uploading to R2',
+      publish:   '🚀 Publishing',
+      notify:    '🔔 Notifying',
+    };
+
+    // Read actual video duration from the browser File object
+    function getVideoDuration(file) {
+      return new Promise(resolve => {
+        const url = URL.createObjectURL(file);
+        const vid = document.createElement('video');
+        vid.preload = 'metadata';
+        vid.onloadedmetadata = () => { URL.revokeObjectURL(url); resolve(vid.duration || 0); };
+        vid.onerror = () => { URL.revokeObjectURL(url); resolve(0); };
+        vid.src = url;
+      });
+    }
+
+    // Fetch personal average from DB — only used when reliable (≥3 samples)
+    async function getPersonalAvg() {
+      try {
+        const r = await apiCall('/api/analytics/my-avg-processing');
+        if (r?.reliable && r.avg_processing_seconds > 0) {
+          return { ms: r.avg_processing_seconds * 1000, reliable: true, samples: r.sample_count };
+        }
+      } catch (e) { /* silent */ }
+      return { ms: null, reliable: false };
+    }
+
+    /**
+     * Physics-based worker time estimate.
+     *
+     * The old code did:  estimate = avgFallback × durationRatio
+     * Bug: avgFallback (420s) already represents a full job. Multiplying by
+     * durationRatio (e.g. 3 for a 3-min clip) = 21 min. That is what you saw.
+     *
+     * Correct model — bottlenecks are:
+     *   FFmpeg transcode:  ~0.35s of CPU per video-second, per platform
+     *   Fixed overhead:    ~60s (download, caption AI, publish API calls, notify)
+     *   File size penalty: large files take longer to pull from R2 before transcode
+     *
+     * Examples:
+     *   30s clip, 1 platform, 80MB  → (30×0.35×1) + 60 + 2  = 72s  ≈ 1.2 min ✓
+     *   60s clip, 4 platforms, 300MB→ (60×0.35×4) + 60 + 9  = 153s ≈ 2.5 min ✓
+     *   3min clip, 4 platforms, 1GB → (180×0.35×4)+60 + 30  = 342s ≈ 5.7 min ✓
+     */
+    function physicsEstimateMs(durationSec, platformCount, fileSizeBytes) {
+      const TRANSCODE  = 0.35;   // s CPU per video-second per platform
+      const OVERHEAD   = 60;     // fixed cost regardless of video length
+      const platforms  = Math.max(1, platformCount || 1);
+      const duration   = Math.max(15, durationSec || 30);
+      const sizeMB     = (fileSizeBytes || 0) / (1024 * 1024);
+      const sizePenalty = Math.min(sizeMB * 0.03, 30); // ~0.03s/MB, cap 30s
+      return Math.round((duration * TRANSCODE * platforms) + OVERHEAD + sizePenalty) * 1000;
+    }
+
+    function fmtElapsed(ms) {
+      const s = Math.floor(ms / 1000);
+      return s < 60 ? `${s}s` : `${Math.floor(s/60)}m ${s%60}s`;
+    }
+
+    function fmtRemaining(ms) {
+      if (ms <= 0) return 'finishing up…';
+      const s = Math.ceil(ms / 1000);
+      return s < 90 ? `~${s}s remaining` : `~${Math.ceil(s/60)}m remaining`;
+    }
+
+    async function pollUpload(uploadId, index) {
+      const pair        = filePairs[index];
+      const clientStart = Date.now();
+      const TIMEOUT_MS  = 35 * 60 * 1000;  // 35 min hard cap
+      const POLL_MS     = 3000;
+
+      // ── Immediate check — job may already be done ─────────────────────
+      try {
+        const first = await apiCall(`/api/uploads/${uploadId}`);
+        if (TERMINAL_STATUSES.includes((first.status || '').toLowerCase())) return first;
+      } catch (_) {}
+
+      // ── Build estimate inputs ─────────────────────────────────────────
+      const [personal, videoDuration] = await Promise.all([
+        getPersonalAvg(),
+        pair?.video ? getVideoDuration(pair.video) : Promise.resolve(0),
+      ]);
+
+      const platformCount =
+        document.querySelectorAll('input[name="platforms"]:checked').length || 1;
+      const fileSizeBytes = pair?.video?.size || 0;
+
+      const physicsMs = physicsEstimateMs(videoDuration, platformCount, fileSizeBytes);
+
+      // Use personal history ONLY if reliable — never multiply it by durationRatio
+      // (personal avg already reflects this user's actual clips; scaling it double-counts)
+      let workerEstimateMs = personal.reliable ? personal.ms : physicsMs;
+
+      // ── Phase state ───────────────────────────────────────────────────
+      let workerStartMs  = null;   // set when processingStartedAt arrives from server
+      let lastPct        = null;
+      let lastStage      = null;
+
+      // ── 1s display tick ──────────────────────────────────────────────
+      const tick = setInterval(() => {
+        if (!workerStartMs) {
+          // Still in Redis queue — elapsed since /complete was called
+          const queuedSec = Math.floor((Date.now() - clientStart) / 1000);
+          updateUploadStatus(index, `⏳ Queued… ${queuedSec}s — waiting for a worker`);
+          return;
+        }
+
+        const workerElapsed  = Date.now() - workerStartMs;
+        const remaining      = Math.max(0, workerEstimateMs - workerElapsed);
+
+        if (lastPct != null) {
+          const label = STAGE_LABELS[lastStage] || (lastStage || 'Processing');
+          updateUploadStatusProgress(
+            index,
+            `${label} • ${lastPct}% • ${fmtElapsed(workerElapsed)} elapsed • ${fmtRemaining(remaining)}`,
+            lastPct
+          );
+        } else {
+          updateUploadStatus(index,
+            `🔄 Processing… ${fmtElapsed(workerElapsed)} elapsed • ${fmtRemaining(remaining)}`
+          );
+        }
+      }, 1000);
+
+      // ── Poll loop ─────────────────────────────────────────────────────
+      try {
+        while (Date.now() - clientStart < TIMEOUT_MS) {
+          let u;
+          try { u = await apiCall(`/api/uploads/${uploadId}`); }
+          catch (_) { await new Promise(r => setTimeout(r, POLL_MS)); continue; }
+
+          const st = (u.status || '').toLowerCase();
+
+          // Anchor timer to server clock the moment worker picks up the job
+          if (u.processingStartedAt && !workerStartMs) {
+            workerStartMs = new Date(u.processingStartedAt).getTime();
+          }
+
+          // Live progress heartbeat from worker
+          if (u.processingProgress != null) {
+            lastPct   = u.processingProgress;
+            lastStage = u.processingStage || null;
+
+            // Refine estimate with live data: if we're at X% after Y ms,
+            // full job ≈ Y/X*100. Blend 70% live / 30% physics to smooth jitter.
+            if (workerStartMs && lastPct > 5) {
+              const elapsed     = Date.now() - workerStartMs;
+              const impliedTotal = (elapsed / lastPct) * 100;
+              workerEstimateMs  = Math.round(impliedTotal * 0.7 + workerEstimateMs * 0.3);
+            }
+          }
+
+          // ── Staged: smart/scheduled upload confirmed, hand off to queue page ──
+          if (st === 'staged') {
+            clearInterval(tick);
+            const schedTime = u.scheduled_time || u.scheduledTime || null;
+            let msg = '📅 Scheduled! Your upload will process automatically.';
+            if (schedTime) {
+              try {
+                const d = new Date(schedTime);
+                const fmt = d.toLocaleString(undefined, {
+                  weekday: 'short', month: 'short', day: 'numeric',
+                  hour: 'numeric', minute: '2-digit', timeZoneName: 'short'
+                });
+                msg = `📅 Scheduled for ${fmt}. Tracking in your Queue.`;
+              } catch(e) {}
+            }
+            updateUploadStatus(index, msg);
+            return u;
+          }
+
+          // ── Ready to publish: processing done, waiting for publish time ──
+          if (st === 'ready_to_publish') {
+            clearInterval(tick);
+            const schedTime = u.scheduled_time || u.scheduledTime || null;
+            let msg = '✅ Processed! Publishing at scheduled time.';
+            if (schedTime) {
+              try {
+                const d = new Date(schedTime);
+                const fmt = d.toLocaleString(undefined, {
+                  weekday: 'short', month: 'short', day: 'numeric',
+                  hour: 'numeric', minute: '2-digit', timeZoneName: 'short'
+                });
+                msg = `✅ Processed! Publishing ${fmt}.`;
+              } catch(e) {}
+            }
+            updateUploadStatus(index, msg);
+            return u;
+          }
+
+          if (TERMINAL_STATUSES.includes(st)) {
+            clearInterval(tick);
+            return u;
+          }
+
+          await new Promise(r => setTimeout(r, POLL_MS));
+        }
+      } finally {
+        clearInterval(tick);
+      }
+
+      return { status: 'failed', error_code: 'TIMEOUT',
+               error_detail: 'Timed out waiting for processing to complete (35 min)' };
+    }
+
+    // Update status text — no progress bar
+    function updateUploadStatusProgress(index, message, pct) {
+      const statusEl = document.getElementById(`uploadStatus${index}`);
+      if (!statusEl) return;
+      if (message) statusEl.textContent = message;
+
+      // Progress bar — create once, reuse
+      let bar = document.getElementById(`uploadBar${index}`);
+      if (pct != null) {
+        if (!bar) {
+          bar = document.createElement('div');
+          bar.id = `uploadBar${index}`;
+          bar.style.cssText = 'margin-top:6px; height:4px; border-radius:2px; background:var(--border-color,#333); overflow:hidden;';
+          bar.innerHTML = `<div id="uploadBarFill${index}" style="height:100%; border-radius:2px; background:var(--primary-color,#f97316); transition:width 0.5s ease; width:0%;"></div>`;
+          statusEl.parentNode.insertBefore(bar, statusEl.nextSibling);
+        }
+        const fill = document.getElementById(`uploadBarFill${index}`);
+        if (fill) fill.style.width = `${Math.min(99, pct)}%`; // cap at 99 until terminal
+      } else if (bar) {
+        bar.remove();
+      }
+    }
+
+    async function uploadToR2(file, url) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.addEventListener('load', () => {
+          if (xhr.status >= 200 && xhr.status < 300) resolve();
+          else reject(new Error(`Upload failed: ${xhr.status}`));
+        });
+        xhr.addEventListener('error', () => reject(new Error('Upload failed')));
+        xhr.open('PUT', url);
+        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+        xhr.send(file);
+      });
+    }
+
+    function goToQueueFromUpload() {
+      const firstId = filePairs.find(p => p.uploadId)?.uploadId;
+      const params = new URLSearchParams();
+      if (firstId) params.set('focus', firstId);
+      params.set('from_upload', 'true');
+      window.location.href = `queue.html?${params.toString()}`;
+    }
+
+    // =========================
+    // ACCOUNT GROUP RESOLUTION
+    // =========================
+    function resolveTargetAccountIds(selectedPlatforms) {
+      // If no groups selected, return empty (backend uses all connected accounts for platform)
+      if (!selectedGroupIds.length) return [];
+
+      const accountIds = [];
+      const platformSet = new Set(selectedPlatforms.map(p => p.toLowerCase()));
+
+      for (const gid of selectedGroupIds) {
+        const group = loadedGroups.find(g => String(g.id) === String(gid));
+        if (!group) continue;
+
+        // Get account IDs from the group
+        const memberIds = group.account_ids || group.accountIds || group.accounts || group.members || [];
+        const ids = (Array.isArray(memberIds) ? memberIds : []).map(x => String(x));
+
+        // Filter to only accounts matching selected platforms
+        for (const id of ids) {
+          const account = connectedAccounts.find(a => {
+            const idCandidates = [a.id, a.token_id, a.tokenId, a.account_id, a.accountId, a.platform_account_id, a.platformAccountId]
+              .filter(v => v !== undefined && v !== null).map(v => String(v));
+            return idCandidates.includes(id);
+          });
+          if (account) {
+            const plat = String(account.platform || account.provider || '').toLowerCase();
+            if (platformSet.has(plat)) {
+              accountIds.push(id);
+            }
+          }
+        }
+      }
+
+      return [...new Set(accountIds)];
+    }
+
+    async function loadAllGroups() {
+      try {
+        const resp = await apiCall('/api/groups');
+        const arr = resp?.groups || resp?.items || (Array.isArray(resp) ? resp : []);
+        loadedGroups = arr.map(g => normalizeGroup(g)).filter(Boolean);
+
+        // Cache for cross-page use
+        try { localStorage.setItem('uploadm8_groups_cache', JSON.stringify(loadedGroups)); } catch (_) {}
+
+        renderGroupSelector();
+      } catch (e) {
+        console.warn('Groups endpoint not available:', e);
+        // Try loading from cache
+        try {
+          const cached = JSON.parse(localStorage.getItem('uploadm8_groups_cache') || '[]');
+          loadedGroups = cached;
+          if (loadedGroups.length) renderGroupSelector();
+        } catch (_) {}
+      }
+    }
+
+    function renderGroupSelector() {
+      const container = document.getElementById('groupSelectorContainer');
+      if (!container) return;
+
+      if (!loadedGroups.length) {
+        container.innerHTML = `
+          <p class="text-sm text-secondary">No account groups found. <a href="groups.html">Create groups</a> to target specific accounts.</p>
+        `;
+        return;
+      }
+
+      // Build group cards with account counts per platform
+      const groupCards = loadedGroups.map(group => {
+        const memberIds = group.account_ids || group.accountIds || group.accounts || group.members || [];
+        const ids = new Set((Array.isArray(memberIds) ? memberIds : []).map(x => String(x)));
+
+        // Resolve which platforms this group covers
+        const platformCounts = {};
+        for (const account of connectedAccounts) {
+          const idCandidates = [account.id, account.token_id, account.tokenId, account.account_id, account.accountId, account.platform_account_id, account.platformAccountId]
+            .filter(v => v !== undefined && v !== null).map(v => String(v));
+          if (idCandidates.some(v => ids.has(v))) {
+            const plat = String(account.platform || account.provider || '').toLowerCase();
+            platformCounts[plat] = (platformCounts[plat] || 0) + 1;
+          }
+        }
+
+        // Also check group-level platforms field
+        const groupPlatforms = group.platforms || group.selected_platforms || group.selectedPlatforms || [];
+        if (Array.isArray(groupPlatforms) && groupPlatforms.length && Object.keys(platformCounts).length === 0) {
+          groupPlatforms.forEach(p => { platformCounts[p.toLowerCase()] = 1; });
+        }
+
+        const isSelected = selectedGroupIds.includes(String(group.id));
+        const platBadges = Object.entries(platformCounts).map(([p, count]) => {
+          const info = getPlatformInfo(p);
+          return `<span class="text-xs" style="color:${info.color};" title="${count} ${info.name} account(s)"><i class="${info.icon}"></i> ${count}</span>`;
+        }).join(' ');
+
+        return `
+          <label class="platform-option ${isSelected ? 'selected' : ''}" data-group-id="${group.id}">
+            <input type="checkbox" name="groups" value="${group.id}" ${isSelected ? 'checked' : ''} />
+            <i class="fas fa-layer-group" style="color: var(--accent-orange); font-size: 1.25rem;"></i>
+            <div style="flex:1;">
+              <div class="font-medium">${group.name || 'Unnamed Group'}</div>
+              <div class="text-xs text-secondary">${ids.size} account(s) ${platBadges ? '• ' + platBadges : ''}</div>
+            </div>
+          </label>
+        `;
+      }).join('');
+
+      container.innerHTML = groupCards;
+
+      // Bind click handlers
+      container.querySelectorAll('label[data-group-id]').forEach(label => {
+        label.addEventListener('click', (e) => {
+          // Prevent double-fire from label>input
+          if (e.target.tagName === 'INPUT') return;
+          const checkbox = label.querySelector('input');
+          checkbox.checked = !checkbox.checked;
+          label.classList.toggle('selected', checkbox.checked);
+          syncGroupSelection();
+        });
+      });
+    }
+
+    function syncGroupSelection() {
+      const checked = Array.from(document.querySelectorAll('input[name="groups"]:checked'));
+      selectedGroupIds = checked.map(c => String(c.value));
+
+      // Auto-select platforms that the selected groups cover
+      if (selectedGroupIds.length > 0) {
+        const platformsFromGroups = new Set();
+        for (const gid of selectedGroupIds) {
+          const group = loadedGroups.find(g => String(g.id) === String(gid));
+          if (!group) continue;
+
+          const memberIds = group.account_ids || group.accountIds || group.accounts || group.members || [];
+          const ids = new Set((Array.isArray(memberIds) ? memberIds : []).map(x => String(x)));
+
+          // Check group-level platforms
+          const gp = group.platforms || group.selected_platforms || group.selectedPlatforms || [];
+          if (Array.isArray(gp) && gp.length) {
+            gp.forEach(p => platformsFromGroups.add(String(p).toLowerCase()));
+          }
+
+          // Derive from connected accounts
+          for (const account of connectedAccounts) {
+            const idCandidates = [account.id, account.token_id, account.tokenId, account.account_id, account.accountId, account.platform_account_id, account.platformAccountId]
+              .filter(v => v !== undefined && v !== null).map(v => String(v));
+            if (idCandidates.some(v => ids.has(v))) {
+              const plat = String(account.platform || account.provider || '').toLowerCase();
+              platformsFromGroups.add(plat);
+            }
+          }
+        }
+
+        // Check the platform checkboxes that match
+        document.querySelectorAll('input[name="platforms"]').forEach(inp => {
+          const val = String(inp.value || '').toLowerCase();
+          if (platformsFromGroups.has(val) && !inp.disabled) {
+            inp.checked = true;
+            const option = inp.closest('.platform-option');
+            if (option) option.classList.add('selected');
+          }
+        });
+      }
+
+      validateForm();
+      try { updatePlatformHashtagPreview(); } catch (_) {}
+    }
+  </script>
+
+<!-- ======================================================================= 
+     UPLOADM8 APPENDED PATCH v2 (APPEND-ONLY)
+     - Dynamic platform hashtag preview INSIDE the AI Content Generation box
+     - Manual title/caption/hashtags input ONLY when uploading ONE video
+     - Master Admin tier label override
+     NOTE: This block is appended and does not modify existing markup above.
+======================================================================= -->
+<script>
+(function () {
+  function el(tag, attrs, html) {
+    const node = document.createElement(tag);
+    if (attrs) Object.keys(attrs).forEach(k => node.setAttribute(k, attrs[k]));
+    if (html != null) node.innerHTML = html;
+    return node;
+  }
+  function safeGet(id) { return document.getElementById(id); }
+
+  // -------------------------
+  // Manual metadata card injection
+  // -------------------------
+  function injectManualMetaCard() {
+    const platformSelect = safeGet('platformSelect');
+    if (!platformSelect) return;
+    if (safeGet('manualMetaCard')) return;
+
+    let platformsCard = platformSelect;
+    while (platformsCard && !(platformsCard.classList && platformsCard.classList.contains('card'))) {
+      platformsCard = platformsCard.parentElement;
+    }
+    if (!platformsCard) return;
+
+    const card = el('div', { class: 'card mb-4', id: 'manualMetaCard', style: 'display:none;' }, `
+      <div class="card-header">
+        <h3 class="card-title"><i class="fas fa-pen-nib"></i> Optional Manual Metadata (Single Video Only)</h3>
+      </div>
+      <div class="card-body">
+        <div class="text-sm text-secondary mb-3">
+          If you upload <strong>one</strong> video, you can provide your own title/caption/hashtags.
+          For multi-upload batches, AI + your preferences drive metadata for consistency.
+        </div>
+
+        <div style="display:grid; grid-template-columns: 1fr; gap: 1rem;">
+          <div>
+            <label class="form-label">Title (optional)</label>
+            <input id="manualTitle" class="form-input" type="text" placeholder="Custom title for this video" maxlength="120" />
+          </div>
+          <div>
+            <label class="form-label">Caption (optional)</label>
+            <textarea id="manualCaption" class="form-input" rows="4" placeholder="Custom caption for this video"></textarea>
+          </div>
+          <div>
+            <label class="form-label">Hashtags (optional)</label>
+            <input id="manualHashtags" class="form-input" type="text" placeholder="#gloryboy #tres #uno (space or comma separated)" />
+            <div class="text-xs text-secondary mt-2">
+              Your settings (Always add / Never use / Platform extras) still apply unless backend treats manual input as final.
+            </div>
+          </div>
+        </div>
+      </div>
+    `);
+
+    platformsCard.insertAdjacentElement('afterend', card);
+  }
+
+  // -------------------------
+  // Platform hashtag preview (renders INSIDE aiPrefBox)
+  // -------------------------
+  function normalizeTagList(v) {
+    if (!v) return [];
+    if (Array.isArray(v)) return v.map(x => ('' + x).trim()).filter(Boolean);
+    if (typeof v === 'string') return v.split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+    return [];
+  }
+  function toHashTags(arr) {
+    return (arr || []).map(t => t.startsWith('#') ? t : `#${t}`);
+  }
+  function getUserPrefs() {
+    try {
+      if (typeof userPreferences !== 'undefined' && userPreferences) return userPreferences;
+    } catch (_) {}
+    return window.userPreferences || {};
+  }
+  function getSelectedPlatforms() {
+    return Array.from(document.querySelectorAll('input[name="platforms"]:checked')).map(x => x.value);
+  }
+
+  function updatePlatformHashtagPreview() {
+    const rowsEl = safeGet('platformPrefRows');
+    const emptyEl = safeGet('platformPrefEmpty');
+    const divider = safeGet('platformPrefDivider');
+    if (!rowsEl) return;
+
+    const selected = getSelectedPlatforms();
+
+    if (!selected.length) {
+      rowsEl.innerHTML = '';
+      if (emptyEl) emptyEl.style.display = 'flex';
+      if (divider) divider.style.display = 'block';
+      return;
+    }
+
+    const prefs = getUserPrefs();
+    const platformHashtags = prefs.platform_hashtags || {};
+
+    const labelMap = {
+      tiktok: '\u{1F3B5} TikTok extra:',
+      youtube: '\u25B6\uFE0F YouTube extra:',
+      instagram: '\u{1F4F7} Instagram extra:',
+      facebook: '\u{1F4D8} Facebook extra:'
+    };
+
+    const rowsHtml = selected.map(p => {
+      const v = platformHashtags[p] || platformHashtags[p.toLowerCase()] || [];
+      const tags = toHashTags(normalizeTagList(v));
+      return `
+        <div class="ai-pref-row">
+          <div class="k">${labelMap[p] || (p + ' extra:')}</div>
+          <div class="v">${tags.length ? tags.join(' ') : '\u2014'}</div>
+        </div>
+      `;
+    }).join('');
+
+    if (emptyEl) emptyEl.style.display = 'none';
+    if (divider) divider.style.display = 'block';
+    rowsEl.innerHTML = rowsHtml;
+  }
+
+  // -------------------------
+  // Manual meta visibility + parsing
+  // -------------------------
+  function getFilePairsLen() {
+    try {
+      if (typeof filePairs !== 'undefined' && Array.isArray(filePairs)) return filePairs.length;
+    } catch (_) {}
+    if (Array.isArray(window.filePairs)) return window.filePairs.length;
+    return 0;
+  }
+
+  function wipeManual() {
+    const t = safeGet('manualTitle');
+    const c = safeGet('manualCaption');
+    const h = safeGet('manualHashtags');
+    if (t) t.value = '';
+    if (c) c.value = '';
+    if (h) h.value = '';
+  }
+
+  function updateManualMetaVisibility() {
+    const card = safeGet('manualMetaCard');
+    if (!card) return;
+    const oneVideo = (getFilePairsLen() === 1);
+    card.style.display = oneVideo ? 'block' : 'none';
+    if (!oneVideo) wipeManual();
+  }
+
+  function parseManualHashtags() {
+    const el = safeGet('manualHashtags');
+    if (!el) return [];
+    const raw = el.value || '';
+    const parts = raw.split(/[,\s]+/).map(x => x.trim()).filter(Boolean);
+    return parts.map(x => x.startsWith('#') ? x : `#${x}`);
+  }
+
+  function snapshotManualMeta() {
+    if (getFilePairsLen() !== 1) return null;
+    const title = (safeGet('manualTitle')?.value || '').trim();
+    const caption = (safeGet('manualCaption')?.value || '').trim();
+    const hashtags = parseManualHashtags();
+    if (!title && !caption && !hashtags.length) return null;
+    return { title, caption, hashtags };
+  }
+
+  // -------------------------
+  // Tier display override (master admin)
+  // -------------------------
+  async function applyTierOverride() {
+    try {
+      // Use already-loaded user object — avoid duplicate /api/me call
+      const me = window.currentUser || (typeof apiCall === 'function' ? await apiCall('/api/me') : null);
+      if (!me) return;
+      const role = (me?.role || '').toString().toLowerCase();
+      const isAdmin = !!me?.is_admin || role.includes('admin') || role.includes('master');
+
+      const tierEl = safeGet('userTier');
+      if (tierEl) {
+        if (isAdmin) tierEl.textContent = 'MASTER ADMIN';
+        else tierEl.textContent = ((me?.plan?.tier || me?.plan?.name || tierEl.textContent || 'FREE') + '').toUpperCase();
+      }
+
+      const planPill = safeGet('aiPlanPill');
+      if (planPill) {
+        if (isAdmin) planPill.textContent = 'Plan: MASTER';
+        else planPill.textContent = `Plan: ${((me?.plan?.tier || me?.plan?.name || 'free') + '').toUpperCase()}`;
+      }
+    } catch (e) {
+      console.warn('Tier override skipped:', e);
+    }
+  }
+
+  // -------------------------
+  // API call wrapper to inject manual meta into /complete for single video
+  // -------------------------
+  function wrapApiCallForComplete() {
+    if (typeof apiCall !== 'function') return;
+    if (apiCall.__uploadm8_wrapped_complete) return;
+
+    const _apiCall = apiCall;
+    const wrapped = async function (url, options) {
+      try {
+        const isComplete = typeof url === 'string' && /\/api\/uploads\/[^/]+\/complete$/.test(url);
+        if (isComplete && options && options.body && getFilePairsLen() === 1) {
+          const manual = snapshotManualMeta();
+          if (manual) {
+            let obj;
+            try { obj = JSON.parse(options.body); } catch (_) { obj = null; }
+            if (obj && typeof obj === 'object') {
+              obj.title = manual.title || obj.title || "";
+              obj.caption = manual.caption || obj.caption || "";
+              obj.hashtags = manual.hashtags || obj.hashtags || [];
+              options = Object.assign({}, options, { body: JSON.stringify(obj) });
+            }
+          }
+        }
+      } catch (_) {}
+      return _apiCall(url, options);
+    };
+
+    wrapped.__uploadm8_wrapped_complete = true;
+    window.apiCall = wrapped;
+  }
+
+  // -------------------------
+  // Observers / hooks (append-only)
+  // -------------------------
+  function attachDelegatedPlatformListener() {
+    const container = safeGet('platformSelect');
+    if (!container) return;
+    if (container.__uploadm8_platform_listener) return;
+
+    container.addEventListener('click', () => setTimeout(updatePlatformHashtagPreview, 0));
+    container.__uploadm8_platform_listener = true;
+  }
+
+  function observeFilePairsChanges() {
+    const fileList = safeGet('fileList');
+    if (fileList && !fileList.__uploadm8_observer) {
+      const mo = new MutationObserver(() => updateManualMetaVisibility());
+      mo.observe(fileList, { childList: true, subtree: true });
+      fileList.__uploadm8_observer = true;
+    }
+    setInterval(updateManualMetaVisibility, 800);
+  }
+
+  function hookPreferencesRender() {
+    if (typeof renderPreferencesNotice === 'function' && !renderPreferencesNotice.__uploadm8_wrapped) {
+      const _r = renderPreferencesNotice;
+      const w = function () {
+        const res = _r.apply(this, arguments);
+        setTimeout(updatePlatformHashtagPreview, 0);
+        return res;
+      };
+      w.__uploadm8_wrapped = true;
+      window.renderPreferencesNotice = w;
+    }
+  }
+
+  // -------------------------
+  // Boot
+  // -------------------------
+  document.addEventListener('DOMContentLoaded', () => {
+    injectManualMetaCard();
+
+    setTimeout(() => {
+      wrapApiCallForComplete();
+      hookPreferencesRender();
+      attachDelegatedPlatformListener();
+      observeFilePairsChanges();
+      updateManualMetaVisibility();
+      updatePlatformHashtagPreview();
+      applyTierOverride();
+    }, 0);
+  });
+})();
+</script>
+<script>
+/** 
+ * upload_queue_bridge_patch.js
+ * ────────────────────────────
+ * Paste this entire <script> block into upload.html immediately BEFORE </body>.
+ *
+ * Fixes:
+ *  1. Session is cleared too early — queue.html rescue gets empty localStorage
+ *  2. Per-platform results never shown in progress UI (just "Done: partial")
+ *  3. goToQueueFromUpload() must always write IDs to BOTH LS keys before navigating
+ *  4. "Open Queue" button now auto-navigates for partial/completed too
+ */
+(function () {
+  'use strict';
+
+  // ─── Wait for the page scripts to finish loading ───────────────────────────
+  function onReady(fn) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', fn);
+    } else {
+      // Scripts already ran — patch on next tick so page globals are set
+      setTimeout(fn, 0);
+    }
+  }
+
+  onReady(function () {
+
+    // ── 1. FIX: updateUploadSessionStatus — keep IDs available even after terminal ──
+    // The original sets session.active = false when all uploads are terminal,
+    // but also keeps the IDs so we can still navigate. We also write to
+    // ACTIVE_UPLOADS_KEY every time so queue.html's rescue always has a copy.
+    const _origUpdateStatus = window.updateUploadSessionStatus;
+    window.updateUploadSessionStatus = function (uploadId, status) {
+      // Call original to keep statuses object up to date
+      if (typeof _origUpdateStatus === 'function') {
+        _origUpdateStatus.call(this, uploadId, status);
+      }
+      // ALWAYS keep a fresh copy in the active-uploads registry key
+      // so queue.html's _rescueLocalUploads() can find the IDs regardless of
+      // whether session.active is true or false.
+      try {
+        const UPLOAD_SESSION_KEY = 'uploadm8.uploadSession';
+        const ACTIVE_UPLOADS_KEY = 'uploadm8.activeUploads.v1';
+        const session = JSON.parse(localStorage.getItem(UPLOAD_SESSION_KEY) || '{}');
+        const ids = (session.ids || []).filter(Boolean).map(String);
+        if (ids.length) {
+          localStorage.setItem(ACTIVE_UPLOADS_KEY, JSON.stringify({ ids, ts: Date.now() }));
+        }
+      } catch (_) {}
+    };
+
+    // ── 2. FIX: goToQueueFromUpload — always write BOTH LS keys before navigating ──
+    // The original just reads filePairs and navigates. We wrap it to guarantee
+    // localStorage has IDs before the navigation fires (browser may GC JS state
+    // before the new page reads LS on fast machines).
+    const _origGoToQueue = window.goToQueueFromUpload;
+    window.goToQueueFromUpload = function () {
+      const UPLOAD_SESSION_KEY = 'uploadm8.uploadSession';
+      const ACTIVE_UPLOADS_KEY = 'uploadm8.activeUploads.v1';
+
+      // Collect every upload ID we have from filePairs
+      const allIds = (window.filePairs || []).map(p => p.uploadId).filter(Boolean).map(String);
+
+      if (allIds.length) {
+        // Merge into existing session so we don't lose any IDs
+        try {
+          const existing = JSON.parse(localStorage.getItem(UPLOAD_SESSION_KEY) || '{}');
+          const mergedIds = [...new Set([...(existing.ids || []), ...allIds])];
+          // Force active=true so queue.html startUploadWatchPolling keeps going
+          existing.ids = mergedIds;
+          existing.active = true;
+          existing.ts = existing.ts || Date.now();
+          localStorage.setItem(UPLOAD_SESSION_KEY, JSON.stringify(existing));
+        } catch (_) {}
+
+        // Always sync the shared registry key
+        try {
+          localStorage.setItem(ACTIVE_UPLOADS_KEY, JSON.stringify({ ids: allIds, ts: Date.now() }));
+        } catch (_) {}
+      }
+
+      // Call original navigate function
+      if (typeof _origGoToQueue === 'function') {
+        return _origGoToQueue.call(this);
+      }
+
+      // Fallback if original was somehow missing
+      const focusId = allIds[0];
+      const params = new URLSearchParams();
+      if (focusId) params.set('focus', focusId);
+      params.set('from_upload', 'true');
+      window.location.href = 'queue.html?' + params.toString();
+    };
+
+    // ── 3. FIX: renderUploadQueue — show per-platform results for partial/completed ──
+    // The original shows "Queued/Processed: partial" with no breakdown.
+    // We wrap it to inject a per-platform badge row after render.
+    const _origRenderQueue = window.renderUploadQueue;
+    window.renderUploadQueue = function () {
+      // Run original first
+      if (typeof _origRenderQueue === 'function') {
+        _origRenderQueue.call(this);
+      }
+      // Now inject platform results per item
+      (window.filePairs || []).forEach(function (pair, index) {
+        injectPlatformResults(pair, index);
+        fixStatusText(pair, index);
+      });
+    };
+
+    function getPlatformIcon(p) {
+      const icons = {
+        tiktok:    'fab fa-tiktok',
+        youtube:   'fab fa-youtube',
+        instagram: 'fab fa-instagram',
+        facebook:  'fab fa-facebook-f',
+      };
+      return icons[String(p).toLowerCase()] || 'fas fa-globe';
+    }
+
+    function injectPlatformResults(pair, index) {
+      if (!pair.final) return;
+
+      const results = pair.final.platform_results
+        || pair.final.publish_results
+        || pair.final.results
+        || [];
+
+      // Also try to infer results from succeeded/failed arrays on the final object
+      const succeeded = pair.final.succeeded || [];
+      const failed    = pair.final.failed    || [];
+
+      let allResults = results;
+      if (!allResults.length && (succeeded.length || failed.length)) {
+        allResults = [
+          ...succeeded.map(p => ({ platform: p, success: true })),
+          ...failed.map(p =>    ({ platform: p, success: false })),
+        ];
+      }
+
+      if (!allResults.length) return;
+
+      const container = document.getElementById('uploadItem' + index);
+      if (!container) return;
+
+      // Remove any previous injection
+      container.querySelectorAll('.platform-results-row').forEach(el => el.remove());
+
+      const badgesHtml = allResults.map(function (r) {
+        const ok    = r.success === true || r.success === 1;
+        const label = String(r.platform || r.name || '?');
+        const icon  = getPlatformIcon(label);
+        const style = ok
+          ? 'background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.3);'
+          : 'background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.3);';
+        return `<span style="${style}padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:4px;">
+          <i class="${icon}" style="font-size:10px;"></i>
+          ${ok ? '✓' : '✗'} ${label}
+        </span>`;
+      }).join('');
+
+      const row = document.createElement('div');
+      row.className = 'platform-results-row';
+      row.style.cssText = 'display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;';
+      row.innerHTML = badgesHtml;
+
+      // Insert after the status text element
+      const statusEl = document.getElementById('uploadStatus' + index);
+      if (statusEl && statusEl.parentNode) {
+        statusEl.parentNode.insertBefore(row, statusEl.nextSibling);
+      } else {
+        // Fallback: append to the item
+        const inner = container.querySelector('[style*="flex:1"]') || container;
+        inner.appendChild(row);
+      }
+    }
+
+    function fixStatusText(pair, index) {
+      if (!pair.final) return;
+      const statusEl = document.getElementById('uploadStatus' + index);
+      if (!statusEl) return;
+
+      const st = (pair.final.status || '').toLowerCase();
+      const succeeded = (pair.final.succeeded || []);
+      const failed    = (pair.final.failed    || []);
+      const total     = succeeded.length + failed.length;
+
+      if (st === 'partial' && total > 0) {
+        statusEl.textContent = `Done: ${succeeded.length}/${total} platforms published`;
+      } else if (st === 'completed' || st === 'succeeded') {
+        statusEl.textContent = `Done: all ${total || succeeded.length} platforms published ✓`;
+      } else if (st === 'failed') {
+        statusEl.textContent = `Failed: 0/${total} platforms published`;
+      }
+      // For processing/queued states, leave the original text alone
+    }
+
+    // ── 4. FIX: after startUpload finishes, write BOTH LS keys ─────────────────
+    // After all tasks complete, mark session active=true and write to registry
+    // so queue.html can always rescue the IDs via its _rescueLocalUploads().
+    const _origStartUpload = window.startUpload;
+    if (typeof _origStartUpload === 'function') {
+      window.startUpload = async function () {
+        try {
+          await _origStartUpload.apply(this, arguments);
+        } finally {
+          // After upload finishes (success, partial, or fail), ensure both keys are written
+          try {
+            const UPLOAD_SESSION_KEY = 'uploadm8.uploadSession';
+            const ACTIVE_UPLOADS_KEY = 'uploadm8.activeUploads.v1';
+            const session = JSON.parse(localStorage.getItem(UPLOAD_SESSION_KEY) || '{}');
+            const ids = (session.ids || []).filter(Boolean).map(String);
+            if (ids.length) {
+              // Keep session.active = true so queue page knows to poll
+              session.active = true;
+              localStorage.setItem(UPLOAD_SESSION_KEY, JSON.stringify(session));
+              localStorage.setItem(ACTIVE_UPLOADS_KEY, JSON.stringify({ ids, ts: Date.now() }));
+            }
+          } catch (_) {}
+        }
+      };
+      window.startUpload.__uploadm8_patched = true;
+    }
+
+    console.log('[upload-queue-bridge] patch applied ✓');
+  });
+})();
+</script>
+
+</body>
+</html>

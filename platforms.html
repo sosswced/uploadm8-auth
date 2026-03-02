@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Connected Accounts - UploadM8</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+</head>
+<body>
+    <div class="app-layout">
+                <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <a href="dashboard.html" class="sidebar-logo">
+                    <img src="images/logo.png" alt="UploadM8">
+                    <span>UploadM8</span>
+                </a>
+            </div>
+            
+            <nav class="sidebar-nav">
+                <div class="nav-section">
+                    <div class="nav-section-title">Main</div>
+                    <a href="dashboard.html" class="nav-link">
+                        <i class="fas fa-home"></i>
+                        <span>Dashboard</span>
+                    </a>
+                    <a href="upload.html" class="nav-link">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                        <span>Upload</span>
+                    </a>
+                    <a href="queue.html" class="nav-link">
+                        <i class="fas fa-list"></i>
+                        <span>Queue</span>
+                    </a>
+                    <a href="scheduled.html" class="nav-link">
+                        <i class="fas fa-calendar-alt"></i>
+                        <span>Scheduled</span>
+                    </a>
+                </div>
+                
+                <div class="nav-section">
+                    <div class="nav-section-title">Platforms</div>
+                    <a href="platforms.html" class="nav-link active">
+                        <i class="fas fa-plug"></i>
+                        <span>Connected Accounts</span>
+                    </a>
+                    <a href="groups.html" class="nav-link">
+                        <i class="fas fa-layer-group"></i>
+                        <span>Account Groups</span>
+                    </a>
+                </div>
+                
+                <div class="nav-section">
+                    <div class="nav-section-title">Insights</div>
+                    <a href="analytics.html" class="nav-link">
+                        <i class="fas fa-chart-line"></i>
+                        <span>Analytics</span>
+                    </a>
+                </div>
+                
+                <div class="nav-section admin-only" id="adminSection" style="display:none;">
+                    <div class="nav-section-title">Admin</div>
+                    <a href="admin.html" class="nav-link">
+                        <i class="fas fa-shield-alt"></i>
+                        <span>Admin Panel</span>
+                    </a>
+                    <a href="account-management.html" class="nav-link">
+                        <i class="fas fa-users-cog"></i>
+                        <span>Account Mgmt</span>
+                    </a>
+                    <a href="admin-kpi.html" class="nav-link">
+                        <i class="fas fa-chart-pie"></i>
+                        <span>KPI Dashboard</span>
+                    </a>
+                    <a href="admin-calculator.html" class="nav-link">
+                        <i class="fas fa-calculator"></i>
+                        <span>Biz Calculator</span>
+                    </a>
+                    <a href="admin-wallet.html" class="nav-link">
+                        <i class="fas fa-coins"></i>
+                        <span>Wallet Manager</span>
+                    </a>
+                </div>
+                
+                <div class="nav-section">
+                    <div class="nav-section-title">Account</div>
+                    <a href="settings.html" class="nav-link">
+                        <i class="fas fa-sliders-h"></i>
+                        <span>Settings</span>
+                    </a>
+                </div>
+            </nav>
+            
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <div class="user-avatar" id="userAvatar">U</div>
+                    <div class="user-details">
+                        <div class="user-name" id="userName">User</div>
+                        <div class="user-tier" id="userTier">Free</div>
+                    </div>
+                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
+                        <i class="fas fa-sign-out-alt"></i>
+                    </button>
+                </div>
+            </div>
+        </aside>
+        
+        <!-- Sidebar Overlay (Mobile) -->
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+        
+        <!-- Top Bar (Mobile) -->
+        <header class="top-bar">
+            <button class="menu-toggle" id="menuToggle">
+                <i class="fas fa-bars"></i>
+            </button>
+            <div class="top-bar-logo">
+                <img src="images/logo.png" alt="UploadM8">
+                <span>UploadM8</span>
+            </div>
+            <div class="top-bar-actions">
+                <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme">
+                    <i class="fas fa-moon" id="themeToggleIconMobile"></i>
+                </button>
+            </div>
+        </header>
+        
+        <!-- Main Content -->
+        <main class="main-content">
+            <div class="page-header">
+                <div>
+                    <h1 class="page-title">Connected Accounts</h1>
+                    <p class="page-subtitle">Manage your social media platform connections</p>
+                </div>
+                <div class="flex items-center gap-3">
+                    <button class="theme-toggle" id="themeToggleDesktop" onclick="toggleTheme()" title="Toggle Theme">
+                        <i class="fas fa-moon" id="themeToggleIconDesktop"></i>
+                    </button>
+                    <span class="text-secondary">Accounts: <span id="accountCount" class="font-bold">0</span>/<span id="accountLimit">1</span></span>
+                </div>
+            </div>
+            
+            <!-- Overview Cards -->
+            <div class="grid grid-4 mb-4">
+                <div class="card stat-card clickable" onclick="scrollToSection('tiktok')">
+                    <div class="flex items-center gap-3">
+                        <div class="platform-icon-sm" style="background: #000;">
+                            <i class="fab fa-tiktok"></i>
+                        </div>
+                        <div>
+                            <div class="stat-value" id="tiktokCount">0</div>
+                            <div class="text-sm text-secondary">TikTok</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="card stat-card clickable" onclick="scrollToSection('youtube')">
+                    <div class="flex items-center gap-3">
+                        <div class="platform-icon-sm" style="background: #ff0000;">
+                            <i class="fab fa-youtube"></i>
+                        </div>
+                        <div>
+                            <div class="stat-value" id="youtubeCount">0</div>
+                            <div class="text-sm text-secondary">YouTube</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="card stat-card clickable" onclick="scrollToSection('instagram')">
+                    <div class="flex items-center gap-3">
+                        <div class="platform-icon-sm" style="background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888);">
+                            <i class="fab fa-instagram"></i>
+                        </div>
+                        <div>
+                            <div class="stat-value" id="instagramCount">0</div>
+                            <div class="text-sm text-secondary">Instagram</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="card stat-card clickable" onclick="scrollToSection('facebook')">
+                    <div class="flex items-center gap-3">
+                        <div class="platform-icon-sm" style="background: #1877f2;">
+                            <i class="fab fa-facebook-f"></i>
+                        </div>
+                        <div>
+                            <div class="stat-value" id="facebookCount">0</div>
+                            <div class="text-sm text-secondary">Facebook</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Platform Sections -->
+            <div id="tiktok" class="card mb-4">
+                <div class="card-header">
+                    <div class="flex items-center gap-3">
+                        <div class="platform-icon-sm" style="background: #000;">
+                            <i class="fab fa-tiktok"></i>
+                        </div>
+                        <div>
+                            <h3 class="card-title">TikTok</h3>
+                            <p class="text-sm text-secondary" id="tiktokStatus">0 accounts connected</p>
+                        </div>
+                    </div>
+                    <button onclick="connectAccount('tiktok')" class="btn btn-primary" style="background: #00f2ea; color: #000;">
+                        <i class="fas fa-plus"></i> Add Account
+                    </button>
+                </div>
+                <div class="card-body" id="tiktokAccounts">
+                    <div class="empty-state">
+                        <i class="fab fa-tiktok"></i>
+                        <p>No TikTok accounts connected</p>
+                        <p class="text-sm text-secondary">Click "Add Account" to connect</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="youtube" class="card mb-4">
+                <div class="card-header">
+                    <div class="flex items-center gap-3">
+                        <div class="platform-icon-sm" style="background: #ff0000;">
+                            <i class="fab fa-youtube"></i>
+                        </div>
+                        <div>
+                            <h3 class="card-title">YouTube</h3>
+                            <p class="text-sm text-secondary" id="youtubeStatus">0 accounts connected</p>
+                        </div>
+                    </div>
+                    <button onclick="connectAccount('youtube')" class="btn btn-primary" style="background: #ff0000;">
+                        <i class="fas fa-plus"></i> Add Account
+                    </button>
+                </div>
+                <div class="card-body" id="youtubeAccounts">
+                    <div class="empty-state">
+                        <i class="fab fa-youtube"></i>
+                        <p>No YouTube channels connected</p>
+                        <p class="text-sm text-secondary">Click "Add Account" to connect</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="instagram" class="card mb-4">
+                <div class="card-header">
+                    <div class="flex items-center gap-3">
+                        <div class="platform-icon-sm" style="background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888);">
+                            <i class="fab fa-instagram"></i>
+                        </div>
+                        <div>
+                            <h3 class="card-title">Instagram</h3>
+                            <p class="text-sm text-secondary" id="instagramStatus">0 accounts connected</p>
+                        </div>
+                    </div>
+                    <button onclick="connectAccount('instagram')" class="btn btn-primary" style="background: linear-gradient(45deg, #f09433, #e6683c, #dc2743);">
+                        <i class="fas fa-plus"></i> Add Account
+                    </button>
+                </div>
+                <div class="card-body" id="instagramAccounts">
+                    <div class="empty-state">
+                        <i class="fab fa-instagram"></i>
+                        <p>No Instagram accounts connected</p>
+                        <p class="text-sm text-secondary">Click "Add Account" to connect</p>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="facebook" class="card mb-4">
+                <div class="card-header">
+                    <div class="flex items-center gap-3">
+                        <div class="platform-icon-sm" style="background: #1877f2;">
+                            <i class="fab fa-facebook-f"></i>
+                        </div>
+                        <div>
+                            <h3 class="card-title">Facebook</h3>
+                            <p class="text-sm text-secondary" id="facebookStatus">0 accounts connected</p>
+                        </div>
+                    </div>
+                    <button onclick="connectAccount('facebook')" class="btn btn-primary" style="background: #1877f2;">
+                        <i class="fas fa-plus"></i> Add Account
+                    </button>
+                </div>
+                <div class="card-body" id="facebookAccounts">
+                    <div class="empty-state">
+                        <i class="fab fa-facebook-f"></i>
+                        <p>No Facebook pages connected</p>
+                        <p class="text-sm text-secondary">Click "Add Account" to connect</p>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <!-- Account Details Modal -->
+    <div class="modal hidden" id="accountModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="flex items-center gap-3">
+                    <img id="modalAvatar" class="avatar-lg" src="" alt="">
+                    <div>
+                        <h3 class="modal-title" id="modalName">Account Name</h3>
+                        <p class="text-secondary" id="modalUsername">@username</p>
+                    </div>
+                </div>
+                <button class="modal-close" onclick="closeAccountModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="info-row">
+                    <span class="info-label">Platform</span>
+                    <span class="info-value" id="modalPlatform">TikTok</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Status</span>
+                    <span id="modalStatus" class="badge badge-success">Active</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Connected</span>
+                    <span class="info-value" id="modalConnected">-</span>
+                </div>
+                <div class="info-row">
+                    <span class="info-label">Last Used</span>
+                    <span class="info-value" id="modalLastUsed">Never</span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button onclick="refreshAccount()" class="btn btn-secondary">
+                    <i class="fas fa-sync-alt"></i> Reconnect
+                </button>
+                <button onclick="disconnectAccount()" class="btn btn-danger">
+                    <i class="fas fa-unlink"></i> Disconnect
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Confirm Modal -->
+    <div class="modal hidden" id="confirmModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title" id="confirmTitle">Confirm</h3>
+                <button class="modal-close" onclick="hideModal('confirmModal')">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <p id="confirmMessage">Are you sure?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="hideModal('confirmModal')">Cancel</button>
+                <button class="btn btn-danger" id="confirmAction">Confirm</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Toast Container -->
+    <div id="toastContainer"></div>
+    
+    <script src="app.js"></script>
+<script src="upgrade-modal.js"></script>
+    <script src="auth-core.js"></script>
+    <script>
+        let accounts = [];
+
+function isUnlimitedAccounts(user, maxAccountsRaw) {
+    const role = String(user?.role || '').toLowerCase();
+    const tier = String(user?.tier || user?.plan || user?.plan_name || '').toLowerCase();
+
+    if (maxAccountsRaw == null) return true;
+
+    try {
+        if (typeof hasEntitlement === 'function') {
+            if (hasEntitlement('unlimited_accounts')) return true;
+            if (hasEntitlement('unlimited_connected_accounts')) return true;
+        }
+    } catch (_) {}
+
+    if (role.includes('master')) return true;
+    if (tier.includes('master')) return true;
+    if (tier.includes('family') && tier.includes('friends')) return true;
+    if (tier === 'family' || tier === 'friends' || tier === 'family_and_friends') return true;
+
+    return false;
+}
+
+        let selectedAccount = null;
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            const user = await initApp('platforms');
+            if (!user) return;
+            
+            updateThemeIcons();
+            
+            const maxAccountsRaw = (user.max_accounts ?? user.entitlements?.max_accounts ?? null);
+            const maxDisplay = (isUnlimitedAccounts(user, maxAccountsRaw) ? '∞' : String(maxAccountsRaw ?? getMaxAccounts()));
+            document.getElementById('accountLimit').textContent = maxDisplay;
+            
+            // Check for OAuth callback
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.get('success')) {
+                showToast('Account connected successfully!', 'success');
+                window.history.replaceState({}, document.title, window.location.pathname);
+            } else if (urlParams.get('error')) {
+                showToast('Failed to connect: ' + urlParams.get('error'), 'error');
+                window.history.replaceState({}, document.title, window.location.pathname);
+            }
+            
+            loadAccounts();
+        });
+        
+        function updateThemeIcons() {
+            const theme = getTheme();
+            const iconClass = theme === 'dark' ? 'fas fa-moon' : 'fas fa-sun';
+            ['themeToggleIconMobile', 'themeToggleIconDesktop'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.className = iconClass;
+            });
+        }
+        
+        const originalToggleTheme = window.toggleTheme;
+        window.toggleTheme = function() {
+            if (originalToggleTheme) originalToggleTheme();
+            updateThemeIcons();
+        };
+
+        async function loadAccounts() {
+            const platforms = ['tiktok', 'youtube', 'instagram', 'facebook'];
+            platforms.forEach(p => {
+                document.getElementById(`${p}Accounts`).innerHTML = `
+                    <div class="flex items-center justify-center py-8 text-secondary">
+                        <i class="fas fa-spinner fa-spin mr-2"></i> Loading...
+                    </div>`;
+            });
+            
+            try {
+                const data = await apiCall('/api/platforms');
+                accounts = [];
+                if (data && data.platforms) {
+                    Object.keys(data.platforms).forEach(platform => {
+                        (data.platforms[platform] || []).forEach(acc => {
+                            accounts.push({
+                                ...acc,
+                                platform: platform,
+                                account_name: acc.name || acc.account_name,
+                                account_username: acc.username || acc.account_username,
+                                account_avatar_url: acc.avatar || acc.account_avatar_url,
+                                connected_at: acc.connected_at,
+                                status: acc.status || 'active'
+                            });
+                        });
+                    });
+                }
+                renderAccounts();
+            } catch (e) {
+                console.error('Error loading accounts:', e);
+                platforms.forEach(p => {
+                    document.getElementById(`${p}Accounts`).innerHTML = `
+                        <div class="empty-state">
+                            <i class="fas fa-exclamation-triangle text-warning"></i>
+                            <p>Failed to load accounts</p>
+                            <button onclick="loadAccounts()" class="btn btn-secondary btn-sm mt-2">
+                                <i class="fas fa-refresh"></i> Retry
+                            </button>
+                        </div>`;
+                });
+                showToast('Failed to load accounts', 'error');
+            }
+        }
+
+        function renderAccounts() {
+            const platforms = ['tiktok', 'youtube', 'instagram', 'facebook'];
+            const platformNames = { tiktok: 'TikTok', youtube: 'YouTube', instagram: 'Instagram', facebook: 'Facebook' };
+            let totalCount = 0;
+
+            platforms.forEach(platform => {
+                const platformAccounts = accounts.filter(a => a.platform === platform);
+                const container = document.getElementById(`${platform}Accounts`);
+                const countEl = document.getElementById(`${platform}Count`);
+                const statusEl = document.getElementById(`${platform}Status`);
+
+                countEl.textContent = platformAccounts.length;
+                statusEl.textContent = `${platformAccounts.length} account${platformAccounts.length !== 1 ? 's' : ''} connected`;
+                totalCount += platformAccounts.length;
+
+                if (platformAccounts.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <i class="fab fa-${platform === 'facebook' ? 'facebook-f' : platform}"></i>
+                            <p>No ${platformNames[platform]} accounts connected</p>
+                            <p class="text-sm text-secondary">Click "Add Account" to connect</p>
+                        </div>`;
+                } else {
+                    container.innerHTML = platformAccounts.map(acc => {
+                        const name = acc.account_name || acc.name || 'Unknown';
+                        const username = acc.account_username || acc.username || '';
+                        const avatar = acc.account_avatar_url || acc.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`;
+                        const connectedDate = acc.connected_at ? formatDate(acc.connected_at) : 'Unknown';
+                        const status = acc.status || 'active';
+                        
+                        return `
+                            <div class="list-item clickable" onclick="showAccountDetails('${acc.id}')">
+                                <img src="${avatar}" class="avatar" alt="${name}" 
+                                     onerror="this.src='https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random'">
+                                <div class="flex-1">
+                                    <div class="font-medium">${name}</div>
+                                    <div class="text-sm text-secondary">${username ? '@' + username : ''}</div>
+                                    <div class="text-xs text-muted">Connected ${connectedDate}</div>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <span class="status-dot ${status === 'active' ? 'success' : 'warning'}"></span>
+                                    <i class="fas fa-chevron-right text-muted"></i>
+                                </div>
+                            </div>`;
+                    }).join('');
+                }
+            });
+
+            document.getElementById('accountCount').textContent = totalCount;
+        }
+
+        function scrollToSection(platform) {
+            document.getElementById(platform).scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        let oauthPopup = null;
+        
+        // Listen for OAuth callback messages from popup
+        window.addEventListener('message', function(event) {
+            // Verify origin matches our backend
+            if (event.origin !== 'https://auth.uploadm8.com') return;
+            
+            const data = event.data;
+            if (data.type === 'oauth_success') {
+                showToast(`${data.platform} account connected successfully!`, 'success');
+                loadAccounts();
+                if (oauthPopup && !oauthPopup.closed) {
+                    oauthPopup.close();
+                }
+            } else if (data.type === 'oauth_error') {
+                showToast(`Failed to connect: ${data.error}`, 'error');
+                if (oauthPopup && !oauthPopup.closed) {
+                    oauthPopup.close();
+                }
+            }
+            oauthPopup = null;
+        });
+
+        async function connectAccount(platform) {
+            const current = accounts.length;
+        const limitText = document.getElementById('accountLimit').textContent.trim();
+        const max = Number(limitText);
+        const unlimited = !Number.isFinite(max);
+
+        if (!unlimited && current >= max) {
+            if (window.showUpgradeModal) {
+                window.showUpgradeModal('account_limit', {
+                    currentTier: window.currentUser && window.currentUser.subscription_tier,
+                    available: currentConnected,
+                    needed: currentConnected + 1,
+                });
+            } else {
+                showToast(`Account limit reached (${max}). Upgrade your plan to add more.`, 'warning');
+            }
+            return;
+        }
+// Close any existing popup
+            if (oauthPopup && !oauthPopup.closed) {
+                oauthPopup.close();
+            }
+
+            try {
+                showToast(`Connecting to ${platform}...`, 'info');
+                const data = await apiCall(`/api/oauth/${platform}/start`);
+                if (data.auth_url) {
+                    // Open in popup - fresh session, no cookies from main window
+                    const width = 600;
+                    const height = 700;
+                    const left = window.screenX + (window.outerWidth - width) / 2;
+                    const top = window.screenY + (window.outerHeight - height) / 2;
+                    
+                    oauthPopup = window.open(
+                        data.auth_url,
+                        'oauth_popup',
+                        `width=${width},height=${height},left=${left},top=${top},toolbar=no,menubar=no,scrollbars=yes,resizable=yes`
+                    );
+                    
+                    // Poll to detect if user closes popup manually
+                    const pollTimer = setInterval(() => {
+                        if (oauthPopup && oauthPopup.closed) {
+                            clearInterval(pollTimer);
+                            oauthPopup = null;
+                        }
+                    }, 500);
+                } else {
+                    throw new Error('No auth URL returned');
+                }
+            } catch (e) {
+                console.error('OAuth start error:', e);
+                showToast(`Failed to start ${platform} connection`, 'error');
+            }
+        }
+
+        function showAccountDetails(accountId) {
+            selectedAccount = accounts.find(a => a.id === accountId);
+            if (!selectedAccount) return;
+
+            const platformNames = { tiktok: 'TikTok', youtube: 'YouTube', instagram: 'Instagram', facebook: 'Facebook' };
+            const name = selectedAccount.account_name || selectedAccount.name || 'Unknown';
+            const username = selectedAccount.account_username || selectedAccount.username || '';
+            const avatar = selectedAccount.account_avatar_url || selectedAccount.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&size=64`;
+            const status = selectedAccount.status || 'active';
+
+            document.getElementById('modalAvatar').src = avatar;
+            document.getElementById('modalName').textContent = name;
+            document.getElementById('modalUsername').textContent = username ? `@${username}` : '';
+            document.getElementById('modalPlatform').textContent = platformNames[selectedAccount.platform] || selectedAccount.platform;
+            
+            const statusEl = document.getElementById('modalStatus');
+            statusEl.className = status === 'active' ? 'badge badge-success' : 'badge badge-warning';
+            statusEl.textContent = status === 'active' ? 'Active' : 'Needs Reconnection';
+            
+            document.getElementById('modalConnected').textContent = selectedAccount.connected_at ? formatDate(selectedAccount.connected_at) : 'Unknown';
+            document.getElementById('modalLastUsed').textContent = selectedAccount.last_used_at ? formatDate(selectedAccount.last_used_at) : 'Never';
+
+            showModal('accountModal');
+        }
+
+        function closeAccountModal() {
+            hideModal('accountModal');
+            selectedAccount = null;
+        }
+
+        async function refreshAccount() {
+            if (!selectedAccount) return;
+            const platform = selectedAccount.platform;
+            closeAccountModal();
+            await connectAccount(platform);
+        }
+
+        function disconnectAccount() {
+            if (!selectedAccount) return;
+            
+            document.getElementById('confirmTitle').textContent = 'Disconnect Account?';
+            document.getElementById('confirmMessage').textContent = 
+                `Are you sure you want to disconnect ${selectedAccount.account_name || 'this account'}?`;
+            
+            document.getElementById('confirmAction').onclick = async () => {
+                try {
+                    await apiCall(`/api/platform-accounts/${selectedAccount.id}`, { method: 'DELETE' });
+                    showToast('Account disconnected', 'success');
+                    hideModal('confirmModal');
+                    closeAccountModal();
+                    loadAccounts();
+                } catch (e) {
+                    showToast('Failed to disconnect account', 'error');
+                }
+            };
+            
+            showModal('confirmModal');
+        }
+    </script>
+    
+    <style>
+        .platform-icon-sm {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 1.1rem;
+        }
+        
+        .clickable {
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .clickable:hover {
+            transform: translateY(-2px);
+        }
+        
+        .list-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem;
+            background: var(--bg-input);
+            border-radius: 12px;
+            margin-bottom: 0.5rem;
+        }
+        
+        .list-item:hover {
+            background: var(--bg-hover);
+        }
+        
+        .avatar {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            object-fit: cover;
+        }
+        
+        .avatar-lg {
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            object-fit: cover;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+        
+        .status-dot.success { background: var(--success); }
+        .status-dot.warning { background: var(--warning); }
+        
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .info-row:last-child { border-bottom: none; }
+        .info-label { color: var(--text-secondary); }
+        .info-value { color: var(--text-primary); font-weight: 500; }
+    </style>
+</body>
+</html>

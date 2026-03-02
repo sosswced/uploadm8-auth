@@ -1,0 +1,1691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scheduled Uploads - UploadM8</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+</head>
+<body>
+    <div class="app-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <a href="dashboard.html" class="sidebar-logo">
+                    <img src="images/logo.png" alt="UploadM8">
+                    <span>UploadM8</span>
+                </a>
+            </div>
+            
+            <nav class="sidebar-nav">
+                <div class="nav-section">
+                    <div class="nav-section-title">Main</div>
+                    <a href="dashboard.html" class="nav-link">
+                        <i class="fas fa-home"></i>
+                        <span>Dashboard</span>
+                    </a>
+                    <a href="upload.html" class="nav-link">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                        <span>Upload</span>
+                    </a>
+                    <a href="queue.html" class="nav-link">
+                        <i class="fas fa-list"></i>
+                        <span>Queue</span>
+                    </a>
+                    <a href="scheduled.html" class="nav-link active">
+                        <i class="fas fa-calendar-alt"></i>
+                        <span>Scheduled</span>
+                    </a>
+                </div>
+                
+                <div class="nav-section">
+                    <div class="nav-section-title">Platforms</div>
+                    <a href="platforms.html" class="nav-link">
+                        <i class="fas fa-plug"></i>
+                        <span>Connected Accounts</span>
+                    </a>
+                    <a href="groups.html" class="nav-link">
+                        <i class="fas fa-layer-group"></i>
+                        <span>Account Groups</span>
+                    </a>
+                </div>
+
+                <div class="nav-section">
+                    <div class="nav-section-title">Insights</div>
+                    <a href="analytics.html" class="nav-link">
+                        <i class="fas fa-chart-line"></i>
+                        <span>Analytics</span>
+                    </a>
+                </div>
+
+                <div class="nav-section admin-only" id="adminSection" style="display:none;">
+                    <div class="nav-section-title">Admin</div>
+                    <a href="admin.html" class="nav-link">
+                        <i class="fas fa-shield-alt"></i>
+                        <span>Admin Panel</span>
+                    </a>
+                    <a href="account-management.html" class="nav-link">
+                        <i class="fas fa-users-cog"></i>
+                        <span>Account Mgmt</span>
+                    </a>
+                    <a href="admin-kpi.html" class="nav-link">
+                        <i class="fas fa-chart-pie"></i>
+                        <span>KPI Dashboard</span>
+                    </a>
+                    <a href="admin-calculator.html" class="nav-link">
+                        <i class="fas fa-calculator"></i>
+                        <span>Biz Calculator</span>
+                    </a>
+                    <a href="admin-wallet.html" class="nav-link">
+                        <i class="fas fa-coins"></i>
+                        <span>Wallet Manager</span>
+                    </a>
+                </div>
+
+                <div class="nav-section">
+                    <div class="nav-section-title">Account</div>
+                    <a href="settings.html" class="nav-link">
+                        <i class="fas fa-sliders-h"></i>
+                        <span>Settings</span>
+                    </a>
+                </div>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <div class="user-avatar" id="userAvatar">U</div>
+                    <div class="user-details">
+                        <div class="user-name" id="userName">User</div>
+                        <div class="user-tier" id="userTier">Free</div>
+                    </div>
+                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
+                        <i class="fas fa-sign-out-alt"></i>
+                    </button>
+                </div>
+            </div>
+        </aside>
+        
+        <!-- Sidebar Overlay (Mobile) -->
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+
+        <!-- Top Bar (Mobile) -->
+        <header class="top-bar">
+            <button class="menu-toggle" id="menuToggle">
+                <i class="fas fa-bars"></i>
+            </button>
+            <div class="top-bar-logo">
+                <img src="images/logo.png" alt="UploadM8">
+                <span>UploadM8</span>
+            </div>
+            <div class="top-bar-actions">
+                <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme">
+                    <i class="fas fa-moon" id="themeToggleIconMobile"></i>
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <div class="page-header">
+                <div class="page-title-section">
+                    <h1>Scheduled Uploads</h1>
+                    <p class="page-subtitle">Manage your upcoming scheduled posts</p>
+                </div>
+                <div class="page-actions">
+                    <a href="upload.html" class="btn btn-primary">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="12" y1="5" x2="12" y2="19"></line>
+                            <line x1="5" y1="12" x2="19" y2="12"></line>
+                        </svg>
+                        Schedule Upload
+                    </a>
+                </div>
+            </div>
+
+            <!-- Stats Summary -->
+            <div class="stats-row">
+                <div class="stat-card">
+                    <div class="stat-card-header">
+                        <span class="stat-label">PENDING</span>
+                        <div class="stat-icon pending">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <polyline points="12 6 12 12 16 14"></polyline>
+                            </svg>
+                        </div>
+                    </div>
+                    <span class="stat-value" id="pendingCount">-</span>
+                    <div class="stat-trend">↑ --%</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-card-header">
+                        <span class="stat-label">TODAY</span>
+                        <div class="stat-icon today">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                                <line x1="16" y1="2" x2="16" y2="6"></line>
+                                <line x1="8" y1="2" x2="8" y2="6"></line>
+                                <line x1="3" y1="10" x2="21" y2="10"></line>
+                            </svg>
+                        </div>
+                    </div>
+                    <span class="stat-value" id="todayCount">-</span>
+                    <div class="stat-trend">↑ --%</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-card-header">
+                        <span class="stat-label">THIS WEEK</span>
+                        <div class="stat-icon week">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                            </svg>
+                        </div>
+                    </div>
+                    <span class="stat-value" id="weekCount">-</span>
+                    <div class="stat-trend">↑ --%</div>
+                </div>
+            </div>
+
+            <!-- View Toggle -->
+            <div class="view-toggle">
+                <button class="view-btn active" data-view="calendar" onclick="setView('calendar')">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="16" y1="2" x2="16" y2="6"></line>
+                        <line x1="8" y1="2" x2="8" y2="6"></line>
+                        <line x1="3" y1="10" x2="21" y2="10"></line>
+                    </svg>
+                    Calendar
+                </button>
+                <button class="view-btn" data-view="list" onclick="setView('list')">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="8" y1="6" x2="21" y2="6"></line>
+                        <line x1="8" y1="12" x2="21" y2="12"></line>
+                        <line x1="8" y1="18" x2="21" y2="18"></line>
+                        <line x1="3" y1="6" x2="3.01" y2="6"></line>
+                        <line x1="3" y1="12" x2="3.01" y2="12"></line>
+                        <line x1="3" y1="18" x2="3.01" y2="18"></line>
+                    </svg>
+                    List
+                </button>
+            </div>
+
+            <!-- Calendar View -->
+            <div class="card calendar-card" id="calendarView">
+                <div class="calendar-header">
+                    <button class="calendar-nav-btn" onclick="changeMonth(-1)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="15 18 9 12 15 6"></polyline>
+                        </svg>
+                    </button>
+                    <h3 id="calendarTitle">January 2026</h3>
+                    <button class="calendar-nav-btn" onclick="changeMonth(1)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="9 18 15 12 9 6"></polyline>
+                        </svg>
+                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="goToToday()">Today</button>
+                </div>
+                <div class="calendar-grid">
+                    <div class="calendar-weekdays">
+                        <span>Sun</span>
+                        <span>Mon</span>
+                        <span>Tue</span>
+                        <span>Wed</span>
+                        <span>Thu</span>
+                        <span>Fri</span>
+                        <span>Sat</span>
+                    </div>
+                    <div class="calendar-days" id="calendarDays">
+                        <!-- Days will be rendered here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- List View -->
+            <div class="card" id="listView" style="display: none;">
+                <div class="card-header">
+                    <h3>Upcoming Uploads</h3>
+                    <div class="header-actions">
+                        <select id="listFilter" class="form-select form-select-sm" onchange="filterList()">
+                            <option value="all">All Platforms</option>
+                            <option value="tiktok">TikTok</option>
+                            <option value="youtube">YouTube</option>
+                            <option value="instagram">Instagram</option>
+                            <option value="facebook">Facebook</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="scheduled-list" id="scheduledList">
+                    <!-- List items will be rendered here -->
+                </div>
+            </div>
+
+            <!-- Empty State -->
+            <div class="empty-state" id="emptyState" style="display: none;">
+                <div class="empty-state-icon">
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="16" y1="2" x2="16" y2="6"></line>
+                        <line x1="8" y1="2" x2="8" y2="6"></line>
+                        <line x1="3" y1="10" x2="21" y2="10"></line>
+                    </svg>
+                </div>
+                <h3>No Scheduled Uploads</h3>
+                <p>Schedule your first upload to start managing your content calendar</p>
+                <a href="upload.html" class="btn btn-primary">Schedule Upload</a>
+            </div>
+        </main>
+
+        <!-- Edit Modal -->
+        <div class="modal" id="editModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 id="modalTitle">Edit Scheduled Upload</h3>
+                    <button class="modal-close" onclick="closeEditModal()">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <!-- Preview banner -->
+                    <div class="upload-preview" id="uploadPreview">
+                        <div class="preview-thumb no-image" id="previewThumb">
+                            <i class="fas fa-video"></i>
+                            <img id="previewImage" src="" alt="" style="display:none;">
+                        </div>
+                        <div class="preview-info">
+                            <div class="preview-title" id="previewTitle"></div>
+                            <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:4px;">
+                                <div class="preview-platforms" id="previewPlatforms"></div>
+                                <span id="previewScheduleBadge" style="font-size:11px;"></span>
+                                <span id="previewStatusBadge" style="font-size:11px;"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Smart schedule per-platform times (read-only info) -->
+                    <div id="smartScheduleInfo" style="display:none;background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.25);border-radius:8px;padding:10px 14px;margin-bottom:14px;">
+                        <div style="font-size:12px;font-weight:700;color:#a78bfa;margin-bottom:6px;"><i class="fas fa-magic" style="margin-right:5px;"></i>Smart Schedule — Per-Platform Publish Times</div>
+                        <div id="smartScheduleTimes" style="display:flex;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--text-secondary);"></div>
+                        <div style="font-size:11px;color:var(--text-secondary);margin-top:6px;opacity:0.7;">Editing the date/time below overrides all platforms to the same time.</div>
+                    </div>
+
+                    <form id="editForm">
+                        <!-- Title -->
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-size:13px;font-weight:600;color:var(--text-primary);display:block;margin-bottom:6px;">Video Title</label>
+                            <input type="text" id="editTitle" class="form-control" placeholder="Enter video title" maxlength="150" style="width:100%;">
+                        </div>
+
+                        <!-- Caption -->
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-size:13px;font-weight:600;color:var(--text-primary);display:block;margin-bottom:6px;">Caption</label>
+                            <textarea id="editCaption" class="form-control" rows="3" placeholder="Write a caption for this video..." maxlength="2200" style="width:100%;resize:vertical;"></textarea>
+                            <div style="font-size:11px;color:var(--text-secondary);margin-top:3px;text-align:right;"><span id="captionCharCount">0</span> / 2200</div>
+                        </div>
+
+                        <!-- Hashtags -->
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-size:13px;font-weight:600;color:var(--text-primary);display:block;margin-bottom:6px;">Hashtags <span style="font-weight:400;color:var(--text-secondary);">(space or comma separated)</span></label>
+                            <input type="text" id="editHashtags" class="form-control" placeholder="#gloryboy #roadtrip #dashcam" style="width:100%;">
+                            <div style="font-size:11px;color:var(--text-secondary);margin-top:3px;" id="hashtagCountHint"></div>
+                        </div>
+
+                        <!-- Platforms -->
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-size:13px;font-weight:600;color:var(--text-primary);display:block;margin-bottom:8px;">Platforms</label>
+                            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;" id="editPlatformGrid">
+                                <label class="edit-platform-opt" data-p="tiktok">
+                                    <input type="checkbox" value="tiktok" style="display:none;">
+                                    <i class="fab fa-tiktok" style="color:#fff;font-size:18px;"></i>
+                                    <span style="font-size:11px;">TikTok</span>
+                                </label>
+                                <label class="edit-platform-opt" data-p="youtube">
+                                    <input type="checkbox" value="youtube" style="display:none;">
+                                    <i class="fab fa-youtube" style="color:#ff0000;font-size:18px;"></i>
+                                    <span style="font-size:11px;">YouTube</span>
+                                </label>
+                                <label class="edit-platform-opt" data-p="instagram">
+                                    <input type="checkbox" value="instagram" style="display:none;">
+                                    <i class="fab fa-instagram" style="color:#e1306c;font-size:18px;"></i>
+                                    <span style="font-size:11px;">Instagram</span>
+                                </label>
+                                <label class="edit-platform-opt" data-p="facebook">
+                                    <input type="checkbox" value="facebook" style="display:none;">
+                                    <i class="fab fa-facebook" style="color:#1877f2;font-size:18px;"></i>
+                                    <span style="font-size:11px;">Facebook</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- Privacy -->
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-size:13px;font-weight:600;color:var(--text-primary);display:block;margin-bottom:6px;">Privacy</label>
+                            <select id="editPrivacy" class="form-control" style="width:100%;">
+                                <option value="public">Public</option>
+                                <option value="unlisted">Unlisted</option>
+                                <option value="private">Private</option>
+                            </select>
+                        </div>
+
+                        <!-- Scheduled Date/Time + Timezone -->
+                        <div class="form-row datetime-row" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+                            <div class="form-group">
+                                <label style="font-size:13px;font-weight:600;color:var(--text-primary);display:block;margin-bottom:6px;">Scheduled Date &amp; Time</label>
+                                <input type="datetime-local" id="editDateTime" class="form-control" style="width:100%;">
+                                <div style="font-size:11px;color:var(--text-secondary);margin-top:3px;" id="scheduleNote"></div>
+                            </div>
+                            <div class="form-group">
+                                <label style="font-size:13px;font-weight:600;color:var(--text-primary);display:block;margin-bottom:6px;">Timezone</label>
+                                <select id="editTimezone" class="form-select" style="width:100%;">
+                                    <option value="America/New_York">Eastern (ET)</option>
+                                    <option value="America/Chicago">Central (CT)</option>
+                                    <option value="America/Denver">Mountain (MT)</option>
+                                    <option value="America/Los_Angeles">Pacific (PT)</option>
+                                    <option value="UTC">UTC</option>
+                                </select>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-danger" onclick="cancelScheduledUpload()">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                        Cancel Upload
+                    </button>
+                    <div style="flex: 1;"></div>
+                    <button class="btn btn-secondary" onclick="closeEditModal()">Close</button>
+                    <button class="btn btn-primary" onclick="saveScheduledUpload()">Save Changes</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="auth-core.js"></script>
+    <script src="app.js"></script>
+    <script>
+        let currentDate = new Date();
+        let selectedUploadId = null;
+        let scheduledUploads = [];
+        let currentView = 'calendar';
+let userColors = {
+            tiktok: '#000000',
+            youtube: '#FF0000',
+            instagram: '#E4405F',
+            facebook: '#1877F2',
+            accent: '#F97316'
+        };
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', async () => {
+            const user = await initApp();
+            if (!user) return;
+
+            // Show admin section if user is admin or master_admin
+            if (user.role === 'admin' || user.role === 'master_admin' || user.is_admin === true || user.isAdmin === true) {
+                const adminSection = document.getElementById('adminSection');
+                if (adminSection) adminSection.style.display = 'block';
+            }
+
+            await loadColorPreferences();
+            await loadScheduledStats();
+            await loadScheduledUploads();
+            renderCalendar();
+
+            // Init new modal components
+            initHashtagInput();
+            initCaptionCounter();
+            initPlatformGrid();
+
+            // Setup modal close handlers
+            setupModalHandlers();
+        });
+
+        // Setup modal event handlers
+        function setupModalHandlers() {
+            // Close modal on ESC key
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    const modal = document.getElementById('editModal');
+                    if (modal && modal.classList.contains('active')) {
+                        closeEditModal();
+                    }
+                }
+            });
+
+            // Close modal when clicking outside
+            const modal = document.getElementById('editModal');
+            if (modal) {
+                modal.addEventListener('click', (e) => {
+                    if (e.target.id === 'editModal') {
+                        closeEditModal();
+                    }
+                });
+            }
+        }
+
+        // Load user's custom color preferences
+        async function loadColorPreferences() {
+            try {
+                const colors = await apiCall('/api/colors');
+                if (colors && typeof colors === 'object') {
+                    userColors = {
+                        tiktok: colors.tiktok_color || '#000000',
+                        youtube: colors.youtube_color || '#FF0000',
+                        instagram: colors.instagram_color || '#E4405F',
+                        facebook: colors.facebook_color || '#1877F2',
+                        accent: colors.accent_color || '#F97316'
+                    };
+                }
+            } catch (error) {
+                console.error('Failed to load color preferences:', error);
+                // Use defaults
+            }
+        }
+
+        // Load scheduled upload statistics from database
+        async function loadScheduledStats() {
+            try {
+                const stats = await apiCall('/api/scheduled/stats');
+                document.getElementById('pendingCount').textContent = (stats && stats.pending) || 0;
+                document.getElementById('todayCount').textContent = (stats && stats.today) || 0;
+                document.getElementById('weekCount').textContent = (stats && stats.week) || 0;
+            } catch (error) {
+                console.error('Failed to load stats:', error);
+                document.getElementById('pendingCount').textContent = '0';
+                document.getElementById('todayCount').textContent = '0';
+                document.getElementById('weekCount').textContent = '0';
+            }
+        }
+
+        // Load scheduled uploads from database
+        async function loadScheduledUploads() {
+            try {
+                const data = await apiCall('/api/scheduled/list');
+                scheduledUploads = Array.isArray(data) ? data : [];
+                
+                if (scheduledUploads.length === 0) {
+                    showEmptyState();
+                } else {
+                    hideEmptyState();
+                    if (currentView === 'calendar') {
+                        renderCalendar();
+                    } else {
+                        renderList();
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to load scheduled uploads:', error);
+                scheduledUploads = [];
+                showEmptyState();
+            }
+        }
+
+        // Show/hide empty state
+        function showEmptyState() {
+            document.getElementById('emptyState').style.display = 'flex';
+            document.getElementById('calendarView').style.display = 'none';
+            document.getElementById('listView').style.display = 'none';
+        }
+
+        function hideEmptyState() {
+            document.getElementById('emptyState').style.display = 'none';
+            if (currentView === 'calendar') {
+                document.getElementById('calendarView').style.display = 'block';
+                document.getElementById('listView').style.display = 'none';
+            } else {
+                document.getElementById('calendarView').style.display = 'none';
+                document.getElementById('listView').style.display = 'block';
+            }
+        }
+
+        // View toggle
+        function setView(view) {
+            currentView = view;
+            document.querySelectorAll('.view-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.view === view);
+            });
+
+            if (scheduledUploads.length === 0) {
+                showEmptyState();
+                return;
+            }
+
+            if (view === 'calendar') {
+                document.getElementById('calendarView').style.display = 'block';
+                document.getElementById('listView').style.display = 'none';
+                renderCalendar();
+            } else {
+                document.getElementById('calendarView').style.display = 'none';
+                document.getElementById('listView').style.display = 'block';
+                renderList();
+            }
+        }
+
+        // Calendar navigation
+        function changeMonth(delta) {
+            currentDate.setMonth(currentDate.getMonth() + delta);
+            renderCalendar();
+        }
+
+        function goToToday() {
+            currentDate = new Date();
+            renderCalendar();
+        }
+
+        // Render calendar
+        function renderCalendar() {
+            const year = currentDate.getFullYear();
+            const month = currentDate.getMonth();
+            
+            document.getElementById('calendarTitle').textContent = 
+                currentDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+
+            const firstDay = new Date(year, month, 1).getDay();
+            const daysInMonth = new Date(year, month + 1, 0).getDate();
+            const daysInPrevMonth = new Date(year, month, 0).getDate();
+
+            const calendarDays = document.getElementById('calendarDays');
+            calendarDays.innerHTML = '';
+
+            // Previous month days
+            for (let i = firstDay - 1; i >= 0; i--) {
+                const day = daysInPrevMonth - i;
+                const dayEl = createDayElement(day, 'other-month');
+                calendarDays.appendChild(dayEl);
+            }
+
+            // Current month days
+            const today = new Date();
+            for (let day = 1; day <= daysInMonth; day++) {
+                const date = new Date(year, month, day);
+                const isToday = date.toDateString() === today.toDateString();
+                const uploads = getUploadsForDate(date);
+                
+                const dayEl = createDayElement(day, isToday ? 'today' : '', uploads, date);
+                calendarDays.appendChild(dayEl);
+            }
+
+            // Next month days
+            const remainingDays = 42 - (firstDay + daysInMonth);
+            for (let day = 1; day <= remainingDays; day++) {
+                const dayEl = createDayElement(day, 'other-month');
+                calendarDays.appendChild(dayEl);
+            }
+        }
+
+        function createDayElement(day, className = '', uploads = [], date = null) {
+            const dayEl = document.createElement('div');
+            dayEl.className = `calendar-day ${className}`;
+            
+            if (uploads.length > 0) {
+                dayEl.classList.add('has-uploads');
+                dayEl.onclick = () => showDayUploads(date, uploads);
+            }
+
+            dayEl.innerHTML = `
+                <div class="day-number">${day}</div>
+                ${uploads.length > 0 ? `
+                    <div class="day-uploads-preview">
+                        ${uploads.slice(0, 3).map(upload => `
+                            <div class="upload-dot" style="background: ${getPlatformColor(upload.platforms[0])}"></div>
+                        `).join('')}
+                        ${uploads.length > 3 ? `<span class="more-count">+${uploads.length - 3}</span>` : ''}
+                    </div>
+                ` : ''}
+            `;
+
+            return dayEl;
+        }
+
+        function getUploadsForDate(date) {
+            return scheduledUploads.filter(upload => {
+                const uploadDate = new Date(upload.scheduled_time);
+                return uploadDate.toDateString() === date.toDateString();
+            });
+        }
+
+        function showDayUploads(date, uploads) {
+            // Could open a modal or navigate to list view filtered by date
+            console.log('Uploads for', date, uploads);
+        }
+
+        // Render list view
+        function renderList() {
+            const listEl = document.getElementById('scheduledList');
+            listEl.innerHTML = '';
+
+            const groupedUploads = groupUploadsByDate(scheduledUploads);
+
+            for (const [dateStr, uploads] of Object.entries(groupedUploads)) {
+                const date = new Date(dateStr);
+                const dateGroup = document.createElement('div');
+                dateGroup.className = 'list-date-group';
+                
+                dateGroup.innerHTML = `
+                    <div class="list-date-header">
+                        <strong>${formatDateHeader(date)}</strong>
+                    </div>
+                    ${uploads.map(upload => createListItem(upload)).join('')}
+                `;
+                
+                listEl.appendChild(dateGroup);
+            }
+        }
+
+        function groupUploadsByDate(uploads) {
+            const grouped = {};
+            uploads.forEach(upload => {
+                const date = new Date(upload.scheduled_time).toDateString();
+                if (!grouped[date]) grouped[date] = [];
+                grouped[date].push(upload);
+            });
+            return grouped;
+        }
+
+        function createListItem(upload) {
+            const time = upload.scheduled_time
+                ? new Date(upload.scheduled_time).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
+                : '—';
+
+            const isSmartSchedule = upload.schedule_mode === 'smart';
+            const scheduleModeBadge = isSmartSchedule
+                ? `<span style="background:rgba(139,92,246,0.18);color:#a78bfa;border:1px solid rgba(139,92,246,0.3);padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;margin-left:6px;"><i class="fas fa-magic" style="margin-right:3px;font-size:10px;"></i>Smart</span>`
+                : `<span style="background:rgba(59,130,246,0.18);color:#60a5fa;border:1px solid rgba(59,130,246,0.3);padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;margin-left:6px;"><i class="fas fa-calendar" style="margin-right:3px;font-size:10px;"></i>Scheduled</span>`;
+
+            // For smart uploads: show per-platform times if available
+            let smartTimesHtml = '';
+            if (isSmartSchedule && upload.smart_schedule && typeof upload.smart_schedule === 'object') {
+                const platformIcons = { tiktok: 'fab fa-tiktok', youtube: 'fab fa-youtube', instagram: 'fab fa-instagram', facebook: 'fab fa-facebook' };
+                const platformColors = { tiktok: '#ffffff', youtube: '#ff0000', instagram: '#e1306c', facebook: '#1877f2' };
+                smartTimesHtml = '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;">' +
+                    Object.entries(upload.smart_schedule).map(([p, dt]) => {
+                        const d = new Date(dt);
+                        const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+                        const icon = platformIcons[p] || 'fas fa-globe';
+                        const color = platformColors[p] || '#888';
+                        return `<span style="font-size:11px;color:var(--text-secondary);"><i class="${icon}" style="color:${color};margin-right:2px;font-size:10px;"></i>${label}</span>`;
+                    }).join('<span style="color:var(--text-secondary);padding:0 2px;">·</span>') +
+                    '</div>';
+            }
+
+            const statusColor = {
+                staged: '#f59e0b', ready_to_publish: '#8b5cf6',
+                queued: '#3b82f6', pending: '#94a3b8', scheduled: '#10b981'
+            }[upload.status] || '#94a3b8';
+
+            return `
+                <div class="scheduled-item" onclick="openEditModal('${upload.id}')">
+                    <div class="scheduled-thumb">
+                        ${upload.thumbnail ?
+                            `<img src="${upload.thumbnail}" alt="${upload.title}">` :
+                            `<div class="thumb-placeholder"><i class="fas fa-video"></i></div>`
+                        }
+                    </div>
+                    <div class="scheduled-info">
+                        <span class="scheduled-title">${upload.title}</span>
+                        <div class="scheduled-meta">
+                            <div class="scheduled-time">
+                                <i class="fas fa-clock"></i>
+                                <span>${time}</span>
+                                ${scheduleModeBadge}
+                                <span style="background:rgba(0,0,0,0.2);color:${statusColor};border:1px solid ${statusColor}44;padding:2px 7px;border-radius:999px;font-size:10px;font-weight:600;margin-left:4px;text-transform:uppercase;">${upload.status}</span>
+                            </div>
+                            <div class="scheduled-platforms">
+                                ${upload.platforms.map(p => getPlatformBadge(p)).join('')}
+                            </div>
+                        </div>
+                        ${smartTimesHtml}
+                    </div>
+                    <div class="scheduled-actions">
+                        <button class="btn btn-icon btn-secondary" onclick="event.stopPropagation(); openEditModal('${upload.id}')">
+                            <i class="fas fa-edit"></i>
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function formatDateHeader(date) {
+            const today = new Date();
+            const tomorrow = new Date(today);
+            tomorrow.setDate(tomorrow.getDate() + 1);
+
+            if (date.toDateString() === today.toDateString()) {
+                return 'Today';
+            } else if (date.toDateString() === tomorrow.toDateString()) {
+                return 'Tomorrow';
+            } else {
+                return date.toLocaleDateString('en-US', { 
+                    weekday: 'long', 
+                    month: 'long', 
+                    day: 'numeric' 
+                });
+            }
+        }
+
+        function filterList() {
+            const filter = document.getElementById('listFilter').value;
+            // Re-render list with filtered data
+            if (filter === 'all') {
+                renderList();
+            } else {
+                const filtered = scheduledUploads.filter(upload => 
+                    upload.platforms.includes(filter)
+                );
+                // Render filtered list
+            }
+        }
+
+        // Modal functions
+        // ── Hashtag input live counter ────────────────────────────────────────
+        function initHashtagInput() {
+            const inp = document.getElementById('editHashtags');
+            const hint = document.getElementById('hashtagCountHint');
+            if (!inp) return;
+            inp.addEventListener('input', () => {
+                const tags = parseHashtags(inp.value);
+                hint.textContent = tags.length > 0 ? `${tags.length} hashtag${tags.length !== 1 ? 's' : ''}` : '';
+                hint.style.color = tags.length > 20 ? '#ef4444' : 'var(--text-secondary)';
+            });
+        }
+
+        function parseHashtags(raw) {
+            if (!raw || !raw.trim()) return [];
+            return raw.replace(/,/g, ' ').split(/\s+/)
+                .map(t => t.replace(/^#+/, '').trim().toLowerCase())
+                .filter(t => t.length > 1);
+        }
+
+        function hashtagsToString(arr) {
+            if (!arr || !arr.length) return '';
+            return arr.map(t => t.startsWith('#') ? t : `#${t}`).join(' ');
+        }
+
+        // ── Caption char counter ──────────────────────────────────────────────
+        function initCaptionCounter() {
+            const ta = document.getElementById('editCaption');
+            const counter = document.getElementById('captionCharCount');
+            if (!ta || !counter) return;
+            ta.addEventListener('input', () => {
+                const len = ta.value.length;
+                counter.textContent = len;
+                counter.style.color = len > 2000 ? '#ef4444' : len > 1800 ? '#f59e0b' : 'var(--text-secondary)';
+            });
+        }
+
+        // ── Platform toggle checkboxes ────────────────────────────────────────
+        function initPlatformGrid() {
+            document.querySelectorAll('.edit-platform-opt').forEach(lbl => {
+                lbl.addEventListener('click', () => {
+                    const cb = lbl.querySelector('input[type=checkbox]');
+                    cb.checked = !cb.checked;
+                    lbl.classList.toggle('selected', cb.checked);
+                });
+            });
+        }
+
+        function setSelectedPlatforms(platforms) {
+            document.querySelectorAll('.edit-platform-opt').forEach(lbl => {
+                const val = lbl.dataset.p;
+                const cb = lbl.querySelector('input[type=checkbox]');
+                const active = platforms.includes(val);
+                cb.checked = active;
+                lbl.classList.toggle('selected', active);
+            });
+        }
+
+        function getSelectedPlatforms() {
+            return [...document.querySelectorAll('.edit-platform-opt input:checked')].map(cb => cb.value);
+        }
+
+        // ── Open edit modal (full fields) ─────────────────────────────────────
+        async function openEditModal(uploadId) {
+            selectedUploadId = uploadId;
+            // Fetch fresh details from API to get latest caption/hashtags/privacy
+            let upload = scheduledUploads.find(u => u.id === uploadId) || {};
+
+            try {
+                const fresh = await apiCall(`/api/scheduled/${uploadId}`);
+                if (fresh && fresh.id) upload = { ...upload, ...fresh };
+            } catch (e) {
+                console.warn('Could not fetch fresh upload details, using cached data');
+            }
+
+            // ── Preview header ──────────────────────────────────────────────
+            document.getElementById('modalTitle').textContent = 'Edit Scheduled Upload';
+            document.getElementById('previewTitle').textContent = upload.title || 'Untitled';
+            document.getElementById('previewPlatforms').innerHTML =
+                (upload.platforms || []).map(p => getPlatformBadge(p)).join('');
+
+            const isSmartMode = upload.schedule_mode === 'smart';
+            const statusColors = { staged: '#f59e0b', ready_to_publish: '#8b5cf6', queued: '#3b82f6', pending: '#94a3b8', scheduled: '#10b981' };
+            const sc = statusColors[upload.status] || '#94a3b8';
+            document.getElementById('previewScheduleBadge').innerHTML = isSmartMode
+                ? `<span style="background:rgba(139,92,246,0.18);color:#a78bfa;border:1px solid rgba(139,92,246,0.3);padding:2px 8px;border-radius:999px;font-weight:600;"><i class="fas fa-magic" style="margin-right:3px;font-size:10px;"></i>Smart</span>`
+                : `<span style="background:rgba(59,130,246,0.18);color:#60a5fa;border:1px solid rgba(59,130,246,0.3);padding:2px 8px;border-radius:999px;font-weight:600;"><i class="fas fa-calendar" style="margin-right:3px;font-size:10px;"></i>Scheduled</span>`;
+            document.getElementById('previewStatusBadge').innerHTML =
+                `<span style="background:rgba(0,0,0,0.25);color:${sc};border:1px solid ${sc}44;padding:2px 7px;border-radius:999px;font-size:10px;font-weight:700;text-transform:uppercase;">${upload.status || 'pending'}</span>`;
+
+            // ── Thumbnail ───────────────────────────────────────────────────
+            const previewThumb = document.getElementById('previewThumb');
+            const previewImage = document.getElementById('previewImage');
+            const iconEl = previewThumb.querySelector('.fa-video');
+            if (upload.thumbnail) {
+                previewThumb.classList.remove('no-image');
+                previewImage.src = upload.thumbnail;
+                previewImage.style.display = 'block';
+                if (iconEl) iconEl.style.display = 'none';
+                previewImage.onerror = () => {
+                    previewThumb.classList.add('no-image');
+                    if (iconEl) iconEl.style.display = 'block';
+                    previewImage.style.display = 'none';
+                };
+            } else {
+                previewThumb.classList.add('no-image');
+                if (iconEl) iconEl.style.display = 'block';
+                previewImage.style.display = 'none';
+            }
+
+            // ── Smart schedule info banner ──────────────────────────────────
+            const smartInfo = document.getElementById('smartScheduleInfo');
+            const smartTimes = document.getElementById('smartScheduleTimes');
+            if (isSmartMode && upload.smart_schedule && typeof upload.smart_schedule === 'object') {
+                const pIcons = { tiktok: 'fab fa-tiktok', youtube: 'fab fa-youtube', instagram: 'fab fa-instagram', facebook: 'fab fa-facebook' };
+                const pColors = { tiktok: '#fff', youtube: '#ff0000', instagram: '#e1306c', facebook: '#1877f2' };
+                smartTimes.innerHTML = Object.entries(upload.smart_schedule).map(([p, dt]) => {
+                    const d = new Date(dt);
+                    const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' at ' + d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+                    return `<span style="display:flex;align-items:center;gap:4px;background:rgba(255,255,255,0.05);padding:3px 8px;border-radius:6px;"><i class="${pIcons[p] || 'fas fa-globe'}" style="color:${pColors[p] || '#888'};font-size:12px;"></i><span>${label}</span></span>`;
+                }).join('');
+                smartInfo.style.display = 'block';
+            } else {
+                smartInfo.style.display = 'none';
+            }
+
+            // ── Form fields ────────────────────────────────────────────────
+            document.getElementById('editTitle').value = upload.title || '';
+            document.getElementById('editCaption').value = upload.caption || '';
+
+            // Hashtags: array or string
+            const rawTags = upload.hashtags;
+            let tagStr = '';
+            if (Array.isArray(rawTags)) tagStr = rawTags.map(t => t.startsWith('#') ? t : `#${t}`).join(' ');
+            else if (typeof rawTags === 'string') tagStr = rawTags;
+            document.getElementById('editHashtags').value = tagStr;
+
+            // Trigger counters
+            document.getElementById('editCaption').dispatchEvent(new Event('input'));
+            document.getElementById('editHashtags').dispatchEvent(new Event('input'));
+
+            // Platforms
+            setSelectedPlatforms(upload.platforms || []);
+
+            // Privacy
+            const privacyEl = document.getElementById('editPrivacy');
+            if (privacyEl) privacyEl.value = upload.privacy || 'public';
+
+            // DateTime
+            if (upload.scheduled_time) {
+                const dt = new Date(upload.scheduled_time);
+                // Offset to local for datetime-local input
+                const offset = dt.getTimezoneOffset();
+                const local = new Date(dt.getTime() - offset * 60000);
+                document.getElementById('editDateTime').value = local.toISOString().slice(0, 16);
+            } else {
+                document.getElementById('editDateTime').value = '';
+            }
+            document.getElementById('editTimezone').value = upload.timezone || 'America/Chicago';
+
+            // Schedule note
+            const note = document.getElementById('scheduleNote');
+            if (isSmartMode && upload.smart_schedule) {
+                note.textContent = 'Overrides smart schedule — applies same time to all platforms.';
+                note.style.color = '#f59e0b';
+            } else {
+                note.textContent = '';
+            }
+
+            document.getElementById('editModal').classList.add('active');
+        }
+
+        function closeEditModal() {
+            document.getElementById('editModal').classList.remove('active');
+            selectedUploadId = null;
+        }
+
+        async function saveScheduledUpload() {
+            if (!selectedUploadId) return;
+
+            const title = document.getElementById('editTitle').value.trim();
+            if (!title) { showToast('Title is required', 'error'); return; }
+
+            const platforms = getSelectedPlatforms();
+            if (!platforms.length) { showToast('Select at least one platform', 'error'); return; }
+
+            const caption = document.getElementById('editCaption').value.trim();
+            const rawHashtags = document.getElementById('editHashtags').value;
+            const hashtags = parseHashtags(rawHashtags);
+            const privacy = document.getElementById('editPrivacy').value || 'public';
+            const dateTime = document.getElementById('editDateTime').value;
+            const timezone = document.getElementById('editTimezone').value;
+
+            const payload = { title, caption, hashtags, platforms, privacy };
+            if (dateTime) payload.scheduled_time = dateTime;
+            if (timezone) payload.timezone = timezone;
+
+            try {
+                await apiCall(`/api/scheduled/${selectedUploadId}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify(payload)
+                });
+
+                // Update local cache so list re-renders instantly
+                const idx = scheduledUploads.findIndex(u => u.id === selectedUploadId);
+                if (idx !== -1) {
+                    scheduledUploads[idx] = { ...scheduledUploads[idx], title, caption, hashtags, platforms, privacy };
+                    if (dateTime) scheduledUploads[idx].scheduled_time = new Date(dateTime).toISOString();
+                }
+
+                showToast('Upload updated successfully', 'success');
+                closeEditModal();
+                await loadScheduledUploads();
+                await loadScheduledStats();
+            } catch (error) {
+                console.error('Failed to save upload:', error);
+                showToast('Failed to save changes — please try again', 'error');
+            }
+        }
+
+        async function cancelScheduledUpload() {
+            if (!selectedUploadId) return;
+
+            if (!confirm('Are you sure you want to cancel this scheduled upload? This cannot be undone.')) return;
+
+            try {
+                await apiCall(`/api/scheduled/${selectedUploadId}`, { method: 'DELETE' });
+                showToast('Scheduled upload cancelled', 'success');
+                closeEditModal();
+                await loadScheduledUploads();
+                await loadScheduledStats();
+            } catch (error) {
+                console.error('Failed to cancel upload:', error);
+                showToast('Failed to cancel upload', 'error');
+            }
+        }
+
+        // Helper functions
+        function getPlatformColor(platform) {
+            const colorMap = {
+                tiktok: userColors.tiktok,
+                youtube: userColors.youtube,
+                instagram: userColors.instagram,
+                facebook: userColors.facebook
+            };
+            return colorMap[platform] || '#6B7280';
+        }
+
+        function getPlatformBadge(platform) {
+            const color = getPlatformColor(platform);
+            const badges = {
+                tiktok: `<span class="platform-badge" style="background: ${color}"><i class="fab fa-tiktok"></i></span>`,
+                youtube: `<span class="platform-badge" style="background: ${color}"><i class="fab fa-youtube"></i></span>`,
+                instagram: `<span class="platform-badge" style="background: ${color}"><i class="fab fa-instagram"></i></span>`,
+                facebook: `<span class="platform-badge" style="background: ${color}"><i class="fab fa-facebook"></i></span>`
+            };
+            return badges[platform] || '';
+        }
+
+        function showToast(type, message) {
+            // Implement toast notification
+            console.log(`${type}: ${message}`);
+        }
+    </script>
+
+    <style>
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.25rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .stat-card {
+            background: var(--bg-card, #1e293b);
+            border-radius: 16px;
+            padding: 1.25rem 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            border: 1px solid var(--border-color, rgba(255,255,255,0.08));
+            box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+        }
+
+        .stat-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            width: 100%;
+        }
+
+        .stat-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .stat-icon.pending { 
+            background: rgba(249, 115, 22, 0.15); 
+            color: #fb923c; 
+        }
+
+        .stat-icon.today { 
+            background: rgba(59, 130, 246, 0.15); 
+            color: #60a5fa; 
+        }
+
+        .stat-icon.week { 
+            background: rgba(16, 185, 129, 0.15); 
+            color: #34d399; 
+        }
+
+        .stat-value {
+            font-size: 1.75rem;
+            font-weight: 800;
+            color: var(--text-primary, #f1f5f9);
+            line-height: 1;
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            color: var(--text-secondary, #94a3b8);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-weight: 600;
+        }
+
+        .stat-trend {
+            font-size: 0.75rem;
+            color: #34d399;
+            font-weight: 500;
+        }
+
+        .view-toggle {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .view-btn {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            border: 1px solid var(--border-color, #E5E7EB);
+            background: var(--bg-card, white);
+            color: var(--text-primary, #1F2937);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+
+        .view-btn:hover {
+            background: var(--bg-hover, #F9FAFB);
+        }
+
+        .view-btn.active {
+            background: var(--accent-color, #F97316);
+            color: white;
+            border-color: var(--accent-color, #F97316);
+        }
+
+        .view-btn svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        .calendar-card {
+            padding: 1.5rem;
+        }
+
+        .calendar-header {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .calendar-header h3 {
+            flex: 1;
+            text-align: center;
+            margin: 0;
+            font-size: 1.125rem;
+            font-weight: 600;
+        }
+
+        .calendar-nav-btn {
+            width: 36px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border-color, #E5E7EB);
+            background: var(--bg-card, white);
+            color: var(--text-primary, #1F2937);
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .calendar-nav-btn:hover {
+            background: var(--bg-hover, #F9FAFB);
+        }
+
+        .calendar-grid {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .calendar-weekdays {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 4px;
+            font-weight: 600;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: var(--text-secondary, #6B7280);
+            padding-bottom: 0.5rem;
+            border-bottom: 1px solid var(--border-color, #E5E7EB);
+            margin-bottom: 0.5rem;
+            text-align: center;
+        }
+
+        .calendar-days {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 4px;
+        }
+
+        .calendar-day {
+            aspect-ratio: 1;
+            padding: 0.5rem;
+            border: 1px solid var(--border-color, #E5E7EB);
+            border-radius: 8px;
+            min-height: 80px;
+            display: flex;
+            flex-direction: column;
+            cursor: default;
+            transition: all 0.2s;
+            color: var(--text-primary, #1F2937);
+        }
+
+        .calendar-day.other-month {
+            color: var(--text-secondary, #D1D5DB);
+            opacity: 0.4;
+            background: var(--bg-hover, #F9FAFB);
+        }
+
+        .calendar-day.today {
+            background: rgba(249, 115, 22, 0.1);
+            border-color: var(--accent-color, #F97316);
+        }
+
+        .calendar-day.today .day-number {
+            background: var(--accent-color, #F97316);
+            color: white;
+            border-radius: 50%;
+            width: 28px;
+            height: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .calendar-day.has-uploads {
+            cursor: pointer;
+            border-color: var(--accent-color, #F97316);
+        }
+
+        .calendar-day.has-uploads:hover {
+            background: rgba(249, 115, 22, 0.05);
+        }
+
+        .day-number {
+            font-weight: 500;
+            font-size: 0.875rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .day-uploads-preview {
+            display: flex;
+            gap: 4px;
+            margin-top: 4px;
+            flex-wrap: wrap;
+        }
+
+        .upload-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .more-count {
+            font-size: 0.625rem;
+            color: var(--text-secondary, #6B7280);
+            margin-left: 2px;
+        }
+
+        .scheduled-list {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .list-date-group {
+            border: 1px solid var(--border-color, #E5E7EB);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .list-date-header {
+            background: var(--bg-hover, #F9FAFB);
+            color: var(--text-primary, #374151);
+            padding: 0.75rem 1rem;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+
+        .scheduled-item {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1rem;
+            border-bottom: 1px solid var(--border-color, #E5E7EB);
+            transition: background 0.2s;
+            cursor: pointer;
+        }
+
+        .scheduled-item:hover {
+            background: var(--bg-hover, #F9FAFB);
+        }
+
+        .scheduled-item:last-child {
+            border-bottom: none;
+        }
+
+        .scheduled-thumb {
+            width: 60px;
+            height: 60px;
+            border-radius: 8px;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .scheduled-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .thumb-placeholder {
+            width: 100%;
+            height: 100%;
+            background: var(--bg-hover, #F3F4F6);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary, #9CA3AF);
+            font-size: 1.5rem;
+        }
+
+        .scheduled-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .scheduled-title {
+            display: block;
+            font-weight: 500;
+            color: var(--text-primary, #1F2937);
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+
+        .scheduled-meta {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-top: 0.25rem;
+        }
+
+        .scheduled-time {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+            font-size: 0.875rem;
+            color: var(--text-secondary, #6B7280);
+        }
+
+        .scheduled-platforms {
+            display: flex;
+            gap: 0.25rem;
+        }
+
+        .platform-badge {
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 0.75rem;
+        }
+
+        .scheduled-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 4rem 2rem;
+            text-align: center;
+        }
+
+        .empty-state-icon {
+            color: var(--text-secondary, #D1D5DB);
+            margin-bottom: 1rem;
+        }
+
+        .empty-state h3 {
+            margin: 0 0 0.5rem;
+            color: var(--text-primary, #1F2937);
+        }
+
+        .empty-state p {
+            color: var(--text-secondary, #6B7280);
+            margin: 0 0 1.5rem;
+        }
+
+        .upload-preview {
+            display: flex;
+            gap: 1rem;
+            padding: 1rem;
+            background: #F9FAFB;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+        }
+
+        .preview-thumb {
+            width: 80px;
+            height: 80px;
+            border-radius: 8px;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .preview-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .preview-info {
+            flex: 1;
+        }
+
+        .preview-title {
+            font-weight: 600;
+            color: #1F2937;
+            margin-bottom: 0.5rem;
+        }
+
+        .preview-platforms {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .datetime-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        /* Modal Styles */
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            padding: 20px;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: var(--bg-card, white);
+            border-radius: 16px;
+            width: 100%;
+            max-width: 600px;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border-color, #E5E7EB);
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1.5rem;
+            border-bottom: 1px solid var(--border-color, #E5E7EB);
+        }
+
+        .modal-header h3 {
+            margin: 0;
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--text-primary, #1F2937);
+        }
+
+        .modal-close {
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: transparent;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: var(--text-secondary, #6B7280);
+        }
+
+        .modal-close:hover {
+            background: var(--bg-hover, #F3F4F6);
+            color: var(--text-primary, #1F2937);
+        }
+
+        .modal-body {
+            padding: 1.5rem;
+            max-height: 72vh;
+            overflow-y: auto;
+        }
+
+        .modal-body .form-control,
+        .modal-body .form-select {
+            background: var(--bg-secondary, #1a1a2e);
+            border: 1px solid var(--border-color, #374151);
+            color: var(--text-primary, #f1f5f9);
+            border-radius: 8px;
+            padding: 9px 12px;
+            font-size: 14px;
+            transition: border-color .15s;
+            box-sizing: border-box;
+        }
+        .modal-body .form-control:focus,
+        .modal-body .form-select:focus {
+            outline: none;
+            border-color: #F97316;
+            box-shadow: 0 0 0 3px rgba(249,115,22,.15);
+        }
+        .modal-body textarea.form-control { font-family: inherit; }
+
+        /* Platform toggle grid */
+        .edit-platform-opt {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            padding: 10px 6px;
+            border-radius: 10px;
+            border: 2px solid var(--border-color, #374151);
+            background: var(--bg-secondary, #1a1a2e);
+            cursor: pointer;
+            user-select: none;
+            transition: border-color .15s, background .15s, transform .1s;
+            color: var(--text-secondary, #94a3b8);
+            font-size: 12px;
+        }
+        .edit-platform-opt:hover { border-color: #F97316; background: rgba(249,115,22,.06); }
+        .edit-platform-opt.selected {
+            border-color: #F97316;
+            background: rgba(249,115,22,.12);
+            color: var(--text-primary, #f1f5f9);
+        }
+        .edit-platform-opt.selected { transform: scale(1.04); }
+
+        .modal-footer {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            padding: 1.5rem;
+            border-top: 1px solid var(--border-color, #E5E7EB);
+        }
+
+        .upload-preview {
+            display: flex;
+            gap: 1rem;
+            padding: 1rem;
+            background: var(--bg-hover, #F9FAFB);
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+        }
+
+        .preview-thumb {
+            width: 80px;
+            height: 80px;
+            border-radius: 8px;
+            overflow: hidden;
+            flex-shrink: 0;
+            background: var(--bg-hover, #E5E7EB);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+
+        .preview-thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        .preview-thumb.no-image {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .preview-thumb .fa-video {
+            font-size: 32px;
+            z-index: 1;
+        }
+
+        .preview-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .preview-title {
+            font-weight: 600;
+            color: var(--text-primary, #1F2937);
+            margin-bottom: 0.5rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .preview-platforms {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        @media (max-width: 768px) {
+            .calendar-day {
+                min-height: 50px;
+                padding: 0.25rem;
+            }
+
+            .day-number {
+                font-size: 0.75rem;
+            }
+
+            .day-uploads-preview {
+                display: none;
+            }
+
+            .calendar-day.has-uploads::after {
+                content: '';
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                background: #F97316;
+                margin-top: 2px;
+            }
+
+            .scheduled-thumb {
+                width: 50px;
+                height: 50px;
+            }
+
+            .datetime-row {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</body>
+</html>

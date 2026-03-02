@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analytics - UploadM8</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <style>
+        /* ── Page header ── */
+        .page-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;margin-bottom:2rem}
+        .page-header-left{display:flex;align-items:center;gap:1rem}
+        .back-btn{display:inline-flex;align-items:center;gap:0.5rem;padding:0.5rem 1rem;background:var(--bg-card);border:1px solid var(--border-color);border-radius:8px;color:var(--text-secondary);font-size:0.875rem;cursor:pointer;transition:all 0.2s;text-decoration:none}
+        .back-btn:hover{background:var(--bg-hover);color:var(--text-primary)}
+        .page-title h1{font-size:1.5rem;font-weight:700;margin:0 0 0.25rem 0}
+        .page-title p{color:var(--text-secondary);margin:0;font-size:0.875rem}
+
+        /* ── Tab Navigation ── */
+        .tab-navigation{display:flex;gap:0.5rem;border-bottom:2px solid var(--border-color);margin-bottom:2rem;flex-wrap:wrap}
+        .tab-btn{padding:0.75rem 1.5rem;background:none;border:none;border-bottom:2px solid transparent;color:var(--text-secondary);font-weight:600;cursor:pointer;transition:all 0.2s;margin-bottom:-2px;display:flex;align-items:center;gap:0.5rem;font-family:inherit;font-size:0.875rem}
+        .tab-btn:hover{color:var(--text-primary);background:var(--bg-hover)}
+        .tab-btn.active{color:var(--accent-orange);border-bottom-color:var(--accent-orange)}
+        .tab-content{display:none}
+        .tab-content.active{display:block}
+
+        /* ── KPI cards ── */
+        .kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:2rem}
+        @media(max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}}
+        @media(max-width:600px){.kpi-grid{grid-template-columns:1fr}}
+        .kpi-card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1.25rem;display:flex;align-items:center;gap:1rem}
+        .kpi-icon{width:48px;height:48px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.25rem;flex-shrink:0}
+        .kpi-icon.uploads{background:rgba(59,130,246,0.15);color:#3b82f6}
+        .kpi-icon.success{background:rgba(34,197,94,0.15);color:#22c55e}
+        .kpi-icon.views{background:rgba(139,92,246,0.15);color:#8b5cf6}
+        .kpi-icon.engagement{background:rgba(249,115,22,0.15);color:#f97316}
+        .kpi-icon.trill{background:rgba(168,85,247,0.15);color:#a855f7}
+        .kpi-icon.speed{background:rgba(249,115,22,0.15);color:#f97316}
+        .kpi-content{flex:1;min-width:0}
+        .kpi-label{font-size:0.75rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:0.25rem}
+        .kpi-value{font-size:1.5rem;font-weight:700;color:var(--text-primary)}
+        .kpi-change{display:inline-flex;align-items:center;gap:0.25rem;font-size:0.75rem;margin-top:0.25rem}
+        .kpi-change.positive{color:#22c55e}
+        .kpi-change.negative{color:#ef4444}
+
+        /* ── Charts row ── */
+        .charts-row{display:grid;grid-template-columns:2fr 1fr;gap:1.5rem;margin-bottom:2rem}
+        @media(max-width:1100px){.charts-row{grid-template-columns:1fr}}
+        .chart-card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1.25rem}
+        .chart-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
+        .chart-title{font-weight:600;font-size:1rem;display:flex;align-items:center;gap:0.5rem}
+        .chart-container{height:280px;position:relative}
+
+        /* ── Platform grid ── */
+        .platform-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:2rem}
+        @media(max-width:1400px){.platform-grid{grid-template-columns:repeat(2,1fr)}}
+        @media(max-width:700px){.platform-grid{grid-template-columns:1fr}}
+        .platform-card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1.25rem;position:relative;overflow:hidden}
+        .platform-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+        .platform-card.tiktok::before{background:#69c9d0}
+        .platform-card.youtube::before{background:#ff0000}
+        .platform-card.instagram::before{background:linear-gradient(90deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888)}
+        .platform-card.facebook::before{background:#1877f2}
+        .platform-card-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
+        .platform-card-header-left{display:flex;align-items:center;gap:0.75rem}
+        .platform-icon{width:40px;height:40px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0}
+        .platform-icon.tiktok{background:#111;color:#fff}
+        .platform-icon.youtube{background:#ff0000;color:#fff}
+        .platform-icon.instagram{background:linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888);color:#fff}
+        .platform-icon.facebook{background:#1877f2;color:#fff}
+        .platform-name{font-weight:700;font-size:0.95rem}
+
+        /* Live badge */
+        .live-pill{display:inline-flex;align-items:center;gap:0.3rem;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;padding:0.2rem 0.5rem;border-radius:20px}
+        .live-pill.live{background:rgba(16,185,129,0.15);color:#10b981}
+        .live-pill.cached{background:rgba(234,179,8,0.15);color:#eab308}
+        .live-pill.error{background:rgba(239,68,68,0.15);color:#ef4444}
+        .live-pill.nc{background:rgba(107,114,128,0.15);color:#6b7280}
+        .live-pill.sandbox{background:rgba(251,146,60,0.15);color:#fb923c}
+        .live-pill .dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex-shrink:0}
+        .live-pill.live .dot{animation:blink 1.8s infinite}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
+
+        /* Stat cells inside platform card */
+        .platform-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:0.5rem;margin-bottom:0.75rem}
+        .platform-stat{background:var(--bg-secondary,rgba(255,255,255,0.04));border-radius:8px;padding:0.5rem;text-align:center}
+        .platform-stat-value{font-size:1rem;font-weight:700;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .platform-stat-label{font-size:0.6rem;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-top:0.1rem}
+
+        /* Mini chart */
+        .mini-chart{height:50px}
+
+        /* Refresh controls */
+        .refresh-bar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:1.25rem;padding:0.75rem 1rem;background:var(--bg-card);border:1px solid var(--border-color);border-radius:10px}
+        .refresh-bar-left{display:flex;align-items:center;gap:0.6rem;font-size:0.8rem;color:var(--text-muted)}
+        .btn-refresh{display:inline-flex;align-items:center;gap:0.4rem;padding:0.4rem 0.9rem;border-radius:8px;font-size:0.8rem;font-weight:600;cursor:pointer;border:1px solid var(--border-color);background:var(--bg-secondary);color:var(--text-primary);transition:background 0.15s;font-family:inherit}
+        .btn-refresh:hover{background:var(--bg-hover)}
+        .btn-refresh:disabled{opacity:0.5;cursor:not-allowed}
+        .spinning i{animation:spin360 1s linear infinite}
+        @keyframes spin360{to{transform:rotate(360deg)}}
+
+        /* Content table */
+        .content-table{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;overflow:hidden;margin-bottom:2rem}
+        .content-table-header{padding:1rem 1.25rem;border-bottom:1px solid var(--border-color)}
+        .content-table table{width:100%;border-collapse:collapse}
+        .content-table th{padding:0.75rem 1rem;text-align:left;font-size:0.75rem;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);border-bottom:1px solid var(--border-color)}
+        .content-table td{padding:0.875rem 1rem;border-bottom:1px solid var(--border-color);font-size:0.875rem;color:var(--text-primary)}
+        .content-table tr:last-child td{border-bottom:none}
+        .empty-state{text-align:center;padding:2.5rem;color:var(--text-muted)}
+        .empty-state i{font-size:2rem;margin-bottom:0.75rem;display:block;opacity:0.4}
+
+        /* Loading */
+        .loading-state{display:flex;align-items:center;justify-content:center;gap:1rem;padding:4rem;color:var(--text-muted);flex-direction:column}
+
+        /* AI badge */
+        .ai-enhanced-badge{background:linear-gradient(135deg,#8b5cf6,#ec4899);color:#fff;padding:0.25rem 0.5rem;border-radius:4px;font-size:0.7rem;margin-left:0.5rem}
+
+        /* Scope health panel */
+        .scope-panel{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1.25rem;margin-bottom:1.5rem}
+        .scope-panel-title{font-weight:700;font-size:0.9rem;margin-bottom:1rem;display:flex;align-items:center;gap:0.5rem;color:var(--text-primary)}
+        .scope-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}
+        @media(max-width:1100px){.scope-grid{grid-template-columns:repeat(2,1fr)}}
+        @media(max-width:600px){.scope-grid{grid-template-columns:1fr}}
+        .scope-platform{border-radius:8px;padding:0.75rem;background:var(--bg-secondary,rgba(255,255,255,0.04))}
+        .scope-platform-name{font-size:0.75rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:0.6rem;display:flex;align-items:center;gap:0.4rem}
+        .scope-item{display:flex;align-items:center;justify-content:space-between;padding:0.25rem 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:0.72rem}
+        .scope-item:last-child{border-bottom:none}
+        .scope-name{color:var(--text-muted);font-family:monospace}
+        .scope-badge{display:inline-flex;align-items:center;gap:0.2rem;font-size:0.65rem;font-weight:700;padding:0.15rem 0.4rem;border-radius:10px}
+        .scope-badge.active{background:rgba(16,185,129,0.15);color:#10b981}
+        .scope-badge.fallback{background:rgba(234,179,8,0.15);color:#eab308}
+        .scope-badge.pending{background:rgba(107,114,128,0.15);color:#6b7280}
+        .scope-badge.error{background:rgba(239,68,68,0.15);color:#ef4444}
+        .scope-badge.sandbox{background:rgba(251,146,60,0.15);color:#fb923c}
+        /* Platform context notes */
+        .scope-context-note{
+            margin-top:0.6rem;padding:0.5rem 0.65rem;border-radius:6px;font-size:0.68rem;
+            line-height:1.5;display:flex;align-items:flex-start;gap:0.4rem;
+        }
+        .scope-context-note.sandbox{background:rgba(251,146,60,0.08);border:1px solid rgba(251,146,60,0.2);color:#fb923c}
+        .scope-context-note.unverified{background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.2);color:#eab308}
+        .scope-context-note.pending{background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);color:#60a5fa}
+        .scope-context-note i{margin-top:1px;flex-shrink:0}
+
+        /* Data source tag on platform cards */
+        .data-source-tag{font-size:0.6rem;color:var(--text-muted);margin-top:0.4rem;text-align:right;font-style:italic}
+        .data-source-tag .source-highlight{color:#10b981;font-weight:600;font-style:normal}
+        .data-source-tag .source-fallback{color:#eab308;font-weight:600;font-style:normal}
+    </style>
+</head>
+<body>
+    <div class="app-layout">
+        <!-- ── Sidebar ── -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <a href="dashboard.html" class="sidebar-logo">
+                    <img src="images/logo.png" alt="UploadM8">
+                    <span>UploadM8</span>
+                </a>
+            </div>
+            <nav class="sidebar-nav">
+                <div class="nav-section">
+                    <div class="nav-section-title">Main</div>
+                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
+                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
+                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
+                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-section-title">Platforms</div>
+                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
+                    <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-section-title">Insights</div>
+                    <a href="analytics.html" class="nav-link active"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
+                </div>
+                <div class="nav-section admin-only" id="adminSection" style="display:none;">
+                    <div class="nav-section-title">Admin</div>
+                    <a href="admin.html" class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
+                    <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
+                    <a href="admin-kpi.html" class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
+                    <a href="admin-calculator.html" class="nav-link"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
+                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-section-title">Account</div>
+                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
+                </div>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <div class="user-avatar" id="userAvatar">U</div>
+                    <div class="user-details">
+                        <div class="user-name" id="userName">Loading...</div>
+                        <div class="user-tier" id="userTier">-</div>
+                    </div>
+                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out"><i class="fas fa-sign-out-alt"></i></button>
+                </div>
+            </div>
+        </aside>
+
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+        <header class="top-bar">
+            <button class="menu-toggle" id="menuToggle"><i class="fas fa-bars"></i></button>
+            <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
+            <div class="top-bar-actions"><button class="theme-toggle" onclick="toggleTheme()"><i class="fas fa-moon"></i></button></div>
+        </header>
+
+        <!-- ── Main content ── -->
+        <main class="main-content">
+
+            <div id="loadingState" class="loading-state">
+                <div class="loading-spinner"></div>
+                <div>Loading analytics…</div>
+            </div>
+
+            <div id="analyticsContent" style="display:none;">
+
+                <!-- Page header -->
+                <div class="page-header">
+                    <div class="page-header-left">
+                        <a href="dashboard.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back</a>
+                        <div class="page-title">
+                            <h1>Analytics</h1>
+                            <p>Track your upload performance and engagement across all platforms</p>
+                        </div>
+                    </div>
+                    <div class="page-actions">
+                        <select id="dateRangeSelect" class="form-select" style="min-width:150px;">
+                            <option value="7">Last 7 Days</option>
+                            <option value="30" selected>Last 30 Days</option>
+                            <option value="90">Last 90 Days</option>
+                            <option value="365">Last Year</option>
+                            <option value="all">All Time</option>
+                        </select>
+                        <button class="btn btn-secondary" id="exportBtn" onclick="exportToExcel()">
+                            <i class="fas fa-download"></i> Export
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Tab Navigation -->
+                <div class="tab-navigation">
+                    <button class="tab-btn active" onclick="switchTab('overview')">
+                        <i class="fas fa-chart-bar"></i> Overview
+                    </button>
+                    <button class="tab-btn" onclick="switchTab('platforms')">
+                        <i class="fas fa-share-alt"></i> Platform Stats
+                    </button>
+                    <button class="tab-btn" id="trillTabBtn" onclick="switchTab('trill')" style="display:none;">
+                        <i class="fas fa-tachometer-alt"></i> Trill Stats
+                    </button>
+                </div>
+
+                <!-- ══════════════════════════════════════════════
+                     OVERVIEW TAB
+                ══════════════════════════════════════════════ -->
+                <div class="tab-content active" id="overviewTab">
+
+                    <!-- 4-up KPI strip -->
+                    <div class="kpi-grid">
+                        <div class="kpi-card">
+                            <div class="kpi-icon uploads"><i class="fas fa-cloud-upload-alt"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Total Uploads</div>
+                                <div class="kpi-value" id="totalUploads">--</div>
+                                <div class="kpi-change positive" id="uploadsChange"><i class="fas fa-arrow-up"></i> --%</div>
+                            </div>
+                        </div>
+                        <div class="kpi-card">
+                            <div class="kpi-icon success"><i class="fas fa-check-circle"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Success Rate</div>
+                                <div class="kpi-value" id="successRate">--%</div>
+                                <div class="kpi-change positive" id="successChange"><i class="fas fa-arrow-up"></i> --%</div>
+                            </div>
+                        </div>
+                        <div class="kpi-card">
+                            <div class="kpi-icon views"><i class="fas fa-eye"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Total Views</div>
+                                <div class="kpi-value" id="totalViews">--</div>
+                                <div class="kpi-change positive" id="viewsChange"><i class="fas fa-arrow-up"></i> --%</div>
+                            </div>
+                        </div>
+                        <div class="kpi-card">
+                            <div class="kpi-icon engagement"><i class="fas fa-heart"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Engagement</div>
+                                <div class="kpi-value" id="engagementRate">--%</div>
+                                <div class="kpi-change positive" id="engagementChange"><i class="fas fa-arrow-up"></i> --%</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Charts -->
+                    <div class="charts-row">
+                        <div class="chart-card">
+                            <div class="chart-header">
+                                <h3 class="chart-title"><i class="fas fa-chart-bar" style="color:#3b82f6;"></i> Upload Activity</h3>
+                            </div>
+                            <div class="chart-container"><canvas id="uploadChart"></canvas></div>
+                        </div>
+                        <div class="chart-card">
+                            <div class="chart-header">
+                                <h3 class="chart-title"><i class="fas fa-chart-pie" style="color:#8b5cf6;"></i> Platform Split</h3>
+                            </div>
+                            <div class="chart-container"><canvas id="platformChart"></canvas></div>
+                        </div>
+                    </div>
+
+                    <!-- Top Performing Content -->
+                    <div class="content-table">
+                        <div class="content-table-header">
+                            <h3 class="chart-title"><i class="fas fa-trophy" style="color:#f97316;"></i> Top Performing Content</h3>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Video</th>
+                                    <th>Platform</th>
+                                    <th>Views</th>
+                                    <th>Likes</th>
+                                    <th>Comments</th>
+                                    <th>Shares</th>
+                                    <th>Engagement</th>
+                                </tr>
+                            </thead>
+                            <tbody id="topContentTable">
+                                <tr><td colspan="7" class="empty-state"><i class="fas fa-film"></i><p>No content data yet</p></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- ══════════════════════════════════════════════
+                     PLATFORM STATS TAB  (live engagement)
+                ══════════════════════════════════════════════ -->
+                <div class="tab-content" id="platformsTab">
+
+                    <!-- Refresh bar -->
+                    <div class="refresh-bar">
+                        <div class="refresh-bar-left">
+                            <i class="fas fa-clock"></i>
+                            <span id="refreshStatusText">Loading live data…</span>
+                            <span id="nextRefreshText" style="margin-left:0.5rem;"></span>
+                        </div>
+                        <button class="btn-refresh" id="refreshBtn" onclick="refreshPlatformMetrics(true)">
+                            <i class="fas fa-sync-alt"></i> Refresh Now
+                        </button>
+                    </div>
+
+                    <!-- Scope Health Panel -->
+                    <div class="scope-panel">
+                        <div class="scope-panel-title">
+                            <i class="fas fa-shield-check" style="color:#10b981;"></i>
+                            Active Scopes &amp; Data Sources
+                            <span style="font-size:0.7rem;font-weight:400;color:var(--text-muted);margin-left:0.5rem;">Shows which API permissions are active and returning live data</span>
+                        </div>
+                        <div class="scope-grid">
+                            <!-- TikTok Scopes -->
+                            <div class="scope-platform">
+                                <div class="scope-platform-name" style="color:#69c9d0;"><i class="fab fa-tiktok"></i> TikTok</div>
+                                <div class="scope-item"><span class="scope-name">video.list</span><span class="scope-badge pending" id="scope-tt-videolist">--</span></div>
+                                <div class="scope-item"><span class="scope-name">user.info.stats</span><span class="scope-badge pending" id="scope-tt-userstats">--</span></div>
+                                <div class="scope-item"><span class="scope-name">video.publish</span><span class="scope-badge pending" id="scope-tt-publish">--</span></div>
+                                <div id="note-tt"></div>
+                            </div>
+                            <!-- YouTube Scopes -->
+                            <div class="scope-platform">
+                                <div class="scope-platform-name" style="color:#ff0000;"><i class="fab fa-youtube"></i> YouTube</div>
+                                <div class="scope-item"><span class="scope-name">youtube.readonly</span><span class="scope-badge pending" id="scope-yt-readonly">--</span></div>
+                                <div class="scope-item"><span class="scope-name">yt-analytics.readonly</span><span class="scope-badge pending" id="scope-yt-analytics">--</span></div>
+                                <div class="scope-item"><span class="scope-name">youtube.upload</span><span class="scope-badge pending" id="scope-yt-upload">--</span></div>
+                                <div id="note-yt"></div>
+                            </div>
+                            <!-- Instagram Scopes -->
+                            <div class="scope-platform">
+                                <div class="scope-platform-name" style="color:#E1306C;"><i class="fab fa-instagram"></i> Instagram</div>
+                                <div class="scope-item"><span class="scope-name">instagram_basic</span><span class="scope-badge pending" id="scope-ig-basic">--</span></div>
+                                <div class="scope-item"><span class="scope-name">instagram_manage_insights</span><span class="scope-badge pending" id="scope-ig-insights">--</span></div>
+                                <div class="scope-item"><span class="scope-name">instagram_content_publish</span><span class="scope-badge pending" id="scope-ig-publish">--</span></div>
+                                <div id="note-ig"></div>
+                            </div>
+                            <!-- Facebook Scopes -->
+                            <div class="scope-platform">
+                                <div class="scope-platform-name" style="color:#1877f2;"><i class="fab fa-facebook-f"></i> Facebook</div>
+                                <div class="scope-item"><span class="scope-name">pages_read_engagement</span><span class="scope-badge pending" id="scope-fb-engagement">--</span></div>
+                                <div class="scope-item"><span class="scope-name">read_insights</span><span class="scope-badge pending" id="scope-fb-insights">--</span></div>
+                                <div class="scope-item"><span class="scope-name">publish_video</span><span class="scope-badge pending" id="scope-fb-publish">--</span></div>
+                                <div id="note-fb"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 4 platform cards -->
+                    <div class="platform-grid">
+
+                        <!-- TikTok -->
+                        <div class="platform-card tiktok">
+                            <div class="platform-card-header">
+                                <div class="platform-card-header-left">
+                                    <div class="platform-icon tiktok"><i class="fab fa-tiktok"></i></div>
+                                    <div class="platform-name">TikTok</div>
+                                </div>
+                                <span class="live-pill nc" id="badge-tiktok"><span class="dot"></span><span id="badge-tiktok-text">--</span></span>
+                            </div>
+                            <div class="platform-stats">
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-uploads">--</div><div class="platform-stat-label">Uploads</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-views">--</div><div class="platform-stat-label">Views</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-likes">--</div><div class="platform-stat-label">Likes</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-comments">--</div><div class="platform-stat-label">Comments</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-shares">--</div><div class="platform-stat-label">Shares</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-watch">--</div><div class="platform-stat-label">Avg Watch</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-followers">--</div><div class="platform-stat-label">Followers</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-following">--</div><div class="platform-stat-label">Following</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-total-likes">--</div><div class="platform-stat-label">Total Likes</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="tt-video-count">--</div><div class="platform-stat-label">Total Videos</div></div>
+                            </div>
+                            <div class="data-source-tag" id="tt-source-tag"></div>
+                            <div class="mini-chart"><canvas id="tiktokMiniChart"></canvas></div>
+                        </div>
+
+                        <!-- YouTube -->
+                        <div class="platform-card youtube">
+                            <div class="platform-card-header">
+                                <div class="platform-card-header-left">
+                                    <div class="platform-icon youtube"><i class="fab fa-youtube"></i></div>
+                                    <div class="platform-name">YouTube</div>
+                                </div>
+                                <span class="live-pill nc" id="badge-youtube"><span class="dot"></span><span id="badge-youtube-text">--</span></span>
+                            </div>
+                            <div class="platform-stats">
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-uploads">--</div><div class="platform-stat-label">Uploads</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-views">--</div><div class="platform-stat-label">Views</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-likes">--</div><div class="platform-stat-label">Likes</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-comments">--</div><div class="platform-stat-label">Comments</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-shares">--</div><div class="platform-stat-label">Shares</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-watch">--</div><div class="platform-stat-label">Avg Watch</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-subs">--</div><div class="platform-stat-label">Subscribers</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-minutes">--</div><div class="platform-stat-label">Min Watched</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="yt-videos">--</div><div class="platform-stat-label">Videos</div></div>
+                            </div>
+                            <div class="data-source-tag" id="yt-source-tag"></div>
+                            <div class="mini-chart"><canvas id="youtubeMiniChart"></canvas></div>
+                        </div>
+
+                        <!-- Instagram -->
+                        <div class="platform-card instagram">
+                            <div class="platform-card-header">
+                                <div class="platform-card-header-left">
+                                    <div class="platform-icon instagram"><i class="fab fa-instagram"></i></div>
+                                    <div class="platform-name">Instagram</div>
+                                </div>
+                                <span class="live-pill nc" id="badge-instagram"><span class="dot"></span><span id="badge-instagram-text">--</span></span>
+                            </div>
+                            <div class="platform-stats">
+                                <div class="platform-stat"><div class="platform-stat-value" id="ig-uploads">--</div><div class="platform-stat-label">Uploads</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="ig-views">--</div><div class="platform-stat-label">Plays</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="ig-likes">--</div><div class="platform-stat-label">Likes</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="ig-comments">--</div><div class="platform-stat-label">Comments</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="ig-saves">--</div><div class="platform-stat-label">Saves</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="ig-reach">--</div><div class="platform-stat-label">Reach</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="ig-shares">--</div><div class="platform-stat-label">Shares</div></div>
+                            </div>
+                            <div class="data-source-tag" id="ig-source-tag"></div>
+                            <div class="mini-chart"><canvas id="instagramMiniChart"></canvas></div>
+                        </div>
+
+                        <!-- Facebook -->
+                        <div class="platform-card facebook">
+                            <div class="platform-card-header">
+                                <div class="platform-card-header-left">
+                                    <div class="platform-icon facebook"><i class="fab fa-facebook-f"></i></div>
+                                    <div class="platform-name">Facebook</div>
+                                </div>
+                                <span class="live-pill nc" id="badge-facebook"><span class="dot"></span><span id="badge-facebook-text">--</span></span>
+                            </div>
+                            <div class="platform-stats">
+                                <div class="platform-stat"><div class="platform-stat-value" id="fb-uploads">--</div><div class="platform-stat-label">Uploads</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="fb-views">--</div><div class="platform-stat-label">Views</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="fb-reactions">--</div><div class="platform-stat-label">Reactions</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="fb-comments">--</div><div class="platform-stat-label">Comments</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="fb-shares">--</div><div class="platform-stat-label">Shares</div></div>
+                                <div class="platform-stat"><div class="platform-stat-value" id="fb-followers">--</div><div class="platform-stat-label">Followers</div></div>
+                            </div>
+                            <div class="data-source-tag" id="fb-source-tag"></div>
+                            <div class="mini-chart"><canvas id="facebookMiniChart"></canvas></div>
+                        </div>
+
+                    </div><!-- /.platform-grid -->
+
+                    <!-- Top content table also visible here -->
+                    <div class="content-table">
+                        <div class="content-table-header">
+                            <h3 class="chart-title"><i class="fas fa-trophy" style="color:#f97316;"></i> Top Performing Content</h3>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Video</th><th>Platform</th><th>Views</th><th>Likes</th><th>Comments</th><th>Shares</th><th>Engagement</th>
+                                </tr>
+                            </thead>
+                            <tbody id="topContentTable2">
+                                <tr><td colspan="7" class="empty-state"><i class="fas fa-film"></i><p>No content data yet</p></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                </div><!-- /#platformsTab -->
+
+                <!-- ══════════════════════════════════════════════
+                     TRILL STATS TAB
+                ══════════════════════════════════════════════ -->
+                <div class="tab-content" id="trillTab">
+                    <div class="kpi-grid">
+                        <div class="kpi-card">
+                            <div class="kpi-icon trill"><i class="fas fa-star"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Avg Trill Score</div>
+                                <div class="kpi-value" id="avgTrillScore">--</div>
+                            </div>
+                        </div>
+                        <div class="kpi-card">
+                            <div class="kpi-icon engagement"><i class="fas fa-fire"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Max Trill Score</div>
+                                <div class="kpi-value" id="maxTrillScore">--</div>
+                            </div>
+                        </div>
+                        <div class="kpi-card">
+                            <div class="kpi-icon speed"><i class="fas fa-tachometer-alt"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Max Speed</div>
+                                <div class="kpi-value" id="maxSpeed">-- mph</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="charts-row" style="grid-template-columns:1fr;">
+                        <div class="chart-card">
+                            <div class="chart-header">
+                                <h3 class="chart-title"><i class="fas fa-tachometer-alt" style="color:#f97316;"></i> Speed Distribution</h3>
+                            </div>
+                            <div class="chart-container"><canvas id="speedBucketChart"></canvas></div>
+                        </div>
+                    </div>
+                    <div class="content-table">
+                        <div class="content-table-header">
+                            <h3 class="chart-title"><i class="fas fa-flag-checkered" style="color:#10b981;"></i> Trill Uploads</h3>
+                        </div>
+                        <table>
+                            <thead>
+                                <tr><th>Title</th><th>Trill Score</th><th>Max Speed</th><th>Distance</th><th>Platforms</th><th>Status</th><th>Date</th></tr>
+                            </thead>
+                            <tbody id="trillTable">
+                                <tr><td colspan="7" class="empty-state"><i class="fas fa-tachometer-alt"></i><p>No Trill uploads found</p></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div><!-- /#trillTab -->
+
+            </div><!-- /#analyticsContent -->
+        </main>
+    </div><!-- /.app-layout -->
+
+    <script src="app.js"></script>
+    <script>
+    (function(){
+        const API_BASE = window.API_BASE || 'https://auth.uploadm8.com';
+        let uploadChart = null, platformChart = null, speedBucketChart = null;
+        let currentAnalyticsData = null;
+        let countdownTimer = null;
+        let nextRefreshAt = 0;
+        const CACHE_TTL_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+        // ── helpers ─────────────────────────────────────────────────────
+        function setText(id, val){
+            const el = document.getElementById(id);
+            if(el) el.textContent = (val !== null && val !== undefined) ? val : '--';
+        }
+        function fmtNum(n){
+            if(n === null || n === undefined || n === '' || isNaN(Number(n))) return 'N/A';
+            n = Number(n);
+            if(n >= 1e9) return (n/1e9).toFixed(1)+'B';
+            if(n >= 1e6) return (n/1e6).toFixed(1)+'M';
+            if(n >= 1e3) return (n/1e3).toFixed(1)+'K';
+            return n.toLocaleString();
+        }
+        function fmtSec(s){
+            if(s === null || s === undefined) return 'N/A';
+            s = Number(s);
+            if(isNaN(s)) return 'N/A';
+            if(s < 60) return s + 's';
+            return Math.floor(s/60)+'m '+(s%60)+'s';
+        }
+        function setBadge(platform, state){
+            const el  = document.getElementById('badge-'+platform);
+            const txt = document.getElementById('badge-'+platform+'-text');
+            if(!el) return;
+            el.className = 'live-pill ' + state;
+            const labels = {live:'Live', cached:'Cached', error:'Error', nc:'Not Connected', sandbox:'Sandbox'};
+            if(txt) txt.textContent = labels[state] || state;
+        }
+
+        // ── tab switching ────────────────────────────────────────────────
+        window.switchTab = function(tabName){
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelector(`.tab-btn[onclick="switchTab('${tabName}')"]`)?.classList.add('active');
+            document.getElementById(tabName+'Tab')?.classList.add('active');
+            if(tabName === 'trill' && currentAnalyticsData) loadTrillUploads();
+            if(tabName === 'platforms') refreshPlatformMetrics(false);
+        };
+
+        // ── init ─────────────────────────────────────────────────────────
+        document.addEventListener('DOMContentLoaded', async () => {
+            const user = await initApp('analytics');
+            if(!user) return;
+            initCharts();                       // init first so canvas is ready
+            await loadAnalytics();             // then load data to populate them
+            document.getElementById('dateRangeSelect')?.addEventListener('change', loadAnalytics);
+        });
+
+        // ── core analytics (uploads / KPIs) ─────────────────────────────
+        async function loadAnalytics(){
+            const range = document.getElementById('dateRangeSelect')?.value || '30';
+            const map = {'7':'7d','30':'30d','90':'90d','365':'1y','all':'1y'};
+            try{
+                const data = await apiCall('/api/analytics?range='+(map[range]||'30d'));
+                if(!data) return;
+                currentAnalyticsData = data;
+                document.getElementById('loadingState').style.display = 'none';
+                document.getElementById('analyticsContent').style.display = 'block';
+                updateKPIs(data);
+                updateCharts(data);
+                loadTopContent(map[range]||'30d');
+                if(data.trill && data.trill.trill_uploads > 0){
+                    document.getElementById('trillTabBtn').style.display = 'flex';
+                    updateTrillStats(data.trill);
+                }
+            }catch(e){
+                console.error('Analytics load error:', e);
+                document.getElementById('loadingState').style.display = 'none';
+                document.getElementById('analyticsContent').style.display = 'block';
+                showToast('Failed to load analytics','error');
+            }
+        }
+
+        function updateKPIs(data){
+            setText('totalUploads', fmtNum(data.total_uploads || 0));
+            const sr = data.total_uploads > 0 ? Math.round((data.completed/data.total_uploads)*100) : 0;
+            setText('successRate', sr+'%');
+            setText('totalViews', fmtNum(data.views || 0));
+            const eng = data.views > 0 ? ((data.likes||0)/data.views*100).toFixed(1)+'%' : '0%';
+            setText('engagementRate', eng);
+        }
+
+        // ── platform metrics (live) ──────────────────────────────────────
+        window.refreshPlatformMetrics = async function(force){
+            const btn = document.getElementById('refreshBtn');
+            if(btn){ btn.classList.add('spinning'); btn.disabled = true; }
+            setText('refreshStatusText', 'Fetching live data…');
+            // Reset all scope badges to loading state
+            const allScopeIds = [
+                'scope-tt-videolist','scope-tt-userstats','scope-tt-publish',
+                'scope-yt-readonly','scope-yt-analytics','scope-yt-upload',
+                'scope-ig-basic','scope-ig-insights','scope-ig-publish',
+                'scope-fb-engagement','scope-fb-insights','scope-fb-publish'
+            ];
+            allScopeIds.forEach(id => setScopeBadge(id, 'pending', '…'));
+            try{
+                const data = await apiCall('/api/analytics/platform-metrics'+(force?'?force=true':''));
+                applyPlatformData(data);
+            }catch(e){
+                console.warn('Platform metrics endpoint not available yet:', e.message);
+                setText('refreshStatusText', 'Platform data unavailable — deploy backend endpoint first');
+                ['tiktok','youtube','instagram','facebook'].forEach(p => setBadge(p,'nc'));
+                // Mark all scopes as error state
+                const allScopeIds = [
+                    'scope-tt-videolist','scope-tt-userstats','scope-tt-publish',
+                    'scope-yt-readonly','scope-yt-analytics','scope-yt-upload',
+                    'scope-ig-basic','scope-ig-insights','scope-ig-publish',
+                    'scope-fb-engagement','scope-fb-insights','scope-fb-publish'
+                ];
+                allScopeIds.forEach(id => setScopeBadge(id, 'error', 'Unavailable'));
+            }finally{
+                if(btn){ btn.classList.remove('spinning'); btn.disabled = false; }
+            }
+        };
+
+        // ── Scope badge helper ────────────────────────────────────────────────
+        function setScopeBadge(id, state, label){
+            const el = document.getElementById(id);
+            if(!el) return;
+            el.className = 'scope-badge ' + state;
+            el.textContent = label || state;
+        }
+
+        // ── Context note helper ───────────────────────────────────────────────
+        // Shows a contextual explanation inside the scope card when a platform
+        // has a known limitation (sandbox, unverified app, pending review).
+        const _CONTEXT_NOTES = {
+            tt: {
+                sandbox: {cls:'sandbox', icon:'fa-flask', text:
+                    '<strong>TikTok Sandbox Mode</strong> — Scopes are granted and working. ' +
+                    'Data is limited to sandbox test accounts. Apply for production access to go live.'},
+                error:   {cls:'sandbox', icon:'fa-exclamation-triangle', text:
+                    'Token may need refreshing. Disconnect and reconnect your TikTok account to restore access.'},
+            },
+            yt: {
+                unverified: {cls:'unverified', icon:'fa-clock', text:
+                    '<strong>App not yet verified by Google</strong> — <code>yt-analytics.readonly</code> works for ' +
+                    'the account owner (you) while in testing. Channel stats are shown as a fallback. ' +
+                    'Analytics will upgrade automatically once Google verifies the app.'},
+            },
+            ig: {
+                pending: {cls:'pending', icon:'fa-hourglass-half', text:
+                    '<strong>Advanced access pending Meta review</strong> — <code>instagram_manage_insights</code> ' +
+                    'requires Meta app review for access by other users. Currently works for your own account. ' +
+                    'Submit for review in Meta for Developers → App Review.'},
+            },
+            fb: {
+                pending: {cls:'pending', icon:'fa-hourglass-half', text:
+                    '<strong>Advanced access pending Meta review</strong> — <code>read_insights</code> and ' +
+                    '<code>pages_read_user_content</code> require Meta app review. Works for your own Page now. ' +
+                    'Submit for review in Meta for Developers → App Review.'},
+            },
+        };
+
+        function _setContextNote(platform, type){
+            const el = document.getElementById('note-' + platform);
+            if(!el) return;
+            if(!type){ el.innerHTML = ''; return; }
+            const note = (_CONTEXT_NOTES[platform]||{})[type];
+            if(!note){ el.innerHTML = ''; return; }
+            el.innerHTML = `<div class="scope-context-note ${note.cls}">
+                <i class="fas ${note.icon}"></i>
+                <span>${note.text}</span>
+            </div>`;
+        }
+
+        // ── Data source tag helper ─────────────────────────────────────────────
+        function setSourceTag(id, source){
+            const el = document.getElementById(id);
+            if(!el) return;
+            if(!source){ el.innerHTML=''; return; }
+            const isAnalytics = source.includes('analytics') || source.includes('insights') || source.includes('video.list');
+            const cls = isAnalytics ? 'source-highlight' : 'source-fallback';
+            el.innerHTML = 'Data via: <span class="'+cls+'">'+source+'</span>';
+        }
+
+        function applyPlatformData(data){
+            if(!data || !data.platforms) return;
+            const p  = data.platforms;
+            const ts = data.fetched_at ? new Date(data.fetched_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '';
+            const stateLabel = data.cached ? 'Cached' : 'Live';
+            setText('refreshStatusText', stateLabel+' as of '+ts+
+                (data.cache_age_minutes ? ' ('+data.cache_age_minutes+'m ago)' : ''));
+
+            // Schedule next refresh countdown
+            clearInterval(countdownTimer);
+            nextRefreshAt = Date.now() + (data.next_refresh_minutes||180)*60000;
+            countdownTimer = setInterval(()=>{
+                const rem = nextRefreshAt - Date.now();
+                if(rem <= 0){ clearInterval(countdownTimer); refreshPlatformMetrics(false); return; }
+                const h = Math.floor(rem/3600000);
+                const m = Math.floor((rem%3600000)/60000);
+                const s = Math.floor((rem%60000)/1000);
+                setText('nextRefreshText',
+                    '· Next refresh in '+(h>0?h+'h ':'')+m+'m '+s+'s');
+            }, 1000);
+
+            // ── TikTok ────────────────────────────────────────────────────────
+            const tt = p.tiktok||{};
+            if(tt.status==='not_connected'){
+                setBadge('tiktok','nc');
+                setScopeBadge('scope-tt-videolist','pending','Not connected');
+                setScopeBadge('scope-tt-userstats','pending','Not connected');
+                setScopeBadge('scope-tt-publish','pending','Not connected');
+                _setContextNote('tt', null);
+            } else if(tt.status==='error'){
+                // Distinguish sandbox mode (403/401) from hard error
+                const isSandbox = tt.error && (String(tt.error).includes('sandbox') ||
+                    String(tt.error).includes('401') || String(tt.error).includes('403') ||
+                    String(tt.error).includes('video_list_http_4'));
+                setBadge('tiktok', isSandbox ? 'sandbox' : 'error');
+                setText('tt-uploads', fmtNum(tt.uploads||0));
+                if(isSandbox){
+                    setScopeBadge('scope-tt-videolist','fallback','Sandbox Mode');
+                    setScopeBadge('scope-tt-userstats','fallback','Sandbox Mode');
+                    setScopeBadge('scope-tt-publish','fallback','Sandbox Mode');
+                    _setContextNote('tt','sandbox');
+                } else {
+                    setScopeBadge('scope-tt-videolist','error','Error');
+                    setScopeBadge('scope-tt-userstats','error','Error');
+                    setScopeBadge('scope-tt-publish','pending','--');
+                    _setContextNote('tt','error');
+                }
+            } else {
+                setBadge('tiktok', data.cached?'cached':'live');
+                setText('tt-uploads',      fmtNum(tt.uploads));
+                setText('tt-views',        fmtNum(tt.views));
+                setText('tt-likes',        fmtNum(tt.likes));
+                setText('tt-comments',     fmtNum(tt.comments));
+                setText('tt-shares',       fmtNum(tt.shares));
+                setText('tt-watch',        fmtSec(tt.avg_watch_seconds));
+                setText('tt-followers',    tt.followers != null ? fmtNum(tt.followers) : 'N/A');
+                setText('tt-following',    tt.following  != null ? fmtNum(tt.following)  : 'N/A');
+                setText('tt-total-likes',  tt.total_likes != null ? fmtNum(tt.total_likes) : 'N/A');
+                setText('tt-video-count',  tt.video_count != null ? fmtNum(tt.video_count) : 'N/A');
+                setSourceTag('tt-source-tag', tt.analytics_source||null);
+                _setContextNote('tt', null);
+                // Scope badges
+                setScopeBadge('scope-tt-videolist', 'active', '✓ Active');
+                setScopeBadge('scope-tt-userstats',
+                    tt.followers != null ? 'active' : 'fallback',
+                    tt.followers != null ? '✓ Active' : 'Needs reconnect');
+                setScopeBadge('scope-tt-publish', 'active', '✓ Active');
+            }
+
+            // ── YouTube ───────────────────────────────────────────────────────
+            const yt = p.youtube||{};
+            if(yt.status==='not_connected'){
+                setBadge('youtube','nc');
+                setScopeBadge('scope-yt-readonly','pending','Not connected');
+                setScopeBadge('scope-yt-analytics','pending','Not connected');
+                setScopeBadge('scope-yt-upload','pending','Not connected');
+            } else if(yt.status==='error'){
+                setBadge('youtube','error');
+                setText('yt-uploads', fmtNum(yt.uploads));
+                setScopeBadge('scope-yt-readonly','error','Error');
+                setScopeBadge('scope-yt-analytics','error','Error');
+                setScopeBadge('scope-yt-upload','pending','--');
+            } else {
+                setBadge('youtube', data.cached?'cached':'live');
+                setText('yt-uploads',  fmtNum(yt.uploads));
+                setText('yt-views',    fmtNum(yt.views));
+                setText('yt-likes',    fmtNum(yt.likes));
+                setText('yt-comments', fmtNum(yt.comments));
+                setText('yt-shares',   fmtNum(yt.shares));
+                setText('yt-watch',    fmtSec(yt.avg_watch_seconds));
+                setText('yt-subs',     fmtNum(yt.subscribers));
+                setText('yt-minutes',  fmtNum(yt.minutes_watched));
+                setText('yt-videos',   fmtNum(yt.video_count));
+                const ytFromAnalytics = yt.analytics_source === 'yt-analytics';
+                setSourceTag('yt-source-tag', yt.analytics_source||null);
+                // Scope badges
+                setScopeBadge('scope-yt-readonly', 'active', '✓ Active');
+                setScopeBadge('scope-yt-analytics',
+                    ytFromAnalytics ? 'active' : 'fallback',
+                    ytFromAnalytics ? '✓ Active' : 'Unverified App');
+                setScopeBadge('scope-yt-upload', 'active', '✓ Active');
+                _setContextNote('yt', ytFromAnalytics ? null : 'unverified');
+            }
+
+            // ── Instagram ─────────────────────────────────────────────────────
+            const ig = p.instagram||{};
+            if(ig.status==='not_connected'){
+                setBadge('instagram','nc');
+                setScopeBadge('scope-ig-basic','pending','Not connected');
+                setScopeBadge('scope-ig-insights','pending','Not connected');
+                setScopeBadge('scope-ig-publish','pending','Not connected');
+            } else if(ig.status==='error'){
+                setBadge('instagram','error');
+                setText('ig-uploads', fmtNum(ig.uploads));
+                setScopeBadge('scope-ig-basic','error','Error');
+                setScopeBadge('scope-ig-insights','error','Error');
+                setScopeBadge('scope-ig-publish','pending','--');
+            } else {
+                setBadge('instagram', data.cached?'cached':'live');
+                setText('ig-uploads',  fmtNum(ig.uploads));
+                setText('ig-views',    fmtNum(ig.views));
+                setText('ig-likes',    fmtNum(ig.likes));
+                setText('ig-comments', fmtNum(ig.comments));
+                setText('ig-saves',    fmtNum(ig.saves));
+                setText('ig-reach',    fmtNum(ig.reach));
+                setText('ig-shares',   fmtNum(ig.shares));
+                setSourceTag('ig-source-tag', ig.analytics_source||null);
+                // Scope badges
+                setScopeBadge('scope-ig-basic',    'active', '✓ Active');
+                const igInsightsOk = ig.analytics_source === 'instagram_manage_insights';
+                setScopeBadge('scope-ig-insights',
+                    igInsightsOk ? 'active' : 'fallback',
+                    igInsightsOk ? '✓ Active' : 'Pending Approval');
+                setScopeBadge('scope-ig-publish',  'active', '✓ Active');
+                _setContextNote('ig', igInsightsOk ? null : 'pending');
+            }
+
+            // ── Facebook ──────────────────────────────────────────────────────
+            const fb = p.facebook||{};
+            if(fb.status==='not_connected'){
+                setBadge('facebook','nc');
+                setScopeBadge('scope-fb-engagement','pending','Not connected');
+                setScopeBadge('scope-fb-insights','pending','Not connected');
+                setScopeBadge('scope-fb-publish','pending','Not connected');
+            } else if(fb.status==='error'){
+                setBadge('facebook','error');
+                setText('fb-uploads', fmtNum(fb.uploads));
+                setScopeBadge('scope-fb-engagement','error','Error');
+                setScopeBadge('scope-fb-insights','error','Error');
+                setScopeBadge('scope-fb-publish','pending','--');
+            } else {
+                setBadge('facebook', data.cached?'cached':'live');
+                setText('fb-uploads',   fmtNum(fb.uploads));
+                setText('fb-views',     fmtNum(fb.views));
+                setText('fb-reactions', fmtNum(fb.reactions));
+                setText('fb-comments',  fmtNum(fb.comments));
+                setText('fb-shares',    fmtNum(fb.shares));
+                setText('fb-followers', fmtNum(fb.followers));
+                setSourceTag('fb-source-tag', fb.analytics_source||null);
+                // Scope badges
+                setScopeBadge('scope-fb-engagement', 'active', '✓ Active');
+                const fbInsightsOk = !!fb.analytics_source;
+                setScopeBadge('scope-fb-insights',
+                    fbInsightsOk ? 'active' : 'fallback',
+                    fbInsightsOk ? '✓ Active' : 'Pending Approval');
+                setScopeBadge('scope-fb-publish', 'active', '✓ Active');
+                _setContextNote('fb', fbInsightsOk ? null : 'pending');
+            }
+        }
+
+        // ── charts ───────────────────────────────────────────────────────
+        const chartDefaults = {
+            responsive:true, maintainAspectRatio:false,
+            plugins:{ legend:{display:false} },
+            scales:{
+                x:{display:false},
+                y:{display:false, ticks:{stepSize:1, precision:0}}
+            }
+        };
+
+        function initCharts(){
+            const uploadCtx = document.getElementById('uploadChart');
+            if(uploadCtx){
+                uploadChart = new Chart(uploadCtx, {
+                    type:'bar',
+                    data:{ labels:[], datasets:[{
+                        data:[], backgroundColor:'rgba(59,130,246,0.6)',
+                        borderColor:'#3b82f6', borderWidth:1, borderRadius:4
+                    }]},
+                    options:{
+                        responsive:true, maintainAspectRatio:false,
+                        plugins:{ legend:{display:false} },
+                        scales:{
+                            x:{grid:{display:false}, ticks:{color:'#9ca3af', font:{size:11}}},
+                            y:{grid:{color:'rgba(255,255,255,0.05)'}, ticks:{color:'#9ca3af'}}
+                        }
+                    }
+                });
+            }
+            const platformCtx = document.getElementById('platformChart');
+            if(platformCtx){
+                platformChart = new Chart(platformCtx, {
+                    type:'doughnut',
+                    data:{
+                        labels:['TikTok','YouTube','Instagram','Facebook'],
+                        datasets:[{ data:[0,0,0,0], backgroundColor:['#69c9d0','#FF0000','#E1306C','#1877F2'], borderWidth:0 }]
+                    },
+                    options:{
+                        responsive:true, maintainAspectRatio:false,
+                        plugins:{ legend:{display:true, position:'bottom', labels:{color:'#9ca3af', padding:12, font:{size:11}}} }
+                    }
+                });
+            }
+            const speedCtx = document.getElementById('speedBucketChart');
+            if(speedCtx){
+                speedBucketChart = new Chart(speedCtx, {
+                    type:'doughnut',
+                    data:{
+                        labels:['🏆 Glory Boy','🔥 Euphoric','⚡ Send It','🏁 Spirited','😎 Cruise'],
+                        datasets:[{ data:[0,0,0,0,0], backgroundColor:['#a855f7','#f97316','#3b82f6','#10b981','#6b7280'], borderWidth:0 }]
+                    },
+                    options:{
+                        responsive:true, maintainAspectRatio:false,
+                        plugins:{ legend:{display:true, position:'bottom', labels:{color:'#9ca3af', padding:12}} }
+                    }
+                });
+            }
+        }
+
+        function updateCharts(data){
+            if(uploadChart && data.daily){
+                uploadChart.data.labels = data.daily.map(d => d.date);
+                uploadChart.data.datasets[0].data = data.daily.map(d => d.uploads);
+                uploadChart.update();
+            }
+            if(platformChart && data.platforms){
+                platformChart.data.datasets[0].data = [
+                    data.platforms.tiktok||0, data.platforms.youtube||0,
+                    data.platforms.instagram||0, data.platforms.facebook||0
+                ];
+                platformChart.update();
+            }
+        }
+
+        // ── Trill ────────────────────────────────────────────────────────
+        function updateTrillStats(trill){
+            setText('avgTrillScore', trill.avg_trill_score?.toFixed(1) || '--');
+            setText('maxTrillScore', trill.max_trill_score?.toFixed(1) || '--');
+            setText('maxSpeed', trill.max_speed ? trill.max_speed.toFixed(1)+' mph' : '-- mph');
+        }
+        async function loadTrillUploads(){
+            try{
+                const range = document.getElementById('dateRangeSelect')?.value||'30';
+                const map = {'7':'7d','30':'30d','90':'90d','365':'1y','all':'1y'};
+                const data = await apiCall('/api/analytics?range='+(map[range]||'30d'));
+                if(data?.trill?.uploads && data.trill.uploads.length > 0){
+                    document.getElementById('trillTable').innerHTML = data.trill.uploads.map(u=>`
+                        <tr>
+                            <td>${u.title||u.filename||'Untitled'}</td>
+                            <td>${u.trill_score?.toFixed(1)||'--'}</td>
+                            <td>${u.max_speed_mph ? u.max_speed_mph.toFixed(1)+' mph' : '--'}</td>
+                            <td>${u.distance_miles ? u.distance_miles.toFixed(1)+' mi' : '--'}</td>
+                            <td>${(u.platforms||[]).join(', ')||'--'}</td>
+                            <td><span class="badge-status ${u.status}">${u.status||'--'}</span></td>
+                            <td>${u.created_at ? new Date(u.created_at).toLocaleDateString() : '--'}</td>
+                        </tr>
+                    `).join('');
+                }
+            }catch(e){ console.error('Trill uploads error:', e); }
+        }
+
+        // ── Top Performing Content ────────────────────────────────────────
+        async function loadTopContent(range){
+            const tbody  = document.getElementById('topContentTable');
+            const tbody2 = document.getElementById('topContentTable2');
+            if(!tbody && !tbody2) return;
+            try{
+                // Note: backend status= only accepts single values, so filter client-side
+                const data = await apiCall('/api/uploads?limit=50').catch(()=>null);
+                if(!data) return;
+                const allItems = Array.isArray(data) ? data : (data.uploads || data.items || []);
+                // Sort by views desc, then filter to completed
+                const items = allItems
+                    .filter(u => ['completed','succeeded','partial'].includes(u.status))
+                    .sort((a,b) => (b.views||0) - (a.views||0));
+                if(!items.length){
+                    // Show the upload even with 0 views so the table is never falsely empty
+                    const anyDone = allItems.filter(u => ['completed','succeeded','partial'].includes(u.status));
+                    if(anyDone.length) {
+                        const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'K' : String(n||0);
+                        const rows = anyDone.slice(0,10).map(u => {
+                            const views=u.views||0,likes=u.likes||0,comments=u.comments||0,shares=u.shares||0;
+                            const eng = views > 0 ? ((likes+comments+shares)/views*100).toFixed(1)+'%' : '—';
+                            const plats = Array.isArray(u.platforms) ? u.platforms.join(', ') : (u.platform||'--');
+                            const title = u.title || u.filename || 'Untitled';
+                            return `<tr><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${title}">${title}</td>
+                                <td>${plats}</td><td>${fmt(views)}</td><td>${fmt(likes)}</td>
+                                <td>${fmt(comments)}</td><td>${fmt(shares)}</td><td>${eng}</td></tr>`;
+                        }).join('');
+                        if(tbody)  tbody.innerHTML  = rows;
+                        if(tbody2) tbody2.innerHTML = rows;
+                    }
+                    return;
+                }
+                const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'K' : String(n||0);
+                const rows = items.slice(0,10).map(u => {
+                    const views    = u.views    || 0;
+                    const likes    = u.likes    || 0;
+                    const comments = u.comments || 0;
+                    const shares   = u.shares   || 0;
+                    const eng      = views > 0 ? ((likes+comments+shares)/views*100).toFixed(1)+'%' : '0%';
+                    const plats    = Array.isArray(u.platforms) ? u.platforms.join(', ') : (u.platform || '--');
+                    const title    = u.title || u.original_filename || u.filename || 'Untitled';
+                    return `<tr>
+                        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${title}</td>
+                        <td>${plats}</td>
+                        <td>${fmt(views)}</td>
+                        <td>${fmt(likes)}</td>
+                        <td>${fmt(comments)}</td>
+                        <td>${fmt(shares)}</td>
+                        <td>${eng}</td>
+                    </tr>`;
+                }).join('');
+                if(tbody)  tbody.innerHTML  = rows;
+                if(tbody2) tbody2.innerHTML = rows;
+            }catch(e){ console.error('Top content error:', e); }
+        }
+
+        // ── Excel export ─────────────────────────────────────────────────
+        window.exportToExcel = async function(){
+            const btn = document.getElementById('exportBtn');
+            if(btn){ btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Exporting…'; }
+            try{
+                const range = document.getElementById('dateRangeSelect')?.value||'30';
+                const r = await fetch(API_BASE+'/api/analytics/export?days='+range,{
+                    headers:{'Authorization':'Bearer '+getToken()}
+                });
+                if(r.ok){
+                    const blob = await r.blob();
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href=url; a.download='uploadm8-analytics-'+new Date().toISOString().split('T')[0]+'.xlsx';
+                    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+                    showToast('Analytics exported','success');
+                }else{ throw new Error('Export failed'); }
+            }catch(e){ showToast('Failed to export','error'); console.error(e); }
+            finally{ if(btn){ btn.disabled=false; btn.innerHTML='<i class="fas fa-download"></i> Export'; } }
+        };
+
+    })();
+    </script>
+</body>
+</html>

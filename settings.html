@@ -59,10 +59,29 @@
             </div>
         </aside>
 
+    <div class="sidebar-overlay hidden" id="sidebarOverlay" aria-hidden="true"></div>
+
+	<header class="top-bar">
+		<button class="btn btn-icon menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
+        <div class="top-bar-actions">
+            <button class="theme-toggle" id="themeToggle" title="Toggle Theme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+        </div>
+    </header>
+
+
         <main class="main-content">
-            <div class="page-header">
-                <div><h1 class="page-title">Settings</h1><p class="page-subtitle">Manage your account and preferences</p></div>
-            </div>
+			<div class="page-header">
+				<div style="display:flex;align-items:center;gap:16px;flex:1;min-width:0;">
+					<button class="btn btn-icon" onclick="history.back()" title="Go Back" aria-label="Go Back">
+						<i class="fas fa-arrow-left"></i>
+					</button>
+					<div>
+						<h1 class="page-title">Settings</h1>
+						<p class="page-subtitle">Manage your account and preferences</p>
+					</div>
+				</div>
+			</div>
 
             <div class="settings-tabs-container">
                 <div class="settings-tabs">

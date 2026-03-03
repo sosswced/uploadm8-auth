@@ -35,7 +35,7 @@ function setTheme(theme) {
         document.body.classList.add('dark-mode');
         document.body.classList.remove('light-mode');
     }
-    const icons = document.querySelectorAll('#themeToggleIcon, #themeToggleIconDesktop');
+    const icons = document.querySelectorAll('#themeToggleIcon, #themeToggleIconDesktop, #themeToggleIconMobile');
     icons.forEach(icon => {
         if (icon) icon.className = theme === 'dark' ? 'fas fa-moon' : 'fas fa-sun';
     });
@@ -961,18 +961,9 @@ function showError(container, message) {
 }
 
 function toggleSidebar() {
-    const sidebar = document.getElementById('sidebar');
-    const overlay = document.getElementById('sidebarOverlay');
-    const body = document.body;
-    
-    if (sidebar) {
-        sidebar.classList.toggle('open');
-        // Also toggle a class on body for potential CSS hooks
-        body.classList.toggle('sidebar-open');
-    }
-    if (overlay) {
-        overlay.classList.toggle('hidden');
-        overlay.classList.toggle('active');
+    // Legacy-safe proxy. Real handler is wired on DOMContentLoaded.
+    if (typeof window.toggleSidebar === 'function' && window.toggleSidebar !== toggleSidebar) {
+        window.toggleSidebar();
     }
 }
 
@@ -1345,108 +1336,150 @@ if (typeof window !== 'undefined') {
     window.buildKpiRangeDropdown = buildKpiRangeDropdown;
 }
 
-
 // ============================================================
-// MOBILE: Universal sidebar init — single source of truth
-// Fires at DOMContentLoaded. No other code should touch these
-// elements. All HTML onclick="toggleSidebar()" has been removed.
+// MOBILE SIDEBAR — Universal DOMContentLoaded Init
+// Fires on EVERY page regardless of whether initApp() is called.
+// This is the single source of truth for burger menu + back buttons.
 // ============================================================
 document.addEventListener('DOMContentLoaded', function () {
 
-    var btn     = document.getElementById('menuToggle');
-    var sidebar = document.getElementById('sidebar');
-    var overlay = document.getElementById('sidebarOverlay');
-    var isOpen  = false;
+    // ── 1. Sidebar toggle ──────────────────────────────────────
+    var menuToggle   = document.getElementById('menuToggle');
+    var sidebar      = document.getElementById('sidebar');
+    var overlay      = document.getElementById('sidebarOverlay');
+
+    var _sidebarIsOpen = false;
 
     function openSidebar() {
-        if (!sidebar || isOpen) return;
-        isOpen = true;
+        if (!sidebar) return;
+        _sidebarIsOpen = true;
         sidebar.classList.add('open');
         document.body.classList.add('sidebar-open');
         if (overlay) {
             overlay.classList.remove('hidden');
+            overlay.classList.add('active');
             overlay.style.display = 'block';
         }
     }
 
     function closeSidebar() {
-        if (!sidebar || !isOpen) return;
-        isOpen = false;
+        if (!sidebar) return;
+        _sidebarIsOpen = false;
         sidebar.classList.remove('open');
         document.body.classList.remove('sidebar-open');
         if (overlay) {
             overlay.classList.add('hidden');
-            overlay.style.display = '';
+            overlay.classList.remove('active');
+            overlay.style.display = 'none';
         }
     }
 
-    function toggleSidebarMobile() {
-        if (isOpen) { closeSidebar(); } else { openSidebar(); }
+    function _toggleSidebar() {
+        if (!sidebar) return;
+        if (_sidebarIsOpen || sidebar.classList.contains('open')) closeSidebar();
+        else openSidebar();
     }
 
-    // Expose globally so any remaining inline calls still work
-    window.toggleSidebar = toggleSidebarMobile;
-
-    if (btn) {
-        btn.addEventListener('click', function () { toggleSidebarMobile(); });
+    // Wire burger button — replaces ANY existing onclick to avoid double-fire
+    if (menuToggle) {
+        menuToggle.removeAttribute('onclick'); // remove inline HTML onclick (prevents double-fire)
+        menuToggle.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            _toggleSidebar();
+        }, { passive: false });
     }
+
+    // Wire overlay tap-to-close
     if (overlay) {
-        overlay.addEventListener('click', function () { closeSidebar(); });
+        overlay.removeAttribute('onclick'); // remove inline HTML onclick (prevents double-fire)
+        overlay.addEventListener('click', function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            closeSidebar();
+        }, { passive: false });
     }
 
-    // Auto-close on nav-link tap (mobile)
+    // Close sidebar on any nav-link click (mobile UX — navigate and close)
     if (sidebar) {
-        sidebar.querySelectorAll('a.nav-link').forEach(function (link) {
+        sidebar.querySelectorAll('.nav-link').forEach(function (link) {
             link.addEventListener('click', function () {
-                if (window.innerWidth <= 1024) { closeSidebar(); }
-            });
+                if (window.innerWidth <= 1024 && sidebar.classList.contains('open')) {
+                    closeSidebar();
+                }
+            }, { passive: true });
         });
     }
 
-    // Swipe right from left edge to open
-    var tx = 0, ty = 0;
-    document.addEventListener('touchstart', function (e) {
-        tx = e.touches[0].clientX;
-        ty = e.touches[0].clientY;
-    }, { passive: true });
-    document.addEventListener('touchend', function (e) {
-        var dx = e.changedTouches[0].clientX - tx;
-        var dy = Math.abs(e.changedTouches[0].clientY - ty);
-        if (dy > 60) return; // too much vertical = not a horizontal swipe
-        if (!isOpen && tx < 30 && dx > 60) { openSidebar(); }
-        if (isOpen && dx < -60)             { closeSidebar(); }
-    }, { passive: true });
+    // Also expose as window.toggleSidebar so inline onclicks still work
+    window.toggleSidebar = _toggleSidebar;
 
-    // ── Back button injection ──────────────────────────────────
-    var page = window.location.pathname.split('/').pop() || 'index.html';
-    var BACK = {
-        'upload.html':              { label: 'Dashboard',  href: 'dashboard.html'  },
-        'queue.html':               { label: 'Dashboard',  href: 'dashboard.html'  },
-        'scheduled.html':           { label: 'Dashboard',  href: 'dashboard.html'  },
-        'platforms.html':           { label: 'Dashboard',  href: 'dashboard.html'  },
-        'groups.html':              { label: 'Platforms',  href: 'platforms.html'  },
-        'analytics.html':           { label: 'Dashboard',  href: 'dashboard.html'  },
-        'settings.html':            { label: 'Dashboard',  href: 'dashboard.html'  },
-        'color-preferences.html':   { label: 'Settings',   href: 'settings.html'   },
-        'guide.html':               { label: 'Dashboard',  href: 'dashboard.html'  },
-        'admin.html':               { label: 'Dashboard',  href: 'dashboard.html'  },
-        'account-management.html':  { label: 'Admin',      href: 'admin.html'      },
-        'admin-kpi.html':           { label: 'Admin',      href: 'admin.html'      },
-        'admin-calculator.html':    { label: 'Admin',      href: 'admin.html'      },
-        'admin-wallet.html':        { label: 'Admin',      href: 'admin.html'      },
-        'billing.html':             { label: 'Settings',   href: 'settings.html'   },
-        'walkthrough.html':         { label: 'Home',       href: 'index.html'      }
+    // Deterministic overlay visibility on load
+    if (overlay) overlay.style.display = (sidebar && sidebar.classList.contains('open')) ? 'block' : 'none';
+
+    // ── 2. Back button injection ───────────────────────────────
+    // Inject a back button in the mobile top-bar on sub-pages.
+    // Only on pages that are NOT the dashboard/home.
+    var currentPage = window.location.pathname.split('/').pop() || 'index.html';
+    var NO_BACK_PAGES = [
+        'dashboard.html', 'index.html', 'login.html', 'signup.html', ''
+    ];
+
+    // Map: page → label + href for back button
+    var BACK_MAP = {
+        'upload.html':              { label: 'Dashboard', href: 'dashboard.html' },
+        'queue.html':               { label: 'Dashboard', href: 'dashboard.html' },
+        'scheduled.html':           { label: 'Dashboard', href: 'dashboard.html' },
+        'platforms.html':           { label: 'Dashboard', href: 'dashboard.html' },
+        'groups.html':              { label: 'Platforms', href: 'platforms.html' },
+        'analytics.html':           { label: 'Dashboard', href: 'dashboard.html' },
+        'settings.html':            { label: 'Dashboard', href: 'dashboard.html' },
+        'color-preferences.html':   { label: 'Settings',  href: 'settings.html'  },
+        'guide.html':               { label: 'Dashboard', href: 'dashboard.html' },
+        'admin.html':               { label: 'Dashboard', href: 'dashboard.html' },
+        'account-management.html':  { label: 'Admin',     href: 'admin.html'     },
+        'admin-kpi.html':           { label: 'Admin',     href: 'admin.html'     },
+        'admin-calculator.html':    { label: 'Admin',     href: 'admin.html'     },
+        'admin-wallet.html':        { label: 'Admin',     href: 'admin.html'     },
+        'billing.html':             { label: 'Settings',  href: 'settings.html'  },
+        'success.html':             { label: 'Dashboard', href: 'dashboard.html' },
+        'walkthrough.html':         { label: 'Home',      href: 'index.html'     },
+        'kpi.html':                 { label: 'Admin',     href: 'admin.html'     },
     };
 
-    if (BACK[page] && window.innerWidth <= 1024) {
-        var actions = document.querySelector('.top-bar-actions');
-        if (actions) {
-            var a = document.createElement('a');
-            a.href = BACK[page].href;
-            a.className = 'back-btn';
-            a.innerHTML = '<i class="fas fa-arrow-left"></i><span>' + BACK[page].label + '</span>';
-            actions.prepend(a);
+    if (!NO_BACK_PAGES.includes(currentPage) && BACK_MAP[currentPage]) {
+        var backInfo = BACK_MAP[currentPage];
+        var topBarActions = document.querySelector('.top-bar-actions');
+        if (topBarActions && window.innerWidth <= 1024) {
+            var backBtn = document.createElement('a');
+            backBtn.href = backInfo.href;
+            backBtn.className = 'back-btn-mobile back-btn';
+            backBtn.innerHTML = '<i class="fas fa-arrow-left"></i><span>' + backInfo.label + '</span>';
+            backBtn.style.cssText = 'display:inline-flex;align-items:center;gap:0.4rem;padding:0.4rem 0.75rem;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text-secondary);font-size:0.78rem;font-weight:500;text-decoration:none;min-height:36px;white-space:nowrap;';
+            topBarActions.prepend(backBtn);
         }
     }
+
+    // ── 3. Swipe-to-open sidebar (mobile gesture) ─────────────
+    var touchStartX = 0;
+    var touchStartY = 0;
+    document.addEventListener('touchstart', function (e) {
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+
+    document.addEventListener('touchend', function (e) {
+        if (!sidebar) return;
+        var dx = e.changedTouches[0].clientX - touchStartX;
+        var dy = Math.abs(e.changedTouches[0].clientY - touchStartY);
+        // Swipe right from left edge → open
+        if (touchStartX < 25 && dx > 60 && dy < 80 && !sidebar.classList.contains('open')) {
+            _toggleSidebar();
+        }
+        // Swipe left while open → close
+        if (sidebar.classList.contains('open') && dx < -60 && dy < 80) {
+            _toggleSidebar();
+        }
+    }, { passive: true });
 
 });

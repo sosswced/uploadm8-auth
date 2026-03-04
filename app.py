@@ -82,6 +82,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 from decimal import Decimal
+from ipaddress import ip_address
 from urllib.parse import urlencode, quote, urlsplit, urlunsplit, parse_qsl
 
 # Sensitive query-param keys that must never appear in logs
@@ -167,14 +168,18 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
-JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError("Missing JWT_SECRET env var")
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "https://auth.uploadm8.com")
 JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "uploadm8-app")
 ACCESS_TOKEN_MINUTES = int(os.environ.get("ACCESS_TOKEN_MINUTES", "15"))
 REFRESH_TOKEN_DAYS = int(os.environ.get("REFRESH_TOKEN_DAYS", "30"))
 TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://app.uploadm8.com,https://uploadm8.com,http://localhost:3000")
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://app.uploadm8.com,https://uploadm8.com,http://localhost:3000,http://localhost:8080")
+ALLOWED_ORIGINS_LIST = [x.strip() for x in ALLOWED_ORIGINS.split(",") if x.strip()]
 BOOTSTRAP_ADMIN_EMAIL = os.environ.get("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").strip().lower() in ("1", "true", "yes", "on")
 
 # R2/S3
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
@@ -434,13 +439,9 @@ def verify_access_jwt(token: str) -> Optional[str]:
     except jwt.ExpiredSignatureError:
         logger.warning("JWT token expired")
         return None
-    except (jwt.InvalidAudienceError, jwt.InvalidIssuerError):
-        # Fallback: try without strict aud/iss validation
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False, "verify_iss": False})
-            return payload.get("sub")
-        except:
-            return None
+    except (jwt.InvalidAudienceError, jwt.InvalidIssuerError) as e:
+        logger.warning(f"JWT verification failed: {type(e).__name__}")
+        return None
     except Exception as e:
         logger.warning(f"JWT verification failed: {e}")
         return None
@@ -1344,7 +1345,7 @@ async def run_migrations():
                     logger.error(f"Migration v{version} failed: {e}")
 
 app = FastAPI(title="UploadM8 API", version="4.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS.split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS_LIST, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ── CORS-safe exception handler ──────────────────────────────────────────────
 # FastAPI's CORSMiddleware does NOT add Access-Control-Allow-Origin to 500
@@ -1355,7 +1356,7 @@ app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS.split(","), all
 @app.exception_handler(Exception)
 async def _cors_safe_500_handler(request: Request, exc: Exception) -> JSONResponse:
     origin = request.headers.get("origin", "")
-    allowed = ALLOWED_ORIGINS.split(",")
+    allowed = ALLOWED_ORIGINS_LIST
     # Only reflect the origin if it's in our allow-list
     cors_origin = origin if origin in allowed else (allowed[0] if allowed else "*")
 
@@ -1382,8 +1383,20 @@ _RATE_BUCKETS: Dict[str, Dict[str, Any]] = {}
 def _rl_now() -> float:
     return time.time()
 
-def rate_limit(key: str, limit: int, window_sec: int) -> bool:
-    """Count requests within a sliding window. Returns True if allowed."""
+async def rate_limit_allowed(key: str, limit: int, window_sec: int) -> bool:
+    """
+    Fixed-window rate limit. Prefers Redis (distributed) when configured,
+    falls back to in-memory buckets for single-instance dev.
+    """
+    if redis_client is not None:
+        try:
+            count = await redis_client.incr(key)
+            if count == 1:
+                await redis_client.expire(key, window_sec)
+            return int(count) <= int(limit)
+        except Exception as e:
+            logger.warning(f"Redis rate limit failed, falling back to memory: {e}")
+
     bucket = _RATE_BUCKETS.get(key)
     t = _rl_now()
     if not bucket or t > bucket["reset_at"]:
@@ -1395,7 +1408,23 @@ def rate_limit(key: str, limit: int, window_sec: int) -> bool:
     return True
 
 def client_ip(req: Request) -> str:
-    # If behind proxy/CDN, consider X-Forwarded-For parsing.
+    if TRUST_PROXY_HEADERS:
+        for hdr in ("cf-connecting-ip", "true-client-ip", "x-real-ip"):
+            val = (req.headers.get(hdr) or "").strip()
+            if val:
+                try:
+                    return str(ip_address(val))
+                except Exception:
+                    pass
+
+        xff = (req.headers.get("x-forwarded-for") or "").strip()
+        if xff:
+            candidate = xff.split(",")[0].strip()
+            try:
+                return str(ip_address(candidate))
+            except Exception:
+                pass
+
     return (req.client.host if req.client else "unknown")
 
 def _json_429(detail: str) -> JSONResponse:
@@ -1408,15 +1437,15 @@ def install_rate_limit_middleware(app: FastAPI) -> None:
         path = request.url.path
 
         # Global guardrail
-        if not rate_limit(f"ip:{ip}:global", limit=300, window_sec=60):
+        if not await rate_limit_allowed(f"ip:{ip}:global", limit=300, window_sec=60):
             return _json_429("Rate limit exceeded (global)")
 
         # Sensitive surfaces
         if path.startswith("/api/auth/"):
-            if not rate_limit(f"ip:{ip}:auth", limit=30, window_sec=60):
+            if not await rate_limit_allowed(f"ip:{ip}:auth", limit=30, window_sec=60):
                 return _json_429("Rate limit exceeded (auth)")
         if path.startswith("/api/admin/"):
-            if not rate_limit(f"ip:{ip}:admin", limit=60, window_sec=60):
+            if not await rate_limit_allowed(f"ip:{ip}:admin", limit=60, window_sec=60):
                 return _json_429("Rate limit exceeded (admin)")
 
         return await call_next(request)
@@ -1444,9 +1473,10 @@ async def security_headers(request: Request, call_next):
 # ============================================================
 # Auth Dependencies
 # ============================================================
-async def get_current_user(request: Request, authorization: Optional[str] = Header(None), token: Optional[str] = Query(None)):
-    auth_token = authorization[7:] if authorization and authorization.startswith("Bearer ") else token
-    if not auth_token: raise HTTPException(401, "Missing authorization")
+async def get_current_user(request: Request, authorization: Optional[str] = Header(None)):
+    auth_token = authorization[7:] if authorization and authorization.startswith("Bearer ") else None
+    if not auth_token:
+        raise HTTPException(401, "Missing authorization")
     user_id = verify_access_jwt(auth_token)
     if not user_id: raise HTTPException(401, "Invalid token")
     
@@ -1481,10 +1511,7 @@ async def log_admin_audit(conn, *, user_id: str, admin: dict, action: str, detai
         ip_address = None
         user_agent = None
         if request is not None:
-            forwarded = request.headers.get("x-forwarded-for")
-            ip_address = forwarded.split(",")[0].strip() if forwarded else (
-                request.client.host if request.client else None
-            )
+            ip_address = client_ip(request)
             user_agent = request.headers.get("user-agent", "")[:512]
 
         await conn.execute(

@@ -331,6 +331,35 @@ from stages.entitlements import (
     compute_upload_cost,   # canonical PUT/AIC formula
 )
 
+# ── Email notifications ───────────────────────────────────────────────────────
+from stages.emails import (
+    send_password_reset_email,
+    send_password_changed_email,
+    send_account_deleted_email,
+    send_subscription_started_email,
+    send_trial_started_email,
+    send_trial_cancelled_email,
+    send_subscription_cancelled_email,
+    send_renewal_receipt_email,
+    send_plan_upgraded_email,
+    send_plan_downgraded_email,
+    send_topup_receipt_email,
+    send_announcement_email,
+    send_friends_family_welcome_email,
+    send_agency_welcome_email,
+    send_master_admin_welcome_email,
+    send_admin_wallet_topup_email,
+    send_admin_tier_switch_email,
+)
+
+# Tier ranking for upgrade/downgrade detection (higher index = higher tier)
+_TIER_RANK = {
+    "free": 0, "launch": 1, "creator_pro": 2, "studio": 3,
+    "agency": 4, "friends_family": 5, "lifetime": 6, "master_admin": 7,
+}
+def _tier_is_upgrade(old: str, new: str) -> bool:
+    return _TIER_RANK.get(new, 0) >= _TIER_RANK.get(old, 0)
+
 def get_plan(tier: str) -> dict:
     """
     Backward-compat shim — returns entitlements_to_dict() so existing callers
@@ -1270,6 +1299,12 @@ async def run_migrations():
     CREATE INDEX IF NOT EXISTS idx_syslog_created    ON system_event_log(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_syslog_resource   ON system_event_log(resource_type, resource_id);
 """),
+
+# ── Country column for geo-analytics ─────────────────────────────────────────
+(701, """
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS country VARCHAR(2);
+    CREATE INDEX IF NOT EXISTS idx_users_country ON users(country) WHERE country IS NOT NULL;
+"""),
 ]
         
         for version, sql in migrations:
@@ -1831,12 +1866,19 @@ async def health():
 # Auth Endpoints
 # ============================================================
 @app.post("/api/auth/register")
-async def register(data: UserCreate, background_tasks: BackgroundTasks):
+async def register(data: UserCreate, background_tasks: BackgroundTasks, request: Request):
     async with db_pool.acquire() as conn:
         if await conn.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1", data.email.lower()):
             raise HTTPException(409, "Email already registered")
         user_id = str(uuid.uuid4())
-        await conn.execute("INSERT INTO users (id, email, password_hash, name) VALUES ($1, $2, $3, $4)", user_id, data.email.lower(), hash_password(data.password), data.name)
+        # Capture country from Cloudflare header if present
+        country_code = (request.headers.get("CF-IPCountry") or "")[:2].upper() or None
+        if country_code in ("XX", "T1", ""):
+            country_code = None
+        await conn.execute(
+            "INSERT INTO users (id, email, password_hash, name, country) VALUES ($1, $2, $3, $4, $5)",
+            user_id, data.email.lower(), hash_password(data.password), data.name, country_code
+        )
         await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
         await conn.execute("INSERT INTO wallets (user_id, put_balance, aic_balance) VALUES ($1, 30, 0)", user_id)
         await ledger_entry(conn, user_id, "put", 30, "signup_bonus")
@@ -1900,17 +1942,12 @@ async def forgot_password(payload: ForgotPasswordRequest, background: Background
             )
 
             reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password?token={quote(token)}"
-            html = f"""
-                <p>You requested a password reset for UploadM8.</p>
-                <p><a href="{reset_link}">Reset your password</a></p>
-                <p>This link expires in 60 minutes. If you did not request this, ignore this email.</p>
-            """
-            background.add_task(send_email, user_row["email"], "Reset your UploadM8 password", html)
+            background.add_task(send_password_reset_email, user_row["email"], reset_link)
 
     return {"ok": True}
 
 @app.post("/api/auth/reset-password")
-async def reset_password(payload: ResetPasswordRequest):
+async def reset_password(payload: ResetPasswordRequest, background: BackgroundTasks):
     token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
     async with db_pool.acquire() as conn:
         pr = await conn.fetchrow(
@@ -1938,6 +1975,12 @@ async def reset_password(payload: ResetPasswordRequest):
 
         # Force logout across devices/sessions
         await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id=$1 AND revoked_at IS NULL", pr["user_id"])
+
+        # Fetch email+name for the security confirmation email
+        _u = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", pr["user_id"])
+
+    if _u:
+        background.add_task(send_password_changed_email, _u["email"], _u["name"] or "there")
 
     return {"ok": True}
 
@@ -2023,7 +2066,7 @@ async def update_me(data: ProfileUpdate, user: dict = Depends(get_current_user))
     return {"status": "updated"}
 
 @app.post("/api/auth/change-password")
-async def change_password(data: PasswordChange, user: dict = Depends(get_current_user)):
+async def change_password(data: PasswordChange, background: BackgroundTasks, user: dict = Depends(get_current_user)):
     """Change user password"""
     async with db_pool.acquire() as conn:
         # Verify current password
@@ -2039,6 +2082,7 @@ async def change_password(data: PasswordChange, user: dict = Depends(get_current
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
     
     logger.info(f"Password changed for user {user['id']}")
+    background.add_task(send_password_changed_email, user["email"], user.get("name") or "there")
     return {"status": "password_changed"}
 
 # ============================================================
@@ -2440,6 +2484,13 @@ async def delete_account(request: Request, user: dict = Depends(get_current_user
         rows_deleted["users"] = 1
 
         # ── 6. Delete DB rows (cascade-safe ordering) ────────────────────
+        # Send goodbye email NOW — before user row is gone, address is still valid
+        import asyncio as _aio
+        _aio.ensure_future(send_account_deleted_email(
+            user.get("email", ""),
+            user.get("name") or "there",
+        ))
+
         await conn.execute("DELETE FROM refresh_tokens          WHERE user_id = $1", user["id"])
         await conn.execute("DELETE FROM token_ledger             WHERE user_id = $1", user["id"])
         await conn.execute("DELETE FROM wallets                  WHERE user_id = $1", user["id"])
@@ -5403,8 +5454,9 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             return {"status": "no_user_id"}
 
         async with db_pool.acquire() as conn:
-            user_row = await conn.fetchrow("SELECT email FROM users WHERE id = $1", user_id)
+            user_row = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", user_id)
             email = user_row["email"] if user_row else ""
+            uname = (user_row["name"] if user_row else None) or "there"
 
             if session.mode == "subscription":
                 sub = stripe.Subscription.retrieve(session.subscription)
@@ -5440,6 +5492,22 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                 )
                 background_tasks.add_task(notify_mrr, amount, email, tier, status)
 
+                # ── Welcome email: trial vs paid ──────────────────────────────
+                if trial_end:
+                    trial_days = sub.get("trial_period_days") or 14
+                    background_tasks.add_task(
+                        send_trial_started_email,
+                        email, uname, tier,
+                        trial_end.strftime("%B %d, %Y"),
+                        trial_days,
+                    )
+                else:
+                    next_date = period_end.strftime("%B %d, %Y")
+                    background_tasks.add_task(
+                        send_subscription_started_email,
+                        email, uname, tier, amount, next_date,
+                    )
+
             elif session.mode == "payment":
                 wallet_type   = session.metadata.get("wallet", "put")
                 amount_tokens = int(session.metadata.get("amount", 0))
@@ -5452,6 +5520,10 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                         user_id, amount, session.id, f"{wallet_type}_{amount_tokens}"
                     )
                     background_tasks.add_task(notify_topup, amount, email, wallet_type, amount_tokens)
+                    background_tasks.add_task(
+                        send_topup_receipt_email,
+                        email, uname, wallet_type, amount_tokens, amount, 0, session.id,
+                    )
 
     # ── invoice.paid — monthly wallet refill on every renewal ──────────
     elif etype == "invoice.paid":
@@ -5462,7 +5534,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
 
         async with db_pool.acquire() as conn:
             user_row = await conn.fetchrow(
-                "SELECT id, email, subscription_tier FROM users WHERE stripe_subscription_id = $1", sub_id
+                "SELECT id, email, name, subscription_tier FROM users WHERE stripe_subscription_id = $1", sub_id
             )
             if not user_row:
                 logger.warning(f"invoice.paid: no user for subscription {sub_id}")
@@ -5470,6 +5542,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
 
             user_id = str(user_row["id"])
             email   = user_row["email"]
+            uname   = user_row["name"] or "there"
             sub = stripe.Subscription.retrieve(sub_id)
             lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
             tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, user_row["subscription_tier"] or "free")
@@ -5498,14 +5571,28 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                 user_id, amount, invoice_id, tier
             )
             background_tasks.add_task(notify_mrr, amount, email, tier, "renewal")
+            background_tasks.add_task(
+                send_renewal_receipt_email,
+                email, uname, tier, amount,
+                invoice_id,
+                f"{period_start.strftime('%b %d')} – {period_end.strftime('%b %d, %Y')}",
+                period_end.strftime("%B %d, %Y"),
+            )
 
     # ── subscription.updated — status changes, upgrades, downgrades ────
     elif etype == "customer.subscription.updated":
         sub = event.data.object
         async with db_pool.acquire() as conn:
             lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
-            tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
+            new_tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
             period_end = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
+
+            # Fetch user before updating so we have old_tier for comparison
+            user_row = await conn.fetchrow(
+                "SELECT id, email, name, subscription_tier FROM users WHERE stripe_subscription_id = $1", sub.id
+            )
+            old_tier = user_row["subscription_tier"] if user_row else new_tier
+
             await conn.execute("""
                 UPDATE users SET
                     subscription_tier   = $1,
@@ -5513,12 +5600,33 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     current_period_end  = $3,
                     updated_at          = NOW()
                 WHERE stripe_subscription_id = $4
-            """, tier, sub.status, period_end, sub.id)
+            """, new_tier, sub.status, period_end, sub.id)
+
+            # Send tier change email only when tier actually changed
+            if user_row and old_tier != new_tier:
+                _email = user_row["email"]
+                _name  = user_row["name"] or "there"
+                _amount = 0.0  # Stripe doesn't provide amount here directly
+                if _tier_is_upgrade(old_tier, new_tier):
+                    background_tasks.add_task(
+                        send_plan_upgraded_email,
+                        _email, _name, old_tier, new_tier, _amount,
+                        period_end.strftime("%B %d, %Y"),
+                    )
+                else:
+                    background_tasks.add_task(
+                        send_plan_downgraded_email,
+                        _email, _name, old_tier, new_tier, _amount,
+                        period_end.strftime("%B %d, %Y"),
+                    )
 
     # ── subscription.deleted — downgrade to free, keep balance ─────────
     elif etype == "customer.subscription.deleted":
         sub = event.data.object
         async with db_pool.acquire() as conn:
+            user_row = await conn.fetchrow(
+                "SELECT id, email, name, subscription_tier, trial_end FROM users WHERE stripe_subscription_id = $1", sub.id
+            )
             await conn.execute("""
                 UPDATE users SET
                     subscription_tier   = 'free',
@@ -5526,6 +5634,28 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     updated_at          = NOW()
                 WHERE stripe_subscription_id = $1
             """, sub.id)
+
+            if user_row:
+                _email    = user_row["email"]
+                _name     = user_row["name"] or "there"
+                _old_tier = user_row["subscription_tier"] or "free"
+                _trial_end = user_row["trial_end"]
+                # Access until end of current period
+                _access_until = datetime.fromtimestamp(
+                    sub.current_period_end, tz=timezone.utc
+                ).strftime("%B %d, %Y") if sub.get("current_period_end") else "now"
+
+                if _trial_end and _trial_end > _now_utc():
+                    # Cancelled while still in trial
+                    background_tasks.add_task(
+                        send_trial_cancelled_email,
+                        _email, _name, _old_tier, _access_until,
+                    )
+                else:
+                    background_tasks.add_task(
+                        send_subscription_cancelled_email,
+                        _email, _name, _old_tier, _access_until,
+                    )
 
     return {"status": "ok"}
 
@@ -7044,7 +7174,7 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
     return {"users": [dict(u) for u in users], "total": total}
 
 @app.put("/api/admin/users/{user_id}")
-async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Request, user: dict = Depends(require_admin)):
+async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(require_admin)):
     updates, params = [], [user_id]
     changes = {}
     if data.subscription_tier:
@@ -7065,10 +7195,32 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
         changes["flex_enabled"] = data.flex_enabled
     if updates:
         async with db_pool.acquire() as conn:
+            # Fetch target before updating so we have old tier
+            _target = await conn.fetchrow("SELECT email, name, subscription_tier FROM users WHERE id = $1", user_id)
             await conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", *params)
             await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_UPDATE_USER",
                                   details={"changes": changes}, request=request,
                                   resource_type="user", resource_id=user_id)
+
+        # Fire tier-change and special welcome emails when subscription_tier changed
+        if data.subscription_tier and _target:
+            _te = _target["email"]
+            _tn = _target["name"] or "there"
+            _old = _target["subscription_tier"] or "free"
+            _new = data.subscription_tier
+            if _old != _new:
+                background_tasks.add_task(
+                    send_admin_tier_switch_email,
+                    _te, _tn, _old, _new, "", _tier_is_upgrade(_old, _new),
+                )
+            # Special heartfelt welcome for privileged tiers
+            if _new == "friends_family":
+                background_tasks.add_task(send_friends_family_welcome_email, _te, _tn)
+            elif _new == "agency":
+                background_tasks.add_task(send_agency_welcome_email, _te, _tn)
+            elif _new == "master_admin":
+                background_tasks.add_task(send_master_admin_welcome_email, _te, _tn)
+
     return {"status": "updated"}
 
 @app.post("/api/admin/users/{user_id}/ban")
@@ -7399,17 +7551,34 @@ async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
 
 
 @app.post("/api/admin/users/assign-tier")
-async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), request: Request = None, user: dict = Depends(require_master_admin)):
+async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), request: Request = None, background_tasks: BackgroundTasks = None, user: dict = Depends(require_master_admin)):
     if tier not in PLAN_CONFIG:
         raise HTTPException(400, "Invalid tier")
     async with db_pool.acquire() as conn:
-        old = await conn.fetchrow("SELECT subscription_tier, email FROM users WHERE id = $1", user_id)
+        old = await conn.fetchrow("SELECT subscription_tier, email, name FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET subscription_tier = $1 WHERE id = $2", tier, user_id)
         await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_ASSIGN_TIER",
                               details={"old_tier": old["subscription_tier"] if old else None, "new_tier": tier,
                                        "target_email": old["email"] if old else None},
                               request=request, resource_type="user", resource_id=user_id,
                               severity="WARNING")
+
+    if old and background_tasks:
+        _te  = old["email"]
+        _tn  = old["name"] or "there"
+        _old = old["subscription_tier"] or "free"
+        if _old != tier:
+            background_tasks.add_task(
+                send_admin_tier_switch_email,
+                _te, _tn, _old, tier, "", _tier_is_upgrade(_old, tier),
+            )
+        if tier == "friends_family":
+            background_tasks.add_task(send_friends_family_welcome_email, _te, _tn)
+        elif tier == "agency":
+            background_tasks.add_task(send_agency_welcome_email, _te, _tn)
+        elif tier == "master_admin":
+            background_tasks.add_task(send_master_admin_welcome_email, _te, _tn)
+
     return {"status": "assigned", "tier": tier}
 
 # ============================================================
@@ -7562,8 +7731,7 @@ async def _execute_announcement_deliveries(conn, announcement_id: str, title: st
 
         if ch == "email":
             try:
-                # send_email(to, subject, html_body) exists in your codebase
-                await send_email(dest, title, f"<h1>{title}</h1><p>{body}</p>")
+                await send_announcement_email(dest, title, body)
                 ok = True
                 email_sent += 1
             except Exception as e:
@@ -8203,7 +8371,26 @@ async def get_leaderboard(range: str = Query("30d"), sort: str = Query("uploads"
 
 @app.get("/api/admin/countries")
 async def get_countries(range: str = Query("30d"), user: dict = Depends(require_admin)):
-    return []  # Add country column to users table to enable this
+    """Return user count by country. Populated from CF-IPCountry header at registration."""
+    days = int(range.replace("d", "")) if range.endswith("d") and range[:-1].isdigit() else 30
+    since = _now_utc() - timedelta(days=days)
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT country, COUNT(*) AS users
+                FROM users
+                WHERE country IS NOT NULL
+                  AND created_at >= $1
+                GROUP BY country
+                ORDER BY users DESC
+                LIMIT 50
+                """,
+                since,
+            )
+        return [{"country": r["country"], "users": int(r["users"])} for r in rows]
+    except Exception:
+        return []  # column may not exist yet on older deployments
 
 
 @app.get("/api/admin/chart/revenue")
@@ -8812,7 +8999,7 @@ async def admin_adjust_wallet(
     """
     async with db_pool.acquire() as conn:
         target = await conn.fetchrow(
-            "SELECT id, email FROM users WHERE id = $1", user_id
+            "SELECT id, email, name FROM users WHERE id = $1", user_id
         )
         if not target:
             raise HTTPException(404, "User not found")
@@ -8891,6 +9078,18 @@ async def admin_adjust_wallet(
         except Exception:
             # admin_audit_log may not exist in some environments; ledger is the source of truth
             pass
+
+    # Send notification email to user for grants (add/set with positive delta only)
+    if delta > 0 and payload.mode in ("add", "set"):
+        import asyncio as _aio
+        _aio.ensure_future(send_admin_wallet_topup_email(
+            target["email"],
+            target["name"] or "there",
+            payload.wallet,
+            int(delta),
+            new_val,
+            payload.reason or "Tokens credited to your account by the UploadM8 team.",
+        ))
 
     return {
         "ok":     True,

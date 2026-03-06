@@ -102,6 +102,10 @@ from stages.notify_stage import (
     notify_admin_worker_stop,
     notify_admin_error,
 )
+from stages.emails import (
+    send_upload_completed_email,
+    send_upload_failed_email,
+)
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -894,6 +898,47 @@ async def run_publish_and_notify(
         ctx.state = "failed"
 
     await db_stage.mark_processing_completed(db_pool, ctx)
+
+    # ── Upload email notification (respects user_preferences.email_notifications) ──
+    try:
+        _u = ctx.user_record
+        _user_email = _u.get("email") if _u else None
+        _user_name  = (_u.get("name") if _u else None) or "there"
+        if _user_email:
+            async with db_pool.acquire() as _pconn:
+                _prefs = await _pconn.fetchrow(
+                    "SELECT email_notifications FROM user_preferences WHERE user_id = $1",
+                    ctx.user_id,
+                )
+            _wants_email = _prefs["email_notifications"] if _prefs else True
+            if _wants_email:
+                _platforms = ctx.platforms or []
+                _put_cost, _aic_cost = await _get_upload_costs(ctx.upload_id)
+                if ctx.state in ("succeeded", "partial"):
+                    import asyncio as _aio
+                    _aio.ensure_future(send_upload_completed_email(
+                        _user_email,
+                        _user_name,
+                        ctx.filename or upload_id,
+                        ctx.get_success_platforms() or _platforms,
+                        int(_put_cost or 0),
+                        int(_aic_cost or 0),
+                        str(upload_id),
+                    ))
+                elif ctx.state == "failed":
+                    _err_reason = getattr(ctx, "error_message", "") or ""
+                    _err_stage  = getattr(ctx, "current_stage", "") or ""
+                    _aio.ensure_future(send_upload_failed_email(
+                        _user_email,
+                        _user_name,
+                        ctx.filename or upload_id,
+                        _platforms,
+                        _err_reason,
+                        str(upload_id),
+                        _err_stage,
+                    ))
+    except Exception as _email_err:
+        logger.warning(f"[{upload_id}] Upload email notification failed (non-fatal): {_email_err}")
 
     # ── Finalize wallet hold (capture on success/partial, release on failure) ──
     try:

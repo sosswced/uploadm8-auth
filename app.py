@@ -167,7 +167,14 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
-JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+_JWT_SECRET_INSECURE_DEFAULTS = {"", "dev-secret-change-me", "secret", "changeme", "change_me"}
+if JWT_SECRET in _JWT_SECRET_INSECURE_DEFAULTS:
+    raise RuntimeError(
+        "FATAL: JWT_SECRET environment variable is missing or set to an insecure default. "
+        "Set a strong, randomly-generated JWT_SECRET before starting the server. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+    )
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "https://auth.uploadm8.com")
 JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "uploadm8-app")
 ACCESS_TOKEN_MINUTES = int(os.environ.get("ACCESS_TOKEN_MINUTES", "15"))
@@ -415,23 +422,28 @@ def create_access_jwt(user_id: str) -> str:
     return jwt.encode({"sub": user_id, "iat": int(now.timestamp()), "exp": int((now + timedelta(minutes=ACCESS_TOKEN_MINUTES)).timestamp()), "iss": JWT_ISSUER, "aud": JWT_AUDIENCE}, JWT_SECRET, algorithm="HS256")
 
 def verify_access_jwt(token: str) -> Optional[str]:
+    """Strict JWT verification — no downgrade paths. Issuer and audience are always enforced."""
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], audience=JWT_AUDIENCE, issuer=JWT_ISSUER)
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+        )
         return payload.get("sub")
     except jwt.ExpiredSignatureError:
         logger.warning("JWT token expired")
         return None
-    except (jwt.InvalidAudienceError, jwt.InvalidIssuerError):
-        # Fallback: try without strict aud/iss validation
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False, "verify_iss": False})
-            return payload.get("sub")
-        except:
-            return None
-    except Exception as e:
-        logger.warning(f"JWT verification failed: {e}")
+    except jwt.InvalidAudienceError:
+        logger.warning("JWT rejected: invalid audience")
         return None
-    except: return None
+    except jwt.InvalidIssuerError:
+        logger.warning("JWT rejected: invalid issuer")
+        return None
+    except Exception as e:
+        logger.warning(f"JWT verification failed: {type(e).__name__}")
+        return None
 
 async def create_refresh_token(conn, user_id: str) -> str:
     token = secrets.token_urlsafe(64)
@@ -1347,16 +1359,18 @@ async def _cors_safe_500_handler(request: Request, exc: Exception) -> JSONRespon
     )
 
 # ============================================================
-# SECURITY + RATE LIMITING (in-memory MVP)
-# Replace with Redis later (same interface)
+# ============================================================
+# SECURITY + RATE LIMITING
+# Redis-backed when available (multi-instance safe).
+# Falls back to in-memory if Redis is not connected.
 # ============================================================
 _RATE_BUCKETS: Dict[str, Dict[str, Any]] = {}
 
 def _rl_now() -> float:
     return time.time()
 
-def rate_limit(key: str, limit: int, window_sec: int) -> bool:
-    """Count requests within a sliding window. Returns True if allowed."""
+def _rate_limit_memory(key: str, limit: int, window_sec: int) -> bool:
+    """In-memory fallback rate limiter (single-instance only)."""
     bucket = _RATE_BUCKETS.get(key)
     t = _rl_now()
     if not bucket or t > bucket["reset_at"]:
@@ -1367,9 +1381,56 @@ def rate_limit(key: str, limit: int, window_sec: int) -> bool:
     bucket["count"] += 1
     return True
 
+async def _rate_limit_redis(key: str, limit: int, window_sec: int) -> bool:
+    """
+    Redis-backed rate limiter using atomic INCR + EXPIRE.
+    Safe across multiple worker instances on Render.
+    """
+    try:
+        redis_key = f"rl:{key}"
+        count = await redis_client.incr(redis_key)
+        if count == 1:
+            # First request in this window — set expiry
+            await redis_client.expire(redis_key, window_sec)
+        return count <= limit
+    except Exception as e:
+        logger.warning(f"Redis rate limit error, falling back to memory: {e}")
+        return _rate_limit_memory(key, limit, window_sec)
+
+async def rate_limit_check(key: str, limit: int, window_sec: int) -> bool:
+    """
+    Unified rate limit entry point.
+    Uses Redis when connected, in-memory otherwise.
+    """
+    if redis_client is not None:
+        return await _rate_limit_redis(key, limit, window_sec)
+    return _rate_limit_memory(key, limit, window_sec)
+
+# Keep synchronous wrapper for any legacy callers
+def rate_limit(key: str, limit: int, window_sec: int) -> bool:
+    """Synchronous in-memory rate limiter (legacy callers only). Prefer rate_limit_check()."""
+    return _rate_limit_memory(key, limit, window_sec)
+
 def client_ip(req: Request) -> str:
-    # If behind proxy/CDN, consider X-Forwarded-For parsing.
-    return (req.client.host if req.client else "unknown")
+    """
+    Extract the real client IP behind Render, Cloudflare, or any reverse proxy.
+    Reads CF-Connecting-IP first (Cloudflare), then the first value in
+    X-Forwarded-For, then falls back to the direct connection IP.
+    Only the leftmost (client-supplied) IP in X-Forwarded-For is trusted —
+    middle/rightmost entries are added by infrastructure and may be spoofed.
+    """
+    # Cloudflare sets this; it's the most authoritative when behind CF
+    cf_ip = req.headers.get("CF-Connecting-IP", "").strip()
+    if cf_ip:
+        return cf_ip
+    # Standard proxy header — take ONLY the first (leftmost) address
+    xff = req.headers.get("X-Forwarded-For", "").strip()
+    if xff:
+        first_ip = xff.split(",")[0].strip()
+        if first_ip:
+            return first_ip
+    # Direct connection fallback
+    return req.client.host if req.client else "unknown"
 
 def _json_429(detail: str) -> JSONResponse:
     return JSONResponse(status_code=429, content={"detail": detail})
@@ -1380,16 +1441,18 @@ def install_rate_limit_middleware(app: FastAPI) -> None:
         ip = client_ip(request)
         path = request.url.path
 
-        # Global guardrail
-        if not rate_limit(f"ip:{ip}:global", limit=300, window_sec=60):
+        # Global guardrail — 300 req/min per IP across all endpoints
+        if not await rate_limit_check(f"ip:{ip}:global", limit=300, window_sec=60):
             return _json_429("Rate limit exceeded (global)")
 
-        # Sensitive surfaces
+        # Auth endpoints — stricter to slow credential stuffing
         if path.startswith("/api/auth/"):
-            if not rate_limit(f"ip:{ip}:auth", limit=30, window_sec=60):
+            if not await rate_limit_check(f"ip:{ip}:auth", limit=30, window_sec=60):
                 return _json_429("Rate limit exceeded (auth)")
+
+        # Admin endpoints — moderate limit
         if path.startswith("/api/admin/"):
-            if not rate_limit(f"ip:{ip}:admin", limit=60, window_sec=60):
+            if not await rate_limit_check(f"ip:{ip}:admin", limit=60, window_sec=60):
                 return _json_429("Rate limit exceeded (admin)")
 
         return await call_next(request)
@@ -1417,12 +1480,22 @@ async def security_headers(request: Request, call_next):
 # ============================================================
 # Auth Dependencies
 # ============================================================
-async def get_current_user(request: Request, authorization: Optional[str] = Header(None), token: Optional[str] = Query(None)):
-    auth_token = authorization[7:] if authorization and authorization.startswith("Bearer ") else token
-    if not auth_token: raise HTTPException(401, "Missing authorization")
+async def get_current_user(request: Request, authorization: Optional[str] = Header(None)):
+    """
+    Authenticate requests via Authorization: Bearer <token> header ONLY.
+    Query-parameter token auth has been intentionally removed — ?token= leaks
+    credentials into browser history, server logs, CDN logs, and referrer headers.
+    All clients must send tokens in the Authorization header.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or malformed Authorization header. Use: Authorization: Bearer <token>")
+    auth_token = authorization[7:]
+    if not auth_token:
+        raise HTTPException(401, "Missing authorization token")
     user_id = verify_access_jwt(auth_token)
-    if not user_id: raise HTTPException(401, "Invalid token")
-    
+    if not user_id:
+        raise HTTPException(401, "Invalid or expired token")
+
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
         if not user: raise HTTPException(401, "User not found")

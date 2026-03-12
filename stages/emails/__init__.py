@@ -1,13 +1,16 @@
 """
 UploadM8 Email Package  —  stages/emails/
 ==========================================
-All 20 email functions in one import:
+All email functions exported from one import:
 
     from stages.emails import (
         # Auth
+        send_welcome_email,
         send_password_reset_email,
         send_password_changed_email,
         send_account_deleted_email,
+        send_email_change_email,
+        send_admin_reset_password_email,
         # Billing — Subscriptions
         send_subscription_started_email,
         send_trial_started_email,
@@ -30,142 +33,98 @@ All 20 email functions in one import:
         send_master_admin_welcome_email,
         # Announcements
         send_announcement_email,
+        # Lifecycle
+        send_payment_failed_email,
+        send_trial_ending_reminder_email,
+        send_low_token_warning_email,
     )
 
 ─────────────────────────────────────────────────────────────────────────────
-APP.PY INTEGRATION GUIDE  —  exactly where to add each call
+APP.PY INTEGRATION GUIDE  —  exactly where to add each new call
 ─────────────────────────────────────────────────────────────────────────────
 
-PHASE 1 — AUTH
---------------
-1. /api/auth/forgot-password  (line ~1908)
-   REPLACE:
-       html=f"<p>{reset_link}</p>"
-   WITH:
-       await send_password_reset_email(email, reset_link)
+NEW CALLS TO WIRE IN app.py:
+─────────────────────────────
 
-2. POST /api/auth/reset-password  (line ~1912, on success)
-   ADD after password update:
-       await send_password_changed_email(email, name)
+1. /api/auth/register  (line ~1902) — Replace raw welcome email:
+   BEFORE:
+       background_tasks.add_task(send_email, data.email, "Welcome to UploadM8!", f"<h1>Welcome, {data.name}!</h1>...")
+   AFTER:
+       background_tasks.add_task(send_welcome_email, data.email, data.name)
 
-3. POST /api/auth/change-password  (line ~2025, on success)
-   ADD after password update:
-       await send_password_changed_email(email, name)
+2. /api/admin/users/{id}/reset-password — After the DB write (line ~7355):
+       target_row = await conn.fetchrow("SELECT email, name FROM users WHERE id=$1", user_id)
+       if target_row:
+           background_tasks.add_task(
+               send_admin_reset_password_email,
+               target_row["email"], target_row["name"] or "there", payload.temp_password
+           )
 
-4. DELETE /api/me  (line ~2341, BEFORE the DELETE query)
-   ADD:
-       await send_account_deleted_email(email, name)
-
-PHASE 2 — BILLING: SUBSCRIPTIONS
-----------------------------------
-Inside the Stripe webhook handler for checkout.session.completed:
-
-5. Subscription mode, no trial:
-       await send_subscription_started_email(
-           email, name, tier, amount/100, next_billing_date
+3. /api/admin/users/{id}/email — After inserting verification_token (line ~7292):
+       verify_link = f"{FRONTEND_URL}/verify-email?token={verification_token}"
+       background_tasks.add_task(
+           send_email_change_email,
+           new_email, old["email"], target_user["name"] or "there", verify_link
        )
 
-6. Subscription mode WITH trial:
-       await send_trial_started_email(
-           email, name, tier, trial_end_date, trial_days
-       )
+4. Stripe webhook — invoice.payment_failed (add new elif block):
+       elif event_type == "invoice.payment_failed":
+           inv = event["data"]["object"]
+           sub_id = inv.get("subscription")
+           if sub_id:
+               async with db_pool.acquire() as conn:
+                   user_row = await conn.fetchrow(
+                       "SELECT email, name, subscription_tier FROM users WHERE stripe_subscription_id=$1", sub_id
+                   )
+               if user_row:
+                   retry_ts = inv.get("next_payment_attempt")
+                   retry_date = datetime.fromtimestamp(retry_ts, tz=timezone.utc).strftime("%B %d, %Y") if retry_ts else ""
+                   background_tasks.add_task(
+                       send_payment_failed_email,
+                       user_row["email"], user_row["name"] or "there",
+                       user_row["subscription_tier"],
+                       inv.get("amount_due", 0) / 100,
+                       retry_date, inv.get("id", ""),
+                   )
 
-Inside customer.subscription.deleted:
+EXISTING WIRING (already in app.py — confirmed active):
+─────────────────────────────────────────────────────────
+- send_password_reset_email      → /api/auth/forgot-password         ✓
+- send_password_changed_email    → /api/auth/reset-password           ✓
+- send_password_changed_email    → /api/auth/change-password          ✓
+- send_account_deleted_email     → DELETE /api/me                     ✓
+- send_subscription_started_email→ checkout.session.completed         ✓
+- send_trial_started_email       → checkout.session.completed (trial) ✓
+- send_trial_cancelled_email     → customer.subscription.deleted      ✓
+- send_subscription_cancelled_email → customer.subscription.deleted   ✓
+- send_renewal_receipt_email     → invoice.paid                       ✓
+- send_plan_upgraded_email       → customer.subscription.updated      ✓
+- send_plan_downgraded_email     → customer.subscription.updated      ✓
+- send_topup_receipt_email       → checkout.session.completed (pay)   ✓
+- send_announcement_email        → admin announcement endpoint        ✓
+- send_friends_family_welcome_email → tier grant                      ✓
+- send_agency_welcome_email      → tier grant                         ✓
+- send_master_admin_welcome_email→ tier grant                         ✓
+- send_admin_wallet_topup_email  → admin wallet credit                ✓
+- send_admin_tier_switch_email   → admin tier change                  ✓
 
-7. Cancelled during trial (subscription_status was "trialing"):
-       await send_trial_cancelled_email(email, name, tier, access_until)
-
-8. Cancelled paid subscription:
-       await send_subscription_cancelled_email(email, name, tier, access_until)
-
-Inside invoice.paid (recurring only — skip first invoice):
-
-9.    await send_renewal_receipt_email(
-           email, name, tier, amount/100,
-           invoice_id, billing_period, next_billing_date, payment_method
-       )
-
-PHASE 3 — BILLING: CHANGES
----------------------------
-Inside customer.subscription.updated — compare old vs new tier:
-
-10. Upgrade:
-        await send_plan_upgraded_email(
-            email, name, old_tier, new_tier, new_amount/100, next_billing_date
-        )
-
-11. Downgrade:
-        await send_plan_downgraded_email(
-            email, name, old_tier, new_tier, new_amount/100, effective_date
-        )
-
-Inside checkout.session.completed (mode=payment — token top-up):
-
-12.     await send_topup_receipt_email(
-            email, name, wallet_type, tokens_added, amount/100,
-            new_balance, stripe_payment_id
-        )
-
-PHASE 4 — UPLOADS
-------------------
-In your upload worker finish handler:
-
-13. On success:
-        prefs = await conn.fetchrow(
-            "SELECT email_notifications FROM user_preferences WHERE user_id=$1", user_id
-        )
-        if prefs and prefs["email_notifications"]:
-            await send_upload_completed_email(
-                email, name, filename, platforms, put_spent, aic_spent, upload_id
-            )
-
-14. On failure:
-        if prefs and prefs["email_notifications"]:
-            await send_upload_failed_email(
-                email, name, filename, platforms, error_reason, upload_id, stage
-            )
-
-Admin action hooks:
-
-15. After credit_wallet() is called by an admin:
-        await send_admin_wallet_topup_email(
-            email, name, wallet_type, tokens_added, new_balance, reason, admin_note
-        )
-
-16. After subscription_tier is manually updated by admin:
-        is_up = _tier_rank(new_tier) >= _tier_rank(old_tier)
-        await send_admin_tier_switch_email(
-            email, name, old_tier, new_tier, admin_note, is_upgrade=is_up
-        )
-
-PHASE 5 — HEARTFELT WELCOMES
-------------------------------
-17. friends_family tier granted (admin grant or invite):
-        await send_friends_family_welcome_email(email, name)
-
-18. agency tier activated:
-        await send_agency_welcome_email(email, name, amount/100, next_billing_date)
-
-19. master_admin granted:
-        await send_master_admin_welcome_email(email, name)
-
-ANNOUNCEMENTS
--------------
-20. In _execute_announcement_deliveries() (line ~7566):
-    REPLACE:
-        await send_email(dest, title, f"<h1>{title}</h1><p>{body}</p>")
-    WITH:
-        from stages.emails.announcements import send_announcement_email
-        await send_announcement_email(dest, title, body)
-
+─────────────────────────────────────────────────────────────────────────────
+FRONTEND PAGES NEEDED (now created):
+─────────────────────────────────────
+- /reset-password.html   → password reset link destination     ✓ NEW
+- /verify-email.html     → email change verification           ✓ NEW
+- /unsubscribe.html      → email preferences management        ✓ NEW
 ─────────────────────────────────────────────────────────────────────────────
 """
 
 # ── Phase 1: Auth ─────────────────────────────────────────────────────────────
 from .auth import (
+    send_welcome_email,
     send_password_reset_email,
     send_password_changed_email,
     send_account_deleted_email,
+    send_email_change_email,
+    send_admin_reset_password_email,
 )
 
 # ── Phase 2: Billing — Subscriptions ─────────────────────────────────────────
@@ -206,12 +165,22 @@ from .welcome_special import (
 # ── Phase 5b: Announcements ───────────────────────────────────────────────────
 from .announcements import send_announcement_email
 
+# ── Phase 6: Lifecycle ────────────────────────────────────────────────────────
+from .lifecycle import (
+    send_payment_failed_email,
+    send_trial_ending_reminder_email,
+    send_low_token_warning_email,
+)
+
 
 __all__ = [
     # Auth
+    "send_welcome_email",
     "send_password_reset_email",
     "send_password_changed_email",
     "send_account_deleted_email",
+    "send_email_change_email",
+    "send_admin_reset_password_email",
     # Billing — Subscriptions
     "send_subscription_started_email",
     "send_trial_started_email",
@@ -234,4 +203,8 @@ __all__ = [
     "send_master_admin_welcome_email",
     # Announcements
     "send_announcement_email",
+    # Lifecycle
+    "send_payment_failed_email",
+    "send_trial_ending_reminder_email",
+    "send_low_token_warning_email",
 ]

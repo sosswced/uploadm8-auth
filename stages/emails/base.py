@@ -25,10 +25,11 @@ FRONTEND_URL    = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
 SUPPORT_EMAIL = "support@uploadm8.com"
 LOGO_URL      = "https://app.uploadm8.com/images/logo.png"
 
-URL_DASHBOARD = f"{FRONTEND_URL}/dashboard.html"
-URL_SETTINGS  = f"{FRONTEND_URL}/settings.html"
-URL_BILLING   = f"{FRONTEND_URL}/billing.html"
-URL_PRICING   = f"{FRONTEND_URL}/index.html#pricing"
+URL_DASHBOARD    = f"{FRONTEND_URL}/dashboard.html"
+URL_SETTINGS     = f"{FRONTEND_URL}/settings.html"
+URL_BILLING      = f"{FRONTEND_URL}/billing.html"
+URL_PRICING      = f"{FRONTEND_URL}/index.html#pricing"
+URL_UNSUBSCRIBE  = f"{FRONTEND_URL}/unsubscribe.html"
 
 # ── Tier display names ────────────────────────────────────────────────────────
 TIER_NAMES: dict = {
@@ -92,6 +93,7 @@ def email_shell(
 ) -> str:
     """
     Wraps body_rows (concatenated <tr> strings) in the full branded card.
+    Logo is a clickable hyperlink to the app.
 
     Usage:
         html = email_shell(
@@ -104,10 +106,13 @@ def email_shell(
         if footer_note else ""
     )
 
+    # Logo is wrapped in an <a> tag so it hyperlinks back to the app
     header = (
         f'<tr><td style="background:{gradient};padding:30px 40px 26px;text-align:center;">'
+        f'<a href="{FRONTEND_URL}" style="display:inline-block;text-decoration:none;">'
         f'<img src="{LOGO_URL}" alt="UploadM8" height="46" '
-        f'style="display:block;margin:0 auto 10px;max-width:200px;">'
+        f'style="display:block;margin:0 auto 10px;max-width:200px;border:0;">'
+        f'</a>'
         f'<p style="margin:0;color:rgba(255,255,255,0.82);font-size:13px;'
         f'letter-spacing:0.4px;">{tagline}</p>'
         f'</td></tr>'
@@ -123,9 +128,14 @@ def email_shell(
         '<tr><td style="padding:22px 40px;text-align:center;">'
         '<p style="margin:0 0 5px;color:#4b5563;font-size:13px;">'
         '&#169; 2025 UploadM8 &middot; All rights reserved</p>'
-        f'<p style="margin:0;color:#4b5563;font-size:12px;">Need help? '
+        f'<p style="margin:0 0 6px;color:#4b5563;font-size:12px;">Need help? '
         f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
         f'{SUPPORT_EMAIL}</a></p>'
+        f'<p style="margin:0;color:#374151;font-size:11px;">'
+        f'<a href="{URL_UNSUBSCRIBE}" style="color:#4b5563;text-decoration:underline;">Manage email preferences</a>'
+        f' &middot; '
+        f'<a href="{FRONTEND_URL}" style="color:#4b5563;text-decoration:underline;">app.uploadm8.com</a>'
+        f'</p>'
         + extra_footer
         + '</td></tr>'
     )
@@ -284,11 +294,11 @@ def plan_change_visual(old_tier: str, new_tier: str, hex_new: str = "#f97316") -
 def platform_logos_row() -> str:
     """TikTok / YouTube / Instagram / Facebook logo strip."""
     logos = [
-        ("#000000", "https://logo.clearbit.com/tiktok.com",   "TikTok"),
-        ("#ff0000", "https://logo.clearbit.com/youtube.com",  "YouTube"),
+        ("#000000", "https://logo.clearbit.com/tiktok.com",    "TikTok"),
+        ("#ff0000", "https://logo.clearbit.com/youtube.com",   "YouTube"),
         ("linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888)",
-                     "https://logo.clearbit.com/instagram.com","Instagram"),
-        ("#1877f2", "https://logo.clearbit.com/facebook.com", "Facebook"),
+                     "https://logo.clearbit.com/instagram.com", "Instagram"),
+        ("#1877f2", "https://logo.clearbit.com/facebook.com",  "Facebook"),
     ]
     cells = "".join(
         f'<td style="padding:0 10px;text-align:center;">'

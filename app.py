@@ -333,23 +333,36 @@ from stages.entitlements import (
 
 # ── Email notifications ───────────────────────────────────────────────────────
 from stages.emails import (
+    # Auth
+    send_welcome_email,
     send_password_reset_email,
     send_password_changed_email,
     send_account_deleted_email,
+    send_email_change_email,
+    send_admin_reset_password_email,
+    # Billing — Subscriptions
     send_subscription_started_email,
     send_trial_started_email,
     send_trial_cancelled_email,
     send_subscription_cancelled_email,
     send_renewal_receipt_email,
+    # Billing — Changes
     send_plan_upgraded_email,
     send_plan_downgraded_email,
     send_topup_receipt_email,
+    # Announcements
     send_announcement_email,
+    # Heartfelt welcomes
     send_friends_family_welcome_email,
     send_agency_welcome_email,
     send_master_admin_welcome_email,
+    # Admin actions
     send_admin_wallet_topup_email,
     send_admin_tier_switch_email,
+    # Lifecycle
+    send_payment_failed_email,
+    send_trial_ending_reminder_email,
+    send_low_token_warning_email,
 )
 
 # Tier ranking for upgrade/downgrade detection (higher index = higher tier)
@@ -1899,7 +1912,7 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
         access = create_access_jwt(user_id)
         refresh = await create_refresh_token(conn, user_id)
     background_tasks.add_task(notify_signup, data.email, data.name)
-    background_tasks.add_task(send_email, data.email, "Welcome to UploadM8!", f"<h1>Welcome, {data.name}!</h1><p>Start uploading at <a href='{FRONTEND_URL}'>uploadm8.com</a></p>")
+    background_tasks.add_task(send_welcome_email, data.email, data.name)
     return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
 
 @app.post("/api/auth/login")
@@ -7306,6 +7319,13 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
             request=request,
         )
 
+    # Send verification email to the new address
+    _verify_link = f"{FRONTEND_URL}/verify-email?token={verification_token}"
+    background_tasks.add_task(
+        send_email_change_email,
+        new_email, old["email"], user.get("name") or "there", _verify_link
+    )
+
     return {"ok": True, "email": new_email}
 
 
@@ -7356,6 +7376,12 @@ async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, requ
             details={"must_reset_password": True},
             request=request,
         )
+
+    # Email the user their temporary password
+    async with db_pool.acquire() as _ec:
+        _tgt = await _ec.fetchrow("SELECT email, name FROM users WHERE id=$1", user_id)
+    if _tgt:
+        background_tasks.add_task(send_admin_reset_password_email, _tgt["email"], _tgt["name"] or "there", payload.temp_password)
 
     return {"ok": True}
 

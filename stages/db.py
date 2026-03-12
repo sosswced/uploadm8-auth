@@ -104,6 +104,7 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "autoCaptions":     "auto_captions",
                         "captionStyle":     "caption_style",
                         "captionTone":      "caption_tone",
+                        "captionVoice":     "caption_voice",
                         "captionFrameCount":"caption_frame_count",
                         "maxHashtags":      "max_hashtags",
                         "trillOpenaiModel": "openai_model",
@@ -342,6 +343,92 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
             )
         except asyncpg.exceptions.UndefinedColumnError as e:
             logger.warning(f"save_generated_metadata skipped (column missing): {e}")
+
+
+# ============================================================
+# Caption memory (few-shot retrieval for caption_stage)
+# ============================================================
+
+async def fetch_caption_memory_examples(
+    pool: asyncpg.Pool,
+    user_id: str,
+    category: str,
+    limit: int = 3,
+) -> List[dict]:
+    """
+    Load recent caption examples for this user + category for prompt injection.
+    Table may not exist yet — returns [] on missing table.
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT ai_title, ai_caption, ai_hashtags, caption_voice, caption_tone, caption_style
+                  FROM upload_caption_memory
+                 WHERE user_id = $1 AND category = $2
+                 ORDER BY created_at DESC
+                 LIMIT $3
+                """,
+                user_id,
+                (category or "general").lower(),
+                max(1, min(limit, 8)),
+            )
+        return [dict(r) for r in rows] if rows else []
+    except asyncpg.exceptions.UndefinedTableError:
+        return []
+    except Exception as e:
+        logger.debug(f"fetch_caption_memory_examples: {e}")
+        return []
+
+
+async def insert_caption_memory(
+    pool: asyncpg.Pool,
+    user_id: str,
+    upload_id: str,
+    category: str,
+    platforms: List[str],
+    ai_title: Optional[str],
+    ai_caption: Optional[str],
+    ai_hashtags: Optional[List[str]],
+    caption_voice: str = "",
+    caption_tone: str = "",
+    caption_style: str = "",
+    source: str = "auto",
+) -> None:
+    """Persist one row for future few-shot retrieval. Non-fatal on missing table."""
+    if not (ai_title or ai_caption or ai_hashtags):
+        return
+    try:
+        import json as _json
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO upload_caption_memory (
+                    user_id, upload_id, category, platforms,
+                    ai_title, ai_caption, ai_hashtags,
+                    caption_voice, caption_tone, caption_style, source
+                ) VALUES (
+                    $1, $2::uuid, $3, $4::jsonb,
+                    $5, $6, $7::jsonb,
+                    $8, $9, $10, $11
+                )
+                """,
+                user_id,
+                upload_id,
+                (category or "general").lower(),
+                _json.dumps(platforms or []),
+                ai_title,
+                ai_caption,
+                _json.dumps(ai_hashtags or []),
+                caption_voice or None,
+                caption_tone or None,
+                caption_style or None,
+                source,
+            )
+    except asyncpg.exceptions.UndefinedTableError:
+        pass
+    except Exception as e:
+        logger.debug(f"insert_caption_memory: {e}")
 
 
 async def increment_upload_count(pool: asyncpg.Pool, user_id: str):

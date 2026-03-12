@@ -752,7 +752,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # STAGE 7: Caption
         # ============================================================
         try:
-            ctx = await run_caption_stage(ctx)
+            ctx = await run_caption_stage(ctx, db_pool)
             await db_stage.save_generated_metadata(db_pool, ctx)
         except SkipStage as e:
             logger.info(f"[{upload_id}] Caption skipped: {e.reason}")
@@ -1287,14 +1287,25 @@ async def _sync_one_upload_analytics(
                 continue
 
     # Persist results + stamp analytics_synced_at regardless (even if all zeros)
-    # so we dont endlessly retry uploads whose scopes arent approved yet
+    # so we dont endlessly retry uploads whose scopes arent approved yet.
     await conn.execute(
-        """UPDATE uploads
-               SET views=, likes=, comments=, shares=,
-                   analytics_synced_at=NOW(), updated_at=NOW()
-             WHERE id= AND user_id=""",
-        total_views, total_likes, total_comments, total_shares,
-        upload_id, user_id,
+        """
+        UPDATE uploads
+           SET views = $1,
+               likes = $2,
+               comments = $3,
+               shares = $4,
+               analytics_synced_at = NOW(),
+               updated_at = NOW()
+         WHERE id = $5
+           AND user_id = $6
+        """,
+        total_views,
+        total_likes,
+        total_comments,
+        total_shares,
+        upload_id,
+        user_id,
     )
 
     return {

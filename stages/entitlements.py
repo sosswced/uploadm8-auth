@@ -65,7 +65,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
 
     "free": {
         "name": "Free", "price": 0,
-        "put_daily": 2, "put_monthly": 60, "aic_monthly": 10,
+        "put_daily": 2, "put_monthly": 60, "aic_monthly": 30,
         "max_accounts": 4, "max_accounts_per_platform": 1,
         "watermark": True, "ads": True, "ai": False,
         "scheduling": False, "webhooks": False, "white_label": False,
@@ -79,7 +79,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
 
     "creator_lite": {
         "name": "Creator Lite", "price": 9.99,
-        "put_daily": 10, "put_monthly": 300, "aic_monthly": 80,
+        "put_daily": 12, "put_monthly": 360, "aic_monthly": 120,
         "max_accounts": 8, "max_accounts_per_platform": 2,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
@@ -93,7 +93,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
 
     "creator_pro": {
         "name": "Creator Pro", "price": 19.99,
-        "put_daily": 20, "put_monthly": 700, "aic_monthly": 200,
+        "put_daily": 25, "put_monthly": 900, "aic_monthly": 260,
         "max_accounts": 20, "max_accounts_per_platform": 5,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
@@ -107,7 +107,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
 
     "studio": {
         "name": "Studio", "price": 49.99,
-        "put_daily": 50, "put_monthly": 2000, "aic_monthly": 600,
+        "put_daily": 60, "put_monthly": 2500, "aic_monthly": 800,
         "max_accounts": 60, "max_accounts_per_platform": 15,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
@@ -121,7 +121,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
 
     "agency": {
         "name": "Agency", "price": 99.99,
-        "put_daily": 200, "put_monthly": 4500, "aic_monthly": 1500,
+        "put_daily": 250, "put_monthly": 6000, "aic_monthly": 2000,
         "max_accounts": 999, "max_accounts_per_platform": 999,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": True,

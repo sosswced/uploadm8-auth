@@ -350,12 +350,30 @@ def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
             )
             if isinstance(extra, str):
                 extra = extra.split()
+
+            # Respect blocked hashtags from user preferences when merging extras
+            raw_blocked = us.get("blockedHashtags") or us.get("blocked_hashtags") or []
+            if isinstance(raw_blocked, str):
+                raw_blocked = [
+                    t.strip()
+                    for t in raw_blocked.replace(",", " ").split()
+                    if t.strip()
+                ]
+            blocked_set = {
+                str(t).strip().lstrip("#").lower()
+                for t in (raw_blocked if isinstance(raw_blocked, list) else [])
+            }
+
             existing_lower = {str(t).lstrip("#").lower() for t in tags}
             for tag in extra:
                 t = str(tag).strip().lstrip("#")
-                if t and t.lower() not in existing_lower:
-                    existing_lower.add(t.lower())
-                    tags.append(f"#{t}")
+                if not t:
+                    continue
+                tl = t.lower()
+                if tl in existing_lower or tl in blocked_set:
+                    continue
+                existing_lower.add(tl)
+                tags.append(f"#{t}")
         except Exception:
             pass
 

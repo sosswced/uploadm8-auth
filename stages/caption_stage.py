@@ -480,6 +480,36 @@ _CATEGORY_PRIORITY = [
 ]
 
 
+# High-level "voices" / personalities for caption delivery.
+# Users can pick these via captionVoice / caption_voice in their preferences.
+VOICE_PROFILES: Dict[str, str] = {
+    "default": (
+        "Balanced, high-signal storytelling. Sounds like a creator who "
+        "knows their audience well — confident but not shouty."
+    ),
+    "mentor": (
+        "Supportive, experienced mentor. Speaks directly to the viewer as "
+        "a guide, with clear takeaways and calm confidence."
+    ),
+    "hypebeast": (
+        "Max energy, hype, slang-forward where appropriate. Short punchy "
+        "sentences, built to spike excitement without sounding fake."
+    ),
+    "best_friend": (
+        "Warm, honest, slightly chaotic best friend energy. First-person, "
+        "casual, occasionally self-deprecating, very relatable."
+    ),
+    "teacher": (
+        "Clear and structured educator. Breaks ideas into steps, avoids "
+        "fluff, and focuses on one key insight per caption."
+    ),
+    "cinematic_narrator": (
+        "Film-trailer narrator voice. Descriptive, visual, and dramatic, "
+        "like a voiceover to a movie trailer."
+    ),
+}
+
+
 def _detect_category_from_text(text: str) -> Optional[str]:
     """Scan a text string for category keyword signals. Returns first match or None."""
     if not text:
@@ -753,6 +783,13 @@ def _build_narrative_prompt(
         category, CONTENT_CATEGORIES["general"]
     ).get("tone", "Engaging and authentic.")
 
+    # ── Voice profile: higher-level personality on top of tone ───────────────
+    us = getattr(ctx, "user_settings", None) or {}
+    voice_key = str(us.get("captionVoice") or us.get("caption_voice") or "default").lower()
+    if voice_key not in VOICE_PROFILES:
+        voice_key = "default"
+    voice_instruction = VOICE_PROFILES[voice_key]
+
     # ── Multi-frame narrative instruction ────────────────────────────────────
     if num_frames > 1:
         frame_instruction = (
@@ -781,6 +818,35 @@ def _build_narrative_prompt(
         context_lines.append(f"Filming location: {ctx.location_name}")
     context_block = "\n".join(f"• {ln}" for ln in context_lines)
 
+    # ── Memory examples (few-shot from past uploads) ─────────────────────────
+    memory_block = ""
+    examples = getattr(ctx, "caption_memory_examples", None) or []
+    if examples:
+        lines = []
+        for i, ex in enumerate(examples[:5], 1):
+            t = (ex.get("ai_title") or "")[:120]
+            c = (ex.get("ai_caption") or "")[:320]
+            tags = ex.get("ai_hashtags")
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except Exception:
+                    tags = []
+            if isinstance(tags, list):
+                tag_str = ", ".join(str(x).lstrip("#") for x in tags[:15])
+            else:
+                tag_str = ""
+            lines.append(f"Example {i} — title: {t}")
+            if c:
+                lines.append(f"  caption: {c}")
+            if tag_str:
+                lines.append(f"  hashtags: {tag_str}")
+        memory_block = (
+            "\n━━ PAST EXAMPLES (match voice but write fresh — do not copy verbatim) ━━\n"
+            + "\n".join(lines)
+            + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
     # ── Category context block ────────────────────────────────────────────────
     category_block = _build_category_context_block(category, ctx.location_name)
 
@@ -799,10 +865,11 @@ def _build_narrative_prompt(
     prompt = f"""You are a social media content specialist for {platform_str}.
 
 {frame_instruction}
-
+{memory_block}
 {category_block}{trill_section}
 
 TONE DIRECTIVE: {tone_instruction}
+VOICE PROFILE: {voice_key.upper()} — {voice_instruction}
 CAPTION STYLE: {caption_style.upper()} — follow this style strictly.
 {f"PLATFORM NOTE: {platform_note}" if platform_note else ""}
 
@@ -984,7 +1051,7 @@ def _estimate_cost(tokens: dict, num_images: int) -> float:
 # Stage Entry Point
 # ============================================================
 
-async def run_caption_stage(ctx: JobContext) -> JobContext:
+async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
     """
     Execute AI caption generation stage.
 
@@ -1055,6 +1122,16 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
 
     # ── Detect content category (3-layer: hint → filename → general) ─────────
     category = _detect_content_category(ctx)
+
+    # ── Retrieve few-shot examples from upload_caption_memory (optional) ───
+    if db_pool:
+        try:
+            from . import db as _db_stage
+            ctx.caption_memory_examples = await _db_stage.fetch_caption_memory_examples(
+                db_pool, str(ctx.user_id), category, limit=3
+            )
+        except Exception as _mem_err:
+            logger.debug(f"Caption memory fetch skipped: {_mem_err}")
 
     logger.info(
         f"Caption stage: category={category}, style={caption_style}, tone={caption_tone}, "
@@ -1134,6 +1211,27 @@ async def run_caption_stage(ctx: JobContext) -> JobContext:
             f"completion={tokens_used.get('completion', 0)}, "
             f"cost=${cost:.4f}, category={category}"
         )
+
+        # ── Persist into caption memory for future few-shot retrieval ────────
+        if db_pool and (ctx.ai_title or ctx.ai_caption or ctx.ai_hashtags):
+            try:
+                from . import db as _db_stage
+                _voice = str(us.get("captionVoice") or us.get("caption_voice") or "")
+                await _db_stage.insert_caption_memory(
+                    db_pool,
+                    str(ctx.user_id),
+                    str(ctx.upload_id),
+                    category,
+                    list(ctx.platforms or []),
+                    ctx.ai_title,
+                    ctx.ai_caption,
+                    ctx.ai_hashtags,
+                    caption_voice=_voice,
+                    caption_tone=caption_tone,
+                    caption_style=caption_style,
+                )
+            except Exception as _ins_err:
+                logger.debug(f"Caption memory insert skipped: {_ins_err}")
 
         return ctx
 

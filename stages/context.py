@@ -189,6 +189,8 @@ class JobContext:
     ai_title: Optional[str] = None
     ai_caption: Optional[str] = None
     ai_hashtags: List[str] = field(default_factory=list)
+    # Few-shot examples from upload_caption_memory (set by caption_stage when db_pool provided)
+    caption_memory_examples: List[Dict[str, Any]] = field(default_factory=list)
 
     telemetry_data: Optional[TelemetryData] = None
     trill_score: Optional[TrillScore] = None

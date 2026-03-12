@@ -726,6 +726,7 @@ class ProfileUpdateSettings(BaseModel):
     timezone: Optional[str] = None
 
 class PreferencesUpdate(BaseModel):
+    """Settings page / legacy prefs — includes Caption & AI card fields for save/load."""
     emailNotifs: Optional[bool] = None
     uploadCompleteNotifs: Optional[bool] = None
     marketingEmails: Optional[bool] = None
@@ -743,7 +744,10 @@ class PreferencesUpdate(BaseModel):
     maxHashtags: Optional[int] = None
     aiHashtagsEnabled: Optional[bool] = None
     aiHashtagCount: Optional[int] = None
-    aiHashtagStyle: Optional[str] = None
+    aiHashtagStyle: Optional[str] = None  # lowercase | capitalized | camelcase | mixed
+    captionStyle: Optional[str] = None   # story | punchy | factual
+    captionTone: Optional[str] = None    # hype | calm | cinematic | authentic
+    captionVoice: Optional[str] = None   # default | mentor | hypebeast | best_friend | teacher | cinematic_narrator
     platformHashtags: Optional[dict] = None
 
 class TransferRequest(BaseModel):
@@ -2232,6 +2236,12 @@ async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depend
             prefs["aiHashtagCount"] = data.aiHashtagCount
         if data.aiHashtagStyle is not None:
             prefs["aiHashtagStyle"] = data.aiHashtagStyle
+        if data.captionStyle is not None:
+            prefs["captionStyle"] = data.captionStyle
+        if data.captionTone is not None:
+            prefs["captionTone"] = data.captionTone
+        if data.captionVoice is not None:
+            prefs["captionVoice"] = data.captionVoice
         if data.platformHashtags is not None:
             prefs["platformHashtags"] = data.platformHashtags
         
@@ -2832,10 +2842,34 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
     if "hashtagPosition" in prefs and prefs["hashtagPosition"] not in ["start", "end", "caption", "comment"]:
         prefs["hashtagPosition"] = "end"
     
-    # Validate AI hashtag style
+    # Validate AI hashtag style (must match caption_stage + UI schema)
     if "aiHashtagStyle" in prefs and prefs["aiHashtagStyle"] not in ["lowercase", "capitalized", "camelcase", "mixed"]:
         prefs["aiHashtagStyle"] = "mixed"
-    
+    if "ai_hashtag_style" in prefs and prefs["ai_hashtag_style"] not in ["lowercase", "capitalized", "camelcase", "mixed"]:
+        prefs["ai_hashtag_style"] = "mixed"
+
+    # Caption & AI Settings — style / tone / voice (worker caption_stage reads these)
+    _CAPTION_STYLES = ("story", "punchy", "factual")
+    _CAPTION_TONES = ("hype", "calm", "cinematic", "authentic")
+    _CAPTION_VOICES = (
+        "default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator",
+    )
+    if "captionStyle" in prefs or "caption_style" in prefs:
+        v = str(prefs.get("captionStyle") or prefs.get("caption_style") or "story").strip().lower()
+        if v not in _CAPTION_STYLES:
+            v = "story"
+        prefs["captionStyle"] = prefs["caption_style"] = v
+    if "captionTone" in prefs or "caption_tone" in prefs:
+        v = str(prefs.get("captionTone") or prefs.get("caption_tone") or "authentic").strip().lower()
+        if v not in _CAPTION_TONES:
+            v = "authentic"
+        prefs["captionTone"] = prefs["caption_tone"] = v
+    if "captionVoice" in prefs or "caption_voice" in prefs:
+        v = str(prefs.get("captionVoice") or prefs.get("caption_voice") or "default").strip().lower()
+        if v not in _CAPTION_VOICES:
+            v = "default"
+        prefs["captionVoice"] = prefs["caption_voice"] = v
+
     async with db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",

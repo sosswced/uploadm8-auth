@@ -1,0 +1,78 @@
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.Python
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+venv*/
+
+# IDE
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# --- Secrets / env ---
+.env
+.env.*
+!.env.example
+
+# --- Python cache / build ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.installed.cfg
+
+# --- Virtual environments ---
+.venv/
+.venv*/
+venv/
+venv*/
+env/
+env*/
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- OS-specific junk ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Logs / runtime ---
+*.log
+logs/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# --- Local tooling ---
+.mypy_cache/
+.pytype/
+.dmypy.json
+.cache/
+
+# --- Node (if/when frontend is added into this repo) ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*

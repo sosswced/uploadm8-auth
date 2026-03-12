@@ -218,6 +218,11 @@ def generate_presigned_download_url(key: str, ttl: int = 3600) -> str:
         ExpiresIn=int(ttl),
     )
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
+# Presigned upload URL TTL (seconds). Default 2h for large/slow uploads; increase if users hit "R2 upload network error" due to expiry.
+R2_PRESIGN_UPLOAD_TTL = int(os.environ.get("R2_PRESIGN_UPLOAD_TTL", "7200"))
+# When true, presigned PUT does not bind Content-Type in the signature. Use if frontend sends file.type that differs from presign
+# (empty or browser-specific) and R2 returns 403 — avoids "network error" from failed PUT. Object may need Content-Type set later if required.
+R2_PRESIGN_PUT_UNSIGNED_CONTENT = os.environ.get("R2_PRESIGN_PUT_UNSIGNED_CONTENT", "").strip().lower() in ("1", "true", "yes", "on")
 
 # Redis
 REDIS_URL = os.environ.get("REDIS_URL", "")
@@ -610,10 +615,19 @@ def r2_presign_get_url(r2_key: str, expires_in: int = 3600) -> str:
     """Generate a short-lived signed URL for a private R2 object."""
     return generate_presigned_download_url(r2_key, ttl=int(expires_in))
 
-def generate_presigned_upload_url(key: str, content_type: str, ttl: int = 3600) -> str:
+def generate_presigned_upload_url(key: str, content_type: str, ttl: int = None) -> str:
+    ttl = int(ttl) if ttl is not None else R2_PRESIGN_UPLOAD_TTL
     key = _normalize_r2_key(key)
     s3 = get_s3_client()
-    return s3.generate_presigned_url("put_object", Params={"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type}, ExpiresIn=ttl)
+    # Binding ContentType in the signature requires the browser to send the exact same header; mismatches → 403 → client often reports "network error".
+    if R2_PRESIGN_PUT_UNSIGNED_CONTENT:
+        params = {"Bucket": R2_BUCKET_NAME, "Key": key}
+        logger.info(f"Presigned upload URL (unsigned Content-Type) for key={key[:80]}{'...' if len(key) > 80 else ''} ttl={ttl}s")
+    else:
+        params = {"Bucket": R2_BUCKET_NAME, "Key": key, "ContentType": content_type}
+        logger.info(f"Presigned upload URL generated for key={key[:80]}{'...' if len(key) > 80 else ''} ttl={ttl}s content_type={content_type}")
+    url = s3.generate_presigned_url("put_object", Params=params, ExpiresIn=ttl)
+    return url
 
 # ============================================================
 # Redis Queue — 4-Lane Architecture

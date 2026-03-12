@@ -546,6 +546,48 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
         return None
 
 
+async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Optional[dict]:
+    """Load a stored platform OAuth token by its platform_tokens.id (UUID).
+
+    Used for multi-account publishing where the caller knows exactly which
+    connected account to publish to.  Returns the parsed token blob with
+    'platform' and 'account_name' injected for caller convenience.
+    """
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM platform_tokens WHERE id = $1 AND revoked_at IS NULL",
+                token_id,
+            )
+            if not row:
+                return None
+            row_dict = dict(row)
+            token_data = row_dict.get("token_blob") or row_dict.get("token_data")
+            if not token_data:
+                return None
+            if isinstance(token_data, str):
+                parsed = json.loads(token_data)
+                if isinstance(parsed, str):
+                    try:
+                        parsed = json.loads(parsed)
+                    except Exception:
+                        pass
+            else:
+                parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
+            if isinstance(parsed, dict):
+                parsed["_platform"] = row_dict.get("platform", "")
+                parsed["_account_name"] = row_dict.get("account_name", "")
+                parsed["_token_id"] = str(row_dict.get("id", ""))
+                account_id_col = row_dict.get("account_id")
+                if account_id_col:
+                    if row_dict.get("platform") == "instagram" and not parsed.get("ig_user_id"):
+                        parsed["ig_user_id"] = str(account_id_col)
+            return parsed
+    except Exception as e:
+        logger.error(f"Failed to load platform token by id {token_id}: {e}")
+        return None
+
+
 # ============================================================
 # Publish Attempts / Ledger (used by publish_stage + verify_stage)
 # ============================================================

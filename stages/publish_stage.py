@@ -351,6 +351,10 @@ def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
             if isinstance(extra, str):
                 extra = extra.split()
 
+            # #region agent log
+            logger.info(f"[HASHTAG_DEBUG] platform={platform} platformHashtags_keys={list(platform_hashtags.keys()) if isinstance(platform_hashtags, dict) else type(platform_hashtags).__name__} extra_for_platform={extra} base_tags_count={len(tags)}")
+            # #endregion
+
             # Respect blocked hashtags from user preferences when merging extras
             raw_blocked = us.get("blockedHashtags") or us.get("blocked_hashtags") or []
             if isinstance(raw_blocked, str):
@@ -374,8 +378,10 @@ def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
                     continue
                 existing_lower.add(tl)
                 tags.append(f"#{t}")
-        except Exception:
-            pass
+        except Exception as _htag_err:
+            # #region agent log
+            logger.error(f"[HASHTAG_DEBUG] platform={platform} exception={_htag_err}")
+            # #endregion
 
     # Normalise: ensure each tag starts with '#' and contains no whitespace
     normalised = []
@@ -397,6 +403,10 @@ def _build_platform_caption(ctx: JobContext, platform: str) -> str:
     """
     caption = _get_caption(ctx)
     hashtags = _get_hashtags(ctx, platform=platform)
+
+    # #region agent log
+    logger.info(f"[CAPTION_DEBUG] platform={platform} caption_len={len(caption or '')} hashtags='{(hashtags or '')[:200]}'")
+    # #endregion
 
     if not hashtags:
         return caption or ""
@@ -1416,7 +1426,7 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
       - UPDATE row after call (success/fail + metadata)
       - verify_stage later turns verify_status into confirmed/rejected/unknown
     """
-    if not ctx.platforms:
+    if not ctx.platforms and not ctx.target_accounts:
         logger.warning(f"No platforms specified for upload {ctx.upload_id}")
         return ctx
 
@@ -1435,7 +1445,6 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
     if not has_any_video:
         raise PublishError("No video files available to publish", code=ErrorCode.UPLOAD_FAILED)
 
-    logger.info(f"Publishing to platforms: {ctx.platforms}")
     init_enc_keys()
 
     # Token DB key mapping (platform -> token table platform key)
@@ -1446,7 +1455,30 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
         "facebook": "facebook",
     }
 
-    for platform in ctx.platforms:
+    # Build publish targets: list of (platform, token_id_or_None)
+    # When target_accounts is set, each entry is a specific account (supports
+    # multi-account per platform, e.g. two YouTube channels).
+    # When empty, fall back to one publish per unique platform name.
+    publish_targets: list[tuple[str, str | None]] = []
+    if ctx.target_accounts:
+        for token_id in ctx.target_accounts:
+            raw = await db_stage.load_platform_token_by_id(db_pool, token_id)
+            if raw and isinstance(raw, dict):
+                plat = raw.get("_platform", "")
+                if plat:
+                    publish_targets.append((plat, token_id))
+                    continue
+            logger.warning(f"target_account {token_id}: token not found or revoked — skipping")
+        if not publish_targets:
+            logger.warning(f"All target_accounts invalid for upload {ctx.upload_id}, falling back to platforms")
+            publish_targets = [(p, None) for p in ctx.platforms]
+    else:
+        publish_targets = [(p, None) for p in ctx.platforms]
+
+    logger.info(f"Publishing to targets: {publish_targets}")
+
+    for platform, token_id in publish_targets:
+        account_label = f"{platform}:{token_id[:8]}" if token_id else platform
         db_key = platform_to_db_key.get(platform, platform)
 
         # -- Select the correct video file for this platform --
@@ -1455,7 +1487,7 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
             video_file = default_video
             if video_file:
                 logger.warning(
-                    f"{platform}: Platform-specific video not found, "
+                    f"{account_label}: Platform-specific video not found, "
                     f"using fallback: {video_file.name}"
                 )
 
@@ -1469,22 +1501,24 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 platform=str(platform),
             )
         except Exception as e:
-            logger.warning(f"{platform}: Could not create publish_attempt row: {e}")
+            logger.warning(f"{account_label}: Could not create publish_attempt row: {e}")
             attempt_id = None
 
-        # -- Load platform token --
+        # -- Load platform token (by ID when multi-account, by platform otherwise) --
         token_data = None
         try:
-            raw_token = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
-            # Decrypt if encrypted blob (token_blob is always encrypted via encrypt_blob())
+            if token_id:
+                raw_token = await db_stage.load_platform_token_by_id(db_pool, token_id)
+            else:
+                raw_token = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
             token_data = decrypt_token(raw_token) if raw_token else None
         except Exception as e:
-            logger.warning(f"{platform}: Token load failed: {e}")
+            logger.warning(f"{account_label}: Token load failed: {e}")
             token_data = None
 
         if not token_data:
-            msg = f"Not connected to {platform}"
-            logger.warning(f"{platform}: {msg}")
+            msg = f"Not connected to {platform}" + (f" (account {token_id[:8]})" if token_id else "")
+            logger.warning(f"{account_label}: {msg}")
             if attempt_id:
                 try:
                     await db_stage.update_publish_attempt_failed(
@@ -1514,14 +1548,12 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 result = await publish_to_youtube(video_file, ctx, token_data, db_pool=db_pool)
 
             elif platform == "instagram":
-                # Instagram needs a public URL (Graph API requirement)
                 video_url = _get_video_public_url(ctx, "instagram")
                 result = await publish_to_instagram(
                     video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
                 )
 
             elif platform == "facebook":
-                # Facebook can use binary upload OR URL
                 video_url = _get_video_public_url(ctx, "facebook")
                 result = await publish_to_facebook(
                     video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
@@ -1536,7 +1568,7 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 )
 
         except Exception as e:
-            logger.exception(f"Error publishing to {platform}")
+            logger.exception(f"Error publishing to {account_label}")
             result = PlatformResult(
                 platform=platform,
                 success=False,
@@ -1550,6 +1582,8 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
 
         status_icon = "OK" if result.success else "FAIL"
         extra = ""
+        if token_id:
+            extra += f" account={token_id[:8]}"
         if result.publish_id:
             extra += f" publish_id={result.publish_id}"
         if result.platform_video_id:
@@ -1557,7 +1591,7 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
         if result.error_message and not result.success:
             extra += f" error={result.error_message[:100]}"
 
-        logger.info(f"{platform} [{status_icon}]: {result.error_code or 'accepted'}{extra}")
+        logger.info(f"{account_label} [{status_icon}]: {result.error_code or 'accepted'}{extra}")
 
         # -- Update ledger row --
         if attempt_id:
@@ -1582,7 +1616,7 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                         response_payload=result.response_payload,
                     )
             except Exception as e:
-                logger.warning(f"{platform}: Could not update publish_attempt: {e}")
+                logger.warning(f"{account_label}: Could not update publish_attempt: {e}")
 
     # -- Summary --
     succeeded = [r.platform for r in ctx.platform_results if r.success]

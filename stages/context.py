@@ -372,6 +372,7 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
         filename=upload_record.get("filename", ""),
         file_size=upload_record.get("file_size", 0),
         platforms=upload_record.get("platforms", []) or [],
+        target_accounts=upload_record.get("target_accounts", []) or [],
         title=upload_record.get("title", ""),
         caption=upload_record.get("caption", ""),
         hashtags=upload_record.get("hashtags", []) or [],

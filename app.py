@@ -708,6 +708,7 @@ class UploadInit(BaseModel):
     file_size: int
     content_type: str
     platforms: List[str]
+    target_accounts: List[str] = []  # platform_tokens.id UUIDs — publish to specific accounts
     title: str = ""
     caption: str = ""
     hashtags: List[str] = []
@@ -1350,6 +1351,10 @@ async def run_migrations():
     -- Index for fast invalidation of unused tokens per user
     CREATE INDEX IF NOT EXISTS idx_password_resets_user_unused ON password_resets(user_id)
         WHERE used_at IS NULL;
+"""),
+
+(703, """
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS target_accounts TEXT[] DEFAULT '{}';
 """),
 ]
         
@@ -2975,9 +2980,11 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         use_ai  = bool(getattr(data, "use_ai", False)) and ent_cost.can_ai
         use_hud = bool(user_prefs.get("hud_enabled", False)) and ent_cost.can_burn_hud
 
+        # Each target account counts as a separate publish (costs +2 PUT per extra beyond 1)
+        num_publish_targets = len(data.target_accounts) if data.target_accounts else len(data.platforms)
         put_cost, aic_cost = compute_upload_cost(
             entitlements=ent_cost,
-            num_platforms=len(data.platforms),
+            num_platforms=num_publish_targets,
             use_ai=use_ai,
             use_hud=use_hud,
             num_thumbnails=ent_cost.max_thumbnails,
@@ -3045,15 +3052,15 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
                 id, user_id, r2_key, filename, file_size, platforms,
                 title, caption, hashtags, privacy, status, scheduled_time,
                 schedule_mode, put_reserved, aic_reserved, schedule_metadata,
-                user_preferences
+                user_preferences, target_accounts
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, $14, $15, $16, $17)
         """,
             upload_id, user["id"], r2_key, data.filename, data.file_size,
             data.platforms, data.title, data.caption, data.hashtags,
             data.privacy, scheduled_time, data.schedule_mode, put_cost,
             aic_cost, json.dumps(schedule_metadata) if schedule_metadata else None,
-            json.dumps(user_prefs)
+            json.dumps(user_prefs), data.target_accounts or []
         )
 
         # Reserve tokens
@@ -3067,6 +3074,7 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         "put_cost": put_cost,
         "aic_cost": aic_cost,
         "schedule_mode": data.schedule_mode,
+        "target_accounts": data.target_accounts or [],
         "preferences_applied": {
             "auto_captions": bool(user_prefs.get("auto_captions")),
             "auto_thumbnails": bool(user_prefs.get("auto_thumbnails")),

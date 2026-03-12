@@ -1,12 +1,19 @@
 """
 UploadM8 — Phase 1: Auth Emails
 ================================
+<<<<<<< HEAD
   send_welcome_email               → /api/auth/register  (replaces raw HTML)
   send_password_reset_email        → /api/auth/forgot-password
   send_password_changed_email      → /api/auth/reset-password + /api/auth/change-password
   send_account_deleted_email       → DELETE /api/me
   send_email_change_email          → /api/admin/users/{id}/email  (verification link)
   send_admin_reset_password_email  → /api/admin/users/{id}/reset-password (temp password)
+=======
+  send_welcome_email           → /api/auth/register
+  send_password_reset_email    → /api/auth/forgot-password
+  send_password_changed_email  → /api/auth/reset-password + /api/auth/change-password
+  send_account_deleted_email   → DELETE /api/me
+>>>>>>> dc68718 (Caption memory, voices, prefs validation, publish hashtags, analytics SQL fix)
 """
 
 import logging
@@ -22,6 +29,7 @@ logger = logging.getLogger("uploadm8-worker")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+<<<<<<< HEAD
 # 1. New user welcome  (replaces the bare <h1>Welcome</h1> in /api/auth/register)
 # ─────────────────────────────────────────────────────────────────────────────
 async def send_welcome_email(email: str, name: str) -> None:
@@ -34,15 +42,29 @@ async def send_welcome_email(email: str, name: str) -> None:
     AFTER:
         from stages.emails.auth import send_welcome_email
         background_tasks.add_task(send_welcome_email, data.email, data.name)
+=======
+# 0. Welcome email — after successful registration
+# ─────────────────────────────────────────────────────────────────────────────
+async def send_welcome_email(email: str, name: str) -> None:
+    """
+    Friendly welcome email sent after a new user registers via /api/auth/register.
+    Replaces the raw HTML string previously in app.py.
+>>>>>>> dc68718 (Caption memory, voices, prefs validation, publish hashtags, analytics SQL fix)
     """
     if not mailgun_ready():
         return
 
+<<<<<<< HEAD
+=======
+    display_name = name or "there"
+
+>>>>>>> dc68718 (Caption memory, voices, prefs validation, publish hashtags, analytics SQL fix)
     html = email_shell(
         gradient=GRAD_ORANGE,
         tagline="Upload once. Publish everywhere.",
         body_rows=(
             intro_row(
+<<<<<<< HEAD
                 f"Welcome to UploadM8, {name}! 🎉",
                 "You've just unlocked the fastest way to publish short-form video across "
                 "TikTok, YouTube Shorts, Instagram Reels, and Facebook Reels — simultaneously. "
@@ -65,16 +87,44 @@ async def send_welcome_email(email: str, name: str) -> None:
                 f'{SUPPORT_EMAIL}</a>.</p>',
                 hex_color="#374151",
                 pb="36px",
+=======
+                f"Welcome to UploadM8, {display_name} 👋",
+                "You just unlocked a faster way to get your content everywhere. "
+                "Connect your platforms once, upload a single video, and let UploadM8 handle "
+                "the transcodes, captions, thumbnails, and publishing for you.",
+            )
+            + check_list(
+                "Upload once — publish to every connected platform",
+                "Let AI help with captions and thumbnails (on supported plans)",
+                "See all your uploads and performance in one dashboard",
+                hex_color="#f97316",
+            )
+            + cta_button("Open My Dashboard", URL_DASHBOARD, pt="8px", pb="24px")
+            + tinted_box(
+                '<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.6;">'
+                "Pro tip: start with a short test upload so you can see the full workflow "
+                "end-to-end before sending a big batch.</p>",
+                hex_color="#374151",
+                pb="32px",
+>>>>>>> dc68718 (Caption memory, voices, prefs validation, publish hashtags, analytics SQL fix)
             )
         ),
         footer_note="You received this because you created an UploadM8 account.",
     )
 
+<<<<<<< HEAD
     await send_email(email, f"Welcome to UploadM8, {name}! 🎉 Your 30 free tokens are ready", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Password reset link
+=======
+    await send_email(email, "Welcome to UploadM8 🎬", html)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Password reset link
+>>>>>>> dc68718 (Caption memory, voices, prefs validation, publish hashtags, analytics SQL fix)
 # ─────────────────────────────────────────────────────────────────────────────
 async def send_password_reset_email(email: str, reset_link: str) -> None:
     """

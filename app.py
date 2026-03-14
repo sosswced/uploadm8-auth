@@ -88,6 +88,16 @@ from urllib.parse import urlencode, quote, urlsplit, urlunsplit, parse_qsl
 # Sensitive query-param keys that must never appear in logs
 _SENSITIVE_KEYS = {"access_token", "client_secret", "code", "refresh_token", "fb_exchange_token"}
 
+def _valid_uuid(s: str) -> bool:
+    """Return True if s is a valid UUID string (avoids 500 when frontend sends 'undefined' etc)."""
+    if not s or not isinstance(s, str) or len(s) != 36:
+        return False
+    try:
+        uuid.UUID(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
 def redact_url(url: str) -> str:
     """Strip sensitive query params from a URL before logging it."""
     try:
@@ -9205,6 +9215,8 @@ async def admin_get_user_wallet(
     admin: dict = Depends(require_admin),
 ):
     """Return the wallet + recent ledger for any user (admin only)."""
+    if not _valid_uuid(user_id):
+        raise HTTPException(400, "Invalid user ID")
     async with db_pool.acquire() as conn:
         target = await conn.fetchrow(
             "SELECT id, email, name, subscription_tier FROM users WHERE id = $1",
@@ -9246,7 +9258,17 @@ async def admin_get_user_wallet(
             "put_monthly": int(plan.get("put_monthly", 0)),
             "aic_monthly": int(plan.get("aic_monthly", 0)),
         },
-        "ledger": [dict(r) for r in ledger],
+        "ledger": [
+            {
+                "token_type": r.get("token_type"),
+                "delta": int(r.get("delta", 0)),
+                "reason": r.get("reason"),
+                "upload_id": str(r["upload_id"]) if r.get("upload_id") else None,
+                "meta": r.get("meta"),
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+            }
+            for r in ledger
+        ],
     }
 
 @app.post("/api/admin/users/{user_id}/wallet/adjust")
@@ -9266,6 +9288,8 @@ async def admin_adjust_wallet(
 
     All changes are written to token_ledger and admin_audit_log.
     """
+    if not _valid_uuid(user_id):
+        raise HTTPException(400, "Invalid user ID")
     async with db_pool.acquire() as conn:
         target = await conn.fetchrow(
             "SELECT id, email, name FROM users WHERE id = $1", user_id
@@ -9293,32 +9317,25 @@ async def admin_adjust_wallet(
             target["id"],
         )
 
+        meta_json = json.dumps({
+            "ref_type": "admin_adjust",
+            "admin_id": str(admin.get("id", "")),
+            "admin_email": admin.get("email") or "",
+            "mode": payload.mode,
+            "before": before,
+            "after": new_val,
+            "reason": payload.reason,
+        })
         await conn.execute(
             """
-            INSERT INTO token_ledger
-                (user_id, token_type, delta, reason, meta)
-            VALUES
-                ($1, $2, $3, $4,
-                 jsonb_build_object(
-                     'ref_type',    'admin_adjust',
-                     'admin_id',    $5::text,
-                     'admin_email', $6,
-                     'mode',        $7,
-                     'before',      $8,
-                     'after',       $9,
-                     'reason',      $10
-                 ))
+            INSERT INTO token_ledger (user_id, token_type, delta, reason, meta)
+            VALUES ($1, $2, $3, $4, $5::jsonb)
             """,
             target["id"],
             payload.wallet,
             int(delta),
             f"admin_{payload.mode}_{payload.wallet}",
-            str(admin.get("id")),
-            admin.get("email"),
-            payload.mode,
-            before,
-            new_val,
-            payload.reason,
+            meta_json,
         )
 
         try:

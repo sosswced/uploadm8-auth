@@ -6724,7 +6724,11 @@ async def _fetch_youtube_metrics(access_token: str) -> dict:
 
 
 async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
-    """Instagram Graph API — Reels insights."""
+    """
+    Instagram Graph API — Reels insights.
+    Attempt 1: instagram_manage_insights (plays, reach, saved, shares, likes, comments)
+    Attempt 2: basic instagram_basic fields (like_count, comments_count) — no advanced scope needed.
+    """
     if not access_token or not ig_user_id:
         return {"status": "not_connected"}
     try:
@@ -6738,12 +6742,15 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
 
             items = media.json().get("data", []) or []
             if not items:
-                return {"status": "live", "views": 0, "likes": 0, "comments": 0, "saves": 0, "reach": 0, "shares": 0, "video_count": 0}
+                return {"status": "live", "views": 0, "likes": 0, "comments": 0,
+                        "saves": 0, "reach": 0, "shares": 0, "video_count": 0,
+                        "analytics_source": None}
 
             total_views = total_likes = total_comments = 0
             total_saves = total_reach = total_shares = 0
-
             analytics_source = None
+            used_fallback = False
+
             for item in items[:10]:
                 media_type = (item.get("media_type") or "IMAGE").upper()
                 # "plays" on IMAGE/CAROUSEL silently kills the insights call
@@ -6754,37 +6761,54 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
                     metric_str = "impressions,reach,saved,shares,comments,likes"
                     view_key   = "impressions"
 
+                # ── Attempt 1: instagram_manage_insights ──────────────────────
                 ins = await client.get(
                     f"https://graph.facebook.com/v21.0/{item['id']}/insights",
                     params={"access_token": access_token, "metric": metric_str},
                 )
-                if ins.status_code != 200:
-                    continue
-                analytics_source = "instagram_manage_insights"
-                for m in ins.json().get("data", []) or []:
-                    name = m.get("name", "")
-                    vals = m.get("values", [])
-                    val  = vals[-1].get("value", 0) if vals else m.get("value", 0)
-                    if isinstance(val, dict):
-                        val = sum(val.values())
-                    val = int(val or 0)
-                    if name == view_key:       total_views    += val
-                    elif name == "likes":      total_likes    += val
-                    elif name == "comments":   total_comments += val
-                    elif name == "saved":      total_saves    += val
-                    elif name == "reach":      total_reach    += val
-                    elif name == "shares":     total_shares   += val
+                if ins.status_code == 200:
+                    analytics_source = "instagram_manage_insights"
+                    for m in ins.json().get("data", []) or []:
+                        name = m.get("name", "")
+                        vals = m.get("values", [])
+                        val  = vals[-1].get("value", 0) if vals else m.get("value", 0)
+                        if isinstance(val, dict):
+                            val = sum(val.values())
+                        val = int(val or 0)
+                        if name == view_key:       total_views    += val
+                        elif name == "likes":      total_likes    += val
+                        elif name == "comments":   total_comments += val
+                        elif name == "saved":      total_saves    += val
+                        elif name == "reach":      total_reach    += val
+                        elif name == "shares":     total_shares   += val
+                else:
+                    # ── Attempt 2: basic media fields (instagram_basic only) ───
+                    # like_count and comments_count are always available.
+                    # views/plays unavailable without manage_insights.
+                    fallback = await client.get(
+                        f"https://graph.facebook.com/v21.0/{item['id']}",
+                        params={"access_token": access_token,
+                                "fields": "like_count,comments_count"},
+                    )
+                    if fallback.status_code == 200:
+                        fb = fallback.json()
+                        total_likes    += int(fb.get("like_count")     or 0)
+                        total_comments += int(fb.get("comments_count") or 0)
+                        used_fallback   = True
+
+            if analytics_source is None and used_fallback:
+                analytics_source = "instagram_basic_fallback"
 
             return {
-                "status": "live",
+                "status":           "live",
                 "analytics_source": analytics_source,
-                "views":    total_views,
-                "likes":    total_likes,
-                "comments": total_comments,
-                "saves":    total_saves,
-                "reach":    total_reach,
-                "shares":   total_shares,
-                "video_count": len(items),
+                "views":            total_views,
+                "likes":            total_likes,
+                "comments":         total_comments,
+                "saves":            total_saves,
+                "reach":            total_reach,
+                "shares":           total_shares,
+                "video_count":      len(items),
             }
     except Exception as e:
         logger.error(f"Instagram metrics error: {e}")
@@ -6792,7 +6816,12 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
 
 
 async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
-    """Facebook Graph API — Page video insights."""
+    """
+    Facebook Graph API — Page video insights.
+    Attempt 1: read_insights scope (total_video_views, reactions, comments, shares)
+    Attempt 2: basic video fields (video_views, reactions.summary, comments.summary, shares)
+               — available with just a page access token, no advanced scope needed.
+    """
     if not access_token or not page_id:
         return {"status": "not_connected"}
     try:
@@ -6806,13 +6835,29 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
 
             videos = vids.json().get("data", []) or []
             if not videos:
-                return {"status": "live", "views": 0, "reactions": 0, "comments": 0, "shares": 0, "followers": 0, "video_count": 0}
+                followers = 0
+                try:
+                    pg = await client.get(
+                        f"https://graph.facebook.com/v21.0/{page_id}",
+                        params={"access_token": access_token, "fields": "followers_count,fan_count"},
+                    )
+                    if pg.status_code == 200:
+                        pg_data = pg.json()
+                        followers = pg_data.get("followers_count") or pg_data.get("fan_count") or 0
+                except Exception:
+                    pass
+                return {"status": "live", "views": 0, "reactions": 0, "comments": 0,
+                        "shares": 0, "followers": followers, "video_count": 0,
+                        "analytics_source": None}
 
             total_views = total_reactions = total_comments = total_shares = 0
-
             analytics_source = None
+
             for vid in videos[:10]:
                 try:
+                    got_vid_stats = False
+
+                    # ── Attempt 1: read_insights scope ────────────────────────
                     ins = await client.get(
                         f"https://graph.facebook.com/v21.0/{vid['id']}",
                         params={
@@ -6820,20 +6865,41 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
                             "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_shares,total_video_comments)",
                         },
                     )
-                    if ins.status_code != 200:
-                        continue
-                    analytics_source = "read_insights+pages_read_engagement"
-                    for m in ins.json().get("insights", {}).get("data", []) or []:
-                        name = m.get("name", "")
-                        vals = m.get("values", [{}])
-                        val  = vals[-1].get("value", 0) if vals else 0
-                        if isinstance(val, dict):
-                            val = sum(val.values())
-                        val = int(val or 0)
-                        if   name == "total_video_views":                    total_views     += val
-                        elif name == "total_video_reactions_by_type_total":  total_reactions += val
-                        elif name == "total_video_shares":                   total_shares    += val
-                        elif name == "total_video_comments":                 total_comments  += val
+                    if ins.status_code == 200:
+                        insights_data = ins.json().get("insights", {}).get("data", []) or []
+                        if insights_data:
+                            analytics_source = "read_insights+pages_read_engagement"
+                            for m in insights_data:
+                                name = m.get("name", "")
+                                vals = m.get("values", [{}])
+                                val  = vals[-1].get("value", 0) if vals else 0
+                                if isinstance(val, dict):
+                                    val = sum(val.values())
+                                val = int(val or 0)
+                                if   name == "total_video_views":                    total_views     += val
+                                elif name == "total_video_reactions_by_type_total":  total_reactions += val
+                                elif name == "total_video_shares":                   total_shares    += val
+                                elif name == "total_video_comments":                 total_comments  += val
+                            got_vid_stats = True
+
+                    # ── Attempt 2: basic video fields (no read_insights needed) ─
+                    if not got_vid_stats:
+                        fallback = await client.get(
+                            f"https://graph.facebook.com/v21.0/{vid['id']}",
+                            params={
+                                "access_token": access_token,
+                                "fields": "video_views,reactions.summary(true),comments.summary(true),shares",
+                            },
+                        )
+                        if fallback.status_code == 200:
+                            fb = fallback.json()
+                            total_views     += int(fb.get("video_views") or 0)
+                            total_reactions += int((fb.get("reactions") or {}).get("summary", {}).get("total_count") or 0)
+                            total_comments  += int((fb.get("comments")  or {}).get("summary", {}).get("total_count") or 0)
+                            total_shares    += int((fb.get("shares")    or {}).get("count") or 0)
+                            if analytics_source is None:
+                                analytics_source = "basic_video_fields_fallback"
+
                 except Exception as ve:
                     logger.warning(f"Facebook video insight error for {vid.get('id')} (skipping): {ve}")
                     continue
@@ -6851,14 +6917,14 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
                 logger.warning(f"Facebook followers fetch error (non-fatal): {fe}")
 
             return {
-                "status": "live",
+                "status":           "live",
                 "analytics_source": analytics_source,
-                "views":     total_views,
-                "reactions": total_reactions,
-                "comments":  total_comments,
-                "shares":    total_shares,
-                "followers": followers,
-                "video_count": len(videos),
+                "views":            total_views,
+                "reactions":        total_reactions,
+                "comments":         total_comments,
+                "shares":           total_shares,
+                "followers":        followers,
+                "video_count":      len(videos),
             }
     except Exception as e:
         logger.error(f"Facebook metrics error: {e}")

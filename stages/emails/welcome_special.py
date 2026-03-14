@@ -1,12 +1,15 @@
 """
-UploadM8 — Phase 5a: Special / Heartfelt Welcome Emails
-=========================================================
+UploadM8 — Phase 5a: Special / Heartfelt Welcome Emails  (v2 — Enhanced Design)
+=================================================================================
   send_friends_family_welcome_email  → friends_family tier granted
   send_agency_welcome_email          → agency tier starts (Stripe or admin grant)
-  send_master_admin_welcome_email    → master_admin tier granted by bootstrap or admin
+  send_master_admin_welcome_email    → master_admin tier granted
 
-These are NOT transaction receipts. They are warm, personal, human emails
-that reflect the relationship behind each of these special tiers.
+v2 upgrades:
+  - All emails have preheader_text
+  - Friends & Family: metric_hero for "unlimited access" feel, warm section_tag
+  - Agency: section_tag "Agency Plan Active", stat_grid for key details
+  - Master Admin: section_tag "Full Access Granted", enhanced responsibility section
 """
 
 import logging
@@ -14,6 +17,7 @@ from .base import (
     send_email, mailgun_ready,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, platform_logos_row, secondary_links, spacer,
+    section_tag, metric_hero, divider_accent, stat_grid,
     GRAD_ORANGE, GRAD_GOLD, GRAD_DARK, GRAD_PURPLE,
     URL_DASHBOARD, URL_SETTINGS, URL_BILLING, SUPPORT_EMAIL, FRONTEND_URL,
 )
@@ -37,18 +41,27 @@ async def send_friends_family_welcome_email(email: str, name: str) -> None:
     html = email_shell(
         gradient=GRAD_ORANGE,
         tagline="Upload once. Publish everywhere.",
+        preheader_text=f"You're one of us, {name}. Full access to UploadM8 — compliments of the team.",
         body_rows=(
-            intro_row(
+            section_tag("Friends &amp; Family Access", "#f97316")
+            + intro_row(
                 f"Welcome to UploadM8, {name}. &#128149;",
                 "You've been given access to UploadM8 as one of our Friends &amp; Family members — "
                 "and that means more to us than any subscription ever could. "
                 "This is the same platform we work on every single day, shared with you "
                 "because we believe in what you're creating.",
             )
+            + metric_hero(
+                "&#128149;",
+                "Friends &amp; Family Access",
+                "full platform — no subscriptions, no credit card, just UploadM8",
+                "#f97316",
+            )
+            + divider_accent()
             + tinted_box(
-                '<p style="margin:0 0 10px;color:#f97316;font-size:14px;font-weight:700;'
+                '<p style="margin:0 0 10px;color:#f97316;font-size:13px;font-weight:700;'
                 'text-transform:uppercase;letter-spacing:1px;">What you have access to</p>'
-                '<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
+                '<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.75;">'
                 'Your account has been set up with our Friends &amp; Family plan — full platform '
                 'access, complimentary upload tokens, and everything you need to get your content '
                 'out to the world. No subscriptions. No credit card. Just UploadM8, '
@@ -58,7 +71,7 @@ async def send_friends_family_welcome_email(email: str, name: str) -> None:
             + platform_logos_row()
             + cta_button("Let's Get Started", URL_DASHBOARD, pt="24px", pb="20px")
             + tinted_box(
-                '<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.7;">'
+                '<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.75;">'
                 'You have a direct line to us — always. If something doesn\'t work, '
                 'if you have an idea, or if you just want to talk about the product, '
                 f'reply to this email or reach out at '
@@ -71,7 +84,7 @@ async def send_friends_family_welcome_email(email: str, name: str) -> None:
         footer_note="You received this because you were granted Friends & Family access to UploadM8.",
     )
 
-    await send_email(email, f"Welcome to UploadM8, {name} — you're one of us &#128149;", html)
+    await send_email(email, f"Welcome to UploadM8, {name} — you're one of us ❤️", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,32 +98,38 @@ async def send_agency_welcome_email(
 ) -> None:
     """
     Fires when a user activates (or is granted) the agency tier.
-    Could be from Stripe checkout or from an admin grant.
-
-    Tone: professional respect — they're running a real operation
-    and trusting us to be part of their stack.
+    Tone: professional respect — they're running a real operation.
     """
     if not mailgun_ready():
         return
 
-    billing_line = (
+    billing_note = (
         f'<p style="margin:12px 0 0;color:#9ca3af;font-size:13px;">'
         f'Your plan renews on <strong style="color:#ffffff;">{next_billing_date}</strong> '
         f'at <strong style="color:#ffffff;">${amount:.2f}/mo</strong>.</p>'
         if amount and next_billing_date else ""
     )
 
+    stats = [("Plan", "Agency")]
+    if amount:
+        stats.append(("Monthly Rate", f"${amount:.2f}"))
+    if next_billing_date:
+        stats.append(("Next Billing", next_billing_date))
+
     html = email_shell(
         gradient=GRAD_GOLD,
         tagline="Built for teams that create at scale",
+        preheader_text=f"Your UploadM8 Agency account is live, {name}. Priority processing, max quotas, direct support.",
         body_rows=(
-            intro_row(
+            section_tag("Agency Plan Active", "#d97706")
+            + intro_row(
                 f"Welcome to Agency, {name}. &#127775;",
                 "We don't take lightly the trust it takes to run a creative agency and choose a "
                 "new platform to be part of your workflow. Thank you — genuinely — for giving us "
                 "that chance. We built the Agency tier for exactly what you do: "
                 "high-volume publishing, multiple creators, and results that matter to clients.",
             )
+            + stat_grid(*stats, pb="28px")
             + check_list(
                 "Maximum upload quota across all four platforms",
                 "Priority processing — your jobs move to the front of the queue",
@@ -121,12 +140,12 @@ async def send_agency_welcome_email(
             )
             + platform_logos_row()
             + tinted_box(
-                '<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
+                '<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.75;">'
                 'We\'re actively building features that agency workflows demand — '
                 'team management, client reporting, and bulk scheduling are on the roadmap. '
                 'As an Agency member, your feedback directly shapes what we build next. '
                 'Please don\'t hesitate to tell us what would make your operation run better.'
-                + billing_line
+                + billing_note
                 + '</p>',
                 hex_color="#d97706",
             )
@@ -136,7 +155,7 @@ async def send_agency_welcome_email(
                 ("Account Settings",       URL_SETTINGS),
             )
             + tinted_box(
-                f'<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.7;">'
+                f'<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.75;">'
                 f'Your direct line: '
                 f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
                 f'{SUPPORT_EMAIL}</a>. '
@@ -149,7 +168,7 @@ async def send_agency_welcome_email(
         footer_note="You received this because you activated an UploadM8 Agency plan.",
     )
 
-    await send_email(email, f"Welcome to UploadM8 Agency — let's build something great, {name} &#127775;", html)
+    await send_email(email, f"Welcome to UploadM8 Agency — let's build something great, {name} 🌟", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -161,7 +180,6 @@ async def send_master_admin_welcome_email(email: str, name: str) -> None:
     BOOTSTRAP_ADMIN_EMAIL mechanism on startup, or via an admin panel grant.
 
     Tone: weight of responsibility. This is not a marketing email.
-    It's a moment-of-trust acknowledgment.
     """
     if not mailgun_ready():
         return
@@ -169,13 +187,24 @@ async def send_master_admin_welcome_email(email: str, name: str) -> None:
     html = email_shell(
         gradient=GRAD_DARK,
         tagline="UploadM8 Platform Administration",
+        preheader_text=f"Master admin access has been granted to your account, {name}. Full platform controls are now active.",
         body_rows=(
-            intro_row(
+            section_tag("Full Access Granted", "#6b7280")
+            + intro_row(
                 f"Full admin access granted, {name}.",
                 "You now have master administrator access to UploadM8. "
                 "This comes with the highest level of trust we extend — "
                 "full visibility into the platform, user management, billing controls, "
                 "and the ability to shape how the system operates for everyone on it.",
+            )
+            + metric_hero(
+                "&#128737;&#65039;",
+                "Master Admin",
+                "full platform visibility and control — every action is logged",
+                "#6b7280",
+            )
+            + divider_accent(
+                "linear-gradient(90deg,rgba(107,114,128,0) 0%,#6b7280 50%,rgba(107,114,128,0) 100%)"
             )
             + check_list(
                 "Full user management — view, edit, ban, restore",
@@ -188,9 +217,9 @@ async def send_master_admin_welcome_email(email: str, name: str) -> None:
                 hex_color="#6b7280",
             )
             + tinted_box(
-                '<p style="margin:0 0 10px;color:#ffffff;font-size:15px;font-weight:600;">'
+                '<p style="margin:0 0 10px;color:#ffffff;font-size:15px;font-weight:700;">'
                 'A note on responsibility</p>'
-                '<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.7;">'
+                '<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.75;">'
                 'With admin access comes responsibility for the people using this platform. '
                 'Every action you take as an admin is logged and timestamped. '
                 'User data, payment information, and personal details must be handled '
@@ -200,7 +229,7 @@ async def send_master_admin_welcome_email(email: str, name: str) -> None:
             )
             + cta_button("Open Admin Dashboard", f"{FRONTEND_URL}/admin.html", pt="20px", pb="20px")
             + tinted_box(
-                f'<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.7;">'
+                f'<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.75;">'
                 f'If you believe you received this in error, or if you have questions about '
                 f'your access level, contact the platform owner immediately at '
                 f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
@@ -212,4 +241,4 @@ async def send_master_admin_welcome_email(email: str, name: str) -> None:
         footer_note="You received this because master admin privileges were granted to this account.",
     )
 
-    await send_email(email, f"Master Admin access granted — UploadM8 Platform", html)
+    await send_email(email, "Master Admin access granted — UploadM8 Platform", html)

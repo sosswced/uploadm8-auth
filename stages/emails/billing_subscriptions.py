@@ -1,6 +1,6 @@
 """
-UploadM8 — Phase 2: Billing Subscription Emails
-================================================
+UploadM8 — Phase 2: Billing Subscription Emails  (v2 — Enhanced Design)
+=========================================================================
   send_subscription_started_email  → checkout.session.completed (subscription, non-trial)
   send_trial_started_email         → checkout.session.completed (trial)
   send_trial_cancelled_email       → customer.subscription.deleted where cancel_at_period_end
@@ -8,7 +8,13 @@ UploadM8 — Phase 2: Billing Subscription Emails
   send_subscription_cancelled_email→ customer.subscription.deleted (paid, post-trial)
   send_renewal_receipt_email       → invoice.paid (recurring)
 
-All five are currently silent in app.py — these fill every gap.
+v2 upgrades:
+  - All emails have preheader_text
+  - Subscription started: section_tag "Subscription Active", metric_hero
+  - Trial started: section_tag "Trial Active", metric_hero for trial days
+  - Trial cancelled: section_tag "Trial Cancelled", cleaner layout
+  - Subscription cancelled: section_tag "Subscription Cancelled", churn-prevention focus
+  - Renewal receipt: section_tag "Payment Confirmed", improved receipt table
 """
 
 import logging
@@ -18,6 +24,7 @@ from .base import (
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, stat_grid, secondary_links, alert_banner,
     receipt_row, platform_logos_row, spacer,
+    section_tag, metric_hero, divider_accent,
     GRAD_ORANGE, GRAD_GREEN, GRAD_RED, GRAD_BLUE,
     URL_DASHBOARD, URL_BILLING, URL_SETTINGS, URL_PRICING,
     SUPPORT_EMAIL,
@@ -49,8 +56,10 @@ async def send_subscription_started_email(
     html = email_shell(
         gradient=GRAD_GREEN,
         tagline="You're officially live on UploadM8",
+        preheader_text=f"Your {plan} subscription is active, {name}. Full access unlocked — let's get publishing.",
         body_rows=(
-            intro_row(
+            section_tag("Subscription Active", "#16a34a")
+            + intro_row(
                 f"Welcome to {plan}, {name}! &#127881;",
                 f"Your <strong style='color:#22c55e;'>{plan}</strong> subscription is active. "
                 "You now have full access to your plan's upload quota, AI captions, and "
@@ -72,7 +81,7 @@ async def send_subscription_started_email(
         footer_note="You received this because you started an UploadM8 subscription.",
     )
 
-    await send_email(email, f"Welcome to UploadM8 {plan}! Your subscription is active &#127881;", html)
+    await send_email(email, f"Welcome to UploadM8 {plan}! Your subscription is active 🎉", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,13 +105,21 @@ async def send_trial_started_email(
     html = email_shell(
         gradient=GRAD_BLUE,
         tagline="Your free trial starts now",
+        preheader_text=f"Your {plan} free trial is live! {trial_days} days of full access — no charge until {trial_end_date}.",
         body_rows=(
-            intro_row(
-                f"Your {plan} trial is live, {name}! &#127381;",
+            section_tag("Trial Active", "#2563eb")
+            + intro_row(
+                f"Your {plan} trial is live, {name}! &#127385;",
                 f"You have <strong style='color:#60a5fa;'>{trial_days} days</strong> of full "
                 f"<strong style='color:#60a5fa;'>{plan}</strong> access — no charge until "
                 f"<strong style='color:#ffffff;'>{trial_end_date}</strong>. "
                 "Cancel any time before then and you'll never be billed.",
+            )
+            + metric_hero(
+                str(trial_days),
+                "Free Trial Days",
+                f"full {plan} access — cancel any time",
+                "#2563eb",
             )
             + stat_grid(
                 ("Trial Length", f"{trial_days} days"),
@@ -125,7 +142,7 @@ async def send_trial_started_email(
         footer_note=f"Your trial ends on {trial_end_date}. We'll email you a reminder before any charge.",
     )
 
-    await send_email(email, f"Your UploadM8 {plan} trial starts now &#127381;", html)
+    await send_email(email, f"Your UploadM8 {plan} trial starts now 🎉", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,8 +166,10 @@ async def send_trial_cancelled_email(
     html = email_shell(
         gradient=GRAD_RED,
         tagline="We're sorry to see you go",
+        preheader_text=f"Your {plan} trial has been cancelled. You won't be charged — access continues until {trial_end_date}.",
         body_rows=(
-            intro_row(
+            section_tag("Trial Cancelled", "#dc2626")
+            + intro_row(
                 f"Trial cancelled, {name}",
                 f"You've cancelled your <strong style='color:#f87171;'>{plan}</strong> trial. "
                 f"You'll keep full access until <strong style='color:#ffffff;'>{trial_end_date}</strong> — "
@@ -163,7 +182,7 @@ async def send_trial_cancelled_email(
                 ("Charge",   "$0.00"),
             )
             + tinted_box(
-                '<p style="margin:0 0 8px;color:#ffffff;font-size:15px;font-weight:600;">'
+                '<p style="margin:0 0 8px;color:#ffffff;font-size:15px;font-weight:700;">'
                 'Want to share what went wrong?</p>'
                 '<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.65;">'
                 'Even a single sentence helps us build a better product. Reply to this email or '
@@ -204,8 +223,10 @@ async def send_subscription_cancelled_email(
     html = email_shell(
         gradient=GRAD_RED,
         tagline="We're sorry to see you go",
+        preheader_text=f"Your {plan} subscription has been cancelled. Access continues until {access_until}.",
         body_rows=(
-            intro_row(
+            section_tag("Subscription Cancelled", "#dc2626")
+            + intro_row(
                 f"Subscription cancelled, {name}",
                 f"Your <strong style='color:#f87171;'>{plan}</strong> subscription has been cancelled. "
                 f"You'll keep all your {plan} features until "
@@ -218,7 +239,7 @@ async def send_subscription_cancelled_email(
                 ("Access Until", access_until),
             )
             + tinted_box(
-                '<p style="margin:0 0 8px;color:#ffffff;font-size:15px;font-weight:600;">'
+                '<p style="margin:0 0 8px;color:#ffffff;font-size:15px;font-weight:700;">'
                 'What happened?</p>'
                 '<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.65;">'
                 'Your feedback matters to us — a lot. If something didn\'t work the way you '
@@ -272,15 +293,17 @@ async def send_renewal_receipt_email(
         + receipt_row("Billing Period", period)
         + receipt_row("Payment Method", pm_label)
         + receipt_row("Invoice #", inv_label)
-        + receipt_row(f"Amount Charged", f"${amount:.2f}", is_total=True)
+        + receipt_row("Amount Charged", f"${amount:.2f}", is_total=True)
         + "</table>"
     )
 
     html = email_shell(
         gradient=GRAD_GREEN,
         tagline="Thanks for sticking with us",
+        preheader_text=f"Payment of ${amount:.2f} received for {plan}. Your next billing date is {next_date}.",
         body_rows=(
-            intro_row(
+            section_tag("Payment Confirmed", "#16a34a")
+            + intro_row(
                 f"Payment received — thank you, {name}! &#128176;",
                 f"Your <strong style='color:#22c55e;'>{plan}</strong> subscription has been renewed. "
                 f"Your next billing date is <strong style='color:#ffffff;'>{next_date}</strong>.",
@@ -295,4 +318,4 @@ async def send_renewal_receipt_email(
         footer_note="You received this because a payment was processed for your UploadM8 subscription.",
     )
 
-    await send_email(email, f"UploadM8 payment received — ${amount:.2f} &#128176;", html)
+    await send_email(email, f"UploadM8 payment received — ${amount:.2f} 💰", html)

@@ -1,12 +1,26 @@
 """
-UploadM8 Email Base
-===================
+UploadM8 Email Base  —  v2 (Enhanced Design)
+=============================================
 Single source of truth for:
   - Mailgun config + low-level sender (send_email)
-  - Branded HTML shell   (email_shell)
-  - All reusable row components
+  - Branded HTML shell (email_shell) with preheader support
+  - All reusable row components (enhanced + new)
 
 Every email module imports from here. Never call Mailgun directly elsewhere.
+
+DESIGN v2 UPGRADES:
+  - preheader_text parameter on email_shell (inbox preview text — huge for open rates)
+  - Gradient orange accent stripe below every header
+  - Enhanced CTA button with glow box-shadow and deeper gradient
+  - Left-border accent on all tinted_box components
+  - Bordered, padded stat pill grid
+  - Larger gradient check-circles in check_list
+  - Improved receipt_row with separated total row
+  - Improved footer with subtle border-top separator
+  - NEW: divider_accent()  — gradient section separator
+  - NEW: section_tag()     — small pill badge label (e.g. "Action Required")
+  - NEW: metric_hero()     — large centered number for key stats
+  - NEW: progress_bar()    — visual % bar for tokens / days remaining
 """
 
 import os
@@ -81,8 +95,29 @@ async def send_email(to: str, subject: str, html: str) -> None:
         logger.warning(f"Mailgun error: {e}")
 
 
+# ── Internal helpers ──────────────────────────────────────────────────────────
+def _hex_rgb(h: str) -> str:
+    h = h.lstrip("#")
+    return f"{int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)}"
+
+
+def _preheader_block(text: str) -> str:
+    """
+    Invisible preview text shown in inbox list before the email is opened.
+    Padded with zero-width non-joiner characters so no body text leaks into preview.
+    This single addition materially improves open rates.
+    """
+    filler = "&zwnj;&nbsp;" * 80
+    return (
+        f'<div style="display:none;font-size:1px;color:#0f0f0f;'
+        f'line-height:1px;max-height:0px;max-width:0px;opacity:0;overflow:hidden;">'
+        f'{text} {filler}'
+        f'</div>'
+    )
+
+
 # ═════════════════════════════════════════════════════════════════════════════
-# HTML shell
+# HTML shell  —  v2
 # ═════════════════════════════════════════════════════════════════════════════
 
 def email_shell(
@@ -90,45 +125,56 @@ def email_shell(
     gradient: str = GRAD_ORANGE,
     tagline: str = "Upload once. Publish everywhere.",
     footer_note: str = "",
+    preheader_text: str = "",
 ) -> str:
     """
     Wraps body_rows (concatenated <tr> strings) in the full branded card.
-    Logo is a clickable hyperlink to the app.
+
+    v2 changes:
+      - preheader_text: visible in inbox preview pane before opening
+      - Gradient orange accent stripe immediately below the header image
+      - Improved footer with border-top separator
+      - Logo is a clickable hyperlink to the app
 
     Usage:
         html = email_shell(
             body_rows=intro_row(...) + cta_button(...),
             gradient=GRAD_GREEN,
+            preheader_text="Your upload just went live on 4 platforms!",
         )
     """
+    preheader_div = _preheader_block(preheader_text) if preheader_text else ""
+
     extra_footer = (
-        f'<p style="margin:6px 0 0;color:#4b5563;font-size:12px;">{footer_note}</p>'
+        f'<p style="margin:8px 0 0;color:#4b5563;font-size:12px;">{footer_note}</p>'
         if footer_note else ""
     )
 
-    # Logo is wrapped in an <a> tag so it hyperlinks back to the app
     header = (
-        f'<tr><td style="background:{gradient};padding:30px 40px 26px;text-align:center;">'
+        f'<tr><td style="background:{gradient};padding:34px 40px 30px;text-align:center;">'
         f'<a href="{FRONTEND_URL}" style="display:inline-block;text-decoration:none;">'
         f'<img src="{LOGO_URL}" alt="UploadM8" height="46" '
-        f'style="display:block;margin:0 auto 10px;max-width:200px;border:0;">'
+        f'style="display:block;margin:0 auto 12px;max-width:200px;border:0;">'
         f'</a>'
-        f'<p style="margin:0;color:rgba(255,255,255,0.82);font-size:13px;'
-        f'letter-spacing:0.4px;">{tagline}</p>'
+        f'<p style="margin:0;color:rgba(255,255,255,0.85);font-size:13px;'
+        f'letter-spacing:0.5px;font-weight:500;">{tagline}</p>'
         f'</td></tr>'
     )
 
-    hr_row = (
-        '<tr><td style="padding:0 40px;">'
-        '<hr style="border:none;border-top:1px solid rgba(255,255,255,0.07);margin:0;">'
-        '</td></tr>'
+    # Orange-to-transparent glow stripe — brand signature below every header
+    accent_stripe = (
+        '<tr><td style="padding:0;line-height:0;font-size:0;">'
+        '<div style="height:3px;'
+        'background:linear-gradient(90deg,#f97316 0%,#fb923c 35%,#fdba74 65%,rgba(249,115,22,0) 100%);">'
+        '</div></td></tr>'
     )
 
     footer = (
-        '<tr><td style="padding:22px 40px;text-align:center;">'
-        '<p style="margin:0 0 5px;color:#4b5563;font-size:13px;">'
+        '<tr><td style="padding:26px 40px 24px;text-align:center;'
+        'border-top:1px solid rgba(255,255,255,0.06);">'
+        '<p style="margin:0 0 6px;color:#4b5563;font-size:13px;">'
         '&#169; 2025 UploadM8 &middot; All rights reserved</p>'
-        f'<p style="margin:0 0 6px;color:#4b5563;font-size:12px;">Need help? '
+        f'<p style="margin:0 0 8px;color:#4b5563;font-size:12px;">Need help? '
         f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
         f'{SUPPORT_EMAIL}</a></p>'
         f'<p style="margin:0;color:#374151;font-size:11px;">'
@@ -144,34 +190,36 @@ def email_shell(
         '<!DOCTYPE html><html lang="en"><head>'
         '<meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+        '<title>UploadM8</title>'
         '</head>'
         '<body style="margin:0;padding:0;background-color:#0f0f0f;'
         "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\">"
-        '<table width="100%" cellpadding="0" cellspacing="0" '
+        + preheader_div
+        + '<table width="100%" cellpadding="0" cellspacing="0" '
         'style="background-color:#0f0f0f;padding:40px 20px;">'
         '<tr><td align="center">'
         '<table width="600" cellpadding="0" cellspacing="0" '
         'style="max-width:600px;width:100%;background-color:#1a1a1a;'
-        'border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,0.08);">'
+        'border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,0.09);">'
         + header
+        + accent_stripe
         + body_rows
-        + hr_row
         + footer
         + '</table></td></tr></table></body></html>'
     )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Reusable row components  (each returns one or more <tr>…</tr> strings)
+# Core row components
 # ═════════════════════════════════════════════════════════════════════════════
 
 def intro_row(headline: str, body: str, pb: str = "4px") -> str:
-    """Large heading + grey paragraph body copy."""
+    """Large heading + grey paragraph body copy. v2: 26px headline, 800 weight."""
     return (
-        f'<tr><td style="padding:36px 40px {pb};">'
-        f'<h2 style="margin:0 0 12px;color:#ffffff;font-size:23px;'
-        f'font-weight:700;line-height:1.35;">{headline}</h2>'
-        f'<p style="margin:0;color:#9ca3af;font-size:15px;line-height:1.7;">{body}</p>'
+        f'<tr><td style="padding:40px 40px {pb};">'
+        f'<h2 style="margin:0 0 14px;color:#ffffff;font-size:26px;'
+        f'font-weight:800;line-height:1.3;letter-spacing:-0.3px;">{headline}</h2>'
+        f'<p style="margin:0;color:#9ca3af;font-size:15px;line-height:1.75;">{body}</p>'
         f'</td></tr>'
     )
 
@@ -182,13 +230,18 @@ def body_row(content: str, padding: str = "0 40px 28px") -> str:
 
 
 def cta_button(label: str, url: str, pt: str = "8px", pb: str = "40px") -> str:
-    """Primary orange CTA button row."""
+    """
+    Primary orange CTA button row.
+    v2: deeper gradient, 800 weight, subtle border + orange glow box-shadow.
+    """
     return (
         f'<tr><td style="padding:{pt} 40px {pb};text-align:center;">'
         f'<a href="{url}" style="display:inline-block;'
-        'background:linear-gradient(135deg,#f97316,#ea580c);'
-        'color:#ffffff;text-decoration:none;padding:15px 44px;'
-        'border-radius:10px;font-size:16px;font-weight:700;letter-spacing:0.3px;">'
+        'background:linear-gradient(135deg,#f97316 0%,#ea580c 55%,#c2410c 100%);'
+        'color:#ffffff;text-decoration:none;padding:16px 50px;'
+        'border-radius:10px;font-size:16px;font-weight:800;letter-spacing:0.4px;'
+        'border:1px solid rgba(255,255,255,0.18);'
+        "box-shadow:0 4px 20px rgba(249,115,22,0.4),0 2px 6px rgba(0,0,0,0.5);\">"
         f'{label} &#8594;</a>'
         '</td></tr>'
     )
@@ -207,45 +260,61 @@ def secondary_links(*links) -> str:
 
 
 def tinted_box(inner_html: str, hex_color: str = "#f97316", pb: str = "28px") -> str:
-    """Tinted rounded box with border."""
+    """
+    Tinted rounded box with border.
+    v2: left accent bar (3px solid colored border-left) for visual depth.
+    """
     rgb = _hex_rgb(hex_color)
     return (
         f'<tr><td style="padding:0 40px {pb};">'
         f'<table width="100%" cellpadding="0" cellspacing="0" '
-        f'style="background:rgba({rgb},0.09);border:1px solid rgba({rgb},0.28);'
-        f'border-radius:12px;">'
-        f'<tr><td style="padding:20px 24px;">{inner_html}</td></tr>'
+        f'style="background:rgba({rgb},0.08);border:1px solid rgba({rgb},0.25);'
+        f'border-left:3px solid {hex_color};border-radius:10px;">'
+        f'<tr><td style="padding:20px 22px;">{inner_html}</td></tr>'
         f'</table></td></tr>'
     )
 
 
 def stat_grid(*stats, pb: str = "28px") -> str:
     """
-    Horizontal stat pills.  stats = [("Label", "Value"), ...]
-    Rendered inside a tinted orange box.
+    Horizontal stat pills. v2: each stat is a bordered pill with padding.
+    stats = [("Label", "Value"), ...]
     """
     cells = "".join(
-        f'<td style="text-align:center;padding:0 16px;">'
-        f'<p style="margin:0;color:#6b7280;font-size:11px;text-transform:uppercase;'
-        f'letter-spacing:1px;">{lbl}</p>'
-        f'<p style="margin:5px 0 0;color:#f97316;font-size:20px;font-weight:700;">{val}</p>'
+        f'<td style="text-align:center;padding:0 6px;">'
+        f'<div style="background:rgba(249,115,22,0.08);'
+        f'border:1px solid rgba(249,115,22,0.22);border-radius:10px;padding:14px 18px;">'
+        f'<p style="margin:0;color:#6b7280;font-size:10px;text-transform:uppercase;'
+        f'letter-spacing:1.2px;font-weight:600;">{lbl}</p>'
+        f'<p style="margin:6px 0 0;color:#f97316;font-size:21px;font-weight:800;'
+        f'letter-spacing:-0.5px;">{val}</p>'
+        f'</div>'
         f'</td>'
         for lbl, val in stats
     )
-    inner = f'<table cellpadding="0" cellspacing="0" align="center"><tr>{cells}</tr></table>'
-    return tinted_box(inner, pb=pb)
+    return (
+        f'<tr><td style="padding:0 40px {pb};">'
+        f'<table cellpadding="0" cellspacing="0" align="center" width="100%">'
+        f'<tr>{cells}</tr></table>'
+        f'</td></tr>'
+    )
 
 
 def check_list(*items, hex_color: str = "#f97316", pb: str = "28px") -> str:
-    """Checked feature list in a tinted box."""
+    """
+    Checked feature list in a tinted box.
+    v2: 22px gradient circles, 800-weight checkmark.
+    """
     rows = "".join(
         f'<tr>'
-        f'<td width="26" valign="top" style="padding-bottom:10px;">'
-        f'<div style="width:19px;height:19px;background:{hex_color};border-radius:50%;'
-        f'text-align:center;line-height:19px;color:#fff;font-size:11px;font-weight:700;">'
+        f'<td width="34" valign="top" style="padding-bottom:12px;">'
+        f'<div style="width:22px;height:22px;'
+        f'background:linear-gradient(135deg,{hex_color},{hex_color}bb);'
+        f'border-radius:50%;text-align:center;line-height:22px;'
+        f'color:#fff;font-size:12px;font-weight:800;">'
         f'&#10003;</div></td>'
-        f'<td style="padding-left:10px;padding-bottom:10px;vertical-align:top;">'
-        f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.55;">{item}</p>'
+        f'<td style="padding-left:10px;padding-bottom:12px;vertical-align:top;">'
+        f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.6;">{item}</p>'
         f'</td></tr>'
         for item in items
     )
@@ -257,17 +326,18 @@ def check_list(*items, hex_color: str = "#f97316", pb: str = "28px") -> str:
 
 
 def numbered_steps(*steps, pb: str = "32px") -> str:
-    """Numbered step guide.  steps = [("Title", "Description"), ...]"""
+    """Numbered step guide. steps = [("Title", "Description"), ...]"""
     rows = "".join(
-        f'<table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:14px;">'
+        f'<table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;">'
         f'<tr>'
-        f'<td width="36" valign="top">'
-        f'<div style="width:30px;height:30px;background:#f97316;border-radius:50%;'
-        f'text-align:center;line-height:30px;color:#fff;font-weight:700;font-size:14px;">{idx}</div>'
+        f'<td width="42" valign="top">'
+        f'<div style="width:32px;height:32px;'
+        f'background:linear-gradient(135deg,#f97316,#ea580c);border-radius:50%;'
+        f'text-align:center;line-height:32px;color:#fff;font-weight:800;font-size:14px;">{idx}</div>'
         f'</td>'
         f'<td style="padding-left:12px;vertical-align:top;">'
-        f'<p style="margin:0;color:#ffffff;font-size:15px;font-weight:600;">{title}</p>'
-        f'<p style="margin:4px 0 0;color:#6b7280;font-size:14px;line-height:1.5;">{desc}</p>'
+        f'<p style="margin:0;color:#ffffff;font-size:15px;font-weight:700;">{title}</p>'
+        f'<p style="margin:5px 0 0;color:#6b7280;font-size:14px;line-height:1.55;">{desc}</p>'
         f'</td></tr></table>'
         for idx, (title, desc) in enumerate(steps, 1)
     )
@@ -275,66 +345,81 @@ def numbered_steps(*steps, pb: str = "32px") -> str:
 
 
 def plan_change_visual(old_tier: str, new_tier: str, hex_new: str = "#f97316") -> str:
-    """Old plan ➜ New plan visual inside a tinted box."""
+    """Old plan ➜ New plan visual inside a tinted box. v2: bolder type, strikethrough old plan."""
     inner = (
         f'<table cellpadding="0" cellspacing="0" align="center"><tr>'
-        f'<td style="text-align:center;padding:0 20px;">'
-        f'<p style="margin:0;color:#6b7280;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Previous Plan</p>'
-        f'<p style="margin:5px 0 0;color:#9ca3af;font-size:18px;font-weight:600;">{tier_label(old_tier)}</p>'
+        f'<td style="text-align:center;padding:0 22px;">'
+        f'<p style="margin:0;color:#6b7280;font-size:10px;text-transform:uppercase;'
+        f'letter-spacing:1.2px;font-weight:600;">Previous Plan</p>'
+        f'<p style="margin:8px 0 0;color:#6b7280;font-size:19px;font-weight:700;'
+        f'text-decoration:line-through;opacity:0.7;">{tier_label(old_tier)}</p>'
         f'</td>'
-        f'<td style="padding:0 16px;"><p style="margin:0;color:#f97316;font-size:26px;">&#8594;</p></td>'
-        f'<td style="text-align:center;padding:0 20px;">'
-        f'<p style="margin:0;color:{hex_new};font-size:11px;text-transform:uppercase;letter-spacing:1px;">New Plan</p>'
-        f'<p style="margin:5px 0 0;color:{hex_new};font-size:18px;font-weight:700;">{tier_label(new_tier)}</p>'
+        f'<td style="padding:0 18px;">'
+        f'<p style="margin:0;color:#f97316;font-size:30px;font-weight:900;line-height:1;">&#8594;</p>'
+        f'</td>'
+        f'<td style="text-align:center;padding:0 22px;">'
+        f'<p style="margin:0;color:{hex_new};font-size:10px;text-transform:uppercase;'
+        f'letter-spacing:1.2px;font-weight:600;">New Plan</p>'
+        f'<p style="margin:8px 0 0;color:{hex_new};font-size:21px;font-weight:800;">{tier_label(new_tier)}</p>'
         f'</td></tr></table>'
     )
     return tinted_box(inner, hex_color=hex_new)
 
 
 def platform_logos_row() -> str:
-    """TikTok / YouTube / Instagram / Facebook logo strip."""
+    """TikTok / YouTube / Instagram / Facebook logo strip. v2: bordered badge squares."""
     logos = [
-        ("#000000", "https://logo.clearbit.com/tiktok.com",    "TikTok"),
+        ("#1a1a1a", "https://logo.clearbit.com/tiktok.com",    "TikTok"),
         ("#ff0000", "https://logo.clearbit.com/youtube.com",   "YouTube"),
-        ("linear-gradient(45deg,#f09433,#e6683c,#dc2743,#cc2366,#bc1888)",
-                     "https://logo.clearbit.com/instagram.com", "Instagram"),
+        ("#c13584", "https://logo.clearbit.com/instagram.com", "Instagram"),
         ("#1877f2", "https://logo.clearbit.com/facebook.com",  "Facebook"),
     ]
     cells = "".join(
-        f'<td style="padding:0 10px;text-align:center;">'
-        f'<div style="width:50px;height:50px;background:{bg};border-radius:12px;'
-        f'display:inline-block;">'
+        f'<td style="padding:0 8px;text-align:center;">'
+        f'<div style="width:52px;height:52px;background:{bg};border-radius:14px;'
+        f'display:inline-block;border:1px solid rgba(255,255,255,0.14);">'
         f'<img src="{src}" alt="{name}" width="30" height="30" '
-        f'style="display:block;margin:10px auto;border-radius:4px;"></div>'
-        f'<p style="margin:6px 0 0;color:#9ca3af;font-size:11px;font-weight:500;">{name}</p>'
+        f'style="display:block;margin:11px auto;border-radius:4px;"></div>'
+        f'<p style="margin:7px 0 0;color:#9ca3af;font-size:11px;font-weight:600;">{name}</p>'
         f'</td>'
         for bg, src, name in logos
     )
     inner = (
-        '<p style="margin:0 0 14px;color:#f97316;font-size:11px;font-weight:700;'
-        'text-transform:uppercase;letter-spacing:1px;text-align:center;">Your Platforms</p>'
+        '<p style="margin:0 0 16px;color:#f97316;font-size:10px;font-weight:700;'
+        'text-transform:uppercase;letter-spacing:1.5px;text-align:center;">Your Platforms</p>'
         f'<table cellpadding="0" cellspacing="0" align="center"><tr>{cells}</tr></table>'
     )
     return tinted_box(inner)
 
 
 def receipt_row(label: str, value: str, is_total: bool = False) -> str:
-    """Single line of a receipt table."""
-    color   = "#ffffff" if is_total else "#9ca3af"
-    weight  = "700"     if is_total else "400"
-    border  = "border-top:1px solid rgba(255,255,255,0.07);padding-top:10px;margin-top:6px;" if is_total else ""
+    """
+    Single line of a receipt table.
+    v2: total row has a separator line above it and orange value color.
+    """
+    if is_total:
+        return (
+            f'<tr><td colspan="2" style="padding:8px 0 0;">'
+            f'<div style="height:1px;background:rgba(255,255,255,0.08);margin-bottom:8px;"></div>'
+            f'</td></tr>'
+            f'<tr>'
+            f'<td style="padding:4px 0 4px;color:#ffffff;font-size:15px;font-weight:800;">{label}</td>'
+            f'<td style="padding:4px 0 4px;color:#f97316;font-size:15px;font-weight:800;'
+            f'text-align:right;">{value}</td>'
+            f'</tr>'
+        )
     return (
         f'<tr>'
-        f'<td style="padding:5px 0;color:{color};font-size:14px;font-weight:{weight};{border}">{label}</td>'
-        f'<td style="padding:5px 0;color:{color};font-size:14px;font-weight:{weight};{border}'
-        f'text-align:right;">{value}</td>'
+        f'<td style="padding:6px 0;color:#9ca3af;font-size:14px;">{label}</td>'
+        f'<td style="padding:6px 0;color:#d1d5db;font-size:14px;text-align:right;">{value}</td>'
         f'</tr>'
     )
 
 
 def alert_banner(msg: str, hex_color: str = "#ef4444", pb: str = "28px") -> str:
+    """Alert / warning banner using tinted_box with left accent border."""
     return tinted_box(
-        f'<p style="margin:0;color:#ffffff;font-size:15px;font-weight:600;">{msg}</p>',
+        f'<p style="margin:0;color:#ffffff;font-size:15px;font-weight:600;line-height:1.55;">{msg}</p>',
         hex_color=hex_color,
         pb=pb,
     )
@@ -344,7 +429,99 @@ def spacer(h: str = "8px") -> str:
     return f'<tr><td style="height:{h};"></td></tr>'
 
 
-# ── Internal ──────────────────────────────────────────────────────────────────
-def _hex_rgb(h: str) -> str:
-    h = h.lstrip("#")
-    return f"{int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)}"
+# ═════════════════════════════════════════════════════════════════════════════
+# NEW v2 components
+# ═════════════════════════════════════════════════════════════════════════════
+
+def divider_accent(
+    gradient: str = "linear-gradient(90deg,rgba(249,115,22,0) 0%,#f97316 50%,rgba(249,115,22,0) 100%)"
+) -> str:
+    """
+    Centered gradient divider line — visual separator between email sections.
+    Default is a centered orange fade. Pass a custom gradient to match the email theme.
+    """
+    return (
+        '<tr><td style="padding:4px 40px 28px;">'
+        f'<div style="height:1px;background:{gradient};border-radius:999px;"></div>'
+        '</td></tr>'
+    )
+
+
+def section_tag(text: str, hex_color: str = "#f97316") -> str:
+    """
+    Small pill badge — used to label a section before the intro_row.
+    Great for 'ACTION REQUIRED', 'CONFIRMED', 'SECURITY ALERT', 'NEW FEATURE', etc.
+    """
+    rgb = _hex_rgb(hex_color)
+    return (
+        '<tr><td style="padding:28px 40px 0;text-align:center;">'
+        f'<span style="display:inline-block;background:rgba({rgb},0.12);'
+        f'border:1px solid rgba({rgb},0.35);color:{hex_color};'
+        f'font-size:10px;font-weight:800;text-transform:uppercase;'
+        f'letter-spacing:2px;padding:5px 18px;border-radius:99px;">'
+        f'{text}</span>'
+        '</td></tr>'
+    )
+
+
+def metric_hero(
+    value: str,
+    label: str,
+    sublabel: str = "",
+    hex_color: str = "#f97316",
+    pb: str = "28px",
+) -> str:
+    """
+    Large centered metric — the focal point for key numbers.
+    value    = big bold number or text  (e.g. "30", "+500 PUT", "4 Platforms")
+    label    = descriptor below value   (e.g. "Free Tokens Waiting", "Now Live")
+    sublabel = optional smaller note    (e.g. "ready to use right now")
+
+    Perfect for: token grants, platform counts, amounts, days remaining.
+    """
+    sublabel_html = (
+        f'<p style="margin:6px 0 0;color:#6b7280;font-size:13px;">{sublabel}</p>'
+        if sublabel else ""
+    )
+    inner = (
+        f'<div style="text-align:center;padding:10px 0 4px;">'
+        f'<p style="margin:0;color:{hex_color};font-size:54px;font-weight:900;'
+        f'letter-spacing:-2px;line-height:1;">{value}</p>'
+        f'<p style="margin:10px 0 0;color:#ffffff;font-size:13px;font-weight:700;'
+        f'text-transform:uppercase;letter-spacing:1.2px;">{label}</p>'
+        + sublabel_html
+        + '</div>'
+    )
+    return tinted_box(inner, hex_color=hex_color, pb=pb)
+
+
+def progress_bar(
+    pct: int,
+    label: str = "",
+    hex_color: str = "#f97316",
+    pb: str = "28px",
+) -> str:
+    """
+    Visual progress / usage bar.
+    pct   = 0–100 integer representing remaining percentage
+    label = optional text above the bar
+
+    Use for: token balance remaining, trial days left, quota used.
+    """
+    rgb = _hex_rgb(hex_color)
+    pct_safe = max(0, min(100, pct))
+    label_html = (
+        f'<p style="margin:0 0 10px;color:#9ca3af;font-size:13px;font-weight:500;">{label}</p>'
+        if label else ""
+    )
+    inner = (
+        label_html
+        + f'<div style="background:rgba({rgb},0.15);border-radius:999px;height:10px;overflow:hidden;">'
+        + f'<div style="width:{pct_safe}%;height:10px;'
+        + f'background:linear-gradient(90deg,{hex_color},{hex_color}99);'
+        + f'border-radius:999px;"></div>'
+        + f'</div>'
+        + f'<p style="margin:8px 0 0;color:{hex_color};font-size:12px;font-weight:700;'
+        + f'text-align:right;">{pct_safe}% remaining</p>'
+    )
+    return tinted_box(inner, hex_color=hex_color, pb=pb)

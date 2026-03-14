@@ -3505,6 +3505,10 @@ async def get_uploads(
             # Schedule fields — lets frontend distinguish smart vs manual scheduled
             "schedule_mode":     d.get("schedule_mode") or "immediate",
             "schedule_metadata": _safe_json(d.get("schedule_metadata"), None),
+            "smart_schedule":    _safe_json(d.get("schedule_metadata"), None),  # alias for queue.html
+
+            # Editable: pending, staged, queued, scheduled, ready_to_publish (queue.html edit button)
+            "is_editable": d.get("status") in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
 
             # Direct video URL if stored by worker
             "video_url": d.get("video_url"),
@@ -4083,6 +4087,7 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
             "status": upload["status"],
             "schedule_mode": upload["schedule_mode"] or "scheduled",
             "smart_schedule": smart_schedule,
+            "is_editable": upload["status"] in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
             "created_at": upload["created_at"].isoformat() if upload["created_at"] else None
         })
     
@@ -4138,6 +4143,8 @@ async def get_scheduled_upload(upload_id: str, user: dict = Depends(get_current_
         "status": upload["status"],
         "schedule_mode": upload.get("schedule_mode") or "scheduled",
         "schedule_metadata": sm,
+        "smart_schedule": sm,  # alias for scheduled.html saveScheduledUpload()
+        "is_editable": upload.get("status") in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
         "created_at": upload["created_at"].isoformat() if upload["created_at"] else None
     }
 
@@ -4149,6 +4156,8 @@ def _parse_smart_schedule(sm: dict, upload_platforms: list) -> tuple:
     """
     if not isinstance(sm, dict):
         raise HTTPException(400, "smart_schedule must be a dict of platform -> ISO datetime string")
+    if not sm:
+        raise HTTPException(400, "smart_schedule requires per-platform times (non-empty object)")
     platforms = list(upload_platforms or [])
     for k in sm:
         if k not in platforms:
@@ -9335,7 +9344,9 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
         "schedule_mode": d.get("schedule_mode") or "immediate",
         "schedule_metadata": _safe_json(d.get("schedule_metadata"), None),
+        "smart_schedule": _safe_json(d.get("schedule_metadata"), None),  # alias for queue.html edit modal
         "timezone": d.get("timezone") or "UTC",
+        "is_editable": d.get("status") in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
         "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
         "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
 

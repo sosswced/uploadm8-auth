@@ -74,7 +74,7 @@ There is already UI for this. Platform hashtags now use the **same pipeline** as
 1. **Get upload details (for edit form):**
    - `GET /api/uploads/{upload_id}` — full upload (queue page)
    - `GET /api/scheduled/{upload_id}` — full upload (scheduled page)
-   - Both return: `title`, `caption`, `hashtags`, `scheduled_time`, `schedule_mode`, `schedule_metadata`, `timezone`, `thumbnail` (presigned URL), `platforms`
+   - Both return: `title`, `caption`, `hashtags`, `scheduled_time`, `schedule_mode`, `schedule_metadata`, `smart_schedule` (alias), `timezone`, `thumbnail`/`thumbnail_url`, `platforms`, `is_editable`
 
 2. **Update upload (queue page):**
    - `PATCH /api/uploads/{upload_id}`

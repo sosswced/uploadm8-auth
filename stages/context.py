@@ -263,16 +263,16 @@ class JobContext:
     def get_effective_caption(self) -> str:
         return self.ai_caption or self.caption or ""
 
-    def get_effective_hashtags(self) -> List[str]:
+    def get_effective_hashtags(self, platform: str = "") -> List[str]:
         """
         Build the final hashtag list for publishing.
 
-        Merge order: always_hashtags (FIRST) → base upload hashtags → AI additions.
+        Merge order: always_hashtags (FIRST) → platform_hashtags for this platform →
+        base upload hashtags → AI additions.
         blocked_hashtags are filtered out at every level.
 
-        always_hashtags and blocked_hashtags are read directly from
-        self.user_settings, which is now populated from users.preferences JSONB
-        by db.load_user_settings() — so frontend settings page values always apply.
+        Uses the same pipeline for always_hashtags and platform_hashtags so both
+        are applied consistently. platform_hashtags keys: tiktok, youtube, instagram, facebook.
         """
         us = self.user_settings or {}
 
@@ -283,6 +283,22 @@ class JobContext:
                 t.strip() for t in raw_always.replace(",", " ").split() if t.strip()
             ]
         always_tags: List[str] = list(raw_always) if isinstance(raw_always, list) else []
+
+        # ── Platform-specific hashtags (same logic as always_hashtags) ────
+        platform_tags: List[str] = []
+        if platform:
+            ph = us.get("platformHashtags") or us.get("platform_hashtags") or {}
+            if isinstance(ph, str):
+                try:
+                    import json as _j
+                    ph = _j.loads(ph)
+                except Exception:
+                    ph = {}
+            if isinstance(ph, dict):
+                raw = ph.get(platform) or ph.get(platform.lower()) or []
+                if isinstance(raw, str):
+                    raw = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
+                platform_tags = list(raw) if isinstance(raw, list) else []
 
         # ── Blocked hashtags from settings page ──────────────────────────
         raw_blocked = us.get("blockedHashtags") or us.get("blocked_hashtags") or []
@@ -295,14 +311,14 @@ class JobContext:
             for t in (raw_blocked if isinstance(raw_blocked, list) else [])
         }
 
-        # ── Merge: always → base → AI (additive, deduplicated, filtered) ─
+        # ── Merge: always → platform → base → AI (same pipeline for all) ─
         base = list(self.hashtags or [])
         ai   = list(self.ai_hashtags or [])
 
         seen: set = set()
         merged: List[str] = []
 
-        for tag in always_tags + base + ai:
+        for tag in always_tags + platform_tags + base + ai:
             t = str(tag).strip().lstrip("#").lower()
             if not t or t in seen or t in blocked_set:
                 continue

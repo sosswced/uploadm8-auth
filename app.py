@@ -2981,6 +2981,8 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         use_hud = bool(user_prefs.get("hud_enabled", False)) and ent_cost.can_burn_hud
 
         # Each target account counts as a separate publish (costs +2 PUT per extra beyond 1)
+        # When target_accounts provided: user selected specific accounts.
+        # When empty: legacy one-per-platform.
         num_publish_targets = len(data.target_accounts) if data.target_accounts else len(data.platforms)
         put_cost, aic_cost = compute_upload_cost(
             entitlements=ent_cost,

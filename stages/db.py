@@ -546,6 +546,27 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
         return None
 
 
+async def load_all_platform_token_ids(pool: asyncpg.Pool, user_id: str, platform: str) -> list[str]:
+    """Return all platform_tokens.id for the user's connected accounts on this platform.
+    Used for multi-account publishing: when no target_accounts specified, publish to ALL.
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id FROM platform_tokens
+                WHERE user_id = $1 AND platform = $2 AND revoked_at IS NULL
+                ORDER BY updated_at DESC
+                """,
+                user_id,
+                platform,
+            )
+            return [str(r["id"]) for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to load platform token ids for {user_id}/{platform}: {e}")
+        return []
+
+
 async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Optional[dict]:
     """Load a stored platform OAuth token by its platform_tokens.id (UUID).
 

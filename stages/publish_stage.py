@@ -295,103 +295,20 @@ def _get_caption(ctx: JobContext) -> str:
 def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
     """Get hashtag string for publishing.
 
-    Merges base hashtags (always_hashtags + AI tags via get_effective_hashtags)
-    with any platform-specific hashtags from user_settings.
-
-    Tags are stored without the '#' prefix (stripped at save time).
-    We always add '#' here so captions look correct on every platform.
+    Uses get_effective_hashtags(platform) which merges in order:
+    always_hashtags → platform_hashtags for this platform → base → AI.
+    Same pipeline for all sources; blocked tags filtered throughout.
     """
-    # Base tags: get_effective_hashtags merges always_hashtags + ai_hashtags
-    # Base tags: get_effective_hashtags merges always_hashtags + ai_hashtags
-    tags: list = []
-
-    def _split_tags(v):
-        if v is None:
-            return []
-        if isinstance(v, str):
-            s = v.strip()
-            if not s:
-                return []
-            try:
-                import json as _hjson
-                maybe = _hjson.loads(s)
-                if isinstance(maybe, list):
-                    v = maybe
-                else:
-                    v = s
-            except Exception:
-                v = s
-        if isinstance(v, str):
-            import re as _hre
-            return [p for p in _hre.split(r"[\s,]+", v.strip()) if p]
-        if isinstance(v, (list, tuple, set)):
-            return [str(x) for x in v if str(x).strip()]
-        s = str(v).strip()
-        return [s] if s else []
-
     if hasattr(ctx, "get_effective_hashtags"):
-        raw = ctx.get_effective_hashtags()
-        tags = _split_tags(raw)
+        merged = ctx.get_effective_hashtags(platform=platform)
     else:
-        raw = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
-        tags = _split_tags(raw)
-    # Add platform-specific hashtags when a platform is specified
-    if platform:
-        try:
-            us = ctx.user_settings or {}
-            platform_hashtags = us.get("platformHashtags") or us.get("platform_hashtags") or {}
-            if isinstance(platform_hashtags, str):
-                import json as _pjson
-                platform_hashtags = _pjson.loads(platform_hashtags)
-            extra = (
-                platform_hashtags.get(platform)
-                or platform_hashtags.get(platform.lower())
-                or []
-            )
-            if isinstance(extra, str):
-                extra = extra.split()
-
-            # #region agent log
-            logger.info(f"[HASHTAG_DEBUG] platform={platform} platformHashtags_keys={list(platform_hashtags.keys()) if isinstance(platform_hashtags, dict) else type(platform_hashtags).__name__} extra_for_platform={extra} base_tags_count={len(tags)}")
-            # #endregion
-
-            # Respect blocked hashtags from user preferences when merging extras
-            raw_blocked = us.get("blockedHashtags") or us.get("blocked_hashtags") or []
-            if isinstance(raw_blocked, str):
-                raw_blocked = [
-                    t.strip()
-                    for t in raw_blocked.replace(",", " ").split()
-                    if t.strip()
-                ]
-            blocked_set = {
-                str(t).strip().lstrip("#").lower()
-                for t in (raw_blocked if isinstance(raw_blocked, list) else [])
-            }
-
-            existing_lower = {str(t).lstrip("#").lower() for t in tags}
-            for tag in extra:
-                t = str(tag).strip().lstrip("#")
-                if not t:
-                    continue
-                tl = t.lower()
-                if tl in existing_lower or tl in blocked_set:
-                    continue
-                existing_lower.add(tl)
-                tags.append(f"#{t}")
-        except Exception as _htag_err:
-            # #region agent log
-            logger.error(f"[HASHTAG_DEBUG] platform={platform} exception={_htag_err}")
-            # #endregion
-
-    # Normalise: ensure each tag starts with '#' and contains no whitespace
-    normalised = []
-    for t in tags:
-        t = str(t).strip()
-        if not t:
-            continue
-        if not t.startswith("#"):
-            t = f"#{t}"
-        normalised.append(t)
+        merged = getattr(ctx, "ai_hashtags", None) or getattr(ctx, "hashtags", None) or []
+    if isinstance(merged, list):
+        tags = [str(t).strip() for t in merged if str(t).strip()]
+    else:
+        import re as _re
+        tags = [p for p in _re.split(r"[\s,]+", str(merged).strip()) if p]
+    normalised = [t if t.startswith("#") else f"#{t}" for t in tags if t]
     return " ".join(normalised) if normalised else ""
 
 
@@ -403,10 +320,6 @@ def _build_platform_caption(ctx: JobContext, platform: str) -> str:
     """
     caption = _get_caption(ctx)
     hashtags = _get_hashtags(ctx, platform=platform)
-
-    # #region agent log
-    logger.info(f"[CAPTION_DEBUG] platform={platform} caption_len={len(caption or '')} hashtags='{(hashtags or '')[:200]}'")
-    # #endregion
 
     if not hashtags:
         return caption or ""
@@ -1456,9 +1369,13 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
     }
 
     # Build publish targets: list of (platform, token_id_or_None)
-    # When target_accounts is set, each entry is a specific account (supports
-    # multi-account per platform, e.g. two YouTube channels).
-    # When empty, fall back to one publish per unique platform name.
+    #
+    # LOGIC: Users select platforms AND which accounts within each platform.
+    # The frontend must send target_accounts = [platform_tokens.id, ...] for the
+    # selected accounts. Only those accounts receive the upload.
+    #
+    # When target_accounts is provided: publish to those specific accounts only.
+    # When empty (legacy): one publish per platform using most-recent token.
     publish_targets: list[tuple[str, str | None]] = []
     if ctx.target_accounts:
         for token_id in ctx.target_accounts:
@@ -1470,12 +1387,11 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                     continue
             logger.warning(f"target_account {token_id}: token not found or revoked — skipping")
         if not publish_targets:
-            logger.warning(f"All target_accounts invalid for upload {ctx.upload_id}, falling back to platforms")
-            publish_targets = [(p, None) for p in ctx.platforms]
-    else:
+            logger.warning(f"All target_accounts invalid for upload {ctx.upload_id}, falling back to one per platform")
+    if not publish_targets:
         publish_targets = [(p, None) for p in ctx.platforms]
 
-    logger.info(f"Publishing to targets: {publish_targets}")
+    logger.info(f"Publishing to {len(publish_targets)} target(s)")
 
     for platform, token_id in publish_targets:
         account_label = f"{platform}:{token_id[:8]}" if token_id else platform

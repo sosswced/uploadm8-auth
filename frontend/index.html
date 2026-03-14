@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UploadM8 — Multi-Platform Video Upload</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  <style>
+    :root { --primary: #7c3aed; --primary-dark: #5b21b6; --bg: #0f0f12; --card: #1a1a1f; --text: #e4e4e7; --muted: #71717a; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+    h1 { font-size: 2.5rem; margin-bottom: 1rem; }
+    h2 { font-size: 1.75rem; margin: 2rem 0 1rem; color: var(--primary); }
+    .pricing-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.5rem; margin: 2rem 0; }
+    .tier-card { background: var(--card); border-radius: 12px; padding: 1.5rem; border: 1px solid #2a2a2f; transition: border-color 0.2s; }
+    .tier-card:hover { border-color: var(--primary); }
+    .tier-card.popular { border-color: var(--primary); box-shadow: 0 0 0 2px rgba(124,58,237,0.3); }
+    .tier-name { font-weight: 700; font-size: 1.1rem; margin-bottom: 0.5rem; }
+    .tier-price { font-size: 2rem; font-weight: 800; color: var(--primary); }
+    .tier-price span { font-size: 0.9rem; font-weight: 400; color: var(--muted); }
+    .tier-tokens { margin: 1rem 0; padding: 0.75rem; background: rgba(124,58,237,0.1); border-radius: 8px; font-size: 0.9rem; }
+    .tier-tokens strong { color: var(--primary); }
+    .tier-perks { list-style: none; font-size: 0.9rem; color: var(--muted); }
+    .tier-perks li { padding: 0.25rem 0; padding-left: 1.25rem; position: relative; }
+    .tier-perks li::before { content: "✓"; position: absolute; left: 0; color: #22c55e; font-weight: bold; }
+    .btn { display: inline-block; padding: 0.75rem 1.5rem; border-radius: 8px; font-weight: 600; text-decoration: none; text-align: center; cursor: pointer; border: none; font-size: 0.95rem; }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-dark); }
+    .btn-outline { background: transparent; color: var(--primary); border: 2px solid var(--primary); }
+    .btn-outline:hover { background: rgba(124,58,237,0.1); }
+    .topup-section { margin: 3rem 0; padding: 2rem; background: var(--card); border-radius: 12px; border: 1px solid #2a2a2f; }
+    .topup-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 1rem; margin-top: 1rem; }
+    .topup-card { background: rgba(124,58,237,0.08); border: 1px solid rgba(124,58,237,0.3); border-radius: 8px; padding: 1rem; text-align: center; cursor: pointer; transition: all 0.2s; }
+    .topup-card:hover { background: rgba(124,58,237,0.15); border-color: var(--primary); }
+    .topup-amount { font-weight: 700; color: var(--primary); }
+    .topup-price { font-size: 1.1rem; margin-top: 0.25rem; }
+    .topup-bonus { font-size: 0.75rem; color: #22c55e; margin-top: 0.25rem; }
+    .badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; background: var(--primary); color: white; margin-left: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>UploadM8</h1>
+    <p style="color: var(--muted); margin-bottom: 2rem;">Upload once, publish everywhere. TikTok, YouTube Shorts, Instagram Reels, Facebook.</p>
+
+    <h2 id="pricing">Plans & Pricing</h2>
+    <p style="color: var(--muted); margin-bottom: 1rem;">Each plan includes monthly PUT (Platform Upload Tokens) and AIC (AI Credits). Value scales with your tier.</p>
+    <div class="pricing-grid" id="pricing-grid">
+      <!-- Fetched from /api/pricing -->
+      <p style="color: var(--muted);">Loading pricing...</p>
+    </div>
+
+    <div class="topup-section">
+      <h2>Need more tokens?</h2>
+      <p style="color: var(--muted); margin-bottom: 0.5rem;">Top up anytime. First-time top-up gets +25% bonus.</p>
+      <div class="topup-grid" id="topup-grid">
+        <!-- Fetched from /api/pricing -->
+        <p style="color: var(--muted);">Loading top-ups...</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = (typeof API_BASE_URL !== 'undefined') ? API_BASE_URL : (window.location.origin.includes('localhost') ? 'http://127.0.0.1:8000' : (window.location.hostname === 'app.uploadm8.com' ? 'https://auth.uploadm8.com' : ''));
+    const STRIPE_LOOKUP = { creator_lite: 'uploadm8_creatorlite_monthly', creator_pro: 'uploadm8_creatorpro_monthly', studio: 'uploadm8_studio_monthly', agency: 'uploadm8_agency_monthly' };
+    const TIER_PERKS = {
+      free: ['AI captions (basic)', 'Scheduling (4h lookahead)', '3 thumbnails', '4 accounts', '10-upload queue', 'Watermark on videos'],
+      creator_lite: ['No watermark', 'Scheduling (12h)', 'Webhooks', '10 accounts', '100-upload queue', '5 thumbnails', '7-day trial'],
+      creator_pro: ['HUD burn-in', 'AI thumbnail styling', '25 accounts', '500-upload queue', '8 thumbnails', '3 team seats', '7-day trial'],
+      studio: ['Excel export', '75 accounts', '2,500-upload queue', '12 thumbnails', '10 team seats', '72h lookahead', '7-day trial'],
+      agency: ['White label', 'Flex (transfer PUT)', '300 accounts', 'Unlimited queue', '20 thumbnails', '25 team seats', '1-week lookahead', '7-day trial'],
+    };
+
+    async function loadPricing() {
+      try {
+        const r = await fetch(API_BASE + '/api/pricing');
+        const { tiers, topups } = await r.json();
+        renderTiers(tiers);
+        renderTopups(topups);
+      } catch (e) {
+        document.getElementById('pricing-grid').innerHTML = '<p style="color:#ef4444;">Could not load pricing. Check API connection.</p>';
+        document.getElementById('topup-grid').innerHTML = '<p style="color:#ef4444;">Could not load top-ups.</p>';
+      }
+    }
+
+    function renderTiers(tiers) {
+      const grid = document.getElementById('pricing-grid');
+      grid.innerHTML = tiers.map(t => {
+        const isFree = t.slug === 'free';
+        const isPopular = t.slug === 'creator_pro';
+        const perks = TIER_PERKS[t.slug] || [];
+        return `
+          <div class="tier-card ${isPopular ? 'popular' : ''}">
+            <div class="tier-name">${t.name} ${isPopular ? '<span class="badge">POPULAR</span>' : ''}</div>
+            <div class="tier-price">${t.price === 0 ? 'Free' : '$' + t.price}<span>/mo</span></div>
+            <div class="tier-tokens">
+              <strong>${t.put_monthly} PUT</strong> + <strong>${t.aic_monthly} AIC</strong> / month
+            </div>
+            <ul class="tier-perks">${perks.map(p => `<li>${p}</li>`).join('')}</ul>
+            <div style="margin-top: 1rem;">
+              ${isFree
+                ? '<a href="/signup.html" class="btn btn-outline" style="width:100%;">Get Started</a>'
+                : `<button class="btn btn-primary" style="width:100%;" data-lookup="${t.stripe_lookup_key || ''}" onclick="subscribeTier(this.dataset.lookup)">Subscribe</button>`
+              }
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderTopups(topups) {
+      const grid = document.getElementById('topup-grid');
+      const putPacks = topups.filter(t => t.wallet === 'put');
+      const aicPacks = topups.filter(t => t.wallet === 'aic');
+      grid.innerHTML = `
+        <div style="grid-column: 1/-1; font-weight:600; color: var(--muted); margin-bottom: 0.5rem;">Platform Upload Tokens (PUT)</div>
+        ${putPacks.map(t => `
+          <div class="topup-card" data-lookup="${t.lookup_key}" data-wallet="put" data-amount="${t.amount}">
+            <div class="topup-amount">+${t.amount} PUT</div>
+            <div class="topup-price">$${t.price_usd || '—'}</div>
+            <div class="topup-bonus">First time: +25% bonus</div>
+          </div>
+        `).join('')}
+        <div style="grid-column: 1/-1; font-weight:600; color: var(--muted); margin: 1rem 0 0.5rem;">AI Credits (AIC)</div>
+        ${aicPacks.map(t => `
+          <div class="topup-card" data-lookup="${t.lookup_key}" data-wallet="aic" data-amount="${t.amount}">
+            <div class="topup-amount">+${t.amount} AIC</div>
+            <div class="topup-price">$${t.price_usd || '—'}</div>
+            <div class="topup-bonus">First time: +25% bonus</div>
+          </div>
+        `).join('')}
+      `;
+      grid.querySelectorAll('.topup-card').forEach(el => {
+        el.addEventListener('click', () => {
+          const lookup = el.dataset.lookup;
+          if (lookup) {
+            const token = localStorage.getItem('access_token');
+            if (token) window.location.href = '/settings.html#billing';
+            else window.location.href = '/login.html?redirect=' + encodeURIComponent('/settings.html#billing');
+          }
+        });
+      });
+    }
+
+    async function subscribeTier(lookupKey) {
+      const token = localStorage.getItem('access_token');
+      if (!token) {
+        window.location.href = '/login.html?redirect=' + encodeURIComponent(window.location.pathname + '#pricing');
+        return;
+      }
+      try {
+        const r = await fetch(API_BASE + '/api/billing/checkout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+          body: JSON.stringify({ lookup_key: lookupKey, kind: 'subscription' })
+        });
+        const data = await r.json();
+        if (data.checkout_url) window.location.href = data.checkout_url;
+        else alert(data.detail || 'Checkout failed');
+      } catch (e) {
+        alert('Could not start checkout');
+      }
+    }
+
+    loadPricing();
+  </script>
+</body>
+</html>

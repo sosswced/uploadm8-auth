@@ -187,6 +187,8 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                     "success": r.success,
                     "account_id": getattr(r, "account_id", None),
                     "account_name": getattr(r, "account_name", None),
+                    "account_username": getattr(r, "account_username", None),
+                    "account_avatar": getattr(r, "account_avatar", None),
                     "platform_video_id": r.platform_video_id,
                     "platform_url": r.platform_url,
                     "publish_id": r.publish_id,
@@ -502,6 +504,10 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                             if platform == "instagram" and not parsed.get("ig_user_id"):
                                 parsed["ig_user_id"] = str(account_id_col)
                                 logger.debug(f"Injected ig_user_id={account_id_col} from account_id column")
+                        if isinstance(parsed, dict):
+                            parsed["_account_name"] = row_dict.get("account_name", "")
+                            parsed["_account_username"] = row_dict.get("account_username", "") or ""
+                            parsed["_account_avatar"] = row_dict.get("account_avatar", "") or ""
                         return parsed
                     # May be encrypted blob
                     encrypted = row_dict.get("encrypted_token")
@@ -510,9 +516,14 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                             parsed = json.loads(encrypted)
                         else:
                             parsed = dict(encrypted) if hasattr(encrypted, "keys") else encrypted
+                        account_id_col = row_dict.get("account_id")
                         if account_id_col and isinstance(parsed, dict):
                             if platform == "instagram" and not parsed.get("ig_user_id"):
                                 parsed["ig_user_id"] = str(account_id_col)
+                        if isinstance(parsed, dict):
+                            parsed["_account_name"] = row_dict.get("account_name", "")
+                            parsed["_account_username"] = row_dict.get("account_username", "") or ""
+                            parsed["_account_avatar"] = row_dict.get("account_avatar", "") or ""
                         return parsed
                     return row_dict
             except asyncpg.exceptions.UndefinedTableError:
@@ -549,6 +560,10 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                             if platform == "instagram" and not parsed.get("ig_user_id"):
                                 parsed["ig_user_id"] = str(account_id_col)
                                 logger.debug(f"Injected ig_user_id={account_id_col} from connected_accounts.account_id")
+                        if isinstance(parsed, dict):
+                            parsed["_account_name"] = row_dict.get("account_name", "")
+                            parsed["_account_username"] = row_dict.get("account_username", "") or ""
+                            parsed["_account_avatar"] = row_dict.get("account_avatar", "") or ""
                         return parsed
                     return row_dict
             except asyncpg.exceptions.UndefinedTableError:
@@ -612,6 +627,8 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
             if isinstance(parsed, dict):
                 parsed["_platform"] = row_dict.get("platform", "")
                 parsed["_account_name"] = row_dict.get("account_name", "")
+                parsed["_account_username"] = row_dict.get("account_username", "") or ""
+                parsed["_account_avatar"] = row_dict.get("account_avatar", "") or ""
                 parsed["_token_id"] = str(row_dict.get("id", ""))
                 account_id_col = row_dict.get("account_id")
                 if account_id_col:

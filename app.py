@@ -14,6 +14,7 @@ import pathlib
 import csv
 import io
 import json
+import re
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +157,11 @@ class UserPreferencesUpdate(BaseModel):
     platform_hashtags: PlatformHashtags = Field(default_factory=PlatformHashtags, alias="platformHashtags")
     email_notifications: bool = Field(True, alias="emailNotifications")
     discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
+    # Caption & AI (stored in users.preferences; worker caption_stage reads these)
+    caption_style: Literal["story", "punchy", "factual"] = Field("story", alias="captionStyle")
+    caption_tone: Literal["hype", "calm", "cinematic", "authentic"] = Field("authentic", alias="captionTone")
+    caption_voice: Literal["default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator"] = Field("default", alias="captionVoice")
+    caption_frame_count: int = Field(6, ge=2, le=12, alias="captionFrameCount")
 
     class Config:
         populate_by_name = True
@@ -388,7 +394,7 @@ from stages.emails import (
 
 # Tier ranking for upgrade/downgrade detection (higher index = higher tier)
 _TIER_RANK = {
-    "free": 0, "launch": 1, "creator_pro": 2, "studio": 3,
+    "free": 0, "launch": 1, "creator_lite": 1, "creator_pro": 2, "studio": 3,
     "agency": 4, "friends_family": 5, "lifetime": 6, "master_admin": 7,
 }
 def _tier_is_upgrade(old: str, new: str) -> bool:
@@ -1997,9 +2003,9 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
             user_id, data.email.lower(), hash_password(data.password), data.name, country_code
         )
         await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
-        # Default credits for new accounts: enough to try uploads and AI features
-        signup_put = 50
-        signup_aic = 30
+        # Experience-first: generous signup to build value and product love
+        signup_put = 100
+        signup_aic = 75
         await conn.execute(
             "INSERT INTO wallets (user_id, put_balance, aic_balance) VALUES ($1, $2, $3)",
             user_id, signup_put, signup_aic
@@ -2109,6 +2115,47 @@ async def reset_password(payload: ResetPasswordRequest, background: BackgroundTa
     return {"ok": True}
 
 # ============================================================
+# Public Pricing API (no auth — for index.html, settings.html)
+# ============================================================
+@app.get("/api/pricing")
+async def get_public_pricing():
+    """
+    Public pricing and entitlements for landing page and billing UI.
+    Returns tiers with PUT/AIC, perks, and top-up packs (with suggested prices).
+    """
+    STRIPE_LOOKUP = {
+        "creator_lite": "uploadm8_creatorlite_monthly",
+        "creator_pro": "uploadm8_creatorpro_monthly",
+        "studio": "uploadm8_studio_monthly",
+        "agency": "uploadm8_agency_monthly",
+    }
+    tiers = []
+    for slug in ("free", "creator_lite", "creator_pro", "studio", "agency"):
+        cfg = TIER_CONFIG.get(slug, {})
+        tiers.append({
+            "slug": slug,
+            "name": cfg.get("name", slug.replace("_", " ").title()),
+            "price": float(cfg.get("price", 0)),
+            "put_monthly": cfg.get("put_monthly", 0),
+            "aic_monthly": cfg.get("aic_monthly", 0),
+            "max_accounts": cfg.get("max_accounts", 0),
+            "lookahead_hours": cfg.get("lookahead_hours", 0),
+            "queue_depth": cfg.get("queue_depth", 0),
+            "max_thumbnails": cfg.get("max_thumbnails", 0),
+            "stripe_lookup_key": STRIPE_LOOKUP.get(slug),
+        })
+    topups = []
+    for lookup_key, meta in TOPUP_PRODUCTS.items():
+        topups.append({
+            "lookup_key": lookup_key,
+            "wallet": meta.get("wallet", ""),
+            "amount": meta.get("amount", 0),
+            "price_usd": meta.get("price_usd") or meta.get("price"),
+            "label": f"{meta.get('wallet', '').upper()} {meta.get('amount', 0)}",
+        })
+    return {"tiers": tiers, "topups": topups}
+
+# ============================================================
 # User Profile & Wallet
 # ============================================================
 @app.get("/api/me")
@@ -2126,11 +2173,19 @@ async def get_me(user: dict = Depends(get_current_user)):
         except Exception as e:
             logger.warning(f"Failed to presign avatar for user {user.get('id')}: {e}")
 
+    # Display name: prefer name, then first_name+last_name, then email prefix
+    raw_name = user.get("name")
+    first = (user.get("first_name") or "").strip()
+    last = (user.get("last_name") or "").strip()
+    combined = f"{first} {last}".strip() if (first or last) else None
+    email_prefix = (user.get("email") or "").split("@")[0] if user.get("email") else None
+    display_name = raw_name or combined or email_prefix or "User"
+
     # Stabilization window: return both snake_case + camelCase keys
     return {
         "id": user["id"],
         "email": user["email"],
-        "name": user.get("name"),
+        "name": display_name,
         "role": role,
         "timezone": user.get("timezone") or "America/Chicago",
 
@@ -3053,8 +3108,9 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
             data.privacy = user_prefs["default_privacy"]
 
         # --- Hashtag assembly ---
-        # Step 1: Always merge always_hashtags + platform-specific hashtags.
-        #         These are manual user settings — work on every plan, no AI flag needed.
+        # Step 1: Merge form hashtags + always_hashtags into upload record.
+        #         Platform-specific hashtags are applied per-platform at publish time
+        #         (context.get_effective_hashtags(platform)), not here.
         def _split_tags(v):
             if v is None:
                 return []
@@ -3088,15 +3144,9 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
                     out.append(f"#{t}")
             return out
 
-        # Normalize client hashtags + always/platform preferences safely
+        # Store ONLY form/manual hashtags here. always_hashtags and platform_hashtags
+        # are applied per-platform at publish via context.get_effective_hashtags(platform).
         combined = _to_hash_tags(getattr(data, "hashtags", []) or [])
-        combined.extend(_to_hash_tags(user_prefs.get("always_hashtags", []) or user_prefs.get("alwaysHashtags", [])))
-
-        platform_hashtags = user_prefs.get("platform_hashtags") or user_prefs.get("platformHashtags") or {}
-        for platform in data.platforms:
-            if isinstance(platform_hashtags, dict):
-                tags = platform_hashtags.get(platform) or platform_hashtags.get(platform.lower()) or []
-                combined.extend(_to_hash_tags(tags))
 
         # Step 2: AI-generated hashtag injection — gated on plan + user toggle.
         #         Actual AI generation happens later in caption_stage.
@@ -3257,6 +3307,17 @@ async def preview_smart_schedule(platforms: List[str] = Query(...), days: int = 
         }
     }
 
+class CompleteUploadBody(BaseModel):
+    """Optional metadata from upload page (single-file manual title/caption/hashtags)."""
+    title: Optional[str] = None
+    caption: Optional[str] = None
+    hashtags: Optional[List[str]] = None
+    platforms: Optional[List[str]] = None
+    privacy: Optional[str] = None
+    target_accounts: Optional[List[str]] = None
+    group_ids: Optional[List[str]] = None
+
+
 @app.post("/api/uploads/{upload_id}/complete")
 async def complete_upload(upload_id: str, request: Request, user: dict = Depends(get_current_user)):
     """
@@ -3266,7 +3327,18 @@ async def complete_upload(upload_id: str, request: Request, user: dict = Depends
     IMMEDIATE  → status=queued, pushed to Redis → worker fires NOW
     SCHEDULED  → status=staged, NOT pushed to Redis → scheduler fires at scheduled_time - processing_window
     SMART      → status=staged, NOT pushed to Redis → scheduler fires at first scheduled_time - processing_window
+
+    Request body may include title, caption, hashtags from the upload page (manual metadata for single-file uploads).
+    These override presign defaults and are stored before enqueue.
     """
+    body = {}
+    try:
+        raw = await request.body()
+        if raw:
+            body = json.loads(raw) or {}
+    except Exception:
+        pass
+
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow(
             "SELECT * FROM uploads WHERE id = $1 AND user_id = $2",
@@ -3279,6 +3351,44 @@ async def complete_upload(upload_id: str, request: Request, user: dict = Depends
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
 
         schedule_mode = upload.get("schedule_mode") or "immediate"
+
+        # ── Apply manual metadata from upload page (single-file) ─────────────────
+        updates = []
+        params = []
+        idx = 1
+        if body.get("title") is not None:
+            updates.append(f"title = ${idx}")
+            params.append(str(body["title"])[:512])
+            idx += 1
+        if body.get("caption") is not None:
+            updates.append(f"caption = ${idx}")
+            params.append(str(body["caption"])[:10000])
+            idx += 1
+        if body.get("hashtags") is not None:
+            raw_tags = body["hashtags"]
+            if isinstance(raw_tags, str):
+                raw_tags = [t.strip() for t in re.split(r"[\s,]+", str(raw_tags)) if t.strip()]
+            tags = []
+            for t in (raw_tags if isinstance(raw_tags, (list, tuple)) else []):
+                t = str(t).strip().lstrip("#")[:50]
+                if t:
+                    tags.append(f"#{t}" if not t.startswith("#") else t)
+            blocked = set(
+                str(x).strip().lstrip("#").lower()
+                for x in (user_prefs.get("blocked_hashtags") or user_prefs.get("blockedHashtags") or [])
+            )
+            tags = [t for t in tags if t and t.lstrip("#").lower() not in blocked]
+            tags = list(dict.fromkeys(tags))[: int(user_prefs.get("max_hashtags", 30))]
+            updates.append(f"hashtags = ${idx}")
+            params.append(tags)  # TEXT[] expects list
+            idx += 1
+
+        if updates:
+            params.append(upload_id)
+            await conn.execute(
+                f"UPDATE uploads SET {', '.join(updates)}, updated_at = NOW() WHERE id = ${idx}",
+                *params
+            )
 
         # ── Determine status and whether to enqueue ──────────────────
         if schedule_mode in ("scheduled", "smart"):
@@ -3391,7 +3501,10 @@ async def reprepare_upload(upload_id: str, user: dict = Depends(get_current_user
 @app.post("/api/uploads/{upload_id}/cancel")
 async def cancel_upload(upload_id: str, request: Request, user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
-        upload = await conn.fetchrow("SELECT put_reserved, aic_reserved, status FROM uploads WHERE id = $1 AND user_id = $2", upload_id, user["id"])
+        upload = await conn.fetchrow(
+            "SELECT put_reserved, aic_reserved, status, r2_key, telemetry_r2_key, processed_r2_key, thumbnail_r2_key FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"]
+        )
         if not upload: raise HTTPException(404, "Upload not found")
         if upload["status"] in ("completed", "succeeded", "cancelled", "failed"):
             raise HTTPException(400, "Cannot cancel this upload")
@@ -3416,6 +3529,15 @@ async def cancel_upload(upload_id: str, request: Request, user: dict = Depends(g
             await log_system_event(conn, user_id=str(user["id"]), action="UPLOAD_CANCELLED",
                                    event_category="UPLOAD", resource_type="upload", resource_id=upload_id,
                                    details={"status_at_cancel": current_status}, request=request, severity="WARNING")
+            # Remove video and related assets from R2 so they don't persist
+            r2_keys = [k for k in (
+                upload.get("r2_key"),
+                upload.get("telemetry_r2_key"),
+                upload.get("processed_r2_key"),
+                upload.get("thumbnail_r2_key"),
+            ) if k]
+            if r2_keys:
+                await _delete_r2_objects(r2_keys)
             return {"status": "cancelled"}
 
 
@@ -4221,7 +4343,7 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
         
         uploads = await conn.fetch("""
             SELECT 
-                id, title, scheduled_time, platforms, 
+                id, title, scheduled_time, platforms, target_accounts,
                 thumbnail_r2_key, caption, status, 
                 created_at, timezone, schedule_mode, schedule_metadata
             FROM uploads 
@@ -4257,12 +4379,32 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
         except Exception:
             pass
 
+        target_ids = [str(x) for x in (upload.get("target_accounts") or []) if x]
+        target_account_details = []
+        if target_ids:
+            rows = await conn.fetch(
+                """SELECT id, platform, account_name, account_username, account_avatar
+                   FROM platform_tokens
+                   WHERE user_id = $1 AND id = ANY($2::uuid[]) AND revoked_at IS NULL""",
+                user["id"], target_ids
+            )
+            for r in rows:
+                target_account_details.append({
+                    "id": str(r["id"]),
+                    "platform": r["platform"],
+                    "name": r["account_name"] or "",
+                    "username": r["account_username"] or "",
+                    "avatar": r["account_avatar"] or "",
+                })
+
         result.append({
             "id": str(upload["id"]),
             "title": upload["title"] or "Untitled",
             "scheduled_time": upload["scheduled_time"].isoformat() if upload["scheduled_time"] else None,
             "timezone": upload["timezone"] or "UTC",
             "platforms": list(upload["platforms"]) if upload["platforms"] else [],
+            "target_accounts": target_ids,
+            "target_account_details": target_account_details,
             "thumbnail": thumbnail_url,
             "caption": upload["caption"],
             "status": upload["status"],
@@ -4696,7 +4838,7 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             except:
                 platform_tags = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
 
-        return {
+        out = {
             "autoCaptions": d.get("auto_captions", False),
             "autoThumbnails": d.get("auto_thumbnails", False),
             "thumbnailInterval": str(d.get("thumbnail_interval", 5)),
@@ -4715,9 +4857,24 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             "trillMinScore": int(d.get("trill_min_score", 0) or 0),
             "trillHudEnabled": bool(d.get("trill_hud_enabled", False)),
             "trillAiEnhance": bool(d.get("trill_ai_enhance", False)),
-                "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
+            "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
             "styledThumbnails": d.get("styled_thumbnails", True),
         }
+        # Caption & AI fields live in users.preferences (worker reads from there)
+        users_prefs = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user["id"])
+        if users_prefs:
+            up = json.loads(users_prefs) if isinstance(users_prefs, str) else (users_prefs or {})
+            if isinstance(up, dict):
+                out["captionStyle"] = up.get("captionStyle") or up.get("caption_style") or "story"
+                out["captionTone"] = up.get("captionTone") or up.get("caption_tone") or "authentic"
+                out["captionVoice"] = up.get("captionVoice") or up.get("caption_voice") or "default"
+                out["captionFrameCount"] = up.get("captionFrameCount") or up.get("caption_frame_count") or 6
+        else:
+            out.setdefault("captionStyle", "story")
+            out.setdefault("captionTone", "authentic")
+            out.setdefault("captionVoice", "default")
+            out.setdefault("captionFrameCount", 6)
+        return out
 
 @app.post("/api/settings/preferences")
 async def save_user_preferences(
@@ -4754,6 +4911,10 @@ async def save_user_preferences(
         "trillAiEnhance": "trill_ai_enhance",
         "trillOpenaiModel": "trill_openai_model",
         "styledThumbnails": "styled_thumbnails",
+        "captionStyle": "caption_style",
+        "captionTone": "caption_tone",
+        "captionVoice": "caption_voice",
+        "captionFrameCount": "caption_frame_count",
     }
 
     def normalize_prefs_payload(p: dict) -> dict:
@@ -4919,6 +5080,41 @@ async def save_user_preferences(
             discord_webhook,
         )
 
+        # Sync caption fields to users.preferences (worker caption_stage reads from there)
+        caption_keys = ("captionStyle", "captionTone", "captionVoice", "captionFrameCount")
+        caption_snake = ("caption_style", "caption_tone", "caption_voice", "caption_frame_count")
+        if any(k in p or sk in p for k, sk in zip(caption_keys, caption_snake)):
+            _CAPTION_STYLES = ("story", "punchy", "factual")
+            _CAPTION_TONES = ("hype", "calm", "cinematic", "authentic")
+            _CAPTION_VOICES = ("default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator")
+            users_prefs_row = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user["id"])
+            users_prefs = {}
+            if users_prefs_row:
+                users_prefs = json.loads(users_prefs_row) if isinstance(users_prefs_row, str) else (users_prefs_row or {})
+            if not isinstance(users_prefs, dict):
+                users_prefs = {}
+            if "captionStyle" in p or "caption_style" in p:
+                v = str(p.get("captionStyle") or p.get("caption_style") or "story").strip().lower()
+                users_prefs["captionStyle"] = users_prefs["caption_style"] = v if v in _CAPTION_STYLES else "story"
+            if "captionTone" in p or "caption_tone" in p:
+                v = str(p.get("captionTone") or p.get("caption_tone") or "authentic").strip().lower()
+                users_prefs["captionTone"] = users_prefs["caption_tone"] = v if v in _CAPTION_TONES else "authentic"
+            if "captionVoice" in p or "caption_voice" in p:
+                v = str(p.get("captionVoice") or p.get("caption_voice") or "default").strip().lower()
+                users_prefs["captionVoice"] = users_prefs["caption_voice"] = v if v in _CAPTION_VOICES else "default"
+            if "captionFrameCount" in p or "caption_frame_count" in p:
+                try:
+                    v = int(p.get("captionFrameCount") or p.get("caption_frame_count") or 6)
+                    v = max(2, min(v, 12))
+                    users_prefs["captionFrameCount"] = users_prefs["caption_frame_count"] = v
+                except (TypeError, ValueError):
+                    users_prefs["captionFrameCount"] = users_prefs["caption_frame_count"] = 6
+            await conn.execute(
+                "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
+                json.dumps(users_prefs),
+                user["id"],
+            )
+
         # immediate read-after-write to validate persistence (helps front-end debugging)
         row = await conn.fetchrow(
             "SELECT updated_at FROM user_preferences WHERE user_id = $1",
@@ -4938,17 +5134,21 @@ async def save_user_preferences_put(
     return await save_user_preferences(prefs.model_dump(by_alias=True), user)
 
 async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
-    """Helper to fetch user preferences for upload processing"""
-    # Read from user_preferences table (primary source)
+    """Helper to fetch user preferences for upload processing.
+    Merges user_preferences table + users.preferences so both PUT /api/me/preferences
+    and POST /api/settings/preferences are respected. users.preferences wins for
+    hashtag fields (always_hashtags, platform_hashtags, blocked_hashtags) since that's
+    where PUT /api/me/preferences writes.
+    """
+    result = {}
+    # Read from user_preferences table
     prefs_row = await conn.fetchrow(
         "SELECT * FROM user_preferences WHERE user_id = $1",
         user_id
     )
-    
     if prefs_row:
-        # User has preferences in the table
         styled = prefs_row.get("styled_thumbnails", True)
-        return {
+        result = {
             "auto_captions": prefs_row["auto_captions"],
             "auto_thumbnails": prefs_row["auto_thumbnails"],
             "styled_thumbnails": styled,
@@ -4966,7 +5166,29 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
             "email_notifications": prefs_row["email_notifications"],
             "discord_webhook": prefs_row["discord_webhook"]
         }
-    
+
+    # Overlay users.preferences for hashtag fields (PUT /api/me/preferences writes here)
+    if result:
+        users_prefs_row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user_id)
+        if users_prefs_row and users_prefs_row["preferences"]:
+            up = users_prefs_row["preferences"]
+            if isinstance(up, str):
+                try:
+                    up = json.loads(up)
+                except Exception:
+                    up = {}
+            if isinstance(up, dict) and up:
+                if up.get("alwaysHashtags") is not None or up.get("always_hashtags") is not None:
+                    v = up.get("alwaysHashtags") or up.get("always_hashtags")
+                    result["alwaysHashtags"] = result["always_hashtags"] = v
+                if up.get("blockedHashtags") is not None or up.get("blocked_hashtags") is not None:
+                    v = up.get("blockedHashtags") or up.get("blocked_hashtags")
+                    result["blockedHashtags"] = result["blocked_hashtags"] = v
+                if up.get("platformHashtags") is not None or up.get("platform_hashtags") is not None:
+                    v = up.get("platformHashtags") or up.get("platform_hashtags")
+                    result["platformHashtags"] = result["platform_hashtags"] = v
+        return result
+
     # Fallback: Try legacy JSONB locations
     # Try user_settings.preferences_json first
     prefs_row = await conn.fetchrow(
@@ -5961,17 +6183,24 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                 wallet_type   = session.metadata.get("wallet", "put")
                 amount_tokens = int(session.metadata.get("amount", 0))
                 if amount_tokens > 0:
-                    await credit_wallet(conn, user_id, wallet_type, amount_tokens, "topup_purchase", session.id)
+                    # First top-up bonus: +25% to incentivize trying paid credits
+                    prior = await conn.fetchval(
+                        "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
+                        user_id
+                    )
+                    bonus = int(amount_tokens * 0.25) if not prior else 0
+                    total = amount_tokens + bonus
+                    await credit_wallet(conn, user_id, wallet_type, total, "topup_purchase", session.id)
                     amount = (session.amount_total or 0) / 100
                     await conn.execute(
                         "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
                         "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT DO NOTHING",
                         user_id, amount, session.id, f"{wallet_type}_{amount_tokens}"
                     )
-                    background_tasks.add_task(notify_topup, amount, email, wallet_type, amount_tokens)
+                    background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
                     background_tasks.add_task(
                         send_topup_receipt_email,
-                        email, uname, wallet_type, amount_tokens, amount, 0, session.id,
+                        email, uname, wallet_type, total, amount, 0, session.id, bonus_tokens=bonus,
                     )
 
     # ── invoice.paid — monthly wallet refill on every renewal ──────────
@@ -8142,7 +8371,7 @@ async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
 
 @app.post("/api/admin/users/assign-tier")
 async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), request: Request = None, background_tasks: BackgroundTasks = None, user: dict = Depends(require_master_admin)):
-    if tier not in PLAN_CONFIG:
+    if tier not in TIER_CONFIG:
         raise HTTPException(400, "Invalid tier")
     async with db_pool.acquire() as conn:
         old = await conn.fetchrow("SELECT subscription_tier, email, name FROM users WHERE id = $1", user_id)
@@ -8731,6 +8960,7 @@ async def get_admin_calculator_pricing(user: dict = Depends(require_master_admin
             "lookup_key": lookup_key,
             "wallet": wallet,
             "amount": amount,
+            "price_usd": meta.get("price_usd") or meta.get("price"),
             "label": f"{wallet.upper()} {amount} Pack",
         })
 

@@ -590,6 +590,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         if not upload_record or not user_record:
             logger.error(f"[{upload_id}] Records not found")
             return False
+        if (upload_record.get("status") or "").lower() == "cancelled":
+            logger.info(f"[{upload_id}] Skipping — already cancelled")
+            return False
 
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
@@ -905,6 +908,23 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
     except CancelRequested:
         logger.info(f"[{upload_id}] Pipeline cancelled")
+        # ── Remove video and assets from R2 ───────────────────────────────────
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT r2_key, telemetry_r2_key, processed_r2_key, thumbnail_r2_key FROM uploads WHERE id = $1",
+                    upload_id,
+                )
+                if row:
+                    for col in ("r2_key", "telemetry_r2_key", "processed_r2_key", "thumbnail_r2_key"):
+                        k = row.get(col)
+                        if k:
+                            try:
+                                await r2_stage.delete_file(k)
+                            except Exception as del_err:
+                                logger.warning(f"[{upload_id}] R2 delete {col} failed: {del_err}")
+        except Exception as r2_err:
+            logger.warning(f"[{upload_id}] R2 cleanup on cancel failed: {r2_err}")
         # ── Release wallet hold on failure ───────────────────────────────────
         try:
             put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)

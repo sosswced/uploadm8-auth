@@ -1535,6 +1535,8 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
         result.attempt_id = attempt_id
         result.account_id = token_id
         result.account_name = (token_data.get("_account_name") or token_data.get("account_name") or "") if token_data else ""
+        result.account_username = (token_data.get("_account_username") or token_data.get("account_username") or "") if token_data else ""
+        result.account_avatar = (token_data.get("_account_avatar") or token_data.get("account_avatar") or "") if token_data else ""
         ctx.platform_results.append(result)
 
         status_icon = "OK" if result.success else "FAIL"

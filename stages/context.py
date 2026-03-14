@@ -120,7 +120,9 @@ class PlatformResult:
 
     # Multi-account: which profile this result is for
     account_id: Optional[str] = None  # platform_tokens.id
-    account_name: Optional[str] = None  # e.g. @username or display name
+    account_name: Optional[str] = None  # e.g. channel title or display name
+    account_username: Optional[str] = None  # e.g. @handle, YouTube custom URL
+    account_avatar: Optional[str] = None  # profile picture URL for Queue/Scheduled display
 
     # Step A (accepted)
     platform_video_id: Optional[str] = None
@@ -421,9 +423,10 @@ CONTEXT
 HARD RULES
 - No profanity, no hate, no nudity, no weapons emphasis, no illegal claims.
 - No copyrighted logos/brand marks (YouTube logo, TikTok logo, etc).
+- ACCURACY: Headlines and badges must reflect what is actually in the video. No misleading claims (e.g. "TOP 5" when it's not a list, "NEW" when it's not new). Describe visible content truthfully.
 - Text: 2–6 words total, ALL CAPS, 1–2 lines, mobile readable.
 - Provide 3 headline options; select 1.
-- Always include 1 badge (e.g., NEW, FAST, HOW TO, TOP 5) if appropriate.
+- Include 1 badge only when it accurately fits (e.g. FAST only if speed/telemetry present; HOW TO only if it's a tutorial).
 - Always include 1 directional element (arrow/circle/glow box).
 - Provide 2 prop ideas that match the category.
 - Never mention AI/automation/API/internal product words.

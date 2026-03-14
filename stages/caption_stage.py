@@ -105,7 +105,7 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "You don't need expensive products to get this look ✨",
-            "The secret to glowy skin nobody tells you 🌟",
+            "Here's what worked for this look 🌟",
             "GRWM for a night out 💄",
         ],
         "hashtag_seeds": [
@@ -149,7 +149,7 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "This room cost $300 to transform — watch 👀",
-            "Nobody believed this would work. I proved them wrong.",
+            "Here's the before and after — transformation complete",
             "The before photos were giving me anxiety 😬",
         ],
         "hashtag_seeds": [
@@ -299,9 +299,9 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
             "Teach one thing per video. The hook IS the insight — lead with the value."
         ),
         "hook_templates": [
-            "Nobody teaches this in school — here's what you need to know",
+            "Here's what actually works — based on what I tried",
             "I learned this the hard way so you don't have to",
-            "The 1% of people who know this will get ahead",
+            "One clear takeaway from this video",
         ],
         "hashtag_seeds": [
             "learnontiktok", "didyouknow", "educationalcontent", "lifelessons",
@@ -383,9 +383,9 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
             "Numbers sell — lead with the ROI, close with the dream."
         ),
         "hook_templates": [
-            "This house generates ${revenue}/month passively",
+            "Here's what this property offers",
             "I bought my first rental property at 24 — here's how",
-            "The neighbourhood nobody is talking about yet",
+            "A closer look at this neighbourhood",
         ],
         "hashtag_seeds": [
             "realestate", "realestatelife", "househunting", "propertyinvesting",
@@ -459,11 +459,12 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         "keywords": [],  # catch-all — always matches last
         "tone": (
             "Engaging, authentic, and specific to what is actually visible in the video. "
-            "Identify the content type from the frames and match your tone to it."
+            "Identify the content type from the frames and match your tone to it. "
+            "Accuracy over hype — never overpromise or mislead."
         ),
         "hook_templates": [
-            "You need to see this",
-            "Nobody expected this outcome",
+            "Here's what actually happened",
+            "What you see in this frame",
         ],
         "hashtag_seeds": [
             "viral", "fyp", "foryoupage", "trending", "mustwatch",
@@ -568,7 +569,9 @@ def _build_category_context_block(category: str, location: Optional[str] = None)
     ]
     if hooks:
         hook_examples = " | ".join(f'"{h}"' for h in hooks[:2])
-        lines.append(f"HOOK INSPIRATION (adapt freely, never copy verbatim): {hook_examples}")
+        lines.append(
+            f"HOOK INSPIRATION (adapt freely, never copy verbatim; must accurately reflect visible content): {hook_examples}"
+        )
     if seeds:
         lines.append(
             f"HASHTAG VOCABULARY (use as seeds, expand with more specific terms): "
@@ -586,7 +589,8 @@ def _build_category_context_block(category: str, location: Optional[str] = None)
         f"{block}\n"
         "━━ Use this category context to produce SPECIFIC, niche-optimised content. "
         "Generic captions get buried by the algorithm. Specific, category-fluent "
-        "captions get algorithmic lift. Hook must feel native to this content type. ━━"
+        "captions get algorithmic lift. Hook must feel native to this content type "
+        "and must accurately reflect what is visible — never overpromise or mislead. ━━"
     )
 
 
@@ -882,6 +886,7 @@ Context:
 Rules:
 - Content must feel AUTHENTIC — not AI-generated
 - NEVER invent events, locations, or narratives not shown in the video. Base caption ONLY on what is visible in the frames.
+- ACCURACY OVER ENGAGEMENT: Do NOT use clickbait patterns ("Nobody expected", "You need to see this", "The secret nobody tells you"). Describe what is actually shown. Hooks must reflect visible content — never overpromise or mislead.
 - Hook in the first 3 words for short-form platforms
 - Use emojis sparingly (1–3 max)
 - HASHTAGS: each must be a complete word (e.g. "makeuptutorial", "gardenlife", "dashcam")

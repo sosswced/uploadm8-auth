@@ -133,7 +133,11 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
         for result in ctx.platform_results:
             icon      = "✅" if result.success else "❌"
             plat_name = result.platform.title()
-            account_label = getattr(result, "account_name", None) or getattr(result, "account_id", None)
+            account_label = (
+                getattr(result, "account_username", None)
+                or getattr(result, "account_name", None)
+                or getattr(result, "account_id", None)
+            )
             if account_label:
                 field_name = f"{icon} {plat_name} ({account_label})"
             else:

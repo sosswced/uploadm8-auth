@@ -6647,7 +6647,11 @@ async def _fetch_youtube_metrics(access_token: str) -> dict:
 
 
 async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
-    """Instagram Graph API — Reels insights."""
+    """
+    Instagram Graph API — Reels insights.
+    Attempt 1: instagram_manage_insights (plays, reach, saved, shares, likes, comments)
+    Attempt 2: basic instagram_basic fields (like_count, comments_count) — no advanced scope needed.
+    """
     if not access_token or not ig_user_id:
         return {"status": "not_connected"}
     try:
@@ -6661,12 +6665,15 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
 
             items = media.json().get("data", []) or []
             if not items:
-                return {"status": "live", "views": 0, "likes": 0, "comments": 0, "saves": 0, "reach": 0, "shares": 0, "video_count": 0}
+                return {"status": "live", "views": 0, "likes": 0, "comments": 0,
+                        "saves": 0, "reach": 0, "shares": 0, "video_count": 0,
+                        "analytics_source": None}
 
             total_views = total_likes = total_comments = 0
             total_saves = total_reach = total_shares = 0
-
             analytics_source = None
+            used_fallback = False
+
             for item in items[:10]:
                 media_type = (item.get("media_type") or "IMAGE").upper()
                 # "plays" on IMAGE/CAROUSEL silently kills the insights call
@@ -6677,37 +6684,54 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
                     metric_str = "impressions,reach,saved,shares,comments,likes"
                     view_key   = "impressions"
 
+                # ── Attempt 1: instagram_manage_insights ──────────────────────
                 ins = await client.get(
                     f"https://graph.facebook.com/v21.0/{item['id']}/insights",
                     params={"access_token": access_token, "metric": metric_str},
                 )
-                if ins.status_code != 200:
-                    continue
-                analytics_source = "instagram_manage_insights"
-                for m in ins.json().get("data", []) or []:
-                    name = m.get("name", "")
-                    vals = m.get("values", [])
-                    val  = vals[-1].get("value", 0) if vals else m.get("value", 0)
-                    if isinstance(val, dict):
-                        val = sum(val.values())
-                    val = int(val or 0)
-                    if name == view_key:       total_views    += val
-                    elif name == "likes":      total_likes    += val
-                    elif name == "comments":   total_comments += val
-                    elif name == "saved":      total_saves    += val
-                    elif name == "reach":      total_reach    += val
-                    elif name == "shares":     total_shares   += val
+                if ins.status_code == 200:
+                    analytics_source = "instagram_manage_insights"
+                    for m in ins.json().get("data", []) or []:
+                        name = m.get("name", "")
+                        vals = m.get("values", [])
+                        val  = vals[-1].get("value", 0) if vals else m.get("value", 0)
+                        if isinstance(val, dict):
+                            val = sum(val.values())
+                        val = int(val or 0)
+                        if name == view_key:       total_views    += val
+                        elif name == "likes":      total_likes    += val
+                        elif name == "comments":   total_comments += val
+                        elif name == "saved":      total_saves    += val
+                        elif name == "reach":      total_reach    += val
+                        elif name == "shares":     total_shares   += val
+                else:
+                    # ── Attempt 2: basic media fields (instagram_basic only) ───
+                    # like_count and comments_count are always available.
+                    # views/plays unavailable without manage_insights.
+                    fallback = await client.get(
+                        f"https://graph.facebook.com/v21.0/{item['id']}",
+                        params={"access_token": access_token,
+                                "fields": "like_count,comments_count"},
+                    )
+                    if fallback.status_code == 200:
+                        fb = fallback.json()
+                        total_likes    += int(fb.get("like_count")     or 0)
+                        total_comments += int(fb.get("comments_count") or 0)
+                        used_fallback   = True
+
+            if analytics_source is None and used_fallback:
+                analytics_source = "instagram_basic_fallback"
 
             return {
-                "status": "live",
+                "status":           "live",
                 "analytics_source": analytics_source,
-                "views":    total_views,
-                "likes":    total_likes,
-                "comments": total_comments,
-                "saves":    total_saves,
-                "reach":    total_reach,
-                "shares":   total_shares,
-                "video_count": len(items),
+                "views":            total_views,
+                "likes":            total_likes,
+                "comments":         total_comments,
+                "saves":            total_saves,
+                "reach":            total_reach,
+                "shares":           total_shares,
+                "video_count":      len(items),
             }
     except Exception as e:
         logger.error(f"Instagram metrics error: {e}")
@@ -6715,7 +6739,12 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
 
 
 async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
-    """Facebook Graph API — Page video insights."""
+    """
+    Facebook Graph API — Page video insights.
+    Attempt 1: read_insights scope (total_video_views, reactions, comments, shares)
+    Attempt 2: basic video fields (video_views, reactions.summary, comments.summary, shares)
+               — available with just a page access token, no advanced scope needed.
+    """
     if not access_token or not page_id:
         return {"status": "not_connected"}
     try:
@@ -6729,13 +6758,29 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
 
             videos = vids.json().get("data", []) or []
             if not videos:
-                return {"status": "live", "views": 0, "reactions": 0, "comments": 0, "shares": 0, "followers": 0, "video_count": 0}
+                followers = 0
+                try:
+                    pg = await client.get(
+                        f"https://graph.facebook.com/v21.0/{page_id}",
+                        params={"access_token": access_token, "fields": "followers_count,fan_count"},
+                    )
+                    if pg.status_code == 200:
+                        pg_data = pg.json()
+                        followers = pg_data.get("followers_count") or pg_data.get("fan_count") or 0
+                except Exception:
+                    pass
+                return {"status": "live", "views": 0, "reactions": 0, "comments": 0,
+                        "shares": 0, "followers": followers, "video_count": 0,
+                        "analytics_source": None}
 
             total_views = total_reactions = total_comments = total_shares = 0
-
             analytics_source = None
+
             for vid in videos[:10]:
                 try:
+                    got_vid_stats = False
+
+                    # ── Attempt 1: read_insights scope ────────────────────────
                     ins = await client.get(
                         f"https://graph.facebook.com/v21.0/{vid['id']}",
                         params={
@@ -6743,20 +6788,41 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
                             "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_shares,total_video_comments)",
                         },
                     )
-                    if ins.status_code != 200:
-                        continue
-                    analytics_source = "read_insights+pages_read_engagement"
-                    for m in ins.json().get("insights", {}).get("data", []) or []:
-                        name = m.get("name", "")
-                        vals = m.get("values", [{}])
-                        val  = vals[-1].get("value", 0) if vals else 0
-                        if isinstance(val, dict):
-                            val = sum(val.values())
-                        val = int(val or 0)
-                        if   name == "total_video_views":                    total_views     += val
-                        elif name == "total_video_reactions_by_type_total":  total_reactions += val
-                        elif name == "total_video_shares":                   total_shares    += val
-                        elif name == "total_video_comments":                 total_comments  += val
+                    if ins.status_code == 200:
+                        insights_data = ins.json().get("insights", {}).get("data", []) or []
+                        if insights_data:
+                            analytics_source = "read_insights+pages_read_engagement"
+                            for m in insights_data:
+                                name = m.get("name", "")
+                                vals = m.get("values", [{}])
+                                val  = vals[-1].get("value", 0) if vals else 0
+                                if isinstance(val, dict):
+                                    val = sum(val.values())
+                                val = int(val or 0)
+                                if   name == "total_video_views":                    total_views     += val
+                                elif name == "total_video_reactions_by_type_total":  total_reactions += val
+                                elif name == "total_video_shares":                   total_shares    += val
+                                elif name == "total_video_comments":                 total_comments  += val
+                            got_vid_stats = True
+
+                    # ── Attempt 2: basic video fields (no read_insights needed) ─
+                    if not got_vid_stats:
+                        fallback = await client.get(
+                            f"https://graph.facebook.com/v21.0/{vid['id']}",
+                            params={
+                                "access_token": access_token,
+                                "fields": "video_views,reactions.summary(true),comments.summary(true),shares",
+                            },
+                        )
+                        if fallback.status_code == 200:
+                            fb = fallback.json()
+                            total_views     += int(fb.get("video_views") or 0)
+                            total_reactions += int((fb.get("reactions") or {}).get("summary", {}).get("total_count") or 0)
+                            total_comments  += int((fb.get("comments")  or {}).get("summary", {}).get("total_count") or 0)
+                            total_shares    += int((fb.get("shares")    or {}).get("count") or 0)
+                            if analytics_source is None:
+                                analytics_source = "basic_video_fields_fallback"
+
                 except Exception as ve:
                     logger.warning(f"Facebook video insight error for {vid.get('id')} (skipping): {ve}")
                     continue
@@ -6774,14 +6840,14 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
                 logger.warning(f"Facebook followers fetch error (non-fatal): {fe}")
 
             return {
-                "status": "live",
+                "status":           "live",
                 "analytics_source": analytics_source,
-                "views":     total_views,
-                "reactions": total_reactions,
-                "comments":  total_comments,
-                "shares":    total_shares,
-                "followers": followers,
-                "video_count": len(videos),
+                "views":            total_views,
+                "reactions":        total_reactions,
+                "comments":         total_comments,
+                "shares":           total_shares,
+                "followers":        followers,
+                "video_count":      len(videos),
             }
     except Exception as e:
         logger.error(f"Facebook metrics error: {e}")
@@ -6830,8 +6896,7 @@ async def _platform_metrics_db_cache_set(conn, user_id: str, output: dict) -> No
 @app.get("/api/analytics/platform-metrics")
 async def get_platform_metrics(force: bool = False, user: dict = Depends(get_current_user)):
     """
-    Fetch live engagement metrics from ALL connected platform accounts.
-    Aggregates across every connected account per platform (not just the last one).
+    Fetch live engagement metrics from all connected platform APIs.
     Cached 3 hours per user (memory + DB). Pass ?force=true to bypass cache.
     """
     user_id = str(user["id"])
@@ -6857,10 +6922,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
             return db_cached
 
         token_rows = await conn.fetch(
-            """SELECT platform, token_blob, account_id, account_name
-               FROM platform_tokens
-               WHERE user_id = $1 AND revoked_at IS NULL
-               ORDER BY platform, created_at ASC""",
+            "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
             user["id"],
         )
         upload_counts = await conn.fetch(
@@ -6870,146 +6932,63 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
                GROUP BY platform""",
             user["id"],
         )
-        # Pull platform_results to scope metrics to UploadM8-published content only
-        pr_rows = await conn.fetch(
-            """SELECT platform_results FROM uploads
-               WHERE user_id = $1 AND status IN ('succeeded', 'completed', 'partial')
-               ORDER BY created_at DESC LIMIT 200""",
-            user["id"],
-        )
 
     upload_map = {r["platform"]: r["cnt"] for r in upload_counts}
 
-    # Build per-platform lists of video IDs UploadM8 actually published
-    _vid_ids: dict = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
-    for row in pr_rows:
-        pr = _safe_json(row["platform_results"], [])
-        if isinstance(pr, dict):
-            pr = [{"platform": k, **v} if isinstance(v, dict) else {"platform": k}
-                  for k, v in pr.items()]
-        for entry in (pr if isinstance(pr, list) else []):
-            plat = str(entry.get("platform") or "").lower()
-            if plat not in _vid_ids:
-                continue
-            vid = (
-                entry.get("platform_video_id")
-                or entry.get("video_id") or entry.get("videoId")
-                or entry.get("media_id") or entry.get("post_id")
-                or entry.get("share_id") or entry.get("reel_id")
-            )
-            if vid and str(vid) not in _vid_ids[plat]:
-                _vid_ids[plat].append(str(vid))
-
-    # Build per-platform list of ALL decrypted tokens (one entry per connected account)
-    # Previous code used token_map[plat] = decrypted which silently dropped all but
-    # the last account. Now we keep every account in a list.
-    token_lists: dict = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+    token_map: dict = {}
     for row in token_rows:
         plat = row["platform"]
-        if plat not in token_lists:
-            continue
         blob = row["token_blob"]
         if not blob:
             continue
         try:
             decrypted = decrypt_blob(blob)
-        except Exception as e:
-            logger.warning(f"platform_metrics: decrypt failed for {plat} account={row['account_id']}: {e}")
+        except Exception:
             continue
-        if not decrypted:
-            continue
-        # Ensure platform-specific IDs are present in the token
-        if plat == "instagram" and not decrypted.get("ig_user_id") and row["account_id"]:
-            decrypted["ig_user_id"] = str(row["account_id"])
-        if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
-            decrypted["page_id"] = str(row["account_id"])
-        decrypted["_account_name"] = row["account_name"] or row["account_id"] or plat
-        token_lists[plat].append(decrypted)
+        if decrypted:
+            if plat == "instagram" and not decrypted.get("ig_user_id") and row["account_id"]:
+                decrypted["ig_user_id"] = str(row["account_id"])
+            if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
+                decrypted["page_id"] = str(row["account_id"])
+            token_map[plat] = decrypted
 
-    # ── Helper: merge multiple account results into one aggregated dict ──────
-    def _merge_platform_results(results: list) -> dict:
-        """
-        Takes a list of per-account result dicts and sums numeric fields.
-        Status is 'live' if any account succeeded, 'error' only if all failed.
-        analytics_source is taken from the first successful result.
-        """
-        if not results:
-            return {"status": "not_connected"}
+    async def run_tiktok():
+        t = token_map.get("tiktok", {})
+        return await _fetch_tiktok_metrics(t.get("access_token", ""))
 
-        successes = [r for r in results if isinstance(r, dict) and r.get("status") not in ("error", "not_connected")]
-        errors    = [r for r in results if isinstance(r, dict) and r.get("status") == "error"]
+    async def run_youtube():
+        t = token_map.get("youtube", {})
+        return await _fetch_youtube_metrics(t.get("access_token", ""))
 
-        if not successes:
-            # All accounts errored — return the first error for display
-            first_err = errors[0] if errors else {"status": "error", "error": "unknown"}
-            return first_err
-
-        merged: dict = {}
-        numeric_keys = ("views", "likes", "comments", "shares", "saves", "reach",
-                        "reactions", "followers", "following", "total_likes",
-                        "video_count", "avg_watch_seconds", "minutes_watched",
-                        "subscribers")
-        for key in numeric_keys:
-            total = sum(int(r.get(key) or 0) for r in successes if r.get(key) is not None)
-            # Only include key if at least one account had a value for it
-            if any(r.get(key) is not None for r in successes):
-                merged[key] = total
-
-        # avg_watch_seconds should be an average, not a sum
-        watch_vals = [float(r["avg_watch_seconds"]) for r in successes if r.get("avg_watch_seconds") is not None]
-        if watch_vals:
-            merged["avg_watch_seconds"] = round(sum(watch_vals) / len(watch_vals), 1)
-
-        merged["status"] = "live"
-        merged["analytics_source"] = successes[0].get("analytics_source")
-        merged["account_count"] = len(successes)
-        if errors:
-            merged["partial_errors"] = len(errors)
-        return merged
-
-    # ── Build per-platform coroutines — one per connected account ────────────
-    all_tasks: list = []   # list of (platform, coroutine)
-
-    for t in token_lists["tiktok"]:
-        all_tasks.append(("tiktok", _fetch_tiktok_metrics(t.get("access_token", ""))))
-
-    for t in token_lists["youtube"]:
-        all_tasks.append(("youtube", _fetch_youtube_metrics(
-            t.get("access_token", ""),
-            video_ids=_vid_ids["youtube"] or None,
-        )))
-
-    for t in token_lists["instagram"]:
+    async def run_instagram():
+        t = token_map.get("instagram", {})
         ig_id = (t.get("ig_user_id") or t.get("instagram_user_id") or t.get("instagram_page_id") or "")
-        all_tasks.append(("instagram", _fetch_instagram_metrics(
-            t.get("access_token", ""),
-            ig_id,
-            media_ids=_vid_ids["instagram"] or None,
-        )))
+        return await _fetch_instagram_metrics(t.get("access_token", ""), ig_id)
 
-    for t in token_lists["facebook"]:
+    async def run_facebook():
+        t = token_map.get("facebook", {})
         page_id = (t.get("page_id") or t.get("facebook_page_id") or t.get("fb_page_id") or "")
-        all_tasks.append(("facebook", _fetch_facebook_metrics(
-            t.get("access_token", ""),
-            page_id,
-            video_ids=_vid_ids["facebook"] or None,
-        )))
+        return await _fetch_facebook_metrics(t.get("access_token", ""), page_id)
 
-    # Run all account fetches concurrently
-    per_platform_raw: dict = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
-    if all_tasks:
-        plat_labels, coros = zip(*all_tasks)
-        raw_results = await _asyncio.gather(*coros, return_exceptions=True)
-        for plat, res in zip(plat_labels, raw_results):
-            if isinstance(res, Exception):
-                per_platform_raw[plat].append({"status": "error", "error": str(res)})
-            else:
-                per_platform_raw[plat].append(res)
+    tasks = {}
+    if "tiktok" in token_map:
+        tasks["tiktok"] = run_tiktok()
+    if "youtube" in token_map:
+        tasks["youtube"] = run_youtube()
+    if "instagram" in token_map:
+        tasks["instagram"] = run_instagram()
+    if "facebook" in token_map:
+        tasks["facebook"] = run_facebook()
 
-    # Merge all accounts per platform into a single result dict
     platforms_result: dict = {}
+    if tasks:
+        results = await _asyncio.gather(*tasks.values(), return_exceptions=True)
+        for plat, res in zip(tasks.keys(), results):
+            platforms_result[plat] = {"status": "error", "error": str(res)} if isinstance(res, Exception) else res
+
     for plat in ["tiktok", "youtube", "instagram", "facebook"]:
-        platforms_result[plat] = _merge_platform_results(per_platform_raw[plat])
+        if plat not in platforms_result:
+            platforms_result[plat] = {"status": "not_connected"}
         platforms_result[plat]["uploads"] = upload_map.get(plat, 0)
 
     output = {

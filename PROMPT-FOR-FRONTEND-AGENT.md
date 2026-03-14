@@ -214,3 +214,46 @@ There is already UI for this. Platform hashtags now use the **same pipeline** as
 **Test Webhook:** Use `POST /api/settings/test-discord-webhook` with body `{ "webhookUrl": "https://discord.com/api/webhooks/..." }`. Requires auth. Returns `{ "status": "sent" }` on success.
 
 **Load:** Discord webhook comes from `GET /api/settings/preferences` (as `discordWebhook`) or `GET /api/settings` (as `discord_webhook`).
+
+---
+
+## Bug Fixes (scheduled, queue, dashboard, feature guide)
+
+**Fix these issues in the frontend:**
+
+### 1. scheduled.html — Date-click modal missing
+
+**Problem:** Clicking on a calendar date that has scheduled uploads does not open a modal/popup showing those uploads.
+
+**Fix:** Add a click handler on calendar date cells. When a date has uploads (from `GET /api/scheduled/list` or similar), show a modal listing the uploads for that date. Use `scheduled_time` to match uploads to the clicked date (compare by date, ignoring time). The modal should list title, platforms, and an Edit button for each upload.
+
+---
+
+### 2. queue.html — "[object Object]" displayed on uploads
+
+**Problem:** Every upload shows `? [object Object]` or `[object Object]` somewhere in the UI.
+
+**Fix:** This happens when an object is concatenated with a string (e.g. `"?" + someObject`). Search for places that display upload data (title, status, platforms, etc.) and ensure you use a string property, e.g.:
+- `upload.title` or `upload.title ?? 'Untitled'`
+- `upload.status` (string)
+- For platforms: `Array.isArray(upload.platforms) ? upload.platforms.join(', ') : String(upload.platforms ?? '')`
+- Never use `+ obj` or `\`${obj}\`` — use `obj?.property` or `JSON.stringify(obj)` only when intentional.
+
+---
+
+### 3. dashboard.html — User not recognized (shows "User" and "Free")
+
+**Problem:** Dashboard does not recognize the logged-in user; header/nav still shows placeholder "User" and "Free" instead of actual name and plan.
+
+**Fix:** Ensure `dashboard.html` (and any shared nav/header) calls `GET /api/me` on load and populates:
+- User name: `me.name` or `me.email` (fallback)
+- Plan/tier: `me.plan?.name` or `me.subscription_tier` or `me.entitlements` — display the actual tier (e.g. "Creator Pro", "Studio"), not "Free" when the user has a paid plan.
+- Apply the same logic used on other pages (e.g. settings, queue) that correctly show the user. If there is a shared `initAuth()` or `loadUser()` function, ensure dashboard.html calls it and uses the result to update the header.
+
+---
+
+### 4. Feature guide — Disappears on some pages
+
+**Problem:** The feature guide (onboarding/tour) is not displayed on every page; it disappears on some pages.
+
+**Fix:** Ensure the feature guide component/script is included on all relevant pages (dashboard, queue, scheduled, upload, settings, etc.), or that it lives in a shared layout/nav that loads on every page. If it is page-specific, add it to each page. If it uses `localStorage` or session state to track "seen" status, ensure that logic does not incorrectly hide it on certain routes. The guide should appear consistently (or follow the same visibility rules) across all main app pages.

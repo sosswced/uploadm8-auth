@@ -1,11 +1,15 @@
 """
-UploadM8 — Phase 4a: Upload Notification Emails
-================================================
+UploadM8 — Phase 4a: Upload Notification Emails  (v2 — Enhanced Design)
+=========================================================================
   send_upload_completed_email  → upload worker: job reaches succeeded/completed status
   send_upload_failed_email     → upload worker: job reaches failed status
 
 Both respect user_preferences.email_notifications.
-Call the guard helper check_email_prefs() before firing.
+
+v2 upgrades:
+  - Both emails have preheader_text
+  - Completed: section_tag "Upload Live", metric_hero for platform count, improved badges
+  - Failed: section_tag "Upload Failed", enhanced error display
 """
 
 import logging
@@ -13,6 +17,7 @@ from .base import (
     send_email, mailgun_ready,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, stat_grid, secondary_links, alert_banner, spacer,
+    section_tag, metric_hero, divider_accent,
     GRAD_GREEN, GRAD_RED, GRAD_ORANGE,
     URL_DASHBOARD, SUPPORT_EMAIL,
 )
@@ -21,7 +26,7 @@ logger = logging.getLogger("uploadm8-worker")
 
 # Platform brand colours (used in mini-badges)
 PLATFORM_COLORS = {
-    "tiktok":    "#000000",
+    "tiktok":    "#1a1a1a",
     "youtube":   "#ff0000",
     "instagram": "#c13584",
     "facebook":  "#1877f2",
@@ -36,11 +41,12 @@ PLATFORM_NAMES = {
 
 
 def _platform_badges(platforms: list[str]) -> str:
-    """Renders small coloured platform pills."""
+    """Renders small coloured platform pills. v2: slightly larger, bolder."""
     badges = "".join(
         f'<span style="display:inline-block;background:{PLATFORM_COLORS.get(p,"#374151")};'
-        f'color:#ffffff;font-size:12px;font-weight:600;padding:4px 12px;border-radius:99px;'
-        f'margin:3px 4px;">{PLATFORM_NAMES.get(p, p.title())}</span>'
+        f'color:#ffffff;font-size:12px;font-weight:700;padding:5px 14px;border-radius:99px;'
+        f'margin:4px 5px;border:1px solid rgba(255,255,255,0.12);">'
+        f'{PLATFORM_NAMES.get(p, p.title())}</span>'
         for p in platforms
     )
     return (
@@ -84,17 +90,25 @@ async def send_upload_completed_email(
         token_stats.append(("PUT Spent", str(put_spent)))
     if aic_spent:
         token_stats.append(("AIC Spent", str(aic_spent)))
-    token_stats.append(("Platforms",    str(platform_count)))
+    token_stats.append(("Platforms", str(platform_count)))
 
     html = email_shell(
         gradient=GRAD_GREEN,
         tagline="Upload once. Publish everywhere.",
+        preheader_text=f"{filename} is live! Published to {platform_count} {platform_word} and reaching your audience now.",
         body_rows=(
-            intro_row(
+            section_tag("Upload Live &#127775;", "#16a34a")
+            + intro_row(
                 "Your upload is live! &#127775;",
                 f"<strong style='color:#ffffff;'>{filename}</strong> has been successfully "
                 f"published to <strong style='color:#22c55e;'>{platform_count} {platform_word}</strong>. "
                 "Your content is now reaching your audience.",
+            )
+            + metric_hero(
+                str(platform_count),
+                f"Platform{'s' if platform_count != 1 else ''} Live",
+                f"{filename}",
+                "#16a34a",
             )
             + _platform_badges(platforms)
             + stat_grid(*token_stats)
@@ -104,7 +118,7 @@ async def send_upload_completed_email(
         footer_note="You received this because upload email notifications are enabled on your account.",
     )
 
-    await send_email(email, f"&#127775; Your upload is live on {platform_count} {platform_word}!", html)
+    await send_email(email, f"🌟 Your upload is live on {platform_count} {platform_word}!", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,18 +148,25 @@ async def send_upload_failed_email(
     html = email_shell(
         gradient=GRAD_RED,
         tagline="Upload once. Publish everywhere.",
+        preheader_text=f"Upload failed: {filename} could not be published. Your tokens have been refunded.",
         body_rows=(
-            intro_row(
+            section_tag("Upload Failed", "#ef4444")
+            + intro_row(
                 "Upload failed &#10060;",
                 f"Unfortunately, <strong style='color:#ffffff;'>{filename}</strong> "
                 f"could not be published. The error occurred during the "
                 f"<strong style='color:#f87171;'>{stage_label}</strong> stage.",
             )
             + tinted_box(
-                f'<p style="margin:0 0 6px;color:#6b7280;font-size:11px;text-transform:uppercase;'
-                f'letter-spacing:1px;">Error Details</p>'
-                f'<p style="margin:0;color:#f87171;font-size:14px;line-height:1.6;'
-                f'font-family:monospace;">{reason_display}</p>',
+                f'<p style="margin:0 0 6px;color:#6b7280;font-size:10px;text-transform:uppercase;'
+                f'letter-spacing:1.2px;font-weight:600;">Error Details</p>'
+                f'<p style="margin:0;color:#f87171;font-size:14px;line-height:1.65;'
+                f'font-family:\'Courier New\',Courier,monospace;">{reason_display}</p>'
+                + (
+                    f'<p style="margin:10px 0 0;color:#6b7280;font-size:12px;">'
+                    f'Upload ID: <code style="color:#f97316;">{upload_id}</code></p>'
+                    if upload_id else ""
+                ),
                 hex_color="#ef4444",
             )
             + check_list(
@@ -156,7 +177,7 @@ async def send_upload_failed_email(
             )
             + cta_button("Retry Upload", URL_DASHBOARD, pt="4px", pb="20px")
             + tinted_box(
-                f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.6;">'
+                f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.65;">'
                 f'If this keeps happening, contact us at '
                 f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
                 f'{SUPPORT_EMAIL}</a> with your upload ID: '
@@ -168,4 +189,4 @@ async def send_upload_failed_email(
         footer_note="You received this because upload email notifications are enabled on your account.",
     )
 
-    await send_email(email, f"&#10060; Upload failed — {filename}", html)
+    await send_email(email, f"❌ Upload failed — {filename}", html)

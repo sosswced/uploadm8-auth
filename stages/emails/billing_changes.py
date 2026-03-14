@@ -1,12 +1,15 @@
 """
-UploadM8 — Phase 3: Billing Change Emails
-==========================================
+UploadM8 — Phase 3: Billing Change Emails  (v2 — Enhanced Design)
+==================================================================
   send_plan_upgraded_email    → customer.subscription.updated (tier went up)
   send_plan_downgraded_email  → customer.subscription.updated (tier went down)
   send_topup_receipt_email    → checkout.session.completed (mode=payment / token top-up)
 
-app.py fires customer.subscription.updated but sends zero emails today.
-The top-up checkout fires but also sends nothing. All three are filled here.
+v2 upgrades:
+  - All emails have preheader_text
+  - Plan upgraded: section_tag "Upgrade Complete", metric_hero for new plan name
+  - Plan downgraded: section_tag "Plan Updated", cleaner plan_change_visual
+  - Top-up receipt: section_tag "Tokens Added", metric_hero for token count
 """
 
 import logging
@@ -15,6 +18,7 @@ from .base import (
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, stat_grid, secondary_links, plan_change_visual,
     receipt_row, spacer,
+    section_tag, metric_hero, divider_accent,
     GRAD_GREEN, GRAD_ORANGE, GRAD_PURPLE,
     URL_DASHBOARD, URL_BILLING, URL_PRICING, URL_SETTINGS,
     SUPPORT_EMAIL,
@@ -50,8 +54,10 @@ async def send_plan_upgraded_email(
     html = email_shell(
         gradient=GRAD_GREEN,
         tagline="More power, more platforms, more reach",
+        preheader_text=f"You're now on {new_plan}! Upgraded from {old_plan} — effective immediately.",
         body_rows=(
-            intro_row(
+            section_tag("Upgrade Complete &#128640;", "#16a34a")
+            + intro_row(
                 f"You've upgraded to {new_plan}! &#128640;",
                 f"Excellent move, {name}. Your account has been upgraded from "
                 f"<strong style='color:#9ca3af;'>{old_plan}</strong> to "
@@ -79,7 +85,7 @@ async def send_plan_upgraded_email(
         footer_note="You received this because your UploadM8 subscription was upgraded.",
     )
 
-    await send_email(email, f"You're now on {new_plan} — welcome to the upgrade! &#128640;", html)
+    await send_email(email, f"You're now on {new_plan} — welcome to the upgrade! 🚀", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,8 +101,7 @@ async def send_plan_downgraded_email(
 ) -> None:
     """
     Fires when customer.subscription.updated shows the new tier is lower.
-    Downgrade typically takes effect at the end of the current billing period
-    in Stripe — pass effective_date so the user knows exactly when.
+    Downgrade typically takes effect at end of current billing period in Stripe.
     """
     if not mailgun_ready():
         return
@@ -108,8 +113,10 @@ async def send_plan_downgraded_email(
     html = email_shell(
         gradient=GRAD_ORANGE,
         tagline="Your plan has been updated",
+        preheader_text=f"Your plan has been updated from {old_plan} to {new_plan}, effective {eff_date}.",
         body_rows=(
-            intro_row(
+            section_tag("Plan Updated", "#f97316")
+            + intro_row(
                 f"Plan changed to {new_plan}, {name}",
                 f"Your subscription has been moved from "
                 f"<strong style='color:#f97316;'>{old_plan}</strong> to "
@@ -124,7 +131,7 @@ async def send_plan_downgraded_email(
                 ("Effective",     eff_date),
             )
             + tinted_box(
-                '<p style="margin:0 0 8px;color:#ffffff;font-size:15px;font-weight:600;">'
+                '<p style="margin:0 0 8px;color:#ffffff;font-size:15px;font-weight:700;">'
                 'Thinking of upgrading again?</p>'
                 '<p style="margin:0;color:#9ca3af;font-size:14px;line-height:1.65;">'
                 'You can switch back any time — upgrades take effect immediately. '
@@ -181,11 +188,19 @@ async def send_topup_receipt_email(
     html = email_shell(
         gradient=GRAD_PURPLE,
         tagline="Your token wallet has been topped up",
+        preheader_text=f"+{tokens_added:,} {wt_short} tokens added to your wallet. Ready to use immediately.",
         body_rows=(
-            intro_row(
+            section_tag(f"+ {tokens_added:,} {wt_short} Tokens Added", "#7c3aed")
+            + intro_row(
                 f"Top-up confirmed, {name}! &#128176;",
                 f"<strong style='color:#a78bfa;'>+{tokens_added:,} {wt_short}</strong> tokens have been "
                 "added to your wallet and are ready to use immediately.",
+            )
+            + metric_hero(
+                f"+{tokens_added:,}",
+                f"{wt_short} Tokens Added",
+                "available in your wallet right now",
+                "#7c3aed",
             )
             + tinted_box(receipt_lines, hex_color="#7c3aed")
             + cta_button("Start Uploading", URL_DASHBOARD, pt="20px", pb="20px")
@@ -197,4 +212,4 @@ async def send_topup_receipt_email(
         footer_note="You received this because a token top-up payment was processed on your account.",
     )
 
-    await send_email(email, f"UploadM8 top-up confirmed — +{tokens_added:,} {wt_short} tokens &#128176;", html)
+    await send_email(email, f"UploadM8 top-up confirmed — +{tokens_added:,} {wt_short} tokens 💰", html)

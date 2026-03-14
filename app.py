@@ -6561,21 +6561,12 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
 
 
 
-async def _fetch_youtube_metrics(access_token: str, video_ids: list = None) -> dict:
-    """
-    YouTube Data API v3 + (optional) YouTube Analytics API.
-
-    When video_ids is provided (YouTube video IDs uploaded via UploadM8),
-    stats are scoped to ONLY those Shorts — views/likes/comments come from
-    videos.list?part=statistics rather than the whole channel.
-    Subscriber count always comes from the channel API regardless.
-    Falls back to channel-level analytics when no video_ids are available.
-    """
+async def _fetch_youtube_metrics(access_token: str) -> dict:
+    """YouTube Data API v3 + (optional) YouTube Analytics API."""
     if not access_token:
         return {"status": "not_connected"}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            # Always fetch channel-level stats for subscriber count
             ch = await client.get(
                 "https://www.googleapis.com/youtube/v3/channels",
                 params={"part": "statistics", "mine": "true"},
@@ -6584,167 +6575,101 @@ async def _fetch_youtube_metrics(access_token: str, video_ids: list = None) -> d
             if ch.status_code != 200:
                 return {"status": "error", "error": f"HTTP {ch.status_code}"}
 
-            ch_items = ch.json().get("items", []) or []
-            ch_stats = ch_items[0].get("statistics", {}) if ch_items else {}
-            subscribers = int(ch_stats.get("subscriberCount", 0)) if "subscriberCount" in ch_stats else 0
+            items = ch.json().get("items", []) or []
+            stats = items[0].get("statistics", {}) if items else {}
 
             views = likes = comments = shares = 0
             avg_watch = minutes_watched = None
-            video_count = 0
             analytics_source = "channel_stats_fallback"
-
-            # ── Path A: per-video stats for UploadM8-published Shorts ────────
-            if video_ids:
-                video_count = len(video_ids)
-                # videos.list accepts up to 50 IDs per request
-                chunks = [video_ids[i:i+50] for i in range(0, min(len(video_ids), 200), 50)]
-                for chunk in chunks:
-                    vr = await client.get(
-                        "https://www.googleapis.com/youtube/v3/videos",
-                        params={"part": "statistics", "id": ",".join(chunk)},
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
-                    if vr.status_code == 200:
-                        for item in vr.json().get("items", []) or []:
-                            st = item.get("statistics", {})
-                            views    += int(st.get("viewCount",    0) or 0)
-                            likes    += int(st.get("likeCount",    0) or 0)
-                            comments += int(st.get("commentCount", 0) or 0)
-                        analytics_source = "yt-video-ids"
-
-                # Try Analytics API filtered to these video IDs for avg watch time
-                try:
-                    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    thirty = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-                    filter_ids = ",".join(video_ids[:200])
-                    an = await client.get(
-                        "https://youtubeanalytics.googleapis.com/v2/reports",
-                        params={
-                            "ids":       "channel==MINE",
-                            "startDate": thirty,
-                            "endDate":   today,
-                            "dimensions": "video",
-                            # rows: [video_id, views, likes, comments, shares, avgDuration, minutesWatched]
-                            "metrics":   "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
-                            "filters":   f"video=={filter_ids}",
-                        },
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
-                    if an.status_code == 200:
-                        rows = an.json().get("rows", []) or []
-                        if rows:
-                            dur_vals        = [float(r[5]) for r in rows if r[5]]
-                            avg_watch       = round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else None
-                            minutes_watched = int(sum(float(r[6] or 0) for r in rows))
-                            analytics_source = "yt-analytics+video-ids"
-                except Exception as ae:
-                    logger.warning(f"YouTube Analytics (video filter) error (non-fatal): {ae}")
-
-            # ── Path B: channel-level fallback when no uploads recorded ──────
-            else:
-                video_count = int(ch_stats.get("videoCount", 0)) if "videoCount" in ch_stats else 0
-                try:
-                    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    thirty = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-                    an = await client.get(
-                        "https://youtubeanalytics.googleapis.com/v2/reports",
-                        params={
-                            "ids":        "channel==MINE",
-                            "startDate":  thirty,
-                            "endDate":    today,
-                            # dimensions=day locks column order: [0]=day [1]=views [2]=likes
-                            # [3]=comments [4]=shares [5]=avgDuration [6]=minutesWatched
-                            "dimensions": "day",
-                            "metrics":    "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
-                            "sort":       "day",
-                        },
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
-                    if an.status_code == 200:
-                        rows = an.json().get("rows", []) or []
-                        if rows:
-                            views           = sum(int(r[1] or 0) for r in rows)
-                            likes           = sum(int(r[2] or 0) for r in rows)
-                            comments        = sum(int(r[3] or 0) for r in rows)
-                            shares          = sum(int(r[4] or 0) for r in rows)
-                            dur_vals        = [float(r[5]) for r in rows if r[5]]
-                            avg_watch       = round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else None
-                            minutes_watched = int(sum(float(r[6] or 0) for r in rows))
-                            analytics_source = "yt-analytics"
-                        else:
-                            views    = int(ch_stats.get("viewCount",    0))
-                            likes    = int(ch_stats.get("likeCount",    0)) if "likeCount"    in ch_stats else 0
-                            comments = int(ch_stats.get("commentCount", 0)) if "commentCount" in ch_stats else 0
-                    elif an.status_code == 403:
-                        logger.warning("YouTube Analytics 403 — yt-analytics.readonly missing; user must reconnect")
-                        views    = int(ch_stats.get("viewCount",    0))
-                        likes    = int(ch_stats.get("likeCount",    0)) if "likeCount"    in ch_stats else 0
-                        comments = int(ch_stats.get("commentCount", 0)) if "commentCount" in ch_stats else 0
+            try:
+                today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                thirty = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+                an = await client.get(
+                    "https://youtubeanalytics.googleapis.com/v2/reports",
+                    params={
+                        "ids":        "channel==MINE",
+                        "startDate":  thirty,
+                        "endDate":    today,
+                        # dimensions=day locks column order: [0]=day [1]=views [2]=likes
+                        # [3]=comments [4]=shares [5]=avgDuration [6]=minutesWatched
+                        # Without it r[0] returns a date string, not view count
+                        "dimensions": "day",
+                        "metrics":    "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
+                        "sort":       "day",
+                    },
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if an.status_code == 200:
+                    rows = an.json().get("rows", []) or []
+                    if rows:
+                        views           = sum(int(r[1] or 0) for r in rows)
+                        likes           = sum(int(r[2] or 0) for r in rows)
+                        comments        = sum(int(r[3] or 0) for r in rows)
+                        shares          = sum(int(r[4] or 0) for r in rows)
+                        dur_vals        = [float(r[5]) for r in rows if r[5]]
+                        avg_watch       = round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else None
+                        minutes_watched = int(sum(float(r[6] or 0) for r in rows))
+                        analytics_source = "yt-analytics"
                     else:
-                        views    = int(ch_stats.get("viewCount",    0))
-                        likes    = int(ch_stats.get("likeCount",    0)) if "likeCount"    in ch_stats else 0
-                        comments = int(ch_stats.get("commentCount", 0)) if "commentCount" in ch_stats else 0
-                except Exception as ae:
-                    logger.warning(f"YouTube Analytics error (non-fatal): {ae}")
-                    views    = int(ch_stats.get("viewCount",    0))
-                    likes    = int(ch_stats.get("likeCount",    0)) if "likeCount"    in ch_stats else 0
-                    comments = int(ch_stats.get("commentCount", 0)) if "commentCount" in ch_stats else 0
+                        views    = int(stats.get("viewCount",    0))
+                        likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
+                        comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+                elif an.status_code == 403:
+                    logger.warning("YouTube Analytics 403 — yt-analytics.readonly missing from token; user must reconnect")
+                    views    = int(stats.get("viewCount",    0))
+                    likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
+                    comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+                else:
+                    views    = int(stats.get("viewCount",    0))
+                    likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
+                    comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+            except Exception as ae:
+                logger.warning(f"YouTube Analytics error (non-fatal): {ae}")
+                views    = int(stats.get("viewCount",    0))
+                likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
+                comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
 
             return {
-                "status":            "live",
-                "analytics_source":  analytics_source,
-                "views":             views,
-                "likes":             likes,
-                "comments":          comments,
-                "shares":            shares,
-                "subscribers":       subscribers,
+                "status": "live",
+                "analytics_source": analytics_source,
+                "views":           views,
+                "likes":           likes,
+                "comments":        comments,
+                "shares":          shares,
+                "subscribers":     int(stats.get("subscriberCount", 0)) if "subscriberCount" in stats else 0,
                 "avg_watch_seconds": avg_watch,
-                "minutes_watched":   minutes_watched,
-                "video_count":       video_count,
+                "minutes_watched": minutes_watched,
+                "video_count":     int(stats.get("videoCount", 0)) if "videoCount" in stats else 0,
             }
     except Exception as e:
         logger.error(f"YouTube metrics error: {e}")
         return {"status": "error", "error": str(e)}
 
 
-async def _fetch_instagram_metrics(access_token: str, ig_user_id: str, media_ids: list = None) -> dict:
-    """
-    Instagram Graph API — Reels insights.
-
-    When media_ids is provided (IG media IDs published via UploadM8),
-    only those specific Reels are queried for insights.
-    Falls back to the most recent 10 Reels/Videos when no IDs are available.
-    """
+async def _fetch_instagram_metrics(access_token: str, ig_user_id: str) -> dict:
+    """Instagram Graph API — Reels insights."""
     if not access_token or not ig_user_id:
         return {"status": "not_connected"}
     try:
         async with httpx.AsyncClient(timeout=25) as client:
+            media = await client.get(
+                f"https://graph.facebook.com/v21.0/{ig_user_id}/media",
+                params={"access_token": access_token, "fields": "id,media_type,timestamp", "limit": 20},
+            )
+            if media.status_code != 200:
+                return {"status": "error", "error": f"HTTP {media.status_code}"}
 
-            # ── Build the list of items to fetch insights for ────────────────
-            if media_ids:
-                # Query only UploadM8-published Reels by their stored media IDs
-                items = [{"id": mid, "media_type": "REELS"} for mid in media_ids[:20]]
-            else:
-                # Fallback: fetch recent media from the account
-                media = await client.get(
-                    f"https://graph.facebook.com/v21.0/{ig_user_id}/media",
-                    params={"access_token": access_token, "fields": "id,media_type,timestamp", "limit": 20},
-                )
-                if media.status_code != 200:
-                    return {"status": "error", "error": f"HTTP {media.status_code}"}
-                items = media.json().get("data", []) or []
-                if not items:
-                    return {"status": "live", "views": 0, "likes": 0, "comments": 0,
-                            "saves": 0, "reach": 0, "shares": 0, "video_count": 0,
-                            "analytics_source": None}
+            items = media.json().get("data", []) or []
+            if not items:
+                return {"status": "live", "views": 0, "likes": 0, "comments": 0, "saves": 0, "reach": 0, "shares": 0, "video_count": 0}
 
             total_views = total_likes = total_comments = 0
             total_saves = total_reach = total_shares = 0
-            analytics_source = None
 
+            analytics_source = None
             for item in items[:10]:
-                media_type = (item.get("media_type") or "REELS").upper()
-                # "plays" metric on IMAGE/CAROUSEL kills the insights call silently
+                media_type = (item.get("media_type") or "IMAGE").upper()
+                # "plays" on IMAGE/CAROUSEL silently kills the insights call
                 if media_type in ("VIDEO", "REELS"):
                     metric_str = "plays,reach,saved,shares,comments,likes"
                     view_key   = "plays"
@@ -6774,93 +6699,45 @@ async def _fetch_instagram_metrics(access_token: str, ig_user_id: str, media_ids
                     elif name == "shares":     total_shares   += val
 
             return {
-                "status":           "live",
+                "status": "live",
                 "analytics_source": analytics_source,
-                "views":            total_views,
-                "likes":            total_likes,
-                "comments":         total_comments,
-                "saves":            total_saves,
-                "reach":            total_reach,
-                "shares":           total_shares,
-                "video_count":      len(items),
+                "views":    total_views,
+                "likes":    total_likes,
+                "comments": total_comments,
+                "saves":    total_saves,
+                "reach":    total_reach,
+                "shares":   total_shares,
+                "video_count": len(items),
             }
     except Exception as e:
         logger.error(f"Instagram metrics error: {e}")
         return {"status": "error", "error": str(e)}
 
 
-async def _fetch_facebook_metrics(access_token: str, page_id: str, video_ids: list = None) -> dict:
-    """
-    Facebook Graph API — Page Reels insights.
-
-    Uses the /{page_id}/reels endpoint (not /videos) since UploadM8 publishes
-    Facebook Reels, not standard Page video posts.
-    When video_ids is provided (Reel IDs published via UploadM8), only those
-    are queried. Falls back to the most recent 10 Reels from the Page.
-    """
+async def _fetch_facebook_metrics(access_token: str, page_id: str) -> dict:
+    """Facebook Graph API — Page video insights."""
     if not access_token or not page_id:
         return {"status": "not_connected"}
     try:
         async with httpx.AsyncClient(timeout=25) as client:
+            vids = await client.get(
+                f"https://graph.facebook.com/v21.0/{page_id}/videos",
+                params={"access_token": access_token, "fields": "id,created_time", "limit": 15},
+            )
+            if vids.status_code != 200:
+                return {"status": "error", "error": f"HTTP {vids.status_code}"}
 
-            # ── Build the list of Reel IDs to fetch insights for ────────────
-            if video_ids:
-                reels = [{"id": vid} for vid in video_ids[:15]]
-            else:
-                # Use the Reels endpoint — not /videos — since UploadM8 publishes Reels
-                reels_resp = await client.get(
-                    f"https://graph.facebook.com/v21.0/{page_id}/reels",
-                    params={"access_token": access_token, "fields": "id,created_time", "limit": 15},
-                )
-                if reels_resp.status_code == 200:
-                    reels = reels_resp.json().get("data", []) or []
-                else:
-                    # Graceful fallback: /reels may require additional permissions
-                    # Try /video_reels as an alternative endpoint
-                    vr_resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{page_id}/video_reels",
-                        params={"access_token": access_token, "fields": "id,created_time", "limit": 15},
-                    )
-                    if vr_resp.status_code == 200:
-                        reels = vr_resp.json().get("data", []) or []
-                    else:
-                        # Last resort fallback to /videos
-                        logger.warning(
-                            f"Facebook /reels HTTP {reels_resp.status_code} and "
-                            f"/video_reels HTTP {vr_resp.status_code} — falling back to /videos"
-                        )
-                        vids_resp = await client.get(
-                            f"https://graph.facebook.com/v21.0/{page_id}/videos",
-                            params={"access_token": access_token, "fields": "id,created_time", "limit": 15},
-                        )
-                        if vids_resp.status_code != 200:
-                            return {"status": "error", "error": f"HTTP {vids_resp.status_code}"}
-                        reels = vids_resp.json().get("data", []) or []
-
-            if not reels:
-                # Still fetch followers even if no reels yet
-                followers = 0
-                try:
-                    pg = await client.get(
-                        f"https://graph.facebook.com/v21.0/{page_id}",
-                        params={"access_token": access_token, "fields": "followers_count,fan_count"},
-                    )
-                    if pg.status_code == 200:
-                        pd = pg.json()
-                        followers = pd.get("followers_count") or pd.get("fan_count") or 0
-                except Exception:
-                    pass
-                return {"status": "live", "views": 0, "reactions": 0, "comments": 0,
-                        "shares": 0, "followers": followers, "video_count": 0,
-                        "analytics_source": None}
+            videos = vids.json().get("data", []) or []
+            if not videos:
+                return {"status": "live", "views": 0, "reactions": 0, "comments": 0, "shares": 0, "followers": 0, "video_count": 0}
 
             total_views = total_reactions = total_comments = total_shares = 0
-            analytics_source = None
 
-            for reel in reels[:10]:
+            analytics_source = None
+            for vid in videos[:10]:
                 try:
                     ins = await client.get(
-                        f"https://graph.facebook.com/v21.0/{reel['id']}",
+                        f"https://graph.facebook.com/v21.0/{vid['id']}",
                         params={
                             "access_token": access_token,
                             "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_shares,total_video_comments)",
@@ -6868,7 +6745,7 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str, video_ids: li
                     )
                     if ins.status_code != 200:
                         continue
-                    analytics_source = "read_insights+reels_endpoint"
+                    analytics_source = "read_insights+pages_read_engagement"
                     for m in ins.json().get("insights", {}).get("data", []) or []:
                         name = m.get("name", "")
                         vals = m.get("values", [{}])
@@ -6881,7 +6758,7 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str, video_ids: li
                         elif name == "total_video_shares":                   total_shares    += val
                         elif name == "total_video_comments":                 total_comments  += val
                 except Exception as ve:
-                    logger.warning(f"Facebook reel insight error for {reel.get('id')} (skipping): {ve}")
+                    logger.warning(f"Facebook video insight error for {vid.get('id')} (skipping): {ve}")
                     continue
 
             followers = 0
@@ -6897,14 +6774,14 @@ async def _fetch_facebook_metrics(access_token: str, page_id: str, video_ids: li
                 logger.warning(f"Facebook followers fetch error (non-fatal): {fe}")
 
             return {
-                "status":           "live",
+                "status": "live",
                 "analytics_source": analytics_source,
-                "views":            total_views,
-                "reactions":        total_reactions,
-                "comments":         total_comments,
-                "shares":           total_shares,
-                "followers":        followers,
-                "video_count":      len(reels),
+                "views":     total_views,
+                "reactions": total_reactions,
+                "comments":  total_comments,
+                "shares":    total_shares,
+                "followers": followers,
+                "video_count": len(videos),
             }
     except Exception as e:
         logger.error(f"Facebook metrics error: {e}")
@@ -6953,7 +6830,8 @@ async def _platform_metrics_db_cache_set(conn, user_id: str, output: dict) -> No
 @app.get("/api/analytics/platform-metrics")
 async def get_platform_metrics(force: bool = False, user: dict = Depends(get_current_user)):
     """
-    Fetch live engagement metrics from all connected platform APIs.
+    Fetch live engagement metrics from ALL connected platform accounts.
+    Aggregates across every connected account per platform (not just the last one).
     Cached 3 hours per user (memory + DB). Pass ?force=true to bypass cache.
     """
     user_id = str(user["id"])
@@ -6979,7 +6857,10 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
             return db_cached
 
         token_rows = await conn.fetch(
-            "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            """SELECT platform, token_blob, account_id, account_name
+               FROM platform_tokens
+               WHERE user_id = $1 AND revoked_at IS NULL
+               ORDER BY platform, created_at ASC""",
             user["id"],
         )
         upload_counts = await conn.fetch(
@@ -6989,7 +6870,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
                GROUP BY platform""",
             user["id"],
         )
-        # Pull platform_results so we can scope metrics to UploadM8-published content only
+        # Pull platform_results to scope metrics to UploadM8-published content only
         pr_rows = await conn.fetch(
             """SELECT platform_results FROM uploads
                WHERE user_id = $1 AND status IN ('succeeded', 'completed', 'partial')
@@ -6999,7 +6880,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
 
     upload_map = {r["platform"]: r["cnt"] for r in upload_counts}
 
-    # Build per-platform lists of video IDs that UploadM8 actually published
+    # Build per-platform lists of video IDs UploadM8 actually published
     _vid_ids: dict = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
     for row in pr_rows:
         pr = _safe_json(row["platform_results"], [])
@@ -7011,7 +6892,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
             if plat not in _vid_ids:
                 continue
             vid = (
-                entry.get("platform_video_id")  # canonical worker field
+                entry.get("platform_video_id")
                 or entry.get("video_id") or entry.get("videoId")
                 or entry.get("media_id") or entry.get("post_id")
                 or entry.get("share_id") or entry.get("reel_id")
@@ -7019,71 +6900,116 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
             if vid and str(vid) not in _vid_ids[plat]:
                 _vid_ids[plat].append(str(vid))
 
-    token_map: dict = {}
+    # Build per-platform list of ALL decrypted tokens (one entry per connected account)
+    # Previous code used token_map[plat] = decrypted which silently dropped all but
+    # the last account. Now we keep every account in a list.
+    token_lists: dict = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
     for row in token_rows:
         plat = row["platform"]
+        if plat not in token_lists:
+            continue
         blob = row["token_blob"]
         if not blob:
             continue
         try:
             decrypted = decrypt_blob(blob)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"platform_metrics: decrypt failed for {plat} account={row['account_id']}: {e}")
             continue
-        if decrypted:
-            if plat == "instagram" and not decrypted.get("ig_user_id") and row["account_id"]:
-                decrypted["ig_user_id"] = str(row["account_id"])
-            if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
-                decrypted["page_id"] = str(row["account_id"])
-            token_map[plat] = decrypted
+        if not decrypted:
+            continue
+        # Ensure platform-specific IDs are present in the token
+        if plat == "instagram" and not decrypted.get("ig_user_id") and row["account_id"]:
+            decrypted["ig_user_id"] = str(row["account_id"])
+        if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
+            decrypted["page_id"] = str(row["account_id"])
+        decrypted["_account_name"] = row["account_name"] or row["account_id"] or plat
+        token_lists[plat].append(decrypted)
 
-    async def run_tiktok():
-        t = token_map.get("tiktok", {})
-        return await _fetch_tiktok_metrics(t.get("access_token", ""))
+    # ── Helper: merge multiple account results into one aggregated dict ──────
+    def _merge_platform_results(results: list) -> dict:
+        """
+        Takes a list of per-account result dicts and sums numeric fields.
+        Status is 'live' if any account succeeded, 'error' only if all failed.
+        analytics_source is taken from the first successful result.
+        """
+        if not results:
+            return {"status": "not_connected"}
 
-    async def run_youtube():
-        t = token_map.get("youtube", {})
-        return await _fetch_youtube_metrics(
+        successes = [r for r in results if isinstance(r, dict) and r.get("status") not in ("error", "not_connected")]
+        errors    = [r for r in results if isinstance(r, dict) and r.get("status") == "error"]
+
+        if not successes:
+            # All accounts errored — return the first error for display
+            first_err = errors[0] if errors else {"status": "error", "error": "unknown"}
+            return first_err
+
+        merged: dict = {}
+        numeric_keys = ("views", "likes", "comments", "shares", "saves", "reach",
+                        "reactions", "followers", "following", "total_likes",
+                        "video_count", "avg_watch_seconds", "minutes_watched",
+                        "subscribers")
+        for key in numeric_keys:
+            total = sum(int(r.get(key) or 0) for r in successes if r.get(key) is not None)
+            # Only include key if at least one account had a value for it
+            if any(r.get(key) is not None for r in successes):
+                merged[key] = total
+
+        # avg_watch_seconds should be an average, not a sum
+        watch_vals = [float(r["avg_watch_seconds"]) for r in successes if r.get("avg_watch_seconds") is not None]
+        if watch_vals:
+            merged["avg_watch_seconds"] = round(sum(watch_vals) / len(watch_vals), 1)
+
+        merged["status"] = "live"
+        merged["analytics_source"] = successes[0].get("analytics_source")
+        merged["account_count"] = len(successes)
+        if errors:
+            merged["partial_errors"] = len(errors)
+        return merged
+
+    # ── Build per-platform coroutines — one per connected account ────────────
+    all_tasks: list = []   # list of (platform, coroutine)
+
+    for t in token_lists["tiktok"]:
+        all_tasks.append(("tiktok", _fetch_tiktok_metrics(t.get("access_token", ""))))
+
+    for t in token_lists["youtube"]:
+        all_tasks.append(("youtube", _fetch_youtube_metrics(
             t.get("access_token", ""),
             video_ids=_vid_ids["youtube"] or None,
-        )
+        )))
 
-    async def run_instagram():
-        t = token_map.get("instagram", {})
+    for t in token_lists["instagram"]:
         ig_id = (t.get("ig_user_id") or t.get("instagram_user_id") or t.get("instagram_page_id") or "")
-        return await _fetch_instagram_metrics(
+        all_tasks.append(("instagram", _fetch_instagram_metrics(
             t.get("access_token", ""),
             ig_id,
             media_ids=_vid_ids["instagram"] or None,
-        )
+        )))
 
-    async def run_facebook():
-        t = token_map.get("facebook", {})
+    for t in token_lists["facebook"]:
         page_id = (t.get("page_id") or t.get("facebook_page_id") or t.get("fb_page_id") or "")
-        return await _fetch_facebook_metrics(
+        all_tasks.append(("facebook", _fetch_facebook_metrics(
             t.get("access_token", ""),
             page_id,
             video_ids=_vid_ids["facebook"] or None,
-        )
+        )))
 
-    tasks = {}
-    if "tiktok" in token_map:
-        tasks["tiktok"] = run_tiktok()
-    if "youtube" in token_map:
-        tasks["youtube"] = run_youtube()
-    if "instagram" in token_map:
-        tasks["instagram"] = run_instagram()
-    if "facebook" in token_map:
-        tasks["facebook"] = run_facebook()
+    # Run all account fetches concurrently
+    per_platform_raw: dict = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+    if all_tasks:
+        plat_labels, coros = zip(*all_tasks)
+        raw_results = await _asyncio.gather(*coros, return_exceptions=True)
+        for plat, res in zip(plat_labels, raw_results):
+            if isinstance(res, Exception):
+                per_platform_raw[plat].append({"status": "error", "error": str(res)})
+            else:
+                per_platform_raw[plat].append(res)
 
+    # Merge all accounts per platform into a single result dict
     platforms_result: dict = {}
-    if tasks:
-        results = await _asyncio.gather(*tasks.values(), return_exceptions=True)
-        for plat, res in zip(tasks.keys(), results):
-            platforms_result[plat] = {"status": "error", "error": str(res)} if isinstance(res, Exception) else res
-
     for plat in ["tiktok", "youtube", "instagram", "facebook"]:
-        if plat not in platforms_result:
-            platforms_result[plat] = {"status": "not_connected"}
+        platforms_result[plat] = _merge_platform_results(per_platform_raw[plat])
         platforms_result[plat]["uploads"] = upload_map.get(plat, 0)
 
     output = {

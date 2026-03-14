@@ -238,9 +238,23 @@ uploadm8-complete-v3/
 
 ### Admin
 - `GET /api/admin/users`
-- `GET /api/admin/kpis`
+- `GET /api/admin/kpis?range=24h|7d|30d|90d|6m|1y` - All KPIs (cost, revenue, funnels)
+- `POST /api/admin/kpi/refresh` - Manually trigger cost/revenue sync from external APIs
 - `GET /api/admin/leaderboard`
 - `GET /api/admin/countries`
+
+### KPI Data Collector (Worker)
+
+The worker runs a KPI collector every 30 minutes (configurable via `KPI_COLLECTOR_INTERVAL_SECONDS`). It fetches cost/revenue from external APIs and posts to `cost_tracking`:
+
+| Env Key | Purpose |
+|---------|---------|
+| `STRIPE_SECRET_KEY` | Stripe fees (balance transactions) |
+| `OPENAI_API_KEY` | OpenAI usage/cost (if Usage API enabled) |
+| `MAILGUN_API_KEY` + `MAILGUN_DOMAIN` | Email delivery stats → cost estimate |
+| `RENDER_MONTHLY_COST` | Postgres cost (prorated) |
+| `UPSTASH_API_KEY` + `UPSTASH_DB_ID` | Redis usage → cost estimate |
+| `CF_API_TOKEN` + `R2_ACCOUNT_ID` | Cloudflare R2 storage/bandwidth (optional) |
 
 ## Contact
 

@@ -767,16 +767,13 @@ async def load_pending_verifications(pool: asyncpg.Pool, limit: int = 50) -> Lis
 # ============================================================
 
 async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
-    """Load admin Discord webhook URL from settings."""
+    """Load admin Discord webhook URL from admin_settings.settings_json (notifications.admin_webhook_url)."""
     try:
         async with pool.acquire() as conn:
-            try:
-                val = await conn.fetchval(
-                    "SELECT value FROM admin_settings WHERE key = 'discord_webhook_url'"
-                )
-                return str(val) if val else None
-            except asyncpg.exceptions.UndefinedTableError:
-                return None
+            val = await conn.fetchval(
+                "SELECT settings_json->'notifications'->>'admin_webhook_url' FROM admin_settings WHERE id = 1"
+            )
+            return str(val).strip() if val else None
     except Exception:
         return None
 

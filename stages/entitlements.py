@@ -50,6 +50,11 @@ MAX THUMBNAILS:
   Number of candidate thumbnail frames generated per video.
   The sharpest frame is auto-selected; all candidates stored for user pick.
   Free = 1 (single frame). Agency/internal = 20 (dense scan, best quality).
+
+MAX PARALLEL UPLOADS:
+  Plan-based cap for parallel batch upload mode (upload.html).
+  Sequential mode always uses 1. Parallel mode uses min(selected, this cap).
+  Free = 1, Creator Lite = 2, Creator Pro = 3, Studio = 4, Agency = 5, internal = 6.
 """
 
 from __future__ import annotations
@@ -73,7 +78,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p4", "queue_depth": 25, "lookahead_hours": 2,
         "max_caption_frames": 3, "ai_depth": "basic",
         "team_seats": 1, "analytics": "basic",
-        "max_thumbnails": 1,
+        "max_thumbnails": 1, "max_parallel_uploads": 1,
         "trial_days": 0,
     },
 
@@ -87,7 +92,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p3", "queue_depth": 500, "lookahead_hours": 12,
         "max_caption_frames": 5, "ai_depth": "enhanced",
         "team_seats": 1, "analytics": "standard",
-        "max_thumbnails": 3,
+        "max_thumbnails": 3, "max_parallel_uploads": 2,
         "trial_days": 7,
     },
 
@@ -101,7 +106,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p2", "queue_depth": 5000, "lookahead_hours": 24,
         "max_caption_frames": 8, "ai_depth": "advanced",
         "team_seats": 3, "analytics": "full",
-        "max_thumbnails": 5,
+        "max_thumbnails": 5, "max_parallel_uploads": 3,
         "trial_days": 7,
     },
 
@@ -115,7 +120,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p1", "queue_depth": 25000, "lookahead_hours": 48,
         "max_caption_frames": 15, "ai_depth": "max",
         "team_seats": 10, "analytics": "full_export",
-        "max_thumbnails": 10,
+        "max_thumbnails": 10, "max_parallel_uploads": 4,
         "trial_days": 7,
     },
 
@@ -129,7 +134,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
         "max_caption_frames": 15, "ai_depth": "max",
         "team_seats": 25, "analytics": "full_export",
-        "max_thumbnails": 15,
+        "max_thumbnails": 15, "max_parallel_uploads": 5,
         "trial_days": 7,
     },
 
@@ -143,7 +148,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 999, "analytics": "full_export",
-        "max_thumbnails": 20,
+        "max_thumbnails": 20, "max_parallel_uploads": 6,
     },
 
     "lifetime": {
@@ -156,7 +161,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 999, "analytics": "full_export",
-        "max_thumbnails": 20,
+        "max_thumbnails": 20, "max_parallel_uploads": 6,
     },
 
     "master_admin": {
@@ -169,7 +174,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "priority_class": "p0", "queue_depth": 999999, "lookahead_hours": 168,
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 9999, "analytics": "full_export",
-        "max_thumbnails": 20,
+        "max_thumbnails": 20, "max_parallel_uploads": 6,
     },
 }
 
@@ -254,6 +259,9 @@ class Entitlements:
     # Thumbnails
     max_thumbnails: int = 1
 
+    # Batch upload (upload.html parallel mode cap)
+    max_parallel_uploads: int = 1
+
     # Team / reporting
     team_seats: int = 1
     analytics: str = "basic"
@@ -300,6 +308,7 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         max_caption_frames=cfg.get("max_caption_frames", 3),
         ai_depth=cfg.get("ai_depth", "basic"),
         max_thumbnails=cfg.get("max_thumbnails", 1),
+        max_parallel_uploads=cfg.get("max_parallel_uploads", 1),
         team_seats=cfg.get("team_seats", 1),
         analytics=cfg.get("analytics", "basic"),
         trial_days=cfg.get("trial_days", 0),
@@ -338,6 +347,7 @@ def get_entitlements_from_user(
         _ov(ent, overrides, "can_white_label",           bool)
         _ov(ent, overrides, "max_accounts",              int)
         _ov(ent, overrides, "max_accounts_per_platform", int)
+        _ov(ent, overrides, "max_parallel_uploads",       int)
         _ov(ent, overrides, "queue_depth",               int)
         _ov(ent, overrides, "lookahead_hours",           int)
         _ov(ent, overrides, "max_caption_frames",        int)
@@ -388,6 +398,7 @@ def entitlements_to_dict(ent: Entitlements) -> dict:
         "max_caption_frames":        ent.max_caption_frames,
         "ai_depth":                  ent.ai_depth,
         "max_thumbnails":            ent.max_thumbnails,
+        "max_parallel_uploads":      ent.max_parallel_uploads,
         "team_seats":                ent.team_seats,
         "analytics":                 ent.analytics,
         "trial_days":                ent.trial_days,

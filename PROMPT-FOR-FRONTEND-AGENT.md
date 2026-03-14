@@ -23,6 +23,29 @@ Copy and paste the following into your **frontend project** (the UploadM8 app UI
 
 ---
 
+## Batch upload mode — plan-based concurrency (backend ready)
+
+The backend now exposes `max_parallel_uploads` in entitlements. Use it instead of inferring from tier names.
+
+**API:** `GET /api/me` returns `plan` and `entitlements`, both include `max_parallel_uploads`:
+- Free: 1
+- Creator Lite: 2
+- Creator Pro: 3
+- Studio: 4
+- Agency: 5
+- Internal (friends_family, lifetime, master_admin): 6
+
+**Frontend (upload.html):** Replace `getConcurrencyCap()` with:
+```javascript
+function getConcurrencyCap() {
+  const ent = userPlan?.entitlements ?? userPlan;
+  return Math.max(1, ent?.max_parallel_uploads ?? 1);
+}
+```
+Or read from `plan.max_parallel_uploads` if the plan object is populated from entitlements.
+
+---
+
 ## Multi-account uploads (backend ready)
 
 Users select **platforms** (YouTube, TikTok, etc.) and **which accounts** within each platform. Uploads post only to **connected and selected** accounts.
@@ -149,3 +172,45 @@ There is already UI for this. Platform hashtags now use the **same pipeline** as
 4. Run **Calculate** automatically after prefilling, or keep the existing Calculate button flow.
 
 **Source of truth:** `stages/entitlements.py` — matches [index.html pricing](https://app.uploadm8.com/index.html) (Free, Creator Lite, Creator Pro, Studio, Agency) plus internal tiers (Friends & Family, Lifetime, Master Admin).
+
+---
+
+## Admin KPI Dashboard (admin-kpi.html)
+
+**Goal:** KPI cards call the correct APIs and support refresh/update flows for cost and revenue.
+
+**APIs:**
+- `GET /api/admin/kpis?range=24h|7d|30d|90d|6m|1y` — All KPIs in one response (auth: admin)
+- `POST /api/admin/kpi/refresh` — Manually trigger cost/revenue sync from Stripe, OpenAI, Mailgun, etc.
+
+**Response shape (GET /api/admin/kpis):**
+```json
+{
+  "total_mrr": 0, "mrr_by_tier": {}, "topup_revenue": 0, "arpu": 0, "arpa": 0,
+  "openai_cost": 0, "storage_cost": 0, "compute_cost": 0,
+  "stripe_fees": 0, "mailgun_cost": 0, "bandwidth_cost": 0, "postgres_cost": 0, "redis_cost": 0,
+  "total_costs": 0, "cost_per_upload": 0, "gross_margin": 0,
+  "total_uploads": 0, "successful_uploads": 0, "success_rate": 0, "queue_depth": 0,
+  "new_users": 0, "active_users": 0, "tier_breakdown": {}, "platform_distribution": {},
+  "funnel_signup_connect": 0, "funnel_connect_upload": 0, "cancellations": 0, ...
+}
+```
+
+**Frontend integration:**
+1. On load: call `GET /api/admin/kpis?range={selectedRange}` (e.g. 30d).
+2. Time range selector: 24h, 7d, 30d, 90d, 6m, 1y — pass as `range` query param.
+3. Refresh button: call `POST /api/admin/kpi/refresh`, then after ~5s call `GET /api/admin/kpis` again.
+4. Cost cards: use `openai_cost`, `storage_cost`, `compute_cost`, `stripe_fees`, `mailgun_cost`, `bandwidth_cost`, `postgres_cost`, `redis_cost`.
+5. Revenue cards: use `total_mrr`, `topup_revenue`, `arpu`, `arpa`.
+
+**Backend data source:** Cost/revenue data is collected every 30 minutes by the worker from Stripe, OpenAI, Mailgun, etc. (env keys: STRIPE_SECRET_KEY, OPENAI_API_KEY, MAILGUN_API_KEY, RENDER_MONTHLY_COST, etc.)
+
+---
+
+## Discord Webhook (Settings → Notifications)
+
+**Save:** Use `POST /api/settings/preferences` or `PUT /api/settings/preferences` with `discordWebhook` in the payload. Both camelCase and snake_case are accepted.
+
+**Test Webhook:** Use `POST /api/settings/test-discord-webhook` with body `{ "webhookUrl": "https://discord.com/api/webhooks/..." }`. Requires auth. Returns `{ "status": "sent" }` on success.
+
+**Load:** Discord webhook comes from `GET /api/settings/preferences` (as `discordWebhook`) or `GET /api/settings` (as `discord_webhook`).

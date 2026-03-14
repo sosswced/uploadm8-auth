@@ -14,7 +14,7 @@ v2 upgrades:
 
 import logging
 from .base import (
-    send_email, mailgun_ready, tier_label,
+    send_email, mailgun_ready, tier_label, MAIL_FROM_SUPPORT,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, stat_grid, secondary_links, plan_change_visual,
     receipt_row, spacer,
@@ -85,7 +85,7 @@ async def send_plan_upgraded_email(
         footer_note="You received this because your UploadM8 subscription was upgraded.",
     )
 
-    await send_email(email, f"You're now on {new_plan} — welcome to the upgrade! 🚀", html)
+    await send_email(email, f"You're now on {new_plan} — welcome to the upgrade! 🚀", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,7 +148,7 @@ async def send_plan_downgraded_email(
         footer_note="You received this because your UploadM8 plan was changed.",
     )
 
-    await send_email(email, f"Your UploadM8 plan has been updated to {new_plan}", html)
+    await send_email(email, f"Your UploadM8 plan has been updated to {new_plan}", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,4 +212,4 @@ async def send_topup_receipt_email(
         footer_note="You received this because a token top-up payment was processed on your account.",
     )
 
-    await send_email(email, f"UploadM8 top-up confirmed — +{tokens_added:,} {wt_short} tokens 💰", html)
+    await send_email(email, f"UploadM8 top-up confirmed — +{tokens_added:,} {wt_short} tokens 💰", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)

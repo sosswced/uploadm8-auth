@@ -17,7 +17,7 @@ v2 upgrades:
 
 import logging
 from .base import (
-    send_email, mailgun_ready,
+    send_email, mailgun_ready, MAIL_FROM_HELLO,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     secondary_links, spacer,
     section_tag, divider_accent,
@@ -123,4 +123,4 @@ async def send_announcement_email(
         footer_note="You received this announcement because you are an UploadM8 user.",
     )
 
-    await send_email(to, f"📢 {title}", html)
+    await send_email(to, f"📢 {title}", html, from_addr=MAIL_FROM_HELLO)

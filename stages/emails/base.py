@@ -33,6 +33,8 @@ logger = logging.getLogger("uploadm8-worker")
 MAILGUN_API_KEY = os.environ.get("MAILGUN_API_KEY", "")
 MAILGUN_DOMAIN  = os.environ.get("MAILGUN_DOMAIN", "")
 MAIL_FROM       = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
+MAIL_FROM_SUPPORT = os.environ.get("MAIL_FROM_SUPPORT", "UploadM8 Support <support@uploadm8.com>")
+MAIL_FROM_HELLO   = os.environ.get("MAIL_FROM_HELLO", "UploadM8 <hello@uploadm8.com>")
 FRONTEND_URL    = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
 
 # ── Brand constants ───────────────────────────────────────────────────────────
@@ -75,8 +77,12 @@ def mailgun_ready() -> bool:
     return bool(MAILGUN_API_KEY and MAILGUN_DOMAIN)
 
 
-async def send_email(to: str, subject: str, html: str) -> None:
+async def send_email(to: str, subject: str, html: str, from_addr: str = None, reply_to: str = None) -> None:
     """Low-level Mailgun sender. All email modules call this."""
+    sender = from_addr or MAIL_FROM
+    data = {"from": sender, "to": to, "subject": subject, "html": html}
+    if reply_to:
+        data["h:Reply-To"] = reply_to
     if not mailgun_ready():
         logger.info(f"Email skipped (Mailgun not configured): {to} | {subject}")
         return
@@ -85,7 +91,7 @@ async def send_email(to: str, subject: str, html: str) -> None:
             resp = await client.post(
                 f"https://api.mailgun.net/v3/{MAILGUN_DOMAIN}/messages",
                 auth=("api", MAILGUN_API_KEY),
-                data={"from": MAIL_FROM, "to": to, "subject": subject, "html": html},
+                data=data,
             )
         if resp.status_code != 200:
             logger.warning(f"Mailgun failed ({resp.status_code}): {to} | {subject}")

@@ -14,13 +14,13 @@ v2 upgrades:
 
 import logging
 from .base import (
-    send_email, mailgun_ready, tier_label,
+    send_email, mailgun_ready, tier_label, MAIL_FROM_SUPPORT, SUPPORT_EMAIL,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, stat_grid, alert_banner, secondary_links, spacer,
     section_tag, metric_hero, progress_bar, divider_accent,
     GRAD_RED, GRAD_ORANGE, GRAD_PURPLE, GRAD_BLUE,
     URL_DASHBOARD, URL_BILLING, URL_PRICING, URL_SETTINGS,
-    SUPPORT_EMAIL, FRONTEND_URL,
+    FRONTEND_URL,
 )
 
 logger = logging.getLogger("uploadm8-worker")
@@ -124,7 +124,7 @@ async def send_payment_failed_email(
         footer_note="You received this because a payment failed on your UploadM8 subscription.",
     )
 
-    await send_email(email, f"⚠️ Payment failed — update your card to keep {plan} active", html)
+    await send_email(email, f"⚠️ Payment failed — update your card to keep {plan} active", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,7 +215,7 @@ async def send_trial_ending_reminder_email(
         footer_note=f"You received this reminder because your {plan} trial ends on {trial_end_date}.",
     )
 
-    await send_email(email, f"⏳ Your {plan} trial ends in {days_word} — here's what happens next", html)
+    await send_email(email, f"⏳ Your {plan} trial ends in {days_word} — here's what happens next", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,4 +303,6 @@ async def send_low_token_warning_email(
         email,
         f"🪙 Low token balance — {current_balance} {wt_short} remaining",
         html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
     )

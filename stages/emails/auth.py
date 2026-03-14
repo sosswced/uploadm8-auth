@@ -20,7 +20,7 @@ v2 upgrades:
 
 import logging
 from .base import (
-    send_email, mailgun_ready,
+    send_email, mailgun_ready, MAIL_FROM_SUPPORT,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, alert_banner, numbered_steps, spacer,
     section_tag, metric_hero, divider_accent,
@@ -87,7 +87,7 @@ async def send_welcome_email(email: str, name: str) -> None:
         footer_note="You received this because you created an UploadM8 account.",
     )
 
-    await send_email(email, f"Welcome to UploadM8, {name}! 🎉 Your 30 free tokens are ready", html)
+    await send_email(email, f"Welcome to UploadM8, {name}! 🎉 Your 30 free tokens are ready", html, from_addr=MAIL_FROM_SUPPORT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ async def send_password_reset_email(email: str, reset_link: str) -> None:
         footer_note="You received this because a password reset was requested for your account.",
     )
 
-    await send_email(email, "Reset your UploadM8 password 🔑", html)
+    await send_email(email, "Reset your UploadM8 password 🔑", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ async def send_password_changed_email(email: str, name: str) -> None:
         footer_note="You received this security alert because your password was changed.",
     )
 
-    await send_email(email, "Your UploadM8 password was changed ⚠️", html)
+    await send_email(email, "Your UploadM8 password was changed ⚠️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,7 +227,7 @@ async def send_account_deleted_email(email: str, name: str) -> None:
         footer_note="This is a confirmation that your account deletion request was completed.",
     )
 
-    await send_email(email, "Your UploadM8 account has been deleted", html)
+    await send_email(email, "Your UploadM8 account has been deleted", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,7 +279,7 @@ async def send_email_change_email(
         footer_note="You received this because an email change was requested for your UploadM8 account.",
     )
 
-    await send_email(new_email, "Verify your new UploadM8 email address ✉️", html)
+    await send_email(new_email, "Verify your new UploadM8 email address ✉️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,4 +338,4 @@ async def send_admin_reset_password_email(
         footer_note="You received this because an admin reset your UploadM8 account password.",
     )
 
-    await send_email(email, "Your UploadM8 password has been reset — action required 🔐", html)
+    await send_email(email, "Your UploadM8 password has been reset — action required 🔐", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)

@@ -20,7 +20,7 @@ v2 upgrades:
 import logging
 from datetime import datetime, timezone
 from .base import (
-    send_email, mailgun_ready, tier_label,
+    send_email, mailgun_ready, tier_label, MAIL_FROM_SUPPORT,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, stat_grid, secondary_links, alert_banner,
     receipt_row, platform_logos_row, spacer,
@@ -81,7 +81,7 @@ async def send_subscription_started_email(
         footer_note="You received this because you started an UploadM8 subscription.",
     )
 
-    await send_email(email, f"Welcome to UploadM8 {plan}! Your subscription is active 🎉", html)
+    await send_email(email, f"Welcome to UploadM8 {plan}! Your subscription is active 🎉", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ async def send_trial_started_email(
         footer_note=f"Your trial ends on {trial_end_date}. We'll email you a reminder before any charge.",
     )
 
-    await send_email(email, f"Your UploadM8 {plan} trial starts now 🎉", html)
+    await send_email(email, f"Your UploadM8 {plan} trial starts now 🎉", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,7 +199,7 @@ async def send_trial_cancelled_email(
         footer_note="You received this because you cancelled your free trial.",
     )
 
-    await send_email(email, f"Your UploadM8 {plan} trial has been cancelled", html)
+    await send_email(email, f"Your UploadM8 {plan} trial has been cancelled", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,7 +259,7 @@ async def send_subscription_cancelled_email(
         footer_note="You received this because your UploadM8 subscription was cancelled.",
     )
 
-    await send_email(email, f"Your UploadM8 {plan} subscription has been cancelled", html)
+    await send_email(email, f"Your UploadM8 {plan} subscription has been cancelled", html, from_addr=MAIL_FROM_SUPPORT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,4 +318,4 @@ async def send_renewal_receipt_email(
         footer_note="You received this because a payment was processed for your UploadM8 subscription.",
     )
 
-    await send_email(email, f"UploadM8 payment received — ${amount:.2f} 💰", html)
+    await send_email(email, f"UploadM8 payment received — ${amount:.2f} 💰", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)

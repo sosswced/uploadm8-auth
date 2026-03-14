@@ -810,13 +810,17 @@ class AdminUpdateEmailIn(BaseModel):
 class AdminResetPasswordIn(BaseModel):
     temp_password: str = Field(min_length=8, max_length=128)
 
-class ScheduledUploadUpdate(BaseModel):
+class SmartScheduleOnlyUpdate(BaseModel):
+    """PATCH /api/scheduled/{id} - only smart_schedule (platform -> ISO datetime string)."""
+    smart_schedule: Dict[str, str] = Field(..., description="Platform -> ISO datetime string")
+
+class UploadUpdate(BaseModel):
+    """PATCH /api/uploads/{id} - title, caption, hashtags, scheduled_time, smart_schedule."""
     title: Optional[str] = None
-    scheduled_time: Optional[datetime] = None
-    timezone: Optional[str] = None
-    platforms: Optional[List[str]] = None
     caption: Optional[str] = None
     hashtags: Optional[List[str]] = None
+    scheduled_time: Optional[datetime] = None
+    smart_schedule: Optional[Dict[str, str]] = Field(None, description="Platform -> ISO datetime string")
 
 class ColorPreferencesUpdate(BaseModel):
     tiktok_color: Optional[str] = None
@@ -1369,6 +1373,11 @@ async def run_migrations():
 (704, """
     ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ;
     CREATE INDEX IF NOT EXISTS idx_users_deletion_requested ON users(deletion_requested_at) WHERE deletion_requested_at IS NOT NULL;
+"""),
+(705, """
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS schedule_metadata JSONB;
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS timezone VARCHAR(100) DEFAULT 'UTC';
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS user_preferences JSONB;
 """),
 ]
         
@@ -3763,6 +3772,28 @@ async def generate_thumbnail_for_upload(upload_id: str, user: dict = Depends(get
         }
 
 
+@app.post("/api/uploads/{upload_id}/thumbnail-presign")
+async def presign_thumbnail_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    """
+    Get a presigned URL for uploading a custom thumbnail.
+    After uploading, call PATCH /api/uploads/{upload_id} with thumbnail_r2_key in the body (if supported).
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, status FROM uploads WHERE id = $1 AND user_id = $2",
+            upload_id, user["id"]
+        )
+    if not row:
+        raise HTTPException(404, "Upload not found")
+    editable = ("pending", "scheduled", "queued", "staged", "ready_to_publish")
+    if row["status"] not in editable:
+        raise HTTPException(400, "Cannot change thumbnail after upload is processing or published")
+
+    thumb_r2_key = f"thumbnails/{user['id']}/{upload_id}/custom.jpg"
+    presigned_url = generate_presigned_upload_url(thumb_r2_key, "image/jpeg")
+    return {"presigned_url": presigned_url, "r2_key": thumb_r2_key}
+
+
 @app.post("/api/uploads/{upload_id}/sync-analytics")
 async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current_user)):
     """
@@ -4059,13 +4090,13 @@ async def get_scheduled_list(user: dict = Depends(get_current_user)):
 
 @app.get("/api/scheduled/{upload_id}")
 async def get_scheduled_upload(upload_id: str, user: dict = Depends(get_current_user)):
-    """Get details of a specific scheduled upload"""
+    """Get details of a specific scheduled upload (for edit form)"""
     async with db_pool.acquire() as conn:
         upload = await conn.fetchrow("""
             SELECT 
                 id, title, scheduled_time, platforms, timezone,
                 thumbnail_r2_key, caption, hashtags, privacy,
-                status, created_at
+                status, created_at, schedule_mode, schedule_metadata
             FROM uploads 
             WHERE id = $1 AND user_id = $2
         """, upload_id, user["id"])
@@ -4084,6 +4115,15 @@ async def get_scheduled_upload(upload_id: str, user: dict = Depends(get_current_
                 )
             except:
                 pass
+
+        sm = upload.get("schedule_metadata")
+        if sm and isinstance(sm, str):
+            try:
+                sm = json.loads(sm)
+            except Exception:
+                sm = None
+        elif not isinstance(sm, dict):
+            sm = None
         
     return {
         "id": str(upload["id"]),
@@ -4096,80 +4136,140 @@ async def get_scheduled_upload(upload_id: str, user: dict = Depends(get_current_
         "hashtags": list(upload["hashtags"]) if upload["hashtags"] else [],
         "privacy": upload["privacy"],
         "status": upload["status"],
+        "schedule_mode": upload.get("schedule_mode") or "scheduled",
+        "schedule_metadata": sm,
         "created_at": upload["created_at"].isoformat() if upload["created_at"] else None
     }
 
-@app.patch("/api/scheduled/{upload_id}")
-async def update_scheduled_upload(
-    upload_id: str, 
-    update_data: ScheduledUploadUpdate, 
-    user: dict = Depends(get_current_user)
-):
-    """Update a scheduled upload's details"""
-    async with db_pool.acquire() as conn:
-        # Verify ownership
-        upload = await conn.fetchrow(
-            "SELECT id, status FROM uploads WHERE id = $1 AND user_id = $2", 
-            upload_id, user["id"]
-        )
-        
-        if not upload:
-            raise HTTPException(404, "Scheduled upload not found")
-        
-        if upload["status"] not in ['pending', 'scheduled', 'queued']:
-            raise HTTPException(400, "Cannot edit upload that is already processing or completed")
-        
-        # Build update query dynamically
-        updates = []
-        params = [upload_id, user["id"]]
-        param_count = 2
-        
-        if update_data.title is not None:
-            param_count += 1
-            updates.append(f"title = ${param_count}")
-            params.append(update_data.title)
-        
-        if update_data.scheduled_time is not None:
+def _parse_smart_schedule(sm: dict, upload_platforms: list) -> tuple:
+    """
+    Parse smart_schedule (platform -> ISO datetime string).
+    Returns (schedule_metadata_json, scheduled_time_dt).
+    Same logic as create flow: validate platforms, parse ISO, set scheduled_time = min.
+    """
+    if not isinstance(sm, dict):
+        raise HTTPException(400, "smart_schedule must be a dict of platform -> ISO datetime string")
+    platforms = list(upload_platforms or [])
+    for k in sm:
+        if k not in platforms:
+            raise HTTPException(400, f"smart_schedule platform '{k}' not in upload platforms")
+    dts = []
+    for v in sm.values():
+        if not v:
+            continue
+        s = str(v).replace("Z", "+00:00").replace("z", "+00:00")
+        try:
+            dts.append(datetime.fromisoformat(s))
+        except ValueError:
+            raise HTTPException(400, "smart_schedule values must be valid ISO datetime strings")
+    metadata = {k: v for k, v in sm.items() if v}
+    scheduled_dt = min(dts) if dts else None
+    return metadata, scheduled_dt
+
+
+async def _apply_smart_schedule(conn, upload_id: str, user_id: str, sm: dict) -> None:
+    """Apply smart_schedule to upload (same logic as create)."""
+    upload = await conn.fetchrow(
+        "SELECT id, status, platforms FROM uploads WHERE id = $1 AND user_id = $2",
+        upload_id, user_id
+    )
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+    editable = ("pending", "scheduled", "queued", "staged", "ready_to_publish")
+    if upload["status"] not in editable:
+        raise HTTPException(400, "Cannot edit upload that is already processing or published")
+
+    metadata, scheduled_dt = _parse_smart_schedule(sm, upload["platforms"])
+    await conn.execute("""
+        UPDATE uploads SET
+            schedule_metadata = $1::jsonb,
+            scheduled_time = $2,
+            schedule_mode = 'smart',
+            updated_at = NOW()
+        WHERE id = $3 AND user_id = $4
+    """, json.dumps(metadata), scheduled_dt, upload_id, user_id)
+
+
+async def _update_upload_metadata(conn, upload_id: str, user_id: str, update_data: UploadUpdate) -> None:
+    """PATCH /api/uploads - title, caption, hashtags, scheduled_time, smart_schedule."""
+    upload = await conn.fetchrow(
+        "SELECT id, status, platforms FROM uploads WHERE id = $1 AND user_id = $2",
+        upload_id, user_id
+    )
+    if not upload:
+        raise HTTPException(404, "Upload not found")
+    editable = ("pending", "scheduled", "queued", "staged", "ready_to_publish")
+    if upload["status"] not in editable:
+        raise HTTPException(400, "Cannot edit upload that is already processing or published")
+
+    updates = []
+    params: list = [upload_id, user_id]
+    param_count = 2
+
+    if update_data.title is not None:
+        param_count += 1
+        updates.append(f"title = ${param_count}")
+        params.append(update_data.title)
+
+    if update_data.caption is not None:
+        param_count += 1
+        updates.append(f"caption = ${param_count}")
+        params.append(update_data.caption)
+
+    if update_data.hashtags is not None:
+        param_count += 1
+        updates.append(f"hashtags = ${param_count}")
+        params.append(update_data.hashtags)
+
+    if update_data.scheduled_time is not None:
+        param_count += 1
+        updates.append(f"scheduled_time = ${param_count}")
+        params.append(update_data.scheduled_time)
+
+    if update_data.smart_schedule is not None:
+        metadata, scheduled_dt = _parse_smart_schedule(update_data.smart_schedule, upload["platforms"])
+        param_count += 1
+        updates.append(f"schedule_metadata = ${param_count}::jsonb")
+        params.append(json.dumps(metadata))
+        if scheduled_dt is not None:
             param_count += 1
             updates.append(f"scheduled_time = ${param_count}")
-            params.append(update_data.scheduled_time)
-        
-        if update_data.timezone is not None:
-            param_count += 1
-            updates.append(f"timezone = ${param_count}")
-            params.append(update_data.timezone)
-        
-        if update_data.caption is not None:
-            param_count += 1
-            updates.append(f"caption = ${param_count}")
-            params.append(update_data.caption)
-        
-        if update_data.hashtags is not None:
-            param_count += 1
-            updates.append(f"hashtags = ${param_count}")
-            params.append(update_data.hashtags)
-        
-        if update_data.platforms is not None:
-            param_count += 1
-            updates.append(f"platforms = ${param_count}")
-            params.append(update_data.platforms)
-        
-        if not updates:
-            raise HTTPException(400, "No updates provided")
-        
-        # Always update updated_at
+            params.append(scheduled_dt)
         param_count += 1
-        updates.append(f"updated_at = ${param_count}")
-        params.append(_now_utc())
-        
-        query = f"""
-            UPDATE uploads 
-            SET {', '.join(updates)}
-            WHERE id = $1 AND user_id = $2
-        """
-        
-        await conn.execute(query, *params)
-    
+        updates.append(f"schedule_mode = ${param_count}")
+        params.append("smart")
+
+    if not updates:
+        raise HTTPException(400, "No updates provided")
+
+    param_count += 1
+    updates.append(f"updated_at = ${param_count}")
+    params.append(_now_utc())
+
+    await conn.execute(f"UPDATE uploads SET {', '.join(updates)} WHERE id = $1 AND user_id = $2", *params)
+
+
+@app.patch("/api/scheduled/{upload_id}")
+async def update_scheduled_upload(
+    upload_id: str,
+    update_data: SmartScheduleOnlyUpdate,
+    user: dict = Depends(get_current_user),
+):
+    """Update a scheduled upload's smart_schedule only (platform -> ISO datetime string)."""
+    async with db_pool.acquire() as conn:
+        await _apply_smart_schedule(conn, upload_id, user["id"], update_data.smart_schedule)
+    return {"status": "updated", "id": upload_id}
+
+
+@app.patch("/api/uploads/{upload_id}")
+async def update_upload(
+    upload_id: str,
+    update_data: UploadUpdate,
+    user: dict = Depends(get_current_user),
+):
+    """Update an upload's metadata: title, caption, hashtags, scheduled_time, smart_schedule."""
+    async with db_pool.acquire() as conn:
+        await _update_upload_metadata(conn, upload_id, user["id"], update_data)
     return {"status": "updated", "id": upload_id}
 
 @app.delete("/api/scheduled/{upload_id}")
@@ -8371,6 +8471,58 @@ async def kpi_funnels(user: dict = Depends(require_admin)):
 async def get_admin_settings(user: dict = Depends(require_master_admin)):
     return admin_settings_cache
 
+
+@app.get("/api/admin/calculator/pricing")
+async def get_admin_calculator_pricing(user: dict = Depends(require_master_admin)):
+    """
+    Live pricing and entitlements for the admin Business Calculator.
+    Single source of truth from stages/entitlements.py.
+    Call on page load to prefill inputs with current tiers (including Friends & Family).
+    """
+    # Revenue tiers (public pricing page)
+    revenue_tiers = {}
+    for slug in ("free", "creator_lite", "creator_pro", "studio", "agency"):
+        cfg = TIER_CONFIG.get(slug, {})
+        revenue_tiers[slug] = {
+            "name": cfg.get("name", slug.replace("_", " ").title()),
+            "price": float(cfg.get("price", 0)),
+            "put_monthly": cfg.get("put_monthly", 0),
+            "aic_monthly": cfg.get("aic_monthly", 0),
+            "queue_depth": cfg.get("queue_depth", 0),
+            "lookahead_hours": cfg.get("lookahead_hours", 0),
+            "max_accounts_per_platform": cfg.get("max_accounts_per_platform", 0),
+        }
+
+    # Internal tiers (Friends & Family, Lifetime, Master Admin) — $0 revenue, full infra cost
+    internal_tiers = {}
+    for slug in ("friends_family", "lifetime", "master_admin"):
+        cfg = TIER_CONFIG.get(slug, {})
+        internal_tiers[slug] = {
+            "name": cfg.get("name", slug.replace("_", " ").title()),
+            "price": 0,
+            "put_monthly": cfg.get("put_monthly", 0),
+            "aic_monthly": cfg.get("aic_monthly", 0),
+        }
+
+    # Top-up packs (amounts from entitlements; prices come from Stripe)
+    topup_packs = []
+    for lookup_key, meta in TOPUP_PRODUCTS.items():
+        wallet = meta.get("wallet", "")
+        amount = meta.get("amount", 0)
+        topup_packs.append({
+            "lookup_key": lookup_key,
+            "wallet": wallet,
+            "amount": amount,
+            "label": f"{wallet.upper()} {amount} Pack",
+        })
+
+    return {
+        "revenue_tiers": revenue_tiers,
+        "internal_tiers": internal_tiers,
+        "topup_packs": topup_packs,
+    }
+
+
 @app.put("/api/admin/settings")
 async def update_admin_settings(settings: dict, user: dict = Depends(require_master_admin)):
     global admin_settings_cache
@@ -9086,6 +9238,7 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "processing_started_at","processing_finished_at",
         "processing_stage","processing_progress",
         "views","likes",
+        "schedule_mode","schedule_metadata","timezone",
         # AI fields (older/newer schema variants)
         "ai_title","ai_caption",
         "ai_generated_title","ai_generated_caption","ai_generated_hashtags",
@@ -9180,6 +9333,9 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "ai_hashtags": ai_hashtags,
 
         "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
+        "schedule_mode": d.get("schedule_mode") or "immediate",
+        "schedule_metadata": _safe_json(d.get("schedule_metadata"), None),
+        "timezone": d.get("timezone") or "UTC",
         "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
         "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
 

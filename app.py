@@ -730,12 +730,15 @@ class UploadInit(BaseModel):
     smart_schedule_days: int = 7  # How many days to spread uploads across
 
 class SettingsUpdate(BaseModel):
-    discord_webhook: Optional[str] = None
-    telemetry_enabled: Optional[bool] = None
-    hud_enabled: Optional[bool] = None
-    hud_position: Optional[str] = None
-    speeding_mph: Optional[int] = None
-    euphoria_mph: Optional[int] = None
+    discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
+    telemetry_enabled: Optional[bool] = Field(None, alias="telemetryEnabled")
+    hud_enabled: Optional[bool] = Field(None, alias="hudEnabled")
+    hud_position: Optional[str] = Field(None, alias="hudPosition")
+    speeding_mph: Optional[int] = Field(None, alias="speedingMph")
+    euphoria_mph: Optional[int] = Field(None, alias="euphoriaMph")
+
+    class Config:
+        populate_by_name = True
 
 class CheckoutRequest(BaseModel):
     lookup_key: str
@@ -1378,6 +1381,18 @@ async def run_migrations():
     ALTER TABLE uploads ADD COLUMN IF NOT EXISTS schedule_metadata JSONB;
     ALTER TABLE uploads ADD COLUMN IF NOT EXISTS timezone VARCHAR(100) DEFAULT 'UTC';
     ALTER TABLE uploads ADD COLUMN IF NOT EXISTS user_preferences JSONB;
+"""),
+(706, """
+    CREATE TABLE IF NOT EXISTS kpi_sync_state (
+        id INT PRIMARY KEY DEFAULT 1,
+        last_stripe_sync_at TIMESTAMPTZ,
+        last_mailgun_sync_at TIMESTAMPTZ,
+        last_openai_sync_at TIMESTAMPTZ,
+        last_cf_sync_at TIMESTAMPTZ,
+        last_upstash_sync_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    INSERT INTO kpi_sync_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 """),
 ]
         
@@ -2794,6 +2809,40 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
 
     return {"status": "updated"}
 
+
+@app.post("/api/settings/test-discord-webhook")
+async def test_user_discord_webhook(data: dict, user: dict = Depends(get_current_user)):
+    """Send a test message to the user's Discord webhook (for Settings page Test Webhook button)."""
+    webhook_url = (data.get("webhookUrl") or data.get("webhook_url") or "").strip()
+    if not webhook_url:
+        raise HTTPException(400, "Webhook URL required")
+    if not webhook_url.startswith("https://discord.com/api/webhooks/"):
+        raise HTTPException(400, "Invalid Discord webhook URL")
+    test_embed = {
+        "title": "🔔 UploadM8 Webhook Test",
+        "description": "If you see this message, your webhook is configured correctly!",
+        "color": 0x22c55e,
+        "fields": [
+            {"name": "Status", "value": "✅ Connected", "inline": True},
+            {"name": "Tested By", "value": user.get("email", "User"), "inline": True},
+        ],
+        "footer": {"text": "UploadM8 Notifications"},
+        "timestamp": _now_utc().isoformat(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(webhook_url, json={"embeds": [test_embed]})
+            if r.status_code not in (200, 204):
+                raise HTTPException(400, f"Discord returned status {r.status_code}")
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Webhook request timed out")
+    except httpx.RequestError as e:
+        raise HTTPException(502, f"Failed to reach Discord: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, f"Failed to send: {str(e)}")
+    return {"status": "sent"}
+
+
 @app.get("/api/me/preferences")
 async def get_preferences(user: dict = Depends(get_current_user)):
     """Get user preferences including hashtag settings"""
@@ -3878,8 +3927,8 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
                     resp = await client.post(
                         "https://open.tiktokapis.com/v2/video/query/",
                         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                        json={"filters": {"video_ids": [str(video_id)]},
-                              "fields": ["id","view_count","like_count","comment_count","share_count"]},
+                        params={"fields": "id,view_count,like_count,comment_count,share_count"},
+                        json={"filters": {"video_ids": [str(video_id)]}},
                     )
                     if resp.status_code == 200:
                         vids = resp.json().get("data", {}).get("videos", []) or []
@@ -3908,22 +3957,26 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
                             total_comments += s["comments"]
 
                 elif plat == "instagram" and video_id:
-                    shortcode = pr.get("shortcode") or video_id
+                    # Instagram Insights API requires numeric media_id (not shortcode)
+                    media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
                     resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{shortcode}/insights",
+                        f"https://graph.facebook.com/v21.0/{media_id}/insights",
                         params={"access_token": access_token,
-                                "metric": "plays,likes,comments,saved,shares,reach"},
+                                "metric": "views,plays,likes,comments,saved,shares,reach"},
                     )
                     if resp.status_code == 200:
                         s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                        ig_views = ig_plays = 0
                         for m in resp.json().get("data", []) or []:
                             name = m.get("name", "")
                             vals = m.get("values", [])
                             val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
-                            if name == "plays":       s["views"]    += val
-                            elif name == "likes":     s["likes"]    += val
+                            if name == "views":       ig_views     = val
+                            elif name == "plays":     ig_plays     = val  # deprecated fallback
+                            elif name == "likes":     s["likes"]   += val
                             elif name == "comments":  s["comments"] += val
-                            elif name == "shares":    s["shares"]   += val
+                            elif name == "shares":    s["shares"]  += val
+                        s["views"] = ig_views or ig_plays  # prefer views over deprecated plays
                         platform_stats["instagram"] = s
                         total_views    += s["views"];    total_likes   += s["likes"]
                         total_comments += s["comments"]; total_shares  += s["shares"]
@@ -4721,6 +4774,16 @@ async def save_user_preferences(
             email_notifications,
             discord_webhook,
             user["id"],
+        )
+
+        # Sync discord_webhook to user_settings so worker (load_user_settings) gets it
+        await conn.execute(
+            """
+            INSERT INTO user_settings (user_id, discord_webhook) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET discord_webhook = $2, updated_at = NOW()
+            """,
+            user["id"],
+            discord_webhook,
         )
 
         # immediate read-after-write to validate persistence (helps front-end debugging)
@@ -8184,9 +8247,14 @@ async def send_announcement(data: AnnouncementRequest, background_tasks: Backgro
               u.id::text AS id,
               u.email,
               u.subscription_tier,
-              COALESCE(NULLIF(us.discord_webhook,''), '') AS discord_webhook
+              COALESCE(
+                NULLIF(TRIM(us.discord_webhook), ''),
+                NULLIF(TRIM(up.discord_webhook), ''),
+                ''
+              ) AS discord_webhook
             FROM users u
             LEFT JOIN user_settings us ON us.user_id = u.id
+            LEFT JOIN user_preferences up ON up.user_id = u.id
             WHERE COALESCE(u.status,'active') <> 'banned'
         """
         params = []
@@ -8390,12 +8458,13 @@ async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
     
     async with db_pool.acquire() as conn:
         costs = await conn.fetchrow("""
-            SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
-            COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
-            COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute
+            SELECT
+                COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
+                COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
+                COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
+                COALESCE(SUM(CASE WHEN category IN ('stripe_fees','mailgun','bandwidth','postgres','redis') THEN cost_usd ELSE 0 END), 0)::decimal AS other
             FROM cost_tracking WHERE created_at >= $1
         """, since)
-        
         revenue = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM revenue_tracking WHERE created_at >= $1", since)
         
         tier_data = await conn.fetch("""
@@ -8409,11 +8478,11 @@ async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
             FROM uploads WHERE created_at >= $1 GROUP BY platform
         """, since)
     
-    total_cost = float(costs["openai"] or 0) + float(costs["storage"] or 0) + float(costs["compute"] or 0)
+    total_cost = float(costs["openai"] or 0) + float(costs["storage"] or 0) + float(costs["compute"] or 0) + float(costs.get("other") or 0)
     gross_margin = float(revenue or 0) - total_cost
     
     return {
-        "costs": {"openai": float(costs["openai"] or 0), "storage": float(costs["storage"] or 0), "compute": float(costs["compute"] or 0), "total": total_cost},
+        "costs": {"openai": float(costs["openai"] or 0), "storage": float(costs["storage"] or 0), "compute": float(costs["compute"] or 0), "other": float(costs.get("other") or 0), "total": total_cost},
         "revenue": float(revenue or 0),
         "gross_margin": gross_margin,
         "margin_pct": (gross_margin / max(float(revenue or 1), 1)) * 100,
@@ -8623,7 +8692,7 @@ def _range_label(range_str: str | None, fallback: str = "30d") -> str:
 @app.get("/api/admin/kpis")
 async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):
     """Combined KPI endpoint that returns all metrics in one call"""
-    minutes = {"7d": 10080, "30d": 43200, "90d": 129600, "365d": 525600, "1y": 525600}.get(range, 43200)
+    minutes = {"24h": 1440, "7d": 10080, "30d": 43200, "90d": 129600, "6m": 259200, "365d": 525600, "1y": 525600}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
     prev_since = since - timedelta(minutes=minutes)
     
@@ -8657,17 +8726,28 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
             FROM revenue_tracking WHERE created_at >= $1
         """, since)
         
-        # Costs
+        # Costs (openai, storage, compute, stripe_fees, mailgun, bandwidth, postgres, redis)
         costs = await conn.fetchrow("""
-            SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
-            COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
-            COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute
+            SELECT
+                COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
+                COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
+                COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
+                COALESCE(SUM(CASE WHEN category = 'stripe_fees' THEN cost_usd ELSE 0 END), 0)::decimal AS stripe_fees,
+                COALESCE(SUM(CASE WHEN category = 'mailgun' THEN cost_usd ELSE 0 END), 0)::decimal AS mailgun,
+                COALESCE(SUM(CASE WHEN category = 'bandwidth' THEN cost_usd ELSE 0 END), 0)::decimal AS bandwidth,
+                COALESCE(SUM(CASE WHEN category = 'postgres' THEN cost_usd ELSE 0 END), 0)::decimal AS postgres,
+                COALESCE(SUM(CASE WHEN category = 'redis' THEN cost_usd ELSE 0 END), 0)::decimal AS redis
             FROM cost_tracking WHERE created_at >= $1
         """, since)
         openai_cost = float(costs["openai"] or 0) if costs else 0
         storage_cost = float(costs["storage"] or 0) if costs else 0
         compute_cost = float(costs["compute"] or 0) if costs else 0
-        total_costs = openai_cost + storage_cost + compute_cost
+        stripe_fees = float(costs.get("stripe_fees") or 0) if costs else 0
+        mailgun_cost = float(costs.get("mailgun") or 0) if costs else 0
+        bandwidth_cost = float(costs.get("bandwidth") or 0) if costs else 0
+        postgres_cost = float(costs.get("postgres") or 0) if costs else 0
+        redis_cost = float(costs.get("redis") or 0) if costs else 0
+        total_costs = openai_cost + storage_cost + compute_cost + stripe_fees + mailgun_cost + bandwidth_cost + postgres_cost + redis_cost
         
         gross_margin = ((total_mrr - total_costs) / max(total_mrr, 1)) * 100 if total_mrr > 0 else 0
         
@@ -8710,6 +8790,8 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
         "refunds": 0, "refund_count": 0,
         "openai_cost": openai_cost, "storage_cost": storage_cost, "compute_cost": compute_cost,
+        "stripe_fees": stripe_fees, "mailgun_cost": mailgun_cost, "bandwidth_cost": bandwidth_cost,
+        "postgres_cost": postgres_cost, "redis_cost": redis_cost,
         "total_costs": total_costs, "cost_per_upload": round(cost_per_upload, 4),
         "gross_margin": round(gross_margin, 1), "gross_margin_change": 0,
         "funnel_signups": new_users, "funnel_connected": funnel_connected, "funnel_uploaded": funnel_uploaded,
@@ -8746,10 +8828,31 @@ async def get_kpi_revenue(user: dict = Depends(require_admin)):
 async def get_kpi_costs(user: dict = Depends(require_admin)):
     since = _now_utc() - timedelta(days=30)
     async with db_pool.acquire() as conn:
-        costs = await conn.fetchrow("SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai, COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage, COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute FROM cost_tracking WHERE created_at >= $1", since)
+        costs = await conn.fetchrow("""
+            SELECT
+                COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
+                COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
+                COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
+                COALESCE(SUM(CASE WHEN category = 'stripe_fees' THEN cost_usd ELSE 0 END), 0)::decimal AS stripe_fees,
+                COALESCE(SUM(CASE WHEN category = 'mailgun' THEN cost_usd ELSE 0 END), 0)::decimal AS mailgun,
+                COALESCE(SUM(CASE WHEN category = 'bandwidth' THEN cost_usd ELSE 0 END), 0)::decimal AS bandwidth,
+                COALESCE(SUM(CASE WHEN category = 'postgres' THEN cost_usd ELSE 0 END), 0)::decimal AS postgres,
+                COALESCE(SUM(CASE WHEN category = 'redis' THEN cost_usd ELSE 0 END), 0)::decimal AS redis
+            FROM cost_tracking WHERE created_at >= $1
+        """, since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('completed','succeeded') AND created_at >= $1", since)
-    o, s, c = (float(costs["openai"] or 0), float(costs["storage"] or 0), float(costs["compute"] or 0)) if costs else (0, 0, 0)
-    return {"openai_cost": o, "storage_cost": s, "compute_cost": c, "total_costs": o+s+c, "costs_change": 0, "cost_per_upload": round((o+s+c) / max(uploads or 1, 1), 4), "successful_uploads": uploads or 0, "total_cogs": o+s+c}
+    if not costs:
+        return {"openai_cost": 0, "storage_cost": 0, "compute_cost": 0, "stripe_fees": 0, "mailgun_cost": 0, "bandwidth_cost": 0, "postgres_cost": 0, "redis_cost": 0, "total_costs": 0, "costs_change": 0, "cost_per_upload": 0, "successful_uploads": uploads or 0, "total_cogs": 0}
+    o = float(costs["openai"] or 0)
+    s = float(costs["storage"] or 0)
+    c = float(costs["compute"] or 0)
+    sf = float(costs.get("stripe_fees") or 0)
+    mg = float(costs.get("mailgun") or 0)
+    bw = float(costs.get("bandwidth") or 0)
+    pg = float(costs.get("postgres") or 0)
+    rd = float(costs.get("redis") or 0)
+    total = o + s + c + sf + mg + bw + pg + rd
+    return {"openai_cost": o, "storage_cost": s, "compute_cost": c, "stripe_fees": sf, "mailgun_cost": mg, "bandwidth_cost": bw, "postgres_cost": pg, "redis_cost": rd, "total_costs": total, "costs_change": 0, "cost_per_upload": round(total / max(uploads or 1, 1), 4), "successful_uploads": uploads or 0, "total_cogs": total}
 
 
 @app.get("/api/admin/kpi/growth")
@@ -8779,6 +8882,23 @@ async def get_kpi_reliability(user: dict = Depends(require_admin)):
     return {"success_rate": round(sr, 1), "reliability_change": 0, "failRates": {"ingest": 0.5, "processing": 1, "upload": round(100-sr, 1), "publish": 0.5, "average": round(100-sr, 1)},
             "retries": {"rate": 5, "one": 3, "two": 1.5, "threePlus": 0.5}, "processingTime": {"ingest": 2, "transcode": 15, "upload": 8, "average": 25},
             "cancels": {"rate": 2, "beforeProcessing": 1.5, "duringProcessing": 0.5, "total30d": 0}, "queue_depth": queue or 0}
+
+
+@app.post("/api/admin/kpi/refresh")
+async def trigger_kpi_refresh(background_tasks: BackgroundTasks, user: dict = Depends(require_admin)):
+    """
+    Manually trigger KPI data collection from Stripe, OpenAI, Mailgun, etc.
+    Runs in background; results appear in cost_tracking within ~30s.
+    """
+    from stages.kpi_collector import run_kpi_collect
+    async def _run():
+        try:
+            summary = await run_kpi_collect(db_pool)
+            logger.info(f"KPI refresh complete: {summary}")
+        except Exception as e:
+            logger.warning(f"KPI refresh failed: {e}")
+    background_tasks.add_task(_run)
+    return {"status": "started", "message": "KPI collection running in background"}
 
 
 @app.get("/api/admin/kpi/usage")

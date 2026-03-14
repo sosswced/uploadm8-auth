@@ -144,6 +144,10 @@ SCHEDULER_POLL_INTERVAL = int(os.environ.get("SCHEDULER_POLL_INTERVAL", "60"))
 # ── Analytics auto-sync ──────────────────────────────────────────
 # How often the analytics sync loop runs (seconds). Default: 6 hours.
 ANALYTICS_SYNC_INTERVAL = int(os.environ.get("ANALYTICS_SYNC_INTERVAL_SECONDS", str(6 * 3600)))
+
+# ── KPI collector ─────────────────────────────────────────────────
+# How often to collect cost/revenue from Stripe, OpenAI, Mailgun, etc. (seconds). Default: 30 min.
+KPI_COLLECTOR_INTERVAL = int(os.environ.get("KPI_COLLECTOR_INTERVAL_SECONDS", str(30 * 60)))
 # How many uploads to sync per cycle (avoids platform API rate-limit hammering)
 ANALYTICS_SYNC_BATCH    = int(os.environ.get("ANALYTICS_SYNC_BATCH_SIZE", "20"))
 # Only re-sync uploads whose analytics_synced_at is older than this many hours
@@ -1224,10 +1228,8 @@ async def _sync_one_upload_analytics(
                             "Authorization": f"Bearer {access_token}",
                             "Content-Type": "application/json",
                         },
-                        json={
-                            "filters": {"video_ids": [str(video_id)]},
-                            "fields": ["id", "view_count", "like_count", "comment_count", "share_count"],
-                        },
+                        params={"fields": "id,view_count,like_count,comment_count,share_count"},
+                        json={"filters": {"video_ids": [str(video_id)]}},
                     )
                     if resp.status_code == 200:
                         vids = resp.json().get("data", {}).get("videos", []) or []
@@ -1268,24 +1270,28 @@ async def _sync_one_upload_analytics(
                         logger.debug(f"[analytics-sync] YouTube HTTP {resp.status_code} for {upload_id}")
 
                 elif plat == "instagram" and video_id:
-                    shortcode = pr.get("shortcode") or video_id
+                    # Instagram Insights API requires numeric media_id (not shortcode)
+                    media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
                     resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{shortcode}/insights",
+                        f"https://graph.facebook.com/v21.0/{media_id}/insights",
                         params={
                             "access_token": access_token,
-                            "metric": "plays,likes,comments,saved,shares,reach",
+                            "metric": "views,plays,likes,comments,saved,shares,reach",
                         },
                     )
                     if resp.status_code == 200:
                         s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                        ig_views = ig_plays = 0
                         for m in resp.json().get("data", []) or []:
                             name = m.get("name", "")
                             vals = m.get("values", [])
                             val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
-                            if name == "plays":      s["views"]    += val
-                            elif name == "likes":    s["likes"]    += val
+                            if name == "views":      ig_views     = val
+                            elif name == "plays":    ig_plays     = val  # deprecated fallback
+                            elif name == "likes":    s["likes"]   += val
                             elif name == "comments": s["comments"] += val
-                            elif name == "shares":   s["shares"]   += val
+                            elif name == "shares":   s["shares"]  += val
+                        s["views"] = ig_views or ig_plays  # prefer views over deprecated plays
                         platform_stats["instagram"] = s
                         total_views    += s["views"];    total_likes    += s["likes"]
                         total_comments += s["comments"]; total_shares   += s["shares"]
@@ -1514,6 +1520,48 @@ async def run_analytics_sync_loop() -> None:
             pass  # normal — continue loop
 
     logger.info("[analytics-sync] loop stopped")
+
+
+# ---------------------------------------------------------------------------
+# KPI COLLECTOR LOOP
+# ---------------------------------------------------------------------------
+
+async def run_kpi_collector_loop() -> None:
+    """
+    Every KPI_COLLECTOR_INTERVAL (default 30 min), fetch cost/revenue from
+    Stripe, OpenAI, Mailgun, Cloudflare, etc. and post to cost_tracking.
+    Uses env keys: STRIPE_SECRET_KEY, OPENAI_API_KEY, MAILGUN_API_KEY, etc.
+    """
+    global shutdown_requested, shutdown_event
+
+    from stages.kpi_collector import run_kpi_collect
+
+    logger.info(f"[kpi-collector] loop started | interval={KPI_COLLECTOR_INTERVAL}s")
+
+    await asyncio.sleep(120)  # Stagger after analytics sync
+
+    while not shutdown_requested:
+        try:
+            summary = await run_kpi_collect(db_pool)
+            if summary.get("rows_inserted", 0) > 0:
+                logger.info(
+                    f"[kpi-collector] synced | stripe=${summary.get('stripe_fees',0):.2f} "
+                    f"mailgun=${summary.get('mailgun_cost',0):.2f} openai=${summary.get('openai_cost',0):.4f} "
+                    f"rows={summary.get('rows_inserted',0)}"
+                )
+        except Exception as e:
+            logger.warning(f"[kpi-collector] error: {e}")
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=KPI_COLLECTOR_INTERVAL,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[kpi-collector] loop stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -1825,16 +1873,18 @@ async def main() -> None:
 
     shutdown_event = asyncio.Event()
 
-    # Five concurrent loops:
+    # Six concurrent loops:
     # 1. process_jobs          — Redis consumer for immediate uploads
     # 2. run_scheduler_loop    — polls DB for staged/ready_to_publish jobs
     # 3. run_verification_loop — delivery verification polling
     # 4. run_analytics_sync_loop — periodic engagement stats fetch from platform APIs
+    # 5. run_kpi_collector_loop — every 30 min: Stripe/Mailgun/OpenAI costs → cost_tracking
     tasks = [
         asyncio.create_task(process_jobs()),
         asyncio.create_task(run_scheduler_loop()),
         asyncio.create_task(run_verification_loop(db_pool, shutdown_event)),
         asyncio.create_task(run_analytics_sync_loop()),
+        asyncio.create_task(run_kpi_collector_loop()),
     ]
 
     try:

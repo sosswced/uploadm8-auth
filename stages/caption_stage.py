@@ -881,6 +881,7 @@ Context:
 
 Rules:
 - Content must feel AUTHENTIC — not AI-generated
+- NEVER invent events, locations, or narratives not shown in the video. Base caption ONLY on what is visible in the frames.
 - Hook in the first 3 words for short-form platforms
 - Use emojis sparingly (1–3 max)
 - HASHTAGS: each must be a complete word (e.g. "makeuptutorial", "gardenlife", "dashcam")

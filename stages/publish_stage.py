@@ -56,6 +56,29 @@ PRESIGNED_URL_EXPIRY = 3600
 # Platform Thumbnail Push
 # =====================================================================
 
+def _get_platform_thumbnail_path(ctx, platform: str):
+    """
+    Return the best thumbnail path for a platform.
+    Prefers platform-specific styled thumbnail (16:9 YouTube, 9:16 IG/FB) when available.
+    """
+    pm = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
+    try:
+        plat_map = json.loads(pm) if isinstance(pm, str) else (pm or {})
+    except Exception:
+        plat_map = {}
+    path_str = plat_map.get(platform)
+    if path_str:
+        p = Path(path_str)
+        if p.exists():
+            return p
+    tp = getattr(ctx, "thumbnail_path", None)
+    if tp:
+        p = Path(tp) if not isinstance(tp, Path) else tp
+        if p.exists():
+            return p
+    return None
+
+
 async def _push_thumbnail_to_platform(
     platform: str,
     video_id: str,
@@ -952,9 +975,10 @@ async def publish_to_youtube(
 
             logger.info(f"YouTube publish accepted: video_id={video_id}, url={platform_url}")
             # Push thumbnail to YouTube (non-fatal — requires verified channel)
-            if video_id and getattr(ctx, "thumbnail_path", None):
+            thumb_path = _get_platform_thumbnail_path(ctx, "youtube")
+            if video_id and thumb_path:
                 await _push_thumbnail_to_platform(
-                    "youtube", video_id, ctx.thumbnail_path, access_token, client
+                    "youtube", video_id, thumb_path, access_token, client
                 )
             return PlatformResult(
                 platform="youtube",
@@ -1052,11 +1076,19 @@ async def publish_to_instagram(
                 "share_to_feed": "true" if ig_privacy == "public" else "false",
             }
             # Instagram cover_url must be set at creation time — cannot change after publish.
-            # We generate a short-lived presigned URL for our R2 thumbnail.
-            if getattr(ctx, "thumbnail_r2_key", None):
+            # Prefer platform-specific 9:16 thumbnail when available (styled thumbnails).
+            thumb_r2_key = None
+            pt_json = ctx.output_artifacts.get("platform_thumbnail_r2_keys", "{}")
+            try:
+                pt_keys = json.loads(pt_json) if isinstance(pt_json, str) else (pt_json or {})
+                thumb_r2_key = pt_keys.get("instagram")
+            except Exception:
+                pass
+            thumb_r2_key = thumb_r2_key or getattr(ctx, "thumbnail_r2_key", None)
+            if thumb_r2_key:
                 try:
                     from . import r2 as _r2
-                    thumb_cover_url = _r2.generate_presigned_url(ctx.thumbnail_r2_key, expires=3600)
+                    thumb_cover_url = _r2.generate_presigned_url(thumb_r2_key, expires=3600)
                     ig_params["cover_url"] = thumb_cover_url
                     logger.info(f"Instagram: cover_url set from R2 thumbnail")
                 except Exception as _e:
@@ -1289,9 +1321,10 @@ async def publish_to_facebook(
             platform_url = f"https://www.facebook.com/video/{video_id}" if video_id else None
             logger.info(f"Facebook publish accepted: video_id={video_id}, url={platform_url}")
             # Push thumbnail to Facebook (non-fatal)
-            if video_id and getattr(ctx, "thumbnail_path", None):
+            thumb_path = _get_platform_thumbnail_path(ctx, "facebook")
+            if video_id and thumb_path:
                 await _push_thumbnail_to_platform(
-                    "facebook", video_id, ctx.thumbnail_path, access_token, client
+                    "facebook", video_id, thumb_path, access_token, client
                 )
             return PlatformResult(
                 platform="facebook",
@@ -1445,13 +1478,15 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                     )
                 except Exception:
                     pass
-            ctx.platform_results.append(PlatformResult(
+            pr = PlatformResult(
                 platform=platform,
                 success=False,
                 attempt_id=attempt_id,
                 error_code="NOT_CONNECTED",
                 error_message=msg,
-            ))
+                account_id=token_id,
+            )
+            ctx.platform_results.append(pr)
             continue
 
         # -- Publish to platform --
@@ -1480,7 +1515,9 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                     platform=platform,
                     success=False,
                     error_code="UNSUPPORTED",
-                    error_message=f"Unsupported platform: {platform}"
+                    error_message=f"Unsupported platform: {platform}",
+                    account_id=token_id,
+                    account_name=(token_data.get("_account_name") or "") if token_data else "",
                 )
 
         except Exception as e:
@@ -1489,11 +1526,15 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 platform=platform,
                 success=False,
                 error_code="PUBLISH_EXCEPTION",
-                error_message=str(e)
+                error_message=str(e),
+                account_id=token_id,
+                account_name=(token_data.get("_account_name") or "") if token_data else "",
             )
 
-        # -- Record result --
+        # -- Record result (include account for multi-account display) --
         result.attempt_id = attempt_id
+        result.account_id = token_id
+        result.account_name = (token_data.get("_account_name") or token_data.get("account_name") or "") if token_data else ""
         ctx.platform_results.append(result)
 
         status_icon = "OK" if result.success else "FAIL"

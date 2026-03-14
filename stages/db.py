@@ -65,16 +65,26 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
         except asyncpg.exceptions.UndefinedTableError:
             pass
 
-        # ── 2. user_preferences fallback ─────────────────────────────────
-        if not result:
-            try:
-                row = await conn.fetchrow(
-                    "SELECT * FROM user_preferences WHERE user_id = $1", user_id
-                )
-                if row:
-                    result = dict(row)
-            except asyncpg.exceptions.UndefinedTableError:
-                pass
+        # ── 2. user_preferences (fallback or merge) ─────────────────────────
+        try:
+            prefs_row = await conn.fetchrow(
+                "SELECT * FROM user_preferences WHERE user_id = $1", user_id
+            )
+            if prefs_row:
+                prefs_d = dict(prefs_row)
+                if not result:
+                    result = prefs_d
+                else:
+                    # Merge preference columns so POST /api/settings/preferences is respected
+                    for k in ("styled_thumbnails", "auto_thumbnails", "auto_captions", "thumbnail_interval",
+                              "default_privacy", "ai_hashtags_enabled", "ai_hashtag_count", "always_hashtags",
+                              "blocked_hashtags", "platform_hashtags", "email_notifications", "discord_webhook"):
+                        if k in prefs_d and prefs_d[k] is not None:
+                            result[k] = prefs_d[k]
+                    result.setdefault("styled_thumbnails", True)
+                    result.setdefault("styledThumbnails", result.get("styled_thumbnails", True))
+        except asyncpg.exceptions.UndefinedTableError:
+            pass
 
         # ── 3. users.preferences JSONB — the source of truth for hashtag prefs ──
         # The settings page saves everything here via /api/me/preferences.
@@ -102,6 +112,8 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "aiHashtagsEnabled":"ai_hashtags_enabled",
                         "aiHashtagStyle":   "ai_hashtag_style",
                         "autoCaptions":     "auto_captions",
+                        "autoThumbnails":   "auto_thumbnails",
+                        "styledThumbnails": "styled_thumbnails",
                         "captionStyle":     "caption_style",
                         "captionTone":      "caption_tone",
                         "captionVoice":     "caption_voice",
@@ -173,6 +185,8 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                 {
                     "platform": r.platform,
                     "success": r.success,
+                    "account_id": getattr(r, "account_id", None),
+                    "account_name": getattr(r, "account_name", None),
                     "platform_video_id": r.platform_video_id,
                     "platform_url": r.platform_url,
                     "publish_id": r.publish_id,

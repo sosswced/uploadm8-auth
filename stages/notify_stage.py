@@ -124,13 +124,20 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
                 "inline": False,
             })
 
-        fields.append({"name": "📤 Platforms", "value": ", ".join(ctx.platforms) or "None", "inline": True})
+        # Platforms summary (unique platforms; multi-account may repeat)
+        plat_set = set(ctx.platforms) if ctx.platforms else set()
+        fields.append({"name": "📤 Platforms", "value": ", ".join(sorted(plat_set)) or "None", "inline": True})
         fields.append({"name": "📁 File",      "value": (ctx.filename or "—")[:80],          "inline": True})
 
-        # ── Per-platform results with live post URLs ──────────────────────────
+        # ── Per-platform/account results with live post URLs ────────────────────
         for result in ctx.platform_results:
             icon      = "✅" if result.success else "❌"
             plat_name = result.platform.title()
+            account_label = getattr(result, "account_name", None) or getattr(result, "account_id", None)
+            if account_label:
+                field_name = f"{icon} {plat_name} ({account_label})"
+            else:
+                field_name = f"{icon} {plat_name}"
 
             if result.success:
                 if result.platform_url and result.platform_url.startswith("http"):
@@ -143,7 +150,7 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
                 raw_err = result.error_message or result.error_code or "Unknown error"
                 value = str(raw_err)[:256]
 
-            fields.append({"name": f"{icon} {plat_name}", "value": value, "inline": False})
+            fields.append({"name": field_name, "value": value, "inline": False})
 
         embed = {
             "title":       status_title,

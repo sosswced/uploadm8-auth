@@ -113,10 +113,14 @@ class TrillScore:
 
 @dataclass
 class PlatformResult:
-    """Result of publishing to a single platform."""
+    """Result of publishing to a single platform/account."""
 
     platform: str
     success: bool
+
+    # Multi-account: which profile this result is for
+    account_id: Optional[str] = None  # platform_tokens.id
+    account_name: Optional[str] = None  # e.g. @username or display name
 
     # Step A (accepted)
     platform_video_id: Optional[str] = None
@@ -285,6 +289,7 @@ class JobContext:
         always_tags: List[str] = list(raw_always) if isinstance(raw_always, list) else []
 
         # ── Platform-specific hashtags (same logic as always_hashtags) ────
+        # Case-insensitive key lookup: frontend may send "TikTok", "Instagram", etc.
         platform_tags: List[str] = []
         if platform:
             ph = us.get("platformHashtags") or us.get("platform_hashtags") or {}
@@ -295,7 +300,13 @@ class JobContext:
                 except Exception:
                     ph = {}
             if isinstance(ph, dict):
-                raw = ph.get(platform) or ph.get(platform.lower()) or []
+                raw = ph.get(platform) or ph.get((platform or "").lower()) or ph.get((platform or "").title()) or []
+                if not raw:
+                    key_lower = (platform or "").lower()
+                    for k, v in ph.items():
+                        if str(k).lower() == key_lower:
+                            raw = v
+                            break
                 if isinstance(raw, str):
                     raw = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
                 platform_tags = list(raw) if isinstance(raw, list) else []
@@ -367,6 +378,81 @@ class JobContext:
         """Road/highway name from reverse geocoding."""
         t = self.telemetry or self.telemetry_data
         return t.location_road if t else None
+
+    def get_thumbnail_brief_vars(self, category: Optional[str] = None) -> Dict[str, str]:
+        """
+        Build variables for THUMBNAIL_BRIEF_PROMPT. Used by thumbnail_stage to
+        generate platform-aware thumbnail briefs (headline, badge, props, etc.).
+        Pass category from thumbnail_stage (from _detect_category) when available.
+        """
+        trill = self.trill or self.trill_score
+        telemetry = self.telemetry or self.telemetry_data
+        max_mph = 0.0
+        if telemetry:
+            max_mph = getattr(telemetry, "max_speed_mph", 0) or 0
+        platforms = [str(p).lower() for p in (self.platforms or [])]
+        platforms_csv = ",".join(platforms) if platforms else "youtube,instagram,facebook,tiktok"
+        return {
+            "effective_title": self.get_effective_title() or self.filename or "Video",
+            "effective_caption": self.get_effective_caption() or "",
+            "category": category or getattr(self, "thumbnail_category", None) or "general",
+            "location_name": self.location_name or "",
+            "trill_bucket": trill.bucket if trill else "",
+            "max_speed_mph": str(max_mph),
+            "platforms_csv": platforms_csv,
+        }
+
+
+# ============================================================
+# Thumbnail Brief Generator — base prompt for thumbnail_stage
+# ============================================================
+THUMBNAIL_BRIEF_PROMPT = """You are a thumbnail/cover strategist for short-form video publishing.
+Return ONLY valid JSON. No markdown.
+
+CONTEXT
+- Effective title: {effective_title}
+- Caption hint: {effective_caption}
+- Category: {category}
+- Location: {location_name}
+- Trill bucket: {trill_bucket}
+- Max speed mph: {max_speed_mph}
+- Target platforms: {platforms_csv}
+
+HARD RULES
+- No profanity, no hate, no nudity, no weapons emphasis, no illegal claims.
+- No copyrighted logos/brand marks (YouTube logo, TikTok logo, etc).
+- Text: 2–6 words total, ALL CAPS, 1–2 lines, mobile readable.
+- Provide 3 headline options; select 1.
+- Always include 1 badge (e.g., NEW, FAST, HOW TO, TOP 5) if appropriate.
+- Always include 1 directional element (arrow/circle/glow box).
+- Provide 2 prop ideas that match the category.
+- Never mention AI/automation/API/internal product words.
+
+PLATFORM RULES
+- youtube: design a 16:9 custom thumbnail, strong text ok.
+- instagram: design a 9:16 cover image safe for center-crop to 1:1 grid; keep key elements centered.
+- facebook: design a 9:16 cover safe for 1:1 crop; keep key elements centered.
+- tiktok: assume no custom thumbnail via API; instead output a recommended thumb_offset_seconds to pick a frame and a text strategy that does NOT rely on overlays.
+
+OUTPUT SCHEMA
+{{
+  "selected_headline": "string",
+  "headline_options": ["string","string","string"],
+  "badge_text": "string",
+  "badge_style": "red"|"yellow"|"white"|"black",
+  "directional_element": "arrow_up"|"arrow_right"|"circle"|"glow_box",
+  "props": ["string","string"],
+  "emotion_cue": "shocked"|"excited"|"serious"|"laughing",
+  "color_mood": "red_black"|"blue_black"|"gold_black"|"neon",
+  "platform_plan": {{
+    "youtube": {{"enabled": true, "canvas": "16:9"}},
+    "instagram": {{"enabled": true, "canvas": "9:16", "safe_center_pct": 60}},
+    "facebook": {{"enabled": true, "canvas": "9:16", "safe_center_pct": 60}},
+    "tiktok": {{"enabled": true, "canvas": "9:16", "thumb_offset_seconds": 1.5}}
+  }},
+  "notes": "1 sentence max"
+}}
+"""
 
 
 def create_context(job_data: dict, upload_record: dict, user_settings: dict, entitlements: Entitlements) -> JobContext:

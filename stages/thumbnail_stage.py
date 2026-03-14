@@ -18,6 +18,10 @@ Flow:
      Set ctx.thumbnail_paths = all candidates in chronological order
      Set ctx.thumbnail_scores = {str(path): score} for all candidates
   8. Store metadata in ctx.output_artifacts for queue UI display
+  9. [When can_custom_thumbnails] Generate Thumbnail Brief (JSON) via GPT,
+     render MrBeast-style composite (headline, badge, arrow) per platform:
+     YouTube 16:9, Instagram/Facebook 9:16 center-safe, TikTok thumb_offset only.
+     Render via template (PIL) or AI image edit (when can_ai_thumbnail_styling).
 
 AI Selection Criteria (per category):
   beauty      — best lighting, eyes open, makeup clearly visible
@@ -54,7 +58,7 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from .context import JobContext
+from .context import JobContext, THUMBNAIL_BRIEF_PROMPT
 from .errors import SkipStage
 
 logger = logging.getLogger("uploadm8-worker.thumbnail")
@@ -521,6 +525,232 @@ async def _ai_select_best_frame(
 
 
 # ============================================================
+# Thumbnail Brief Generator (platform-aware JSON)
+# ============================================================
+
+async def _generate_thumbnail_brief(ctx: JobContext, category: str) -> Optional[Dict]:
+    """
+    Generate a platform-aware Thumbnail Brief (JSON) using GPT.
+    Returns parsed brief dict or None on failure.
+    """
+    if not OPENAI_API_KEY or not ctx.entitlements or not ctx.entitlements.can_ai:
+        return None
+    vars_ = ctx.get_thumbnail_brief_vars(category=category)
+    prompt = THUMBNAIL_BRIEF_PROMPT.format(**vars_)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENAI_THUMB_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 400,
+                    "temperature": 0.5,
+                },
+            )
+        if response.status_code != 200:
+            logger.warning(f"Thumbnail brief HTTP {response.status_code}: {response.text[:200]}")
+            return None
+        data = response.json()
+        answer = data["choices"][0]["message"]["content"].strip()
+        if "```json" in answer:
+            answer = answer.split("```json")[1].split("```")[0]
+        elif "```" in answer:
+            answer = answer.split("```")[1].split("```")[0]
+        brief = json.loads(answer)
+        # Ensure platform_plan exists with defaults
+        brief.setdefault("platform_plan", {})
+        for plat in ("youtube", "instagram", "facebook", "tiktok"):
+            brief["platform_plan"].setdefault(plat, {"enabled": True, "canvas": "16:9"})
+        return brief
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.warning(f"Thumbnail brief parse failed: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Thumbnail brief generation failed: {e}")
+        return None
+
+
+# ============================================================
+# Template Renderer (PIL overlays — deterministic fallback)
+# ============================================================
+
+def _render_template_thumbnail(
+    base_path: Path,
+    brief: Dict,
+    platform: str,
+    output_path: Path,
+) -> bool:
+    """
+    Render headline + badge + directional element onto base frame using PIL.
+    Platform-aware: YouTube 16:9 (1280x720), IG/FB 9:16 center-safe (720x1280).
+    Returns True on success.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        logger.warning("Pillow not installed — skipping template thumbnail render")
+        return False
+
+    plan = brief.get("platform_plan", {}).get(platform, {})
+    if not plan.get("enabled", True):
+        return False
+
+    canvas = plan.get("canvas", "16:9")
+    if platform == "youtube":
+        target_w, target_h = 1280, 720
+    else:
+        target_w, target_h = 720, 1280  # 9:16
+
+    try:
+        img = Image.open(base_path).convert("RGB")
+        iw, ih = img.size
+        # Scale/crop to target aspect
+        scale = max(target_w / iw, target_h / ih)
+        nw, nh = int(iw * scale), int(ih * scale)
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+        x0, y0 = (nw - target_w) // 2, (nh - target_h) // 2
+        img = img.crop((x0, y0, x0 + target_w, y0 + target_h))
+    except Exception as e:
+        logger.warning(f"Template render: could not load/crop base image: {e}")
+        return False
+
+    draw = ImageDraw.Draw(img)
+    safe_margin = int(min(target_w, target_h) * 0.06)
+
+    # Font — try common paths, fallback to default
+    font_large = font_badge = None
+    for path in (
+        "arial.ttf",
+        "Arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ):
+        try:
+            font_large = ImageFont.truetype(path, 72)
+            font_badge = ImageFont.truetype(path, 36)
+            break
+        except OSError:
+            continue
+    if font_large is None:
+        font_large = ImageFont.load_default()
+        font_badge = font_large
+
+    headline = (brief.get("selected_headline") or brief.get("headline_options", [""])[0] or "").upper()[:30]
+    badge_text = (brief.get("badge_text") or "").upper()[:12]
+
+    # Badge colors
+    badge_style = brief.get("badge_style", "red")
+    badge_colors = {"red": "#e53935", "yellow": "#fdd835", "white": "#ffffff", "black": "#1a1a1a"}
+    badge_fg = "#ffffff" if badge_style in ("red", "black") else "#1a1a1a"
+    badge_bg = badge_colors.get(badge_style, "#e53935")
+
+    # Draw badge (top-left)
+    if badge_text:
+        pad = 8
+        bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
+        bw, bh = bbox[2] - bbox[0] + pad * 2, bbox[3] - bbox[1] + pad * 2
+        draw.rectangle([safe_margin, safe_margin, safe_margin + bw, safe_margin + bh], fill=badge_bg, outline="#fff", width=2)
+        draw.text((safe_margin + pad, safe_margin + pad), badge_text, fill=badge_fg, font=font_badge)
+
+    # Headline (bottom, centered)
+    if headline:
+        bbox = draw.textbbox((0, 0), headline, font=font_large)
+        tw = bbox[2] - bbox[0]
+        tx = (target_w - tw) // 2
+        ty = target_h - safe_margin - (bbox[3] - bbox[1]) - 20
+        # Stroke for readability
+        for dx, dy in [(-2,-2),(-2,2),(2,-2),(2,2)]:
+            draw.text((tx+dx, ty+dy), headline, fill="#000", font=font_large)
+        draw.text((tx, ty), headline, fill="#fff", font=font_large)
+
+    # Simple directional element (circle highlight — bottom-right area)
+    elem = brief.get("directional_element", "circle")
+    if elem in ("circle", "glow_box"):
+        cx, cy = target_w - safe_margin - 80, target_h - safe_margin - 80
+        draw.ellipse([cx-50, cy-50, cx+50, cy+50], outline="#fff", width=4)
+    elif elem in ("arrow_up", "arrow_right"):
+        cx, cy = target_w - safe_margin - 60, target_h - safe_margin - 60
+        draw.polygon([(cx, cy-30), (cx-20, cy+20), (cx+20, cy+20)], outline="#fff", width=3)
+
+    try:
+        img.save(output_path, "JPEG", quality=90)
+        return output_path.exists() and output_path.stat().st_size >= MIN_THUMB_SIZE
+    except Exception as e:
+        logger.warning(f"Template render save failed: {e}")
+        return False
+
+
+# ============================================================
+# AI Image Edit (optional premium — with guardrails + fallback)
+# ============================================================
+
+async def _ai_edit_thumbnail(
+    base_path: Path,
+    brief: Dict,
+    output_path: Path,
+    retry_reduce: bool = False,
+) -> bool:
+    """
+    Use OpenAI image edit to add headline/badge/props to base frame.
+    Guardrails: no logos, no new objects except arrow/badge/simple props.
+    Max 2 retries; falls back to template in caller.
+    Note: OpenAI edits API may return base64 or URL; we handle both.
+    """
+    if not OPENAI_API_KEY:
+        return False
+    instruction = (
+        f"Add these elements to the image. Headline text (ALL CAPS): {brief.get('selected_headline', '')}. "
+        f"Badge: {brief.get('badge_text', '')}. "
+        f"Add a {brief.get('directional_element', 'circle')} highlight. "
+        "No new objects except: arrow, badge, simple prop icons. "
+        "No logos, no brand marks, no watermarks. "
+        "Keep key elements centered for mobile crop. "
+    )
+    if retry_reduce:
+        instruction += "Reduce text size, increase contrast, fewer effects. "
+    try:
+        with open(base_path, "rb") as f:
+            image_data = f.read()
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/images/edits",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                files={
+                    "image": ("frame.jpg", image_data, "image/jpeg"),
+                    "prompt": (None, instruction),
+                    "size": (None, "1024x1024"),
+                },
+            )
+        if response.status_code != 200:
+            logger.warning(f"AI thumbnail edit HTTP {response.status_code}: {response.text[:200]}")
+            return False
+        data = response.json()
+        items = data.get("data", [])
+        if not items:
+            return False
+        item = items[0]
+        if "b64_json" in item:
+            out_bytes = base64.b64decode(item["b64_json"])
+        elif "url" in item:
+            dl = await client.get(item["url"])
+            if dl.status_code != 200:
+                return False
+            out_bytes = dl.content
+        else:
+            return False
+        output_path.write_bytes(out_bytes)
+        return output_path.exists() and output_path.stat().st_size >= MIN_THUMB_SIZE
+    except Exception as e:
+        logger.warning(f"AI thumbnail edit failed: {e}")
+        return False
+
+
+# ============================================================
 # ffprobe — get video duration
 # ============================================================
 
@@ -828,6 +1058,93 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     ctx.output_artifacts["thumbnail_scores"]            = json.dumps(
         {str(p): round(s, 4) for p, s in candidates}
     )
+
+    # ── Styled thumbnails (MrBeast-style composite) — Trill + non-Trill, every upload ──
+    # Gated by: can_custom_thumbnails + user pref styled_thumbnails (default True)
+    can_custom = bool(getattr(ctx.entitlements, "can_custom_thumbnails", False) if ctx.entitlements else False)
+    can_ai_style = bool(getattr(ctx.entitlements, "can_ai_thumbnail_styling", False) if ctx.entitlements else False)
+    us = ctx.user_settings or {}
+    styled_enabled = us.get("styled_thumbnails", us.get("styledThumbnails", True))
+    if can_custom and styled_enabled and ctx.temp_dir:
+        brief: Optional[Dict] = None
+        if can_ai:
+            brief = await _generate_thumbnail_brief(ctx, category)
+        if not brief and can_ai:
+            # Fallback brief when GPT fails — minimal defaults
+            brief = {
+                "selected_headline": (ctx.get_effective_title() or "WATCH")[:20].upper(),
+                "headline_options": [],
+                "badge_text": "NEW",
+                "badge_style": "red",
+                "directional_element": "circle",
+                "props": [],
+                "emotion_cue": "excited",
+                "color_mood": "red_black",
+                "platform_plan": {
+                    "youtube": {"enabled": True, "canvas": "16:9"},
+                    "instagram": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+                    "facebook": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+                    "tiktok": {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5},
+                },
+                "notes": "Fallback brief",
+            }
+        elif not brief:
+            brief = {
+                "selected_headline": (ctx.get_effective_title() or "WATCH")[:20].upper(),
+                "headline_options": [],
+                "badge_text": "",
+                "badge_style": "red",
+                "directional_element": "circle",
+                "props": [],
+                "emotion_cue": "excited",
+                "color_mood": "red_black",
+                "platform_plan": {
+                    "youtube": {"enabled": True, "canvas": "16:9"},
+                    "instagram": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+                    "facebook": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+                    "tiktok": {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5},
+                },
+                "notes": "No AI — minimal brief",
+            }
+        ctx.output_artifacts["thumbnail_brief_json"] = json.dumps(brief)
+
+        # TikTok: no custom thumbnail via API — store thumb_offset for worker
+        platform_map: Dict[str, str] = {}
+        tiktok_plan = brief.get("platform_plan", {}).get("tiktok", {})
+        ctx.output_artifacts["tiktok_thumb_offset_seconds"] = str(
+            tiktok_plan.get("thumb_offset_seconds", 1.5)
+        )
+
+        # Render per platform (YouTube, Instagram, Facebook)
+        platforms_to_render = [p for p in ("youtube", "instagram", "facebook")
+                              if (brief.get("platform_plan", {}).get(p, {}).get("enabled", True))
+                              and p in [pl.lower() for pl in (ctx.platforms or [])]]
+        render_method = "none"
+        primary_styled: Optional[Path] = None  # Prefer YouTube for primary
+        for platform in platforms_to_render:
+            out_name = f"thumb_styled_{platform}_{ctx.upload_id}.jpg"
+            out_path = ctx.temp_dir / out_name
+            ok = False
+            if can_ai_style and OPENAI_API_KEY:
+                ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=False)
+                if not ok:
+                    ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=True)
+                if ok:
+                    render_method = "ai_edit"
+            if not ok:
+                ok = _render_template_thumbnail(best_path, brief, platform, out_path)
+                if ok:
+                    render_method = "template"
+            if ok:
+                platform_map[platform] = str(out_path)
+                if primary_styled is None or platform == "youtube":
+                    primary_styled = out_path
+        if primary_styled and primary_styled.exists():
+            ctx.thumbnail_path = primary_styled
+            ctx.output_artifacts["thumbnail"] = str(primary_styled)
+
+        ctx.output_artifacts["thumbnail_render_method"] = render_method
+        ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_map)
 
     logger.info(
         f"Thumbnail stage complete: {len(candidates)} frames, "

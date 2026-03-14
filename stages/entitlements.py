@@ -79,6 +79,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_caption_frames": 3, "ai_depth": "basic",
         "team_seats": 1, "analytics": "basic",
         "max_thumbnails": 1, "max_parallel_uploads": 1,
+        "custom_thumbnails": False, "ai_thumbnail_styling": False,
         "trial_days": 0,
     },
 
@@ -93,6 +94,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_caption_frames": 5, "ai_depth": "enhanced",
         "team_seats": 1, "analytics": "standard",
         "max_thumbnails": 3, "max_parallel_uploads": 2,
+        "custom_thumbnails": True, "ai_thumbnail_styling": False,
         "trial_days": 7,
     },
 
@@ -107,6 +109,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_caption_frames": 8, "ai_depth": "advanced",
         "team_seats": 3, "analytics": "full",
         "max_thumbnails": 5, "max_parallel_uploads": 3,
+        "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "trial_days": 7,
     },
 
@@ -121,6 +124,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_caption_frames": 15, "ai_depth": "max",
         "team_seats": 10, "analytics": "full_export",
         "max_thumbnails": 10, "max_parallel_uploads": 4,
+        "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "trial_days": 7,
     },
 
@@ -135,6 +139,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_caption_frames": 15, "ai_depth": "max",
         "team_seats": 25, "analytics": "full_export",
         "max_thumbnails": 15, "max_parallel_uploads": 5,
+        "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "trial_days": 7,
     },
 
@@ -149,6 +154,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 999, "analytics": "full_export",
         "max_thumbnails": 20, "max_parallel_uploads": 6,
+        "custom_thumbnails": True, "ai_thumbnail_styling": True,
     },
 
     "lifetime": {
@@ -162,6 +168,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 999, "analytics": "full_export",
         "max_thumbnails": 20, "max_parallel_uploads": 6,
+        "custom_thumbnails": True, "ai_thumbnail_styling": True,
     },
 
     "master_admin": {
@@ -175,6 +182,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_caption_frames": 20, "ai_depth": "max",
         "team_seats": 9999, "analytics": "full_export",
         "max_thumbnails": 20, "max_parallel_uploads": 6,
+        "custom_thumbnails": True, "ai_thumbnail_styling": True,
     },
 }
 
@@ -258,6 +266,8 @@ class Entitlements:
 
     # Thumbnails
     max_thumbnails: int = 1
+    can_custom_thumbnails: bool = False   # YouTube/FB/IG styled thumbnails allowed
+    can_ai_thumbnail_styling: bool = False  # AI image edit vs template-only
 
     # Batch upload (upload.html parallel mode cap)
     max_parallel_uploads: int = 1
@@ -308,6 +318,8 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         max_caption_frames=cfg.get("max_caption_frames", 3),
         ai_depth=cfg.get("ai_depth", "basic"),
         max_thumbnails=cfg.get("max_thumbnails", 1),
+        can_custom_thumbnails=cfg.get("custom_thumbnails", False),
+        can_ai_thumbnail_styling=cfg.get("ai_thumbnail_styling", False),
         max_parallel_uploads=cfg.get("max_parallel_uploads", 1),
         team_seats=cfg.get("team_seats", 1),
         analytics=cfg.get("analytics", "basic"),
@@ -352,6 +364,8 @@ def get_entitlements_from_user(
         _ov(ent, overrides, "lookahead_hours",           int)
         _ov(ent, overrides, "max_caption_frames",        int)
         _ov(ent, overrides, "max_thumbnails",            int)
+        _ov(ent, overrides, "can_custom_thumbnails",     bool)
+        _ov(ent, overrides, "can_ai_thumbnail_styling", bool)
         _ov(ent, overrides, "priority_class",            str)
         ent.custom_overrides = dict(overrides)
 
@@ -398,6 +412,8 @@ def entitlements_to_dict(ent: Entitlements) -> dict:
         "max_caption_frames":        ent.max_caption_frames,
         "ai_depth":                  ent.ai_depth,
         "max_thumbnails":            ent.max_thumbnails,
+        "can_custom_thumbnails":     ent.can_custom_thumbnails,
+        "can_ai_thumbnail_styling":  ent.can_ai_thumbnail_styling,
         "max_parallel_uploads":      ent.max_parallel_uploads,
         "team_seats":                ent.team_seats,
         "analytics":                 ent.analytics,

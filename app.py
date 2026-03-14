@@ -140,6 +140,7 @@ class UserPreferencesUpdate(BaseModel):
     # Accept both snake_case (backend) and camelCase (frontend) keys.
     auto_captions: bool = Field(False, alias="autoCaptions")
     auto_thumbnails: bool = Field(False, alias="autoThumbnails")
+    styled_thumbnails: bool = Field(True, alias="styledThumbnails")
     thumbnail_interval: int = Field(5, ge=1, le=60, alias="thumbnailInterval")
 
     default_privacy: Literal["public", "private", "unlisted"] = Field("public", alias="defaultPrivacy")
@@ -1176,6 +1177,7 @@ async def run_migrations():
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_ai_enhance BOOLEAN DEFAULT TRUE;
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_openai_model VARCHAR(50) DEFAULT 'gpt-4o-mini';
             """),
+            (1030, "ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS styled_thumbnails BOOLEAN DEFAULT TRUE"),
         
 (103, """CREATE TABLE IF NOT EXISTS support_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1995,8 +1997,15 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
             user_id, data.email.lower(), hash_password(data.password), data.name, country_code
         )
         await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
-        await conn.execute("INSERT INTO wallets (user_id, put_balance, aic_balance) VALUES ($1, 30, 0)", user_id)
-        await ledger_entry(conn, user_id, "put", 30, "signup_bonus")
+        # Default credits for new accounts: enough to try uploads and AI features
+        signup_put = 50
+        signup_aic = 30
+        await conn.execute(
+            "INSERT INTO wallets (user_id, put_balance, aic_balance) VALUES ($1, $2, $3)",
+            user_id, signup_put, signup_aic
+        )
+        await ledger_entry(conn, user_id, "put", signup_put, "signup_bonus")
+        await ledger_entry(conn, user_id, "aic", signup_aic, "signup_bonus")
         access = create_access_jwt(user_id)
         refresh = await create_refresh_token(conn, user_id)
     background_tasks.add_task(notify_signup, data.email, data.name)
@@ -2812,10 +2821,29 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
 
 @app.post("/api/settings/test-discord-webhook")
 async def test_user_discord_webhook(data: dict, user: dict = Depends(get_current_user)):
-    """Send a test message to the user's Discord webhook (for Settings page Test Webhook button)."""
+    """Send a test message to the user's Discord webhook (for Settings page Test Webhook button).
+    Accepts webhookUrl or webhook_url in body. If empty, uses the user's saved webhook from settings.
+    The same saved URL is used when admin sends via 'Send to user webhooks'."""
     webhook_url = (data.get("webhookUrl") or data.get("webhook_url") or "").strip()
     if not webhook_url:
-        raise HTTPException(400, "Webhook URL required")
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT COALESCE(
+                  NULLIF(TRIM(us.discord_webhook), ''),
+                  NULLIF(TRIM(up.discord_webhook), ''),
+                  NULLIF(TRIM(COALESCE(u.preferences->>'discordWebhook', u.preferences->>'discord_webhook')), '')
+                ) AS url
+                FROM users u
+                LEFT JOIN user_settings us ON us.user_id = u.id
+                LEFT JOIN user_preferences up ON up.user_id = u.id
+                WHERE u.id = $1
+                """,
+                user["id"],
+            )
+            webhook_url = (row["url"] or "").strip() if row else ""
+    if not webhook_url:
+        raise HTTPException(400, "Webhook URL required. Save your webhook in Settings first, or pass webhookUrl in the request.")
     if not webhook_url.startswith("https://discord.com/api/webhooks/"):
         raise HTTPException(400, "Invalid Discord webhook URL")
     test_embed = {
@@ -2928,7 +2956,7 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
         cleaned_ui = {}
         cleaned_worker = {}
         for platform in ["tiktok", "youtube", "instagram", "facebook"]:
-            raw = ph.get(platform)
+            raw = ph.get(platform) or ph.get(platform.title()) or ph.get(platform.upper())
             clean = _clean_tag_list(raw, 50)
             cleaned_ui[platform] = [f"#{t}" for t in clean]
             cleaned_worker[platform] = clean
@@ -2977,6 +3005,27 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
         await conn.execute(
             "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
             json.dumps(prefs), user["id"]
+        )
+        # Sync discord_webhook to user_settings and user_preferences so:
+        # - Admin "Send to user webhooks" finds it (announcement query reads from these tables)
+        # - Worker load_user_settings can use either source
+        discord_webhook = (prefs.get("discordWebhook") or prefs.get("discord_webhook") or "").strip() or None
+        await conn.execute(
+            """
+            INSERT INTO user_settings (user_id, discord_webhook) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET discord_webhook = $2, updated_at = NOW()
+            """,
+            user["id"],
+            discord_webhook,
+        )
+        await conn.execute(
+            "INSERT INTO user_preferences (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user["id"],
+        )
+        await conn.execute(
+            "UPDATE user_preferences SET discord_webhook = $1, updated_at = NOW() WHERE user_id = $2",
+            discord_webhook,
+            user["id"],
         )
     return {"status": "updated"}
 
@@ -3370,9 +3419,38 @@ async def cancel_upload(upload_id: str, request: Request, user: dict = Depends(g
             return {"status": "cancelled"}
 
 
+# Status view groupings for queue/dashboard (simplified UX)
+# pending: waiting to process (includes smart + scheduled)
+# processing: actively being processed
+# completed: done (succeeded, partial, or legacy completed)
+# failed: publish failed
+_UPLOAD_VIEW_STATUS = {
+    "pending": ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
+    "processing": ("processing",),
+    "completed": ("completed", "succeeded", "partial"),
+    "failed": ("failed",),
+    "staged": ("pending", "staged", "queued", "scheduled", "ready_to_publish"),  # alias for pending
+    "smart_schedule": None,  # special: schedule_mode='smart' + pending statuses
+}
+_STATUS_LABEL = {
+    "pending": "Pending",
+    "staged": "Scheduled",
+    "queued": "Queued",
+    "scheduled": "Scheduled",
+    "ready_to_publish": "Ready to publish",
+    "processing": "Processing",
+    "completed": "Completed",
+    "succeeded": "Succeeded",
+    "partial": "Partial",
+    "failed": "Failed",
+    "cancelled": "Cancelled",
+}
+
+
 @app.get("/api/uploads")
 async def get_uploads(
     status: Optional[str] = None,
+    view: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     trill_only: bool = False,
@@ -3382,13 +3460,17 @@ async def get_uploads(
     """
     Upload queue list for current user.
 
+    Filter by status (exact) or view (semantic group):
+      view=pending   → status IN (pending, staged, queued, scheduled, ready_to_publish) — waiting uploads incl. smart/scheduled
+      view=processing → status = processing
+      view=completed → status IN (completed, succeeded, partial)
+      view=failed   → status = failed
+      view=staged   → same as pending (alias for Staged/Pending filter)
+      view=smart_schedule → schedule_mode='smart' AND status IN pending group
+
     Contract (frontend-safe):
-      - thumbnail_url: presigned R2 URL (if thumbnail_r2_key exists)
-      - platform_results: always a list (even if DB stored dict)
-      - hashtags: always list[str]
-      - title/caption: falls back to AI-generated values if base fields are empty
-      - ai_title/ai_caption/ai_hashtags: explicit AI fields (may be empty)
-      - views/likes: totals from uploads table (platform-specific lives in platform_results if present)
+      - status_label: human-readable label for display (fixes ? succeeded, ? staged)
+      - thumbnail_url, platform_results, hashtags, etc.
     """
     cols = await _load_uploads_columns(db_pool)
 
@@ -3402,41 +3484,50 @@ async def get_uploads(
         "processing_started_at","processing_finished_at",
         "processing_stage","processing_progress",
         "views","likes","comments","shares",
-        # Schedule fields — required by dashboard to distinguish smart vs manual
         "schedule_mode","schedule_metadata",
-        # Direct video URL (populated by worker after successful upload)
         "video_url",
-        # AI fields (older/newer schema variants)
         "ai_title","ai_caption",
         "ai_generated_title","ai_generated_caption","ai_generated_hashtags",
     ]
     select_cols = _pick_cols(wanted, cols) or ["id","filename","platforms","status","created_at"]
     select_sql = f"SELECT {', '.join(select_cols)} FROM uploads WHERE user_id = $1"
+    count_sql = "SELECT COUNT(*) FROM uploads WHERE user_id = $1"
     params = [user["id"]]
+    count_params = [user["id"]]
 
-    if status:
+    # view takes precedence over status for semantic filtering
+    if view and view in _UPLOAD_VIEW_STATUS:
+        statuses = _UPLOAD_VIEW_STATUS[view]
+        if statuses is not None:
+            placeholders = ", ".join(f"${i}" for i in range(len(params) + 1, len(params) + 1 + len(statuses)))
+            params.extend(statuses)
+            count_params.extend(statuses)
+            select_sql += f" AND status IN ({placeholders})"
+            count_sql += f" AND status IN ({placeholders})"
+        else:
+            # smart_schedule: schedule_mode='smart' AND status IN pending group
+            pending = _UPLOAD_VIEW_STATUS["pending"]
+            ph = ", ".join(f"${i}" for i in range(len(params) + 1, len(params) + 1 + len(pending)))
+            params.extend(pending)
+            count_params.extend(pending)
+            select_sql += f" AND schedule_mode = 'smart' AND status IN ({ph})"
+            count_sql += f" AND schedule_mode = 'smart' AND status IN ({ph})"
+    elif status:
         params.append(status)
+        count_params.append(status)
         select_sql += f" AND status = ${len(params)}"
+        count_sql += f" AND status = ${len(count_params)}"
+
     if trill_only and "trill_score" in cols:
         select_sql += " AND trill_score IS NOT NULL"
+        count_sql += " AND trill_score IS NOT NULL"
 
     params.extend([limit, offset])
     select_sql += f" ORDER BY created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}"
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(select_sql, *params)
-
-        total = None
-        if meta:
-            # total count uses same filters
-            count_sql = "SELECT COUNT(*) FROM uploads WHERE user_id = $1"
-            count_params = [user["id"]]
-            if status:
-                count_params.append(status)
-                count_sql += f" AND status = ${len(count_params)}"
-            if trill_only and "trill_score" in cols:
-                count_sql += " AND trill_score IS NOT NULL"
-            total = await conn.fetchval(count_sql, *count_params)
+        total = await conn.fetchval(count_sql, *count_params) if meta else None
 
     def _normalize_platform_results(raw):
         """
@@ -3466,6 +3557,7 @@ async def get_uploads(
         # Alias platform_video_id → video_id and platform_url → url
         # so buildPlatformUrl() in the frontend finds them with its
         # existing entry.video_id / entry.url lookups.
+        # account_id and account_name (from item) support multi-account display.
         out = []
         for item in items:
             d = dict(item)
@@ -3515,11 +3607,13 @@ async def get_uploads(
             except Exception:
                 thumbnail_url = None
 
+        raw_status = d.get("status") or ""
         item = {
             "id": str(d.get("id")),
             "filename": d.get("filename"),
             "platforms": list(d.get("platforms") or []),
-            "status": d.get("status"),
+            "status": raw_status,
+            "status_label": _STATUS_LABEL.get(raw_status, raw_status.replace("_", " ").title() if raw_status else "Unknown"),
             "privacy": d.get("privacy", "public"),
             "title": title,
             "caption": caption,
@@ -3568,6 +3662,40 @@ async def get_uploads(
         return out
 
     return {"uploads": out, "total": int(total or 0), "limit": limit, "offset": offset}
+
+
+@app.get("/api/uploads/queue-stats")
+async def get_uploads_queue_stats(user: dict = Depends(get_current_user)):
+    """
+    Queue summary counts for queue.html and dashboard.html.
+    Use these counts for Pending, Processing, Completed, Failed cards.
+    Pending includes staged, queued, scheduled, ready_to_publish (smart + scheduled).
+    """
+    pending_statuses = _UPLOAD_VIEW_STATUS["pending"]
+    completed_statuses = _UPLOAD_VIEW_STATUS["completed"]
+    n_p, n_c = len(pending_statuses), len(completed_statuses)
+    ph_p = ", ".join(f"${i}" for i in range(2, 2 + n_p))
+    ph_c = ", ".join(f"${i}" for i in range(2 + n_p, 2 + n_p + n_c))
+    params = [user["id"]] + list(pending_statuses) + list(completed_statuses)
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT
+                SUM(CASE WHEN status IN ({ph_p}) THEN 1 ELSE 0 END)::int AS pending,
+                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END)::int AS processing,
+                SUM(CASE WHEN status IN ({ph_c}) THEN 1 ELSE 0 END)::int AS completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed
+            FROM uploads WHERE user_id = $1
+            """,
+            *params,
+        )
+    return {
+        "pending": row["pending"] or 0,
+        "processing": row["processing"] or 0,
+        "completed": row["completed"] or 0,
+        "failed": row["failed"] or 0,
+    }
 
 
 async def partial_refund_tokens(
@@ -4587,7 +4715,8 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             "trillMinScore": int(d.get("trill_min_score", 0) or 0),
             "trillHudEnabled": bool(d.get("trill_hud_enabled", False)),
             "trillAiEnhance": bool(d.get("trill_ai_enhance", False)),
-            "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
+                "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
+            "styledThumbnails": d.get("styled_thumbnails", True),
         }
 
 @app.post("/api/settings/preferences")
@@ -4624,6 +4753,7 @@ async def save_user_preferences(
         "trillHudEnabled": "trill_hud_enabled",
         "trillAiEnhance": "trill_ai_enhance",
         "trillOpenaiModel": "trill_openai_model",
+        "styledThumbnails": "styled_thumbnails",
     }
 
     def normalize_prefs_payload(p: dict) -> dict:
@@ -4699,6 +4829,7 @@ async def save_user_preferences(
     # core scalar coercions
     auto_captions = bool(p.get("auto_captions", False))
     auto_thumbnails = bool(p.get("auto_thumbnails", False))
+    styled_thumbnails = bool(p.get("styled_thumbnails", True))
 
     try:
         thumbnail_interval = int(p.get("thumbnail_interval", 5))
@@ -4744,23 +4875,25 @@ async def save_user_preferences(
             UPDATE user_preferences SET
                 auto_captions = $1,
                 auto_thumbnails = $2,
-                thumbnail_interval = $3,
-                default_privacy = $4,
-                ai_hashtags_enabled = $5,
-                ai_hashtag_count = $6,
-                ai_hashtag_style = $7,
-                hashtag_position = $8,
-                max_hashtags = $9,
-                always_hashtags = $10::jsonb,
-                blocked_hashtags = $11::jsonb,
-                platform_hashtags = $12::jsonb,
-                email_notifications = $13,
-                discord_webhook = $14,
+                styled_thumbnails = $3,
+                thumbnail_interval = $4,
+                default_privacy = $5,
+                ai_hashtags_enabled = $6,
+                ai_hashtag_count = $7,
+                ai_hashtag_style = $8,
+                hashtag_position = $9,
+                max_hashtags = $10,
+                always_hashtags = $11::jsonb,
+                blocked_hashtags = $12::jsonb,
+                platform_hashtags = $13::jsonb,
+                email_notifications = $14,
+                discord_webhook = $15,
                 updated_at = NOW()
-            WHERE user_id = $15
+            WHERE user_id = $16
             """,
             auto_captions,
             auto_thumbnails,
+            styled_thumbnails,
             thumbnail_interval,
             default_privacy,
             ai_hashtags_enabled,
@@ -4802,7 +4935,7 @@ async def save_user_preferences_put(
     user: dict = Depends(get_current_user)
 ):
     """Backward-compatible alias for clients that still call PUT"""
-    return await save_user_preferences(prefs, user)
+    return await save_user_preferences(prefs.model_dump(by_alias=True), user)
 
 async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     """Helper to fetch user preferences for upload processing"""
@@ -4814,9 +4947,12 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     
     if prefs_row:
         # User has preferences in the table
+        styled = prefs_row.get("styled_thumbnails", True)
         return {
             "auto_captions": prefs_row["auto_captions"],
             "auto_thumbnails": prefs_row["auto_thumbnails"],
+            "styled_thumbnails": styled,
+            "styledThumbnails": styled,
             "thumbnail_interval": prefs_row["thumbnail_interval"],
             "default_privacy": prefs_row["default_privacy"],
             "ai_hashtags_enabled": prefs_row["ai_hashtags_enabled"],
@@ -4860,9 +4996,12 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
             prefs = {}
     
     # Return preferences with defaults (convert camelCase to snake_case for internal use)
+    styled = prefs.get("styledThumbnails", prefs.get("styled_thumbnails", True))
     return {
         "auto_captions": prefs.get("autoCaptions", False),
         "auto_thumbnails": prefs.get("autoThumbnails", False),
+        "styled_thumbnails": styled,
+        "styledThumbnails": styled,
         "thumbnail_interval": prefs.get("thumbnailInterval", 5),
         "default_privacy": prefs.get("defaultPrivacy", "public"),
         "ai_hashtags_enabled": prefs.get("aiHashtagsEnabled", False),
@@ -8250,6 +8389,7 @@ async def send_announcement(data: AnnouncementRequest, background_tasks: Backgro
               COALESCE(
                 NULLIF(TRIM(us.discord_webhook), ''),
                 NULLIF(TRIM(up.discord_webhook), ''),
+                NULLIF(TRIM(COALESCE(u.preferences->>'discordWebhook', u.preferences->>'discord_webhook')), ''),
                 ''
               ) AS discord_webhook
             FROM users u
@@ -8629,30 +8769,72 @@ async def trigger_weekly_report(user: dict = Depends(require_master_admin)):
 # ============================================================
 @app.get("/api/dashboard/stats")
 async def get_dashboard_stats(user: dict = Depends(get_current_user)):
+    """Dashboard stats for user: uploads, quota, success rate, accounts, scheduled."""
     plan = get_plan(user.get("subscription_tier", "free"))
     wallet = user.get("wallet", {})
     
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
-            SUM(CASE WHEN status IN ('pending', 'queued', 'processing') THEN 1 ELSE 0 END)::int AS in_queue,
-            COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes
+            SELECT COUNT(*)::int AS total,
+                   SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
+                   SUM(CASE WHEN status IN ('pending', 'queued', 'processing') THEN 1 ELSE 0 END)::int AS in_queue,
+                   COALESCE(SUM(views), 0)::bigint AS views,
+                   COALESCE(SUM(likes), 0)::bigint AS likes
             FROM uploads WHERE user_id = $1
         """, user["id"])
-        accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", user["id"])
-        recent = await conn.fetch("SELECT id, filename, platforms, status, created_at FROM uploads WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5", user["id"])
+        # Scheduled: pending/staged/ready_to_publish with schedule_mode in scheduled/smart
+        scheduled = await conn.fetchval("""
+            SELECT COUNT(*)::int FROM uploads
+            WHERE user_id = $1
+              AND status IN ('pending','staged','queued','scheduled','ready_to_publish')
+              AND schedule_mode IN ('scheduled','smart')
+              AND scheduled_time IS NOT NULL
+        """, user["id"])
+        # Monthly PUT used (current month)
+        try:
+            put_used_month = await conn.fetchval("""
+                SELECT COALESCE(SUM(put_spent), 0)::int FROM uploads
+                WHERE user_id = $1 AND created_at >= date_trunc('month', CURRENT_DATE)
+            """, user["id"])
+        except Exception:
+            put_used_month = 0
+        # Connected accounts (exclude revoked)
+        try:
+            accounts = await conn.fetchval(
+                "SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1 AND (revoked_at IS NULL OR revoked_at > NOW())",
+                user["id"],
+            )
+        except Exception:
+            accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", user["id"])
+        recent = await conn.fetch(
+            "SELECT id, filename, platforms, status, created_at FROM uploads WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5",
+            user["id"],
+        )
     
+    total = stats["total"] if stats else 0
+    completed = stats["completed"] if stats else 0
     put_avail = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
     aic_avail = wallet.get("aic_balance", 0) - wallet.get("aic_reserved", 0)
+    put_monthly = plan.get("put_monthly", 60)
+    success_rate = (completed / max(total, 1)) * 100 if total else 0
     
     return {
-        "uploads": {"total": stats["total"] if stats else 0, "completed": stats["completed"] if stats else 0, "in_queue": stats["in_queue"] if stats else 0},
+        "uploads": {"total": total, "completed": completed, "in_queue": stats["in_queue"] if stats else 0},
         "engagement": {"views": stats["views"] if stats else 0, "likes": stats["likes"] if stats else 0},
+        "success_rate": round(success_rate, 1),
+        "scheduled": scheduled or 0,
+        "quota": {"put_used": put_used_month or 0, "put_limit": put_monthly},
         "wallet": {"put_available": put_avail, "put_total": wallet.get("put_balance", 0), "aic_available": aic_avail, "aic_total": wallet.get("aic_balance", 0)},
-        "accounts": {"connected": accounts, "limit": plan.get("max_accounts", 1)},
+        "accounts": {"connected": accounts or 0, "limit": plan.get("max_accounts", 1)},
         "recent": [{"id": str(r["id"]), "filename": r["filename"], "platforms": r["platforms"], "status": r["status"]} for r in recent],
         "plan": plan,
     }
+
+
+@app.get("/api/dashboard")
+async def get_dashboard_alias(user: dict = Depends(get_current_user)):
+    """Alias for GET /api/dashboard/stats — some frontends call /api/dashboard."""
+    return await get_dashboard_stats(user)
 
 
 # ============================================================

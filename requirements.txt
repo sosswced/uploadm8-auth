@@ -51,3 +51,6 @@ shapely>=2.0.0,<3.0.0
 # Data analysis — used by telemetry_stage for statistical enrichment
 pandas>=2.0.0,<3.0.0
 numpy>=1.24.0,<3.0.0
+
+# Image processing — used by thumbnail_stage for template rendering
+Pillow>=10.0.0,<11.0.0

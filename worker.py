@@ -768,6 +768,28 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except Exception as e:
                 logger.warning(f"[{upload_id}] Thumbnail R2 upload failed (non-fatal): {e}")
 
+        # ── Upload platform-specific styled thumbnails to R2 (for publish + deferred) ──
+        # platform_thumbnail_map has local paths per platform (youtube, instagram, facebook).
+        # Upload each so publish_stage can use platform-specific cover for IG/FB (9:16).
+        platform_thumb_r2: Dict[str, str] = {}
+        pm_json = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
+        try:
+            platform_map = json.loads(pm_json) if isinstance(pm_json, str) else (pm_json or {})
+        except Exception:
+            platform_map = {}
+        for platform, local_path in platform_map.items():
+            if not local_path or not Path(local_path).exists():
+                continue
+            r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/{platform}.jpg"
+            try:
+                await r2_stage.upload_file(Path(local_path), r2_key, "image/jpeg")
+                platform_thumb_r2[platform] = r2_key
+                logger.debug(f"[{upload_id}] Platform thumb {platform} → {r2_key}")
+            except Exception as e:
+                logger.debug(f"[{upload_id}] Platform thumb {platform} upload failed: {e}")
+        if platform_thumb_r2:
+            ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2)
+
         # Also upload any additional candidate thumbnails (for tier users who can pick)
         if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
             candidate_keys = []
@@ -836,6 +858,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 ctx.processed_r2_key = default_key
             except Exception as e:
                 logger.warning(f"[{upload_id}] Default R2 upload failed: {e}")
+
+        # Merge platform thumbnail R2 keys into processed_assets for deferred publish
+        if platform_thumb_r2:
+            for k, v in platform_thumb_r2.items():
+                processed_assets[f"thumb_{k}"] = v
 
         ctx.output_artifacts["processed_assets"] = json.dumps(processed_assets)
         ctx.output_artifacts["processed_video"] = ctx.processed_r2_key or ""
@@ -1125,7 +1152,7 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
 
         downloaded: Dict[str, Path] = {}
         for platform, r2_key in processed_assets.items():
-            if platform == "default":
+            if platform == "default" or platform.startswith("thumb_"):
                 continue
             if r2_key in downloaded:
                 ctx.platform_videos[platform] = downloaded[r2_key]
@@ -1158,6 +1185,27 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
                 ctx.processed_video_path = default_local
             except Exception:
                 pass
+
+        # Download platform-specific thumbnails for publish (thumb_youtube, thumb_instagram, thumb_facebook)
+        platform_thumb_map: Dict[str, str] = {}
+        platform_thumb_r2_keys: Dict[str, str] = {}
+        for key, r2_key in processed_assets.items():
+            if not key.startswith("thumb_") or not r2_key:
+                continue
+            plat = key.replace("thumb_", "")
+            platform_thumb_r2_keys[plat] = r2_key
+            local_thumb = temp_dir / f"thumb_{plat}.jpg"
+            try:
+                await r2_stage.download_file(r2_key, local_thumb)
+                if local_thumb.exists():
+                    platform_thumb_map[plat] = str(local_thumb)
+                    logger.debug(f"[{upload_id}] Downloaded thumb_{plat} for publish")
+            except Exception as e:
+                logger.debug(f"[{upload_id}] Thumb {plat} download failed: {e}")
+        if platform_thumb_map:
+            ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_thumb_map)
+        if platform_thumb_r2_keys:
+            ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2_keys)
 
         try:
             result = await run_publish_and_notify(ctx, upload_id, user_id)

@@ -105,6 +105,7 @@ from stages.notify_stage import (
 from stages.emails import (
     send_upload_completed_email,
     send_upload_failed_email,
+    send_low_token_warning_email,
 )
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -199,6 +200,42 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
         await conn.execute("""
             UPDATE uploads SET hold_status = 'captured' WHERE id = $1
         """, upload_id)
+
+        # Low token warning: if balance dropped to/below threshold, email user
+        LOW_THRESHOLD = 5
+        wallet = await conn.fetchrow(
+            "SELECT put_balance, aic_balance FROM wallets WHERE user_id = $1", user_id
+        )
+        if wallet:
+            prefs = await conn.fetchrow(
+                "SELECT email_notifications FROM user_preferences WHERE user_id = $1",
+                user_id,
+            )
+            user_row = await conn.fetchrow(
+                "SELECT email, name FROM users WHERE id = $1", user_id
+            )
+            wants_email = prefs["email_notifications"] if prefs else True
+            if wants_email and user_row and user_row.get("email"):
+                put_bal = int(wallet.get("put_balance") or 0)
+                aic_bal = int(wallet.get("aic_balance") or 0)
+                if put_bal <= LOW_THRESHOLD and put_cost > 0:
+                    import asyncio as _aio
+                    _aio.ensure_future(send_low_token_warning_email(
+                        user_row["email"],
+                        user_row.get("name") or "there",
+                        "put",
+                        put_bal,
+                        LOW_THRESHOLD,
+                    ))
+                elif aic_bal <= LOW_THRESHOLD and aic_cost > 0:
+                    import asyncio as _aio
+                    _aio.ensure_future(send_low_token_warning_email(
+                        user_row["email"],
+                        user_row.get("name") or "there",
+                        "aic",
+                        aic_bal,
+                        LOW_THRESHOLD,
+                    ))
 
 
 async def _release_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost: int, reason: str = "release"):

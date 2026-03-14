@@ -1356,6 +1356,10 @@ async def run_migrations():
 (703, """
     ALTER TABLE uploads ADD COLUMN IF NOT EXISTS target_accounts TEXT[] DEFAULT '{}';
 """),
+(704, """
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_users_deletion_requested ON users(deletion_requested_at) WHERE deletion_requested_at IS NOT NULL;
+"""),
 ]
         
         for version, sql in migrations:
@@ -2462,19 +2466,109 @@ async def _delete_r2_objects(keys: list[str]) -> int:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Account deletion helper (TOS: paid users keep access until period end)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _execute_account_deletion(conn, user: dict, ip_addr: str = None, initiated_by: str = "self") -> dict:
+    """
+    Performs full account deletion: revoke platform tokens, delete DB rows, purge R2.
+    Called from DELETE /api/me (immediate) or customer.subscription.deleted (deferred).
+    """
+    user_id = str(user["id"])
+    r2_rows = await conn.fetch(
+        "SELECT r2_key, telemetry_r2_key, processed_r2_key, thumbnail_r2_key FROM uploads WHERE user_id = $1",
+        user["id"],
+    )
+    r2_keys = []
+    for row in r2_rows:
+        for col in ("r2_key", "telemetry_r2_key", "processed_r2_key", "thumbnail_r2_key"):
+            v = row.get(col) if col in row.keys() else None
+            if v:
+                r2_keys.append(v)
+    avatar_key = user.get("avatar_r2_key") or ""
+    if avatar_key:
+        r2_keys.append(avatar_key)
+
+    token_rows = await conn.fetch(
+        "SELECT id, platform, account_id, account_name, token_blob FROM platform_tokens WHERE user_id = $1",
+        user["id"],
+    )
+    tokens_revoked = 0
+    for trow in token_rows:
+        ok, err = await _revoke_platform_token(trow["platform"], trow["token_blob"])
+        if ok:
+            tokens_revoked += 1
+        await conn.execute(
+            """
+            INSERT INTO platform_disconnect_log
+                (user_id, platform, account_id, account_name,
+                 revoked_at_provider, provider_revoke_error, initiated_by, ip_address)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            """,
+            user_id,
+            trow["platform"],
+            trow["account_id"],
+            trow["account_name"],
+            ok,
+            err or None,
+            initiated_by,
+            ip_addr,
+        )
+
+    rows_deleted = {}
+    for tbl in ("uploads", "platform_tokens", "token_ledger", "wallets",
+                "user_settings", "user_preferences", "refresh_tokens",
+                "user_color_preferences", "account_groups", "white_label_settings"):
+        try:
+            n = await conn.fetchval(f"SELECT COUNT(*) FROM {tbl} WHERE user_id = $1", user["id"])
+            rows_deleted[tbl] = int(n)
+        except Exception:
+            pass
+    rows_deleted["users"] = 1
+
+    import asyncio as _aio
+    _aio.ensure_future(send_account_deleted_email(
+        user.get("email", ""),
+        user.get("name") or "there",
+    ))
+
+    await conn.execute("DELETE FROM refresh_tokens          WHERE user_id = $1", user["id"])
+    await conn.execute("DELETE FROM token_ledger             WHERE user_id = $1", user["id"])
+    await conn.execute("DELETE FROM wallets                  WHERE user_id = $1", user["id"])
+    await conn.execute("DELETE FROM user_settings            WHERE user_id = $1", user["id"])
+    await conn.execute("DELETE FROM user_preferences         WHERE user_id = $1", user["id"])
+    await conn.execute("DELETE FROM platform_tokens          WHERE user_id = $1", user["id"])
+    await conn.execute("DELETE FROM user_color_preferences   WHERE user_id = $1", user["id"])
+    await conn.execute("DELETE FROM account_groups           WHERE user_id = $1", user["id"])
+    try:
+        await conn.execute("DELETE FROM white_label_settings WHERE user_id = $1", user["id"])
+    except Exception:
+        pass
+    await conn.execute("DELETE FROM uploads                  WHERE user_id = $1", user["id"])
+    try:
+        await conn.execute(
+            "UPDATE support_messages SET name = '[deleted]', email = '[deleted]' WHERE user_id = $1",
+            user["id"],
+        )
+    except Exception:
+        pass
+    await conn.execute("DELETE FROM users WHERE id = $1", user["id"])
+
+    r2_deleted = await _delete_r2_objects(r2_keys)
+    return {"r2_deleted": r2_deleted, "tokens_revoked": tokens_revoked, "rows_deleted": rows_deleted}
+
+
 # Self-serve account deletion  DELETE /api/me
 # ──────────────────────────────────────────────────────────────────────────────
 
 @app.delete("/api/me")
 async def delete_account(request: Request, user: dict = Depends(get_current_user)):
     """
-    Self-serve account deletion.  Proves it deletes:
-      • all platform OAuth tokens (revoked at provider first)
-      • all R2 upload artifacts (video, thumbnail, processed, telemetry)
-      • all personal data rows (users, uploads, settings, wallets, ledger …)
-      • Stripe subscription (cancelled immediately if active)
-    Writes a tamper-evident audit record BEFORE touching any data so even a
-    mid-flight crash leaves an evidence trail.
+    Self-serve account deletion. TOS-aligned:
+      • Free users: deletion is immediate.
+      • Paid users: subscription cancelled (no future charges), access until period end,
+        then full deletion when Stripe sends subscription.deleted.
     """
     user_id = str(user["id"])
     ip_addr = request.headers.get("X-Forwarded-For", request.client.host if request.client else None)
@@ -2483,7 +2577,6 @@ async def delete_account(request: Request, user: dict = Depends(get_current_user
         raise HTTPException(403, "Master admin accounts cannot be deleted via this endpoint.")
 
     async with db_pool.acquire() as conn:
-        # ── 1. Write deletion REQUEST record immediately ──────────────────
         deletion_log_id = await conn.fetchval(
             """
             INSERT INTO account_deletion_log
@@ -2497,141 +2590,64 @@ async def delete_account(request: Request, user: dict = Depends(get_current_user
             ip_addr,
         )
 
-        # ── 2. Collect all R2 keys for this user ─────────────────────────
-        r2_rows = await conn.fetch(
-            """
-            SELECT r2_key, telemetry_r2_key, processed_r2_key, thumbnail_r2_key
-            FROM uploads WHERE user_id = $1
-            """,
-            user["id"],
-        )
-        r2_keys = []
-        for row in r2_rows:
-            for col in ("r2_key", "telemetry_r2_key", "processed_r2_key", "thumbnail_r2_key"):
-                v = row[col] if col in row.keys() else None
-                if v:
-                    r2_keys.append(v)
-        # Also pick up avatar if stored in R2
-        avatar_key = user.get("avatar_r2_key") or ""
-        if avatar_key:
-            r2_keys.append(avatar_key)
-
-        # ── 3. Collect & revoke platform tokens ──────────────────────────
-        token_rows = await conn.fetch(
-            "SELECT id, platform, account_id, account_name, token_blob FROM platform_tokens WHERE user_id = $1",
-            user["id"],
-        )
-        tokens_revoked = 0
-        for trow in token_rows:
-            ok, err = await _revoke_platform_token(trow["platform"], trow["token_blob"])
-            if ok:
-                tokens_revoked += 1
-            # Log each disconnect individually
-            await conn.execute(
-                """
-                INSERT INTO platform_disconnect_log
-                    (user_id, platform, account_id, account_name,
-                     revoked_at_provider, provider_revoke_error, initiated_by, ip_address)
-                VALUES ($1,$2,$3,$4,$5,$6,'account_deletion',$7)
-                """,
-                user_id,
-                trow["platform"],
-                trow["account_id"],
-                trow["account_name"],
-                ok,
-                err or None,
-                ip_addr,
-            )
-
-        # ── 4. Cancel Stripe subscription ────────────────────────────────
-        stripe_cancelled = False
         stripe_sub_id = user.get("stripe_subscription_id")
-        if stripe_sub_id and STRIPE_SECRET_KEY:
+        has_active_paid_sub = bool(stripe_sub_id and STRIPE_SECRET_KEY)
+
+        if has_active_paid_sub:
+            try:
+                sub = stripe.Subscription.retrieve(stripe_sub_id)
+                if sub.status in ("active", "trialing"):
+                    has_active_paid_sub = True
+                else:
+                    has_active_paid_sub = False
+            except Exception:
+                has_active_paid_sub = False
+
+        if has_active_paid_sub:
+            # TOS: paid users keep access until end of billing period
+            await conn.execute(
+                "UPDATE users SET deletion_requested_at = NOW() WHERE id = $1",
+                user["id"],
+            )
             try:
                 stripe.Subscription.cancel(stripe_sub_id)
-                stripe_cancelled = True
             except Exception as e:
                 logger.warning(f"Stripe cancel failed for {user_id}: {e}")
 
-        # ── 5. Count rows for the audit manifest ─────────────────────────
-        rows_deleted = {}
-        for tbl in ("uploads", "platform_tokens", "token_ledger", "wallets",
-                    "user_settings", "user_preferences", "refresh_tokens",
-                    "user_color_preferences", "account_groups",
-                    "white_label_settings"):
-            try:
-                n = await conn.fetchval(f"SELECT COUNT(*) FROM {tbl} WHERE user_id = $1", user["id"])
-                rows_deleted[tbl] = int(n)
-            except Exception:
-                pass
-        rows_deleted["users"] = 1
+            period_end = user.get("current_period_end")
+            access_until = period_end.strftime("%B %d, %Y") if period_end and hasattr(period_end, "strftime") else "end of billing period"
 
-        # ── 6. Delete DB rows (cascade-safe ordering) ────────────────────
-        # Send goodbye email NOW — before user row is gone, address is still valid
-        import asyncio as _aio
-        _aio.ensure_future(send_account_deleted_email(
-            user.get("email", ""),
-            user.get("name") or "there",
-        ))
-
-        await conn.execute("DELETE FROM refresh_tokens          WHERE user_id = $1", user["id"])
-        await conn.execute("DELETE FROM token_ledger             WHERE user_id = $1", user["id"])
-        await conn.execute("DELETE FROM wallets                  WHERE user_id = $1", user["id"])
-        await conn.execute("DELETE FROM user_settings            WHERE user_id = $1", user["id"])
-        await conn.execute("DELETE FROM user_preferences         WHERE user_id = $1", user["id"])
-        await conn.execute("DELETE FROM platform_tokens          WHERE user_id = $1", user["id"])
-        await conn.execute("DELETE FROM user_color_preferences   WHERE user_id = $1", user["id"])
-        await conn.execute("DELETE FROM account_groups           WHERE user_id = $1", user["id"])
-        try:
-            await conn.execute("DELETE FROM white_label_settings WHERE user_id = $1", user["id"])
-        except Exception:
-            pass
-        await conn.execute("DELETE FROM uploads                  WHERE user_id = $1", user["id"])
-        # Pseudonymize support_messages (keep subject/message for audit, strip PII)
-        try:
+            logger.info(f"[DELETION SCHEDULED] user={user_id} access_until={access_until}")
+            return {
+                "status": "deletion_scheduled",
+                "message": "Your account will be deleted at the end of your billing period. You retain access until then.",
+                "access_until": access_until,
+            }
+        else:
+            # Free user or no active subscription: delete immediately
+            result = await _execute_account_deletion(conn, user, ip_addr=ip_addr, initiated_by="account_deletion")
             await conn.execute(
-                "UPDATE support_messages SET name = '[deleted]', email = '[deleted]' WHERE user_id = $1",
-                user["id"],
+                """
+                UPDATE account_deletion_log
+                SET completed_at = NOW(), r2_keys_deleted = $2, tokens_revoked = $3,
+                    stripe_cancelled = $4, rows_deleted = $5
+                WHERE id = $1
+                """,
+                deletion_log_id,
+                result["r2_deleted"],
+                result["tokens_revoked"],
+                False,
+                json.dumps(result["rows_deleted"]),
             )
-        except Exception:
-            pass
-        await conn.execute("DELETE FROM users WHERE id = $1", user["id"])
-
-        # ── 7. Delete R2 objects (non-blocking; best-effort) ─────────────
-        r2_deleted = await _delete_r2_objects(r2_keys)
-
-        # ── 8. Mark audit record as COMPLETED ────────────────────────────
-        await conn.execute(
-            """
-            UPDATE account_deletion_log
-            SET completed_at   = NOW(),
-                r2_keys_deleted  = $2,
-                tokens_revoked   = $3,
-                stripe_cancelled = $4,
-                rows_deleted     = $5
-            WHERE id = $1
-            """,
-            deletion_log_id,
-            r2_deleted,
-            tokens_revoked,
-            stripe_cancelled,
-            json.dumps(rows_deleted),
-        )
-
-    logger.info(
-        f"[DELETION COMPLETE] user={user_id} "
-        f"r2={r2_deleted} tokens_revoked={tokens_revoked} "
-        f"stripe_cancelled={stripe_cancelled}"
-    )
-    return {
-        "status": "account_deleted",
-        "summary": {
-            "r2_objects_deleted": r2_deleted,
-            "platform_tokens_revoked": tokens_revoked,
-            "stripe_subscription_cancelled": stripe_cancelled,
-            "rows_deleted": rows_deleted,
-        },
-    }
+            logger.info(f"[DELETION COMPLETE] user={user_id} r2={result['r2_deleted']} tokens={result['tokens_revoked']}")
+            return {
+                "status": "account_deleted",
+                "summary": {
+                    "r2_objects_deleted": result["r2_deleted"],
+                    "platform_tokens_revoked": result["tokens_revoked"],
+                    "rows_deleted": result["rows_deleted"],
+                },
+            }
 
 @app.get("/api/wallet")
 async def get_wallet_endpoint(user: dict = Depends(get_current_user)):
@@ -5732,33 +5748,94 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                         period_end.strftime("%B %d, %Y"),
                     )
 
-    # ── subscription.deleted — downgrade to free, keep balance ─────────
+    # ── invoice.payment_failed — notify user to update payment method ────
+    elif etype == "invoice.payment_failed":
+        inv = event.data.object
+        sub_id = inv.get("subscription")
+        if sub_id:
+            async with db_pool.acquire() as conn:
+                user_row = await conn.fetchrow(
+                    "SELECT email, name, subscription_tier FROM users WHERE stripe_subscription_id = $1",
+                    sub_id,
+                )
+            if user_row:
+                retry_ts = inv.get("next_payment_attempt")
+                retry_date = (
+                    datetime.fromtimestamp(retry_ts, tz=timezone.utc).strftime("%B %d, %Y")
+                    if retry_ts else ""
+                )
+                failure_reason = ""
+                try:
+                    err = inv.get("last_finalization_error") or {}
+                    failure_reason = err.get("message", "") if isinstance(err, dict) else str(err)
+                except Exception:
+                    pass
+                background_tasks.add_task(
+                    send_payment_failed_email,
+                    user_row["email"],
+                    user_row["name"] or "there",
+                    user_row["subscription_tier"] or "free",
+                    (inv.get("amount_due") or 0) / 100,
+                    retry_date,
+                    inv.get("id", ""),
+                    failure_reason,
+                )
+
+    # ── subscription.deleted — downgrade to free OR execute deferred account deletion ─
     elif etype == "customer.subscription.deleted":
         sub = event.data.object
         async with db_pool.acquire() as conn:
             user_row = await conn.fetchrow(
-                "SELECT id, email, name, subscription_tier, trial_end FROM users WHERE stripe_subscription_id = $1", sub.id
+                "SELECT * FROM users WHERE stripe_subscription_id = $1", sub.id
             )
-            await conn.execute("""
-                UPDATE users SET
-                    subscription_tier   = 'free',
-                    subscription_status = 'cancelled',
-                    updated_at          = NOW()
-                WHERE stripe_subscription_id = $1
-            """, sub.id)
+            if not user_row:
+                return {"status": "user_not_found"}
 
-            if user_row:
+            user_dict = dict(user_row)
+
+            if user_row.get("deletion_requested_at"):
+                # User requested account deletion; period ended — execute full deletion now
+                deletion_log = await conn.fetchrow(
+                    "SELECT id FROM account_deletion_log WHERE user_id = $1 AND completed_at IS NULL ORDER BY requested_at DESC LIMIT 1",
+                    str(user_row["id"]),
+                )
+                result = await _execute_account_deletion(conn, user_dict, initiated_by="account_deletion")
+                if deletion_log:
+                    await conn.execute(
+                        """
+                        UPDATE account_deletion_log
+                        SET completed_at = NOW(), r2_keys_deleted = $2, tokens_revoked = $3,
+                            stripe_cancelled = TRUE, rows_deleted = $4
+                        WHERE id = $1
+                        """,
+                        deletion_log["id"],
+                        result["r2_deleted"],
+                        result["tokens_revoked"],
+                        json.dumps(result["rows_deleted"]),
+                    )
+                logger.info(
+                    f"[DELETION COMPLETE via subscription.deleted] user={user_row['id']} "
+                    f"r2={result['r2_deleted']} tokens={result['tokens_revoked']}"
+                )
+            else:
+                # Normal cancellation: downgrade to free, send emails
+                await conn.execute("""
+                    UPDATE users SET
+                        subscription_tier   = 'free',
+                        subscription_status = 'cancelled',
+                        updated_at          = NOW()
+                    WHERE stripe_subscription_id = $1
+                """, sub.id)
+
                 _email    = user_row["email"]
                 _name     = user_row["name"] or "there"
                 _old_tier = user_row["subscription_tier"] or "free"
-                _trial_end = user_row["trial_end"]
-                # Access until end of current period
+                _trial_end = user_row.get("trial_end")
                 _access_until = datetime.fromtimestamp(
                     sub.current_period_end, tz=timezone.utc
                 ).strftime("%B %d, %Y") if sub.get("current_period_end") else "now"
 
                 if _trial_end and _trial_end > _now_utc():
-                    # Cancelled while still in trial
                     background_tasks.add_task(
                         send_trial_cancelled_email,
                         _email, _name, _old_tier, _access_until,
@@ -7371,7 +7448,7 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
         if exists:
             raise HTTPException(status_code=409, detail="Email already in use")
 
-        old = await conn.fetchrow("SELECT email FROM users WHERE id=$1", user_id)
+        old = await conn.fetchrow("SELECT email, name FROM users WHERE id=$1", user_id)
         if not old:
             raise HTTPException(status_code=404, detail="User not found")
 
@@ -7404,11 +7481,12 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
             request=request,
         )
 
-    # Send verification email to the new address
+    # Send verification email to the new address (name = target user, not admin)
     _verify_link = f"{FRONTEND_URL}/verify-email?token={verification_token}"
+    _target_name = old.get("name") or "there"
     background_tasks.add_task(
         send_email_change_email,
-        new_email, old["email"], user.get("name") or "there", _verify_link
+        new_email, old["email"], _target_name, _verify_link
     )
 
     return {"ok": True, "email": new_email}

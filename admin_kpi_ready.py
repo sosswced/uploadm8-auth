@@ -62,9 +62,13 @@ async def get_db():
 
 
 # ============================================================================
-# AUTH - Update JWT_SECRET to match YOUR project
+# AUTH - JWT_SECRET must be set via env; never use a default in production
 # ============================================================================
-JWT_SECRET = os.getenv("JWT_SECRET", os.getenv("SECRET_KEY", "your-secret-key-here"))
+JWT_SECRET = os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY")
+if not JWT_SECRET:
+    import sys
+    print("FATAL: JWT_SECRET or SECRET_KEY must be set. Never use default secrets.", file=sys.stderr)
+    sys.exit(1)
 JWT_ALGORITHM = "HS256"
 
 

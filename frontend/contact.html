@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Contact - UploadM8</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="/images/logo.png">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+        --blue-50:#eff6ff; --blue-100:#dbeafe; --blue-500:#3b82f6; --blue-600:#2563eb;
+        --orange-500:#f97316;
+        --gray-50:#f9fafb; --gray-100:#f3f4f6; --gray-200:#e5e7eb; --gray-300:#d1d5db;
+        --gray-400:#9ca3af; --gray-500:#6b7280; --gray-600:#4b5563; --gray-700:#374151;
+        --gray-800:#1f2937; --gray-900:#111827;
+        --green-500:#22c55e; --red-500:#ef4444; --yellow-500:#eab308;
+    }
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--gray-50);color:var(--gray-800);line-height:1.65;}
+    nav{position:sticky;top:0;background:rgba(255,255,255,0.95);backdrop-filter:blur(20px);border-bottom:1px solid var(--gray-200);z-index:10;padding:0 24px;}
+    .nav-container{max-width:1100px;margin:0 auto;height:72px;display:flex;align-items:center;justify-content:space-between;}
+    .logo{display:flex;align-items:center;gap:10px;text-decoration:none;}
+    .logo img{height:34px;}
+    .nav-links{display:flex;align-items:center;gap:18px;}
+    .nav-links a{color:var(--gray-600);text-decoration:none;font-weight:600;font-size:0.95rem;}
+    .nav-links a:hover{color:var(--gray-900);}
+    .nav-buttons{display:flex;gap:12px;align-items:center;}
+    .btn{padding:10px 18px;border-radius:10px;font-weight:700;font-size:0.95rem;text-decoration:none;display:inline-flex;align-items:center;gap:8px;border:1px solid transparent;cursor:pointer;}
+    .btn-ghost{background:transparent;border-color:var(--gray-300);color:var(--gray-700);}
+    .btn-ghost:hover{background:var(--gray-100);}
+    .btn-primary{background:linear-gradient(135deg,var(--blue-500),var(--blue-600));color:#fff;box-shadow:0 6px 18px rgba(59,130,246,0.35);}
+    .btn-primary:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(59,130,246,0.45);}
+    .wrap{max-width:1100px;margin:0 auto;padding:56px 24px;}
+    .card{background:#fff;border:1px solid var(--gray-200);border-radius:18px;padding:28px;}
+    h1{font-size:2.2rem;line-height:1.15;color:var(--gray-900);margin-bottom:10px;}
+    .meta{color:var(--gray-500);font-weight:600;margin-bottom:22px;}
+    h2{font-size:1.25rem;color:var(--gray-900);margin-top:26px;margin-bottom:10px;}
+    p{color:var(--gray-700);margin:10px 0;}
+    ul{padding-left:20px;margin:10px 0;color:var(--gray-700);}
+    li{margin:6px 0;}
+    .callout{border-left:4px solid var(--blue-500);background:var(--blue-50);padding:14px 16px;border-radius:12px;margin:16px 0;color:var(--gray-700);}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:14px;}
+    .pill{display:inline-flex;gap:8px;align-items:center;padding:6px 12px;border-radius:999px;background:var(--gray-100);border:1px solid var(--gray-200);font-weight:700;color:var(--gray-700);font-size:0.85rem;}
+    footer{border-top:1px solid var(--gray-200);background:#fff;}
+    .foot{max-width:1100px;margin:0 auto;padding:26px 24px;color:var(--gray-500);display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;}
+    .foot a{color:var(--gray-600);text-decoration:none;font-weight:700;}
+    .foot a:hover{color:var(--gray-900);}
+    @media (max-width:900px){.grid{grid-template-columns:1fr;}.nav-links{display:none;}}
+</style>
+</head>
+<body>
+  <nav>
+    <div class="nav-container">
+      <a class="logo" href="/index.html"><img src="/images/logo.png" alt="UploadM8"></a>
+      
+        <div class="nav-links">
+            <a href="/index.html">Home</a>
+            <a href="/contact.html">Contact</a>
+        </div>
+    
+      <div class="nav-buttons">
+        <a class="btn btn-ghost" href="/login.html">Log in</a>
+        <a class="btn btn-primary" href="/signup.html">Get started free</a>
+      </div>
+    </div>
+  </nav>
+
+  <div class="wrap">
+    <div class="card">
+      <h1>Contact UploadM8</h1>
+      <div class="meta">Last updated: January 26, 2026</div>
+      
+<p>For support, billing, and platform connection issues, use the form below. Submissions are routed to <a href="mailto:sosswced@gmail.com">sosswced@gmail.com</a>.</p>
+
+<h2>Contact form</h2>
+<div id="alert" class="callout" style="display:none;"></div>
+<form id="contactForm" style="margin-top:14px;display:grid;gap:12px;">
+  <div>
+    <label style="font-weight:800;color:var(--gray-900);display:block;margin-bottom:6px;">Name</label>
+    <input id="name" required minlength="2" style="width:100%;padding:12px 14px;border:1px solid var(--gray-300);border-radius:12px;font-family:inherit;font-size:1rem;">
+  </div>
+  <div>
+    <label style="font-weight:800;color:var(--gray-900);display:block;margin-bottom:6px;">Email</label>
+    <input id="email" type="email" required style="width:100%;padding:12px 14px;border:1px solid var(--gray-300);border-radius:12px;font-family:inherit;font-size:1rem;">
+  </div>
+  <div>
+    <label style="font-weight:800;color:var(--gray-900);display:block;margin-bottom:6px;">Subject</label>
+    <input id="subject" required style="width:100%;padding:12px 14px;border:1px solid var(--gray-300);border-radius:12px;font-family:inherit;font-size:1rem;">
+  </div>
+  <div>
+    <label style="font-weight:800;color:var(--gray-900);display:block;margin-bottom:6px;">Message</label>
+    <textarea id="message" required rows="6" style="width:100%;padding:12px 14px;border:1px solid var(--gray-300);border-radius:12px;font-family:inherit;font-size:1rem;"></textarea>
+  </div>
+  <button class="btn btn-primary" type="submit" id="sendBtn" style="justify-content:center;">Submit</button>
+  <div style="color:var(--gray-500);font-weight:600;font-size:0.9rem;">If the form cannot reach the API, it will open your email client as a fallback.</div>
+</form>
+
+<script>
+  const API_URL = 'https://auth.uploadm8.com';
+  const TO = 'sosswced@gmail.com';
+  const form = document.getElementById('contactForm');
+  const alertBox = document.getElementById('alert');
+  const btn = document.getElementById('sendBtn');
+
+  function show(msg, ok=true){
+    alertBox.style.display='block';
+    alertBox.style.borderLeftColor = ok ? 'var(--green-500)' : 'var(--red-500)';
+    alertBox.innerHTML = msg;
+  }
+
+  form.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    btn.disabled=true; btn.textContent='Sending...';
+    const payload = {
+      name: document.getElementById('name').value,
+      email: document.getElementById('email').value,
+      subject: document.getElementById('subject').value,
+      message: document.getElementById('message').value
+    };
+    try {
+      const r = await fetch(API_URL + '/api/support/contact', {
+        method:'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) throw new Error('API returned ' + r.status);
+      show('<strong>Submitted.</strong> We received your message and will respond by email.');
+      form.reset();
+    } catch (err) {
+      const mailto = `mailto:${TO}?subject=${encodeURIComponent('[UploadM8] ' + payload.subject)}&body=${encodeURIComponent('From: ' + payload.name + ' <' + payload.email + '>\n\n' + payload.message)}`;
+      show('<strong>Fallback:</strong> opening your email client to send the message directly.', false);
+      window.location.href = mailto;
+    } finally {
+      btn.disabled=false; btn.textContent='Submit';
+    }
+  });
+</script>
+
+    </div>
+  </div>
+
+  <footer>
+    <div class="foot">
+      <div>© 2026 UploadM8</div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;">
+        <a href="/about.html">About</a>
+        <a href="/blog.html">Blog</a>
+        <a href="/contact.html">Contact</a>
+        <a href="/privacy.html">Privacy</a>
+        <a href="/terms.html">Terms</a>
+        <a href="/data-deletion.html">Data deletion</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

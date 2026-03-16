@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <title>Email Preferences - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0a0a0f;
+            color: #ffffff;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            padding: 1.5rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            text-decoration: none;
+            color: white;
+            font-size: 1.5rem;
+            font-weight: 700;
+        }
+        .logo img { height: 32px; }
+        .main {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+        .card {
+            background: #12121a;
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 20px;
+            padding: 2.5rem;
+            width: 100%;
+            max-width: 500px;
+        }
+        .card-header { text-align: center; margin-bottom: 2rem; }
+        .card-icon {
+            width: 64px;
+            height: 64px;
+            background: linear-gradient(135deg, #f97316, #ea580c);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.75rem;
+            margin: 0 auto 1.25rem;
+        }
+        .card-header h1 { font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .card-header p { color: #9ca3af; font-size: 0.95rem; line-height: 1.5; }
+        .section-title {
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #6b7280;
+            margin-bottom: 1rem;
+            margin-top: 1.5rem;
+        }
+        .pref-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem 1.25rem;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 12px;
+            margin-bottom: 0.75rem;
+            transition: background 0.2s;
+        }
+        .pref-row:hover { background: rgba(255,255,255,0.05); }
+        .pref-info { flex: 1; }
+        .pref-info strong { display: block; font-size: 0.95rem; font-weight: 600; margin-bottom: 0.2rem; }
+        .pref-info span { font-size: 0.82rem; color: #6b7280; }
+        .pref-required {
+            font-size: 0.72rem;
+            background: rgba(249,115,22,0.12);
+            border: 1px solid rgba(249,115,22,0.25);
+            color: #f97316;
+            padding: 0.2rem 0.6rem;
+            border-radius: 99px;
+            font-weight: 600;
+            white-space: nowrap;
+            margin-left: 1rem;
+        }
+        /* Toggle switch */
+        .toggle { position: relative; display: inline-block; width: 46px; height: 26px; margin-left: 1rem; flex-shrink: 0; }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(255,255,255,0.12);
+            border-radius: 99px;
+            transition: background 0.25s;
+        }
+        .toggle-slider:before {
+            content: '';
+            position: absolute;
+            height: 20px; width: 20px;
+            left: 3px; bottom: 3px;
+            background: white;
+            border-radius: 50%;
+            transition: transform 0.25s;
+        }
+        .toggle input:checked + .toggle-slider { background: #f97316; }
+        .toggle input:checked + .toggle-slider:before { transform: translateX(20px); }
+        .unsubscribe-all {
+            margin-top: 1.75rem;
+            padding: 1rem 1.25rem;
+            background: rgba(239,68,68,0.06);
+            border: 1px solid rgba(239,68,68,0.2);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .unsubscribe-all p { font-size: 0.9rem; color: #9ca3af; }
+        .unsubscribe-all strong { display: block; color: #f87171; margin-bottom: 0.2rem; }
+        .unsub-btn {
+            background: rgba(239,68,68,0.12);
+            border: 1px solid rgba(239,68,68,0.3);
+            color: #f87171;
+            padding: 0.6rem 1.25rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+            margin-left: 1rem;
+            flex-shrink: 0;
+            transition: background 0.2s;
+        }
+        .unsub-btn:hover { background: rgba(239,68,68,0.2); }
+        .save-btn {
+            width: 100%;
+            padding: 1rem;
+            background: linear-gradient(135deg, #f97316, #ea580c);
+            border: none;
+            border-radius: 10px;
+            color: white;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 1.75rem;
+            transition: opacity 0.2s, transform 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        .save-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+        .save-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .alert {
+            display: none;
+            padding: 1rem;
+            border-radius: 10px;
+            margin-top: 1rem;
+            font-size: 0.9rem;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        .alert.show { display: flex; }
+        .alert-success { background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.3); color: #86efac; }
+        .alert-error   { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); color: #fca5a5; }
+        .back-link { text-align: center; margin-top: 1.5rem; }
+        .back-link a { color: #6b7280; text-decoration: none; font-size: 0.9rem; }
+        .back-link a:hover { color: #9ca3af; }
+        .footer {
+            padding: 1.5rem 2rem;
+            text-align: center;
+            color: #9ca3af;
+            font-size: 0.85rem;
+            border-top: 1px solid rgba(255,255,255,0.05);
+        }
+        .footer a { color: #9ca3af; text-decoration: none; margin: 0 0.75rem; }
+        .footer a:hover { color: white; }
+        .confirmed-state { display: none; text-align: center; padding: 1rem 0; }
+        .confirmed-state.show { display: block; }
+        .confirmed-state .big-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+        .confirmed-state h2 { font-size: 1.5rem; margin-bottom: 0.75rem; }
+        .confirmed-state p { color: #9ca3af; margin-bottom: 1.75rem; line-height: 1.6; }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <a href="index.html" class="logo">
+            <img src="images/logo.png" alt="UploadM8">
+            UploadM8
+        </a>
+    </header>
+
+    <main class="main">
+        <div class="card">
+
+            <!-- Main preferences form -->
+            <div id="prefForm">
+                <div class="card-header">
+                    <div class="card-icon">📧</div>
+                    <h1>Email Preferences</h1>
+                    <p>Control which emails UploadM8 sends to you. Transactional emails (receipts, security alerts) cannot be disabled.</p>
+                </div>
+
+                <div class="section-title">Upload Notifications</div>
+
+                <div class="pref-row">
+                    <div class="pref-info">
+                        <strong>Upload Completed</strong>
+                        <span>Notify me when my videos are successfully published</span>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="togUploadSuccess" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="pref-row">
+                    <div class="pref-info">
+                        <strong>Upload Failed</strong>
+                        <span>Notify me if a video fails to publish</span>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="togUploadFail" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="section-title">Billing &amp; Account</div>
+
+                <div class="pref-row">
+                    <div class="pref-info">
+                        <strong>Renewal Receipts</strong>
+                        <span>Receive a receipt each time your subscription renews</span>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="togRenewal" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="pref-row">
+                    <div class="pref-info">
+                        <strong>Low Token Balance Alerts</strong>
+                        <span>Warn me when my upload tokens are running low</span>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="togLowToken" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="pref-row">
+                    <div class="pref-info">
+                        <strong>Trial Ending Reminders</strong>
+                        <span>Remind me 3 days before my free trial expires</span>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="togTrial" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="section-title">Product &amp; Marketing</div>
+
+                <div class="pref-row">
+                    <div class="pref-info">
+                        <strong>Platform Announcements</strong>
+                        <span>New features, product updates, and platform news</span>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="togAnnouncements" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="section-title">Always Sent (Cannot Disable)</div>
+
+                <div class="pref-row" style="opacity:0.6;">
+                    <div class="pref-info">
+                        <strong>Security Alerts</strong>
+                        <span>Password changes, account access, suspicious activity</span>
+                    </div>
+                    <span class="pref-required">Required</span>
+                </div>
+
+                <div class="pref-row" style="opacity:0.6;">
+                    <div class="pref-info">
+                        <strong>Billing Transactions</strong>
+                        <span>Payment confirmations, plan changes, subscription updates</span>
+                    </div>
+                    <span class="pref-required">Required</span>
+                </div>
+
+                <!-- Unsubscribe all -->
+                <div class="unsubscribe-all">
+                    <div>
+                        <strong>Unsubscribe from All Optional Emails</strong>
+                        <p>Turn off all non-essential emails at once. Transactional emails will still be sent.</p>
+                    </div>
+                    <button class="unsub-btn" onclick="unsubscribeAll()">Unsubscribe All</button>
+                </div>
+
+                <button class="save-btn" id="saveBtn" onclick="savePreferences()">
+                    <i class="fas fa-check"></i> Save Preferences
+                </button>
+
+                <div id="alertSuccess" class="alert alert-success">
+                    <i class="fas fa-check-circle"></i>
+                    <span>Preferences saved successfully.</span>
+                </div>
+                <div id="alertError" class="alert alert-error">
+                    <i class="fas fa-exclamation-circle"></i>
+                    <span id="alertErrorMsg">Something went wrong. Please try again.</span>
+                </div>
+
+                <div class="back-link">
+                    <a href="settings.html">&larr; Back to Settings</a>
+                </div>
+            </div>
+
+            <!-- Unsubscribed all confirmation state -->
+            <div id="unsubConfirmed" class="confirmed-state">
+                <div class="big-icon">✉️</div>
+                <h2>You've Been Unsubscribed</h2>
+                <p>All optional email notifications have been turned off. You'll still receive security alerts and billing receipts as required by law.</p>
+                <a href="settings.html" style="display:inline-block;padding:0.9rem 2.25rem;background:linear-gradient(135deg,#f97316,#ea580c);border-radius:10px;color:white;text-decoration:none;font-weight:600;">Go to Settings &rarr;</a>
+                <div class="back-link" style="margin-top:1rem;">
+                    <a href="index.html">Return to Home</a>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span>© 2025 UploadM8</span>
+        <a href="terms.html">Terms</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="support.html">Support</a>
+    </footer>
+
+    <script>
+        (function () {
+            var m = /[?&]api=([^&]+)/.exec(location.search);
+            if (m) window.API_BASE = decodeURIComponent(m[1]).replace(/\/$/, '');
+            else if (!window.API_BASE && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin))
+                window.API_BASE = 'http://127.0.0.1:8000';
+        })();
+        const API_BASE = window.API_BASE || 'https://auth.uploadm8.com';
+
+        const accessToken = localStorage.getItem('access_token') || sessionStorage.getItem('access_token');
+
+        // Load current preferences on page load
+        async function loadPreferences() {
+            if (!accessToken) return; // guest view — defaults shown
+            try {
+                const resp = await fetch(`${API_BASE}/api/me/preferences`, {
+                    headers: { 'Authorization': `Bearer ${accessToken}` }
+                });
+                if (resp.ok) {
+                    const prefs = await resp.json();
+                    if ('email_notifications' in prefs) {
+                        const en = prefs.email_notifications;
+                        // If server returns a single boolean, apply to all optional toggles
+                        if (typeof en === 'boolean') {
+                            ['togUploadSuccess','togUploadFail','togRenewal','togLowToken','togTrial','togAnnouncements'].forEach(id => {
+                                document.getElementById(id).checked = en;
+                            });
+                        }
+                        // If server returns granular object
+                        if (typeof en === 'object' && en !== null) {
+                            if ('upload_success' in en) document.getElementById('togUploadSuccess').checked = en.upload_success;
+                            if ('upload_fail'    in en) document.getElementById('togUploadFail').checked    = en.upload_fail;
+                            if ('renewal'        in en) document.getElementById('togRenewal').checked       = en.renewal;
+                            if ('low_token'      in en) document.getElementById('togLowToken').checked      = en.low_token;
+                            if ('trial'          in en) document.getElementById('togTrial').checked         = en.trial;
+                            if ('announcements'  in en) document.getElementById('togAnnouncements').checked = en.announcements;
+                        }
+                    }
+                }
+            } catch (e) { /* silent — use defaults */ }
+        }
+
+        async function savePreferences() {
+            const btn = document.getElementById('saveBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+            document.getElementById('alertSuccess').classList.remove('show');
+            document.getElementById('alertError').classList.remove('show');
+
+            const payload = {
+                email_notifications: {
+                    upload_success: document.getElementById('togUploadSuccess').checked,
+                    upload_fail:    document.getElementById('togUploadFail').checked,
+                    renewal:        document.getElementById('togRenewal').checked,
+                    low_token:      document.getElementById('togLowToken').checked,
+                    trial:          document.getElementById('togTrial').checked,
+                    announcements:  document.getElementById('togAnnouncements').checked,
+                }
+            };
+
+            try {
+                const headers = { 'Content-Type': 'application/json' };
+                if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`;
+
+                const resp = await fetch(`${API_BASE}/api/me/preferences`, {
+                    method: 'PATCH',
+                    headers,
+                    body: JSON.stringify(payload)
+                });
+
+                if (resp.ok) {
+                    document.getElementById('alertSuccess').classList.add('show');
+                } else {
+                    const data = await resp.json().catch(() => ({}));
+                    document.getElementById('alertErrorMsg').textContent = data.detail || 'Could not save. Please try again.';
+                    document.getElementById('alertError').classList.add('show');
+                }
+            } catch (e) {
+                document.getElementById('alertErrorMsg').textContent = 'Connection error. Please try again.';
+                document.getElementById('alertError').classList.add('show');
+            }
+
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fas fa-check"></i> Save Preferences';
+        }
+
+        function unsubscribeAll() {
+            ['togUploadSuccess','togUploadFail','togRenewal','togLowToken','togTrial','togAnnouncements'].forEach(id => {
+                document.getElementById(id).checked = false;
+            });
+
+            // Auto-save then show confirmation
+            const payload = {
+                email_notifications: {
+                    upload_success: false,
+                    upload_fail:    false,
+                    renewal:        false,
+                    low_token:      false,
+                    trial:          false,
+                    announcements:  false,
+                }
+            };
+
+            const headers = { 'Content-Type': 'application/json' };
+            if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`;
+
+            fetch(`${API_BASE}/api/me/preferences`, {
+                method: 'PATCH',
+                headers,
+                body: JSON.stringify(payload)
+            }).catch(() => {});
+
+            // Show unsubscribed confirmation
+            document.getElementById('prefForm').style.display = 'none';
+            document.getElementById('unsubConfirmed').classList.add('show');
+        }
+
+        loadPreferences();
+    </script>
+</body>
+</html>

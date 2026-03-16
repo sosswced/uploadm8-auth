@@ -235,7 +235,7 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "The clip I've been waiting to post 🎮",
-            "Nobody expects this strat in ranked 👀",
+            "This strat worked in ranked 👀",
             "New personal best — I'm still shaking",
         ],
         "hashtag_seeds": [
@@ -406,8 +406,8 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "This goal took 3 years of practice 🥅",
-            "Nobody thought we'd make it to the finals",
-            "The play that silenced the critics",
+            "Here's the play that got us to the finals",
+            "The moment that defined this match",
         ],
         "hashtag_seeds": [
             "sports", "athlete", "sportsmotivation", "sportstok",
@@ -425,8 +425,8 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
             "Don't oversell it — let the content breathe. Less = more in ASMR."
         ),
         "hook_templates": [
-            "The most satisfying 60 seconds you'll watch today",
-            "Just watch until the end 🎧",
+            "60 seconds of satisfying sounds 🎧",
+            "No talking — just the triggers",
             "Instant calm — no talking",
         ],
         "hashtag_seeds": [
@@ -447,8 +447,8 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "A realistic day in my life (not the highlight reel)",
-            "I tried {challenge} for 30 days — here's what changed",
-            "Morning routine that actually changed my life",
+            "I tried {challenge} for 30 days — here's what I noticed",
+            "My morning routine — what works for me",
         ],
         "hashtag_seeds": [
             "dayinmylife", "vlog", "lifestylevlog", "morningroutine",

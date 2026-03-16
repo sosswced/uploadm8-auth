@@ -1,0 +1,36 @@
+# Environment and secrets - NEVER commit
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+.env.test
+*.env
+secrets/
+*.pem
+*.key
+# GCP / Google Cloud - service account keys must NEVER be committed
+*-credentials.json
+*service-account*.json
+gcp-key*.json
+credentials.json
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+.cache/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

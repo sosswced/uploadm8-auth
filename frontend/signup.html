@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign Up — UploadM8</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  <style>
+    :root { --primary: #7c3aed; --primary-dark: #5b21b6; --bg: #0f0f12; --card: #1a1a1f; --text: #e4e4e7; --muted: #71717a; --danger: #ef4444; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .auth-card { background: var(--card); border-radius: 16px; padding: 2.5rem; width: 100%; max-width: 400px; border: 1px solid #2a2a2f; }
+    .auth-card h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+    .auth-card .sub { color: var(--muted); margin-bottom: 1.5rem; font-size: 0.9rem; }
+    .form-group { margin-bottom: 1rem; }
+    .form-group label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.3rem; color: var(--muted); }
+    .form-group input { width: 100%; padding: 0.7rem 0.9rem; border-radius: 8px; border: 1px solid #2a2a2f; background: var(--bg); color: var(--text); font-size: 0.95rem; outline: none; transition: border-color 0.2s; }
+    .form-group input:focus { border-color: var(--primary); }
+    .hint { font-size: 0.75rem; color: var(--muted); margin-top: 0.2rem; }
+    .btn { display: block; width: 100%; padding: 0.75rem; border-radius: 8px; font-weight: 600; text-align: center; cursor: pointer; border: none; font-size: 0.95rem; margin-top: 0.5rem; }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-dark); }
+    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+    .error-msg { color: var(--danger); font-size: 0.85rem; margin-top: 0.5rem; display: none; }
+    .links { margin-top: 1.25rem; text-align: center; font-size: 0.85rem; color: var(--muted); }
+    .links a { color: var(--primary); text-decoration: none; }
+    .links a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="auth-card">
+    <h1>Create account</h1>
+    <p class="sub">Start uploading to all platforms in minutes</p>
+    <form id="signup-form" autocomplete="on">
+      <div class="form-group">
+        <label for="name">Name</label>
+        <input id="name" type="text" placeholder="Your name" required minlength="2" autocomplete="name" />
+      </div>
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input id="email" type="email" placeholder="you@example.com" required autocomplete="email" />
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input id="password" type="password" placeholder="Min 8 characters" required minlength="8" autocomplete="new-password" />
+        <div class="hint">At least 8 characters</div>
+      </div>
+      <div id="error" class="error-msg"></div>
+      <button type="submit" class="btn btn-primary" id="submit-btn">Create account</button>
+    </form>
+    <div class="links">
+      Already have an account? <a href="/login.html">Sign in</a>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = (typeof API_BASE_URL !== 'undefined') ? API_BASE_URL : (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : (window.location.hostname === 'app.uploadm8.com' ? 'https://auth.uploadm8.com' : ''));
+
+    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+    const form = document.getElementById('signup-form');
+    const errEl = document.getElementById('error');
+    const btn = document.getElementById('submit-btn');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errEl.style.display = 'none';
+      const name = document.getElementById('name').value.trim();
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+
+      if (!name || !email || !password) { errEl.textContent = 'Please fill in all fields.'; errEl.style.display = 'block'; return; }
+      if (password.length < 8) { errEl.textContent = 'Password must be at least 8 characters.'; errEl.style.display = 'block'; return; }
+
+      btn.disabled = true; btn.textContent = 'Creating account...';
+      try {
+        const r = await fetch(API_BASE + '/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, email, password })
+        });
+        const data = await r.json();
+        if (!r.ok) { errEl.textContent = esc(data.detail || 'Registration failed'); errEl.style.display = 'block'; return; }
+        localStorage.setItem('access_token', data.access_token);
+        if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
+        window.location.href = '/settings.html';
+      } catch (err) {
+        errEl.textContent = 'Network error. Please try again.'; errEl.style.display = 'block';
+      } finally {
+        btn.disabled = false; btn.textContent = 'Create account';
+      }
+    });
+  </script>
+</body>
+</html>

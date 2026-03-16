@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DMCA Policy - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg-primary: #0a0a0f; --bg-secondary: #12121a; --bg-card: #1a1a24; --bg-hover: #22222e;
+            --bg-input: rgba(255,255,255,0.05); --text-primary: #ffffff; --text-secondary: #9ca3af;
+            --text-muted: #6b7280; --border-color: rgba(255,255,255,0.08); --border-hover: rgba(255,255,255,0.15);
+            --accent-orange: #f97316; --accent-orange-hover: #ea580c; --accent-blue: #3b82f6;
+            --accent-green: #22c55e; --accent-red: #ef4444; --accent-purple: #8b5cf6;
+            --radius-sm: 6px; --radius-md: 10px; --radius-lg: 16px;
+        }
+        html { scroll-behavior: smooth; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg-primary); color: var(--text-primary); line-height: 1.7; min-height: 100vh; }
+        a { color: var(--accent-orange); text-decoration: none; transition: color 0.2s; }
+        a:hover { color: var(--accent-orange-hover); }
+        .nav { position: sticky; top: 0; z-index: 100; padding: 1rem 2rem; background: rgba(10,10,15,0.97); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); }
+        .nav-container { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+        .nav-logo { display: flex; align-items: center; gap: 0.75rem; font-size: 1.25rem; font-weight: 700; color: white; text-decoration: none; }
+        .nav-logo-icon { width: 32px; height: 32px; background: linear-gradient(135deg, var(--accent-orange), var(--accent-purple)); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 1rem; }
+        .back-btn { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; font-weight: 500; padding: 0.5rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-md); transition: all 0.2s; }
+        .back-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--bg-hover); }
+        .hero { padding: 4rem 2rem 3rem; background: linear-gradient(180deg, rgba(239,68,68,0.06) 0%, transparent 100%); border-bottom: 1px solid var(--border-color); }
+        .hero-inner { max-width: 900px; margin: 0 auto; }
+        .hero-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.875rem; background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.25); border-radius: 50px; font-size: 0.8rem; font-weight: 600; color: var(--accent-red); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 1.25rem; }
+        .hero h1 { font-size: 2.75rem; font-weight: 800; margin-bottom: 0.75rem; }
+        .hero-meta { display: flex; align-items: center; gap: 1.5rem; color: var(--text-muted); font-size: 0.875rem; flex-wrap: wrap; }
+        .hero-meta span { display: flex; align-items: center; gap: 0.4rem; }
+        .legal-nav { background: var(--bg-secondary); border-bottom: 1px solid var(--border-color); padding: 0 2rem; overflow-x: auto; }
+        .legal-nav-inner { max-width: 1280px; margin: 0 auto; display: flex; }
+        .legal-nav a { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
+        .legal-nav a:hover { color: var(--text-primary); }
+        .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+        .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
+        @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
+        .sidebar-toc { position: sticky; top: 80px; }
+        .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
+        .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
+        .toc-list { list-style: none; }
+        .toc-list li { margin-bottom: 0.125rem; }
+        .toc-list a { display: block; padding: 0.4rem 0.75rem; color: var(--text-secondary); font-size: 0.85rem; border-radius: var(--radius-sm); border-left: 2px solid transparent; transition: all 0.2s; text-decoration: none; }
+        .toc-list a:hover, .toc-list a.active { color: var(--accent-orange); border-left-color: var(--accent-orange); background: rgba(249,115,22,0.07); }
+        .article { min-width: 0; }
+        .section-block { margin-bottom: 3rem; }
+        .section-header { display: flex; align-items: center; gap: 0.875rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); }
+        .section-num { width: 32px; height: 32px; background: rgba(249,115,22,0.15); border: 1px solid rgba(249,115,22,0.3); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 700; color: var(--accent-orange); flex-shrink: 0; }
+        .section-header h2 { font-size: 1.35rem; font-weight: 700; }
+        .prose p { color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.95rem; }
+        .prose ul, .prose ol { color: var(--text-secondary); padding-left: 1.5rem; margin-bottom: 1rem; }
+        .prose li { margin-bottom: 0.6rem; font-size: 0.95rem; }
+        .prose h3 { font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 1.5rem 0 0.75rem; }
+        .prose strong { color: var(--text-primary); font-weight: 600; }
+        .callout { display: flex; gap: 0.875rem; padding: 1rem 1.25rem; border-radius: var(--radius-md); margin: 1.25rem 0; font-size: 0.9rem; }
+        .callout i { flex-shrink: 0; margin-top: 0.1rem; }
+        .callout-blue { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); color: #93c5fd; }
+        .callout-blue i { color: var(--accent-blue); }
+        .callout-orange { background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.2); color: #fdba74; }
+        .callout-orange i { color: var(--accent-orange); }
+        .callout-red { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: #fca5a5; }
+        .callout-red i { color: var(--accent-red); }
+        .checklist { list-style: none; padding: 0; }
+        .checklist li { display: flex; align-items: flex-start; gap: 0.75rem; padding: 0.6rem 0; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 0.9rem; }
+        .checklist li:last-child { border-bottom: none; }
+        .checklist li i { color: var(--accent-orange); margin-top: 0.15rem; flex-shrink: 0; width: 16px; }
+        .footer { background: var(--bg-secondary); border-top: 1px solid var(--border-color); padding: 2rem; margin-top: 4rem; }
+        .footer-inner { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+        .footer-copy { color: var(--text-muted); font-size: 0.85rem; }
+        .footer-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+        .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
+        .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
+        ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: var(--bg-secondary); } ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+    </style>
+</head>
+<body>
+
+<nav class="nav">
+    <div class="nav-container">
+        <a href="index.html" class="nav-logo">
+            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            UploadM8
+        </a>
+        <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
+    </div>
+</nav>
+
+<div class="hero">
+    <div class="hero-inner">
+        <div class="hero-badge"><i class="fas fa-gavel"></i> Legal</div>
+        <h1>DMCA Policy</h1>
+        <div class="hero-meta">
+            <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
+            <span><i class="fas fa-envelope"></i> Notices: dmca@uploadm8.com</span>
+            <span><i class="fas fa-clock"></i> Response: 2 business days</span>
+        </div>
+    </div>
+</div>
+
+<nav class="legal-nav">
+    <div class="legal-nav-inner">
+        <a href="privacy.html"><i class="fas fa-shield-alt"></i> Privacy</a>
+        <a href="terms.html"><i class="fas fa-file-contract"></i> Terms</a>
+        <a href="security.html"><i class="fas fa-lock"></i> Security</a>
+        <a href="cookies.html"><i class="fas fa-cookie-bite"></i> Cookies</a>
+        <a href="subprocessors.html"><i class="fas fa-server"></i> Subprocessors</a>
+        <a href="refunds.html"><i class="fas fa-undo"></i> Refunds</a>
+        <a href="dmca.html" class="active"><i class="fas fa-gavel"></i> DMCA</a>
+        <a href="support.html"><i class="fas fa-headset"></i> Support</a>
+    </div>
+</nav>
+
+<div class="content-wrapper">
+    <article class="article">
+
+        <div class="callout callout-blue">
+            <i class="fas fa-info-circle"></i>
+            <div>UploadM8 respects intellectual property rights and complies with the Digital Millennium Copyright Act (DMCA), 17 U.S.C. § 512. We process valid takedown notices promptly and maintain a repeat infringer policy as required by law to preserve our safe harbor protections.</div>
+        </div>
+
+        <div class="section-block" id="platform-scope">
+            <div class="section-header"><div class="section-num">1</div><h2>Platform Scope & Safe Harbor</h2></div>
+            <div class="prose">
+                <p>UploadM8 operates as a video upload and distribution pipeline. We facilitate the publishing of content to third-party platforms (TikTok, YouTube, Instagram, Facebook) at the direction of our users. We qualify as a service provider under DMCA Section 512(c) and maintain safe harbor protections by:</p>
+                <ul>
+                    <li>Not having actual knowledge of infringing content stored on our systems</li>
+                    <li>Expeditiously removing or disabling access to content upon receiving valid notices</li>
+                    <li>Maintaining and enforcing a repeat infringer termination policy</li>
+                    <li>Designating a DMCA agent with the U.S. Copyright Office</li>
+                </ul>
+                <div class="callout callout-orange">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <div><strong>Important scope note:</strong> UploadM8 controls the upload pipeline and our storage infrastructure. We do not control content once it is published to TikTok, YouTube, Instagram, or Facebook. Takedown requests for content already live on those platforms must be directed to each respective platform using their own DMCA/copyright reporting tools.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section-block" id="notice-requirements">
+            <div class="section-header"><div class="section-num">2</div><h2>DMCA Takedown Notice Requirements</h2></div>
+            <div class="prose">
+                <p>To file a valid DMCA takedown notice, your written communication to <a href="mailto:dmca@uploadm8.com">dmca@uploadm8.com</a> must include all of the following:</p>
+            </div>
+            <ul class="checklist">
+                <li><i class="fas fa-circle-notch"></i> <div>A physical or electronic signature of the copyright owner or a person authorized to act on their behalf</div></li>
+                <li><i class="fas fa-circle-notch"></i> <div>Identification of the copyrighted work claimed to be infringed (or a representative list if multiple works are covered by a single notice)</div></li>
+                <li><i class="fas fa-circle-notch"></i> <div>Identification of the allegedly infringing material and information sufficient for us to locate it on our systems (e.g., the specific URL, upload date, or UploadM8 job ID)</div></li>
+                <li><i class="fas fa-circle-notch"></i> <div>Your contact information: name, mailing address, telephone number, and email address</div></li>
+                <li><i class="fas fa-circle-notch"></i> <div>A statement that you have a good faith belief that the use of the material is not authorized by the copyright owner, its agent, or the law</div></li>
+                <li><i class="fas fa-circle-notch"></i> <div>A statement, made under penalty of perjury, that the information in the notification is accurate and that you are the copyright owner or authorized to act on the copyright owner's behalf</div></li>
+            </ul>
+            <div class="prose">
+                <div class="callout callout-red">
+                    <i class="fas fa-exclamation-circle"></i>
+                    <div>Intentionally submitting a materially false DMCA notice exposes you to liability under DMCA Section 512(f) for damages, costs, and attorneys' fees. Submit notices only for content you have a good faith belief infringes your copyright.</div>
+                </div>
+                <p>Incomplete notices will be rejected without action. We will contact you via the email address provided to request any missing information.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="our-process">
+            <div class="section-header"><div class="section-num">3</div><h2>Our DMCA Process</h2></div>
+            <div class="prose">
+                <p>Upon receiving a complete, valid DMCA notice:</p>
+                <ol>
+                    <li>We will acknowledge receipt within 2 business days</li>
+                    <li>We will review the notice for completeness and apparent validity</li>
+                    <li>If valid, we will expeditiously remove or disable access to the identified content in our systems</li>
+                    <li>We will notify the user who uploaded the content that their material has been removed and provide a copy of the notice (with your contact information)</li>
+                    <li>We will provide the user with information about filing a counter-notice</li>
+                    <li>If the content was already published to social platforms, we will advise the user to remove it from those platforms directly and will advise the claimant to use platform-specific reporting tools</li>
+                </ol>
+                <p>For valid, actionable notices, we target content removal within 10 business days of receipt of a complete notice.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="counter-notice">
+            <div class="section-header"><div class="section-num">4</div><h2>Counter-Notice Procedure</h2></div>
+            <div class="prose">
+                <p>If you believe your content was removed in error (e.g., due to misidentification or a claim of fair use), you may submit a counter-notice to <a href="mailto:dmca@uploadm8.com">dmca@uploadm8.com</a>. Your counter-notice must include:</p>
+                <ul>
+                    <li>Your physical or electronic signature</li>
+                    <li>Identification of the removed material and its location before removal</li>
+                    <li>A statement, under penalty of perjury, that you have a good faith belief the material was removed due to mistake or misidentification</li>
+                    <li>Your name, address, phone number, and email address</li>
+                    <li>A statement consenting to jurisdiction of the Federal District Court for your district (or Jackson County, Missouri if outside the U.S.)</li>
+                </ul>
+                <p>Upon receiving a valid counter-notice, we will forward it to the original claimant. If the claimant does not notify us of a court action within 10–14 business days, we may restore the removed material at our discretion.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="repeat-infringers">
+            <div class="section-header"><div class="section-num">5</div><h2>Repeat Infringer Policy</h2></div>
+            <div class="prose">
+                <p>UploadM8 maintains a repeat infringer policy as required by DMCA Section 512(i):</p>
+            </div>
+            <ul class="checklist">
+                <li><i class="fas fa-exclamation-triangle"></i> <div><strong>First valid DMCA strike:</strong> Formal warning issued. Content removed. User notified of our repeat infringer policy.</div></li>
+                <li><i class="fas fa-exclamation-triangle"></i> <div><strong>Second valid DMCA strike:</strong> Publishing privileges suspended for 30 days. Account flagged for review.</div></li>
+                <li><i class="fas fa-ban"></i> <div><strong>Third valid DMCA strike:</strong> Account terminated permanently. No refunds issued for any remaining subscription period.</div></li>
+            </ul>
+            <div class="prose">
+                <p>Strikes may be contested through the counter-notice process. Successful counter-notices will not count toward the strike total. We reserve the right to terminate accounts after fewer strikes if the infringement is egregious (e.g., systematic copyright theft or commercial piracy).</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="designated-agent">
+            <div class="section-header"><div class="section-num">6</div><h2>Designated DMCA Agent</h2></div>
+            <div class="prose">
+                <p>All DMCA notices and counter-notices must be sent to our designated agent:</p>
+                <p>
+                    <strong>Email:</strong> <a href="mailto:dmca@uploadm8.com">dmca@uploadm8.com</a><br>
+                    <strong>Mailing Address:</strong> UploadM8 — DMCA Agent, Kansas City, Missouri, USA<br>
+                    <strong>Response Time:</strong> Acknowledgment within 2 business days
+                </p>
+                <p>Please note that non-DMCA inquiries sent to this address will not receive a response. For general support, use <a href="mailto:earl@uploadm8.com">earl@uploadm8.com</a>.</p>
+            </div>
+        </div>
+
+    </article>
+
+    <aside class="sidebar-toc">
+        <div class="toc-card">
+            <div class="toc-title">On This Page</div>
+            <ul class="toc-list">
+                <li><a href="#platform-scope">1. Platform Scope</a></li>
+                <li><a href="#notice-requirements">2. Notice Requirements</a></li>
+                <li><a href="#our-process">3. Our DMCA Process</a></li>
+                <li><a href="#counter-notice">4. Counter-Notice</a></li>
+                <li><a href="#repeat-infringers">5. Repeat Infringers</a></li>
+                <li><a href="#designated-agent">6. Designated Agent</a></li>
+            </ul>
+        </div>
+    </aside>
+</div>
+
+<footer class="footer">
+    <div class="footer-inner">
+        <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
+        <div class="footer-links">
+            <a href="privacy.html">Privacy</a>
+            <a href="terms.html">Terms</a>
+            <a href="security.html">Security</a>
+            <a href="cookies.html">Cookies</a>
+            <a href="subprocessors.html">Subprocessors</a>
+            <a href="refunds.html">Refunds</a>
+            <a href="dmca.html" class="active">DMCA</a>
+            <a href="support.html">Support</a>
+        </div>
+    </div>
+</footer>
+
+<script>
+    const sections = document.querySelectorAll('.section-block[id]');
+    const tocLinks = document.querySelectorAll('.toc-list a');
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                tocLinks.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+            }
+        });
+    }, { rootMargin: '-20% 0% -60% 0%' });
+    sections.forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

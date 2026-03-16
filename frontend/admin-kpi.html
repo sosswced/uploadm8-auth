@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KPI Dashboard - Admin - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+    <style>
+        .kpi-header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+        .time-select { min-width: 180px; }
+        .custom-range { display: none; }
+        .custom-range.show { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+
+        .section-header { display: flex; align-items: center; gap: 0.75rem; margin: 2rem 0 1rem 0; padding-bottom: 0.5rem; border-bottom: 2px solid var(--border-color); }
+        .section-header h2 { font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 0; }
+        .section-header i { font-size: 1.1rem; }
+        .section-header.revenue i { color: #22c55e; }
+        .section-header.costs i { color: #ef4444; }
+        .section-header.margins i { color: #8b5cf6; }
+        .section-header.funnels i { color: #3b82f6; }
+        .section-header.reliability i { color: #f97316; }
+        .section-header.targets i { color: #fbbf24; }
+        .section-header.usage i { color: #06b6d4; }
+
+        .kpi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1rem; min-height: 50px; }
+
+        /* clickable cards */
+        .kpi-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1rem; cursor: pointer; transition: all 0.2s ease; user-select: none; text-decoration: none; color: inherit; display: block; position: relative; }
+        .kpi-card:hover { border-color: var(--accent-orange); box-shadow: 0 4px 12px rgba(0,0,0,0.15); transform: translateY(-2px); }
+        .kpi-card.dragging { opacity: 0.5; cursor: grabbing; transform: scale(1.02); }
+        .kpi-card.drag-over { border-color: var(--accent-orange); background: rgba(249, 115, 22, 0.05); }
+        .kpi-card .label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+        .kpi-card .label i { font-size: 0.65rem; opacity: 0.7; }
+        .kpi-card .value { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); line-height: 1.2; }
+        .kpi-card .value.money { color: #22c55e; }
+        .kpi-card .value.cost { color: #ef4444; }
+        .kpi-card .value.percent { color: #8b5cf6; }
+        .kpi-card .change { font-size: 0.75rem; margin-top: 0.5rem; display: flex; align-items: center; gap: 0.25rem; }
+        .kpi-card .change.up { color: #22c55e; }
+        .kpi-card .change.down { color: #ef4444; }
+        .kpi-card .change.neutral { color: var(--text-muted); }
+        .kpi-card .subtext { font-size: 0.7rem; color: var(--text-muted); margin-top: 0.25rem; }
+        .kpi-card .external-link { position: absolute; top: 0.6rem; right: 0.6rem; color: var(--text-muted); font-size: 0.7rem; opacity: 0; transition: opacity 0.2s; }
+        .kpi-card:hover .external-link { opacity: 1; }
+
+        .target-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1rem; }
+        .target-card .target-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
+        .target-card .target-label { font-size: 0.8rem; color: var(--text-secondary); }
+        .target-card .target-range { font-size: 0.7rem; color: var(--text-muted); background: var(--bg-input); padding: 0.2rem 0.5rem; border-radius: 4px; }
+        .target-card .target-value { font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .target-card .target-value.good { color: #22c55e; }
+        .target-card .target-value.warning { color: #f59e0b; }
+        .target-card .target-value.bad { color: #ef4444; }
+        .target-card .progress-bar { height: 6px; background: var(--bg-input); border-radius: 3px; overflow: hidden; }
+        .target-card .progress-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+
+        .leaderboard { max-height: 350px; overflow-y: auto; }
+        .leaderboard-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem; border-bottom: 1px solid var(--border-color); }
+        .leaderboard-item:last-child { border-bottom: none; }
+        .rank { width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 50%; font-weight: 700; font-size: 0.75rem; }
+        .rank-1 { background: linear-gradient(135deg, #fbbf24, #f59e0b); color: #000; }
+        .rank-2 { background: linear-gradient(135deg, #9ca3af, #6b7280); color: #fff; }
+        .rank-3 { background: linear-gradient(135deg, #cd7f32, #8b5a2b); color: #fff; }
+        .rank-default { background: var(--bg-input); color: var(--text-secondary); }
+
+        .edit-mode-banner { background: linear-gradient(135deg, rgba(249, 115, 22, 0.1), rgba(139, 92, 246, 0.1)); border: 1px dashed var(--accent-orange); border-radius: var(--radius-md); padding: 0.75rem 1rem; margin-bottom: 1rem; display: none; align-items: center; gap: 0.75rem; }
+        .edit-mode-banner.active { display: flex; }
+        .edit-mode-banner i { color: var(--accent-orange); }
+        .edit-mode-banner span { flex: 1; font-size: 0.875rem; }
+
+        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }
+        .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; }
+        @media (max-width: 1200px) { .grid-4 { grid-template-columns: repeat(2, 1fr); } }
+        @media (max-width: 768px) { .grid-2, .grid-4 { grid-template-columns: 1fr; } .kpi-grid { grid-template-columns: repeat(2, 1fr); } }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }
+        .badge.free { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
+        .badge.launch { background: rgba(59, 130, 246, 0.2); color: #3b82f6; }
+        .badge.creator_pro { background: rgba(249, 115, 22, 0.2); color: #f97316; }
+        .badge.studio { background: rgba(139, 92, 246, 0.2); color: #8b5cf6; }
+        .badge.agency { background: rgba(236, 72, 153, 0.2); color: #ec4899; }
+        .badge.active { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
+        .badge.banned { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+    </style>
+</head>
+<body>
+    <div class="app-layout">
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <a href="dashboard.html" class="sidebar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></a>
+            </div>
+            <nav class="sidebar-nav">
+                <div class="nav-section">
+                    <div class="nav-section-title">Main</div>
+                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
+                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
+                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
+                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-section-title">Platforms</div>
+                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
+                    <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-section-title">Insights</div>
+                    <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
+                </div>
+                <div class="nav-section admin-only" id="adminSection" style="display:none;">
+                    <div class="nav-section-title">Admin</div>
+                    <a href="admin.html" class="nav-link"><i class="fas fa-cog"></i><span>Admin Panel</span></a>
+                    <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>User Management</span></a>
+                    <a href="admin-kpi.html" class="nav-link active"><i class="fas fa-chart-bar"></i><span>KPI Dashboard</span></a>
+                    <a href="admin-calculator.html" class="nav-link"> <i class="fas fa-calculator"></i> <span>Biz Calculator</span> </a>
+                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
+                </div>
+                <div class="nav-section">
+                    <div class="nav-section-title">Account</div>
+                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
+                    <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
+                </div>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <div class="user-avatar" id="userAvatar">U</div>
+                    <div class="user-details">
+                        <div class="user-name" id="userName">User</div>
+                        <div class="user-tier" id="userTier">Admin</div>
+                    </div>
+                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out"><i class="fas fa-sign-out-alt"></i></button>
+                </div>
+            </div>
+        </aside>
+
+        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+        <header class="top-bar">
+            <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
+            <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
+            <div class="top-bar-actions"><button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme"><i class="fas fa-moon"></i></button></div>
+        </header>
+
+        <main class="main-content">
+            <div id="loadingState" style="display: flex; align-items: center; justify-content: center; min-height: 50vh; flex-direction: column; gap: 1rem;">
+                <div style="width: 40px; height: 40px; border: 3px solid var(--border-color); border-top-color: var(--accent-orange); border-radius: 50%; animation: spin 1s linear infinite;"></div>
+                <div>Verifying admin access...</div>
+            </div>
+
+            <div id="accessDenied" style="display: none; align-items: center; justify-content: center; min-height: 50vh; flex-direction: column; gap: 1rem; text-align: center;">
+                <div style="width: 64px; height: 64px; background: rgba(239, 68, 68, 0.1); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #ef4444; font-size: 1.5rem;"><i class="fas fa-lock"></i></div>
+                <h2>Access Denied</h2>
+                <p style="color: var(--text-secondary);">Admin privileges required.</p>
+                <a href="dashboard.html" class="btn btn-primary"><i class="fas fa-home"></i> Return to Dashboard</a>
+            </div>
+
+            <div id="adminContent" style="display: none;">
+                <div class="page-header" style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem;">
+                    <div>
+                        <h1 class="page-title">KPI Dashboard</h1>
+                        <p class="page-subtitle">Profit-First Analytics & Business Performance</p>
+                    </div>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <button class="btn btn-secondary btn-sm" id="editModeBtn" onclick="toggleEditMode()"><i class="fas fa-grip-vertical"></i> Customize</button>
+                        <button class="btn btn-secondary btn-sm" onclick="resetLayout()"><i class="fas fa-undo"></i> Reset</button>
+                        <button class="btn btn-secondary btn-sm" id="kpiRefreshBtn" onclick="refreshKPIsWithSync()"><i class="fas fa-sync-alt"></i> Refresh</button>
+                    </div>
+                </div>
+
+                <div class="edit-mode-banner" id="editModeBanner">
+                    <i class="fas fa-info-circle"></i>
+                    <span>Drag and drop cards to customize your layout. In edit mode, card clicks are disabled.</span>
+                    <button class="btn btn-primary btn-sm" onclick="toggleEditMode()">Done</button>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="kpi-header">
+                        <div class="flex items-center gap-2"><i class="fas fa-clock text-orange"></i><span class="font-medium">Time Range:</span></div>
+                        <select id="timeRange" class="form-select time-select">
+                            <option value="24h">Last 24 Hours</option>
+                            <option value="7d">Last 7 Days</option>
+                            <option value="30d" selected>Last 30 Days</option>
+                            <option value="90d">Last 90 Days</option>
+                            <option value="6m">Last 6 Months</option>
+                            <option value="1y">Last Year</option>
+                            <option value="custom">Custom Range</option>
+                        </select>
+                        <div class="custom-range" id="customRange">
+                            <input type="date" id="startDate" class="form-input" style="width: 140px;">
+                            <span>to</span>
+                            <input type="date" id="endDate" class="form-input" style="width: 140px;">
+                            <button class="btn btn-primary btn-sm" onclick="applyCustomRange()">Apply</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- HEALTH TARGETS -->
+                <div class="section-header targets"><i class="fas fa-bullseye"></i><h2>Health Targets</h2></div>
+                <div class="grid-4 mb-4">
+                    <div class="target-card"><div class="target-header"><span class="target-label">Free → Paid Conversion</span><span class="target-range">Target: 3-7%</span></div><div class="target-value" id="targetFreePaid">--%</div><div class="progress-bar"><div class="progress-fill" id="targetFreePaidBar" style="width: 0%;"></div></div></div>
+                    <div class="target-card"><div class="target-header"><span class="target-label">Paid Churn Rate</span><span class="target-range">Target: &lt;4%</span></div><div class="target-value" id="targetChurn">--%</div><div class="progress-bar"><div class="progress-fill" id="targetChurnBar" style="width: 0%;"></div></div></div>
+                    <div class="target-card"><div class="target-header"><span class="target-label">ARPA Uplift (Microtx)</span><span class="target-range">Target: +15-30%</span></div><div class="target-value" id="targetMicrotx">--%</div><div class="progress-bar"><div class="progress-fill" id="targetMicrotxBar" style="width: 0%;"></div></div></div>
+                    <div class="target-card"><div class="target-header"><span class="target-label">Users Hitting Quota</span><span class="target-range">Target: 20-35%</span></div><div class="target-value" id="targetQuota">--%</div><div class="progress-bar"><div class="progress-fill" id="targetQuotaBar" style="width: 0%;"></div></div></div>
+                </div>
+
+                <!-- REVENUE -->
+                <div class="section-header revenue"><i class="fas fa-dollar-sign"></i><h2>Revenue</h2></div>
+                <div class="kpi-grid mb-4" id="revenueGrid" data-section="revenue">
+                    <a class="kpi-card" draggable="true" data-card-id="mrr-total" data-href="https://dashboard.stripe.com/payments" target="_blank" rel="noopener"><div class="label"><i class="fas fa-chart-line"></i> Total MRR</div><div class="value money" id="kpiMRR">$--</div><div class="change up" id="kpiMRRChange"><i class="fas fa-arrow-up"></i> --% vs prev</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="mrr-launch" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-rocket"></i> MRR - Launch</div><div class="value money" id="kpiMRRLaunch">$--</div><div class="subtext" id="kpiMRRLaunchUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="mrr-creator" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-star"></i> MRR - Creator Pro</div><div class="value money" id="kpiMRRCreator">$--</div><div class="subtext" id="kpiMRRCreatorUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="mrr-studio" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-building"></i> MRR - Studio</div><div class="value money" id="kpiMRRStudio">$--</div><div class="subtext" id="kpiMRRStudioUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="mrr-agency" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-users"></i> MRR - Agency</div><div class="value money" id="kpiMRRAgency">$--</div><div class="subtext" id="kpiMRRAgencyUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="topup-revenue" data-href="https://dashboard.stripe.com/payments?type[0]=charge" target="_blank" rel="noopener"><div class="label"><i class="fas fa-plus-circle"></i> Top-Up Revenue</div><div class="value money" id="kpiTopUp">$--</div><div class="subtext" id="kpiTopUpCount">-- purchases</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="arpu" data-href="https://dashboard.stripe.com/customers" target="_blank" rel="noopener"><div class="label"><i class="fas fa-user-tag"></i> ARPU</div><div class="value money" id="kpiARPU">$--</div><div class="subtext">Avg revenue/user</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="arpa" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-hand-holding-usd"></i> ARPA</div><div class="value money" id="kpiARPA">$--</div><div class="subtext">Avg revenue/account</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="refunds" data-href="https://dashboard.stripe.com/refunds" target="_blank" rel="noopener"><div class="label"><i class="fas fa-undo-alt"></i> Refunds</div><div class="value cost" id="kpiRefunds">$--</div><div class="subtext" id="kpiRefundsCount">-- requests</div><i class="fas fa-external-link-alt external-link"></i></a>
+                </div>
+
+                <!-- COSTS -->
+                <div class="section-header costs"><i class="fas fa-receipt"></i><h2>Costs</h2></div>
+                <div class="kpi-grid mb-4" id="costsGrid" data-section="costs">
+                    <a class="kpi-card" draggable="true" data-card-id="openai-cost" data-href="https://platform.openai.com/usage" target="_blank" rel="noopener"><div class="label"><i class="fas fa-brain"></i> OpenAI Cost</div><div class="value cost" id="kpiOpenAI">$--</div><div class="subtext" id="kpiOpenAICalls">-- API calls</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="storage-cost" data-href="https://dash.cloudflare.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-database"></i> Storage Cost</div><div class="value cost" id="kpiStorage">$--</div><div class="subtext" id="kpiStorageGB">-- GB used</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="bandwidth-cost" data-href="https://dash.cloudflare.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-wifi"></i> Bandwidth Cost</div><div class="value cost" id="kpiBandwidth">$--</div><div class="subtext" id="kpiBandwidthTB">-- TB transferred</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="compute-cost" data-href="https://render.com/dashboard" target="_blank" rel="noopener"><div class="label"><i class="fas fa-server"></i> Compute Cost</div><div class="value cost" id="kpiCompute">$--</div><div class="subtext" id="kpiComputeHours">-- CPU hours</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <div class="kpi-card" draggable="true" data-card-id="cost-per-upload"><div class="label"><i class="fas fa-cloud-upload-alt"></i> Cost/Upload</div><div class="value cost" id="kpiCostPerUpload">$--</div><div class="subtext">Per successful upload</div></div>
+                    <a class="kpi-card" draggable="true" data-card-id="stripe-fees" data-href="https://dashboard.stripe.com/balance" target="_blank" rel="noopener"><div class="label"><i class="fab fa-stripe-s"></i> Stripe Fees</div><div class="value cost" id="kpiStripeFees">$--</div><div class="subtext" id="kpiStripeFeesCount">-- transactions</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="mailgun-cost" data-href="https://app.mailgun.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-envelope"></i> Mailgun Cost</div><div class="value cost" id="kpiMailgun">$--</div><div class="subtext" id="kpiMailgunEmails">-- emails sent</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="postgres-cost" data-href="https://dashboard.render.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-database"></i> Postgres Cost</div><div class="value cost" id="kpiPostgres">$--</div><div class="subtext" id="kpiPostgresSize">-- GB</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="redis-cost" data-href="https://dashboard.render.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-memory"></i> Redis Cost</div><div class="value cost" id="kpiRedis">$--</div><div class="subtext" id="kpiRedisMemory">-- MB used</div><i class="fas fa-external-link-alt external-link"></i></a>
+                </div>
+
+                <!-- MARGINS -->
+                <div class="section-header margins"><i class="fas fa-percentage"></i><h2>Margins</h2></div>
+                <div class="kpi-grid mb-4" id="marginsGrid" data-section="margins">
+                    <div class="kpi-card" draggable="true" data-card-id="gross-margin"><div class="label"><i class="fas fa-chart-pie"></i> Gross Margin</div><div class="value percent" id="kpiGrossMargin">--%</div><div class="change up" id="kpiGrossMarginChange"><i class="fas fa-arrow-up"></i> --% vs prev</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="margin-launch"><div class="label"><i class="fas fa-rocket"></i> Margin - Launch</div><div class="value percent" id="kpiMarginLaunch">--%</div><div class="subtext">Per tier</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="margin-creator"><div class="label"><i class="fas fa-star"></i> Margin - Creator</div><div class="value percent" id="kpiMarginCreator">--%</div><div class="subtext">Per tier</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="margin-studio"><div class="label"><i class="fas fa-building"></i> Margin - Studio</div><div class="value percent" id="kpiMarginStudio">--%</div><div class="subtext">Per tier</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="margin-agency"><div class="label"><i class="fas fa-users"></i> Margin - Agency</div><div class="value percent" id="kpiMarginAgency">--%</div><div class="subtext">Per tier</div></div>
+                    <a class="kpi-card" draggable="true" data-card-id="margin-tiktok" data-href="https://analytics.tiktok.com" target="_blank" rel="noopener"><div class="label"><i class="fab fa-tiktok"></i> Margin - TikTok</div><div class="value percent" id="kpiMarginTikTok">--%</div><div class="subtext">Per platform</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="margin-youtube" data-href="https://studio.youtube.com/channel/analytics" target="_blank" rel="noopener"><div class="label"><i class="fab fa-youtube"></i> Margin - YouTube</div><div class="value percent" id="kpiMarginYouTube">--%</div><div class="subtext">Per platform</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="margin-instagram" data-href="https://business.facebook.com/creatorstudio" target="_blank" rel="noopener"><div class="label"><i class="fab fa-instagram"></i> Margin - Instagram</div><div class="value percent" id="kpiMarginInstagram">--%</div><div class="subtext">Per platform</div><i class="fas fa-external-link-alt external-link"></i></a>
+                </div>
+
+                <!-- GROWTH FUNNELS -->
+                <div class="section-header funnels"><i class="fas fa-filter"></i><h2>Growth Funnels</h2></div>
+                <div class="kpi-grid mb-4" id="funnelsGrid" data-section="funnels">
+                    <div class="kpi-card" draggable="true" data-card-id="signup-connect"><div class="label"><i class="fas fa-plug"></i> Signup → Connect (24h)</div><div class="value percent" id="kpiFunnelConnect">--%</div><div class="subtext" id="kpiFunnelConnectCount">-- / -- users</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="connect-upload"><div class="label"><i class="fas fa-upload"></i> Connect → Upload (24h)</div><div class="value percent" id="kpiFunnelUpload">--%</div><div class="subtext" id="kpiFunnelUploadCount">-- / -- users</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="free-paid"><div class="label"><i class="fas fa-arrow-up"></i> Free → Paid</div><div class="value percent" id="kpiFreePaid">--%</div><div class="change up" id="kpiFreePaidChange"><i class="fas fa-arrow-up"></i> --% vs prev</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="ai-attach"><div class="label"><i class="fas fa-robot"></i> AI Attach Rate</div><div class="value percent" id="kpiAIAttach">--%</div><div class="subtext">Using AI features</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="topup-attach"><div class="label"><i class="fas fa-coins"></i> Top-Up Attach</div><div class="value percent" id="kpiTopUpAttach">--%</div><div class="subtext">Buying top-ups</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="flex-adopt"><div class="label"><i class="fas fa-sliders-h"></i> Flex Adoption</div><div class="value percent" id="kpiFlexAdopt">--%</div><div class="subtext">On Flex plan</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="cancellations"><div class="label"><i class="fas fa-times-circle"></i> Cancellations</div><div class="value" id="kpiCancellations">--</div><div class="change down" id="kpiCancellationsRate">--% of paid</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="failed-payments"><div class="label"><i class="fas fa-credit-card"></i> Failed Payments</div><div class="value" id="kpiFailedPayments">--</div><div class="change down" id="kpiFailedPaymentsRate">--% failure rate</div></div>
+                </div>
+
+                <!-- RELIABILITY -->
+                <div class="section-header reliability"><i class="fas fa-heartbeat"></i><h2>Reliability</h2></div>
+                <div class="kpi-grid mb-4" id="reliabilityGrid" data-section="reliability">
+                    <div class="kpi-card" draggable="true" data-card-id="upload-success"><div class="label"><i class="fas fa-check-circle"></i> Upload Success</div><div class="value percent" id="kpiUploadSuccess">--%</div><div class="subtext" id="kpiUploadSuccessCount">-- / -- uploads</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="transcode-fail"><div class="label"><i class="fas fa-film"></i> Transcode Fail %</div><div class="value" id="kpiFailTranscode">--%</div><div class="subtext">Video processing</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="platform-fail"><div class="label"><i class="fas fa-cloud"></i> Platform Fail %</div><div class="value" id="kpiFailPlatform">--%</div><div class="subtext">Platform API errors</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="retry-rate"><div class="label"><i class="fas fa-redo"></i> Retry Rate</div><div class="value" id="kpiRetryRate">--%</div><div class="subtext">Uploads requiring retry</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="avg-process-time"><div class="label"><i class="fas fa-clock"></i> Avg Process Time</div><div class="value" id="kpiAvgProcessTime">--s</div><div class="subtext">End-to-end</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="transcode-time"><div class="label"><i class="fas fa-cog"></i> Transcode Time</div><div class="value" id="kpiTranscodeTime">--s</div><div class="subtext">Avg per video</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="cancel-rate"><div class="label"><i class="fas fa-ban"></i> Cancel Request %</div><div class="value" id="kpiCancelRate">--%</div><div class="subtext">User-cancelled</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="queue-depth"><div class="label"><i class="fas fa-layer-group"></i> Queue Depth</div><div class="value" id="kpiQueueDepth">--</div><div class="subtext">Current pending</div></div>
+                </div>
+
+                <!-- USAGE METRICS -->
+                <div class="section-header usage"><i class="fas fa-chart-bar"></i><h2>Usage Metrics</h2></div>
+                <div class="kpi-grid mb-4" id="usageGrid" data-section="usage">
+                    <div class="kpi-card" draggable="true" data-card-id="new-users"><div class="label"><i class="fas fa-user-plus"></i> New Users</div><div class="value" id="kpiNewUsers">--</div><div class="change up" id="kpiNewUsersChange"><i class="fas fa-arrow-up"></i> --% vs prev</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="total-uploads"><div class="label"><i class="fas fa-cloud-upload-alt"></i> Total Uploads</div><div class="value" id="kpiUploads">--</div><div class="change up" id="kpiUploadsChange"><i class="fas fa-arrow-up"></i> --% vs prev</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="active-users"><div class="label"><i class="fas fa-users"></i> Active Users</div><div class="value" id="kpiActiveUsers">--</div><div class="subtext">With uploads in period</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="total-views"><div class="label"><i class="fas fa-eye"></i> Total Views</div><div class="value" id="kpiViews">--</div><div class="subtext">Across all platforms</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="total-likes"><div class="label"><i class="fas fa-heart"></i> Total Likes</div><div class="value" id="kpiLikes">--</div><div class="subtext">Engagement metric</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="avg-uploads"><div class="label"><i class="fas fa-calculator"></i> Avg Uploads/User</div><div class="value" id="kpiAvgUploads">--</div><div class="subtext">Per active user</div></div>
+                </div>
+
+                <!-- DETAIL PANELS -->
+                <div class="grid-2 mb-4">
+                    <div class="card">
+                        <div class="card-header"><h3 class="card-title"><i class="fas fa-trophy"></i> Top Uploaders</h3>
+                            <select id="leaderboardSort" class="form-select" style="width: 130px;"><option value="uploads">By Uploads</option><option value="views">By Views</option><option value="revenue">By Revenue</option></select>
+                        </div>
+                        <div class="card-body"><div class="leaderboard" id="leaderboard"><div class="text-center py-4 text-secondary">Loading...</div></div></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-header"><h3 class="card-title"><i class="fas fa-globe"></i> Top Countries</h3></div>
+                        <div class="card-body"><div class="leaderboard" id="countriesLeaderboard"><div class="text-center py-4 text-secondary">Loading...</div></div></div>
+                    </div>
+                </div>
+
+                <div class="grid-2 mb-4">
+                    <div class="card">
+                        <div class="card-header"><h3 class="card-title"><i class="fas fa-layer-group"></i> User Tier Breakdown</h3></div>
+                        <div class="card-body"><div id="tierBreakdown"><div class="text-center py-4 text-secondary">Loading...</div></div></div>
+                    </div>
+                    <div class="card">
+                        <div class="card-header"><h3 class="card-title"><i class="fas fa-share-alt"></i> Platform Distribution</h3></div>
+                        <div class="card-body"><div id="platformDistribution"><div class="text-center py-4 text-secondary">Loading...</div></div></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><h3 class="card-title"><i class="fas fa-user-plus"></i> Recent Signups</h3><a href="account-management.html" class="btn btn-ghost btn-sm">View All Users</a></div>
+                    <div class="card-body">
+                        <div class="table-container">
+                            <table class="table">
+                                <thead><tr><th>User</th><th>Email</th><th>Tier</th><th>Status</th><th>Signed Up</th><th>Uploads</th></tr></thead>
+                                <tbody id="recentUsersBody"><tr><td colspan="6" class="text-center py-4 text-secondary">Loading...</td></tr></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div id="toastContainer"></div>
+    
+    <script src="wallet-tokens.js"></script>
+    <script src="app.js"></script>
+    
+    <script>
+    (function() {
+        'use strict';
+
+        const LAYOUT_KEY = 'uploadm8_kpi_layout_v2';
+        let currentRange = '30d';
+        let customStart = null;
+        let customEnd = null;
+        let editMode = false;
+        let draggedCard = null;
+
+        // ---------- Helpers ----------
+        function formatNumber(n) {
+            if (n == null) return '--';
+            if (typeof n !== 'number') n = Number(n);
+            if (!isFinite(n)) return '--';
+            if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+            if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
+            return Math.round(n).toLocaleString();
+        }
+        function formatCurrency(n) {
+            if (n == null) return '$--';
+            if (typeof n !== 'number') n = Number(n);
+            if (!isFinite(n)) return '$--';
+            return '$' + Math.round(n).toLocaleString();
+        }
+        function formatPercent(n) {
+            if (n == null) return '--%';
+            if (typeof n !== 'number') n = Number(n);
+            if (!isFinite(n)) return '--%';
+            return n.toFixed(1) + '%';
+        }
+        function formatRelativeTime(d) {
+            if (!d) return '--';
+            const diff = Math.floor((new Date() - new Date(d))/1000);
+            if (diff < 60) return 'Just now';
+            if (diff < 3600) return Math.floor(diff/60)+'m ago';
+            if (diff < 86400) return Math.floor(diff/3600)+'h ago';
+            return Math.floor(diff/86400)+'d ago';
+        }
+
+        function setText(id, val) {
+            const el = document.getElementById(id);
+            if (el) el.textContent = val;
+        }
+
+        function updateChange(id, change) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (change == null || !isFinite(Number(change))) {
+                el.className = 'change neutral';
+                el.innerHTML = '<i class="fas fa-minus"></i> --% vs prev';
+                return;
+            }
+            change = Number(change);
+            const up = change >= 0;
+            el.className = 'change ' + (up ? 'up' : 'down');
+            el.innerHTML = '<i class="fas fa-arrow-' + (up ? 'up' : 'down') + '"></i> ' + Math.abs(change).toFixed(1) + '% vs prev';
+        }
+
+        function updateTarget(valId, barId, val, min, max, inverse) {
+            const valEl = document.getElementById(valId);
+            const barEl = document.getElementById(barId);
+            val = Number(val || 0);
+
+            if (valEl) {
+                valEl.textContent = val.toFixed(1) + '%';
+                let status = 'good';
+                if (inverse) {
+                    if (val > max) status = 'bad';
+                    else if (val > max * 0.8) status = 'warning';
+                } else {
+                    if (val < min) status = 'bad';
+                    else if (val > max) status = 'warning';
+                }
+                valEl.className = 'target-value ' + status;
+            }
+
+            if (barEl) {
+                let pct = Math.max(0, Math.min(100, ((val - min) / (max - min)) * 100));
+                barEl.style.width = pct + '%';
+                let color = '#22c55e';
+                if (inverse) {
+                    color = val > max ? '#ef4444' : val > max*0.8 ? '#f59e0b' : '#22c55e';
+                } else {
+                    color = val < min ? '#ef4444' : val > max ? '#f59e0b' : '#22c55e';
+                }
+                barEl.style.background = color;
+            }
+        }
+
+        // Normalize KPI response to protect UI against backend field drift.
+        function normalizeKpis(raw) {
+            const k = raw || {};
+            // Accept both the original contract AND the newer shared.js variant.
+            return {
+                // Targets
+                free_to_paid_rate: k.free_to_paid_rate ?? k.free_to_paid ?? 0,
+                paid_churn_rate: k.paid_churn_rate ?? k.churn_rate ?? 0,
+                arpa_uplift: k.arpa_uplift ?? 0,
+                quota_hit_rate: k.quota_hit_rate ?? 0,
+
+                // Revenue
+                mrr: k.mrr ?? k.total_mrr ?? 0,
+                mrr_change: k.mrr_change ?? 0,
+                mrr_by_tier: k.mrr_by_tier ?? {
+                    launch: k.mrr_launch,
+                    creator_pro: k.mrr_creator ?? k.mrr_creator_pro,
+                    studio: k.mrr_studio,
+                    agency: k.mrr_agency,
+                },
+                users_by_tier: k.users_by_tier ?? {
+                    launch: k.launch_users,
+                    creator_pro: k.creator_pro_users,
+                    studio: k.studio_users,
+                    agency: k.agency_users,
+                },
+                topup_revenue: k.topup_revenue ?? 0,
+                topup_count: k.topup_count ?? 0,
+                arpu: k.arpu ?? 0,
+                arpa: k.arpa ?? 0,
+                refunds: k.refunds ?? 0,
+                refund_count: k.refund_count ?? 0,
+
+                // Costs
+                openai_cost: k.openai_cost ?? 0,
+                openai_calls: k.openai_calls ?? 0,
+                storage_cost: k.storage_cost ?? 0,
+                storage_gb: k.storage_gb ?? k.storage_used_gb ?? 0,
+                bandwidth_cost: k.bandwidth_cost ?? 0,
+                bandwidth_tb: k.bandwidth_tb ?? 0,
+                compute_cost: k.compute_cost ?? 0,
+                compute_hours: k.compute_hours ?? 0,
+                cost_per_upload: k.cost_per_upload ?? 0,
+
+                // Costs – additional providers
+                stripe_fees: k.stripe_fees ?? 0,
+                stripe_fee_txns: k.stripe_fee_txns ?? 0,
+                mailgun_cost: k.mailgun_cost ?? 0,
+                mailgun_emails_sent: k.mailgun_emails_sent ?? 0,
+                postgres_cost: k.postgres_cost ?? 0,
+                postgres_size_gb: k.postgres_size_gb ?? 0,
+                redis_cost: k.redis_cost ?? 0,
+                redis_memory_mb: k.redis_memory_mb ?? 0,
+
+                // Margins
+                gross_margin: k.gross_margin ?? 0,
+                gross_margin_change: k.gross_margin_change ?? k.margin_change ?? 0,
+                margin_by_tier: k.margin_by_tier ?? {
+                    launch: k.margin_launch,
+                    creator_pro: k.margin_creator ?? k.margin_creator_pro,
+                    studio: k.margin_studio,
+                    agency: k.margin_agency,
+                },
+                margin_by_platform: k.margin_by_platform ?? {
+                    tiktok: k.margin_tiktok,
+                    youtube: k.margin_youtube,
+                    instagram: k.margin_instagram,
+                },
+
+                // Funnels
+                funnel_signup_connect: k.funnel_signup_connect ?? 0,
+                funnel_signups: k.funnel_signups ?? 0,
+                funnel_connected: k.funnel_connected ?? 0,
+                funnel_connect_upload: k.funnel_connect_upload ?? 0,
+                funnel_uploaded: k.funnel_uploaded ?? 0,
+                free_to_paid_change: k.free_to_paid_change ?? 0,
+                ai_attach_rate: k.ai_attach_rate ?? 0,
+                topup_attach_rate: k.topup_attach_rate ?? 0,
+                flex_adoption_rate: k.flex_adoption_rate ?? 0,
+                cancellations: k.cancellations ?? 0,
+                cancellation_rate: k.cancellation_rate ?? 0,
+                failed_payments: k.failed_payments ?? 0,
+                payment_failure_rate: k.payment_failure_rate ?? 0,
+
+                // Reliability
+                success_rate: k.success_rate ?? 0,
+                successful_uploads: k.successful_uploads ?? 0,
+                total_uploads: k.total_uploads ?? 0,
+                transcode_fail_rate: k.transcode_fail_rate ?? 0,
+                platform_fail_rate: k.platform_fail_rate ?? 0,
+                retry_rate: k.retry_rate ?? 0,
+                avg_process_time: k.avg_process_time ?? 0,
+                avg_transcode_time: k.avg_transcode_time ?? 0,
+                cancel_rate: k.cancel_rate ?? 0,
+                queue_depth: k.queue_depth ?? 0,
+
+                // Usage
+                new_users: k.new_users ?? 0,
+                new_users_change: k.new_users_change ?? 0,
+                uploads_change: k.uploads_change ?? 0,
+                active_users: k.active_users ?? 0,
+                total_views: k.total_views ?? 0,
+                total_likes: k.total_likes ?? 0,
+                avg_uploads_per_user: k.avg_uploads_per_user ?? 0,
+
+                // Breakdowns
+                tier_breakdown: k.tier_breakdown ?? k.tier_breakdown ?? null,
+                platform_breakdown: k.platform_breakdown ?? k.platform_distribution ?? null,
+            };
+        }
+
+        function updateKPICards(raw) {
+            const k = normalizeKpis(raw);
+
+            // Targets
+            updateTarget('targetFreePaid', 'targetFreePaidBar', k.free_to_paid_rate || 0, 3, 7, false);
+            updateTarget('targetChurn', 'targetChurnBar', k.paid_churn_rate || 0, 0, 4, true);
+            updateTarget('targetMicrotx', 'targetMicrotxBar', k.arpa_uplift || 0, 15, 30, false);
+            updateTarget('targetQuota', 'targetQuotaBar', k.quota_hit_rate || 0, 20, 35, false);
+
+            // Revenue
+            setText('kpiMRR', formatCurrency(k.mrr)); updateChange('kpiMRRChange', k.mrr_change);
+            setText('kpiMRRLaunch', formatCurrency(k.mrr_by_tier?.launch)); setText('kpiMRRLaunchUsers', (k.users_by_tier?.launch || 0) + ' users');
+            setText('kpiMRRCreator', formatCurrency(k.mrr_by_tier?.creator_pro)); setText('kpiMRRCreatorUsers', (k.users_by_tier?.creator_pro || 0) + ' users');
+            setText('kpiMRRStudio', formatCurrency(k.mrr_by_tier?.studio)); setText('kpiMRRStudioUsers', (k.users_by_tier?.studio || 0) + ' users');
+            setText('kpiMRRAgency', formatCurrency(k.mrr_by_tier?.agency)); setText('kpiMRRAgencyUsers', (k.users_by_tier?.agency || 0) + ' users');
+            setText('kpiTopUp', formatCurrency(k.topup_revenue)); setText('kpiTopUpCount', (k.topup_count || 0) + ' purchases');
+            setText('kpiARPU', formatCurrency(k.arpu));
+            setText('kpiARPA', formatCurrency(k.arpa));
+            setText('kpiRefunds', formatCurrency(k.refunds)); setText('kpiRefundsCount', (k.refund_count || 0) + ' requests');
+
+            // Costs
+            setText('kpiOpenAI', formatCurrency(k.openai_cost)); setText('kpiOpenAICalls', formatNumber(k.openai_calls) + ' API calls');
+            setText('kpiStorage', formatCurrency(k.storage_cost)); setText('kpiStorageGB', formatNumber(k.storage_gb) + ' GB used');
+            setText('kpiCompute', formatCurrency(k.compute_cost)); setText('kpiComputeHours', formatNumber(k.compute_hours) + ' CPU hours');
+            setText('kpiCostPerUpload', '$' + Number(k.cost_per_upload || 0).toFixed(3));
+            setText('kpiBandwidth', formatCurrency(k.bandwidth_cost)); setText('kpiBandwidthTB', Number(k.bandwidth_tb || 0).toFixed(2) + ' TB');
+            setText('kpiStripeFees', formatCurrency(k.stripe_fees)); setText('kpiStripeFeesCount', formatNumber(k.stripe_fee_txns) + ' transactions');
+            setText('kpiMailgun', formatCurrency(k.mailgun_cost)); setText('kpiMailgunEmails', formatNumber(k.mailgun_emails_sent) + ' emails sent');
+            setText('kpiPostgres', formatCurrency(k.postgres_cost)); setText('kpiPostgresSize', Number(k.postgres_size_gb || 0).toFixed(2) + ' GB');
+            setText('kpiRedis', formatCurrency(k.redis_cost)); setText('kpiRedisMemory', Number(k.redis_memory_mb || 0).toFixed(1) + ' MB used');
+
+            // Margins
+            setText('kpiGrossMargin', formatPercent(k.gross_margin)); updateChange('kpiGrossMarginChange', k.gross_margin_change);
+            setText('kpiMarginLaunch', formatPercent(k.margin_by_tier?.launch));
+            setText('kpiMarginCreator', formatPercent(k.margin_by_tier?.creator_pro));
+            setText('kpiMarginStudio', formatPercent(k.margin_by_tier?.studio));
+            setText('kpiMarginAgency', formatPercent(k.margin_by_tier?.agency));
+            setText('kpiMarginTikTok', formatPercent(k.margin_by_platform?.tiktok));
+            setText('kpiMarginYouTube', formatPercent(k.margin_by_platform?.youtube));
+            setText('kpiMarginInstagram', formatPercent(k.margin_by_platform?.instagram));
+
+            // Funnels
+            setText('kpiFunnelConnect', formatPercent(k.funnel_signup_connect)); setText('kpiFunnelConnectCount', (k.funnel_connected||0) + ' / ' + (k.funnel_signups||0) + ' users');
+            setText('kpiFunnelUpload', formatPercent(k.funnel_connect_upload)); setText('kpiFunnelUploadCount', (k.funnel_uploaded||0) + ' / ' + (k.funnel_connected||0) + ' users');
+            setText('kpiFreePaid', formatPercent(k.free_to_paid_rate)); updateChange('kpiFreePaidChange', k.free_to_paid_change);
+            setText('kpiAIAttach', formatPercent(k.ai_attach_rate));
+            setText('kpiTopUpAttach', formatPercent(k.topup_attach_rate));
+            setText('kpiFlexAdopt', formatPercent(k.flex_adoption_rate));
+            setText('kpiCancellations', formatNumber(k.cancellations)); setText('kpiCancellationsRate', formatPercent(k.cancellation_rate) + ' of paid');
+            setText('kpiFailedPayments', formatNumber(k.failed_payments)); setText('kpiFailedPaymentsRate', formatPercent(k.payment_failure_rate) + ' failure rate');
+
+            // Reliability
+            setText('kpiUploadSuccess', formatPercent(k.success_rate));
+            setText('kpiUploadSuccessCount', formatNumber(k.successful_uploads) + ' / ' + formatNumber(k.total_uploads) + ' uploads');
+            setText('kpiFailTranscode', formatPercent(k.transcode_fail_rate));
+            setText('kpiFailPlatform', formatPercent(k.platform_fail_rate));
+            setText('kpiRetryRate', formatPercent(k.retry_rate));
+            setText('kpiAvgProcessTime', Number(k.avg_process_time || 0).toFixed(1) + 's');
+            setText('kpiTranscodeTime', Number(k.avg_transcode_time || 0).toFixed(1) + 's');
+            setText('kpiCancelRate', formatPercent(k.cancel_rate));
+            setText('kpiQueueDepth', formatNumber(k.queue_depth));
+
+            // Usage
+            setText('kpiNewUsers', formatNumber(k.new_users)); updateChange('kpiNewUsersChange', k.new_users_change);
+            setText('kpiUploads', formatNumber(k.total_uploads)); updateChange('kpiUploadsChange', k.uploads_change);
+            setText('kpiActiveUsers', formatNumber(k.active_users));
+            setText('kpiViews', formatNumber(k.total_views));
+            setText('kpiLikes', formatNumber(k.total_likes));
+            setText('kpiAvgUploads', Number(k.avg_uploads_per_user || k.avg_uploads_per_user || k.avg_uploads_per_user || 0).toFixed(1));
+
+            // Breakdowns
+            loadTierBreakdown(k.tier_breakdown);
+            loadPlatformDistribution(k.platform_breakdown);
+        }
+
+        // ---------- Layout & interactions ----------
+        function handleTimeRangeChange() {
+            currentRange = document.getElementById('timeRange').value;
+            document.getElementById('customRange').classList.toggle('show', currentRange === 'custom');
+            if (currentRange !== 'custom') refreshKPIs();
+        }
+
+        window.applyCustomRange = function() {
+            customStart = document.getElementById('startDate').value;
+            customEnd = document.getElementById('endDate').value;
+            if (!customStart || !customEnd) { alert('Please select both dates'); return; }
+            refreshKPIs();
+        };
+
+        function initDragAndDrop() {
+            document.querySelectorAll('.kpi-card[draggable="true"]').forEach(card => {
+                card.addEventListener('dragstart', function(e) {
+                    if (!editMode) { e.preventDefault(); return; }
+                    draggedCard = this;
+                    this.classList.add('dragging');
+                    e.dataTransfer.effectAllowed = 'move';
+                });
+                card.addEventListener('dragend', function() {
+                    this.classList.remove('dragging');
+                    document.querySelectorAll('.kpi-card').forEach(c => c.classList.remove('drag-over'));
+                    draggedCard = null;
+                    saveLayout();
+                });
+                card.addEventListener('dragover', function(e) {
+                    if (!editMode || !draggedCard) return;
+                    e.preventDefault();
+                });
+                card.addEventListener('dragenter', function(e) {
+                    if (!editMode || !draggedCard) return;
+                    e.preventDefault();
+                    if (this !== draggedCard) this.classList.add('drag-over');
+                });
+                card.addEventListener('dragleave', function() {
+                    this.classList.remove('drag-over');
+                });
+                card.addEventListener('drop', function(e) {
+                    if (!editMode || !draggedCard) return;
+                    e.preventDefault();
+                    this.classList.remove('drag-over');
+                    if (draggedCard && this !== draggedCard && this.parentNode === draggedCard.parentNode) {
+                        const all = Array.from(this.parentNode.children);
+                        if (all.indexOf(draggedCard) < all.indexOf(this)) this.parentNode.insertBefore(draggedCard, this.nextSibling);
+                        else this.parentNode.insertBefore(draggedCard, this);
+                    }
+                });
+            });
+        }
+
+        function initClickableCards() {
+            document.querySelectorAll('.kpi-card[data-href]').forEach(card => {
+                card.addEventListener('click', (e) => {
+                    if (editMode) {
+                        e.preventDefault();
+                        return;
+                    }
+                    const url = card.getAttribute('data-href');
+                    if (!url) return;
+                    // Always open external dashboards in a new tab.
+                    window.open(url, '_blank', 'noopener');
+                });
+            });
+        }
+
+        window.toggleEditMode = function() {
+            editMode = !editMode;
+            document.getElementById('editModeBanner').classList.toggle('active', editMode);
+            document.getElementById('editModeBtn').innerHTML = editMode
+                ? '<i class="fas fa-check"></i> Done'
+                : '<i class="fas fa-grip-vertical"></i> Customize';
+        };
+
+        function saveLayout() {
+            const layout = {};
+            document.querySelectorAll('[data-section]').forEach(grid => {
+                layout[grid.dataset.section] = Array.from(grid.querySelectorAll('[data-card-id]')).map(c => c.dataset.cardId);
+            });
+            localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
+        }
+
+        function loadSavedLayout() {
+            const saved = localStorage.getItem(LAYOUT_KEY);
+            if (!saved) return;
+            try {
+                const layout = JSON.parse(saved);
+                Object.entries(layout).forEach(([section, cardIds]) => {
+                    const grid = document.querySelector('[data-section="' + section + '"]');
+                    if (!grid) return;
+                    cardIds.forEach(id => {
+                        const card = grid.querySelector('[data-card-id="' + id + '"]');
+                        if (card) grid.appendChild(card);
+                    });
+                });
+            } catch (e) {}
+        }
+
+        window.resetLayout = function() {
+            localStorage.removeItem(LAYOUT_KEY);
+            location.reload();
+        };
+
+        // ---------- Query-param builder (shared by all KPI fetches) ----------
+        function buildKpiParams() {
+            if (currentRange === 'custom' && customStart && customEnd) {
+                // Backend only accepts range= param; map custom date span to closest supported value
+                const diffDays = Math.round((new Date(customEnd) - new Date(customStart)) / 86400000);
+                let r = '30d';
+                if (diffDays <= 7) r = '7d';
+                else if (diffDays <= 30) r = '30d';
+                else if (diffDays <= 90) r = '90d';
+                else r = '365d';
+                return 'range=' + r;
+            }
+            // FIX 1: Removed the extra closing brace here!
+            return 'range=' + encodeURIComponent(currentRange);
+        }
+
+        // ---------- Data loaders ----------
+        window.refreshKPIsWithSync = async function() {
+            const btn = document.getElementById('kpiRefreshBtn');
+            if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Syncing...'; }
+            try {
+                if (typeof window.apiCall === 'function') {
+                    await window.apiCall('/api/admin/kpi/refresh', { method: 'POST', body: JSON.stringify({}) }).catch(() => ({}));
+                }
+                if (btn) btn.innerHTML = '<i class="fas fa-hourglass-half"></i> Waiting 5s...';
+                await new Promise(r => setTimeout(r, 5000));
+            } catch (_) {}
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i> Refresh'; }
+            await refreshKPIs();
+        };
+
+        window.refreshKPIs = async function() {
+            try {
+                const params = buildKpiParams();
+
+                const [raw, costsSummary, revenueSummary, usageSummary, reliabilitySummary, providerCosts] = await Promise.all([
+                    window.apiCall('/api/admin/kpis?' + params).catch(() => ({})),
+                    window.apiCall('/api/admin/kpi/costs?' + params).catch(() => null),
+                    window.apiCall('/api/admin/kpi/revenue?' + params).catch(() => null),
+                    window.apiCall('/api/admin/kpi/usage?' + params).catch(() => null),
+                    window.apiCall('/api/admin/kpi/reliability?' + params).catch(() => null),
+                    window.apiCall('/api/admin/kpi/provider-costs').catch(() => null),
+                ]);
+
+                const merged = Object.assign({}, raw || {});
+
+                // /api/admin/kpi/costs
+                if (costsSummary) {
+                    merged.openai_cost     = merged.openai_cost     || costsSummary.openai_cost     || 0;
+                    merged.storage_cost    = merged.storage_cost    || costsSummary.storage_cost    || 0;
+                    merged.compute_cost    = merged.compute_cost    || costsSummary.compute_cost    || 0;
+                    merged.cost_per_upload = merged.cost_per_upload || costsSummary.cost_per_upload || 0;
+                }
+
+                // /api/admin/kpi/revenue
+                if (revenueSummary) {
+                    merged.total_mrr     = merged.total_mrr     || revenueSummary.total_mrr    || 0;
+                    merged.topup_revenue = merged.topup_revenue || revenueSummary.topup_total  || 0;
+                    merged.refunds       = merged.refunds       || revenueSummary.refunds_total || 0;
+                    merged.refund_count  = merged.refund_count  || revenueSummary.refunds_count || 0;
+                }
+
+                // /api/admin/kpi/usage
+                if (usageSummary) {
+                    merged.total_uploads = merged.total_uploads || usageSummary.total_uploads || 0;
+                    merged.active_users  = merged.active_users  || usageSummary.active_users  || 0;
+                    merged.total_views   = merged.total_views   || usageSummary.total_views   || 0;
+                    merged.total_likes   = merged.total_likes   || usageSummary.total_likes   || 0;
+                }
+
+                // /api/admin/kpi/reliability
+                if (reliabilitySummary) {
+                    merged.success_rate        = merged.success_rate        || reliabilitySummary.success_rate                || 0;
+                    merged.queue_depth         = merged.queue_depth         || reliabilitySummary.queue_depth                || 0;
+                    merged.avg_process_time    = merged.avg_process_time    || reliabilitySummary.processingTime?.average     || 0;
+                    merged.avg_transcode_time  = merged.avg_transcode_time  || reliabilitySummary.processingTime?.transcode   || 0;
+                    merged.cancel_rate         = merged.cancel_rate         || reliabilitySummary.cancels?.rate               || 0;
+                    merged.retry_rate          = merged.retry_rate          || reliabilitySummary.retries?.rate               || 0;
+                    merged.transcode_fail_rate = merged.transcode_fail_rate || reliabilitySummary.failRates?.processing       || 0;
+                    merged.platform_fail_rate  = merged.platform_fail_rate  || reliabilitySummary.failRates?.publish          || 0;
+                }
+
+                // /api/admin/kpi/provider-costs (synced from external APIs + Render env var)
+                // These always win over DB-derived zeros — cost_tracking only has OpenAI rows.
+                if (providerCosts) {
+                    if (providerCosts.render_cost    > 0) merged.compute_cost      = providerCosts.render_cost;
+                    if (providerCosts.storage_gb     > 0) merged.storage_gb        = providerCosts.storage_gb;
+                    if (providerCosts.storage_cost  >= 0 && providerCosts.storage_gb  > 0) merged.storage_cost   = providerCosts.storage_cost;
+                    if (providerCosts.bandwidth_cost >= 0)                                  merged.bandwidth_cost = providerCosts.bandwidth_cost;
+                    if (providerCosts.bandwidth_tb   >= 0)                                  merged.bandwidth_tb   = providerCosts.bandwidth_tb;
+                    if (providerCosts.redis_cost      > 0) merged.redis_cost       = providerCosts.redis_cost;
+                    if (providerCosts.redis_memory_mb > 0) merged.redis_memory_mb  = providerCosts.redis_memory_mb;
+                    if (providerCosts.postgres_cost   > 0) merged.postgres_cost    = providerCosts.postgres_cost;
+                    if (providerCosts.postgres_size_gb > 0) merged.postgres_size_gb = providerCosts.postgres_size_gb;
+                    if (providerCosts.mailgun_cost        >= 0) merged.mailgun_cost        = providerCosts.mailgun_cost;
+                    if (providerCosts.mailgun_emails_sent  > 0) merged.mailgun_emails_sent = providerCosts.mailgun_emails_sent;
+                    if (providerCosts.stripe_fees     >= 0) merged.stripe_fees     = providerCosts.stripe_fees;
+                    if (providerCosts.stripe_fee_txns  > 0) merged.stripe_fee_txns = providerCosts.stripe_fee_txns;
+                }
+
+                updateKPICards(merged);
+
+                await Promise.all([
+                    loadLeaderboard(),
+                    loadCountries(),
+                    loadRecentUsers(),
+                ]);
+            } catch (e) {
+                console.error('KPI load error:', e);
+                if (typeof window.showToast === 'function') window.showToast('Failed to load KPIs', 'error');
+            }
+        };
+
+        async function loadLeaderboard() {
+            const sort = document.getElementById('leaderboardSort').value;
+            try {
+                const users = await window.apiCall('/api/admin/leaderboard?' + buildKpiParams() + '&sort=' + sort);
+                const container = document.getElementById('leaderboard');
+                if (!users || !users.length) {
+                    container.innerHTML = '<div class="text-center py-4 text-secondary">No data</div>';
+                    return;
+                }
+                container.innerHTML = users.slice(0, 10).map((u, i) => (
+                    '<div class="leaderboard-item">'
+                    + '<div class="rank ' + (i < 3 ? 'rank-' + (i+1) : 'rank-default') + '">' + (i+1) + '</div>'
+                    + '<div class="flex-1">'
+                    + '<div class="font-medium">' + (u.name || 'Unknown') + '</div>'
+                    + '<div class="text-xs text-secondary">' + (u.email || '') + '</div>'
+                    + '</div>'
+                    + '<div class="text-right">'
+                    + '<div class="font-semibold">' + (sort === 'revenue' ? formatCurrency(u[sort]) : formatNumber(u[sort] || u.uploads)) + '</div>'
+                    + '<div class="text-xs text-secondary">' + sort + '</div>'
+                    + '</div>'
+                    + '</div>'
+                )).join('');
+            } catch (e) {
+                document.getElementById('leaderboard').innerHTML = '<div class="text-center py-4 text-secondary">Failed to load</div>';
+            }
+        }
+
+        async function loadCountries() {
+            try {
+                const countries = await window.apiCall('/api/admin/countries?' + buildKpiParams());
+                const container = document.getElementById('countriesLeaderboard');
+                if (!countries || !countries.length) {
+                    container.innerHTML = '<div class="text-center py-4 text-secondary">No data</div>';
+                    return;
+                }
+                container.innerHTML = countries.slice(0, 10).map((c, i) => (
+                    '<div class="leaderboard-item">'
+                    + '<div class="rank ' + (i < 3 ? 'rank-' + (i+1) : 'rank-default') + '">' + (i+1) + '</div>'
+                    + '<div class="flex-1"><div class="font-medium">' + (c.name || c.code || 'Unknown') + '</div></div>'
+                    + '<div class="text-right"><div class="font-semibold">' + formatNumber(c.users || c.views || 0) + '</div><div class="text-xs text-secondary">users</div></div>'
+                    + '</div>'
+                )).join('');
+            } catch (e) {
+                document.getElementById('countriesLeaderboard').innerHTML = '<div class="text-center py-4 text-secondary">No data</div>';
+            }
+        }
+
+        function loadTierBreakdown(data) {
+            const container = document.getElementById('tierBreakdown');
+            if (!container) return;
+            if (!data) {
+                container.innerHTML = '<div class="text-center py-4 text-secondary">No data</div>';
+                return;
+            }
+            const tiers = [
+                {key:'free',label:'Free',color:'#6b7280'},
+                {key:'launch',label:'Launch',color:'#3b82f6'},
+                {key:'creator_pro',label:'Creator Pro',color:'#f97316'},
+                {key:'studio',label:'Studio',color:'#8b5cf6'},
+                {key:'agency',label:'Agency',color:'#ec4899'},
+            ];
+            const total = Object.values(data).reduce((a,b) => a + (Number(b)||0), 0) || 1;
+            container.innerHTML = tiers.map(t => {
+                const count = Number(data[t.key] || 0);
+                const pct = ((count/total)*100).toFixed(1);
+                return (
+                    '<div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem;">'
+                    + '<div style="width:80px;font-size:0.8rem;">' + t.label + '</div>'
+                    + '<div style="flex:1;"><div style="height:18px;background:var(--bg-input);border-radius:4px;overflow:hidden;">'
+                    + '<div style="height:100%;width:' + pct + '%;background:' + t.color + ';border-radius:4px;"></div>'
+                    + '</div></div>'
+                    + '<div style="width:90px;text-align:right;font-size:0.8rem;">' + count + ' (' + pct + '%)</div>'
+                    + '</div>'
+                );
+            }).join('');
+        }
+
+        function loadPlatformDistribution(data) {
+            const container = document.getElementById('platformDistribution');
+            if (!container) return;
+            if (!data) {
+                container.innerHTML = '<div class="text-center py-4 text-secondary">No data</div>';
+                return;
+            }
+            const platforms = [
+                {key:'tiktok',label:'TikTok',color:'#111827'},
+                {key:'youtube',label:'YouTube',color:'#FF0000'},
+                {key:'instagram',label:'Instagram',color:'#E1306C'},
+                {key:'facebook',label:'Facebook',color:'#1877F2'},
+            ];
+            const total = Object.values(data).reduce((a,b) => a + (Number(b)||0), 0) || 1;
+            container.innerHTML = platforms.map(p => {
+                const count = Number(data[p.key] || 0);
+                const pct = ((count/total)*100).toFixed(1);
+                return (
+                    '<div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem;">'
+                    + '<div style="width:80px;font-size:0.8rem;">' + p.label + '</div>'
+                    + '<div style="flex:1;"><div style="height:18px;background:var(--bg-input);border-radius:4px;overflow:hidden;">'
+                    + '<div style="height:100%;width:' + pct + '%;background:' + p.color + ';border-radius:4px;"></div>'
+                    + '</div></div>'
+                    + '<div style="width:90px;text-align:right;font-size:0.8rem;">' + formatNumber(count) + '</div>'
+                    + '</div>'
+                );
+            }).join('');
+        }
+
+        async function loadRecentUsers() {
+            try {
+                const resp = await window.apiCall('/api/admin/users?limit=10&sort=created_at:desc');
+                const users = resp?.users || resp || [];
+                const tbody = document.getElementById('recentUsersBody');
+                if (!tbody) return;
+                if (!users.length) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-secondary">No recent signups</td></tr>';
+                    return;
+                }
+                tbody.innerHTML = users.map(u => (
+                    '<tr>'
+                    + '<td><div style="display:flex;align-items:center;gap:0.5rem;">'
+                    + '<div class="user-avatar" style="width:30px;height:30px;font-size:0.75rem;">' + (u.name || 'U')[0].toUpperCase() + '</div>'
+                    + '<span>' + (u.name || 'Unknown') + '</span></div></td>'
+                    + '<td class="text-secondary">' + (u.email || '') + '</td>'
+                    + '<td><span class="badge ' + (u.subscription_tier || 'free') + '">' + (u.subscription_tier || 'free') + '</span></td>'
+                    + '<td><span class="badge ' + (u.status || 'active') + '">' + (u.status || 'active') + '</span></td>'
+                    + '<td class="text-secondary">' + formatRelativeTime(u.created_at) + '</td>'
+                    + '<td class="text-center">' + (u.uploads_count || 0) + '</td>'
+                    + '</tr>'
+                )).join('');
+            } catch (e) {
+                const tbody = document.getElementById('recentUsersBody');
+                if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-secondary">Failed to load</td></tr>';
+            }
+        }
+
+        // ---------- Bootstrap ----------
+        async function authenticateUser() {
+            // Single source of truth: app.js initApp() (calls /api/me)
+            if (typeof window.initApp === 'function') {
+                await window.initApp('admin-kpi');
+            }
+
+            // Preferred: app.js exposes currentUser
+            const u = window.currentUser || (typeof window.getCurrentUser === 'function' ? window.getCurrentUser() : null);
+            if (u) return u;
+
+            // Fallback: direct apiCall
+            if (typeof window.apiCall === 'function') {
+                return await window.apiCall('/api/me');
+            }
+
+            throw new Error('Auth unavailable');
+        }
+
+        function initPage(user) {
+            document.getElementById('loadingState').style.display = 'none';
+
+            // Role gate
+            if (user.role !== 'admin' && user.role !== 'master_admin') {
+                document.getElementById('accessDenied').style.display = 'flex';
+                return;
+            }
+
+            // Reveal Admin nav
+            const adminSection = document.getElementById('adminSection');
+            if (adminSection) adminSection.style.display = 'block';
+
+            document.getElementById('adminContent').style.display = 'block';
+
+            // Set default custom range
+            const today = new Date();
+            const monthAgo = new Date(today); monthAgo.setDate(monthAgo.getDate() - 30);
+            document.getElementById('endDate').value = today.toISOString().split('T')[0];
+            document.getElementById('startDate').value = monthAgo.toISOString().split('T')[0];
+
+            document.getElementById('timeRange').onchange = handleTimeRangeChange;
+            document.getElementById('leaderboardSort').onchange = loadLeaderboard;
+
+            initClickableCards();
+            initDragAndDrop();
+            loadSavedLayout();
+            refreshKPIs();
+        }
+
+        (async function bootstrap() {
+            try {
+                const user = await authenticateUser();
+                initPage(user);
+            } catch (e) {
+                console.error('[admin-kpi] bootstrap failed:', e);
+                document.getElementById('loadingState').style.display = 'none';
+                document.getElementById('accessDenied').style.display = 'flex';
+            }
+        })();
+    })();
+    </script>
+</body>
+</html>

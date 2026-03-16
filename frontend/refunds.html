@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Refund & Cancellation Policy - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg-primary: #0a0a0f; --bg-secondary: #12121a; --bg-card: #1a1a24; --bg-hover: #22222e;
+            --bg-input: rgba(255,255,255,0.05); --text-primary: #ffffff; --text-secondary: #9ca3af;
+            --text-muted: #6b7280; --border-color: rgba(255,255,255,0.08); --border-hover: rgba(255,255,255,0.15);
+            --accent-orange: #f97316; --accent-orange-hover: #ea580c; --accent-blue: #3b82f6;
+            --accent-green: #22c55e; --accent-red: #ef4444; --accent-purple: #8b5cf6;
+            --radius-sm: 6px; --radius-md: 10px; --radius-lg: 16px;
+        }
+        html { scroll-behavior: smooth; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg-primary); color: var(--text-primary); line-height: 1.7; min-height: 100vh; }
+        a { color: var(--accent-orange); text-decoration: none; transition: color 0.2s; }
+        a:hover { color: var(--accent-orange-hover); }
+        .nav { position: sticky; top: 0; z-index: 100; padding: 1rem 2rem; background: rgba(10,10,15,0.97); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); }
+        .nav-container { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+        .nav-logo { display: flex; align-items: center; gap: 0.75rem; font-size: 1.25rem; font-weight: 700; color: white; text-decoration: none; }
+        .nav-logo-icon { width: 32px; height: 32px; background: linear-gradient(135deg, var(--accent-orange), var(--accent-purple)); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 1rem; }
+        .back-btn { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; font-weight: 500; padding: 0.5rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-md); transition: all 0.2s; }
+        .back-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--bg-hover); }
+        .hero { padding: 4rem 2rem 3rem; background: linear-gradient(180deg, rgba(249,115,22,0.06) 0%, transparent 100%); border-bottom: 1px solid var(--border-color); }
+        .hero-inner { max-width: 900px; margin: 0 auto; }
+        .hero-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.875rem; background: rgba(249,115,22,0.1); border: 1px solid rgba(249,115,22,0.25); border-radius: 50px; font-size: 0.8rem; font-weight: 600; color: var(--accent-orange); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 1.25rem; }
+        .hero h1 { font-size: 2.75rem; font-weight: 800; margin-bottom: 0.75rem; }
+        .hero-meta { display: flex; align-items: center; gap: 1.5rem; color: var(--text-muted); font-size: 0.875rem; flex-wrap: wrap; }
+        .hero-meta span { display: flex; align-items: center; gap: 0.4rem; }
+        .legal-nav { background: var(--bg-secondary); border-bottom: 1px solid var(--border-color); padding: 0 2rem; overflow-x: auto; }
+        .legal-nav-inner { max-width: 1280px; margin: 0 auto; display: flex; }
+        .legal-nav a { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
+        .legal-nav a:hover { color: var(--text-primary); }
+        .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+        .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
+        @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
+        .sidebar-toc { position: sticky; top: 80px; }
+        .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
+        .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
+        .toc-list { list-style: none; }
+        .toc-list li { margin-bottom: 0.125rem; }
+        .toc-list a { display: block; padding: 0.4rem 0.75rem; color: var(--text-secondary); font-size: 0.85rem; border-radius: var(--radius-sm); border-left: 2px solid transparent; transition: all 0.2s; text-decoration: none; }
+        .toc-list a:hover, .toc-list a.active { color: var(--accent-orange); border-left-color: var(--accent-orange); background: rgba(249,115,22,0.07); }
+        .article { min-width: 0; }
+        .section-block { margin-bottom: 3rem; }
+        .section-header { display: flex; align-items: center; gap: 0.875rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); }
+        .section-num { width: 32px; height: 32px; background: rgba(249,115,22,0.15); border: 1px solid rgba(249,115,22,0.3); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 700; color: var(--accent-orange); flex-shrink: 0; }
+        .section-header h2 { font-size: 1.35rem; font-weight: 700; }
+        .prose p { color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.95rem; }
+        .prose ul { color: var(--text-secondary); padding-left: 1.5rem; margin-bottom: 1rem; }
+        .prose li { margin-bottom: 0.5rem; font-size: 0.95rem; }
+        .prose h3 { font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 1.5rem 0 0.75rem; }
+        .prose strong { color: var(--text-primary); font-weight: 600; }
+        .callout { display: flex; gap: 0.875rem; padding: 1rem 1.25rem; border-radius: var(--radius-md); margin: 1.25rem 0; font-size: 0.9rem; }
+        .callout i { flex-shrink: 0; margin-top: 0.1rem; }
+        .callout-blue { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); color: #93c5fd; }
+        .callout-blue i { color: var(--accent-blue); }
+        .callout-green { background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2); color: #86efac; }
+        .callout-green i { color: var(--accent-green); }
+        .callout-orange { background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.2); color: #fdba74; }
+        .callout-orange i { color: var(--accent-orange); }
+        .callout-red { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: #fca5a5; }
+        .callout-red i { color: var(--accent-red); }
+        .data-table { width: 100%; border-collapse: collapse; margin: 1.25rem 0; border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-color); font-size: 0.875rem; }
+        .data-table th { background: var(--bg-secondary); padding: 0.75rem 1rem; text-align: left; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
+        .data-table td { padding: 0.875rem 1rem; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); vertical-align: top; }
+        .data-table tr:last-child td { border-bottom: none; }
+        .data-table tr:hover td { background: var(--bg-hover); }
+        .data-table td:first-child { color: var(--text-primary); font-weight: 500; }
+        .footer { background: var(--bg-secondary); border-top: 1px solid var(--border-color); padding: 2rem; margin-top: 4rem; }
+        .footer-inner { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+        .footer-copy { color: var(--text-muted); font-size: 0.85rem; }
+        .footer-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+        .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
+        .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
+        ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: var(--bg-secondary); } ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+    </style>
+</head>
+<body>
+
+<nav class="nav">
+    <div class="nav-container">
+        <a href="index.html" class="nav-logo">
+            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            UploadM8
+        </a>
+        <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
+    </div>
+</nav>
+
+<div class="hero">
+    <div class="hero-inner">
+        <div class="hero-badge"><i class="fas fa-undo"></i> Legal</div>
+        <h1>Refund & Cancellation Policy</h1>
+        <div class="hero-meta">
+            <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
+            <span><i class="fas fa-clock"></i> Last Updated: February 2026</span>
+        </div>
+    </div>
+</div>
+
+<nav class="legal-nav">
+    <div class="legal-nav-inner">
+        <a href="privacy.html"><i class="fas fa-shield-alt"></i> Privacy</a>
+        <a href="terms.html"><i class="fas fa-file-contract"></i> Terms</a>
+        <a href="security.html"><i class="fas fa-lock"></i> Security</a>
+        <a href="cookies.html"><i class="fas fa-cookie-bite"></i> Cookies</a>
+        <a href="subprocessors.html"><i class="fas fa-server"></i> Subprocessors</a>
+        <a href="refunds.html" class="active"><i class="fas fa-undo"></i> Refunds</a>
+        <a href="dmca.html"><i class="fas fa-gavel"></i> DMCA</a>
+        <a href="support.html"><i class="fas fa-headset"></i> Support</a>
+    </div>
+</nav>
+
+<div class="content-wrapper">
+    <article class="article">
+
+        <div class="callout callout-blue">
+            <i class="fas fa-info-circle"></i>
+            <div>We stand behind UploadM8 and want you to be satisfied. This policy outlines exactly when and how refunds are issued so there are no surprises. For billing questions, contact <a href="mailto:billing@uploadm8.com">billing@uploadm8.com</a>.</div>
+        </div>
+
+        <div class="section-block" id="subscription-refunds">
+            <div class="section-header"><div class="section-num">1</div><h2>Subscription Refunds</h2></div>
+            <table class="data-table">
+                <thead>
+                    <tr><th>Plan Type</th><th>Refund Policy</th><th>How to Cancel</th></tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Monthly Subscription</td>
+                        <td>No partial refunds for unused days. Cancel anytime — no future charges; access continues until end of billing period.</td>
+                        <td>Settings → Billing → Open Billing Portal → Cancel</td>
+                    </tr>
+                    <tr>
+                        <td>Annual Subscription</td>
+                        <td>Prorated refund available within 14 days of renewal date. Reviewed case-by-case after 14 days. No refunds after 60 days.</td>
+                        <td>Email billing@uploadm8.com</td>
+                    </tr>
+                    <tr>
+                        <td>Enterprise / Custom</td>
+                        <td>Per contract terms negotiated at time of agreement.</td>
+                        <td>Per contract</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="prose">
+                <div class="callout callout-orange">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <div>Downgrading your plan mid-cycle does not trigger a refund. The downgrade takes effect at the start of the next billing cycle. You retain access to your current plan features until then.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section-block" id="aic-tokens">
+            <div class="section-header"><div class="section-num">2</div><h2>AIC Token Purchases</h2></div>
+            <div class="prose">
+                <div class="callout callout-red">
+                    <i class="fas fa-ban"></i>
+                    <div><strong>AIC tokens are non-refundable and non-transferable.</strong> Once purchased, tokens are credited to your account immediately. Unused tokens do not carry over to new subscription periods unless explicitly stated in your plan.</div>
+                </div>
+                <p>Exceptions may be granted at our sole discretion in cases where tokens were consumed due to a verified platform error or system malfunction on our end. Contact <a href="mailto:billing@uploadm8.com">billing@uploadm8.com</a> within 7 days of the incident with your job IDs and a description of the issue.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="service-failure">
+            <div class="section-header"><div class="section-num">3</div><h2>Service Failure Credits</h2></div>
+            <div class="prose">
+                <p>If UploadM8 experiences a service failure that materially impacts your ability to use the platform (not caused by third-party platform outages), you may be eligible for account credit:</p>
+                <ul>
+                    <li>Outage of 24+ continuous hours: Eligible for prorated credit for affected days</li>
+                    <li>Repeated publishing failures due to UploadM8 bugs (not platform API issues): Case-by-case credit review</li>
+                    <li>Data loss caused by our infrastructure: Full credit for affected billing period</li>
+                </ul>
+                <p>Credits are applied to your account balance and automatically applied to your next billing cycle. Credits are non-transferable and not redeemable for cash. To request a credit, email <a href="mailto:billing@uploadm8.com">billing@uploadm8.com</a> with your account email, affected dates, and description of the issue.</p>
+            </div>
+            <table class="data-table">
+                <thead><tr><th>Incident Type</th><th>Response Time</th><th>Resolution Time</th></tr></thead>
+                <tbody>
+                    <tr><td>Credit Request Review</td><td>5 business days</td><td>10 business days</td></tr>
+                    <tr><td>Annual Refund Request</td><td>5 business days</td><td>14 business days</td></tr>
+                    <tr><td>Billing Error</td><td>2 business days</td><td>5 business days</td></tr>
+                    <tr><td>Chargeback Dispute</td><td>Immediate suspension pending review</td><td>Per card network timeline</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section-block" id="cancellation">
+            <div class="section-header"><div class="section-num">4</div><h2>Cancellation Process</h2></div>
+            <div class="prose">
+                <h3>Self-Service Cancellation</h3>
+                <p>You can cancel your subscription at any time from <strong>Settings → Billing → Open Billing Portal</strong> (then cancel in the portal). <strong>When you cancel, no future charges are made.</strong> Cancellation takes effect at the end of the current billing period — you retain access until then. You can reactivate later by resubscribing.</p>
+                <h3>What Happens After Cancellation</h3>
+                <ul>
+                    <li>No further charges; subscription ends at period end</li>
+                    <li>You retain access until the end of your current billing period</li>
+                    <li>At period end, your plan downgrades to free (or if you requested account deletion, your account is fully deleted)</li>
+                </ul>
+                <h3>Account Deletion vs. Cancellation</h3>
+                <p>Cancelling your subscription stops future billing; you keep access until period end. To permanently delete all your data, use <strong>Settings → Security → Delete your account</strong>. <strong>Free users:</strong> Deletion is immediate and irreversible. <strong>Paid users:</strong> Deletion is scheduled for the end of your billing period; you retain access until then. There is no refund for any remaining subscription time upon account deletion.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="chargebacks">
+            <div class="section-header"><div class="section-num">5</div><h2>Chargebacks & Disputes</h2></div>
+            <div class="prose">
+                <div class="callout callout-red">
+                    <i class="fas fa-exclamation-circle"></i>
+                    <div>Filing a chargeback without first contacting us will result in immediate account suspension during the investigation period. We will provide full transaction records to your card issuer and have a strong track record of winning legitimate disputes.</div>
+                </div>
+                <p>If you believe a charge is incorrect, please contact <a href="mailto:billing@uploadm8.com">billing@uploadm8.com</a> first. Billing errors are resolved typically within 5 business days — far faster than a chargeback process. We are committed to resolving legitimate billing issues promptly and fairly.</p>
+                <p>Accounts involved in fraudulent chargebacks may be permanently banned and reported to payment fraud prevention networks.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="price-changes">
+            <div class="section-header"><div class="section-num">6</div><h2>Price Changes</h2></div>
+            <div class="prose">
+                <p>We will provide at least 30 days written notice via email before implementing any price increases on your current plan. You may cancel before the new price takes effect to avoid the increase.</p>
+                <p>Annual plan pricing is locked for the duration of the subscription year at the rate charged at the time of purchase. Price changes take effect at annual renewal.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="contact">
+            <div class="section-header"><div class="section-num">7</div><h2>Billing Contact</h2></div>
+            <div class="prose">
+                <p><strong>Email:</strong> <a href="mailto:billing@uploadm8.com">billing@uploadm8.com</a><br>
+                <strong>Response Time:</strong> Within 5 business days<br>
+                <strong>Hours:</strong> Monday – Friday, 9am – 6pm CT</p>
+            </div>
+        </div>
+
+    </article>
+
+    <aside class="sidebar-toc">
+        <div class="toc-card">
+            <div class="toc-title">On This Page</div>
+            <ul class="toc-list">
+                <li><a href="#subscription-refunds">1. Subscription Refunds</a></li>
+                <li><a href="#aic-tokens">2. AIC Tokens</a></li>
+                <li><a href="#service-failure">3. Service Failure Credits</a></li>
+                <li><a href="#cancellation">4. Cancellation Process</a></li>
+                <li><a href="#chargebacks">5. Chargebacks</a></li>
+                <li><a href="#price-changes">6. Price Changes</a></li>
+                <li><a href="#contact">7. Billing Contact</a></li>
+            </ul>
+        </div>
+    </aside>
+</div>
+
+<footer class="footer">
+    <div class="footer-inner">
+        <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
+        <div class="footer-links">
+            <a href="privacy.html">Privacy</a>
+            <a href="terms.html">Terms</a>
+            <a href="security.html">Security</a>
+            <a href="cookies.html">Cookies</a>
+            <a href="subprocessors.html">Subprocessors</a>
+            <a href="refunds.html" class="active">Refunds</a>
+            <a href="dmca.html">DMCA</a>
+            <a href="support.html">Support</a>
+        </div>
+    </div>
+</footer>
+
+<script>
+    const sections = document.querySelectorAll('.section-block[id]');
+    const tocLinks = document.querySelectorAll('.toc-list a');
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                tocLinks.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+            }
+        });
+    }, { rootMargin: '-20% 0% -60% 0%' });
+    sections.forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

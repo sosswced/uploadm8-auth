@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>How It Works - UploadM8</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="/images/logo.png">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+        --blue-50:#eff6ff; --blue-100:#dbeafe; --blue-500:#3b82f6; --blue-600:#2563eb;
+        --orange-500:#f97316;
+        --gray-50:#f9fafb; --gray-100:#f3f4f6; --gray-200:#e5e7eb; --gray-300:#d1d5db;
+        --gray-400:#9ca3af; --gray-500:#6b7280; --gray-600:#4b5563; --gray-700:#374151;
+        --gray-800:#1f2937; --gray-900:#111827;
+        --green-500:#22c55e; --red-500:#ef4444; --yellow-500:#eab308;
+    }
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--gray-50);color:var(--gray-800);line-height:1.65;}
+    nav{position:sticky;top:0;background:rgba(255,255,255,0.95);backdrop-filter:blur(20px);border-bottom:1px solid var(--gray-200);z-index:10;padding:0 24px;}
+    .nav-container{max-width:1100px;margin:0 auto;height:72px;display:flex;align-items:center;justify-content:space-between;}
+    .logo{display:flex;align-items:center;gap:10px;text-decoration:none;}
+    .logo img{height:34px;}
+    .nav-links{display:flex;align-items:center;gap:18px;}
+    .nav-links a{color:var(--gray-600);text-decoration:none;font-weight:600;font-size:0.95rem;}
+    .nav-links a:hover{color:var(--gray-900);}
+    .nav-buttons{display:flex;gap:12px;align-items:center;}
+    .btn{padding:10px 18px;border-radius:10px;font-weight:700;font-size:0.95rem;text-decoration:none;display:inline-flex;align-items:center;gap:8px;border:1px solid transparent;cursor:pointer;}
+    .btn-ghost{background:transparent;border-color:var(--gray-300);color:var(--gray-700);}
+    .btn-ghost:hover{background:var(--gray-100);}
+    .btn-primary{background:linear-gradient(135deg,var(--blue-500),var(--blue-600));color:#fff;box-shadow:0 6px 18px rgba(59,130,246,0.35);}
+    .btn-primary:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(59,130,246,0.45);}
+    .wrap{max-width:1100px;margin:0 auto;padding:56px 24px;}
+    .card{background:#fff;border:1px solid var(--gray-200);border-radius:18px;padding:28px;}
+    h1{font-size:2.2rem;line-height:1.15;color:var(--gray-900);margin-bottom:10px;}
+    .meta{color:var(--gray-500);font-weight:600;margin-bottom:22px;}
+    h2{font-size:1.25rem;color:var(--gray-900);margin-top:26px;margin-bottom:10px;}
+    p{color:var(--gray-700);margin:10px 0;}
+    ul{padding-left:20px;margin:10px 0;color:var(--gray-700);}
+    li{margin:6px 0;}
+    .callout{border-left:4px solid var(--blue-500);background:var(--blue-50);padding:14px 16px;border-radius:12px;margin:16px 0;color:var(--gray-700);}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:14px;}
+    .pill{display:inline-flex;gap:8px;align-items:center;padding:6px 12px;border-radius:999px;background:var(--gray-100);border:1px solid var(--gray-200);font-weight:700;color:var(--gray-700);font-size:0.85rem;}
+    footer{border-top:1px solid var(--gray-200);background:#fff;}
+    .foot{max-width:1100px;margin:0 auto;padding:26px 24px;color:var(--gray-500);display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;}
+    .foot a{color:var(--gray-600);text-decoration:none;font-weight:700;}
+    .foot a:hover{color:var(--gray-900);}
+    @media (max-width:900px){.grid{grid-template-columns:1fr;}.nav-links{display:none;}}
+</style>
+</head>
+<body>
+  <nav>
+    <div class="nav-container">
+      <a class="logo" href="/index.html"><img src="/images/logo.png" alt="UploadM8"></a>
+      
+        <div class="nav-links">
+            <a href="/index.html">Home</a>
+            <a href="/contact.html">Contact</a>
+        </div>
+    
+      <div class="nav-buttons">
+        <a class="btn btn-ghost" href="/login.html">Log in</a>
+        <a class="btn btn-primary" href="/signup.html">Get started free</a>
+      </div>
+    </div>
+  </nav>
+
+  <div class="wrap">
+    <div class="card">
+      <h1>How UploadM8 Works</h1>
+      <div class="meta">Last updated: January 26, 2026</div>
+      
+<p>UploadM8 is designed for creators and teams who need repeatable distribution at scale without drowning in manual uploads.</p>
+
+<h2>Workflow</h2>
+<ol style="padding-left:20px;color:var(--gray-700);margin:10px 0;">
+  <li><strong>Connect:</strong> link TikTok, YouTube, Instagram, and Facebook accounts in one place.</li>
+  <li><strong>Upload:</strong> drop videos, set title/caption/hashtags once.</li>
+  <li><strong>Schedule:</strong> choose “smart” (recommended windows) or set a specific publish time.</li>
+  <li><strong>Queue:</strong> monitor countdowns, cancel pending jobs, and track platform results.</li>
+  <li><strong>Notify:</strong> get Discord webhooks on success/failure with links and metadata.</li>
+</ol>
+
+<h2>Smart Scheduling (what it means)</h2>
+<ul>
+  <li><strong>Inputs:</strong> your preferred windows (e.g., weekdays 6–9pm), spacing rules, and content volume.</li>
+  <li><strong>Output:</strong> a publish plan that avoids collisions and maximizes consistency.</li>
+  <li><strong>Overrides:</strong> manual time always wins.</li>
+</ul>
+
+<div class="callout"><strong>Reality check:</strong> “optimal times” can be improved, but the biggest lift comes from consistency and volume. UploadM8’s job is to make that operationally painless.</div>
+
+<h2>Core values</h2>
+<div class="grid">
+  <div class="card" style="padding:18px;border-radius:16px;">
+    <div class="pill">Single source of truth</div>
+    <p>One queue and one dashboard for all platform outcomes.</p>
+  </div>
+  <div class="card" style="padding:18px;border-radius:16px;">
+    <div class="pill">Automation, not autopilot</div>
+    <p>You set intent; the system executes and reports.</p>
+  </div>
+  <div class="card" style="padding:18px;border-radius:16px;">
+    <div class="pill">Enterprise readiness</div>
+    <p>Auditability, billing, roles, reliability, and scalability.</p>
+  </div>
+</div>
+
+<h2>Need help?</h2>
+<p>Reach out at <a href="mailto:sosswced@gmail.com">sosswced@gmail.com</a>.</p>
+
+    </div>
+  </div>
+
+  <footer>
+    <div class="foot">
+      <div>© 2026 UploadM8</div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;">
+        <a href="/about.html">About</a>
+        <a href="/blog.html">Blog</a>
+        <a href="/contact.html">Contact</a>
+        <a href="/privacy.html">Privacy</a>
+        <a href="/terms.html">Terms</a>
+        <a href="/data-deletion.html">Data deletion</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

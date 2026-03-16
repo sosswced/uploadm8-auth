@@ -51,6 +51,7 @@ URL_UNSUBSCRIBE  = f"{FRONTEND_URL}/unsubscribe.html"
 TIER_NAMES: dict = {
     "free":           "Free",
     "launch":         "Launch",
+    "creator_lite":   "Creator Lite",
     "creator_pro":    "Creator Pro",
     "studio":         "Studio",
     "agency":         "Agency",

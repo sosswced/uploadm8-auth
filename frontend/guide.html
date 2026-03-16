@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feature Guide — UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+    <style>
+/* ── Guide-specific overrides ─────────────────────────────── */
+.guide-layout { display:grid; grid-template-columns:260px 1fr; min-height:100vh; }
+@media(max-width:900px){ .guide-layout{ grid-template-columns:1fr; } .guide-toc{ display:none; } }
+
+/* Table of contents sidebar */
+.guide-toc {
+    position:sticky; top:0; height:100vh; overflow-y:auto;
+    background:var(--bg-card); border-right:1px solid var(--border-color);
+    padding:1.5rem 1rem;
+}
+.guide-toc::-webkit-scrollbar { width:4px; }
+.guide-toc::-webkit-scrollbar-thumb { background:var(--border-color); border-radius:2px; }
+.toc-logo { display:flex; align-items:center; gap:.6rem; margin-bottom:1.5rem; text-decoration:none; color:var(--text-primary); font-weight:700; font-size:.95rem; }
+.toc-logo img { width:28px; height:28px; object-fit:contain; }
+.toc-section-title { font-size:.65rem; font-weight:700; letter-spacing:.13em; text-transform:uppercase; color:var(--text-muted); padding:.25rem .5rem; margin:.75rem 0 .25rem; }
+.toc-link { display:flex; align-items:center; gap:.6rem; padding:.45rem .6rem; border-radius:6px; font-size:.82rem; color:var(--text-secondary); text-decoration:none; transition:all .15s; cursor:pointer; }
+.toc-link:hover, .toc-link.active { background:rgba(249,115,22,.1); color:#f97316; }
+.toc-link i { width:14px; text-align:center; flex-shrink:0; font-size:.8rem; }
+.toc-back { display:flex; align-items:center; gap:.5rem; padding:.5rem .6rem; border-radius:6px; font-size:.8rem; color:var(--text-muted); text-decoration:none; margin-bottom:1rem; transition:color .15s; }
+.toc-back:hover { color:var(--text-primary); }
+
+/* Plan filter bar */
+.plan-filter { display:flex; flex-wrap:wrap; gap:.5rem; margin-bottom:2rem; }
+.plan-btn {
+    display:flex; align-items:center; gap:.4rem;
+    padding:.35rem .875rem; border-radius:999px; font-size:.78rem; font-weight:600;
+    border:1px solid var(--border-color); background:transparent; color:var(--text-secondary);
+    cursor:pointer; transition:all .15s;
+}
+.plan-btn.active, .plan-btn:hover { color:#fff; border-color:transparent; }
+.plan-btn[data-tier="all"].active        { background:#f97316; }
+.plan-btn[data-tier="creator_lite"].active  { background:#f97316; }
+.plan-btn[data-tier="creator_pro"].active   { background:#8b5cf6; }
+.plan-btn[data-tier="studio"].active        { background:#3b82f6; }
+.plan-btn[data-tier="agency"].active        { background:#22c55e; }
+
+/* Section heading */
+.guide-section { margin-bottom:3.5rem; scroll-margin-top:1.5rem; }
+.section-header { display:flex; align-items:center; gap:.75rem; margin-bottom:1.25rem; }
+.section-icon { width:38px; height:38px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:.95rem; flex-shrink:0; }
+.section-title { font-size:1.2rem; font-weight:700; }
+.section-sub   { font-size:.85rem; color:var(--text-secondary); margin-top:.15rem; }
+
+/* Feature card */
+.feat-card {
+    background:var(--bg-card);
+    border:1px solid var(--border-color);
+    border-radius:12px;
+    padding:1.25rem 1.5rem;
+    margin-bottom:1rem;
+    transition:border-color .15s;
+    position:relative;
+}
+.feat-card:hover { border-color:var(--border-hover); }
+.feat-card-header { display:flex; align-items:flex-start; gap:.875rem; }
+.feat-card-icon { width:38px; height:38px; border-radius:9px; display:flex; align-items:center; justify-content:center; font-size:.9rem; flex-shrink:0; margin-top:.1rem; }
+.feat-card-title { font-size:.95rem; font-weight:600; margin-bottom:.2rem; }
+.feat-card-desc  { font-size:.83rem; color:var(--text-secondary); line-height:1.55; }
+.feat-card-body  { margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border-color); display:none; }
+.feat-card-body.open { display:block; }
+.feat-toggle { position:absolute; top:1rem; right:1rem; background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:.85rem; padding:.25rem .5rem; border-radius:5px; transition:color .15s; }
+.feat-toggle:hover { color:var(--text-primary); }
+
+/* Tier badge */
+.tier-badge { display:inline-flex; align-items:center; gap:.3rem; padding:.2rem .55rem; border-radius:999px; font-size:.68rem; font-weight:700; margin-bottom:.75rem; }
+.tb-free  { background:rgba(156,163,175,.1); color:#9ca3af; border:1px solid rgba(156,163,175,.2); }
+.tb-lite  { background:rgba(249,115,22,.1);  color:#f97316; border:1px solid rgba(249,115,22,.2); }
+.tb-pro   { background:rgba(139,92,246,.1);  color:#8b5cf6; border:1px solid rgba(139,92,246,.2); }
+.tb-studio{ background:rgba(59,130,246,.1);  color:#3b82f6; border:1px solid rgba(59,130,246,.2); }
+.tb-agency{ background:rgba(34,197,94,.1);   color:#22c55e; border:1px solid rgba(34,197,94,.2); }
+
+/* Tips / notes */
+.tip { background:rgba(249,115,22,.06); border-left:3px solid #f97316; border-radius:0 8px 8px 0; padding:.75rem 1rem; font-size:.82rem; color:var(--text-secondary); margin:.75rem 0; }
+.tip strong { color:#f97316; }
+.note { background:rgba(59,130,246,.06); border-left:3px solid #3b82f6; border-radius:0 8px 8px 0; padding:.75rem 1rem; font-size:.82rem; color:var(--text-secondary); margin:.75rem 0; }
+.note strong { color:#3b82f6; }
+
+/* How-to steps */
+.how-steps { list-style:none; counter-reset:step; padding:0; margin:.75rem 0; }
+.how-steps li { counter-increment:step; display:flex; gap:.875rem; margin-bottom:.75rem; font-size:.84rem; }
+.how-steps li::before { content:counter(step); width:24px; height:24px; background:rgba(249,115,22,.15); color:#f97316; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:.7rem; font-weight:700; flex-shrink:0; margin-top:.05rem; }
+
+/* Comparison table */
+.comp-table { width:100%; border-collapse:collapse; font-size:.82rem; margin:.75rem 0; }
+.comp-table th { text-align:left; padding:.5rem .75rem; border-bottom:1px solid var(--border-color); color:var(--text-muted); font-weight:600; font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; }
+.comp-table td { padding:.55rem .75rem; border-bottom:1px solid rgba(255,255,255,.04); vertical-align:middle; }
+.comp-table tr:last-child td { border-bottom:none; }
+.comp-table tr:hover td { background:rgba(255,255,255,.02); }
+.check-yes { color:#22c55e; } .check-no { color:rgba(255,255,255,.2); }
+
+/* Page header */
+.guide-header { padding:2rem 2.5rem 1rem; border-bottom:1px solid var(--border-color); background:var(--bg-secondary); }
+.guide-breadcrumb { font-size:.78rem; color:var(--text-muted); margin-bottom:.5rem; }
+.guide-breadcrumb a { color:var(--text-muted); text-decoration:none; } .guide-breadcrumb a:hover { color:#f97316; }
+
+/* ── Iframe / embedded mode ───────────────────────────────────────────── */
+/* Remove escape-navigation links */
+html.in-iframe .toc-back            { display: none !important; }
+html.in-iframe .toc-logo            { pointer-events: none; cursor: default; text-decoration: none; }
+html.in-iframe .toc-logo:hover      { opacity: 1; }
+html.in-iframe .guide-breadcrumb    { display: none; }
+
+/* Fit inside iframe — let iframe handle the scroll container */
+html.in-iframe body                 { overflow-y: auto; min-height: 0; }
+html.in-iframe .guide-layout        { min-height: 0 !important; }
+html.in-iframe .guide-toc           { position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+.guide-page-title { font-size:1.8rem; font-weight:700; }
+.guide-page-sub   { font-size:.9rem; color:var(--text-secondary); margin-top:.35rem; }
+
+/* Your plan highlight */
+#yourPlanBanner { display:none; background:linear-gradient(135deg,rgba(249,115,22,.08),rgba(139,92,246,.06)); border:1px solid rgba(249,115,22,.2); border-radius:12px; padding:1rem 1.25rem; margin-bottom:2rem; }
+#yourPlanBanner.visible { display:flex; align-items:center; gap:1rem; }
+
+/* Tag for showing which features are "yours" */
+.yours-tag { display:inline-flex; align-items:center; gap:.3rem; padding:.15rem .5rem; background:rgba(34,197,94,.12); color:#22c55e; border-radius:999px; font-size:.65rem; font-weight:700; }
+</style>
+</head>
+<body>
+
+<script>
+// When embedded in an iframe (e.g. Settings > Guide tab), hide the sidebar
+// and collapse to single-column reading mode automatically.
+if (window.self !== window.top) {
+    document.documentElement.classList.add('in-iframe');
+}
+</script>
+
+<div class="guide-layout">
+
+  <!-- ── Left TOC ─────────────────────────────────────────── -->
+  <aside class="guide-toc">
+    <a href="dashboard.html" class="toc-back"><i class="fas fa-arrow-left"></i> Dashboard</a>
+    <a href="dashboard.html" class="toc-logo">
+      <img src="images/logo.png" alt="UploadM8">
+      <span>UploadM8</span>
+    </a>
+    <div style="font-size:.72rem;font-weight:700;color:var(--text-primary);margin-bottom:1rem;">Feature Guide</div>
+
+    <div class="toc-section-title">Getting Started</div>
+    <a class="toc-link" data-target="gs-upload"><i class="fas fa-play-circle"></i> Quick Start</a>
+    <a class="toc-link" data-target="gs-wallet"><i class="fas fa-wallet"></i> PUT & AIC Wallet</a>
+    <a class="toc-link" data-target="gs-platforms"><i class="fas fa-plug"></i> Connecting Platforms</a>
+
+    <div class="toc-section-title">Core Features</div>
+    <a class="toc-link" data-target="feat-upload"><i class="fas fa-cloud-upload-alt"></i> Upload System</a>
+    <a class="toc-link" data-target="feat-scheduler"><i class="fas fa-calendar-alt"></i> Scheduler</a>
+    <a class="toc-link" data-target="feat-queue"><i class="fas fa-list"></i> Job Queue</a>
+    <a class="toc-link" data-target="feat-groups"><i class="fas fa-layer-group"></i> Account Groups</a>
+
+    <div class="toc-section-title">AI & Video</div>
+    <a class="toc-link" data-target="feat-ai"><i class="fas fa-robot"></i> AI Engine</a>
+    <a class="toc-link" data-target="feat-hud"><i class="fas fa-film"></i> HUD Overlay</a>
+    <a class="toc-link" data-target="feat-thumbnails"><i class="fas fa-image"></i> Thumbnails</a>
+
+    <div class="toc-section-title">Analytics & Reports</div>
+    <a class="toc-link" data-target="feat-analytics"><i class="fas fa-chart-line"></i> Analytics</a>
+    <a class="toc-link" data-target="feat-excel"><i class="fas fa-file-excel"></i> Excel Export</a>
+    <a class="toc-link" data-target="feat-webhooks"><i class="fas fa-bell"></i> Webhooks</a>
+
+    <div class="toc-section-title">Plans & Billing</div>
+    <a class="toc-link" data-target="billing-plans"><i class="fas fa-credit-card"></i> Plans Compared</a>
+    <a class="toc-link" data-target="billing-topup"><i class="fas fa-coins"></i> Top-Up Packs</a>
+    <a class="toc-link" data-target="billing-flex"><i class="fas fa-exchange-alt"></i> Flex Transfers</a>
+
+    <div class="toc-section-title">Advanced</div>
+    <a class="toc-link" data-target="adv-priority"><i class="fas fa-bolt"></i> Priority Queue</a>
+    <a class="toc-link" data-target="adv-white-label"><i class="fas fa-tag"></i> White Label</a>
+    <a class="toc-link" data-target="adv-team"><i class="fas fa-users"></i> Team Seats</a>
+  </aside>
+
+  <!-- ── Main content ───────────────────────────────────────── -->
+  <div style="min-width:0;">
+
+    <!-- Page header -->
+    <div class="guide-header">
+      <div class="guide-breadcrumb"><a href="dashboard.html">Dashboard</a> / Feature Guide</div>
+      <h1 class="guide-page-title"><i class="fas fa-book-open" style="color:#f97316;margin-right:.5rem;font-size:1.4rem;"></i>UploadM8 Feature Guide</h1>
+      <p class="guide-page-sub">Everything you need to master every feature — from first upload to agency-scale automation.</p>
+    </div>
+
+    <div style="padding:2rem 2.5rem;" id="guideContent">
+
+      <!-- Your plan banner -->
+      <div id="yourPlanBanner">
+        <div style="width:40px;height:40px;background:rgba(249,115,22,.15);border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0;"><i class="fas fa-bolt" style="color:#f97316;"></i></div>
+        <div>
+          <div style="font-size:.85rem;font-weight:600;" id="bannerPlanName">Your plan</div>
+          <div style="font-size:.78rem;color:var(--text-secondary);" id="bannerPlanDetail"></div>
+        </div>
+        <a href="settings.html#billing" style="margin-left:auto;font-size:.78rem;color:#f97316;text-decoration:none;white-space:nowrap;"><i class="fas fa-arrow-up-right-from-square"></i> Manage</a>
+      </div>
+
+      <!-- Plan filter -->
+      <div class="plan-filter" id="planFilter">
+        <button class="plan-btn active" data-tier="all"><i class="fas fa-th"></i> All Plans</button>
+        <button class="plan-btn" data-tier="creator_lite" style="--hc:#f97316;"><i class="fas fa-circle" style="font-size:.55rem;"></i> Lite</button>
+        <button class="plan-btn" data-tier="creator_pro"><i class="fas fa-circle" style="font-size:.55rem;color:#8b5cf6;"></i> Pro</button>
+        <button class="plan-btn" data-tier="studio"><i class="fas fa-circle" style="font-size:.55rem;color:#3b82f6;"></i> Studio</button>
+        <button class="plan-btn" data-tier="agency"><i class="fas fa-circle" style="font-size:.55rem;color:#22c55e;"></i> Agency</button>
+      </div>
+
+      <!-- ════════════ GETTING STARTED ════════════ -->
+      <div class="guide-section" id="gs-upload">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(249,115,22,.12);color:#f97316;"><i class="fas fa-play-circle"></i></div>
+          <div><div class="section-title">Quick Start — First Upload</div><div class="section-sub">From sign-up to live in under 5 minutes</div></div>
+        </div>
+        <div class="feat-card">
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"><i class="fas fa-rocket"></i></div>
+            <div>
+              <div class="feat-card-title">Your first video goes everywhere at once</div>
+              <div class="feat-card-desc">UploadM8 lets you upload a single video file and automatically publish it to TikTok, YouTube Shorts, Instagram Reels, and Facebook Reels simultaneously — no manual re-uploading.</div>
+            </div>
+          </div>
+          <div class="feat-card-body open">
+            <ol class="how-steps">
+              <li><strong>Connect accounts</strong> — Go to <a href="platforms.html" style="color:#f97316;">Connected Accounts</a> and authorize each platform via OAuth. Takes about 60 seconds per platform.</li>
+              <li><strong>Upload a video</strong> — Head to <a href="upload.html" style="color:#f97316;">Upload</a>, drag your file in, choose your platforms, add a caption, and hit Upload.</li>
+              <li><strong>Watch it process</strong> — UploadM8 transcodes, validates, and publishes. Check the <a href="queue.html" style="color:#f97316;">Queue</a> for live status.</li>
+              <li><strong>Check results</strong> — Once done, each platform chip in the Dashboard shows a direct link to your live post.</li>
+            </ol>
+            <div class="tip"><strong>Pro tip:</strong> Your first upload uses PUT tokens from your wallet. Free plans get 60 PUT/month; paid plans get 300–4500. Each upload costs 10+ PUT depending on platforms and features.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ WALLET ════════════ -->
+      <div class="guide-section" id="gs-wallet">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(249,115,22,.12);color:#f97316;"><i class="fas fa-wallet"></i></div>
+          <div><div class="section-title">PUT & AIC Wallet</div><div class="section-sub">Understanding your upload credits and AI credits</div></div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;">⚡</div>
+            <div>
+              <div class="feat-card-title">PUT Tokens — Upload Processing Credits</div>
+              <div class="feat-card-desc">Each upload job costs PUT tokens. They cover the processing, transcoding, and publishing costs. Your wallet refills automatically every billing period.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;">PUT cost per job is deterministic — you always know exactly what you'll spend before uploading:</p>
+            <table class="comp-table">
+              <tr><th>Item</th><th>PUT cost</th></tr>
+              <tr><td>Base (any upload)</td><td><strong>10 PUT</strong></td></tr>
+              <tr><td>Each additional publish target beyond the 1st (platform or account)</td><td><strong>+2 PUT</strong></td></tr>
+              <tr><td>HUD burn-in overlay</td><td><strong>+5 PUT</strong></td></tr>
+              <tr><td>Priority/turbo processing lane</td><td><strong>+5 PUT</strong></td></tr>
+              <tr><td>Each additional thumbnail beyond 1st</td><td><strong>+1 PUT</strong></td></tr>
+            </table>
+            <div class="tip"><strong>Example:</strong> Uploading to 3 publish targets (e.g. 3 platforms or 3 selected accounts) with HUD = 10 + (2×2) + 5 = <strong>19 PUT</strong></div>
+            <div class="note"><strong>Important:</strong> PUT is reserved when you submit an upload, then debited when the job succeeds. If it fails, the hold is released automatically — you don't lose PUT on failures.</div>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;">🤖</div>
+            <div>
+              <div class="feat-card-title">AIC — AI Credits</div>
+              <div class="feat-card-desc">AI Credits fuel every AI-powered feature: caption generation, hashtag suggestions, thumbnail selection, and video analysis. Paid tiers only.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;">AIC cost depends on your plan's AI depth and frame count:</p>
+            <table class="comp-table">
+              <tr><th>AI Depth</th><th>Base AIC</th><th>Who gets it</th></tr>
+              <tr><td>None</td><td>0</td><td>Free</td></tr>
+              <tr><td>Enhanced</td><td>3</td><td>Creator Lite</td></tr>
+              <tr><td>Advanced</td><td>4</td><td>Creator Pro</td></tr>
+              <tr><td>Max</td><td>6</td><td>Studio, Agency</td></tr>
+            </table>
+            <p style="font-size:.78rem;color:var(--text-muted);margin-top:.5rem;">+ frame surcharge: 0 (≤6 frames), +1 (7–12), +2 (13–24)</p>
+            <div class="tip"><strong>Free plan:</strong> No AIC are consumed since AI features are disabled. AIC only matter once you're on a paid plan.</div>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-sync"></i></div>
+            <div>
+              <div class="feat-card-title">Monthly Refills & Top-Ups</div>
+              <div class="feat-card-desc">Your wallet resets to your plan's full allocation every billing period. Need more? Buy top-up packs anytime without changing your plan.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Plan</th><th>PUT / month</th><th>AIC / month</th></tr>
+              <tr><td>Free</td><td>60</td><td>10</td></tr>
+              <tr><td>Creator Lite</td><td>300</td><td>80</td></tr>
+              <tr><td>Creator Pro</td><td>700</td><td>200</td></tr>
+              <tr><td>Studio</td><td>2,000</td><td>600</td></tr>
+              <tr><td>Agency</td><td>4,500</td><td>1,500</td></tr>
+            </table>
+            <div class="note"><strong>Top-ups:</strong> Available in Billing settings. PUT packs from $2.99 (50 PUT) to $29.99 (1000 PUT). AIC packs from $3.99 (100 AIC) to $49.99 (2500 AIC). Top-ups don't expire.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ PLATFORMS ════════════ -->
+      <div class="guide-section" id="gs-platforms">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(59,130,246,.12);color:#3b82f6;"><i class="fas fa-plug"></i></div>
+          <div><div class="section-title">Connecting Platforms</div><div class="section-sub">OAuth authorization for TikTok, YouTube, Instagram & Facebook</div></div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-link"></i></div>
+            <div>
+              <div class="feat-card-title">How platform connections work</div>
+              <div class="feat-card-desc">UploadM8 uses each platform's official OAuth 2.0 flow. You never share passwords — only a scoped token that lets UploadM8 upload on your behalf.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <ol class="how-steps">
+              <li>Go to <a href="platforms.html" style="color:#f97316;">Connected Accounts</a></li>
+              <li>Click <strong>Connect</strong> next to the platform you want</li>
+              <li>You'll be redirected to the platform's login page — sign in and approve access</li>
+              <li>You're redirected back. The account appears in your list with a green status dot</li>
+              <li>Repeat for each account. Multiple accounts per platform allowed on paid plans</li>
+            </ol>
+            <table class="comp-table" style="margin-top:.75rem;">
+              <tr><th>Plan</th><th>Max accounts total</th><th>Per platform</th></tr>
+              <tr><td>Free</td><td>4</td><td>1</td></tr>
+              <tr><td>Creator Lite</td><td>8</td><td>2</td></tr>
+              <tr><td>Creator Pro</td><td>20</td><td>5</td></tr>
+              <tr><td>Studio</td><td>60</td><td>15</td></tr>
+              <tr><td>Agency</td><td>Unlimited</td><td>Unlimited</td></tr>
+            </table>
+            <div class="tip"><strong>Token expiry:</strong> Platform tokens expire periodically. UploadM8 will alert you in the dashboard if a connection needs to be re-authorized.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ UPLOAD SYSTEM ════════════ -->
+      <div class="guide-section" id="feat-upload">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(249,115,22,.12);color:#f97316;"><i class="fas fa-cloud-upload-alt"></i></div>
+          <div><div class="section-title">Upload System</div><div class="section-sub">The full pipeline from file → live post</div></div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"><i class="fas fa-film"></i></div>
+            <div>
+              <div class="feat-card-title">Video processing pipeline</div>
+              <div class="feat-card-desc">Your video goes through a multi-stage pipeline: upload to R2 storage → FFmpeg transcode per platform spec → AI analysis → publish to each platform.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;">Pipeline stages in order:</p>
+            <ol class="how-steps">
+              <li><strong>Presign</strong> — Frontend requests a secure upload URL. Wallet is checked, PUT/AIC is reserved as a hold.</li>
+              <li><strong>R2 Upload</strong> — File goes directly to Cloudflare R2 (never touches the API server).</li>
+              <li><strong>Download to worker</strong> — Worker pulls the file from R2 to local temp storage.</li>
+              <li><strong>FFmpeg transcode</strong> — Video is re-encoded to each platform's required spec (resolution, codec, bitrate, aspect ratio).</li>
+              <li><strong>AI analysis</strong> — If enabled, AI scans keyframes for captions, hashtags, thumbnails.</li>
+              <li><strong>HUD burn-in</strong> — If enabled, overlay is composited onto the video.</li>
+              <li><strong>Publish</strong> — Transcoded versions are uploaded to each connected account via platform APIs.</li>
+              <li><strong>Settle wallet</strong> — On success: hold is captured (PUT/AIC debited). On failure: hold is released (no cost).</li>
+            </ol>
+            <div class="note"><strong>File requirements:</strong> MP4, MOV, AVI, MKV or WebM. Max 4GB. Recommended: 1080×1920 (9:16 portrait) for short-form platforms.</div>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"><i class="fas fa-align-left"></i></div>
+            <div>
+              <div class="feat-card-title">Captions & metadata per platform</div>
+              <div class="feat-card-desc">Write one caption and UploadM8 handles length limits and hashtag rules per platform. Or use AI to auto-generate platform-optimized captions.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Platform</th><th>Caption limit</th><th>Hashtag notes</th></tr>
+              <tr><td>TikTok</td><td>2,200 chars</td><td>Hashtags in body, recommended 3–5</td></tr>
+              <tr><td>YouTube Shorts</td><td>5,000 chars (title: 100)</td><td>#Shorts in title recommended</td></tr>
+              <tr><td>Instagram Reels</td><td>2,200 chars</td><td>Up to 30 hashtags</td></tr>
+              <tr><td>Facebook Reels</td><td>63,206 chars</td><td>Hashtags supported, less algorithmic</td></tr>
+            </table>
+            <div class="tip"><strong>Override per platform:</strong> In the upload form, you can customize the caption for individual platforms if the same text doesn't work everywhere.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ SCHEDULER ════════════ -->
+      <div class="guide-section" id="feat-scheduler">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(251,191,36,.12);color:#fbbf24;"><i class="fas fa-calendar-alt"></i></div>
+          <div>
+            <div class="section-title">Scheduler</div>
+            <div class="section-sub">
+              <span class="tier-badge tb-lite"><i class="fas fa-bolt"></i> Creator Lite+</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(251,191,36,.1);color:#fbbf24;"><i class="fas fa-clock"></i></div>
+            <div>
+              <div class="feat-card-title">Schedule uploads in advance</div>
+              <div class="feat-card-desc">Pick an exact date and time for your upload to go live, or use Smart Scheduling to let UploadM8 choose peak engagement times automatically.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;"><strong>How it works:</strong></p>
+            <ol class="how-steps">
+              <li>In the upload form, toggle <strong>Schedule</strong> on instead of "Upload now"</li>
+              <li>Choose <strong>Fixed time</strong> (specific date/time) or <strong>Smart</strong> (AI picks the optimal slot)</li>
+              <li>Submit — the job enters a <em>staged</em> state and sits in the queue</li>
+              <li>Worker pre-processes the video ahead of the scheduled time (lookahead window)</li>
+              <li>At your chosen time, the publish stage fires automatically</li>
+            </ol>
+            <table class="comp-table">
+              <tr><th>Plan</th><th>Lookahead window</th><th>Queue depth</th></tr>
+              <tr><td>Creator Lite</td><td>12 hours</td><td>500 jobs</td></tr>
+              <tr><td>Creator Pro</td><td>24 hours</td><td>5,000 jobs</td></tr>
+              <tr><td>Studio</td><td>48 hours</td><td>25,000 jobs</td></tr>
+              <tr><td>Agency</td><td>1 week (168h)</td><td>Unlimited</td></tr>
+            </table>
+            <div class="tip"><strong>Lookahead explained:</strong> A 24-hour lookahead means your video is fully transcoded and ready 24 hours before publish time. This prevents delays at the exact publish moment.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ QUEUE ════════════ -->
+      <div class="guide-section" id="feat-queue">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(59,130,246,.12);color:#3b82f6;"><i class="fas fa-list"></i></div>
+          <div><div class="section-title">Job Queue</div><div class="section-sub">Track every upload from pending to published</div></div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-tasks"></i></div>
+            <div>
+              <div class="feat-card-title">Upload statuses explained</div>
+              <div class="feat-card-desc">Every upload moves through a predictable state machine. Knowing each status helps you understand what's happening at any point.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Status</th><th>Meaning</th></tr>
+              <tr><td><span style="color:#fbbf24;">●</span> <strong>staged</strong></td><td>File uploaded, waiting to be processed (scheduled jobs sit here until lookahead window)</td></tr>
+              <tr><td><span style="color:#3b82f6;">●</span> <strong>queued</strong></td><td>Job is in the Redis queue, waiting for a worker slot</td></tr>
+              <tr><td><span style="color:#8b5cf6;">●</span> <strong>processing</strong></td><td>Worker is actively transcoding, running AI, compositing HUD</td></tr>
+              <tr><td><span style="color:#3b82f6;">●</span> <strong>ready_to_publish</strong></td><td>All processing done, waiting for scheduled publish time</td></tr>
+              <tr><td><span style="color:#3b82f6;">●</span> <strong>publishing</strong></td><td>Actively sending to platform APIs</td></tr>
+              <tr><td><span style="color:#22c55e;">●</span> <strong>succeeded</strong></td><td>Published to all requested platforms successfully</td></tr>
+              <tr><td><span style="color:#f97316;">●</span> <strong>partial</strong></td><td>Published to some platforms but at least one failed</td></tr>
+              <tr><td><span style="color:#ef4444;">●</span> <strong>failed</strong></td><td>Could not publish. PUT hold is automatically released.</td></tr>
+              <tr><td><span style="color:#6b7280;">●</span> <strong>cancelled</strong></td><td>You cancelled before publishing. PUT hold released.</td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ GROUPS ════════════ -->
+      <div class="guide-section" id="feat-groups">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(139,92,246,.12);color:#8b5cf6;"><i class="fas fa-layer-group"></i></div>
+          <div><div class="section-title">Account Groups</div><div class="section-sub">Organize accounts into named groups for bulk publishing</div></div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-object-group"></i></div>
+            <div>
+              <div class="feat-card-title">Group multiple accounts for one-click publishing</div>
+              <div class="feat-card-desc">Create groups like "Fitness Brand", "Client A", or "All TikToks" — then select the group in the upload form instead of picking accounts one by one.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <ol class="how-steps">
+              <li>Go to <a href="groups.html" style="color:#f97316;">Account Groups</a> and click <strong>New Group</strong></li>
+              <li>Name your group and add any connected accounts to it</li>
+              <li>In the upload form, choose your group from the platform selector</li>
+              <li>UploadM8 publishes to every account in the group simultaneously</li>
+            </ol>
+            <div class="tip"><strong>Agency use case:</strong> Create one group per client brand. A single upload to the "Client A" group posts to their TikTok, Instagram, YouTube, and Facebook accounts all at once.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ AI ENGINE ════════════ -->
+      <div class="guide-section" id="feat-ai">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(139,92,246,.12);color:#8b5cf6;"><i class="fas fa-robot"></i></div>
+          <div>
+            <div class="section-title">AI Engine</div>
+            <div class="section-sub">
+              <span class="tier-badge tb-lite"><i class="fas fa-bolt"></i> Creator Lite+</span>
+            </div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-brain"></i></div>
+            <div>
+              <div class="feat-card-title">AI caption, hashtag & description generation</div>
+              <div class="feat-card-desc">UploadM8's AI samples keyframes from your video and generates platform-optimized captions, trending hashtags, and descriptions using GPT-4o vision.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;"><strong>How AI analysis works:</strong></p>
+            <ol class="how-steps">
+              <li>FFmpeg extracts keyframes at 5%, 50%, and 95% of your video (anchors — always taken)</li>
+              <li>Additional frames are sampled between anchors up to your plan's max_caption_frames limit</li>
+              <li>Frames + your video title are sent to GPT-4o with platform-specific prompts</li>
+              <li>AI returns captions, hashtag suggestions, and optional descriptions</li>
+              <li>You can edit the AI output before publishing, or auto-accept it</li>
+            </ol>
+            <table class="comp-table">
+              <tr><th>Plan</th><th>AI Depth</th><th>Max Frames</th></tr>
+              <tr><td>Free</td><td>Disabled</td><td>3 (anchors only)</td></tr>
+              <tr><td>Creator Lite</td><td>Enhanced</td><td>5</td></tr>
+              <tr><td>Creator Pro</td><td>Advanced</td><td>8</td></tr>
+              <tr><td>Studio</td><td>Max</td><td>15</td></tr>
+              <tr><td>Agency</td><td>Max</td><td>15</td></tr>
+            </table>
+            <div class="tip"><strong>More frames = better AI:</strong> Higher frame counts give the AI more visual context, improving caption accuracy for fast-cut or visually complex videos.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ HUD ════════════ -->
+      <div class="guide-section" id="feat-hud">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(59,130,246,.12);color:#3b82f6;"><i class="fas fa-film"></i></div>
+          <div>
+            <div class="section-title">HUD Overlay</div>
+            <div class="section-sub">
+              <span class="tier-badge tb-pro"><i class="fas fa-bolt"></i> Creator Pro+</span>
+            </div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-layer-group"></i></div>
+            <div>
+              <div class="feat-card-title">Burn a custom overlay into your video</div>
+              <div class="feat-card-desc">The HUD (Heads-Up Display) lets you composite a branded overlay — logo, username, CTA text, progress bar — directly into your video's pixels before publishing.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <ol class="how-steps">
+              <li>Configure your HUD template in Settings → Video Preferences</li>
+              <li>Toggle "HUD Overlay" on in the upload form</li>
+              <li>The worker composites your overlay using FFmpeg before publishing</li>
+              <li>The burned-in version is what gets published to every platform</li>
+            </ol>
+            <div class="note"><strong>Why burn-in matters:</strong> Platform overlays (like TikTok's UI) can cover your branding. By burning it in before upload, your branding is guaranteed visible at the pixel level regardless of platform chrome.</div>
+            <div class="tip"><strong>Cost:</strong> HUD burn adds +5 PUT per upload. Toggle it per upload — you don't have to use it every time.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ THUMBNAILS ════════════ -->
+      <div class="guide-section" id="feat-thumbnails">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(251,191,36,.12);color:#fbbf24;"><i class="fas fa-image"></i></div>
+          <div><div class="section-title">Thumbnail Generation</div><div class="section-sub">Auto-generated candidate frames from your video</div></div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(251,191,36,.1);color:#fbbf24;"><i class="fas fa-camera"></i></div>
+            <div>
+              <div class="feat-card-title">Smart thumbnail selection</div>
+              <div class="feat-card-desc">UploadM8 extracts multiple candidate frames from your video, scores them for sharpness and visual quality, and auto-selects the best one — or lets you pick manually.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Plan</th><th>Candidate thumbnails</th></tr>
+              <tr><td>Free</td><td>1 (auto only)</td></tr>
+              <tr><td>Creator Lite</td><td>3</td></tr>
+              <tr><td>Creator Pro</td><td>5</td></tr>
+              <tr><td>Studio</td><td>10</td></tr>
+              <tr><td>Agency</td><td>15</td></tr>
+            </table>
+            <div class="tip"><strong>Manual selection:</strong> On paid plans, all candidate frames are stored and you can pick your preferred thumbnail from the upload detail page after processing completes.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ ANALYTICS ════════════ -->
+      <div class="guide-section" id="feat-analytics">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(34,197,94,.12);color:#22c55e;"><i class="fas fa-chart-line"></i></div>
+          <div><div class="section-title">Analytics</div><div class="section-sub">Track views, likes, and engagement across every platform</div></div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-chart-bar"></i></div>
+            <div>
+              <div class="feat-card-title">Cross-platform performance dashboard</div>
+              <div class="feat-card-desc">See views, likes, comments, shares, and saves aggregated across TikTok, YouTube, Instagram, and Facebook in one place. Hit Sync to pull fresh data anytime.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Plan</th><th>Analytics level</th></tr>
+              <tr><td>Free</td><td>Basic — upload count, success rate</td></tr>
+              <tr><td>Creator Lite</td><td>Standard — views, likes, engagement rate</td></tr>
+              <tr><td>Creator Pro</td><td>Full — all metrics + per-platform breakdown</td></tr>
+              <tr><td>Studio / Agency</td><td>Full + export — everything, plus CSV/Excel download</td></tr>
+            </table>
+            <div class="note"><strong>Sync cadence:</strong> Stats aren't polled continuously (that would exhaust API rate limits). Click the Sync button on any upload row to pull the latest stats on demand.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ EXCEL ════════════ -->
+      <div class="guide-section" id="feat-excel">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(34,197,94,.12);color:#22c55e;"><i class="fas fa-file-excel"></i></div>
+          <div>
+            <div class="section-title">Excel Export</div>
+            <div class="section-sub"><span class="tier-badge tb-studio"><i class="fas fa-bolt"></i> Studio+</span></div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-download"></i></div>
+            <div>
+              <div class="feat-card-title">Export analytics to Excel / CSV</div>
+              <div class="feat-card-desc">Download a full report of all your uploads, cross-platform stats, platform results, and engagement data as a formatted Excel file for reporting to clients or your own records.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ WEBHOOKS ════════════ -->
+      <div class="guide-section" id="feat-webhooks">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(249,115,22,.12);color:#f97316;"><i class="fas fa-bell"></i></div>
+          <div>
+            <div class="section-title">Webhooks</div>
+            <div class="section-sub"><span class="tier-badge tb-lite"><i class="fas fa-bolt"></i> Creator Lite+</span></div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"><i class="fas fa-satellite-dish"></i></div>
+            <div>
+              <div class="feat-card-title">Get notified when uploads complete</div>
+              <div class="feat-card-desc">Configure a webhook URL in Settings and UploadM8 will POST a JSON payload to your endpoint every time an upload succeeds, partially succeeds, or fails.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.5rem;">Example webhook payload:</p>
+            <pre style="background:rgba(0,0,0,.3);border:1px solid var(--border-color);border-radius:8px;padding:.875rem;font-size:.76rem;color:#22c55e;overflow-x:auto;white-space:pre-wrap;">{"event":"upload.completed","upload_id":"abc123","status":"succeeded","platforms":["tiktok","youtube"],"put_cost":14,"timestamp":"2025-01-01T12:00:00Z"}</pre>
+            <div class="tip"><strong>Use cases:</strong> Trigger a Zapier workflow, update a Notion database, post to Slack, or update your own CMS when content goes live.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ PLANS COMPARED ════════════ -->
+      <div class="guide-section" id="billing-plans">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(249,115,22,.12);color:#f97316;"><i class="fas fa-credit-card"></i></div>
+          <div><div class="section-title">Plans Compared</div><div class="section-sub">Every feature, every plan, side by side</div></div>
+        </div>
+        <div class="feat-card" style="overflow-x:auto;">
+          <table class="comp-table" style="min-width:580px;">
+            <tr>
+              <th>Feature</th>
+              <th style="color:#9ca3af;">Free</th>
+              <th style="color:#f97316;">Lite<br><span style="font-weight:400;font-size:.7rem;">$9.99/mo</span></th>
+              <th style="color:#8b5cf6;">Pro<br><span style="font-weight:400;font-size:.7rem;">$19.99/mo</span></th>
+              <th style="color:#3b82f6;">Studio<br><span style="font-weight:400;font-size:.7rem;">$49.99/mo</span></th>
+              <th style="color:#22c55e;">Agency<br><span style="font-weight:400;font-size:.7rem;">$99.99/mo</span></th>
+            </tr>
+            <tr><td>PUT / month</td><td>60</td><td>300</td><td>700</td><td>2,000</td><td>4,500</td></tr>
+            <tr><td>AIC / month</td><td>10</td><td>80</td><td>200</td><td>600</td><td>1,500</td></tr>
+            <tr><td>Connected accounts</td><td>4 (1/platform)</td><td>8 (2/platform)</td><td>20 (5/platform)</td><td>60 (15/platform)</td><td>Unlimited</td></tr>
+            <tr><td>Watermark removed</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+            <tr><td>AI captions</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+            <tr><td>Scheduling</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+            <tr><td>HUD overlay</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+            <tr><td>Priority queue</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+            <tr><td>Excel export</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+            <tr><td>White label</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+            <tr><td>Flex transfers</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+            <tr><td>Team seats</td><td>1</td><td>1</td><td>3</td><td>10</td><td>25</td></tr>
+            <tr><td>Queue depth</td><td>25</td><td>500</td><td>5,000</td><td>25,000</td><td>∞</td></tr>
+            <tr><td>7-day free trial</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
+          </table>
+        </div>
+      </div>
+
+      <!-- ════════════ TOP-UPS ════════════ -->
+      <div class="guide-section" id="billing-topup">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(251,191,36,.12);color:#fbbf24;"><i class="fas fa-coins"></i></div>
+          <div><div class="section-title">Top-Up Packs</div><div class="section-sub">Buy extra PUT or AIC without changing your plan</div></div>
+        </div>
+        <div class="feat-card">
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(251,191,36,.1);color:#fbbf24;"><i class="fas fa-plus-circle"></i></div>
+            <div>
+              <div class="feat-card-title">One-time token packs</div>
+              <div class="feat-card-desc">Top-up packs are one-time purchases. They're added to your wallet immediately and don't expire. Perfect for high-output months without upgrading your plan.</div>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1rem;">
+            <div>
+              <div style="font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#f97316;margin-bottom:.6rem;">⚡ PUT Packs</div>
+              <table class="comp-table">
+                <tr><th>Tokens</th><th>Price</th></tr>
+                <tr><td>50 PUT</td><td>$2.99</td></tr>
+                <tr><td>100 PUT</td><td>$4.99</td></tr>
+                <tr><td>250 PUT</td><td>$9.99</td></tr>
+                <tr><td>500 PUT</td><td>$17.99</td></tr>
+                <tr><td>1,000 PUT</td><td>$29.99</td></tr>
+              </table>
+            </div>
+            <div>
+              <div style="font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#8b5cf6;margin-bottom:.6rem;">🤖 AIC Packs</div>
+              <table class="comp-table">
+                <tr><th>Credits</th><th>Price</th></tr>
+                <tr><td>100 AIC</td><td>$3.99</td></tr>
+                <tr><td>250 AIC</td><td>$7.99</td></tr>
+                <tr><td>500 AIC</td><td>$14.99</td></tr>
+                <tr><td>1,000 AIC</td><td>$24.99</td></tr>
+                <tr><td>2,500 AIC</td><td>$49.99</td></tr>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ FLEX ════════════ -->
+      <div class="guide-section" id="billing-flex">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(34,197,94,.12);color:#22c55e;"><i class="fas fa-exchange-alt"></i></div>
+          <div>
+            <div class="section-title">Flex Token Transfers</div>
+            <div class="section-sub"><span class="tier-badge tb-agency"><i class="fas fa-bolt"></i> Agency only</span></div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-random"></i></div>
+            <div>
+              <div class="feat-card-title">Transfer PUT or AIC between accounts</div>
+              <div class="feat-card-desc">Agency plan holders can transfer PUT and AIC tokens to sub-accounts or client workspaces. Ideal for agencies managing multiple brands under one UploadM8 organization.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ PRIORITY QUEUE ════════════ -->
+      <div class="guide-section" id="adv-priority">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(139,92,246,.12);color:#8b5cf6;"><i class="fas fa-bolt"></i></div>
+          <div>
+            <div class="section-title">Priority Queue System</div>
+            <div class="section-sub"><span class="tier-badge tb-pro"><i class="fas fa-bolt"></i> Creator Pro+</span></div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-tachometer-alt"></i></div>
+            <div>
+              <div class="feat-card-title">Your uploads jump the queue</div>
+              <div class="feat-card-desc">Paid tiers on Pro and above are routed to dedicated priority Redis queues. Their jobs are always processed before any free-tier uploads in the system.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Priority Class</th><th>Queue</th><th>Plans</th></tr>
+              <tr><td><strong>p0</strong> — Highest</td><td>process:priority</td><td>Agency, Lifetime, Admin</td></tr>
+              <tr><td><strong>p1</strong></td><td>process:priority</td><td>Studio</td></tr>
+              <tr><td><strong>p2</strong></td><td>process:priority</td><td>Creator Pro</td></tr>
+              <tr><td><strong>p3</strong></td><td>process:normal</td><td>Creator Lite</td></tr>
+              <tr><td><strong>p4</strong> — Lowest</td><td>process:normal</td><td>Free</td></tr>
+            </table>
+            <div class="note"><strong>BRPOP order:</strong> Workers always check <code>process:priority</code> first. The priority queue fully drains before a single normal-queue job is processed. An Agency upload literally jumps every Free-tier upload in the system.</div>
+            <div class="tip"><strong>Cost:</strong> Being on a priority plan adds +5 PUT to your upload cost. This covers the resource premium for guaranteed fast processing.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ WHITE LABEL ════════════ -->
+      <div class="guide-section" id="adv-white-label">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(34,197,94,.12);color:#22c55e;"><i class="fas fa-tag"></i></div>
+          <div>
+            <div class="section-title">White Label</div>
+            <div class="section-sub"><span class="tier-badge tb-agency"><i class="fas fa-bolt"></i> Agency only</span></div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-paint-brush"></i></div>
+            <div>
+              <div class="feat-card-title">Remove UploadM8 branding for clients</div>
+              <div class="feat-card-desc">White label mode removes all UploadM8 watermarks and branding from exported reports, client-facing views, and notification emails — replaced with your agency's logo and name.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ TEAM SEATS ════════════ -->
+      <div class="guide-section" id="adv-team">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(59,130,246,.12);color:#3b82f6;"><i class="fas fa-users"></i></div>
+          <div>
+            <div class="section-title">Team Seats</div>
+            <div class="section-sub"><span class="tier-badge tb-pro"><i class="fas fa-bolt"></i> Creator Pro+</span></div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-user-plus"></i></div>
+            <div>
+              <div class="feat-card-title">Invite teammates to your workspace</div>
+              <div class="feat-card-desc">Team seats let you invite collaborators — editors, social media managers, or virtual assistants — who can upload and manage content under your account.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Plan</th><th>Team seats</th></tr>
+              <tr><td>Free / Creator Lite</td><td>1 (solo only)</td></tr>
+              <tr><td>Creator Pro</td><td>3</td></tr>
+              <tr><td>Studio</td><td>10</td></tr>
+              <tr><td>Agency</td><td>25</td></tr>
+            </table>
+            <div class="tip"><strong>Shared wallet:</strong> All team members draw from the same PUT/AIC wallet. The account owner can see all team activity in the Queue and Analytics.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Bottom CTA -->
+      <div style="background:linear-gradient(135deg,rgba(249,115,22,.08),rgba(139,92,246,.06));border:1px solid rgba(249,115,22,.2);border-radius:14px;padding:2rem;text-align:center;margin-top:1rem;">
+        <div style="font-size:1.25rem;font-weight:700;margin-bottom:.5rem;">Ready to start?</div>
+        <p style="font-size:.88rem;color:var(--text-secondary);margin-bottom:1.5rem;">Connect your first platform and send your first upload in under 5 minutes.</p>
+        <div style="display:flex;gap:.75rem;justify-content:center;flex-wrap:wrap;">
+          <a href="platforms.html" style="display:inline-flex;align-items:center;gap:.5rem;background:linear-gradient(135deg,#f97316,#ea580c);color:#fff;padding:.75rem 1.5rem;border-radius:10px;text-decoration:none;font-weight:600;font-size:.9rem;">
+            <i class="fas fa-plug"></i> Connect Platforms
+          </a>
+          <a href="upload.html" style="display:inline-flex;align-items:center;gap:.5rem;background:transparent;color:var(--text-primary);border:1px solid var(--border-color);padding:.75rem 1.5rem;border-radius:10px;text-decoration:none;font-weight:600;font-size:.9rem;">
+            <i class="fas fa-cloud-upload-alt"></i> Upload a Video
+          </a>
+        </div>
+      </div>
+
+    </div><!-- /guideContent -->
+  </div><!-- /main -->
+</div><!-- /guide-layout -->
+
+<script src="wallet-tokens.js"></script>
+<script src="app.js"></script>
+<script src="auth-core.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', async function() {
+    // Use same auth pattern as all other pages
+    var user = null;
+    try { user = await initApp('guide'); } catch(e) {}
+
+    // Show "your plan" banner if user is loaded
+    if (user && user.subscription_tier) {
+        var tier = user.subscription_tier;
+        var NAMES = { free:'Free', creator_lite:'Creator Lite', launch:'Creator Lite', creator_pro:'Creator Pro', studio:'Studio', agency:'Agency', master_admin:'Admin', lifetime:'Lifetime' };
+        var COLORS= { free:'#9ca3af', creator_lite:'#f97316', launch:'#f97316', creator_pro:'#8b5cf6', studio:'#3b82f6', agency:'#22c55e', master_admin:'#ef4444', lifetime:'#fbbf24' };
+        var puts  = { free:60, creator_lite:300, creator_pro:700, studio:2000, agency:4500 };
+        var aics  = { free:10, creator_lite:80,  creator_pro:200, studio:600,  agency:1500 };
+        var name  = NAMES[tier] || tier;
+        var col   = COLORS[tier] || '#f97316';
+        document.getElementById('bannerPlanName').innerHTML = '<span style="color:'+col+'">'+name+'</span> — Your current plan';
+        var p = puts[tier], a = aics[tier];
+        document.getElementById('bannerPlanDetail').textContent = p ? p.toLocaleString()+' PUT / month · '+a.toLocaleString()+' AIC / month' : 'Unlimited access';
+        var banner = document.getElementById('yourPlanBanner');
+        banner.style.display = 'flex'; banner.classList.add('visible');
+
+        // Pre-select their plan in filter
+        var fBtn = document.querySelector('.plan-btn[data-tier="'+tier+'"]') || document.querySelector('.plan-btn[data-tier="all"]');
+        if (fBtn) { document.querySelectorAll('.plan-btn').forEach(b=>b.classList.remove('active')); fBtn.classList.add('active'); }
+    }
+});
+
+// TOC scroll spy + click
+(function() {
+    var links = document.querySelectorAll('.toc-link[data-target]');
+    links.forEach(function(link) {
+        link.addEventListener('click', function() {
+            var id = this.dataset.target;
+            var el = document.getElementById(id);
+            if (el) { el.scrollIntoView({ behavior:'smooth', block:'start' }); }
+            links.forEach(function(l){l.classList.remove('active');});
+            this.classList.add('active');
+        });
+    });
+
+    // Scroll spy
+    var sections = Array.from(document.querySelectorAll('.guide-section'));
+    window.addEventListener('scroll', function() {
+        var scrollY = window.scrollY + 120;
+        var current = sections.reduce(function(acc, s) {
+            return s.offsetTop <= scrollY ? s : acc;
+        }, sections[0]);
+        if (!current) return;
+        links.forEach(function(l) {
+            l.classList.toggle('active', l.dataset.target === current.id);
+        });
+    });
+})();
+
+// Feature card toggle
+function toggleCard(btn) {
+    var body = btn.closest('.feat-card').querySelector('.feat-card-body');
+    if (!body) return;
+    body.classList.toggle('open');
+    var icon = btn.querySelector('i');
+    if (icon) icon.style.transform = body.classList.contains('open') ? 'rotate(180deg)' : '';
+}
+
+// Plan filter
+document.getElementById('planFilter').addEventListener('click', function(e) {
+    var btn = e.target.closest('.plan-btn');
+    if (!btn) return;
+    document.querySelectorAll('.plan-btn').forEach(function(b){b.classList.remove('active');});
+    btn.classList.add('active');
+    // Could hide/show features by tier — currently shows all
+});
+</script>
+</body>
+</html>

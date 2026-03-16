@@ -1,0 +1,1267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scheduled Uploads - UploadM8</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+
+    <style>
+        /* ── Stats Row ─────────────────────────────── */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+        .stat-card {
+            background: var(--card-bg, white);
+            border-radius: 12px;
+            padding: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            border: 1px solid var(--border-color, #E5E7EB);
+        }
+        .stat-icon {
+            width: 40px; height: 40px; border-radius: 10px;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .stat-icon.pending { background: rgba(249,115,22,0.1); color: #F97316; }
+        .stat-icon.today   { background: rgba(59,130,246,0.1);  color: #3B82F6; }
+        .stat-icon.week    { background: rgba(16,185,129,0.1);  color: #10B981; }
+        .stat-content { display: flex; flex-direction: column; }
+        .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--text-primary, #1F2937); }
+        .stat-label { font-size: 0.75rem; color: var(--text-secondary, #6B7280); text-transform: uppercase; letter-spacing: 0.5px; }
+
+        /* ── View Toggle ────────────────────────────── */
+        .view-toggle { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+        .view-btn {
+            display: flex; align-items: center; gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            border: 1px solid var(--border-color, #E5E7EB);
+            background: var(--card-bg, white);
+            border-radius: 8px; cursor: pointer; transition: all 0.2s;
+            font-size: 0.875rem; font-weight: 500;
+            color: var(--text-primary, #1F2937);
+        }
+        .view-btn:hover { background: var(--hover-bg, #F9FAFB); }
+        .view-btn.active { background: #F97316; color: white; border-color: #F97316; }
+        .view-btn svg { width: 18px; height: 18px; }
+
+        /* ── Calendar ───────────────────────────────── */
+        .calendar-card { padding: 1.5rem; }
+        .calendar-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
+        .calendar-header h3 { flex: 1; text-align: center; margin: 0; font-size: 1.125rem; font-weight: 600; color: var(--text-primary, #1F2937); }
+        .calendar-nav-btn {
+            width: 36px; height: 36px;
+            display: flex; align-items: center; justify-content: center;
+            border: 1px solid var(--border-color, #E5E7EB);
+            background: var(--card-bg, white); border-radius: 8px; cursor: pointer; transition: all 0.2s;
+            color: var(--text-primary, #374151);
+        }
+        .calendar-nav-btn:hover { background: var(--hover-bg, #F9FAFB); }
+        .calendar-grid { display: flex; flex-direction: column; }
+        .calendar-weekdays {
+            display: grid; grid-template-columns: repeat(7,1fr); gap: 4px;
+            font-weight: 600; font-size: 0.75rem; text-transform: uppercase;
+            color: var(--text-secondary, #6B7280);
+            padding-bottom: 0.5rem; border-bottom: 1px solid var(--border-color, #E5E7EB);
+            margin-bottom: 0.5rem; text-align: center;
+        }
+        .calendar-days { display: grid; grid-template-columns: repeat(7,1fr); gap: 4px; }
+        .calendar-day {
+            aspect-ratio: 1; padding: 0.5rem;
+            border: 1px solid var(--border-color, #E5E7EB); border-radius: 8px;
+            min-height: 80px; display: flex; flex-direction: column;
+            cursor: default; transition: all 0.2s;
+            background: var(--card-bg, white); color: var(--text-primary, #374151);
+        }
+        .calendar-day.other-month { color: var(--text-muted, #D1D5DB); background: var(--bg-subtle, #F9FAFB); }
+        .calendar-day.today { background: rgba(249,115,22,0.1); border-color: #F97316; }
+        .calendar-day.today .day-number {
+            background: #F97316; color: white; border-radius: 50%;
+            width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+        }
+        .calendar-day.has-uploads { cursor: pointer; border-color: #F97316; }
+        .calendar-day.has-uploads:hover { background: rgba(249,115,22,0.05); }
+        .day-number { font-weight: 500; font-size: 0.875rem; margin-bottom: 0.25rem; }
+        .day-uploads-preview { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
+        .upload-dot { width: 8px; height: 8px; border-radius: 50%; }
+        .more-count { font-size: 0.625rem; color: var(--text-secondary, #6B7280); margin-left: 2px; }
+
+        /* ── List View ──────────────────────────────── */
+        .scheduled-list { display: flex; flex-direction: column; gap: 1rem; }
+        .list-date-group { border: 1px solid var(--border-color, #E5E7EB); border-radius: 8px; overflow: hidden; }
+        .list-date-header {
+            background: var(--bg-subtle, #F9FAFB); color: var(--text-primary, #374151);
+            padding: 0.75rem 1rem; font-size: 0.875rem; font-weight: 600;
+        }
+        .scheduled-item {
+            display: flex; align-items: center; gap: 1rem; padding: 1rem;
+            border-bottom: 1px solid var(--border-color, #E5E7EB);
+            transition: background 0.2s; cursor: pointer;
+            background: var(--card-bg, white);
+        }
+        .scheduled-item:hover { background: var(--hover-bg, #F9FAFB); }
+        .scheduled-item:last-child { border-bottom: none; }
+        .scheduled-thumb { width: 60px; height: 60px; border-radius: 8px; overflow: hidden; flex-shrink: 0; }
+        .scheduled-thumb img { width: 100%; height: 100%; object-fit: cover; }
+        .thumb-placeholder {
+            width: 100%; height: 100%; background: var(--bg-subtle, #F3F4F6);
+            display: flex; align-items: center; justify-content: center;
+            color: var(--text-muted, #9CA3AF); font-size: 1.5rem;
+        }
+        .scheduled-info { flex: 1; min-width: 0; }
+        .scheduled-title { display: block; font-weight: 500; color: var(--text-primary, #1F2937); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .scheduled-meta { display: flex; align-items: center; gap: 1rem; margin-top: 0.25rem; }
+        .scheduled-time { display: flex; align-items: center; gap: 0.25rem; font-size: 0.875rem; color: var(--text-secondary, #6B7280); }
+        .scheduled-platforms { display: flex; gap: 0.25rem; }
+        .platform-badge {
+            width: 24px; height: 24px; border-radius: 4px;
+            display: inline-flex; align-items: center; justify-content: center;
+            color: white; font-size: 0.75rem;
+        }
+        .scheduled-actions { display: flex; gap: 0.5rem; }
+
+        /* Smart schedule per-platform rows in list view */
+        .smart-schedule-times { margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.25rem; }
+        .smart-time-row {
+            display: flex; align-items: center; gap: 0.5rem;
+            font-size: 0.8rem; color: var(--text-secondary, #6B7280);
+        }
+
+        /* ── Day Popup ──────────────────────────────── */
+        .day-popup-overlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000;
+            display: flex; align-items: center; justify-content: center;
+            opacity: 0; pointer-events: none; transition: opacity 0.2s;
+        }
+        .day-popup-overlay.active { opacity: 1; pointer-events: all; }
+        .day-popup {
+            background: var(--card-bg, white); border-radius: 12px; padding: 1.5rem;
+            width: 90%; max-width: 480px; max-height: 80vh; overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .day-popup-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+        .day-popup-header h4 { margin: 0; font-weight: 600; color: var(--text-primary, #1F2937); }
+        .day-popup-close { background: none; border: none; cursor: pointer; color: var(--text-secondary, #6B7280); font-size: 1.25rem; padding: 0; }
+        .day-popup-item {
+            display: flex; gap: 0.75rem; padding: 0.75rem 0.5rem;
+            border-bottom: 1px solid var(--border-color, #E5E7EB); cursor: pointer; border-radius: 6px;
+        }
+        .day-popup-item:last-child { border-bottom: none; }
+        .day-popup-item:hover { background: var(--hover-bg, #F9FAFB); }
+        .day-popup-thumb { width: 48px; height: 48px; border-radius: 6px; overflow: hidden; flex-shrink: 0; background: var(--bg-subtle, #F3F4F6); display: flex; align-items: center; justify-content: center; color: var(--text-muted, #9CA3AF); }
+        .day-popup-thumb img { width: 100%; height: 100%; object-fit: cover; }
+        .day-popup-info { flex: 1; min-width: 0; }
+        .day-popup-title { font-weight: 500; font-size: 0.875rem; color: var(--text-primary, #1F2937); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .day-popup-meta { font-size: 0.75rem; color: var(--text-secondary, #6B7280); margin-top: 2px; display: flex; gap: 0.5rem; align-items: center; }
+
+        /* ── Empty State ────────────────────────────── */
+        .empty-state {
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; padding: 4rem 2rem; text-align: center;
+        }
+        .empty-state-icon { color: var(--text-muted, #D1D5DB); margin-bottom: 1rem; }
+        .empty-state h3 { margin: 0 0 0.5rem; color: var(--text-primary, #1F2937); }
+        .empty-state p { color: var(--text-secondary, #6B7280); margin: 0 0 1.5rem; }
+
+        /* ── Edit Modal ─────────────────────────────── */
+        .modal {
+            position: fixed; inset: 0; z-index: 2000;
+            background: rgba(0,0,0,0.5);
+            display: flex; align-items: center; justify-content: center;
+            opacity: 0; pointer-events: none; transition: opacity 0.2s;
+        }
+        .modal.active { opacity: 1; pointer-events: all; }
+        .modal-content {
+            background: var(--card-bg, white); border-radius: 12px;
+            width: 90%; max-width: 520px; max-height: 90vh; overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .modal-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border-color, #E5E7EB);
+        }
+        .modal-header h3 { margin: 0; font-weight: 600; color: var(--text-primary, #1F2937); }
+        .modal-close { background: none; border: none; cursor: pointer; color: var(--text-secondary, #6B7280); }
+        .modal-body { padding: 1.5rem; display: flex; flex-direction: column; gap: 1rem; }
+        .modal-footer {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 1rem 1.5rem; border-top: 1px solid var(--border-color, #E5E7EB); gap: 0.75rem;
+        }
+        .modal-footer-right { display: flex; gap: 0.5rem; margin-left: auto; }
+
+        .upload-preview {
+            display: flex; gap: 1rem; padding: 1rem;
+            background: var(--bg-subtle, #F9FAFB); border-radius: 8px;
+        }
+        .preview-thumb {
+            width: 80px; height: 80px; border-radius: 8px; overflow: hidden; flex-shrink: 0;
+            background: var(--bg-subtle, #F3F4F6); display: flex; align-items: center; justify-content: center;
+            color: var(--text-muted, #9CA3AF); font-size: 2rem;
+        }
+        .preview-thumb img { width: 100%; height: 100%; object-fit: cover; }
+        .preview-info { flex: 1; }
+        .preview-title { font-weight: 600; color: var(--text-primary, #1F2937); margin-bottom: 0.25rem; font-size: 0.9rem; }
+        .preview-platforms { display: flex; gap: 0.25rem; flex-wrap: wrap; margin-top: 0.25rem; }
+
+        .form-group { display: flex; flex-direction: column; gap: 0.375rem; }
+        .form-label { font-size: 0.875rem; font-weight: 500; color: var(--text-primary, #374151); }
+        .form-input {
+            padding: 0.5rem 0.75rem; border: 1px solid var(--border-color, #E5E7EB);
+            border-radius: 8px; font-size: 0.875rem; width: 100%;
+            background: var(--input-bg, white); color: var(--text-primary, #1F2937);
+            box-sizing: border-box;
+        }
+        .form-input:focus { outline: none; border-color: #F97316; box-shadow: 0 0 0 2px rgba(249,115,22,0.15); }
+
+        /* Smart schedule editors in modal */
+        .smart-edit-row {
+            display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0;
+            border-bottom: 1px solid var(--border-color, #F3F4F6);
+        }
+        .smart-edit-row:last-child { border-bottom: none; }
+        .smart-edit-platform { display: flex; align-items: center; gap: 0.5rem; width: 110px; flex-shrink: 0; font-size: 0.85rem; color: var(--text-primary, #374151); font-weight: 500; }
+        .smart-edit-input {
+            flex: 1; padding: 0.4rem 0.6rem; border: 1px solid var(--border-color, #E5E7EB);
+            border-radius: 6px; font-size: 0.8rem;
+            background: var(--input-bg, white); color: var(--text-primary, #1F2937);
+        }
+        .smart-edit-input:focus { outline: none; border-color: #F97316; }
+
+        /* Loading spinner */
+        .page-spinner {
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            padding: 4rem 2rem; gap: 1rem; color: var(--text-secondary, #6B7280);
+        }
+        .page-spinner i { font-size: 2rem; color: #F97316; }
+
+        @media (max-width: 640px) {
+            .calendar-day { min-height: 50px; padding: 0.25rem; }
+            .calendar-day .day-number { font-size: 0.75rem; }
+            .stats-row { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+</head>
+<body>
+<div class="app-layout">
+
+    <!-- ── Sidebar ─────────────────────────────────────────── -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <a href="dashboard.html" class="sidebar-logo">
+                <img src="images/logo.png" alt="UploadM8">
+                <span>UploadM8</span>
+            </a>
+        </div>
+        <nav class="sidebar-nav">
+            <div class="nav-section">
+                <div class="nav-section-title">Main</div>
+                <a href="dashboard.html" class="nav-link">
+                    <i class="fas fa-home"></i><span>Dashboard</span>
+                </a>
+                <a href="upload.html" class="nav-link">
+                    <i class="fas fa-cloud-upload-alt"></i><span>Upload</span>
+                </a>
+                <a href="queue.html" class="nav-link">
+                    <i class="fas fa-list"></i><span>Queue</span>
+                </a>
+                <a href="scheduled.html" class="nav-link active">
+                    <i class="fas fa-calendar-alt"></i><span>Scheduled</span>
+                </a>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">Platforms</div>
+                <a href="platforms.html" class="nav-link">
+                    <i class="fas fa-plug"></i><span>Connected Accounts</span>
+                </a>
+                <a href="groups.html" class="nav-link">
+                    <i class="fas fa-layer-group"></i><span>Account Groups</span>
+                </a>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">Insights</div>
+                <a href="analytics.html" class="nav-link">
+                    <i class="fas fa-chart-line"></i><span>Analytics</span>
+                </a>
+            </div>
+            <div class="nav-section admin-only" id="adminSection" style="display:none;">
+                <div class="nav-section-title">Admin</div>
+                <a href="admin.html" class="nav-link">
+                    <i class="fas fa-cog"></i><span>Admin Panel</span>
+                </a>
+                <a href="admin-users.html" class="nav-link">
+                    <i class="fas fa-users"></i><span>User Management</span>
+                </a>
+                <a href="admin-kpi.html" class="nav-link">
+                    <i class="fas fa-chart-bar"></i><span>KPI Dashboard</span>
+                </a>
+                <a href="admin-calculator.html" class="nav-link">
+                    <i class="fas fa-calculator"></i><span>Biz Calculator</span>
+                </a>
+            </div>
+            <div class="nav-section">
+                <div class="nav-section-title">Account</div>
+                <a href="settings.html" class="nav-link">
+                    <i class="fas fa-sliders-h"></i><span>Settings</span>
+                </a>
+            </div>
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="user-info">
+                <div class="user-avatar" id="userAvatar">U</div>
+                <div class="user-details">
+                    <div class="user-name" id="userName">Loading...</div>
+                    <div class="user-tier" id="userTier">Free</div>
+                </div>
+                <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
+                    <i class="fas fa-sign-out-alt"></i>
+                </button>
+            </div>
+        </div>
+    </aside>
+
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+
+    <!-- ── Main Content ────────────────────────────────────── -->
+    <main class="main-content">
+
+        <!-- Top Bar -->
+        <header class="top-bar">
+            <button class="menu-toggle" id="menuToggle">
+                <i class="fas fa-bars"></i>
+            </button>
+            <div class="top-bar-logo">
+                <img src="images/logo.png" alt="UploadM8"><span>UploadM8</span>
+            </div>
+            <div class="top-bar-actions">
+                <a href="upload.html" class="btn btn-primary btn-sm">
+                    <i class="fas fa-plus"></i> Schedule Upload
+                </a>
+                <button class="btn btn-secondary btn-sm" onclick="refreshData()" id="refreshBtn" title="Refresh">
+                    <i class="fas fa-sync-alt"></i>
+                </button>
+                <button id="themeToggle" class="btn btn-ghost btn-icon" title="Toggle theme">
+                    <i class="fas fa-moon" id="themeToggleIcon"></i>
+                </button>
+            </div>
+        </header>
+
+        <!-- Loading state — shown while fetching, then swapped out -->
+        <div id="loadingState" class="page-spinner">
+            <i class="fas fa-spinner fa-spin"></i>
+            <span>Loading your schedule...</span>
+        </div>
+
+        <!-- Page content — hidden until data loads -->
+        <div id="pageContent" style="display:none;">
+
+            <!-- Stats Cards -->
+            <div class="stats-row">
+                <div class="stat-card">
+                    <div class="stat-icon pending"><i class="fas fa-clock"></i></div>
+                    <div class="stat-content">
+                        <span class="stat-value" id="pendingCount">0</span>
+                        <span class="stat-label">Pending</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon today"><i class="fas fa-calendar-day"></i></div>
+                    <div class="stat-content">
+                        <span class="stat-value" id="todayCount">0</span>
+                        <span class="stat-label">Today</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon week"><i class="fas fa-calendar-week"></i></div>
+                    <div class="stat-content">
+                        <span class="stat-value" id="weekCount">0</span>
+                        <span class="stat-label">This Week</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- View Toggle -->
+            <div class="view-toggle">
+                <button class="view-btn active" data-view="calendar" onclick="setView('calendar')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="4" width="18" height="18" rx="2"/>
+                        <line x1="16" y1="2" x2="16" y2="6"/>
+                        <line x1="8" y1="2" x2="8" y2="6"/>
+                        <line x1="3" y1="10" x2="21" y2="10"/>
+                    </svg>
+                    Calendar
+                </button>
+                <button class="view-btn" data-view="list" onclick="setView('list')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="8" y1="6" x2="21" y2="6"/>
+                        <line x1="8" y1="12" x2="21" y2="12"/>
+                        <line x1="8" y1="18" x2="21" y2="18"/>
+                        <line x1="3" y1="6" x2="3.01" y2="6"/>
+                        <line x1="3" y1="12" x2="3.01" y2="12"/>
+                        <line x1="3" y1="18" x2="3.01" y2="18"/>
+                    </svg>
+                    List
+                </button>
+            </div>
+
+            <!-- Calendar View (hidden until setView is called) -->
+            <div class="card calendar-card" id="calendarView" style="display:none;">
+                <div class="calendar-header">
+                    <button class="calendar-nav-btn" onclick="changeMonth(-1)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="15 18 9 12 15 6"/>
+                        </svg>
+                    </button>
+                    <h3 id="calendarTitle">Loading...</h3>
+                    <button class="calendar-nav-btn" onclick="changeMonth(1)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="9 18 15 12 9 6"/>
+                        </svg>
+                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="goToToday()">Today</button>
+                </div>
+                <div class="calendar-grid">
+                    <div class="calendar-weekdays">
+                        <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span>
+                        <span>Thu</span><span>Fri</span><span>Sat</span>
+                    </div>
+                    <div class="calendar-days" id="calendarDays"></div>
+                </div>
+            </div>
+
+            <!-- List View -->
+            <div class="card" id="listView" style="display:none;">
+                <div class="card-header">
+                    <h3>Upcoming Uploads</h3>
+                    <div class="header-actions">
+                        <select id="listFilter" class="form-select form-select-sm" onchange="filterList()">
+                            <option value="all">All Platforms</option>
+                            <option value="tiktok">TikTok</option>
+                            <option value="youtube">YouTube</option>
+                            <option value="instagram">Instagram</option>
+                            <option value="facebook">Facebook</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="scheduled-list" id="scheduledList"></div>
+            </div>
+
+            <!-- Empty State -->
+            <div class="empty-state" id="emptyState" style="display:none;">
+                <div class="empty-state-icon">
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <rect x="3" y="4" width="18" height="18" rx="2"/>
+                        <line x1="16" y1="2" x2="16" y2="6"/>
+                        <line x1="8" y1="2" x2="8" y2="6"/>
+                        <line x1="3" y1="10" x2="21" y2="10"/>
+                    </svg>
+                </div>
+                <h3>No Scheduled Uploads</h3>
+                <p>Schedule your first upload to start managing your content calendar</p>
+                <a href="upload.html" class="btn btn-primary">Schedule Upload</a>
+            </div>
+
+        </div><!-- /pageContent -->
+    </main>
+</div><!-- /app-layout -->
+
+<!-- ── Day Uploads Popup ─────────────────────────────────── -->
+<div class="day-popup-overlay" id="dayPopup">
+    <div class="day-popup" onclick="event.stopPropagation()">
+        <div class="day-popup-header">
+            <h4 id="dayPopupTitle">Uploads</h4>
+            <button class="day-popup-close" onclick="closeDayPopup()">&times;</button>
+        </div>
+        <div id="dayPopupList"></div>
+    </div>
+</div>
+
+<!-- ── Edit Modal ────────────────────────────────────────── -->
+<div class="modal" id="editModal">
+    <div class="modal-content" onclick="event.stopPropagation()">
+        <div class="modal-header">
+            <h3 id="modalTitle">Edit Scheduled Upload</h3>
+            <button class="modal-close" onclick="closeEditModal()">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="18" y1="6" x2="6" y2="18"/>
+                    <line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+            </button>
+        </div>
+        <div class="modal-body">
+
+            <!-- Upload preview strip -->
+            <div class="upload-preview">
+                <div class="preview-thumb" id="previewThumb">
+                    <i class="fas fa-video" id="previewIcon"></i>
+                    <img id="previewImage" src="" alt="" style="display:none; width:100%; height:100%; object-fit:cover;">
+                </div>
+                <div class="preview-info">
+                    <div class="preview-title" id="previewTitle"></div>
+                    <div class="preview-platforms" id="previewPlatforms"></div>
+                </div>
+            </div>
+
+            <!-- Title -->
+            <div class="form-group">
+                <label class="form-label" for="editTitle">Title</label>
+                <input type="text" id="editTitle" class="form-input" placeholder="Video title">
+            </div>
+
+            <!-- Regular schedule fields -->
+            <div id="regularScheduleSection">
+                <div class="form-group">
+                    <label class="form-label" for="editDateTime">Scheduled Time</label>
+                    <input type="datetime-local" id="editDateTime" class="form-input">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="editTimezone">Timezone</label>
+                    <select id="editTimezone" class="form-input">
+                        <option value="America/New_York">Eastern Time (ET)</option>
+                        <option value="America/Chicago">Central Time (CT)</option>
+                        <option value="America/Denver">Mountain Time (MT)</option>
+                        <option value="America/Los_Angeles">Pacific Time (PT)</option>
+                        <option value="UTC">UTC</option>
+                        <option value="Europe/London">London (GMT/BST)</option>
+                        <option value="Europe/Paris">Paris (CET)</option>
+                        <option value="Asia/Tokyo">Tokyo (JST)</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Smart schedule per-platform editors -->
+            <div id="smartScheduleSection" style="display:none;">
+                <div class="form-group">
+                    <label class="form-label">Per-Platform Schedule</label>
+                    <div id="smartScheduleEditors"></div>
+                </div>
+            </div>
+
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-danger btn-sm" onclick="cancelScheduledUpload()">
+                <i class="fas fa-trash"></i> Cancel Upload
+            </button>
+            <div class="modal-footer-right">
+                <button class="btn btn-secondary" onclick="closeEditModal()">Discard</button>
+                <button class="btn btn-primary" onclick="saveScheduledUpload()" id="saveBtn">
+                    <i class="fas fa-save"></i> Save Changes
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Scripts -->
+<script src="wallet-tokens.js"></script>
+<script src="app.js"></script>
+<script>
+// ============================================================
+// STATE
+// ============================================================
+let scheduledUploads = [];
+let currentDate      = new Date();
+let currentView      = 'calendar';
+let selectedUploadId = null;
+let selectedUpload   = null;
+let userColors = {
+    tiktok: '#000000', youtube: '#FF0000',
+    instagram: '#E4405F', facebook: '#1877F2', accent: '#F97316'
+};
+
+// ============================================================
+// TIMEOUT HELPER — prevents a single slow API call from
+// keeping the entire page stuck on the spinner forever
+// ============================================================
+function withTimeout(promise, ms = 12000) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Request timed out after ' + ms + 'ms')), ms)
+        )
+    ]);
+}
+
+// ============================================================
+// INIT — non-blocking bootstrap:
+//   1. Reveal page shell immediately after initApp()
+//   2. Fire data calls independently — one slow endpoint
+//      never blocks another or keeps the spinner up
+// ============================================================
+document.addEventListener('DOMContentLoaded', async () => {
+    const _loadingEl = document.getElementById('loadingState');
+
+    function _showLoadError(msg) {
+        if (!_loadingEl) return;
+        _loadingEl.innerHTML =
+            '<i class="fas fa-exclamation-triangle" style="color:#ef4444;font-size:2rem;"></i>' +
+            '<span style="color:var(--text-secondary)">' + msg + '</span>' +
+            '<button onclick="location.reload()" class="btn btn-primary btn-sm" style="margin-top:.5rem;">' +
+            '<i class="fas fa-redo"></i> Retry</button>';
+    }
+
+    // Hard timeout — if initApp hangs for any reason, show error and let user retry
+    const _initTimeout = setTimeout(() => {
+        console.error('[Scheduled] initApp timed out after 20s');
+        _showLoadError('Loading timed out. Check your connection.');
+    }, 20000);
+
+    try {
+        const user = await initApp('scheduled');
+        clearTimeout(_initTimeout);
+
+        if (!user) {
+            // checkAuth handles redirect to login; if still here show a message
+            _showLoadError('Could not verify your session. <a href="login.html" style="color:#f97316;">Log in</a>');
+            return;
+        }
+
+        // Reveal shell immediately — data loads independently below
+        _loadingEl.style.display = 'none';
+        document.getElementById('pageContent').style.display = 'block';
+
+        setupModalHandlers();
+
+        // Fire independently — a slow/failing endpoint never blocks the others
+        loadColorPreferences().catch(e => console.warn('[Scheduled] colors unavailable:', e));
+        loadScheduledStats().catch(e => console.error('[Scheduled] stats failed:', e));
+        loadScheduledUploads().catch(e => {
+            console.error('[Scheduled] uploads failed:', e);
+            _showScheduledEmpty();
+        });
+
+    } catch (err) {
+        clearTimeout(_initTimeout);
+        console.error('[Scheduled] init failed:', err);
+        _showLoadError('Page failed to load. ' + (err.message || '') + ' <a href="javascript:location.reload()" style="color:#f97316;">Retry</a>');
+    }
+});
+
+function setupModalHandlers() {
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        const edit = document.getElementById('editModal');
+        if (edit && edit.classList.contains('active')) closeEditModal();
+        const day  = document.getElementById('dayPopup');
+        if (day  && day.classList.contains('active'))  closeDayPopup();
+    });
+    // Clicking outside modal content closes it
+    document.getElementById('editModal').addEventListener('click', (e) => {
+        if (e.target.id === 'editModal') closeEditModal();
+    });
+    document.getElementById('dayPopup').addEventListener('click', (e) => {
+        if (e.target.id === 'dayPopup') closeDayPopup();
+    });
+}
+
+// ============================================================
+// REFRESH BUTTON
+// ============================================================
+async function refreshData() {
+    const btn = document.getElementById('refreshBtn');
+    const icon = btn ? btn.querySelector('i') : null;
+    if (btn) btn.disabled = true;
+    if (icon) icon.classList.add('fa-spin');
+    try {
+        await Promise.all([loadScheduledStats(), loadScheduledUploads()]);
+    } finally {
+        if (btn) btn.disabled = false;
+        if (icon) icon.classList.remove('fa-spin');
+    }
+}
+
+// ============================================================
+// DATA LOADING
+// FIX: apiCall() in app.js ALREADY returns parsed JSON.
+//      Never call .json() on the result — that throws TypeError
+//      which kills the entire DOMContentLoaded block silently.
+// ============================================================
+async function loadColorPreferences() {
+    try {
+        const colors = await apiCall('/api/colors');   // parsed object, not Response
+        userColors = {
+            tiktok:    colors.tiktok_color    || '#000000',
+            youtube:   colors.youtube_color   || '#FF0000',
+            instagram: colors.instagram_color || '#E4405F',
+            facebook:  colors.facebook_color  || '#1877F2',
+            accent:    colors.accent_color    || '#F97316'
+        };
+    } catch (err) {
+        console.warn('Color prefs unavailable, using defaults:', err);
+    }
+}
+
+async function loadScheduledStats() {
+    try {
+        const stats = await withTimeout(apiCall('/api/scheduled/stats'));
+        document.getElementById('pendingCount').textContent = stats.pending ?? 0;
+        document.getElementById('todayCount').textContent   = stats.today   ?? 0;
+        document.getElementById('weekCount').textContent    = stats.week    ?? 0;
+    } catch (err) {
+        console.error('Failed to load stats:', err);
+        ['pendingCount','todayCount','weekCount'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = '0';
+        });
+    }
+}
+
+async function loadScheduledUploads() {
+    try {
+        const data = await withTimeout(apiCall('/api/scheduled/list'));
+        scheduledUploads = Array.isArray(data) ? data : (data.uploads || []);
+
+        if (scheduledUploads.length === 0) {
+            _showScheduledEmpty();
+        } else {
+            _hideScheduledEmpty();
+            setView(currentView);
+        }
+    } catch (err) {
+        console.error('Failed to load scheduled uploads:', err);
+        scheduledUploads = [];
+        _showScheduledEmpty();
+    }
+}
+
+// ============================================================
+// EMPTY / CONTENT STATE
+// ============================================================
+function _showScheduledEmpty() {
+    document.getElementById('emptyState').style.display   = 'flex';
+    document.getElementById('calendarView').style.display = 'none';
+    document.getElementById('listView').style.display     = 'none';
+}
+
+function _hideScheduledEmpty() {
+    document.getElementById('emptyState').style.display = 'none';
+}
+
+// ============================================================
+// VIEW TOGGLE
+// ============================================================
+function setView(view) {
+    currentView = view;
+    document.querySelectorAll('.view-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.view === view);
+    });
+
+    if (scheduledUploads.length === 0) { _showScheduledEmpty(); return; }
+
+    _hideScheduledEmpty();
+
+    if (view === 'calendar') {
+        document.getElementById('calendarView').style.display = 'block';
+        document.getElementById('listView').style.display     = 'none';
+        renderCalendar();
+    } else {
+        document.getElementById('calendarView').style.display = 'none';
+        document.getElementById('listView').style.display     = 'block';
+        renderList();
+    }
+}
+
+// ============================================================
+// CALENDAR
+// ============================================================
+function changeMonth(delta) {
+    currentDate.setMonth(currentDate.getMonth() + delta);
+    renderCalendar();
+}
+
+function goToToday() {
+    currentDate = new Date();
+    renderCalendar();
+}
+
+function renderCalendar() {
+    const year  = currentDate.getFullYear();
+    const month = currentDate.getMonth();
+
+    document.getElementById('calendarTitle').textContent =
+        currentDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+
+    const firstDay     = new Date(year, month, 1).getDay();
+    const daysInMonth  = new Date(year, month + 1, 0).getDate();
+    const daysInPrevMo = new Date(year, month, 0).getDate();
+    const container    = document.getElementById('calendarDays');
+    container.innerHTML = '';
+
+    // Filler days from previous month
+    for (let i = firstDay - 1; i >= 0; i--) {
+        container.appendChild(createDayElement(daysInPrevMo - i, 'other-month', null, []));
+    }
+
+    // Current month days
+    const today = new Date();
+    for (let day = 1; day <= daysInMonth; day++) {
+        const date    = new Date(year, month, day);
+        const isToday = date.toDateString() === today.toDateString();
+        const uploads = getUploadsForDate(date);
+        container.appendChild(createDayElement(day, isToday ? 'today' : '', date, uploads));
+    }
+
+    // Filler to complete last row
+    const filled    = container.childElementCount;
+    const remaining = filled % 7 === 0 ? 0 : 7 - (filled % 7);
+    for (let i = 1; i <= remaining; i++) {
+        container.appendChild(createDayElement(i, 'other-month', null, []));
+    }
+}
+
+function createDayElement(day, cssClass, date, uploads) {
+    const dayEl = document.createElement('div');
+    dayEl.className = `calendar-day ${cssClass || ''}`.trim();
+    if (uploads && uploads.length > 0) dayEl.classList.add('has-uploads');
+
+    const numEl = document.createElement('div');
+    numEl.className = 'day-number';
+    numEl.textContent = day;
+    dayEl.appendChild(numEl);
+
+    if (uploads && uploads.length > 0) {
+        const preview = document.createElement('div');
+        preview.className = 'day-uploads-preview';
+
+        uploads.slice(0, 3).forEach(u => {
+            const dot = document.createElement('div');
+            dot.className = 'upload-dot';
+            dot.style.background = getPlatformColor((u.platforms || [])[0] || '');
+            preview.appendChild(dot);
+        });
+        if (uploads.length > 3) {
+            const more = document.createElement('span');
+            more.className = 'more-count';
+            more.textContent = `+${uploads.length - 3}`;
+            preview.appendChild(more);
+        }
+        dayEl.appendChild(preview);
+
+        dayEl.addEventListener('click', () => showDayPopup(date, uploads));
+    }
+
+    return dayEl;
+}
+
+// FIX: also match smart_schedule per-platform dates — not just scheduled_time
+function getUploadsForDate(date) {
+    return scheduledUploads.filter(upload => {
+        // Check primary scheduled_time
+        if (upload.scheduled_time) {
+            const d = new Date(upload.scheduled_time);
+            if (!isNaN(d) && d.toDateString() === date.toDateString()) return true;
+        }
+        // Check smart_schedule dict — each platform has its own datetime
+        const sm = upload.smart_schedule || upload.schedule_metadata;
+        if (sm && typeof sm === 'object') {
+            for (const val of Object.values(sm)) {
+                if (!val) continue;
+                const d = new Date(val);
+                if (!isNaN(d) && d.toDateString() === date.toDateString()) return true;
+            }
+        }
+        return false;
+    });
+}
+
+// ── Day popup (click on calendar day with uploads) ───────────
+function showDayPopup(date, uploads) {
+    const popup   = document.getElementById('dayPopup');
+    const listEl  = document.getElementById('dayPopupList');
+    const titleEl = document.getElementById('dayPopupTitle');
+
+    const label = date.toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
+    titleEl.textContent = `${label} — ${uploads.length} upload${uploads.length !== 1 ? 's' : ''}`;
+
+    listEl.innerHTML = '';
+    uploads.forEach(upload => {
+        const timeStr = getBestTimeForDate(upload, date);
+        const item = document.createElement('div');
+        item.className = 'day-popup-item';
+        item.onclick = () => { closeDayPopup(); openEditModal(upload.id); };
+        item.innerHTML = `
+            <div class="day-popup-thumb">
+                ${upload.thumbnail
+                    ? `<img src="${upload.thumbnail}" alt="">`
+                    : `<i class="fas fa-video"></i>`}
+            </div>
+            <div class="day-popup-info">
+                <div class="day-popup-title">${upload.title || 'Untitled'}</div>
+                <div class="day-popup-meta">
+                    <span><i class="fas fa-clock"></i> ${timeStr}</span>
+                    <span>${(upload.platforms || []).map(p => _scheduledPlatformBadge(p)).join('')}</span>
+                </div>
+            </div>
+        `;
+        listEl.appendChild(item);
+    });
+
+    popup.classList.add('active');
+}
+
+function closeDayPopup() {
+    document.getElementById('dayPopup').classList.remove('active');
+}
+
+function getBestTimeForDate(upload, date) {
+    const sm = upload.smart_schedule || upload.schedule_metadata;
+    if (sm && typeof sm === 'object') {
+        for (const [plat, val] of Object.entries(sm)) {
+            if (!val) continue;
+            const d = new Date(val);
+            if (!isNaN(d) && d.toDateString() === date.toDateString()) {
+                return d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' }) + ` (${plat})`;
+            }
+        }
+    }
+    if (upload.scheduled_time) {
+        const d = new Date(upload.scheduled_time);
+        if (!isNaN(d)) return d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' });
+    }
+    return 'Time TBD';
+}
+
+// ============================================================
+// LIST VIEW
+// ============================================================
+function renderList(filterPlatform) {
+    const listEl = document.getElementById('scheduledList');
+    listEl.innerHTML = '';
+
+    let data = [...scheduledUploads];
+    if (filterPlatform && filterPlatform !== 'all') {
+        data = data.filter(u => (u.platforms || []).includes(filterPlatform));
+    }
+
+    if (data.length === 0) {
+        listEl.innerHTML = `<div style="padding:2rem;text-align:center;color:var(--text-secondary,#6B7280);">No uploads match this filter.</div>`;
+        return;
+    }
+
+    const grouped = groupUploadsByDate(data);
+    for (const [dateStr, uploads] of Object.entries(grouped)) {
+        const date = new Date(dateStr);
+        const group = document.createElement('div');
+        group.className = 'list-date-group';
+        group.innerHTML = `
+            <div class="list-date-header"><strong>${formatDateHeader(date)}</strong></div>
+            ${uploads.map(u => createListItem(u)).join('')}
+        `;
+        listEl.appendChild(group);
+    }
+}
+
+function groupUploadsByDate(uploads) {
+    const grouped = {};
+    uploads.forEach(upload => {
+        // Use earliest date from smart_schedule or scheduled_time
+        let dateStr = null;
+        const sm = upload.smart_schedule || upload.schedule_metadata;
+        if (sm && typeof sm === 'object') {
+            const dates = Object.values(sm)
+                .filter(Boolean)
+                .map(d => new Date(d))
+                .filter(d => !isNaN(d));
+            if (dates.length) dateStr = new Date(Math.min(...dates)).toDateString();
+        }
+        if (!dateStr && upload.scheduled_time) {
+            dateStr = new Date(upload.scheduled_time).toDateString();
+        }
+        if (!dateStr) dateStr = 'Unscheduled';
+        if (!grouped[dateStr]) grouped[dateStr] = [];
+        grouped[dateStr].push(upload);
+    });
+    return grouped;
+}
+
+function createListItem(upload) {
+    const timeStr = upload.scheduled_time
+        ? new Date(upload.scheduled_time).toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' })
+        : 'Smart Schedule';
+
+    const sm = upload.smart_schedule || upload.schedule_metadata;
+    let smartHtml = '';
+    if (sm && typeof sm === 'object' && Object.keys(sm).length > 0) {
+        const rows = Object.entries(sm).map(([plat, dt]) => {
+            if (!dt) return '';
+            const d = new Date(dt);
+            const label = isNaN(d) ? dt
+                : d.toLocaleDateString('en-US', { month:'short', day:'numeric' })
+                  + ' ' + d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit' });
+            return `<div class="smart-time-row">${_scheduledPlatformBadge(plat)}<span>${label}</span></div>`;
+        }).join('');
+        if (rows) smartHtml = `<div class="smart-schedule-times">${rows}</div>`;
+    }
+
+    return `
+        <div class="scheduled-item" onclick="openEditModal('${upload.id}')">
+            <div class="scheduled-thumb">
+                ${upload.thumbnail
+                    ? `<img src="${upload.thumbnail}" alt="">`
+                    : `<div class="thumb-placeholder"><i class="fas fa-video"></i></div>`}
+            </div>
+            <div class="scheduled-info">
+                <span class="scheduled-title">${upload.title || 'Untitled'}</span>
+                <div class="scheduled-meta">
+                    <div class="scheduled-time"><i class="fas fa-clock"></i><span>${timeStr}</span></div>
+                    <div class="scheduled-platforms">${(upload.platforms||[]).map(p => _scheduledPlatformBadge(p)).join('')}</div>
+                </div>
+                ${smartHtml}
+            </div>
+            <div class="scheduled-actions">
+                <button class="btn btn-icon btn-secondary" onclick="event.stopPropagation(); openEditModal('${upload.id}')" title="Edit">
+                    <i class="fas fa-edit"></i>
+                </button>
+            </div>
+        </div>
+    `;
+}
+
+function filterList() {
+    renderList(document.getElementById('listFilter').value);
+}
+
+function formatDateHeader(date) {
+    const today    = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (date.toDateString() === today.toDateString())    return 'Today';
+    if (date.toDateString() === tomorrow.toDateString()) return 'Tomorrow';
+    return date.toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric' });
+}
+
+// ============================================================
+// EDIT MODAL
+// ============================================================
+async function openEditModal(uploadId) {
+    let upload = scheduledUploads.find(u => u.id === uploadId);
+    if (!upload) return;
+
+    // Fetch fresh detail (gets smart_schedule, hashtags, full data)
+    try {
+        const fresh = await apiCall(`/api/scheduled/${uploadId}`);
+        upload = { ...upload, ...fresh };
+    } catch (err) {
+        console.warn('Could not refresh upload detail, using cached copy:', err);
+    }
+
+    selectedUploadId = uploadId;
+    selectedUpload   = upload;
+
+    const isSmartMode = upload.schedule_mode === 'smart';
+
+    document.getElementById('modalTitle').textContent = isSmartMode
+        ? 'Edit Smart Schedule'
+        : 'Edit Scheduled Upload';
+
+    // Title
+    document.getElementById('editTitle').value    = upload.title || '';
+    document.getElementById('editTimezone').value = upload.timezone || 'America/Chicago';
+
+    // Thumbnail preview
+    const previewThumb = document.getElementById('previewThumb');
+    const previewImage = document.getElementById('previewImage');
+    const previewIcon  = document.getElementById('previewIcon');
+    if (upload.thumbnail) {
+        previewImage.src = upload.thumbnail;
+        previewImage.style.display = 'block';
+        if (previewIcon) previewIcon.style.display = 'none';
+        previewImage.onerror = () => {
+            previewImage.style.display = 'none';
+            if (previewIcon) previewIcon.style.display = '';
+        };
+    } else {
+        previewImage.style.display = 'none';
+        if (previewIcon) previewIcon.style.display = '';
+    }
+
+    document.getElementById('previewTitle').textContent = upload.title || 'Untitled';
+    document.getElementById('previewPlatforms').innerHTML =
+        (upload.platforms || []).map(p => _scheduledPlatformBadge(p)).join('');
+
+    // Show correct fields
+    document.getElementById('regularScheduleSection').style.display = isSmartMode ? 'none' : 'block';
+    document.getElementById('smartScheduleSection').style.display   = isSmartMode ? 'block' : 'none';
+
+    if (isSmartMode) {
+        buildSmartEditors(upload);
+    } else {
+        if (upload.scheduled_time) {
+            const d   = new Date(upload.scheduled_time);
+            const pad = n => String(n).padStart(2, '0');
+            document.getElementById('editDateTime').value =
+                `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        } else {
+            document.getElementById('editDateTime').value = '';
+        }
+    }
+
+    document.getElementById('editModal').classList.add('active');
+}
+
+function buildSmartEditors(upload) {
+    const container = document.getElementById('smartScheduleEditors');
+    container.innerHTML = '';
+
+    const sm        = upload.smart_schedule || upload.schedule_metadata || {};
+    const platforms = upload.platforms || [];
+    // Show all platforms in the upload, fill from sm if available
+    const allPlats  = Array.from(new Set([...Object.keys(sm), ...platforms]));
+
+    allPlats.forEach(plat => {
+        const existingDt = sm[plat];
+        let inputVal = '';
+        if (existingDt) {
+            const d = new Date(existingDt);
+            if (!isNaN(d)) {
+                const pad = n => String(n).padStart(2,'0');
+                inputVal = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+            }
+        }
+        const row = document.createElement('div');
+        row.className = 'smart-edit-row';
+        row.innerHTML = `
+            <div class="smart-edit-platform">
+                ${_scheduledPlatformBadge(plat)}
+                <span>${plat.charAt(0).toUpperCase() + plat.slice(1)}</span>
+            </div>
+            <input type="datetime-local" class="smart-edit-input" data-platform="${plat}" value="${inputVal}">
+        `;
+        container.appendChild(row);
+    });
+}
+
+function closeEditModal() {
+    document.getElementById('editModal').classList.remove('active');
+    selectedUploadId = null;
+    selectedUpload   = null;
+}
+
+// ============================================================
+// SAVE — FIX: correct endpoint per schedule mode
+// - Smart schedule  → PATCH /api/scheduled/{id}  (body: {smart_schedule: {...}})
+// - Regular schedule → PATCH /api/uploads/{id}   (body: {title, scheduled_time})
+// Calling PATCH /api/scheduled/{id} with title/time errors 422 because
+// SmartScheduleOnlyUpdate only accepts smart_schedule.
+// ============================================================
+async function saveScheduledUpload() {
+    if (!selectedUploadId || !selectedUpload) return;
+
+    const saveBtn = document.getElementById('saveBtn');
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+
+    const title       = document.getElementById('editTitle').value.trim();
+    const isSmartMode = selectedUpload.schedule_mode === 'smart';
+
+    try {
+        if (isSmartMode) {
+            // Build smart_schedule dict from per-platform datetime pickers
+            const inputs   = document.querySelectorAll('#smartScheduleEditors .smart-edit-input');
+            const schedule = {};
+            inputs.forEach(input => {
+                const plat = input.dataset.platform;
+                const val  = input.value;
+                if (plat && val) schedule[plat] = new Date(val).toISOString();
+            });
+
+            if (Object.keys(schedule).length === 0) {
+                showToast('Please set at least one platform time.', 'warning');
+                return;
+            }
+
+            // Smart schedule endpoint
+            await apiCall(`/api/scheduled/${selectedUploadId}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ smart_schedule: schedule })
+            });
+
+            // Title is a separate concern — send via uploads endpoint if changed
+            if (title !== (selectedUpload.title || '').trim()) {
+                await apiCall(`/api/uploads/${selectedUploadId}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ title })
+                });
+            }
+
+        } else {
+            // Regular scheduled upload — use uploads endpoint
+            const dateTimeVal = document.getElementById('editDateTime').value;
+            const payload = { title };
+            if (dateTimeVal) payload.scheduled_time = new Date(dateTimeVal).toISOString();
+
+            await apiCall(`/api/uploads/${selectedUploadId}`, {
+                method: 'PATCH',
+                body: JSON.stringify(payload)
+            });
+        }
+
+        // Use global showToast(message, type) — do NOT override arg order
+        showToast('Schedule updated successfully.', 'success');
+        closeEditModal();
+        await Promise.all([loadScheduledUploads(), loadScheduledStats()]);
+
+    } catch (err) {
+        console.error('Save failed:', err);
+        showToast(err.message || 'Failed to save changes.', 'error');
+    } finally {
+        saveBtn.disabled = false;
+        saveBtn.innerHTML = '<i class="fas fa-save"></i> Save Changes';
+    }
+}
+
+// ============================================================
+// CANCEL / DELETE
+// ============================================================
+async function cancelScheduledUpload() {
+    if (!selectedUploadId) return;
+    if (!confirm('Cancel this scheduled upload? Tokens will be refunded.')) return;
+
+    try {
+        await apiCall(`/api/scheduled/${selectedUploadId}`, { method: 'DELETE' });
+        showToast('Scheduled upload cancelled. Tokens refunded.', 'success');
+        closeEditModal();
+        await Promise.all([loadScheduledUploads(), loadScheduledStats()]);
+    } catch (err) {
+        console.error('Cancel failed:', err);
+        showToast(err.message || 'Failed to cancel upload.', 'error');
+    }
+}
+
+// ============================================================
+// PLATFORM HELPERS
+// ============================================================
+function getPlatformColor(platform) {
+    const map = {
+        tiktok:    userColors.tiktok,
+        youtube:   userColors.youtube,
+        instagram: userColors.instagram,
+        facebook:  userColors.facebook
+    };
+    return map[(platform || '').toLowerCase()] || '#6B7280';
+}
+
+function _scheduledPlatformBadge(platform) {
+    const p     = (platform || '').toLowerCase();
+    const color = getPlatformColor(p);
+    const icons = {
+        tiktok:    'fab fa-tiktok',
+        youtube:   'fab fa-youtube',
+        instagram: 'fab fa-instagram',
+        facebook:  'fab fa-facebook'
+    };
+    const icon = icons[p] || 'fas fa-globe';
+    return `<span class="platform-badge" style="background:${color}" title="${p}"><i class="${icon}"></i></span>`;
+}
+</script>
+</body>
+</html>

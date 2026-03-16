@@ -1,0 +1,1111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <title>Admin Dashboard - UploadM8</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
+    <style>
+        .admin-header{background:linear-gradient(135deg,rgba(239,68,68,0.1) 0%,rgba(249,115,22,0.1) 100%);border:1px solid rgba(239,68,68,0.2);border-radius:16px;padding:1.5rem;margin-bottom:2rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem}
+        .admin-header-left h1{font-size:1.5rem;font-weight:700;margin:0 0 0.25rem 0;display:flex;align-items:center;gap:0.5rem}
+        .admin-header-left h1 i{color:var(--accent-red)}
+        .admin-header-left p{color:var(--text-secondary);margin:0;font-size:0.875rem}
+        .admin-badge{display:inline-flex;align-items:center;gap:0.5rem;background:linear-gradient(135deg,#ef4444 0%,#dc2626 100%);color:white;padding:0.5rem 1rem;border-radius:8px;font-weight:600;font-size:0.75rem}
+        .admin-nav{display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1.5rem}
+        .admin-nav-btn{padding:0.625rem 1.25rem;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-secondary);font-weight:500;font-size:0.875rem;cursor:pointer;transition:all 0.2s;text-decoration:none}
+        .admin-nav-btn:hover{background:var(--bg-hover);color:var(--text-primary)}
+        .admin-nav-btn.active{background:linear-gradient(135deg,#f97316 0%,#ea580c 100%);border-color:transparent;color:white}
+        .actions-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:2rem}
+        @media(max-width:1200px){.actions-grid{grid-template-columns:repeat(2,1fr)}}
+        @media(max-width:600px){.actions-grid{grid-template-columns:1fr}}
+        .action-card{display:flex;align-items:center;gap:1rem;padding:1.25rem;background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;cursor:pointer;transition:all 0.2s;text-decoration:none;color:inherit}
+        .action-card:hover{background:var(--bg-hover);border-color:var(--accent-orange);transform:translateY(-2px);box-shadow:0 4px 12px rgba(249,115,22,0.15)}
+        .action-card-icon{width:48px;height:48px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.25rem;flex-shrink:0}
+        .action-card.users .action-card-icon{background:rgba(59,130,246,0.15);color:#3b82f6}
+        .action-card.kpi .action-card-icon{background:rgba(139,92,246,0.15);color:#8b5cf6}
+        .action-card.stripe .action-card-icon{background:rgba(99,102,241,0.15);color:#6366f1}
+        .action-card.announce .action-card-icon{background:rgba(249,115,22,0.15);color:#f97316}
+        .action-card-content{flex:1;min-width:0}
+        .action-card-title{font-weight:600;font-size:0.95rem;margin-bottom:0.25rem}
+        .action-card-desc{font-size:0.8rem;color:var(--text-muted)}
+        .summary-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:1rem;margin-bottom:2rem}
+        @media(max-width:1400px){.summary-grid{grid-template-columns:repeat(3,1fr)}}
+        @media(max-width:900px){.summary-grid{grid-template-columns:repeat(2,1fr)}}
+        @media(max-width:600px){.summary-grid{grid-template-columns:1fr}}
+        .summary-card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1.25rem;position:relative;overflow:hidden;cursor:pointer;transition:all 0.2s;text-decoration:none;color:inherit;display:block}
+        .summary-card:hover{border-color:var(--accent-orange);transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.15)}
+        .summary-card::before{content:'';position:absolute;top:0;right:0;width:80px;height:80px;background:radial-gradient(circle,var(--card-color,#f97316) 0%,transparent 70%);opacity:0.1}
+        .summary-card.revenue{--card-color:#22c55e}
+        .summary-card.costs{--card-color:#ef4444}
+        .summary-card.margins{--card-color:#8b5cf6}
+        .summary-card.growth{--card-color:#3b82f6}
+        .summary-card.reliability{--card-color:#f97316}
+        .summary-card.usage{--card-color:#06b6d4}
+        .summary-card-header{display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem}
+        .summary-card-icon{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:0.875rem}
+        .summary-card.revenue .summary-card-icon{background:rgba(34,197,94,0.15);color:#22c55e}
+        .summary-card.costs .summary-card-icon{background:rgba(239,68,68,0.15);color:#ef4444}
+        .summary-card.margins .summary-card-icon{background:rgba(139,92,246,0.15);color:#8b5cf6}
+        .summary-card.growth .summary-card-icon{background:rgba(59,130,246,0.15);color:#3b82f6}
+        .summary-card.reliability .summary-card-icon{background:rgba(249,115,22,0.15);color:#f97316}
+        .summary-card.usage .summary-card-icon{background:rgba(6,182,212,0.15);color:#06b6d4}
+        .summary-card-title{font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted)}
+        .summary-card-value{font-size:1.75rem;font-weight:700;color:var(--text-primary);line-height:1.2}
+        .summary-card-sub{font-size:0.75rem;color:var(--text-muted);margin-top:0.25rem}
+        .summary-card-change{display:inline-flex;align-items:center;gap:0.25rem;font-size:0.7rem;padding:0.2rem 0.4rem;border-radius:4px;margin-top:0.5rem}
+        .summary-card-change.positive{background:rgba(34,197,94,0.15);color:#22c55e}
+        .summary-card-change.negative{background:rgba(239,68,68,0.15);color:#ef4444}
+        .charts-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:1.5rem;margin-bottom:2rem}
+        @media(max-width:900px){.charts-grid{grid-template-columns:1fr}}
+        .chart-card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1.25rem}
+        .chart-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem}
+        .chart-title{font-weight:600;font-size:1rem;display:flex;align-items:center;gap:0.5rem}
+        .chart-container{height:250px;position:relative}
+        .section-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-top:2rem}
+        @media(max-width:1100px){.section-grid{grid-template-columns:1fr}}
+        .activity-card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px}
+        .activity-header{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.25rem;border-bottom:1px solid var(--border-color)}
+        .activity-title{font-weight:600;display:flex;align-items:center;gap:0.5rem}
+        .activity-list{padding:0.75rem;max-height:300px;overflow-y:auto}
+        .activity-item{display:flex;align-items:center;gap:0.75rem;padding:0.75rem;border-radius:8px;transition:background 0.2s}
+        .activity-item:hover{background:var(--bg-hover)}
+        .activity-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:0.875rem;flex-shrink:0}
+        .activity-icon.signup{background:rgba(34,197,94,0.15);color:#22c55e}
+        .activity-icon.upgrade{background:rgba(139,92,246,0.15);color:#8b5cf6}
+        .activity-icon.upload{background:rgba(59,130,246,0.15);color:#3b82f6}
+        .activity-icon.payment{background:rgba(249,115,22,0.15);color:#f97316}
+        .activity-icon.downgrade{background:rgba(239,68,68,0.15);color:#ef4444}
+        .activity-content{flex:1;min-width:0}
+        .activity-text{font-size:0.875rem;margin-bottom:0.125rem}
+        .activity-time{font-size:0.75rem;color:var(--text-muted)}
+        .users-table{width:100%;border-collapse:collapse}
+        .users-table th{text-align:left;padding:0.75rem 1rem;font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);background:var(--bg-hover)}
+        .users-table td{padding:0.75rem 1rem;font-size:0.875rem;border-bottom:1px solid var(--border-color)}
+        .users-table tr:last-child td{border-bottom:none}
+        .user-cell{display:flex;align-items:center;gap:0.75rem}
+        .user-avatar-sm{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,var(--accent-orange),var(--accent-purple));display:flex;align-items:center;justify-content:center;font-weight:600;font-size:0.75rem;color:white;flex-shrink:0}
+        .tier-badge{display:inline-block;padding:0.25rem 0.5rem;border-radius:4px;font-size:0.7rem;font-weight:600;text-transform:uppercase}
+        .tier-badge.free{background:rgba(107,114,128,0.2);color:#9ca3af}
+        .tier-badge.launch{background:rgba(59,130,246,0.2);color:#3b82f6}
+        .tier-badge.creator_pro{background:rgba(249,115,22,0.2);color:#f97316}
+        .tier-badge.studio{background:rgba(139,92,246,0.2);color:#8b5cf6}
+        .tier-badge.agency{background:rgba(236,72,153,0.2);color:#ec4899}
+        .loading-state{display:flex;align-items:center;justify-content:center;padding:3rem;flex-direction:column;gap:1rem}
+        .loading-spinner{width:40px;height:40px;border:3px solid var(--border-color);border-top-color:var(--accent-orange);border-radius:50%;animation:spin 1s linear infinite}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .access-denied{display:flex;align-items:center;justify-content:center;min-height:60vh;flex-direction:column;gap:1rem;text-align:center}
+        .access-denied-icon{width:64px;height:64px;background:rgba(239,68,68,0.1);border-radius:50%;display:flex;align-items:center;justify-content:center;color:#ef4444;font-size:1.5rem}
+        .empty-state{text-align:center;padding:2rem;color:var(--text-muted)}
+        .refresh-indicator{font-size:0.75rem;color:var(--text-muted);display:flex;align-items:center;gap:0.375rem}
+        .refresh-indicator.loading i{animation:spin 1s linear infinite}
+        .modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:9999;padding:1rem}
+        .modal-overlay.active{display:flex}
+        .modal{background:var(--bg-card);border:1px solid var(--border-color);border-radius:16px;width:100%;max-width:560px;max-height:calc(100vh - 2rem);display:flex;flex-direction:column;box-shadow:0 25px 50px -12px rgba(0,0,0,0.5)}
+        .modal-header{display:flex;align-items:center;justify-content:space-between;padding:1.25rem 1.5rem;border-bottom:1px solid var(--border-color);flex-shrink:0}
+        .modal-title{font-size:1.125rem;font-weight:600;display:flex;align-items:center;gap:0.5rem}
+        .modal-title i{color:var(--accent-orange)}
+        .modal-close{width:32px;height:32px;border-radius:8px;border:none;background:var(--bg-hover);color:var(--text-muted);cursor:pointer;transition:all 0.2s;display:flex;align-items:center;justify-content:center}
+        .modal-close:hover{background:rgba(239,68,68,0.15);color:#ef4444}
+        .modal-body{padding:1.5rem;overflow-y:auto;flex:1}
+        .modal-footer{display:flex;align-items:center;justify-content:flex-end;gap:0.75rem;padding:1rem 1.5rem;border-top:1px solid var(--border-color);background:var(--bg-hover);flex-shrink:0;border-radius:0 0 16px 16px}
+        .form-group{margin-bottom:1.25rem}
+        .form-label{display:block;font-size:0.875rem;font-weight:500;margin-bottom:0.5rem;color:var(--text-secondary)}
+        .form-input{width:100%;padding:0.75rem 1rem;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-primary);font-size:0.875rem;transition:all 0.2s;box-sizing:border-box}
+        .form-input:focus{outline:none;border-color:var(--accent-orange);box-shadow:0 0 0 3px rgba(249,115,22,0.1)}
+        .form-textarea{min-height:100px;resize:vertical;font-family:inherit}
+        .form-section{background:var(--bg-hover);border-radius:10px;padding:1rem;margin-bottom:1.25rem}
+        .form-section-title{font-size:0.8rem;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin-bottom:0.75rem}
+        .checkbox-group{display:flex;flex-direction:column;gap:0.5rem}
+        .checkbox-item{display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0.75rem;background:var(--bg-card);border:1px solid var(--border-color);border-radius:8px;cursor:pointer;transition:all 0.2s}
+        .checkbox-item:hover{border-color:var(--accent-orange)}
+        .checkbox-item input[type="checkbox"]{width:16px;height:16px;accent-color:var(--accent-orange);cursor:pointer;flex-shrink:0}
+        .checkbox-item label{flex:1;cursor:pointer;font-size:0.875rem}
+        .checkbox-icon{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:0.875rem;flex-shrink:0}
+        .checkbox-icon.email{background:rgba(34,197,94,0.15);color:#22c55e}
+        .checkbox-icon.discord{background:rgba(88,101,242,0.15);color:#5865F2}
+        .audience-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:0.5rem}
+        @media(max-width:500px){.audience-grid{grid-template-columns:1fr}}
+        .audience-option{display:flex;align-items:center;gap:0.5rem;padding:0.625rem 0.75rem;background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;cursor:pointer;transition:all 0.2s;font-size:0.8rem}
+        .audience-option:hover{border-color:var(--accent-orange)}
+        .audience-option input[type="radio"]{accent-color:var(--accent-orange);flex-shrink:0}
+        .tier-select,.user-search{margin-top:0.75rem;display:none}
+        .tier-select.active,.user-search.active{display:block}
+        .user-search-results{max-height:120px;overflow-y:auto;margin-top:0.5rem;border:1px solid var(--border-color);border-radius:8px}
+        .user-search-result{display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.75rem;cursor:pointer;transition:background 0.2s;font-size:0.8rem}
+        .user-search-result:hover{background:var(--bg-hover)}
+        .selected-users{display:flex;flex-wrap:wrap;gap:0.375rem;margin-top:0.5rem}
+        .selected-user-tag{display:inline-flex;align-items:center;gap:0.375rem;padding:0.25rem 0.5rem;background:rgba(249,115,22,0.15);color:var(--accent-orange);border-radius:4px;font-size:0.75rem}
+        .selected-user-tag button{background:none;border:none;color:inherit;cursor:pointer;padding:0;line-height:1;font-size:1rem}
+        .btn-send{display:inline-flex;align-items:center;gap:0.5rem;padding:0.75rem 1.5rem;background:linear-gradient(135deg,#f97316 0%,#ea580c 100%);border:none;border-radius:8px;color:white;font-weight:600;font-size:0.875rem;cursor:pointer;transition:all 0.2s}
+        .btn-send:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(249,115,22,0.3)}
+        .btn-send:disabled{opacity:0.6;cursor:not-allowed;transform:none;box-shadow:none}
+        .btn-cancel{padding:0.75rem 1.25rem;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-secondary);font-weight:500;font-size:0.875rem;cursor:pointer;transition:all 0.2s}
+        .btn-cancel:hover{background:var(--bg-hover);color:var(--text-primary)}
+        .sending-progress{display:none;text-align:center;padding:2rem}
+        .sending-progress.active{display:block}
+        
+        /* Discord Notification Settings */
+        .notif-settings{margin-top:2rem}
+        .notif-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid var(--border-color)}
+        .notif-header h2{font-size:1.25rem;font-weight:700;display:flex;align-items:center;gap:0.75rem;margin:0}
+        .notif-header h2 i{color:#5865F2}
+        .notif-section{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1.5rem;margin-bottom:1.25rem}
+        .notif-section-header{display:flex;align-items:flex-start;gap:1rem;padding-bottom:1rem;border-bottom:1px solid var(--border-color);margin-bottom:1rem}
+        .notif-section-icon{width:44px;height:44px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.1rem;flex-shrink:0}
+        .notif-section-icon.revenue{background:rgba(34,197,94,0.15);color:#22c55e}
+        .notif-section-icon.costs{background:rgba(239,68,68,0.15);color:#ef4444}
+        .notif-section-icon.calendar{background:rgba(59,130,246,0.15);color:#3b82f6}
+        .notif-section-info{flex:1}
+        .notif-section-title{font-weight:600;font-size:1rem;margin:0 0 0.25rem 0}
+        .notif-section-desc{font-size:0.8rem;color:var(--text-muted);margin:0;line-height:1.4}
+        .notif-master-toggle{display:flex;align-items:center;gap:0.5rem}
+        .notif-master-toggle span{font-size:0.7rem;color:var(--text-muted);text-transform:uppercase}
+        .toggle-switch{position:relative;width:48px;height:26px;flex-shrink:0}
+        .toggle-switch input{opacity:0;width:0;height:0}
+        .toggle-slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:var(--bg-input);border:2px solid var(--border-color);transition:0.3s;border-radius:26px}
+        .toggle-slider:before{position:absolute;content:"";height:18px;width:18px;left:2px;bottom:2px;background:var(--text-muted);transition:0.3s;border-radius:50%}
+        input:checked+.toggle-slider{background:#22c55e;border-color:#22c55e}
+        input:checked+.toggle-slider:before{transform:translateX(22px);background:white}
+        .toggle-list{display:flex;flex-direction:column;gap:0.75rem}
+        .toggle-item{display:flex;align-items:center;gap:1rem;padding:1rem;background:var(--bg-input);border-radius:10px;border:1px solid transparent;transition:all 0.2s}
+        .toggle-item:hover{border-color:var(--border-color)}
+        .toggle-item.disabled{opacity:0.4;pointer-events:none}
+        .toggle-item-icon{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:0.9rem;flex-shrink:0}
+        .toggle-item-icon.green{background:rgba(34,197,94,0.15);color:#22c55e}
+        .toggle-item-icon.orange{background:rgba(249,115,22,0.15);color:#f97316}
+        .toggle-item-icon.purple{background:rgba(139,92,246,0.15);color:#8b5cf6}
+        .toggle-item-icon.blue{background:rgba(59,130,246,0.15);color:#3b82f6}
+        .toggle-item-icon.red{background:rgba(239,68,68,0.15);color:#ef4444}
+        .toggle-item-icon.yellow{background:rgba(234,179,8,0.15);color:#eab308}
+        .toggle-item-icon.cyan{background:rgba(6,182,212,0.15);color:#06b6d4}
+        .toggle-item-content{flex:1;min-width:0}
+        .toggle-item-content h4{font-size:0.875rem;font-weight:600;margin:0 0 0.25rem 0}
+        .toggle-item-content p{font-size:0.75rem;color:var(--text-muted);margin:0;line-height:1.4}
+        .toggle-item-meta{display:flex;flex-wrap:wrap;gap:0.375rem;margin-top:0.5rem}
+        .meta-tag{font-size:0.6rem;padding:0.15rem 0.4rem;background:var(--bg-card);border-radius:4px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.3px}
+        .webhook-config{margin-top:1rem;padding-top:1rem;border-top:1px solid var(--border-color)}
+        .webhook-config label{display:block;font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.5rem}
+        .webhook-row{display:flex;gap:0.5rem}
+        .webhook-input{flex:1;padding:0.625rem 0.875rem;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-primary);font-size:0.8rem;font-family:monospace}
+        .webhook-input:focus{outline:none;border-color:var(--accent-orange)}
+        .btn-test{padding:0.625rem 1rem;background:rgba(88,101,242,0.15);border:1px solid rgba(88,101,242,0.3);border-radius:8px;color:#5865F2;font-size:0.8rem;font-weight:500;cursor:pointer;transition:all 0.2s;white-space:nowrap}
+        .btn-test:hover{background:rgba(88,101,242,0.25)}
+        .btn-test:disabled{opacity:0.5;cursor:not-allowed}
+        .btn-save-notif{display:inline-flex;align-items:center;gap:0.5rem;padding:0.75rem 1.5rem;background:linear-gradient(135deg,#f97316,#ea580c);border:none;border-radius:8px;color:white;font-weight:600;font-size:0.875rem;cursor:pointer;transition:all 0.2s}
+        .btn-save-notif:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(249,115,22,0.3)}
+        .btn-save-notif:disabled{opacity:0.6;cursor:not-allowed;transform:none}
+        .notif-status{display:flex;align-items:center;gap:0.5rem;font-size:0.8rem;color:var(--text-muted)}
+        .notif-status .dot{width:8px;height:8px;border-radius:50%;background:var(--text-muted)}
+        .notif-status .dot.active{background:#22c55e;box-shadow:0 0 8px rgba(34,197,94,0.5)}
+        .notif-footer{display:flex;align-items:center;justify-content:space-between;margin-top:1.5rem;padding-top:1rem;border-top:1px solid var(--border-color)}
+        .billing-dates{display:grid;grid-template-columns:repeat(3,1fr);gap:0.75rem;margin-top:1rem}
+        @media(max-width:768px){.billing-dates{grid-template-columns:1fr}}
+        .billing-date-item{background:var(--bg-input);border-radius:8px;padding:0.75rem}
+        .billing-date-item label{display:block;font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;margin-bottom:0.375rem}
+        .billing-date-item input{width:100%;padding:0.5rem;background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;color:var(--text-primary);font-size:0.8rem}
+        .billing-date-item input:focus{outline:none;border-color:var(--accent-orange)}
+    </style>
+</head>
+<body>
+    <div class="app-layout">
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header"><a href="dashboard.html" class="sidebar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></a></div>
+            <nav class="sidebar-nav">
+                <div class="nav-section"><div class="nav-section-title">Main</div>
+                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
+                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
+                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
+                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
+                </div>
+                <div class="nav-section"><div class="nav-section-title">Platforms</div>
+                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
+                    <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
+                </div>
+                <div class="nav-section"><div class="nav-section-title">Insights</div>
+                    <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
+                </div>
+                <div class="nav-section admin-only" id="adminSection" style="display:none;"><div class="nav-section-title">Admin</div>
+                    <a href="admin.html" class="nav-link active"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
+                    <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
+                    <a href="admin-kpi.html" class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
+                    <a href="admin-calculator.html" class="nav-link"> <i class="fas fa-calculator"></i> <span>Biz Calculator</span> </a>
+                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
+                </div>
+                <div class="nav-section"><div class="nav-section-title">Account</div>
+                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
+                    <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
+                </div>
+            </nav>
+            <div class="sidebar-footer"><div class="user-info"><div class="user-avatar" id="userAvatar">U</div><div class="user-details"><div class="user-name" id="userName">Loading...</div><div class="user-tier" id="userTier">-</div></div><button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out"><i class="fas fa-sign-out-alt"></i></button></div></div>
+        </aside>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+        <header class="top-bar"><button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button><div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div><div class="top-bar-actions"><button class="theme-toggle" onclick="toggleTheme()"><i class="fas fa-moon"></i></button></div></header>
+        
+        <main class="main-content">
+            <div id="loadingState" class="loading-state"><div class="loading-spinner"></div><div>Verifying admin access...</div></div>
+            <div id="accessDenied" class="access-denied" style="display:none;"><div class="access-denied-icon"><i class="fas fa-lock"></i></div><h2>Access Denied</h2><p style="color:var(--text-secondary);">You don't have permission to view this page.</p><a href="dashboard.html" class="btn btn-primary"><i class="fas fa-home"></i> Return to Dashboard</a></div>
+            
+            <div id="adminContent" style="display:none;">
+                <div class="admin-header">
+                    <div class="admin-header-left"><h1><i class="fas fa-shield-alt"></i> Admin Dashboard</h1><p>Overview of key metrics and quick actions</p></div>
+                    <div style="display:flex;align-items:center;gap:1rem;">
+                        <div class="refresh-indicator" id="refreshIndicator"><i class="fas fa-sync-alt"></i><span id="lastUpdated">Updating...</span></div>
+                        <div class="admin-badge"><i class="fas fa-crown"></i><span id="adminRoleBadge">ADMIN</span></div>
+                    </div>
+                </div>
+                
+                <div class="admin-nav">
+                    <a href="admin.html" class="admin-nav-btn active">Overview</a>
+                    <a href="account-management.html" class="admin-nav-btn">Users</a>
+                    <a href="admin-kpi.html" class="admin-nav-btn">KPI Dashboard</a>
+                </div>
+                
+                <div class="actions-grid">
+                    <a href="account-management.html" class="action-card users"><div class="action-card-icon"><i class="fas fa-users-cog"></i></div><div class="action-card-content"><div class="action-card-title">Manage Users</div><div class="action-card-desc">View, edit, or ban users</div></div></a>
+                    <a href="admin-kpi.html" class="action-card kpi"><div class="action-card-icon"><i class="fas fa-chart-bar"></i></div><div class="action-card-content"><div class="action-card-title">KPI Dashboard</div><div class="action-card-desc">Detailed analytics</div></div></a>
+                    <div class="action-card stripe" onclick="window.open('https://dashboard.stripe.com','_blank')"><div class="action-card-icon"><i class="fab fa-stripe-s"></i></div><div class="action-card-content"><div class="action-card-title">Stripe Dashboard</div><div class="action-card-desc">Payments & invoices</div></div></div>
+                    <div class="action-card announce" onclick="openAnnouncementModal()"><div class="action-card-icon"><i class="fas fa-bullhorn"></i></div><div class="action-card-content"><div class="action-card-title">Send Announcement</div><div class="action-card-desc">Email & Discord</div></div></div>
+                </div>
+                
+                <div class="summary-grid">
+                    <a href="admin-kpi.html#revenue" class="summary-card revenue">
+                        <div class="summary-card-header"><div class="summary-card-icon"><i class="fas fa-dollar-sign"></i></div><span class="summary-card-title">Revenue</span></div>
+                        <div class="summary-card-value" id="summaryMRR">$--</div>
+                        <div class="summary-card-sub">MRR</div>
+                        <div class="summary-card-change positive" id="summaryMRRChange"><i class="fas fa-arrow-up"></i> --%</div>
+                    </a>
+                    <a href="admin-kpi.html#costs" class="summary-card costs">
+                        <div class="summary-card-header"><div class="summary-card-icon"><i class="fas fa-receipt"></i></div><span class="summary-card-title">Costs</span></div>
+                        <div class="summary-card-value" id="summaryTotalCosts">$--</div>
+                        <div class="summary-card-sub">Total (30d)</div>
+                        <div class="summary-card-change negative" id="summaryCostsChange"><i class="fas fa-arrow-up"></i> --%</div>
+                    </a>
+                    <a href="admin-kpi.html#margins" class="summary-card margins">
+                        <div class="summary-card-header"><div class="summary-card-icon"><i class="fas fa-percentage"></i></div><span class="summary-card-title">Margins</span></div>
+                        <div class="summary-card-value" id="summaryGrossMargin">--%</div>
+                        <div class="summary-card-sub">Gross Margin</div>
+                        <div class="summary-card-change positive" id="summaryMarginChange"><i class="fas fa-arrow-up"></i> --%</div>
+                    </a>
+                    <a href="admin-kpi.html#funnels" class="summary-card growth">
+                        <div class="summary-card-header"><div class="summary-card-icon"><i class="fas fa-funnel-dollar"></i></div><span class="summary-card-title">Growth</span></div>
+                        <div class="summary-card-value" id="summaryConversion">--%</div>
+                        <div class="summary-card-sub">Free → Paid</div>
+                        <div class="summary-card-change positive" id="summaryConversionChange"><i class="fas fa-arrow-up"></i> --%</div>
+                    </a>
+                    <a href="admin-kpi.html#reliability" class="summary-card reliability">
+                        <div class="summary-card-header"><div class="summary-card-icon"><i class="fas fa-heartbeat"></i></div><span class="summary-card-title">Reliability</span></div>
+                        <div class="summary-card-value" id="summarySuccessRate">--%</div>
+                        <div class="summary-card-sub">Upload Success</div>
+                        <div class="summary-card-change positive" id="summaryReliabilityChange"><i class="fas fa-arrow-up"></i> --%</div>
+                    </a>
+                    <a href="admin-kpi.html#usage" class="summary-card usage">
+                        <div class="summary-card-header"><div class="summary-card-icon"><i class="fas fa-chart-bar"></i></div><span class="summary-card-title">Usage</span></div>
+                        <div class="summary-card-value" id="summaryActiveUsers">--</div>
+                        <div class="summary-card-sub">Active Users</div>
+                        <div class="summary-card-change positive" id="summaryUsageChange"><i class="fas fa-arrow-up"></i> --%</div>
+                    </a>
+                </div>
+                
+                <div class="charts-grid">
+                    <div class="chart-card"><div class="chart-header"><h3 class="chart-title"><i class="fas fa-chart-line" style="color:#22c55e;"></i> Revenue (30d)</h3></div><div class="chart-container"><canvas id="revenueChart"></canvas></div></div>
+                    <div class="chart-card"><div class="chart-header"><h3 class="chart-title"><i class="fas fa-user-plus" style="color:#3b82f6;"></i> User Growth (30d)</h3></div><div class="chart-container"><canvas id="userGrowthChart"></canvas></div></div>
+                </div>
+                
+                <div class="section-grid">
+                    <div class="activity-card"><div class="activity-header"><h3 class="activity-title"><i class="fas fa-history"></i> Recent Activity</h3></div><div class="activity-list" id="activityList"><div class="empty-state"><i class="fas fa-clock"></i><p>Loading...</p></div></div></div>
+                    <div class="activity-card"><div class="activity-header"><h3 class="activity-title"><i class="fas fa-trophy"></i> Top Users</h3></div><div style="overflow-x:auto;"><table class="users-table"><thead><tr><th>User</th><th>Tier</th><th>Uploads</th><th>Revenue</th></tr></thead><tbody id="topUsersTable"><tr><td colspan="4" class="empty-state">Loading...</td></tr></tbody></table></div></div>
+                </div>
+                
+                <!-- Discord Notification Settings -->
+                <div class="notif-settings">
+                    <div class="notif-header">
+                        <h2><i class="fab fa-discord"></i> Discord Notification Settings</h2>
+                        <div class="notif-status" id="notifStatus"><div class="dot" id="notifStatusDot"></div><span id="notifStatusText">Loading...</span></div>
+                    </div>
+                    
+                    <!-- Revenue Alerts Section -->
+                    <div class="notif-section">
+                        <div class="notif-section-header">
+                            <div class="notif-section-icon revenue"><i class="fas fa-dollar-sign"></i></div>
+                            <div class="notif-section-info">
+                                <h3 class="notif-section-title">Revenue Event Alerts</h3>
+                                <p class="notif-section-desc">Get instant Discord notifications for payments, subscriptions, and revenue changes</p>
+                            </div>
+                            <div class="notif-master-toggle">
+                                <span>Master</span>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleRevenueAll" onchange="toggleSection('revenue', this.checked)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="toggle-list" id="revenueToggles">
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon green"><i class="fas fa-credit-card"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>MRR Charges (Invoice Paid)</h4>
+                                    <p>Alert when subscription payments are successfully processed</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">user email</span>
+                                        <span class="meta-tag">tier</span>
+                                        <span class="meta-tag">amount</span>
+                                        <span class="meta-tag">stripe ids</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleMrrCharge" data-setting="notify_mrr_charge">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon orange"><i class="fas fa-plus-circle"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Top-up Purchases</h4>
+                                    <p>Alert when users buy PUT or AIC token packs</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">user email</span>
+                                        <span class="meta-tag">wallet type</span>
+                                        <span class="meta-tag">tokens</span>
+                                        <span class="meta-tag">amount</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleTopup" data-setting="notify_topup">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon purple"><i class="fas fa-arrow-up"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Upgrades</h4>
+                                    <p>Alert when users upgrade to a higher tier</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">user email</span>
+                                        <span class="meta-tag">old → new tier</span>
+                                        <span class="meta-tag">mrr impact</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleUpgrade" data-setting="notify_upgrade">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon blue"><i class="fas fa-arrow-down"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Downgrades</h4>
+                                    <p>Alert when users downgrade to a lower tier</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">user email</span>
+                                        <span class="meta-tag">old → new tier</span>
+                                        <span class="meta-tag">mrr impact</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleDowngrade" data-setting="notify_downgrade">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon red"><i class="fas fa-times-circle"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Cancellations</h4>
+                                    <p>Alert when subscriptions are cancelled</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">user email</span>
+                                        <span class="meta-tag">tier lost</span>
+                                        <span class="meta-tag">mrr impact</span>
+                                        <span class="meta-tag">reason</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleCancel" data-setting="notify_cancel">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon yellow"><i class="fas fa-undo"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Refunds</h4>
+                                    <p>Alert when refunds are processed</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">user email</span>
+                                        <span class="meta-tag">amount</span>
+                                        <span class="meta-tag">reason</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleRefund" data-setting="notify_refund">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Cost Monitoring Section -->
+                    <div class="notif-section">
+                        <div class="notif-section-header">
+                            <div class="notif-section-icon costs"><i class="fas fa-chart-pie"></i></div>
+                            <div class="notif-section-info">
+                                <h3 class="notif-section-title">Cost Monitoring & Forecasts</h3>
+                                <p class="notif-section-desc">Weekly cost summaries and usage estimates by provider</p>
+                            </div>
+                            <div class="notif-master-toggle">
+                                <span>Master</span>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleCostsAll" onchange="toggleSection('costs', this.checked)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="toggle-list" id="costsToggles">
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon cyan"><i class="fas fa-robot"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>OpenAI Cost Summary</h4>
+                                    <p>Weekly estimated cost from logged API usage (tokens × rate)</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">tokens used</span>
+                                        <span class="meta-tag">est. cost</span>
+                                        <span class="meta-tag">vs last week</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleOpenaiCost" data-setting="notify_openai_cost">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon blue"><i class="fas fa-database"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Storage Cost Summary</h4>
+                                    <p>Weekly estimated storage cost (bytes stored × $/GB-month)</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">gb stored</span>
+                                        <span class="meta-tag">est. cost</span>
+                                        <span class="meta-tag">growth rate</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleStorageCost" data-setting="notify_storage_cost">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon purple"><i class="fas fa-server"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Compute Cost Summary</h4>
+                                    <p>Weekly estimated compute cost (worker runtime × $/second)</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">runtime hours</span>
+                                        <span class="meta-tag">est. cost</span>
+                                        <span class="meta-tag">jobs processed</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleComputeCost" data-setting="notify_compute_cost">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon green"><i class="fas fa-file-invoice-dollar"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Weekly Cost Report</h4>
+                                    <p>Consolidated weekly report with all costs, revenue, and margins</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">total cogs</span>
+                                        <span class="meta-tag">revenue</span>
+                                        <span class="meta-tag">margin %</span>
+                                        <span class="meta-tag">forecast</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleWeeklyReport" data-setting="notify_weekly_report">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Billing Calendar Section -->
+                    <div class="notif-section">
+                        <div class="notif-section-header">
+                            <div class="notif-section-icon calendar"><i class="fas fa-calendar-alt"></i></div>
+                            <div class="notif-section-info">
+                                <h3 class="notif-section-title">Billing Calendar Reminders</h3>
+                                <p class="notif-section-desc">Get reminded before important billing dates and renewals</p>
+                            </div>
+                            <div class="notif-master-toggle">
+                                <span>Master</span>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleCalendarAll" onchange="toggleSection('calendar', this.checked)">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="toggle-list" id="calendarToggles">
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon purple"><i class="fab fa-stripe-s"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Stripe Payout Reminders</h4>
+                                    <p>Alert 2 days before expected Stripe payouts/settlements</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">payout date</span>
+                                        <span class="meta-tag">est. amount</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleStripePayout" data-setting="notify_stripe_payout">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon orange"><i class="fas fa-cloud"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Cloud Provider Billing</h4>
+                                    <p>Alert before AWS/Cloudflare/other cloud billing cycles</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">billing date</span>
+                                        <span class="meta-tag">provider</span>
+                                        <span class="meta-tag">est. amount</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleCloudBilling" data-setting="notify_cloud_billing">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon cyan"><i class="fas fa-rocket"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Render Renewal Reminders</h4>
+                                    <p>Alert before Render hosting renewal dates</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">renewal date</span>
+                                        <span class="meta-tag">service</span>
+                                        <span class="meta-tag">amount</span>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleRenderRenewal" data-setting="notify_render_renewal">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="billing-dates">
+                            <div class="billing-date-item">
+                                <label>Stripe Payout Day</label>
+                                <input type="number" id="stripePayoutDay" min="1" max="28" placeholder="e.g., 15" value="15">
+                            </div>
+                            <div class="billing-date-item">
+                                <label>Cloud Billing Day</label>
+                                <input type="number" id="cloudBillingDay" min="1" max="28" placeholder="e.g., 1" value="1">
+                            </div>
+                            <div class="billing-date-item">
+                                <label>Render Renewal Day</label>
+                                <input type="number" id="renderRenewalDay" min="1" max="28" placeholder="e.g., 7" value="7">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Webhook Configuration -->
+                    <div class="notif-section">
+                        <div class="notif-section-header">
+                            <div class="notif-section-icon" style="background:rgba(88,101,242,0.15);color:#5865F2;"><i class="fas fa-link"></i></div>
+                            <div class="notif-section-info">
+                                <h3 class="notif-section-title">Discord Webhook Configuration</h3>
+                                <p class="notif-section-desc">Configure where notifications are sent</p>
+                            </div>
+                        </div>
+                        <div class="webhook-config" style="border-top:none;padding-top:0;margin-top:0;">
+                            <label>Admin Alerts Webhook (Revenue, Costs, Billing)</label>
+                            <div class="webhook-row">
+                                <input type="text" class="webhook-input" id="adminWebhookUrl" placeholder="https://discord.com/api/webhooks/...">
+                                <button class="btn-test" id="testWebhookBtn" onclick="testWebhook()"><i class="fab fa-discord"></i> Test</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="notif-footer">
+                        <div class="notif-status">
+                            <span id="saveStatusText"></span>
+                        </div>
+                        <button class="btn-save-notif" id="saveNotifBtn" onclick="saveNotificationSettings()">
+                            <i class="fas fa-save"></i> Save Settings
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <div class="modal-overlay" id="announcementModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2 class="modal-title"><i class="fas fa-bullhorn"></i> Send Announcement</h2>
+                <button class="modal-close" onclick="closeAnnouncementModal()"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body" id="announcementForm">
+                <div class="form-group">
+                    <label class="form-label">Announcement Title</label>
+                    <input type="text" class="form-input" id="announcementTitle" placeholder="e.g., New Feature Launch">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Message</label>
+                    <textarea class="form-input form-textarea" id="announcementBody" placeholder="Write your announcement..."></textarea>
+                </div>
+                <div class="form-section">
+                    <div class="form-section-title">Delivery Channels</div>
+                    <div class="checkbox-group">
+                        <div class="checkbox-item"><input type="checkbox" id="channelEmail" checked><div class="checkbox-icon email"><i class="fas fa-envelope"></i></div><label for="channelEmail">Send email to users</label></div>
+                        <div class="checkbox-item"><input type="checkbox" id="channelDiscordCommunity"><div class="checkbox-icon discord"><i class="fab fa-discord"></i></div><label for="channelDiscordCommunity">Post to Discord community</label></div>
+                        <div class="checkbox-item"><input type="checkbox" id="channelDiscordWebhooks"><div class="checkbox-icon discord"><i class="fab fa-discord"></i></div><label for="channelDiscordWebhooks">Send to user webhooks</label></div>
+                    </div>
+                </div>
+                <div class="form-section">
+                    <div class="form-section-title">Target Audience</div>
+                    <div class="audience-grid">
+                        <label class="audience-option"><input type="radio" name="audience" value="all" checked><span>All users</span></label>
+                        <label class="audience-option"><input type="radio" name="audience" value="paid"><span>Paid only</span></label>
+                        <label class="audience-option"><input type="radio" name="audience" value="trial"><span>Trial only</span></label>
+                        <label class="audience-option"><input type="radio" name="audience" value="free"><span>Free only</span></label>
+                        <label class="audience-option"><input type="radio" name="audience" value="tier"><span>Specific tier(s)</span></label>
+                        <label class="audience-option"><input type="radio" name="audience" value="specific"><span>Specific user(s)</span></label>
+                    </div>
+                    <div class="tier-select" id="tierSelection">
+                        <label class="form-label" style="margin-top:0.75rem;">Select Tiers</label>
+                        <div class="checkbox-group">
+                            <div class="checkbox-item"><input type="checkbox" id="tierLaunch"><label for="tierLaunch">Launch</label></div>
+                            <div class="checkbox-item"><input type="checkbox" id="tierPro"><label for="tierPro">Creator Pro</label></div>
+                            <div class="checkbox-item"><input type="checkbox" id="tierStudio"><label for="tierStudio">Studio</label></div>
+                            <div class="checkbox-item"><input type="checkbox" id="tierAgency"><label for="tierAgency">Agency</label></div>
+                        </div>
+                    </div>
+                    <div class="user-search" id="userSearchContainer">
+                        <label class="form-label" style="margin-top:0.75rem;">Search Users</label>
+                        <input type="text" class="form-input" id="userSearchInput" placeholder="Search by name or email...">
+                        <div class="user-search-results" id="userSearchResults"></div>
+                        <div class="selected-users" id="selectedUsers"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="sending-progress" id="sendingProgress"><div class="loading-spinner" style="margin:0 auto 1rem;"></div><h4>Sending Announcement...</h4><p id="sendingStatus">Preparing...</p></div>
+            <div class="modal-footer" id="announcementFooter">
+                <button class="btn-cancel" onclick="closeAnnouncementModal()">Cancel</button>
+                <button class="btn-send" onclick="sendAnnouncement()"><i class="fas fa-paper-plane"></i> Send</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="toastContainer"></div>
+    <script src="wallet-tokens.js"></script>
+    <script src="app.js"></script>
+    <script>
+    (function(){
+        'use strict';
+        const API_BASE = window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : 'https://auth.uploadm8.com');
+        const TOKEN_KEY = 'uploadm8_access_token';
+        let revenueChart = null, userGrowthChart = null, allUsers = [], selectedUserIds = [];
+        
+        function getToken(){ return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY); }
+        function clearTokensAndRedirect(msg){ localStorage.removeItem(TOKEN_KEY); localStorage.removeItem('uploadm8_refresh_token'); sessionStorage.removeItem(TOKEN_KEY); if(msg) sessionStorage.setItem('uploadm8_auth_message', msg); window.location.href = 'login.html'; }
+        function showToast(msg, type='info'){ const c=document.getElementById('toastContainer'); if(!c) return; const t=document.createElement('div'); t.className=`toast toast-${type}`; t.innerHTML=`<i class="fas fa-${type==='success'?'check-circle':type==='error'?'exclamation-circle':'info-circle'}"></i><span>${msg}</span>`; c.appendChild(t); setTimeout(()=>t.classList.add('show'),10); setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},4000); }
+        
+        async function fetchAPI(endpoint){ const token=getToken(); try{ const r=await fetch(`${API_BASE}${endpoint}`,{headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'}}); if(r.ok) return await r.json(); return null; }catch(e){ console.error(`Error fetching ${endpoint}:`,e); return null; } }
+        
+        async function authenticateUser(){
+            // Use canonical auth flow from app.js so currentUser + refresh logic stay consistent across all pages.
+            if(typeof checkAuth !== 'function'){
+                console.error('checkAuth not found (app.js not loaded)');
+                clearTokensAndRedirect('Please log in.');
+                return null;
+            }
+            const user = await checkAuth({ redirectOnFail: true, silent: false });
+            if(!user) return null;
+            return user;
+        }
+        
+        function initAdminPage(user){
+            document.getElementById('loadingState').style.display='none';
+            const isAdmin = user.role==='admin'||user.role==='master_admin';
+            if(!isAdmin){ document.getElementById('accessDenied').style.display='flex'; return; }
+
+            // Show admin UI
+            document.getElementById('adminSection').style.display='block';
+            document.getElementById('adminContent').style.display='block';
+            document.getElementById('adminRoleBadge').textContent=user.role==='master_admin'?'MASTER ADMIN':'ADMIN';
+
+            // Delegate sidebar identity (name/tier/avatar) to app.js for consistency across all pages.
+            try{
+                if(typeof updateUserUI === 'function'){
+                    updateUserUI();
+                }else{
+                    // Minimal fallback if app.js isn't loaded for some reason
+                    const name=user.name||user.email?.split('@')[0]||'Admin';
+                    document.getElementById('userName').textContent=name;
+                    document.getElementById('userTier').textContent=user.role==='master_admin'?'Master Admin':'Admin';
+                    document.getElementById('userAvatar').textContent=(user.name||user.email||'U').charAt(0).toUpperCase();
+                }
+            }catch(e){ console.error('updateUserUI failed:', e); }
+
+            loadAllData();
+            setupEventListeners();
+        }
+        
+        (async function(){ const user=await authenticateUser(); if(user) initAdminPage(user); })();
+        
+        async function loadAllData(){
+            document.getElementById('refreshIndicator').classList.add('loading');
+            document.getElementById('lastUpdated').textContent='Updating...';
+            await Promise.all([loadSummaryKPIs(),loadCharts(),loadActivity(),loadTopUsers(),loadAllUsers()]);
+            document.getElementById('refreshIndicator').classList.remove('loading');
+            document.getElementById('lastUpdated').textContent='Updated '+new Date().toLocaleTimeString();
+        }
+        
+        async function loadSummaryKPIs(){
+            const [rev,costs,margins,growth,reliability] = await Promise.all([
+                fetchAPI('/api/admin/kpi/revenue'),
+                fetchAPI('/api/admin/kpi/costs'),
+                fetchAPI('/api/admin/kpi/margins'),
+                fetchAPI('/api/admin/kpi/growth'),
+                fetchAPI('/api/admin/kpi/reliability')
+            ]);
+            
+            if(rev){ document.getElementById('summaryMRR').textContent = fmtCurrency(rev.total_mrr||0); updateChangeEl('summaryMRRChange', rev.mrr_change||0); }
+            if(costs){ const tc = (costs.openai_cost||0)+(costs.storage_cost||0)+(costs.compute_cost||0); document.getElementById('summaryTotalCosts').textContent = fmtCurrency(tc); updateChangeEl('summaryCostsChange', costs.costs_change||0, true); }
+            if(margins){ document.getElementById('summaryGrossMargin').textContent = fmtPercent(margins.gross_margin||0); updateChangeEl('summaryMarginChange', margins.margin_change||0); }
+            if(growth){ document.getElementById('summaryConversion').textContent = fmtPercent(growth.free_to_paid_rate||0); updateChangeEl('summaryConversionChange', growth.conversion_change||0); }
+            if(reliability){ document.getElementById('summarySuccessRate').textContent = fmtPercent(reliability.success_rate||0); updateChangeEl('summaryReliabilityChange', reliability.reliability_change||0); }
+            
+            const usage = await fetchAPI('/api/admin/kpi/usage');
+            if(usage){ document.getElementById('summaryActiveUsers').textContent = fmtNumber(usage.active_users||0); updateChangeEl('summaryUsageChange', usage.active_users_change||0); }
+        }
+        
+        function updateChangeEl(id, val, inverse=false){
+            const el = document.getElementById(id);
+            if(!el) return;
+            const isPositive = inverse ? val <= 0 : val >= 0;
+            el.className = `summary-card-change ${isPositive ? 'positive' : 'negative'}`;
+            el.innerHTML = `<i class="fas fa-arrow-${val >= 0 ? 'up' : 'down'}"></i> ${Math.abs(val||0).toFixed(1)}%`;
+        }
+        
+        async function loadCharts(){
+            const [rev,usr]=await Promise.all([fetchAPI('/api/admin/chart/revenue?period=30d'),fetchAPI('/api/admin/chart/users?period=30d')]);
+            renderRevenueChart(rev||{labels:[],values:[]}); renderUserGrowthChart(usr||{labels:[],values:[]});
+        }
+        
+        function renderRevenueChart(d){ const ctx=document.getElementById('revenueChart')?.getContext('2d'); if(!ctx)return; if(revenueChart)revenueChart.destroy(); revenueChart=new Chart(ctx,{type:'line',data:{labels:d.labels||[],datasets:[{data:d.values||[],borderColor:'#22c55e',backgroundColor:'rgba(34,197,94,0.1)',fill:true,tension:0.4,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(255,255,255,0.5)',maxTicksLimit:8}},y:{grid:{color:'rgba(255,255,255,0.05)'},ticks:{color:'rgba(255,255,255,0.5)',callback:v=>'$'+v.toLocaleString()}}}}}); }
+        function renderUserGrowthChart(d){ const ctx=document.getElementById('userGrowthChart')?.getContext('2d'); if(!ctx)return; if(userGrowthChart)userGrowthChart.destroy(); userGrowthChart=new Chart(ctx,{type:'line',data:{labels:d.labels||[],datasets:[{data:d.values||[],borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',fill:true,tension:0.4,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(255,255,255,0.5)',maxTicksLimit:8}},y:{grid:{color:'rgba(255,255,255,0.05)'},ticks:{color:'rgba(255,255,255,0.5)'}}}}}); }
+        
+        async function loadActivity(){ const d=await fetchAPI('/api/admin/activity?limit=10'); const c=document.getElementById('activityList'); if(!d||!d.length){ c.innerHTML='<div class="empty-state"><i class="fas fa-clock"></i><p>No recent activity</p></div>'; return; } const icons={signup:{i:'fa-user-plus',c:'signup'},upgrade:{i:'fa-arrow-up',c:'upgrade'},downgrade:{i:'fa-arrow-down',c:'downgrade'},payment:{i:'fa-dollar-sign',c:'payment'},upload:{i:'fa-cloud-upload-alt',c:'upload'}}; c.innerHTML=d.map(a=>{const ic=icons[a.type]||{i:'fa-circle',c:''};return`<div class="activity-item"><div class="activity-icon ${ic.c}"><i class="fas ${ic.i}"></i></div><div class="activity-content"><div class="activity-text">${a.description||a.message||''}</div><div class="activity-time">${fmtRelTime(a.created_at)}</div></div></div>`;}).join(''); }
+        async function loadTopUsers(){ const d=await fetchAPI('/api/admin/top-users?limit=5&sort=revenue'); const tb=document.getElementById('topUsersTable'); if(!d||!d.length){ tb.innerHTML='<tr><td colspan="4" class="empty-state">No data</td></tr>'; return; } tb.innerHTML=d.map(u=>{const n=u.name||u.email?.split('@')[0]||'User';const t=u.tier||u.subscription_tier||'free';return`<tr><td><div class="user-cell"><div class="user-avatar-sm">${n.charAt(0).toUpperCase()}</div><div>${n}</div></div></td><td><span class="tier-badge ${t.toLowerCase().replace(' ','_')}">${t}</span></td><td>${fmtNumber(u.uploads||0)}</td><td>${fmtCurrency(u.revenue||0)}</td></tr>`;}).join(''); }
+        async function loadAllUsers(){ const d=await fetchAPI('/api/admin/users?limit=1000'); allUsers=d?.users||d||[]; }
+        
+        window.openAnnouncementModal=function(){ document.getElementById('announcementModal').classList.add('active'); document.getElementById('announcementTitle').value=''; document.getElementById('announcementBody').value=''; document.getElementById('channelEmail').checked=true; document.getElementById('channelDiscordCommunity').checked=false; document.getElementById('channelDiscordWebhooks').checked=false; document.querySelector('input[name="audience"][value="all"]').checked=true; document.getElementById('tierSelection').classList.remove('active'); document.getElementById('userSearchContainer').classList.remove('active'); selectedUserIds=[]; renderSelectedUsers(); document.getElementById('sendingProgress').classList.remove('active'); document.getElementById('announcementForm').style.display='block'; document.getElementById('announcementFooter').style.display='flex'; };
+        window.closeAnnouncementModal=function(){ document.getElementById('announcementModal').classList.remove('active'); };
+        
+        window.sendAnnouncement=async function(){
+            const title=document.getElementById('announcementTitle').value.trim();
+            const body=document.getElementById('announcementBody').value.trim();
+            if(!title||!body){ showToast('Please enter title and message','error'); return; }
+            const channels=[]; if(document.getElementById('channelEmail').checked) channels.push('email'); if(document.getElementById('channelDiscordCommunity').checked) channels.push('discord_community'); if(document.getElementById('channelDiscordWebhooks').checked) channels.push('discord_webhooks');
+            if(channels.length===0){ showToast('Select at least one channel','error'); return; }
+            const audienceType=document.querySelector('input[name="audience"]:checked').value;
+            let audience={type:audienceType};
+            if(audienceType==='tier'){ const tiers=[]; ['Launch','Pro','Studio','Agency'].forEach(t=>{if(document.getElementById('tier'+t)?.checked) tiers.push(t.toLowerCase());}); if(tiers.length===0){showToast('Select at least one tier','error');return;} audience.tiers=tiers; }
+            else if(audienceType==='specific'){ if(selectedUserIds.length===0){showToast('Select at least one user','error');return;} audience.userIds=selectedUserIds; }
+            document.getElementById('announcementForm').style.display='none'; document.getElementById('announcementFooter').style.display='none'; document.getElementById('sendingProgress').classList.add('active'); document.getElementById('sendingStatus').textContent='Sending to '+channels.join(', ')+'...';
+            try{ const r=await fetch(`${API_BASE}/api/admin/announcements`,{method:'POST',headers:{'Authorization':`Bearer ${getToken()}`,'Content-Type':'application/json'},body:JSON.stringify({title,body,channels,audience})}); if(r.ok){ const res=await r.json(); showToast(`Sent! ${res.delivered||0} recipients`,'success'); closeAnnouncementModal(); }else{ throw new Error((await r.json().catch(()=>({}))).message||'Failed'); } }catch(e){ showToast(e.message||'Failed to send','error'); document.getElementById('sendingProgress').classList.remove('active'); document.getElementById('announcementForm').style.display='block'; document.getElementById('announcementFooter').style.display='flex'; }
+        };
+        
+        function searchUsers(q){
+            const r = document.getElementById('userSearchResults');
+            if (!r) return;
+            r.textContent = '';
+            if (!q || q.length < 2) return;
+
+            const ql = q.toLowerCase();
+            const f = allUsers
+                .filter(u => {
+                    const n = String(u.name || '').toLowerCase();
+                    const e = String(u.email || '').toLowerCase();
+                    return (n.includes(ql) || e.includes(ql)) && !selectedUserIds.includes(u.id);
+                })
+                .slice(0, 10);
+
+            if (f.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'user-search-result';
+                empty.style.color = 'var(--text-muted)';
+                empty.textContent = 'No users found';
+                r.appendChild(empty);
+                return;
+            }
+
+            for (const u of f) {
+                const row = document.createElement('div');
+                row.className = 'user-search-result';
+                row.tabIndex = 0;
+
+                const nameSpan = document.createElement('span');
+                nameSpan.textContent = u.name || u.email || 'User';
+
+                const emailSpan = document.createElement('span');
+                emailSpan.textContent = u.email || '';
+                emailSpan.style.color = 'var(--text-muted)';
+                emailSpan.style.marginLeft = 'auto';
+                emailSpan.style.fontSize = '0.75rem';
+
+                row.appendChild(nameSpan);
+                row.appendChild(emailSpan);
+
+                row.addEventListener('click', () => window.selectUser(u.id));
+                row.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        window.selectUser(u.id);
+                    }
+                });
+                r.appendChild(row);
+            }
+        }
+
+        window.selectUser=function(id){
+            if(!selectedUserIds.includes(id)){
+                selectedUserIds.push(id);
+                renderSelectedUsers();
+            }
+            const input = document.getElementById('userSearchInput');
+            if (input) input.value = '';
+            const results = document.getElementById('userSearchResults');
+            if (results) results.textContent = '';
+        };
+        window.removeSelectedUser=function(id){ selectedUserIds=selectedUserIds.filter(uid=>uid!==id); renderSelectedUsers(); };
+        function renderSelectedUsers(){
+            const c = document.getElementById('selectedUsers');
+            if (!c) return;
+            c.textContent = '';
+            if (selectedUserIds.length === 0) return;
+
+            for (const id of selectedUserIds) {
+                const u = allUsers.find(x => x.id === id);
+                const n = u ? (u.name || u.email) : id;
+
+                const tag = document.createElement('span');
+                tag.className = 'selected-user-tag';
+
+                const label = document.createElement('span');
+                label.textContent = n || id;
+
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.innerHTML = '&times;';
+                btn.addEventListener('click', () => window.removeSelectedUser(id));
+
+                tag.appendChild(label);
+                tag.appendChild(btn);
+                c.appendChild(tag);
+            }
+        }
+        
+        function setupEventListeners(){
+            document.querySelectorAll('input[name="audience"]').forEach(r=>{r.addEventListener('change',()=>{document.getElementById('tierSelection').classList.toggle('active',r.value==='tier');document.getElementById('userSearchContainer').classList.toggle('active',r.value==='specific');});});
+            document.getElementById('userSearchInput')?.addEventListener('input',e=>searchUsers(e.target.value));
+            document.getElementById('announcementModal')?.addEventListener('click',e=>{if(e.target.id==='announcementModal')closeAnnouncementModal();});
+        }
+        
+        function fmtCurrency(v){if(v==null)return'$--';return'$'+Number(v).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});}
+        function fmtNumber(v){if(v==null)return'--';if(v>=1e6)return(v/1e6).toFixed(1)+'M';if(v>=1e3)return(v/1e3).toFixed(1)+'K';return Number(v).toLocaleString('en-US');}
+        function fmtPercent(v){if(v==null)return'--%';return Number(v).toFixed(1)+'%';}
+        function fmtRelTime(dt){if(!dt)return'';const d=new Date(dt),n=new Date(),ms=n-d,m=Math.floor(ms/60000),h=Math.floor(ms/3600000),dy=Math.floor(ms/86400000);if(m<1)return'just now';if(m<60)return m+'m ago';if(h<24)return h+'h ago';if(dy<7)return dy+'d ago';return d.toLocaleDateString();}
+        
+        // ============================================
+        // Discord Notification Settings Functions
+        // ============================================
+        let notifSettings = {};
+        
+        async function loadNotificationSettings(){
+            try{
+                const d = await fetchAPI('/api/admin/notification-settings');
+                if(d){
+                    notifSettings = d;
+                    applyNotificationSettings(d);
+                    updateNotifStatus(true);
+                }
+            }catch(e){
+                console.error('Failed to load notification settings:', e);
+                updateNotifStatus(false);
+            }
+        }
+        
+        function applyNotificationSettings(s){
+            // Revenue toggles
+            const el1 = document.getElementById('toggleMrrCharge'); if(el1) el1.checked = s.notify_mrr_charge || false;
+            const el2 = document.getElementById('toggleTopup'); if(el2) el2.checked = s.notify_topup || false;
+            const el3 = document.getElementById('toggleUpgrade'); if(el3) el3.checked = s.notify_upgrade || false;
+            const el4 = document.getElementById('toggleDowngrade'); if(el4) el4.checked = s.notify_downgrade || false;
+            const el5 = document.getElementById('toggleCancel'); if(el5) el5.checked = s.notify_cancel || false;
+            const el6 = document.getElementById('toggleRefund'); if(el6) el6.checked = s.notify_refund || false;
+            
+            // Cost toggles
+            const el7 = document.getElementById('toggleOpenaiCost'); if(el7) el7.checked = s.notify_openai_cost || false;
+            const el8 = document.getElementById('toggleStorageCost'); if(el8) el8.checked = s.notify_storage_cost || false;
+            const el9 = document.getElementById('toggleComputeCost'); if(el9) el9.checked = s.notify_compute_cost || false;
+            const el10 = document.getElementById('toggleWeeklyReport'); if(el10) el10.checked = s.notify_weekly_report || false;
+            
+            // Calendar toggles
+            const el11 = document.getElementById('toggleStripePayout'); if(el11) el11.checked = s.notify_stripe_payout || false;
+            const el12 = document.getElementById('toggleCloudBilling'); if(el12) el12.checked = s.notify_cloud_billing || false;
+            const el13 = document.getElementById('toggleRenderRenewal'); if(el13) el13.checked = s.notify_render_renewal || false;
+            
+            // Billing dates
+            const d1 = document.getElementById('stripePayoutDay'); if(d1 && s.stripe_payout_day) d1.value = s.stripe_payout_day;
+            const d2 = document.getElementById('cloudBillingDay'); if(d2 && s.cloud_billing_day) d2.value = s.cloud_billing_day;
+            const d3 = document.getElementById('renderRenewalDay'); if(d3 && s.render_renewal_day) d3.value = s.render_renewal_day;
+            
+            // Webhook URL
+            const wh = document.getElementById('adminWebhookUrl'); if(wh && s.admin_webhook_url) wh.value = s.admin_webhook_url;
+            
+            // Update master toggles
+            updateMasterToggles();
+        }
+        
+        function updateMasterToggles(){
+            const revenueToggles = ['toggleMrrCharge','toggleTopup','toggleUpgrade','toggleDowngrade','toggleCancel','toggleRefund'];
+            const costsToggles = ['toggleOpenaiCost','toggleStorageCost','toggleComputeCost','toggleWeeklyReport'];
+            const calendarToggles = ['toggleStripePayout','toggleCloudBilling','toggleRenderRenewal'];
+            
+            const allRevenueOn = revenueToggles.every(id => document.getElementById(id)?.checked);
+            const allCostsOn = costsToggles.every(id => document.getElementById(id)?.checked);
+            const allCalendarOn = calendarToggles.every(id => document.getElementById(id)?.checked);
+            
+            const t1 = document.getElementById('toggleRevenueAll'); if(t1) t1.checked = allRevenueOn;
+            const t2 = document.getElementById('toggleCostsAll'); if(t2) t2.checked = allCostsOn;
+            const t3 = document.getElementById('toggleCalendarAll'); if(t3) t3.checked = allCalendarOn;
+        }
+        
+        window.toggleSection = function(section, enabled){
+            let toggleIds = [];
+            if(section === 'revenue') toggleIds = ['toggleMrrCharge','toggleTopup','toggleUpgrade','toggleDowngrade','toggleCancel','toggleRefund'];
+            else if(section === 'costs') toggleIds = ['toggleOpenaiCost','toggleStorageCost','toggleComputeCost','toggleWeeklyReport'];
+            else if(section === 'calendar') toggleIds = ['toggleStripePayout','toggleCloudBilling','toggleRenderRenewal'];
+            
+            toggleIds.forEach(id => {
+                const el = document.getElementById(id);
+                if(el) el.checked = enabled;
+            });
+        };
+        
+        function updateNotifStatus(connected){
+            const dot = document.getElementById('notifStatusDot');
+            const text = document.getElementById('notifStatusText');
+            if(dot && text){
+                if(connected){
+                    dot.classList.add('active');
+                    text.textContent = 'Connected';
+                }else{
+                    dot.classList.remove('active');
+                    text.textContent = 'Not configured';
+                }
+            }
+        }
+        
+        window.saveNotificationSettings = async function(){
+            const btn = document.getElementById('saveNotifBtn');
+            const statusText = document.getElementById('saveStatusText');
+            if(!btn) return;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Saving...';
+            
+            const settings = {
+                notify_mrr_charge: document.getElementById('toggleMrrCharge')?.checked || false,
+                notify_topup: document.getElementById('toggleTopup')?.checked || false,
+                notify_upgrade: document.getElementById('toggleUpgrade')?.checked || false,
+                notify_downgrade: document.getElementById('toggleDowngrade')?.checked || false,
+                notify_cancel: document.getElementById('toggleCancel')?.checked || false,
+                notify_refund: document.getElementById('toggleRefund')?.checked || false,
+                notify_openai_cost: document.getElementById('toggleOpenaiCost')?.checked || false,
+                notify_storage_cost: document.getElementById('toggleStorageCost')?.checked || false,
+                notify_compute_cost: document.getElementById('toggleComputeCost')?.checked || false,
+                notify_weekly_report: document.getElementById('toggleWeeklyReport')?.checked || false,
+                notify_stripe_payout: document.getElementById('toggleStripePayout')?.checked || false,
+                notify_cloud_billing: document.getElementById('toggleCloudBilling')?.checked || false,
+                notify_render_renewal: document.getElementById('toggleRenderRenewal')?.checked || false,
+                stripe_payout_day: parseInt(document.getElementById('stripePayoutDay')?.value) || 15,
+                cloud_billing_day: parseInt(document.getElementById('cloudBillingDay')?.value) || 1,
+                render_renewal_day: parseInt(document.getElementById('renderRenewalDay')?.value) || 7,
+                admin_webhook_url: document.getElementById('adminWebhookUrl')?.value?.trim() || ''
+            };
+            
+            try{
+                const r = await fetch(`${API_BASE}/api/admin/notification-settings`, {
+                    method: 'PUT',
+                    headers: {'Authorization': `Bearer ${getToken()}`, 'Content-Type': 'application/json'},
+                    body: JSON.stringify(settings)
+                });
+                if(r.ok){
+                    notifSettings = settings;
+                    showToast('Notification settings saved!', 'success');
+                    if(statusText) statusText.textContent = 'Saved just now';
+                    updateNotifStatus(!!settings.admin_webhook_url);
+                }else{
+                    throw new Error('Failed to save');
+                }
+            }catch(e){
+                showToast('Failed to save settings', 'error');
+                if(statusText) statusText.textContent = 'Save failed';
+            }finally{
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-save"></i> Save Settings';
+            }
+        };
+        
+        window.testWebhook = async function(){
+            const urlEl = document.getElementById('adminWebhookUrl');
+            const url = urlEl?.value?.trim();
+            if(!url){
+                showToast('Enter a webhook URL first', 'error');
+                return;
+            }
+            
+            const btn = document.getElementById('testWebhookBtn');
+            if(!btn) return;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Testing...';
+            
+            try{
+                const r = await fetch(`${API_BASE}/api/admin/test-webhook`, {
+                    method: 'POST',
+                    headers: {'Authorization': `Bearer ${getToken()}`, 'Content-Type': 'application/json'},
+                    body: JSON.stringify({ webhook_url: url })
+                });
+                if(r.ok){
+                    showToast('Test message sent! Check your Discord', 'success');
+                }else{
+                    const err = await r.json().catch(()=>({}));
+                    throw new Error(err.detail || 'Webhook test failed');
+                }
+            }catch(e){
+                showToast(e.message || 'Webhook test failed', 'error');
+            }finally{
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fab fa-discord"></i> Test';
+            }
+        };
+        
+        // Load notification settings after admin content is shown
+        setTimeout(() => {
+            if(document.getElementById('adminContent')?.style.display !== 'none'){
+                loadNotificationSettings();
+            }
+        }, 1500);
+    })();
+    </script>
+</body>
+</html>

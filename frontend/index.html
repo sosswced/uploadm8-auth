@@ -62,8 +62,9 @@
   </div>
 
   <script>
-    const API_BASE = (typeof API_BASE_URL !== 'undefined') ? API_BASE_URL : (window.location.origin.includes('localhost') ? 'http://127.0.0.1:8000' : (window.location.hostname === 'app.uploadm8.com' ? 'https://auth.uploadm8.com' : ''));
-    const STRIPE_LOOKUP = { creator_lite: 'uploadm8_creatorlite_monthly', creator_pro: 'uploadm8_creatorpro_monthly', studio: 'uploadm8_studio_monthly', agency: 'uploadm8_agency_monthly' };
+    const API_BASE = (typeof API_BASE_URL !== 'undefined') ? API_BASE_URL : (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : (window.location.hostname === 'app.uploadm8.com' ? 'https://auth.uploadm8.com' : ''));
+    function esc(s) { const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
+
     const TIER_PERKS = {
       free: ['AI captions (basic)', 'Scheduling (4h lookahead)', '3 thumbnails', '4 accounts', '10-upload queue', 'Watermark on videos'],
       creator_lite: ['No watermark', 'Scheduling (12h)', 'Webhooks', '10 accounts', '100-upload queue', '5 thumbnails', '7-day trial'],
@@ -75,9 +76,12 @@
     async function loadPricing() {
       try {
         const r = await fetch(API_BASE + '/api/pricing');
-        const { tiers, topups } = await r.json();
-        renderTiers(tiers);
-        renderTopups(topups);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        const tiers = data.tiers || [];
+        const topups = data.topups || [];
+        if (tiers.length) renderTiers(tiers); else document.getElementById('pricing-grid').innerHTML = '<p style="color:var(--muted);">No plans available.</p>';
+        if (topups.length) renderTopups(topups); else document.getElementById('topup-grid').innerHTML = '<p style="color:var(--muted);">No top-ups available.</p>';
       } catch (e) {
         document.getElementById('pricing-grid').innerHTML = '<p style="color:#ef4444;">Could not load pricing. Check API connection.</p>';
         document.getElementById('topup-grid').innerHTML = '<p style="color:#ef4444;">Could not load top-ups.</p>';
@@ -92,16 +96,16 @@
         const perks = TIER_PERKS[t.slug] || [];
         return `
           <div class="tier-card ${isPopular ? 'popular' : ''}">
-            <div class="tier-name">${t.name} ${isPopular ? '<span class="badge">POPULAR</span>' : ''}</div>
-            <div class="tier-price">${t.price === 0 ? 'Free' : '$' + t.price}<span>/mo</span></div>
+            <div class="tier-name">${esc(t.name)} ${isPopular ? '<span class="badge">POPULAR</span>' : ''}</div>
+            <div class="tier-price">${t.price === 0 ? 'Free' : '$' + esc(t.price)}<span>/mo</span></div>
             <div class="tier-tokens">
-              <strong>${t.put_monthly} PUT</strong> + <strong>${t.aic_monthly} AIC</strong> / month
+              <strong>${esc(t.put_monthly)} PUT</strong> + <strong>${esc(t.aic_monthly)} AIC</strong> / month
             </div>
             <ul class="tier-perks">${perks.map(p => `<li>${p}</li>`).join('')}</ul>
             <div style="margin-top: 1rem;">
               ${isFree
                 ? '<a href="/signup.html" class="btn btn-outline" style="width:100%;">Get Started</a>'
-                : `<button class="btn btn-primary" style="width:100%;" data-lookup="${t.stripe_lookup_key || ''}" onclick="subscribeTier(this.dataset.lookup)">Subscribe</button>`
+                : `<button class="btn btn-primary" style="width:100%;" data-lookup="${esc(t.stripe_lookup_key || '')}" onclick="subscribeTier(this.dataset.lookup)">Subscribe</button>`
               }
             </div>
           </div>
@@ -116,17 +120,17 @@
       grid.innerHTML = `
         <div style="grid-column: 1/-1; font-weight:600; color: var(--muted); margin-bottom: 0.5rem;">Platform Upload Tokens (PUT)</div>
         ${putPacks.map(t => `
-          <div class="topup-card" data-lookup="${t.lookup_key}" data-wallet="put" data-amount="${t.amount}">
-            <div class="topup-amount">+${t.amount} PUT</div>
-            <div class="topup-price">$${t.price_usd || '—'}</div>
+          <div class="topup-card" data-lookup="${esc(t.lookup_key)}" data-wallet="put" data-amount="${esc(t.amount)}">
+            <div class="topup-amount">+${esc(t.amount)} PUT</div>
+            <div class="topup-price">$${esc(t.price_usd || '—')}</div>
             <div class="topup-bonus">First time: +25% bonus</div>
           </div>
         `).join('')}
         <div style="grid-column: 1/-1; font-weight:600; color: var(--muted); margin: 1rem 0 0.5rem;">AI Credits (AIC)</div>
         ${aicPacks.map(t => `
-          <div class="topup-card" data-lookup="${t.lookup_key}" data-wallet="aic" data-amount="${t.amount}">
-            <div class="topup-amount">+${t.amount} AIC</div>
-            <div class="topup-price">$${t.price_usd || '—'}</div>
+          <div class="topup-card" data-lookup="${esc(t.lookup_key)}" data-wallet="aic" data-amount="${esc(t.amount)}">
+            <div class="topup-amount">+${esc(t.amount)} AIC</div>
+            <div class="topup-price">$${esc(t.price_usd || '—')}</div>
             <div class="topup-bonus">First time: +25% bonus</div>
           </div>
         `).join('')}
@@ -136,8 +140,9 @@
           const lookup = el.dataset.lookup;
           if (lookup) {
             const token = localStorage.getItem('access_token');
-            if (token) window.location.href = '/settings.html#billing';
-            else window.location.href = '/login.html?redirect=' + encodeURIComponent('/settings.html#billing');
+            const dest = '/settings.html#billing&topup=' + encodeURIComponent(lookup);
+            if (token) window.location.href = dest;
+            else window.location.href = '/login.html?redirect=' + encodeURIComponent(dest);
           }
         });
       });
@@ -149,6 +154,8 @@
         window.location.href = '/login.html?redirect=' + encodeURIComponent(window.location.pathname + '#pricing');
         return;
       }
+      const btn = document.querySelector(`[data-lookup="${lookupKey}"]`);
+      if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
       try {
         const r = await fetch(API_BASE + '/api/billing/checkout', {
           method: 'POST',
@@ -156,10 +163,13 @@
           body: JSON.stringify({ lookup_key: lookupKey, kind: 'subscription' })
         });
         const data = await r.json();
+        if (!r.ok) { alert(data.detail || `Checkout failed (${r.status})`); return; }
         if (data.checkout_url) window.location.href = data.checkout_url;
         else alert(data.detail || 'Checkout failed');
       } catch (e) {
         alert('Could not start checkout');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Subscribe'; }
       }
     }
 

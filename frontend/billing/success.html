@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Confirmed — UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg:        #0a0a0f;
+            --card:      #14141e;
+            --card2:     #1a1a27;
+            --border:    rgba(255,255,255,.08);
+            --border2:   rgba(255,255,255,.13);
+            --text:      #f3f4f6;
+            --muted:     #9ca3af;
+            --dim:       #6b7280;
+            --orange:    #f97316;
+            --orange2:   #ea580c;
+            --purple:    #8b5cf6;
+            --blue:      #3b82f6;
+            --green:     #22c55e;
+            --yellow:    #fbbf24;
+            --red:       #ef4444;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+            overflow-x: hidden;
+        }
+
+        /* ── Ambient background ──────────────────── */
+        .ambient {
+            position: fixed; inset: 0; pointer-events: none; z-index: 0;
+            overflow: hidden;
+        }
+        .ambient-orb {
+            position: absolute; border-radius: 50%;
+            filter: blur(80px); opacity: 0;
+            transition: opacity 1.5s ease;
+        }
+        .ambient-orb.a { width:600px;height:600px; top:-150px;left:50%;transform:translateX(-50%); background:radial-gradient(circle,rgba(249,115,22,.2),transparent 70%); }
+        .ambient-orb.b { width:400px;height:400px; bottom:0;right:-100px; background:radial-gradient(circle,rgba(139,92,246,.15),transparent 70%); }
+        .ambient-orb.c { width:300px;height:300px; bottom:0;left:-50px; background:radial-gradient(circle,rgba(59,130,246,.1),transparent 70%); }
+        body.loaded .ambient-orb { opacity: 1; }
+
+        /* ── Canvas for confetti ─────────────────── */
+        #confetti { position:fixed;inset:0;pointer-events:none;z-index:1; }
+
+        /* ── Main card ───────────────────────────── */
+        .card {
+            position: relative; z-index: 2;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            width: 100%; max-width: 520px;
+            overflow: hidden;
+            box-shadow: 0 0 0 1px rgba(249,115,22,.06), 0 40px 80px rgba(0,0,0,.5);
+            opacity: 0; transform: translateY(24px) scale(.97);
+            transition: opacity .6s cubic-bezier(.16,1,.3,1), transform .6s cubic-bezier(.16,1,.3,1);
+        }
+        body.loaded .card { opacity: 1; transform: translateY(0) scale(1); }
+
+        /* Rainbow top bar */
+        .rainbow-bar {
+            height: 3px;
+            background: linear-gradient(90deg, #f97316 0%, #a855f7 40%, #3b82f6 70%, #22c55e 100%);
+        }
+
+        .card-body { padding: 2.5rem 2.25rem 2.25rem; }
+
+        /* ── Loading state ───────────────────────── */
+        #stateLoading { text-align:center; padding:1.5rem 0; }
+        .spin-ring {
+            width: 52px; height: 52px;
+            border: 3px solid rgba(249,115,22,.15);
+            border-top-color: var(--orange);
+            border-radius: 50%;
+            margin: 0 auto 1.25rem;
+            animation: spin .75s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .spin-label { color: var(--muted); font-size: .875rem; }
+        .spin-sublabel { font-size: .75rem; color: var(--dim); margin-top: .35rem; }
+
+        /* ── Success state ───────────────────────── */
+        #stateSuccess, #stateError { display: none; }
+
+        .check-ring {
+            width: 76px; height: 76px;
+            background: linear-gradient(135deg, #f97316, #ea580c);
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 1.25rem;
+            font-size: 1.8rem; color: #fff;
+            box-shadow: 0 0 0 0 rgba(249,115,22,.4);
+            transform: scale(0) rotate(-20deg);
+            transition: transform .55s cubic-bezier(.16,1,.3,1) .1s;
+        }
+        .check-ring.pop { transform: scale(1) rotate(0deg); animation: ring-pulse 2s ease 0.65s; }
+        @keyframes ring-pulse {
+            0%   { box-shadow: 0 0 0 0   rgba(249,115,22,.5); }
+            60%  { box-shadow: 0 0 0 22px rgba(249,115,22,.1); }
+            100% { box-shadow: 0 0 0 36px rgba(249,115,22,0);  }
+        }
+
+        /* Fade-up reveal sequence */
+        .reveal { opacity: 0; transform: translateY(10px); transition: opacity .4s ease, transform .4s ease; }
+        .reveal.show { opacity: 1; transform: none; }
+
+        /* Eyebrow + headline */
+        .eyebrow { font-size:.7rem; font-weight:700; letter-spacing:.18em; text-transform:uppercase; color:var(--orange); margin-bottom:.4rem; }
+        .headline { font-family:'Syne',sans-serif; font-size:1.7rem; font-weight:800; line-height:1.15; margin-bottom:.5rem; }
+        .subline   { font-size:.875rem; color:var(--muted); line-height:1.6; }
+
+        /* ── Test mode badge ─────────────────────── */
+        .test-badge {
+            display: inline-flex; align-items: center; gap: .35rem;
+            background: rgba(251,191,36,.1); border: 1px solid rgba(251,191,36,.25);
+            color: var(--yellow); border-radius: 999px;
+            padding: .25rem .75rem; font-size: .7rem; font-weight: 700;
+            letter-spacing: .06em; text-transform: uppercase;
+            margin-bottom: .9rem;
+        }
+
+        /* ── Amount badge ────────────────────────── */
+        .amount-row {
+            display: flex; align-items: center; gap: .75rem;
+            background: rgba(34,197,94,.06); border: 1px solid rgba(34,197,94,.15);
+            border-radius: 12px; padding: .875rem 1rem;
+            margin: 1.25rem 0;
+        }
+        .amount-icon { width:36px;height:36px;background:rgba(34,197,94,.12);border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0;color:var(--green);font-size:1rem; }
+        .amount-label { font-size:.75rem; color:var(--muted); }
+        .amount-value { font-size:1rem; font-weight:700; color:var(--text); }
+        .amount-status { margin-left:auto; display:flex;align-items:center;gap:.4rem;font-size:.75rem;font-weight:600; }
+        .paid-dot { width:7px;height:7px;border-radius:50%;background:var(--green); }
+
+        /* ── Plan pill ───────────────────────────── */
+        .plan-pill {
+            display: inline-flex; align-items: center; gap: .45rem;
+            border-radius: 999px; padding: .35rem 1rem;
+            font-size: .8rem; font-weight: 700;
+            margin-bottom: 1.25rem;
+        }
+
+        /* ── Wallet row ──────────────────────────── */
+        .wallet-grid { display:grid;grid-template-columns:1fr 1fr;gap:.875rem;margin-bottom:1.25rem; }
+        .wallet-card {
+            border-radius: 12px; padding: 1rem;
+            text-align: center; position: relative; overflow: hidden;
+        }
+        .wallet-card.put  { background:rgba(249,115,22,.07); border:1px solid rgba(249,115,22,.2); }
+        .wallet-card.aic  { background:rgba(139,92,246,.07); border:1px solid rgba(139,92,246,.2); }
+        .wallet-emoji { font-size:1.3rem; margin-bottom:.25rem; }
+        .wallet-num   { font-family:'Syne',sans-serif; font-size:2rem; font-weight:800; line-height:1; }
+        .wallet-lbl   { font-size:.65rem; text-transform:uppercase; letter-spacing:.12em; margin-top:.3rem; font-weight:700; }
+        .wallet-sub   { font-size:.7rem; color:var(--muted); margin-top:.15rem; }
+        .wallet-card.put .wallet-lbl { color:var(--orange); }
+        .wallet-card.aic .wallet-lbl { color:var(--purple); }
+
+        /* ── Trial banner ────────────────────────── */
+        .trial-strip {
+            display: none; align-items: center; gap: .6rem;
+            background: rgba(245,158,11,.07); border: 1px solid rgba(245,158,11,.2);
+            border-radius: 10px; padding: .75rem 1rem;
+            font-size: .8rem; color: var(--yellow);
+            margin-bottom: 1.25rem;
+        }
+        .trial-strip.show { display: flex; }
+
+        /* ── Feature list ────────────────────────── */
+        .features-label { font-size:.65rem;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--dim);margin-bottom:.6rem; }
+        .feature-grid { display:grid;grid-template-columns:1fr 1fr;gap:.45rem;margin-bottom:1.5rem; }
+        .feat-item {
+            display:flex;align-items:center;gap:.5rem;
+            background:rgba(255,255,255,.03); border:1px solid var(--border);
+            border-radius:8px; padding:.5rem .7rem;
+            font-size:.78rem;
+        }
+        .feat-item i { width:13px;text-align:center;flex-shrink:0; }
+        .feat-item.yes i { color:var(--green); }
+        .feat-item.no  { opacity:.45; }
+        .feat-item.no i { color:var(--dim); }
+
+        /* ── CTA buttons ─────────────────────────── */
+        .cta-row { display:flex;gap:.75rem;flex-wrap:wrap; }
+        .btn-primary {
+            flex:1;min-width:140px;
+            display:flex;align-items:center;justify-content:center;gap:.5rem;
+            background:linear-gradient(135deg,#f97316,#ea580c);
+            color:#fff;border:none;border-radius:10px;
+            padding:.875rem 1.25rem; font-size:.9rem; font-weight:600;
+            text-decoration:none; cursor:pointer;
+            transition:transform .15s,box-shadow .15s;
+        }
+        .btn-primary:hover { transform:translateY(-2px);box-shadow:0 8px 24px rgba(249,115,22,.35); }
+        .btn-secondary {
+            flex:1;min-width:140px;
+            display:flex;align-items:center;justify-content:center;gap:.5rem;
+            background:transparent;color:var(--muted);
+            border:1px solid var(--border);border-radius:10px;
+            padding:.875rem 1.25rem; font-size:.9rem; font-weight:600;
+            text-decoration:none; cursor:pointer;
+            transition:border-color .15s,color .15s;
+        }
+        .btn-secondary:hover { border-color:rgba(249,115,22,.35);color:var(--text); }
+
+        /* ── Session debug (test mode only) ──────── */
+        .session-meta {
+            display:none;
+            margin-top:1.25rem; padding:1rem;
+            background:rgba(251,191,36,.05); border:1px solid rgba(251,191,36,.15);
+            border-radius:10px; font-size:.72rem; color:var(--muted);
+        }
+        .session-meta.show { display:block; }
+        .session-meta pre { font-size:.68rem; color:var(--yellow); white-space:pre-wrap; word-break:break-all; margin-top:.5rem; }
+
+        /* ── Error state ─────────────────────────── */
+        .err-icon { width:64px;height:64px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 1.25rem;font-size:1.5rem;color:var(--red); }
+        .err-msg { font-size:.85rem;color:var(--muted);line-height:1.6;margin-bottom:1.5rem; }
+
+        /* ── Topup variant ───────────────────────── */
+        .topup-icon { font-size:2rem;margin-bottom:.5rem; }
+
+        /* ── Responsive ──────────────────────────── */
+        @media(max-width:480px){
+            .card-body { padding:2rem 1.5rem; }
+            .wallet-grid, .feature-grid { grid-template-columns:1fr; }
+            .cta-row .btn-primary, .cta-row .btn-secondary { min-width:100%; }
+            .headline { font-size:1.4rem; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Ambient glows -->
+<div class="ambient">
+    <div class="ambient-orb a"></div>
+    <div class="ambient-orb b"></div>
+    <div class="ambient-orb c"></div>
+</div>
+
+<!-- Confetti canvas -->
+<canvas id="confetti"></canvas>
+
+<!-- Card -->
+<div class="card" id="mainCard">
+    <div class="rainbow-bar"></div>
+    <div class="card-body">
+
+        <!-- ── LOADING ── -->
+        <div id="stateLoading">
+            <div class="spin-ring"></div>
+            <p class="spin-label">Verifying with Stripe…</p>
+            <p class="spin-sublabel" id="loadingDetail">Checking your session</p>
+        </div>
+
+        <!-- ── SUCCESS ── -->
+        <div id="stateSuccess">
+            <!-- Test mode badge (only visible for test sessions) -->
+            <div class="test-badge" id="testBadge" style="display:none;">
+                <i class="fas fa-flask"></i> Test Mode — No real charge
+            </div>
+
+            <div class="check-ring" id="checkRing"><i class="fas fa-check"></i></div>
+
+            <div class="reveal" id="r0">
+                <div class="eyebrow" id="eyebrow"></div>
+                <h1 class="headline" id="headline"></h1>
+                <p class="subline" id="subline"></p>
+            </div>
+
+            <!-- Plan pill -->
+            <div class="reveal" id="r1" style="margin:.9rem 0 0;">
+                <div class="plan-pill" id="planPill"></div>
+            </div>
+
+            <!-- Amount charged -->
+            <div class="reveal" id="r2">
+                <div class="amount-row" id="amountRow">
+                    <div class="amount-icon"><i class="fas fa-receipt"></i></div>
+                    <div>
+                        <div class="amount-label" id="amountLabel"></div>
+                        <div class="amount-value" id="amountValue"></div>
+                    </div>
+                    <div class="amount-status">
+                        <div class="paid-dot" id="statusDot"></div>
+                        <span id="statusText"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Trial strip -->
+            <div class="reveal trial-strip" id="trialStrip">
+                <i class="fas fa-hourglass-half"></i>
+                <span id="trialText"></span>
+            </div>
+
+            <!-- Wallet -->
+            <div class="reveal" id="r3">
+                <div class="wallet-grid">
+                    <div class="wallet-card put">
+                        <div class="wallet-emoji">⚡</div>
+                        <div class="wallet-num" id="walletPUT">—</div>
+                        <div class="wallet-lbl">PUT Tokens</div>
+                        <div class="wallet-sub">Upload credits / mo</div>
+                    </div>
+                    <div class="wallet-card aic">
+                        <div class="wallet-emoji">🤖</div>
+                        <div class="wallet-num" id="walletAIC">—</div>
+                        <div class="wallet-lbl">AI Credits</div>
+                        <div class="wallet-sub">AI analysis / mo</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Features -->
+            <div class="reveal" id="r4">
+                <div class="features-label">What's included in your plan</div>
+                <div class="feature-grid" id="featureGrid"></div>
+            </div>
+
+            <!-- CTAs -->
+            <div class="reveal" id="r5">
+                <div class="cta-row">
+                    <a href="../upload.html" class="btn-primary"><i class="fas fa-cloud-upload-alt"></i> Start Uploading</a>
+                    <a href="../guide.html" class="btn-secondary"><i class="fas fa-book-open"></i> Feature Guide</a>
+                </div>
+            </div>
+
+            <!-- Session debug (test mode only) -->
+            <div class="session-meta" id="sessionMeta">
+                <strong style="color:var(--yellow);font-size:.7rem;"><i class="fas fa-bug"></i> Stripe Session Data (test mode only)</strong>
+                <pre id="sessionJSON"></pre>
+            </div>
+        </div>
+
+        <!-- ── ERROR ── -->
+        <div id="stateError">
+            <div class="err-icon"><i class="fas fa-exclamation-triangle"></i></div>
+            <h2 style="margin-bottom:.6rem;font-size:1.2rem;">Couldn't verify payment</h2>
+            <p class="err-msg" id="errMsg">We couldn't confirm your session with Stripe. If your card was charged, your account will update within a minute once the webhook fires.</p>
+            <div class="cta-row">
+                <a href="../settings.html#billing" class="btn-primary"><i class="fas fa-credit-card"></i> Check Billing</a>
+                <a href="../dashboard.html" class="btn-secondary"><i class="fas fa-home"></i> Dashboard</a>
+            </div>
+        </div>
+
+    </div><!-- /card-body -->
+</div><!-- /card -->
+
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════
+   UploadM8 — billing/success.html
+   Reads LIVE Stripe session data via /api/billing/session
+   then polls /api/me for wallet balance post-webhook.
+═══════════════════════════════════════════════════════════════ */
+
+const API_BASE = window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : 'https://auth.uploadm8.com');
+const TOKEN_KEY = 'uploadm8_access_token';
+
+// ── Tier metadata (mirrors entitlements.py) ─────────────────
+const TIER_META = {
+    free:           { name:'Free',            color:'#9ca3af', put:60,    aic:10,   bg:'rgba(156,163,175,.1)',  border:'rgba(156,163,175,.25)' },
+    creator_lite:   { name:'Creator Lite',    color:'#f97316', put:300,   aic:80,   bg:'rgba(249,115,22,.1)',   border:'rgba(249,115,22,.3)'   },
+    launch:         { name:'Creator Lite',    color:'#f97316', put:300,   aic:80,   bg:'rgba(249,115,22,.1)',   border:'rgba(249,115,22,.3)'   },
+    creator_pro:    { name:'Creator Pro',     color:'#8b5cf6', put:700,   aic:200,  bg:'rgba(139,92,246,.1)',   border:'rgba(139,92,246,.3)'   },
+    studio:         { name:'Studio',          color:'#3b82f6', put:2000,  aic:600,  bg:'rgba(59,130,246,.1)',   border:'rgba(59,130,246,.3)'   },
+    agency:         { name:'Agency',          color:'#22c55e', put:4500,  aic:1500, bg:'rgba(34,197,94,.1)',    border:'rgba(34,197,94,.3)'    },
+    friends_family: { name:'Friends & Family',color:'#fbbf24', put:999999,aic:999999,bg:'rgba(251,191,36,.1)', border:'rgba(251,191,36,.3)'   },
+    lifetime:       { name:'Lifetime',        color:'#fbbf24', put:999999,aic:999999,bg:'rgba(251,191,36,.1)', border:'rgba(251,191,36,.3)'   },
+    master_admin:   { name:'Admin',           color:'#ef4444', put:999999,aic:999999,bg:'rgba(239,68,68,.1)',   border:'rgba(239,68,68,.3)'    },
+};
+
+// ── Feature lists per tier ──────────────────────────────────
+const TIER_FEATS = {
+    free: [
+        { ok:true,  icon:'fa-cloud-upload-alt', label:'4 platform accounts'    },
+        { ok:false, icon:'fa-robot',            label:'AI captions'             },
+        { ok:false, icon:'fa-calendar-alt',     label:'Scheduled posts'         },
+        { ok:false, icon:'fa-film',             label:'HUD overlay'             },
+        { ok:true,  icon:'fa-chart-line',       label:'Basic analytics'         },
+        { ok:false, icon:'fa-bolt',             label:'Priority queue'          },
+    ],
+    creator_lite: [
+        { ok:true,  icon:'fa-cloud-upload-alt', label:'8 accounts (2 / platform)' },
+        { ok:true,  icon:'fa-robot',            label:'AI captions (enhanced)'    },
+        { ok:true,  icon:'fa-calendar-alt',     label:'Scheduled posts'           },
+        { ok:true,  icon:'fa-image',            label:'Up to 3 thumbnails'        },
+        { ok:true,  icon:'fa-bell',             label:'Webhook notifications'     },
+        { ok:true,  icon:'fa-chart-line',       label:'Standard analytics'        },
+    ],
+    creator_pro: [
+        { ok:true,  icon:'fa-cloud-upload-alt', label:'20 accounts (5 / platform)' },
+        { ok:true,  icon:'fa-robot',            label:'Advanced AI depth'           },
+        { ok:true,  icon:'fa-film',             label:'HUD burn-in overlay'         },
+        { ok:true,  icon:'fa-bolt',             label:'Priority queue (p2)'         },
+        { ok:true,  icon:'fa-image',            label:'5 candidate thumbnails'      },
+        { ok:true,  icon:'fa-users',            label:'3 team seats'                },
+    ],
+    studio: [
+        { ok:true,  icon:'fa-cloud-upload-alt', label:'60 accounts (15 / platform)' },
+        { ok:true,  icon:'fa-robot',            label:'Max AI — 15 frame scan'       },
+        { ok:true,  icon:'fa-file-excel',       label:'Excel export reports'         },
+        { ok:true,  icon:'fa-bolt',             label:'Turbo priority queue (p1)'    },
+        { ok:true,  icon:'fa-film',             label:'HUD burn-in overlay'          },
+        { ok:true,  icon:'fa-users',            label:'10 team seats'                },
+    ],
+    agency: [
+        { ok:true,  icon:'fa-cloud-upload-alt', label:'Unlimited accounts'          },
+        { ok:true,  icon:'fa-robot',            label:'Max AI + dense frame scan'   },
+        { ok:true,  icon:'fa-tag',              label:'White-label branding'        },
+        { ok:true,  icon:'fa-bolt',             label:'Top priority queue (p0)'     },
+        { ok:true,  icon:'fa-exchange-alt',     label:'Flex token transfers'        },
+        { ok:true,  icon:'fa-users',            label:'25 team seats'               },
+    ],
+};
+TIER_FEATS.launch = TIER_FEATS.creator_lite;
+
+// ── Helpers ─────────────────────────────────────────────────
+function $(id) { return document.getElementById(id); }
+function fmtNum(n) { return n >= 999999 ? '∞' : Number(n).toLocaleString(); }
+function fmtCurrency(n, cur) {
+    if (!n) return 'Free';
+    return new Intl.NumberFormat('en-US',{ style:'currency', currency: cur || 'USD' }).format(n);
+}
+function fmtDate(ts) {
+    if (!ts) return null;
+    return new Date(ts * 1000).toLocaleDateString('en-US',{ month:'long', day:'numeric', year:'numeric' });
+}
+function getToken() {
+    return localStorage.getItem(TOKEN_KEY) ||
+           sessionStorage.getItem(TOKEN_KEY) ||
+           localStorage.getItem('auth_token') ||
+           localStorage.getItem('token') || null;
+}
+
+function showState(id) {
+    ['stateLoading','stateSuccess','stateError'].forEach(s => {
+        $(s).style.display = s === id ? 'block' : 'none';
+    });
+}
+
+function setLoadingDetail(msg) {
+    var el = $('loadingDetail');
+    if (el) el.textContent = msg;
+}
+
+// ── API calls ────────────────────────────────────────────────
+async function api(path, opts) {
+    var token = getToken();
+    var headers = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    var res = await fetch(API_BASE + path, Object.assign({ headers: headers }, opts || {}));
+    if (!res.ok) throw Object.assign(new Error(res.statusText), { status: res.status });
+    return res.json();
+}
+
+// Poll /api/me until subscription_status is active or trialing (max ~15s)
+async function pollMe(maxTries, interval) {
+    maxTries  = maxTries  || 10;
+    interval  = interval  || 1500;
+    for (var i = 0; i < maxTries; i++) {
+        try {
+            var me = await api('/api/me');
+            var st = me && me.subscription_status;
+            if (st === 'active' || st === 'trialing' || st === 'past_due') return me;
+        } catch(e) {
+            if (e.status === 401 || e.status === 403) return null; // not logged in
+        }
+        await new Promise(function(r){ setTimeout(r, interval); });
+    }
+    try { return await api('/api/me'); } catch(e) { return null; }
+}
+
+// ── Confetti burst ───────────────────────────────────────────
+function fireworks() {
+    var canvas = $('confetti');
+    var ctx    = canvas.getContext('2d');
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    var COLS = ['#f97316','#fbbf24','#22c55e','#3b82f6','#a855f7','#f43f5e','#ffffff'];
+    var pieces = [];
+    for (var i = 0; i < 120; i++) {
+        pieces.push({
+            x:   Math.random() * canvas.width,
+            y:   -10 - Math.random() * 40,
+            w:   5  + Math.random() * 7,
+            h:   4  + Math.random() * 4,
+            col: COLS[Math.floor(Math.random() * COLS.length)],
+            vx:  (Math.random() - 0.5) * 5,
+            vy:  1.5 + Math.random() * 4,
+            rot: Math.random() * 360,
+            vr:  (Math.random() - 0.5) * 10,
+            life: 1,
+            circle: Math.random() > 0.5,
+        });
+    }
+
+    var raf;
+    (function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        var alive = false;
+        pieces.forEach(function(p) {
+            p.x  += p.vx; p.y += p.vy; p.rot += p.vr;
+            p.vy += 0.04; // gravity
+            p.life -= 0.011;
+            if (p.life <= 0 || p.y > canvas.height) return;
+            alive = true;
+            ctx.save();
+            ctx.globalAlpha = Math.max(0, p.life);
+            ctx.translate(p.x, p.y);
+            ctx.rotate(p.rot * Math.PI / 180);
+            ctx.fillStyle = p.col;
+            if (p.circle) {
+                ctx.beginPath(); ctx.arc(0, 0, p.w / 2, 0, Math.PI * 2); ctx.fill();
+            } else {
+                ctx.fillRect(-p.w/2, -p.h/2, p.w, p.h);
+            }
+            ctx.restore();
+        });
+        if (alive) raf = requestAnimationFrame(draw);
+        else { cancelAnimationFrame(raf); ctx.clearRect(0, 0, canvas.width, canvas.height); }
+    })();
+}
+
+// ── Reveal animation sequence ────────────────────────────────
+function revealAll(delays) {
+    delays = delays || [0, 100, 200, 300, 400, 500, 600];
+    ['r0','r1','r2','trialStrip','r3','r4','r5'].forEach(function(id, i) {
+        var el = $(id); if (!el) return;
+        var d = delays[i] || (i * 100);
+        setTimeout(function() { el.classList.add('show'); }, d);
+    });
+}
+
+// ── Render subscription success ──────────────────────────────
+function renderSubscription(stripe, me) {
+    var tier   = (stripe && stripe.tier)  || (me && me.subscription_tier) || 'creator_lite';
+    var status = (stripe && stripe.subscription_status) || (me && me.subscription_status) || 'active';
+    var meta   = TIER_META[tier] || TIER_META.creator_lite;
+    var feats  = TIER_FEATS[tier] || TIER_FEATS.creator_lite;
+    var isTest = stripe && stripe.is_test_mode;
+    var isTrialing = status === 'trialing';
+
+    // Test mode badge
+    if (isTest) { $('testBadge').style.display = 'inline-flex'; }
+
+    // Check icon pop
+    setTimeout(function() { $('checkRing').classList.add('pop'); }, 80);
+
+    // Eyebrow / headline
+    $('eyebrow').textContent  = isTrialing ? '7-Day Free Trial Active' : 'Subscription Confirmed';
+    $('headline').textContent = meta.name + (isTrialing ? ' trial started.' : ' activated.');
+    $('subline').textContent  = isTrialing
+        ? 'You have full ' + meta.name + ' access for 7 days. No charge until your trial ends.'
+        : 'Your wallet has been loaded. Credits renew automatically every billing period.';
+
+    // Plan pill
+    var pill = $('planPill');
+    pill.style.background = meta.bg;
+    pill.style.border      = '1px solid ' + meta.border;
+    pill.style.color       = meta.color;
+    pill.innerHTML = '<i class="fas fa-bolt"></i> ' + meta.name;
+
+    // Amount row
+    var amount = stripe && stripe.amount_total;
+    var cur    = stripe && stripe.currency;
+    if (amount > 0) {
+        $('amountLabel').textContent = isTrialing ? 'Billed after trial' : 'Amount charged';
+        $('amountValue').textContent = isTrialing
+            ? fmtCurrency(amount, cur) + ' / month'
+            : fmtCurrency(amount, cur) + ' ' + (cur || 'USD');
+    } else {
+        $('amountLabel').textContent = 'Plan cost';
+        $('amountValue').textContent = isTrialing ? 'Free for 7 days' : 'Free';
+    }
+    var dot = $('statusDot');
+    var stxt = $('statusText');
+    if (status === 'active')   { dot.style.background='#22c55e'; stxt.textContent='Active';   stxt.style.color='#22c55e'; }
+    if (status === 'trialing') { dot.style.background='#fbbf24'; stxt.textContent='Trial';    stxt.style.color='#fbbf24'; }
+    if (status === 'past_due') { dot.style.background='#ef4444'; stxt.textContent='Past Due'; stxt.style.color='#ef4444'; }
+
+    // Trial banner
+    if (isTrialing) {
+        var trialEnd = stripe && stripe.trial_end;
+        var trialStr = trialEnd ? 'Trial ends ' + fmtDate(trialEnd) + '.' : 'Trial ends in 7 days.';
+        var periodEnd = stripe && stripe.current_period_end;
+        if (periodEnd) trialStr += ' Card charged ' + fmtDate(periodEnd) + '.';
+        $('trialText').textContent = trialStr;
+        $('trialStrip').classList.add('show');
+    }
+
+    // Wallet — prefer live /api/me balance, fall back to plan defaults
+    var walletPUT = (me && me.wallet && me.wallet.put_balance != null) ? me.wallet.put_balance : meta.put;
+    var walletAIC = (me && me.wallet && me.wallet.aic_balance != null) ? me.wallet.aic_balance : meta.aic;
+    $('walletPUT').textContent = fmtNum(walletPUT);
+    $('walletAIC').textContent = fmtNum(walletAIC);
+
+    // Features
+    var grid = $('featureGrid');
+    grid.innerHTML = feats.map(function(f) {
+        return '<div class="feat-item ' + (f.ok ? 'yes' : 'no') + '">'
+            + '<i class="fas ' + f.icon + '"></i>'
+            + '<span>' + f.label + '</span>'
+            + '</div>';
+    }).join('');
+
+    // Session debug panel (test mode)
+    if (isTest && stripe) {
+        $('sessionMeta').classList.add('show');
+        $('sessionJSON').textContent = JSON.stringify({
+            session_id:          stripe.session_id,
+            mode:                stripe.mode,
+            tier:                stripe.tier,
+            lookup_key:          stripe.lookup_key,
+            subscription_status: stripe.subscription_status,
+            payment_status:      stripe.payment_status,
+            amount_total:        stripe.amount_total,
+            trial_end:           stripe.trial_end ? fmtDate(stripe.trial_end) : null,
+            current_period_end:  stripe.current_period_end ? fmtDate(stripe.current_period_end) : null,
+            me_tier:             me && me.subscription_tier,
+            me_status:           me && me.subscription_status,
+            me_wallet_put:       me && me.wallet && me.wallet.put_balance,
+            me_wallet_aic:       me && me.wallet && me.wallet.aic_balance,
+        }, null, 2);
+    }
+
+    // Show success state
+    showState('stateSuccess');
+    revealAll();
+    setTimeout(fireworks, 250);
+}
+
+// ── Render topup success ─────────────────────────────────────
+function renderTopup(stripe, me) {
+    var wallet = (stripe && stripe.topup_wallet) || 'put';
+    var amount = (stripe && stripe.topup_amount) || 0;
+    var charged = (stripe && stripe.amount_total) || 0;
+    var cur     = (stripe && stripe.currency) || 'USD';
+    var isTest  = stripe && stripe.is_test_mode;
+
+    if (isTest) $('testBadge').style.display = 'inline-flex';
+    setTimeout(function() { $('checkRing').classList.add('pop'); }, 80);
+
+    $('eyebrow').textContent  = 'Top-Up Confirmed';
+    $('headline').textContent = fmtNum(amount) + ' ' + (wallet === 'put' ? '⚡ PUT' : '🤖 AIC') + ' added.';
+    $('subline').textContent  = 'Tokens have been credited to your wallet and are ready to use immediately.';
+
+    var pill = $('planPill');
+    pill.style.background = wallet === 'put' ? 'rgba(249,115,22,.1)'  : 'rgba(139,92,246,.1)';
+    pill.style.border      = '1px solid ' + (wallet === 'put' ? 'rgba(249,115,22,.3)' : 'rgba(139,92,246,.3)');
+    pill.style.color       = wallet === 'put' ? '#f97316' : '#8b5cf6';
+    pill.innerHTML = (wallet === 'put' ? '⚡ PUT Pack' : '🤖 AIC Pack') + ' — ' + fmtNum(amount) + ' tokens';
+
+    $('amountLabel').textContent = 'Charged';
+    $('amountValue').textContent = fmtCurrency(charged, cur);
+    $('statusDot').style.background = '#22c55e';
+    $('statusText').textContent = 'Paid'; $('statusText').style.color = '#22c55e';
+
+    // Wallet
+    var putBal = me && me.wallet ? me.wallet.put_balance : 0;
+    var aicBal = me && me.wallet ? me.wallet.aic_balance : 0;
+    $('walletPUT').textContent = fmtNum(putBal);
+    $('walletAIC').textContent = fmtNum(aicBal);
+
+    // Hide features, show updated balances only
+    $('featureGrid').innerHTML = '<div class="feat-item yes"><i class="fas fa-check-circle"></i><span>Tokens added to wallet</span></div><div class="feat-item yes"><i class="fas fa-infinity"></i><span>Never expire</span></div>';
+
+    showState('stateSuccess');
+    revealAll([0,80,150,9999,250,350,450]); // hide trial strip (9999ms = never)
+    setTimeout(fireworks, 250);
+}
+
+// ── Main ─────────────────────────────────────────────────────
+(async function main() {
+    // Kick off loading animation
+    document.body.classList.add('loaded');
+
+    var params    = new URLSearchParams(window.location.search);
+    var sessionId = params.get('session_id') || '';
+
+    if (!sessionId) {
+        $('errMsg').textContent = 'No session ID found in the URL. If you just completed a payment, please check your billing settings.';
+        showState('stateError');
+        return;
+    }
+
+    // Persist for dashboard modal
+    sessionStorage.setItem('billing_session_id', sessionId);
+
+    setLoadingDetail('Session: ' + sessionId.slice(0, 24) + '…');
+
+    var token = getToken();
+
+    // ── 1. Fetch Stripe session (requires auth) ───────────────
+    var stripeData = null;
+    if (token) {
+        try {
+            setLoadingDetail('Calling Stripe API…');
+            stripeData = await api('/api/billing/session?session_id=' + encodeURIComponent(sessionId));
+        } catch (e) {
+            if (e.status !== 401 && e.status !== 403) {
+                // Non-auth error — show error but don't bail, try me anyway
+                console.warn('[BillingSuccess] /api/billing/session error:', e);
+            }
+        }
+    }
+
+    // ── 2. Poll /api/me (webhook may need a moment) ───────────
+    var meData = null;
+    if (token) {
+        setLoadingDetail('Waiting for account to activate…');
+        meData = await pollMe(10, 1500);
+    }
+
+    // ── 3. Decide what to render ──────────────────────────────
+    if (!stripeData && !meData) {
+        // Not logged in or total failure
+        $('errMsg').textContent = 'Could not verify your session. If your card was charged, check Billing Settings — your account will update within a minute once our webhook confirms.';
+        showState('stateError');
+        return;
+    }
+
+    var mode = (stripeData && stripeData.mode) || 'subscription';
+
+    if (mode === 'payment') {
+        renderTopup(stripeData, meData);
+    } else {
+        renderSubscription(stripeData, meData);
+    }
+})();
+</script>
+</body>
+</html>

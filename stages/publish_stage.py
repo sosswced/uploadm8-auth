@@ -1453,17 +1453,19 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
             logger.warning(f"{account_label}: Could not create publish_attempt row: {e}")
             attempt_id = None
 
-        # -- Load platform token (by ID when multi-account, by platform otherwise) --
+        # -- Load platform token (use target_accounts token when specified) --
         token_data = None
+        token_identity = {}
         try:
-            if token_id:
-                raw_token = await db_stage.load_platform_token_by_id(db_pool, token_id)
-            else:
-                raw_token = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
-            token_data = decrypt_token(raw_token) if raw_token else None
+            token_data, token_identity = await db_stage.load_platform_token_with_identity(
+                db_pool, ctx.user_id, db_key, token_row_id=token_id
+            )
+            if token_data:
+                token_data = decrypt_token(token_data) if isinstance(token_data, dict) and token_data.get("kid") else token_data
         except Exception as e:
             logger.warning(f"{account_label}: Token load failed: {e}")
             token_data = None
+            token_identity = {}
 
         if not token_data:
             msg = f"Not connected to {platform}" + (f" (account {token_id[:8]})" if token_id else "")
@@ -1484,7 +1486,7 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 attempt_id=attempt_id,
                 error_code="NOT_CONNECTED",
                 error_message=msg,
-                account_id=token_id,
+                token_row_id=token_id,
             )
             ctx.platform_results.append(pr)
             continue
@@ -1531,12 +1533,14 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 account_name=(token_data.get("_account_name") or "") if token_data else "",
             )
 
-        # -- Record result (include account for multi-account display) --
+        # -- Record result (stamp account identity from token so it's saved to DB) --
         result.attempt_id = attempt_id
-        result.account_id = token_id
-        result.account_name = (token_data.get("_account_name") or token_data.get("account_name") or "") if token_data else ""
-        result.account_username = (token_data.get("_account_username") or token_data.get("account_username") or "") if token_data else ""
-        result.account_avatar = (token_data.get("_account_avatar") or token_data.get("account_avatar") or "") if token_data else ""
+        if token_identity:
+            result.token_row_id     = token_identity.get("token_row_id")
+            result.account_id       = token_identity.get("account_id")
+            result.account_username = token_identity.get("account_username")
+            result.account_name     = token_identity.get("account_name")
+            result.account_avatar   = token_identity.get("account_avatar")
         ctx.platform_results.append(result)
 
         status_icon = "OK" if result.success else "FAIL"

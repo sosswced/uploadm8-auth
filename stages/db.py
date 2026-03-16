@@ -185,6 +185,7 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                 {
                     "platform": r.platform,
                     "success": r.success,
+                    "token_row_id": getattr(r, "token_row_id", None),
                     "account_id": getattr(r, "account_id", None),
                     "account_name": getattr(r, "account_name", None),
                     "account_username": getattr(r, "account_username", None),
@@ -573,6 +574,80 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
     except Exception as e:
         logger.error(f"Failed to load platform token for {user_id}/{platform}: {e}")
         return None
+
+
+async def load_platform_token_with_identity(
+    pool: asyncpg.Pool,
+    user_id: str,
+    platform: str,
+    token_row_id: Optional[str] = None,
+) -> tuple:
+    """
+    Load a platform token AND its account identity fields.
+
+    If token_row_id is provided (a specific platform_tokens.id UUID),
+    load that exact row — used when target_accounts specifies which account to publish to.
+
+    Returns (token_blob_dict, identity_dict) or (None, None).
+    identity_dict = {token_row_id, account_id, account_username, account_name, account_avatar}
+    """
+    try:
+        async with pool.acquire() as conn:
+            if token_row_id:
+                row = await conn.fetchrow(
+                    """SELECT * FROM platform_tokens
+                       WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL""",
+                    token_row_id, user_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """SELECT * FROM platform_tokens
+                       WHERE user_id = $1 AND platform = $2 AND revoked_at IS NULL
+                       ORDER BY is_primary DESC NULLS LAST, updated_at DESC
+                       LIMIT 1""",
+                    user_id, platform,
+                )
+
+            if not row:
+                return None, None
+
+            row_dict = dict(row)
+            identity = {
+                "token_row_id":     str(row_dict["id"]),
+                "account_id":       row_dict.get("account_id") or "",
+                "account_username": row_dict.get("account_username") or "",
+                "account_name":     row_dict.get("account_name") or "",
+                "account_avatar":   row_dict.get("account_avatar") or "",
+            }
+
+            token_data = row_dict.get("token_blob") or row_dict.get("token_data")
+            if token_data:
+                if isinstance(token_data, str):
+                    parsed = json.loads(token_data)
+                    if isinstance(parsed, str):
+                        try:
+                            parsed = json.loads(parsed)
+                        except Exception:
+                            pass
+                else:
+                    parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
+
+                account_id_col = row_dict.get("account_id")
+                if account_id_col and isinstance(parsed, dict):
+                    if platform == "instagram" and not parsed.get("ig_user_id"):
+                        parsed["ig_user_id"] = str(account_id_col)
+
+                if isinstance(parsed, dict):
+                    parsed["_account_name"] = row_dict.get("account_name", "")
+                    parsed["_account_username"] = row_dict.get("account_username", "") or ""
+                    parsed["_account_avatar"] = row_dict.get("account_avatar", "") or ""
+                return parsed, identity
+
+            return None, None
+
+    except Exception as e:
+        logger.warning(f"load_platform_token_with_identity failed: {e}")
+        return None, None
 
 
 async def load_all_platform_token_ids(pool: asyncpg.Pool, user_id: str, platform: str) -> list[str]:

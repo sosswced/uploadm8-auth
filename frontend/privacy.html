@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Policy - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: #1a1a24;
+            --bg-hover: #22222e;
+            --bg-input: rgba(255,255,255,0.05);
+            --text-primary: #ffffff;
+            --text-secondary: #9ca3af;
+            --text-muted: #6b7280;
+            --border-color: rgba(255,255,255,0.08);
+            --border-hover: rgba(255,255,255,0.15);
+            --accent-orange: #f97316;
+            --accent-orange-hover: #ea580c;
+            --accent-blue: #3b82f6;
+            --accent-green: #22c55e;
+            --accent-red: #ef4444;
+            --accent-purple: #8b5cf6;
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 16px;
+        }
+        html { scroll-behavior: smooth; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg-primary); color: var(--text-primary); line-height: 1.7; min-height: 100vh; }
+        a { color: var(--accent-orange); text-decoration: none; transition: color 0.2s; }
+        a:hover { color: var(--accent-orange-hover); }
+
+        /* NAV */
+        .nav { position: sticky; top: 0; z-index: 100; padding: 1rem 2rem; background: rgba(10,10,15,0.97); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); }
+        .nav-container { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+        .nav-logo { display: flex; align-items: center; gap: 0.75rem; font-size: 1.25rem; font-weight: 700; color: white; text-decoration: none; }
+        .nav-logo-icon { width: 32px; height: 32px; background: linear-gradient(135deg, var(--accent-orange), var(--accent-purple)); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 1rem; }
+        .back-btn { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; font-weight: 500; padding: 0.5rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-md); transition: all 0.2s; }
+        .back-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--bg-hover); }
+
+        /* HERO */
+        .hero { padding: 4rem 2rem 3rem; background: linear-gradient(180deg, rgba(249,115,22,0.06) 0%, transparent 100%); border-bottom: 1px solid var(--border-color); }
+        .hero-inner { max-width: 900px; margin: 0 auto; }
+        .hero-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.875rem; background: rgba(249,115,22,0.1); border: 1px solid rgba(249,115,22,0.25); border-radius: 50px; font-size: 0.8rem; font-weight: 600; color: var(--accent-orange); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 1.25rem; }
+        .hero h1 { font-size: 2.75rem; font-weight: 800; margin-bottom: 0.75rem; line-height: 1.15; }
+        .hero-meta { display: flex; align-items: center; gap: 1.5rem; color: var(--text-muted); font-size: 0.875rem; flex-wrap: wrap; }
+        .hero-meta span { display: flex; align-items: center; gap: 0.4rem; }
+
+        /* LEGAL NAV */
+        .legal-nav { background: var(--bg-secondary); border-bottom: 1px solid var(--border-color); padding: 0 2rem; overflow-x: auto; }
+        .legal-nav-inner { max-width: 1280px; margin: 0 auto; display: flex; gap: 0; }
+        .legal-nav a { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
+        .legal-nav a:hover { color: var(--text-primary); }
+        .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+
+        /* LAYOUT */
+        .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
+        @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
+
+        /* SIDEBAR TOC */
+        .sidebar-toc { position: sticky; top: 80px; }
+        .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
+        .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
+        .toc-list { list-style: none; }
+        .toc-list li { margin-bottom: 0.125rem; }
+        .toc-list a { display: block; padding: 0.4rem 0.75rem; color: var(--text-secondary); font-size: 0.85rem; border-radius: var(--radius-sm); border-left: 2px solid transparent; transition: all 0.2s; text-decoration: none; }
+        .toc-list a:hover, .toc-list a.active { color: var(--accent-orange); border-left-color: var(--accent-orange); background: rgba(249,115,22,0.07); }
+
+        /* ARTICLE */
+        .article { min-width: 0; }
+        .section-block { margin-bottom: 3rem; }
+        .section-block:last-child { margin-bottom: 0; }
+        .section-header { display: flex; align-items: center; gap: 0.875rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); }
+        .section-num { width: 32px; height: 32px; background: rgba(249,115,22,0.15); border: 1px solid rgba(249,115,22,0.3); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 700; color: var(--accent-orange); flex-shrink: 0; }
+        .section-header h2 { font-size: 1.35rem; font-weight: 700; }
+        .prose p { color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.95rem; }
+        .prose p:last-child { margin-bottom: 0; }
+        .prose ul, .prose ol { color: var(--text-secondary); padding-left: 1.5rem; margin-bottom: 1rem; }
+        .prose li { margin-bottom: 0.5rem; font-size: 0.95rem; }
+        .prose h3 { font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 1.5rem 0 0.75rem; }
+        .prose strong { color: var(--text-primary); font-weight: 600; }
+
+        /* CALLOUTS */
+        .callout { display: flex; gap: 0.875rem; padding: 1rem 1.25rem; border-radius: var(--radius-md); margin: 1.25rem 0; font-size: 0.9rem; }
+        .callout i { flex-shrink: 0; margin-top: 0.1rem; font-size: 1rem; }
+        .callout-blue { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); color: #93c5fd; }
+        .callout-blue i { color: var(--accent-blue); }
+        .callout-green { background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2); color: #86efac; }
+        .callout-green i { color: var(--accent-green); }
+        .callout-orange { background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.2); color: #fdba74; }
+        .callout-orange i { color: var(--accent-orange); }
+        .callout-red { background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: #fca5a5; }
+        .callout-red i { color: var(--accent-red); }
+
+        /* TABLE */
+        .data-table { width: 100%; border-collapse: collapse; margin: 1.25rem 0; border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-color); font-size: 0.875rem; }
+        .data-table th { background: var(--bg-secondary); padding: 0.75rem 1rem; text-align: left; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
+        .data-table td { padding: 0.875rem 1rem; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); vertical-align: top; }
+        .data-table tr:last-child td { border-bottom: none; }
+        .data-table tr:hover td { background: var(--bg-hover); }
+        .data-table td:first-child { color: var(--text-primary); font-weight: 500; }
+
+        /* BADGE */
+        .badge { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.2rem 0.6rem; border-radius: var(--radius-sm); font-size: 0.75rem; font-weight: 600; }
+        .badge-green { background: rgba(34,197,94,0.15); color: var(--accent-green); }
+        .badge-orange { background: rgba(249,115,22,0.15); color: var(--accent-orange); }
+        .badge-blue { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
+        .badge-red { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+
+        /* FOOTER */
+        .footer { background: var(--bg-secondary); border-top: 1px solid var(--border-color); padding: 2rem; margin-top: 4rem; }
+        .footer-inner { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+        .footer-copy { color: var(--text-muted); font-size: 0.85rem; }
+        .footer-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+        .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
+        .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
+
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg-secondary); }
+        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
+    </style>
+</head>
+<body>
+
+<nav class="nav">
+    <div class="nav-container">
+        <a href="index.html" class="nav-logo">
+            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            UploadM8
+        </a>
+        <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
+    </div>
+</nav>
+
+<div class="hero">
+    <div class="hero-inner">
+        <div class="hero-badge"><i class="fas fa-shield-alt"></i> Legal</div>
+        <h1>UploadM8 Privacy Policy</h1>
+        <div class="hero-meta">
+            <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
+            <span><i class="fas fa-clock"></i> Last Updated: February 2026</span>
+            <span><i class="fas fa-map-marker-alt"></i> Governing Law: Missouri, USA</span>
+        </div>
+    </div>
+</div>
+
+<nav class="legal-nav">
+    <div class="legal-nav-inner">
+        <a href="privacy.html" class="active"><i class="fas fa-shield-alt"></i> Privacy</a>
+        <a href="terms.html"><i class="fas fa-file-contract"></i> Terms</a>
+        <a href="security.html"><i class="fas fa-lock"></i> Security</a>
+        <a href="cookies.html"><i class="fas fa-cookie-bite"></i> Cookies</a>
+        <a href="subprocessors.html"><i class="fas fa-server"></i> Subprocessors</a>
+        <a href="refunds.html"><i class="fas fa-undo"></i> Refunds</a>
+        <a href="dmca.html"><i class="fas fa-gavel"></i> DMCA</a>
+        <a href="support.html"><i class="fas fa-headset"></i> Support</a>
+    </div>
+</nav>
+
+<div class="content-wrapper">
+    <article class="article">
+
+        <div class="callout callout-blue">
+            <i class="fas fa-info-circle"></i>
+            <div>This Privacy Policy explains how UploadM8 ("we," "us," "our") collects, uses, and protects your personal information when you use our multi-platform video publishing service. We are committed to protecting your privacy and handling your data with transparency.</div>
+        </div>
+
+        <!-- Section 1 -->
+        <div class="section-block" id="information-collected">
+            <div class="section-header">
+                <div class="section-num">1</div>
+                <h2>Information We Collect</h2>
+            </div>
+            <div class="prose">
+                <h3>Account Information</h3>
+                <p>When you create an UploadM8 account, we collect your name, email address, password (stored as a cryptographic hash), and billing information (processed by Stripe — we never store raw card data).</p>
+
+                <h3>Content You Upload</h3>
+                <p>Videos, thumbnails, titles, captions, hashtags, and other metadata you submit through our platform. This content is temporarily stored in Cloudflare R2 storage during processing and publishing. Original uploads are retained for 30 days after publication unless you delete them sooner.</p>
+
+                <h3>Platform Integration Data</h3>
+                <p>When you connect social media accounts (TikTok, YouTube, Instagram, Facebook), we receive and store OAuth access tokens and refresh tokens necessary to publish on your behalf. We also receive basic profile information (username, channel/page name, profile photo URL) to display in your dashboard.</p>
+
+                <h3>Usage & Technical Data</h3>
+                <p>Log data (IP addresses, browser type, pages visited, timestamps), device information, and platform-specific analytics (views, engagement metrics) when available through platform APIs.</p>
+
+                <h3>AI Feature Data</h3>
+                <p>When you use AIC token-powered features, your video frames, transcripts, and metadata may be processed by third-party AI providers (Anthropic Claude API) solely to generate captions, titles, and thumbnails. This content is not retained by the AI provider beyond the processing request.</p>
+            </div>
+        </div>
+
+        <!-- Section 2 -->
+        <div class="section-block" id="platform-data">
+            <div class="section-header">
+                <div class="section-num">2</div>
+                <h2>Platform User Data & OAuth Tokens</h2>
+            </div>
+            <div class="prose">
+                <div class="callout callout-orange">
+                    <i class="fas fa-exclamation-triangle"></i>
+                    <div><strong>Important:</strong> UploadM8 acts as your agent when posting to social platforms. We only access the permissions you explicitly grant during OAuth authorization and never exceed those permissions.</div>
+                </div>
+                <p>Each platform integration collects the following data categories:</p>
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Platform</th>
+                        <th>Data Collected</th>
+                        <th>Purpose</th>
+                        <th>Retention</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><i class="fab fa-tiktok"></i> TikTok</td>
+                        <td>OAuth token, user ID, display name, avatar URL</td>
+                        <td>Video upload via Content Posting API v2</td>
+                        <td>Until disconnected + 24 hrs</td>
+                    </tr>
+                    <tr>
+                        <td><i class="fab fa-youtube" style="color:#FF0000"></i> YouTube</td>
+                        <td>OAuth token, channel ID, channel name, thumbnail</td>
+                        <td>Shorts upload via YouTube Data API v3</td>
+                        <td>Until disconnected + 24 hrs</td>
+                    </tr>
+                    <tr>
+                        <td><i class="fab fa-instagram" style="color:#E1306C"></i> Instagram</td>
+                        <td>OAuth token, business account ID, username</td>
+                        <td>Reels upload via Meta Graph API v21.0</td>
+                        <td>Until disconnected + 24 hrs</td>
+                    </tr>
+                    <tr>
+                        <td><i class="fab fa-facebook" style="color:#1877F2"></i> Facebook</td>
+                        <td>OAuth token, page ID, page name, page category</td>
+                        <td>Reels upload via Meta Graph API v21.0</td>
+                        <td>Until disconnected + 24 hrs</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="prose">
+                <p>OAuth tokens are encrypted at rest using AES-256 and transmitted exclusively over TLS 1.3. Tokens are stored in isolated database rows with access restricted to the publishing service only.</p>
+            </div>
+        </div>
+
+        <!-- Section 3 -->
+        <div class="section-block" id="how-we-use">
+            <div class="section-header">
+                <div class="section-num">3</div>
+                <h2>How We Use Your Information</h2>
+            </div>
+            <div class="prose">
+                <p>We use the data we collect exclusively for the following purposes:</p>
+                <ul>
+                    <li><strong>Service Delivery:</strong> Processing and publishing your videos to connected platforms, generating AI-enhanced metadata, delivering scheduling and queue management.</li>
+                    <li><strong>Account Management:</strong> Authentication, subscription billing, plan enforcement, usage quota tracking.</li>
+                    <li><strong>Analytics & Reporting:</strong> Providing your Trill telemetry dashboard with cross-platform performance data pulled from platform APIs.</li>
+                    <li><strong>Platform Communications:</strong> Transactional emails (upload confirmations, failed job alerts, billing receipts, security notifications).</li>
+                    <li><strong>Security & Fraud Prevention:</strong> Detecting unauthorized access, enforcing Terms of Service, maintaining audit logs.</li>
+                    <li><strong>Product Improvement:</strong> Aggregated, anonymized usage analytics to improve features. We do not sell individual behavioral data.</li>
+                </ul>
+                <div class="callout callout-green">
+                    <i class="fas fa-check-circle"></i>
+                    <div>We do not sell your personal data, platform credentials, or content to any third party. We do not use your data for advertising targeting or behavioral profiling.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Section 4 -->
+        <div class="section-block" id="data-retention">
+            <div class="section-header">
+                <div class="section-num">4</div>
+                <h2>Data Retention</h2>
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Data Type</th>
+                        <th>Retention Period</th>
+                        <th>Deletion Trigger</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>OAuth Tokens</td>
+                        <td>Active + 24 hours post-disconnect</td>
+                        <td>Platform disconnect or account deletion</td>
+                    </tr>
+                    <tr>
+                        <td>Uploaded Videos</td>
+                        <td>30 days post-publication</td>
+                        <td>Automatic scheduled purge from R2</td>
+                    </tr>
+                    <tr>
+                        <td>Processed/Transcoded Files</td>
+                        <td>72 hours post-publish</td>
+                        <td>Automatic cleanup after delivery confirmed</td>
+                    </tr>
+                    <tr>
+                        <td>Account Data</td>
+                        <td>Duration of account + 30 days</td>
+                        <td>Account deletion request</td>
+                    </tr>
+                    <tr>
+                        <td>Billing Records</td>
+                        <td>7 years</td>
+                        <td>Legal requirement (tax compliance)</td>
+                    </tr>
+                    <tr>
+                        <td>Audit Logs</td>
+                        <td>12 months</td>
+                        <td>Rolling purge</td>
+                    </tr>
+                    <tr>
+                        <td>Database Backups</td>
+                        <td>30-day rolling rotation</td>
+                        <td>Automatic overwrite cycle</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Section 5 -->
+        <div class="section-block" id="data-deletion">
+            <div class="section-header">
+                <div class="section-num">5</div>
+                <h2>Data Deletion</h2>
+            </div>
+            <div class="prose">
+                <p>You have three pathways to request deletion of your personal data:</p>
+                <h3>Method 1: Self-Service Account Deletion</h3>
+                <p>Navigate to <strong>Settings → Security → Delete your account</strong> (Danger Zone). This triggers immediate anonymization of your profile data, disconnection of all platform accounts, and queues your video files and database records for purge within 30 days.</p>
+                <h3>Method 2: Platform Disconnect</h3>
+                <p>Navigate to <strong>Settings → Platforms → Disconnect</strong>. OAuth tokens for that platform are revoked and deleted within 24 hours. This does not delete your UploadM8 account.</p>
+                <h3>Method 3: Direct Request</h3>
+                <p>Email <a href="/cdn-cgi/l/email-protection#6515170c1304061c251015090a0401085d4b060a08"><span class="__cf_email__" data-cfemail="6d1d1f041b0c0e142d181d01020c090055430e0200">[email&#160;protected]</span></a> with subject line "Data Deletion Request." We acknowledge within 5 business days and complete deletion within 30 days, providing written confirmation upon completion.</p>
+                <div class="callout callout-blue">
+                    <i class="fas fa-info-circle"></i>
+                    <div>UploadM8 also maintains a dedicated data deletion page at <a href="data-deletion.html">uploadm8.com/data-deletion</a> to comply with TikTok, Meta, and YouTube platform review requirements.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Section 6 -->
+        <div class="section-block" id="sharing">
+            <div class="section-header">
+                <div class="section-num">6</div>
+                <h2>Data Sharing & Third Parties</h2>
+            </div>
+            <div class="prose">
+                <p>We share your data only with the following categories of service providers (subprocessors) strictly necessary to deliver our service:</p>
+                <ul>
+                    <li><strong>Infrastructure:</strong> Render (hosting), PostgreSQL (database), Redis (job queue), Cloudflare R2 (file storage)</li>
+                    <li><strong>Payments:</strong> Stripe (billing — PCI DSS Level 1 compliant)</li>
+                    <li><strong>AI Processing:</strong> Anthropic (Claude API — for AIC token AI features, no data retained)</li>
+                    <li><strong>Platform APIs:</strong> TikTok, YouTube/Google, Meta (for publishing only)</li>
+                </ul>
+                <p>All subprocessors are bound by data processing agreements. See our full <a href="subprocessors.html">Subprocessors List</a> for complete details including data locations and privacy policy links.</p>
+                <p>We may disclose your data if legally required by court order, government request, or to protect our rights, property, or safety. We will notify you of any such disclosure to the extent permitted by law.</p>
+            </div>
+        </div>
+
+        <!-- Section 7 -->
+        <div class="section-block" id="your-rights">
+            <div class="section-header">
+                <div class="section-num">7</div>
+                <h2>Your Rights (GDPR / CCPA)</h2>
+            </div>
+            <div class="prose">
+                <p>Depending on your jurisdiction, you may have the following rights regarding your personal data:</p>
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Right</th>
+                        <th>Description</th>
+                        <th>How to Exercise</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Access</td>
+                        <td>Request a copy of all personal data we hold about you</td>
+                        <td>Email <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="8cfcfee5faedeff5ccf9fce0e3ede8e1b4a2efe3e1">[email&#160;protected]</a></td>
+                    </tr>
+                    <tr>
+                        <td>Correction</td>
+                        <td>Request correction of inaccurate personal data</td>
+                        <td>Settings → Profile, or email us</td>
+                    </tr>
+                    <tr>
+                        <td>Deletion</td>
+                        <td>Request erasure of your personal data</td>
+                        <td>See Section 5 above</td>
+                    </tr>
+                    <tr>
+                        <td>Portability</td>
+                        <td>Receive your data in a machine-readable format</td>
+                        <td>Email <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="7505071c0314160c350005191a1411184d5b161a18">[email&#160;protected]</a></td>
+                    </tr>
+                    <tr>
+                        <td>Objection</td>
+                        <td>Object to processing for direct marketing</td>
+                        <td>Email <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="1666647f6077756f5663667a7977727b2e3875797b">[email&#160;protected]</a></td>
+                    </tr>
+                    <tr>
+                        <td>Opt-Out (CCPA)</td>
+                        <td>Opt out of sale of personal information (we do not sell data)</td>
+                        <td>Documented — no action needed</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="prose">
+                <p>We respond to all verifiable rights requests within 30 days. There is no fee for exercising your rights unless requests are manifestly unfounded or excessive.</p>
+            </div>
+        </div>
+
+        <!-- Section 8 -->
+        <div class="section-block" id="children">
+            <div class="section-header">
+                <div class="section-num">8</div>
+                <h2>Children's Privacy</h2>
+            </div>
+            <div class="prose">
+                <div class="callout callout-red">
+                    <i class="fas fa-exclamation-circle"></i>
+                    <div>UploadM8 is not intended for children under 13 years of age. We do not knowingly collect personal information from children under 13. If you are between 13 and 17, you may use UploadM8 only with verified parental or guardian consent.</div>
+                </div>
+                <p>If we discover that we have inadvertently collected data from a child under 13, we will delete that information immediately. If you believe we have collected data from a minor without appropriate consent, contact us at <a href="/cdn-cgi/l/email-protection#b2c2c0dbc4d3d1cbf2c7c2deddd3d6df8a9cd1dddf"><span class="__cf_email__" data-cfemail="fb8b89928d9a9882bb8e8b97949a9f96c3d5989496">[email&#160;protected]</span></a> immediately.</p>
+            </div>
+        </div>
+
+        <!-- Section 9 -->
+        <div class="section-block" id="security">
+            <div class="section-header">
+                <div class="section-num">9</div>
+                <h2>Security Measures</h2>
+            </div>
+            <div class="prose">
+                <p>We implement industry-standard technical and organizational security measures including:</p>
+                <ul>
+                    <li>TLS 1.3 encryption for all data in transit</li>
+                    <li>AES-256 encryption for all data at rest (tokens, sensitive fields)</li>
+                    <li>Bcrypt password hashing with appropriate cost factor</li>
+                    <li>Role-based access control with principle of least privilege</li>
+                    <li>Automated 30-day database backup rotation</li>
+                    <li>Comprehensive audit logging of all data access and modifications</li>
+                    <li>Security incident response with 72-hour breach notification target</li>
+                </ul>
+                <p>For complete details, see our <a href="security.html">Security Overview</a>.</p>
+            </div>
+        </div>
+
+        <!-- Section 10 -->
+        <div class="section-block" id="international">
+            <div class="section-header">
+                <div class="section-num">10</div>
+                <h2>International Data Transfers</h2>
+            </div>
+            <div class="prose">
+                <p>UploadM8 is based in the United States (Missouri). If you access our service from the European Economic Area, United Kingdom, or other regions with data protection laws, your data may be transferred to and processed in the United States.</p>
+                <p>We rely on Standard Contractual Clauses (SCCs) and other approved transfer mechanisms where required. All international transfers are protected by the same security standards applied to U.S.-based data.</p>
+            </div>
+        </div>
+
+        <!-- Section 11 -->
+        <div class="section-block" id="changes">
+            <div class="section-header">
+                <div class="section-num">11</div>
+                <h2>Policy Changes</h2>
+            </div>
+            <div class="prose">
+                <p>We may update this Privacy Policy periodically. Material changes will be communicated via email to registered users and/or a prominent notice on our platform at least 30 days before taking effect. Your continued use of UploadM8 after the effective date constitutes acceptance of the revised policy.</p>
+            </div>
+        </div>
+
+        <!-- Section 12 -->
+        <div class="section-block" id="contact">
+            <div class="section-header">
+                <div class="section-num">12</div>
+                <h2>Contact Us</h2>
+            </div>
+            <div class="prose">
+                <p>For privacy-related inquiries, data requests, or to exercise your rights:</p>
+                <p><strong>Email:</strong> <a href="/cdn-cgi/l/email-protection#deaeacb7a8bfbda79eabaeb2b1bfbab3e6f0bdb1b3"><span class="__cf_email__" data-cfemail="abdbd9c2ddcac8d2ebdedbc7c4cacfc69385c8c4c6">[email&#160;protected]</span></a><br>
+                <strong>Response Time:</strong> Within 5 business days<br>
+                <strong>Mailing Address:</strong> UploadM8, Kansas City, Missouri, USA</p>
+            </div>
+        </div>
+
+    </article>
+
+    <aside class="sidebar-toc">
+        <div class="toc-card">
+            <div class="toc-title">On This Page</div>
+            <ul class="toc-list">
+                <li><a href="#information-collected">1. Information We Collect</a></li>
+                <li><a href="#platform-data">2. Platform & OAuth Data</a></li>
+                <li><a href="#how-we-use">3. How We Use Data</a></li>
+                <li><a href="#data-retention">4. Data Retention</a></li>
+                <li><a href="#data-deletion">5. Data Deletion</a></li>
+                <li><a href="#sharing">6. Data Sharing</a></li>
+                <li><a href="#your-rights">7. Your Rights</a></li>
+                <li><a href="#children">8. Children's Privacy</a></li>
+                <li><a href="#security">9. Security Measures</a></li>
+                <li><a href="#international">10. International Transfers</a></li>
+                <li><a href="#changes">11. Policy Changes</a></li>
+                <li><a href="#contact">12. Contact Us</a></li>
+            </ul>
+        </div>
+    </aside>
+</div>
+
+<footer class="footer">
+    <div class="footer-inner">
+        <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
+        <div class="footer-links">
+            <a href="privacy.html" class="active">Privacy</a>
+            <a href="terms.html">Terms</a>
+            <a href="security.html">Security</a>
+            <a href="cookies.html">Cookies</a>
+            <a href="subprocessors.html">Subprocessors</a>
+            <a href="re

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <title>Verify Email - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0a0a0f;
+            color: #ffffff;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            padding: 1.5rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            text-decoration: none;
+            color: white;
+            font-size: 1.5rem;
+            font-weight: 700;
+        }
+        .logo img { height: 32px; }
+        .main {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+        .card {
+            background: #12121a;
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 20px;
+            padding: 2.5rem;
+            width: 100%;
+            max-width: 460px;
+            text-align: center;
+        }
+        .status-icon {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2.25rem;
+            margin: 0 auto 1.75rem;
+        }
+        .icon-loading { background: rgba(249,115,22,0.15); border: 2px solid rgba(249,115,22,0.3); }
+        .icon-success { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .icon-error   { background: linear-gradient(135deg, #dc2626, #b91c1c); }
+        h1 { font-size: 1.75rem; font-weight: 700; margin-bottom: 0.75rem; }
+        .subtitle { color: #9ca3af; font-size: 0.95rem; line-height: 1.6; margin-bottom: 2rem; }
+        .email-badge {
+            display: inline-block;
+            background: rgba(249,115,22,0.1);
+            border: 1px solid rgba(249,115,22,0.3);
+            color: #f97316;
+            padding: 0.5rem 1.25rem;
+            border-radius: 99px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            margin-bottom: 2rem;
+        }
+        .action-btn {
+            display: inline-block;
+            padding: 0.9rem 2.25rem;
+            background: linear-gradient(135deg, #f97316, #ea580c);
+            border-radius: 10px;
+            color: white;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1rem;
+            transition: opacity 0.2s, transform 0.2s;
+            border: none;
+            cursor: pointer;
+        }
+        .action-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+        .secondary-link {
+            display: block;
+            margin-top: 1.25rem;
+            color: #6b7280;
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+        .secondary-link:hover { color: #9ca3af; }
+        .spinner { animation: spin 1s linear infinite; display: inline-block; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .footer {
+            padding: 1.5rem 2rem;
+            text-align: center;
+            color: #9ca3af;
+            font-size: 0.85rem;
+            border-top: 1px solid rgba(255,255,255,0.05);
+        }
+        .footer a { color: #9ca3af; text-decoration: none; margin: 0 0.75rem; }
+        .footer a:hover { color: white; }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <a href="index.html" class="logo">
+            <img src="images/logo.png" alt="UploadM8">
+            UploadM8
+        </a>
+    </header>
+
+    <main class="main">
+        <div class="card" id="verifyCard">
+
+            <!-- Loading state (default) -->
+            <div id="stateLoading">
+                <div class="status-icon icon-loading">
+                    <i class="fas fa-envelope spinner"></i>
+                </div>
+                <h1>Verifying Email...</h1>
+                <p class="subtitle">Please wait while we confirm your new email address.</p>
+            </div>
+
+            <!-- Success state -->
+            <div id="stateSuccess" style="display:none;">
+                <div class="status-icon icon-success">✓</div>
+                <h1>Email Verified!</h1>
+                <p class="subtitle">Your email address has been updated successfully. Use your new email to sign in going forward.</p>
+                <div class="email-badge" id="newEmailBadge"></div>
+                <br>
+                <a href="dashboard.html" class="action-btn">Go to Dashboard &rarr;</a>
+                <a href="login.html" class="secondary-link">Sign in with new email</a>
+            </div>
+
+            <!-- Error / expired state -->
+            <div id="stateError" style="display:none;">
+                <div class="status-icon icon-error">!</div>
+                <h1 id="errorTitle">Link Expired</h1>
+                <p class="subtitle" id="errorSubtitle">This verification link has expired or has already been used. Please update your email again from your account settings.</p>
+                <a href="settings.html" class="action-btn">Go to Settings &rarr;</a>
+                <a href="support.html" class="secondary-link">Contact Support</a>
+            </div>
+
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span>© 2025 UploadM8</span>
+        <a href="terms.html">Terms</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="support.html">Support</a>
+    </footer>
+
+    <script>
+        (function () {
+            var m = /[?&]api=([^&]+)/.exec(location.search);
+            if (m) window.API_BASE = decodeURIComponent(m[1]).replace(/\/$/, '');
+            else if (!window.API_BASE && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin))
+                window.API_BASE = 'http://127.0.0.1:8000';
+        })();
+        const API_BASE = window.API_BASE || 'https://auth.uploadm8.com';
+
+        const params = new URLSearchParams(window.location.search);
+        const token = params.get('token');
+
+        function showState(name, newEmail) {
+            document.getElementById('stateLoading').style.display = 'none';
+            document.getElementById('stateSuccess').style.display = 'none';
+            document.getElementById('stateError').style.display = 'none';
+            document.getElementById('state' + name).style.display = 'block';
+            if (name === 'Success' && newEmail) {
+                document.getElementById('newEmailBadge').textContent = newEmail;
+            }
+        }
+
+        async function verifyEmail() {
+            if (!token) {
+                showState('Error');
+                document.getElementById('errorTitle').textContent = 'Invalid Link';
+                document.getElementById('errorSubtitle').textContent = 'No verification token found in this link. Please request a new email change from your settings.';
+                return;
+            }
+
+            try {
+                const resp = await fetch(`${API_BASE}/api/auth/verify-email?token=${encodeURIComponent(token)}`, {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (resp.ok) {
+                    const data = await resp.json().catch(() => ({}));
+                    showState('Success', data.email || data.new_email || '');
+                } else {
+                    const data = await resp.json().catch(() => ({}));
+                    showState('Error');
+                    if (resp.status === 410 || resp.status === 404) {
+                        document.getElementById('errorTitle').textContent = 'Link Expired';
+                        document.getElementById('errorSubtitle').textContent = 'This verification link has expired or was already used. Update your email again from Settings.';
+                    } else {
+                        document.getElementById('errorTitle').textContent = 'Verification Failed';
+                        document.getElementById('errorSubtitle').textContent = data.detail || 'Something went wrong. Please try again or contact support.';
+                    }
+                }
+            } catch (err) {
+                showState('Error');
+                document.getElementById('errorTitle').textContent = 'Connection Error';
+                document.getElementById('errorSubtitle').textContent = 'Could not reach the server. Check your connection and try again.';
+            }
+        }
+
+        verifyEmail();
+    </script>
+</body>
+</html>

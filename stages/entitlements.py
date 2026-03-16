@@ -154,7 +154,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "team_seats": 9999, "analytics": "full_export", "internal": True,
     },
     "friends_family": {
-        "name": "Friends", "price": 0,
+        "name": "Friends & Family", "price": 0,
         "put_daily": 999, "put_monthly": 12000, "aic_monthly": 5000,
         "max_accounts": 80, "max_accounts_per_platform": 80,
         "watermark": False, "ads": False, "ai": True,
@@ -222,6 +222,61 @@ TOPUP_PRODUCTS = {
 # Priority class routing sets
 PRIORITY_QUEUE_CLASSES = {"p0", "p1", "p2"}   # -> process:priority / publish:priority
 NORMAL_QUEUE_CLASSES   = {"p3", "p4"}          # -> process:normal  / publish:normal
+
+# ============================================================
+# Canonical Tier & Entitlement Schema (shared with frontend)
+# ============================================================
+# All valid subscription_tier values. Frontend and backend MUST use these slugs.
+TIER_SLUGS = ("free", "creator_lite", "creator_pro", "studio", "agency", "friends_family", "lifetime", "master_admin", "launch")
+
+# launch is legacy alias for creator_lite
+TIER_ALIASES = {"launch": "creator_lite"}
+
+
+def normalize_tier(tier: str) -> str:
+    """Return canonical tier slug. Maps launch->creator_lite, unknown->free."""
+    t = (tier or "free").lower().strip()
+    if t in TIER_ALIASES:
+        return TIER_ALIASES[t]
+    return t if t in TIER_CONFIG else "free"
+
+
+def get_tier_display_name(tier: str) -> str:
+    """Return human-readable tier name from TIER_CONFIG."""
+    t = normalize_tier(tier)
+    return TIER_CONFIG.get(t, TIER_CONFIG["free"]).get("name", t.replace("_", " ").title())
+
+
+# Entitlement keys returned by entitlements_to_dict — frontend uses these exact keys
+ENTITLEMENT_KEYS = (
+    "tier", "tier_display", "put_daily", "put_monthly", "aic_monthly",
+    "max_accounts", "max_accounts_per_platform", "can_watermark", "can_ai",
+    "can_schedule", "can_webhooks", "can_white_label", "can_excel", "can_priority",
+    "can_flex", "can_burn_hud", "show_ads", "priority_class", "queue_depth",
+    "lookahead_hours", "max_caption_frames", "ai_depth", "max_thumbnails",
+    "can_custom_thumbnails", "can_ai_thumbnail_styling", "max_parallel_uploads",
+    "team_seats", "analytics", "trial_days", "is_internal",
+)
+
+
+def get_tiers_for_api() -> list:
+    """Return tier metadata for /api/entitlements/tiers. Single source for frontend.
+    Includes revenue tiers + internal (friends_family, lifetime, master_admin) + launch alias.
+    app.js, wallet-tokens.js, and settings.html all consume this for consistent PUT/AIC/names."""
+    all_slugs = ("free", "creator_lite", "creator_pro", "studio", "agency",
+                 "friends_family", "lifetime", "master_admin", "launch")
+    out = []
+    for slug in all_slugs:
+        cfg = TIER_CONFIG.get(slug, {})
+        out.append({
+            "slug": slug,
+            "name": cfg.get("name", slug.replace("_", " ").title()),
+            "price": float(cfg.get("price", 0)),
+            "put_monthly": cfg.get("put_monthly", 0),
+            "aic_monthly": cfg.get("aic_monthly", 0),
+            "internal": cfg.get("internal", False),
+        })
+    return out
 
 
 # ============================================================
@@ -291,12 +346,12 @@ class Entitlements:
 # ============================================================
 
 def get_entitlements_for_tier(tier: str) -> Entitlements:
-    """Build Entitlements from a tier slug. Falls back to free on unknown slugs."""
-    t = (tier or "free").lower().strip()
+    """Build Entitlements from a tier slug. Uses normalize_tier (launch->creator_lite, unknown->free)."""
+    t = normalize_tier(tier)
     cfg = TIER_CONFIG.get(t, TIER_CONFIG["free"])
     return Entitlements(
         tier=t,
-        tier_display=cfg.get("name", tier.title()),
+        tier_display=cfg.get("name", t.replace("_", " ").title()),
         put_daily=cfg.get("put_daily", 2),
         put_monthly=cfg.get("put_monthly", 60),
         aic_monthly=cfg.get("aic_monthly", 0),
@@ -308,7 +363,7 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         can_webhooks=cfg.get("webhooks", False),
         can_white_label=cfg.get("white_label", False),
         can_excel=cfg.get("excel", False),
-        can_priority=cfg.get("priority", False),
+        can_priority=cfg.get("priority_class", "p4") in PRIORITY_QUEUE_CLASSES,
         can_flex=cfg.get("flex", False),
         can_burn_hud=cfg.get("hud", False),
         show_ads=cfg.get("ads", True),
@@ -345,7 +400,8 @@ def get_entitlements_from_user(
     if role in ("admin", "master_admin"):
         return get_entitlements_for_tier("master_admin")
 
-    tier = (user_record.get("subscription_tier") or "free").lower()
+    raw_tier = (user_record.get("subscription_tier") or "free").lower()
+    tier = normalize_tier(raw_tier)
     ent = get_entitlements_for_tier(tier)
 
     if overrides:
@@ -482,12 +538,6 @@ def check_queue_depth(
 def get_priority_lane(priority_class: str) -> str:
     """Return 'priority' or 'normal' for a given priority_class string."""
     return "priority" if priority_class in PRIORITY_QUEUE_CLASSES else "normal"
-
-
-def get_tier_display_name(tier: str) -> str:
-    """Get human-readable display name for a tier slug."""
-    cfg = TIER_CONFIG.get((tier or "free").lower(), {})
-    return cfg.get("name", tier.title())
 
 
 def get_tier_from_lookup_key(lookup_key: str) -> str:

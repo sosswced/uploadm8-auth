@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Overview - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg-primary: #0a0a0f; --bg-secondary: #12121a; --bg-card: #1a1a24; --bg-hover: #22222e;
+            --bg-input: rgba(255,255,255,0.05); --text-primary: #ffffff; --text-secondary: #9ca3af;
+            --text-muted: #6b7280; --border-color: rgba(255,255,255,0.08); --border-hover: rgba(255,255,255,0.15);
+            --accent-orange: #f97316; --accent-orange-hover: #ea580c; --accent-blue: #3b82f6;
+            --accent-green: #22c55e; --accent-red: #ef4444; --accent-purple: #8b5cf6;
+            --radius-sm: 6px; --radius-md: 10px; --radius-lg: 16px;
+        }
+        html { scroll-behavior: smooth; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg-primary); color: var(--text-primary); line-height: 1.7; min-height: 100vh; }
+        a { color: var(--accent-orange); text-decoration: none; transition: color 0.2s; }
+        a:hover { color: var(--accent-orange-hover); }
+        .nav { position: sticky; top: 0; z-index: 100; padding: 1rem 2rem; background: rgba(10,10,15,0.97); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); }
+        .nav-container { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+        .nav-logo { display: flex; align-items: center; gap: 0.75rem; font-size: 1.25rem; font-weight: 700; color: white; text-decoration: none; }
+        .nav-logo-icon { width: 32px; height: 32px; background: linear-gradient(135deg, var(--accent-orange), var(--accent-purple)); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 1rem; }
+        .back-btn { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; font-weight: 500; padding: 0.5rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-md); transition: all 0.2s; }
+        .back-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--bg-hover); }
+        .hero { padding: 4rem 2rem 3rem; background: linear-gradient(180deg, rgba(34,197,94,0.06) 0%, transparent 100%); border-bottom: 1px solid var(--border-color); }
+        .hero-inner { max-width: 900px; margin: 0 auto; }
+        .hero-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.875rem; background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.25); border-radius: 50px; font-size: 0.8rem; font-weight: 600; color: var(--accent-green); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 1.25rem; }
+        .hero h1 { font-size: 2.75rem; font-weight: 800; margin-bottom: 0.75rem; line-height: 1.15; }
+        .hero-meta { display: flex; align-items: center; gap: 1.5rem; color: var(--text-muted); font-size: 0.875rem; flex-wrap: wrap; }
+        .hero-meta span { display: flex; align-items: center; gap: 0.4rem; }
+        .legal-nav { background: var(--bg-secondary); border-bottom: 1px solid var(--border-color); padding: 0 2rem; overflow-x: auto; }
+        .legal-nav-inner { max-width: 1280px; margin: 0 auto; display: flex; }
+        .legal-nav a { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
+        .legal-nav a:hover { color: var(--text-primary); }
+        .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+        .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
+        @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
+        .sidebar-toc { position: sticky; top: 80px; }
+        .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
+        .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
+        .toc-list { list-style: none; }
+        .toc-list li { margin-bottom: 0.125rem; }
+        .toc-list a { display: block; padding: 0.4rem 0.75rem; color: var(--text-secondary); font-size: 0.85rem; border-radius: var(--radius-sm); border-left: 2px solid transparent; transition: all 0.2s; text-decoration: none; }
+        .toc-list a:hover, .toc-list a.active { color: var(--accent-orange); border-left-color: var(--accent-orange); background: rgba(249,115,22,0.07); }
+        .article { min-width: 0; }
+        .section-block { margin-bottom: 3rem; }
+        .section-block:last-child { margin-bottom: 0; }
+        .section-header { display: flex; align-items: center; gap: 0.875rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); }
+        .section-num { width: 32px; height: 32px; background: rgba(34,197,94,0.15); border: 1px solid rgba(34,197,94,0.3); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: 700; color: var(--accent-green); flex-shrink: 0; }
+        .section-header h2 { font-size: 1.35rem; font-weight: 700; }
+        .prose p { color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.95rem; }
+        .prose p:last-child { margin-bottom: 0; }
+        .prose ul { color: var(--text-secondary); padding-left: 1.5rem; margin-bottom: 1rem; }
+        .prose li { margin-bottom: 0.5rem; font-size: 0.95rem; }
+        .prose h3 { font-size: 1rem; font-weight: 600; color: var(--text-primary); margin: 1.5rem 0 0.75rem; }
+        .prose strong { color: var(--text-primary); font-weight: 600; }
+        .callout { display: flex; gap: 0.875rem; padding: 1rem 1.25rem; border-radius: var(--radius-md); margin: 1.25rem 0; font-size: 0.9rem; }
+        .callout i { flex-shrink: 0; margin-top: 0.1rem; font-size: 1rem; }
+        .callout-blue { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); color: #93c5fd; }
+        .callout-blue i { color: var(--accent-blue); }
+        .callout-green { background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2); color: #86efac; }
+        .callout-green i { color: var(--accent-green); }
+        .callout-orange { background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.2); color: #fdba74; }
+        .callout-orange i { color: var(--accent-orange); }
+
+        /* Security control grid */
+        .security-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.25rem; margin: 1.5rem 0; }
+        .security-card { background: rgba(34,197,94,0.05); border: 1px solid rgba(34,197,94,0.2); border-radius: var(--radius-lg); padding: 1.5rem; transition: border-color 0.2s, transform 0.2s; }
+        .security-card:hover { border-color: rgba(34,197,94,0.4); transform: translateY(-2px); }
+        .security-card-icon { width: 44px; height: 44px; background: rgba(34,197,94,0.15); border-radius: var(--radius-md); display: flex; align-items: center; justify-content: center; font-size: 1.25rem; color: var(--accent-green); margin-bottom: 1rem; }
+        .security-card h3 { font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem; }
+        .security-card p { color: var(--text-secondary); font-size: 0.875rem; line-height: 1.6; }
+
+        .data-table { width: 100%; border-collapse: collapse; margin: 1.25rem 0; border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-color); font-size: 0.875rem; }
+        .data-table th { background: var(--bg-secondary); padding: 0.75rem 1rem; text-align: left; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
+        .data-table td { padding: 0.875rem 1rem; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); vertical-align: top; }
+        .data-table tr:last-child td { border-bottom: none; }
+        .data-table tr:hover td { background: var(--bg-hover); }
+        .data-table td:first-child { color: var(--text-primary); font-weight: 500; }
+
+        .footer { background: var(--bg-secondary); border-top: 1px solid var(--border-color); padding: 2rem; margin-top: 4rem; }
+        .footer-inner { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+        .footer-copy { color: var(--text-muted); font-size: 0.85rem; }
+        .footer-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+        .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
+        .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg-secondary); }
+        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+    </style>
+</head>
+<body>
+
+<nav class="nav">
+    <div class="nav-container">
+        <a href="index.html" class="nav-logo">
+            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            UploadM8
+        </a>
+        <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
+    </div>
+</nav>
+
+<div class="hero">
+    <div class="hero-inner">
+        <div class="hero-badge"><i class="fas fa-lock"></i> Security</div>
+        <h1>Security Overview</h1>
+        <div class="hero-meta">
+            <span><i class="fas fa-calendar"></i> Updated: February 2026</span>
+            <span><i class="fas fa-shield-alt"></i> Infrastructure: Cloudflare R2 + Render</span>
+            <span><i class="fas fa-envelope"></i> Report: security@uploadm8.com</span>
+        </div>
+    </div>
+</div>
+
+<nav class="legal-nav">
+    <div class="legal-nav-inner">
+        <a href="privacy.html"><i class="fas fa-shield-alt"></i> Privacy</a>
+        <a href="terms.html"><i class="fas fa-file-contract"></i> Terms</a>
+        <a href="security.html" class="active"><i class="fas fa-lock"></i> Security</a>
+        <a href="cookies.html"><i class="fas fa-cookie-bite"></i> Cookies</a>
+        <a href="subprocessors.html"><i class="fas fa-server"></i> Subprocessors</a>
+        <a href="refunds.html"><i class="fas fa-undo"></i> Refunds</a>
+        <a href="dmca.html"><i class="fas fa-gavel"></i> DMCA</a>
+        <a href="support.html"><i class="fas fa-headset"></i> Support</a>
+    </div>
+</nav>
+
+<div class="content-wrapper">
+    <article class="article">
+
+        <div class="callout callout-green">
+            <i class="fas fa-check-circle"></i>
+            <div>Security is a foundational commitment at UploadM8, not an afterthought. We apply defense-in-depth principles across every layer of the platform — from credential storage to API token handling to data transmission.</div>
+        </div>
+
+        <div class="section-block" id="controls">
+            <div class="section-header"><div class="section-num"><i class="fas fa-shield-alt" style="font-size:0.75rem"></i></div><h2>Security Controls</h2></div>
+            <div class="security-grid">
+                <div class="security-card">
+                    <div class="security-card-icon"><i class="fas fa-network-wired"></i></div>
+                    <h3>Encryption in Transit</h3>
+                    <p>All data transmitted between clients and UploadM8 servers uses TLS 1.3. Platform API communications use enforced HTTPS with certificate validation. No unencrypted connections accepted.</p>
+                </div>
+                <div class="security-card">
+                    <div class="security-card-icon"><i class="fas fa-hdd"></i></div>
+                    <h3>Encryption at Rest</h3>
+                    <p>All OAuth tokens, refresh tokens, and sensitive credentials are encrypted at rest using AES-256. Video files in Cloudflare R2 are stored with server-side encryption enabled by default.</p>
+                </div>
+                <div class="security-card">
+                    <div class="security-card-icon"><i class="fas fa-key"></i></div>
+                    <h3>Credential Isolation</h3>
+                    <p>Platform OAuth tokens are stored in isolated database rows accessible only to the publishing microservice. No other service component has direct token access. Tokens are never logged or exposed in error messages.</p>
+                </div>
+                <div class="security-card">
+                    <div class="security-card-icon"><i class="fas fa-list-alt"></i></div>
+                    <h3>Audit Logging</h3>
+                    <p>Comprehensive logs capture all authentication events, API calls, data access, publishing actions, and administrative changes. Logs are retained for 12 months and are tamper-resistant.</p>
+                </div>
+                <div class="security-card">
+                    <div class="security-card-icon"><i class="fas fa-database"></i></div>
+                    <h3>Automated Backups</h3>
+                    <p>PostgreSQL databases are backed up on a 30-day rolling rotation. Backups are encrypted and stored in geographically separated storage. Restoration procedures are tested quarterly.</p>
+                </div>
+                <div class="security-card">
+                    <div class="security-card-icon"><i class="fas fa-users-cog"></i></div>
+                    <h3>Role-Based Access Control</h3>
+                    <p>Internal team access follows least-privilege principles. Admin actions require multi-factor authentication. All privileged access events are logged with user attribution and timestamp.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="section-block" id="authentication">
+            <div class="section-header"><div class="section-num"><i class="fas fa-user-lock" style="font-size:0.75rem"></i></div><h2>Authentication Security</h2></div>
+            <div class="prose">
+                <h3>Password Storage</h3>
+                <p>User passwords are hashed using bcrypt with an appropriate work factor. Plaintext passwords are never stored, logged, or transmitted. We do not have access to your password.</p>
+                <h3>Session Management</h3>
+                <p>Authentication sessions use cryptographically secure, randomly generated tokens. Sessions expire after inactivity. You can sign out on this device from the app header, or invalidate all other sessions via <strong>Settings → Security → Log Out All Other Sessions</strong>.</p>
+                <h3>OAuth Token Lifecycle</h3>
+                <p>Platform OAuth tokens are encrypted immediately upon receipt and decrypted only at the moment of API call execution. Tokens are automatically refreshed before expiration. Disconnecting a platform triggers immediate token revocation via the platform's OAuth revocation endpoint, followed by deletion from our database within 24 hours.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="infrastructure">
+            <div class="section-header"><div class="section-num"><i class="fas fa-server" style="font-size:0.75rem"></i></div><h2>Infrastructure Security</h2></div>
+            <table class="data-table">
+                <thead><tr><th>Component</th><th>Provider</th><th>Security Features</th></tr></thead>
+                <tbody>
+                    <tr><td>Application Hosting</td><td>Render</td><td>Isolated containers, automatic HTTPS, DDoS protection</td></tr>
+                    <tr><td>Database</td><td>PostgreSQL (Render)</td><td>Encrypted at rest, private network, automated backups</td></tr>
+                    <tr><td>Job Queue</td><td>Redis (Render)</td><td>Private network, no external exposure, auth required</td></tr>
+                    <tr><td>Video Storage</td><td>Cloudflare R2</td><td>AES-256 server-side encryption, signed URLs, zero egress</td></tr>
+                    <tr><td>CDN / WAF</td><td>Cloudflare</td><td>DDoS mitigation, bot management, rate limiting</td></tr>
+                    <tr><td>Payment Processing</td><td>Stripe</td><td>PCI DSS Level 1, no card data stored by UploadM8</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section-block" id="incident-response">
+            <div class="section-header"><div class="section-num"><i class="fas fa-bell" style="font-size:0.75rem"></i></div><h2>Incident Response</h2></div>
+            <div class="prose">
+                <h3>Detection & Response</h3>
+                <p>We maintain automated monitoring for anomalous access patterns, failed authentication spikes, unusual API call volumes, and data exfiltration indicators. Security alerts route to on-call personnel 24/7.</p>
+                <h3>Breach Notification</h3>
+                <p>In the event of a security incident affecting your personal data, we will notify affected users via email within 72 hours of confirmation. Notifications will include: nature of the incident, data categories affected, likely consequences, and remediation steps taken.</p>
+                <h3>Regulatory Reporting</h3>
+                <p>Where required by applicable law (e.g., GDPR Article 33), we will report confirmed breaches to the relevant supervisory authority within the legally mandated timeframe.</p>
+            </div>
+        </div>
+
+        <div class="section-block" id="vulnerability-disclosure">
+            <div class="section-header"><div class="section-num"><i class="fas fa-bug" style="font-size:0.75rem"></i></div><h2>Vulnerability Disclosure</h2></div>
+            <div class="prose">
+                <p>We welcome security researchers who act in good faith to report vulnerabilities. Please follow responsible disclosure:</p>
+                <ul>
+                    <li>Email your findings to <a href="mailto:security@uploadm8.com">security@uploadm8.com</a> with a detailed description</li>
+                    <li>Allow us reasonable time to investigate and remediate before public disclosure (90 days standard)</li>
+                    <li>Do not access, modify, or delete user data during your research</li>
+                    <li>Do not conduct DDoS testing, social engineering, or physical security attacks</li>
+                </ul>
+                <div class="callout callout-blue">
+                    <i class="fas fa-info-circle"></i>
+                    <div>We will acknowledge receipt within 48 hours and provide a remediation timeline within 10 business days. Good-faith researchers will not face legal action for qualifying disclosures.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section-block" id="user-responsibilities">
+            <div class="section-header"><div class="section-num"><i class="fas fa-user-shield" style="font-size:0.75rem"></i></div><h2>Your Security Responsibilities</h2></div>
+            <div class="prose">
+                <p>We provide the infrastructure security. Your responsibilities include:</p>
+                <ul>
+                    <li>Using a strong, unique password for your UploadM8 account</li>
+                    <li>Keeping your connected platform credentials (TikTok, YouTube, etc.) secure</li>
+                    <li>Logging out from shared or public devices</li>
+                    <li>Reporting suspicious account activity to <a href="mailto:security@uploadm8.com">security@uploadm8.com</a> immediately</li>
+                    <li>Not sharing your account credentials with third parties</li>
+                    <li>Reviewing connected platform permissions periodically</li>
+                </ul>
+            </div>
+        </div>
+
+    </article>
+
+    <aside class="sidebar-toc">
+        <div class="toc-card">
+            <div class="toc-title">On This Page</div>
+            <ul class="toc-list">
+                <li><a href="#controls">Security Controls</a></li>
+                <li><a href="#authentication">Authentication Security</a></li>
+                <li><a href="#infrastructure">Infrastructure</a></li>
+                <li><a href="#incident-response">Incident Response</a></li>
+                <li><a href="#vulnerability-disclosure">Vulnerability Disclosure</a></li>
+                <li><a href="#user-responsibilities">Your Responsibilities</a></li>
+            </ul>
+        </div>
+    </aside>
+</div>
+
+<footer class="footer">
+    <div class="footer-inner">
+        <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
+        <div class="footer-links">
+            <a href="privacy.html">Privacy</a>
+            <a href="terms.html">Terms</a>
+            <a href="security.html" class="active">Security</a>
+            <a href="cookies.html">Cookies</a>
+            <a href="subprocessors.html">Subprocessors</a>
+            <a href="refunds.html">Refunds</a>
+            <a href="dmca.html">DMCA</a>
+            <a href="support.html">Support</a>
+        </div>
+    </div>
+</footer>
+
+<script>
+    const sections = document.querySelectorAll('.section-block[id]');
+    const tocLinks = document.querySelectorAll('.toc-list a');
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                tocLinks.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+            }
+        });
+    }, { rootMargin: '-20% 0% -60% 0%' });
+    sections.forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

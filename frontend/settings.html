@@ -74,33 +74,81 @@
   </div>
 
   <script>
-    const API_BASE = (typeof API_BASE_URL !== 'undefined') ? API_BASE_URL : (window.location.origin.includes('localhost') ? 'http://127.0.0.1:8000' : (window.location.hostname === 'app.uploadm8.com' ? 'https://auth.uploadm8.com' : ''));
+    const API_BASE = (typeof API_BASE_URL !== 'undefined') ? API_BASE_URL : (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : (window.location.hostname === 'app.uploadm8.com' ? 'https://auth.uploadm8.com' : ''));
+
+    function esc(s) { const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
+
+    function renderTopupGrid(topups, isLoggedIn) {
+      const putPacks = (topups || []).filter(t => t.wallet === 'put');
+      const aicPacks = (topups || []).filter(t => t.wallet === 'aic');
+      if (!putPacks.length && !aicPacks.length) {
+        document.getElementById('topup-grid').innerHTML = '<p style="color:var(--muted);">No top-ups available.</p>';
+        return;
+      }
+      const hash = (window.location.hash || '').replace('#', '');
+      const topupLookup = hash.includes('topup=') ? hash.split('topup=')[1]?.split('&')[0] : null;
+      document.getElementById('topup-grid').innerHTML = `
+        <div style="grid-column: 1/-1; font-weight:600; color: var(--muted); font-size: 0.85rem;">PUT</div>
+        ${putPacks.map(t => `
+          <div class="topup-card${topupLookup === t.lookup_key ? ' selected' : ''}" data-lookup="${esc(t.lookup_key)}" style="${topupLookup === t.lookup_key ? 'border-color:var(--primary);background:rgba(124,58,237,0.2);' : ''}">
+            <div class="topup-amount">+${esc(t.amount)} PUT</div>
+            <div class="topup-price">$${esc(t.price_usd || '—')}</div>
+          </div>
+        `).join('')}
+        <div style="grid-column: 1/-1; font-weight:600; color: var(--muted); font-size: 0.85rem; margin-top: 0.5rem;">AIC</div>
+        ${aicPacks.map(t => `
+          <div class="topup-card${topupLookup === t.lookup_key ? ' selected' : ''}" data-lookup="${esc(t.lookup_key)}" style="${topupLookup === t.lookup_key ? 'border-color:var(--primary);background:rgba(124,58,237,0.2);' : ''}">
+            <div class="topup-amount">+${esc(t.amount)} AIC</div>
+            <div class="topup-price">$${esc(t.price_usd || '—')}</div>
+          </div>
+        `).join('')}
+      `;
+      const grid = document.getElementById('topup-grid');
+      grid.querySelectorAll('.topup-card').forEach(el => {
+        el.addEventListener('click', () => {
+          if (isLoggedIn) buyTopup(el.dataset.lookup);
+          else window.location.href = '/login.html?redirect=' + encodeURIComponent('/settings.html#billing');
+        });
+      });
+      if (topupLookup) {
+        const target = grid.querySelector(`.topup-card[data-lookup="${CSS.escape(topupLookup)}"]`);
+        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }
 
     async function loadBilling() {
       const token = localStorage.getItem('access_token');
+
+      // Always load pricing/topups (even for anonymous users)
+      let topups = [];
+      try {
+        const pricingRes = await fetch(API_BASE + '/api/pricing');
+        if (pricingRes.ok) {
+          const pricingData = await pricingRes.json();
+          topups = pricingData.topups || [];
+        }
+      } catch (_) {}
+
       if (!token) {
         document.getElementById('wallet-display').innerHTML = '<p><a href="/login.html">Sign in</a> to view your wallet.</p>';
+        renderTopupGrid(topups, false);
         return;
       }
       try {
-        const [meRes, pricingRes] = await Promise.all([
-          fetch(API_BASE + '/api/me', { headers: { Authorization: 'Bearer ' + token } }),
-          fetch(API_BASE + '/api/pricing')
-        ]);
+        const meRes = await fetch(API_BASE + '/api/me', { headers: { Authorization: 'Bearer ' + token } });
         if (!meRes.ok) {
           document.getElementById('wallet-display').innerHTML = '<p><a href="/login.html">Sign in</a> to view your wallet.</p>';
+          renderTopupGrid(topups, false);
           return;
         }
         const me = await meRes.json();
-        const { topups } = await pricingRes.json();
 
         const w = me.wallet || {};
         const plan = me.plan || {};
-        const tier = me.subscription_tier || 'free';
         document.getElementById('wallet-display').innerHTML = `
           <div class="wallet-row">
             <span class="wallet-label">Current plan</span>
-            <span class="plan-badge">${(me.subscription_tier || 'free').replace('_',' ')}</span>
+            <span class="plan-badge">${esc((me.subscription_tier || 'free').replace('_',' '))}</span>
           </div>
           <div class="wallet-row">
             <span class="wallet-label">PUT balance</span>
@@ -119,54 +167,39 @@
           </div>
         `;
 
-        // Top-ups
-        const putPacks = topups.filter(t => t.wallet === 'put');
-        const aicPacks = topups.filter(t => t.wallet === 'aic');
-        const hash = (window.location.hash || '').replace('#', '');
-        const topupLookup = hash.includes('topup=') ? hash.split('topup=')[1]?.split('&')[0] : null;
-        document.getElementById('topup-grid').innerHTML = `
-          <div style="grid-column: 1/-1; font-weight:600; color: var(--muted); font-size: 0.85rem;">PUT</div>
-          ${putPacks.map(t => `
-            <div class="topup-card" data-lookup="${t.lookup_key}">
-              <div class="topup-amount">+${t.amount} PUT</div>
-              <div class="topup-price">$${t.price_usd || '—'}</div>
-            </div>
-          `).join('')}
-          <div style="grid-column: 1/-1; font-weight:600; color: var(--muted); font-size: 0.85rem; margin-top: 0.5rem;">AIC</div>
-          ${aicPacks.map(t => `
-            <div class="topup-card" data-lookup="${t.lookup_key}">
-              <div class="topup-amount">+${t.amount} AIC</div>
-              <div class="topup-price">$${t.price_usd || '—'}</div>
-            </div>
-          `).join('')}
-        `;
-        document.querySelectorAll('.topup-card').forEach(el => {
-          el.addEventListener('click', () => buyTopup(el.dataset.lookup));
-        });
+        renderTopupGrid(topups, true);
       } catch (e) {
         document.getElementById('wallet-display').innerHTML = '<p style="color:#ef4444;">Could not load billing. Check API.</p>';
+        renderTopupGrid(topups, true);
       }
     }
 
     async function openBillingPortal() {
       const token = localStorage.getItem('access_token');
       if (!token) { window.location.href = '/login.html'; return; }
+      const btn = document.querySelector('[onclick="openBillingPortal()"]');
+      if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
       try {
         const r = await fetch(API_BASE + '/api/billing/portal', {
           method: 'POST',
           headers: { Authorization: 'Bearer ' + token }
         });
         const data = await r.json();
+        if (!r.ok) { alert(data.detail || `Portal error (${r.status})`); return; }
         if (data.portal_url) window.location.href = data.portal_url;
         else alert(data.detail || 'Could not open billing portal');
       } catch (e) {
         alert('Could not open billing portal');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Manage subscription'; }
       }
     }
 
     async function buyTopup(lookupKey) {
       const token = localStorage.getItem('access_token');
       if (!token) { window.location.href = '/login.html'; return; }
+      const card = document.querySelector(`.topup-card[data-lookup="${lookupKey}"]`);
+      if (card) card.style.opacity = '0.5';
       try {
         const r = await fetch(API_BASE + '/api/wallet/topup', {
           method: 'POST',
@@ -174,10 +207,13 @@
           body: JSON.stringify({ lookup_key: lookupKey })
         });
         const data = await r.json();
+        if (!r.ok) { alert(data.detail || `Checkout failed (${r.status})`); return; }
         if (data.checkout_url) window.location.href = data.checkout_url;
         else alert(data.detail || 'Checkout failed');
       } catch (e) {
         alert('Could not start checkout');
+      } finally {
+        if (card) card.style.opacity = '1';
       }
     }
 

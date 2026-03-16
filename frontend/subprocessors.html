@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Subprocessors - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg-primary: #0a0a0f; --bg-secondary: #12121a; --bg-card: #1a1a24; --bg-hover: #22222e;
+            --bg-input: rgba(255,255,255,0.05); --text-primary: #ffffff; --text-secondary: #9ca3af;
+            --text-muted: #6b7280; --border-color: rgba(255,255,255,0.08); --border-hover: rgba(255,255,255,0.15);
+            --accent-orange: #f97316; --accent-orange-hover: #ea580c; --accent-blue: #3b82f6;
+            --accent-green: #22c55e; --accent-red: #ef4444; --accent-purple: #8b5cf6;
+            --radius-sm: 6px; --radius-md: 10px; --radius-lg: 16px;
+        }
+        html { scroll-behavior: smooth; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg-primary); color: var(--text-primary); line-height: 1.7; min-height: 100vh; }
+        a { color: var(--accent-orange); text-decoration: none; transition: color 0.2s; }
+        a:hover { color: var(--accent-orange-hover); }
+        .nav { position: sticky; top: 0; z-index: 100; padding: 1rem 2rem; background: rgba(10,10,15,0.97); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); }
+        .nav-container { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+        .nav-logo { display: flex; align-items: center; gap: 0.75rem; font-size: 1.25rem; font-weight: 700; color: white; text-decoration: none; }
+        .nav-logo-icon { width: 32px; height: 32px; background: linear-gradient(135deg, var(--accent-orange), var(--accent-purple)); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 1rem; }
+        .back-btn { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; font-weight: 500; padding: 0.5rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-md); transition: all 0.2s; }
+        .back-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--bg-hover); }
+        .hero { padding: 4rem 2rem 3rem; background: linear-gradient(180deg, rgba(139,92,246,0.06) 0%, transparent 100%); border-bottom: 1px solid var(--border-color); }
+        .hero-inner { max-width: 900px; margin: 0 auto; }
+        .hero-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.875rem; background: rgba(139,92,246,0.1); border: 1px solid rgba(139,92,246,0.25); border-radius: 50px; font-size: 0.8rem; font-weight: 600; color: var(--accent-purple); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 1.25rem; }
+        .hero h1 { font-size: 2.75rem; font-weight: 800; margin-bottom: 0.75rem; line-height: 1.15; }
+        .hero-meta { display: flex; align-items: center; gap: 1.5rem; color: var(--text-muted); font-size: 0.875rem; flex-wrap: wrap; }
+        .hero-meta span { display: flex; align-items: center; gap: 0.4rem; }
+        .legal-nav { background: var(--bg-secondary); border-bottom: 1px solid var(--border-color); padding: 0 2rem; overflow-x: auto; }
+        .legal-nav-inner { max-width: 1280px; margin: 0 auto; display: flex; }
+        .legal-nav a { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
+        .legal-nav a:hover { color: var(--text-primary); }
+        .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+        .content-wrapper { max-width: 1100px; margin: 0 auto; padding: 3rem 2rem; }
+        .section-block { margin-bottom: 3rem; }
+        .section-header-plain { margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); }
+        .section-header-plain h2 { font-size: 1.35rem; font-weight: 700; display: flex; align-items: center; gap: 0.75rem; }
+        .section-header-plain h2 i { color: var(--accent-orange); font-size: 1rem; }
+        .prose p { color: var(--text-secondary); margin-bottom: 1rem; font-size: 0.95rem; }
+        .callout { display: flex; gap: 0.875rem; padding: 1rem 1.25rem; border-radius: var(--radius-md); margin: 1.25rem 0; font-size: 0.9rem; }
+        .callout i { flex-shrink: 0; margin-top: 0.1rem; }
+        .callout-blue { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); color: #93c5fd; }
+        .callout-blue i { color: var(--accent-blue); }
+        .callout-orange { background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.2); color: #fdba74; }
+        .callout-orange i { color: var(--accent-orange); }
+        .data-table { width: 100%; border-collapse: collapse; margin: 1rem 0 2rem; border-radius: var(--radius-md); overflow: hidden; border: 1px solid var(--border-color); font-size: 0.875rem; }
+        .data-table th { background: var(--bg-secondary); padding: 0.75rem 1rem; text-align: left; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
+        .data-table td { padding: 0.875rem 1rem; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); vertical-align: top; }
+        .data-table tr:last-child td { border-bottom: none; }
+        .data-table tr:hover td { background: var(--bg-hover); }
+        .data-table td:first-child { color: var(--text-primary); font-weight: 600; }
+        .data-table td a { font-size: 0.8rem; }
+        .badge { display: inline-flex; align-items: center; padding: 0.2rem 0.6rem; border-radius: var(--radius-sm); font-size: 0.75rem; font-weight: 600; }
+        .badge-blue { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
+        .badge-green { background: rgba(34,197,94,0.15); color: var(--accent-green); }
+        .badge-orange { background: rgba(249,115,22,0.15); color: var(--accent-orange); }
+        .badge-purple { background: rgba(139,92,246,0.15); color: var(--accent-purple); }
+        .footer { background: var(--bg-secondary); border-top: 1px solid var(--border-color); padding: 2rem; margin-top: 4rem; }
+        .footer-inner { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+        .footer-copy { color: var(--text-muted); font-size: 0.85rem; }
+        .footer-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+        .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
+        .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
+        ::-webkit-scrollbar { width: 6px; height: 6px; } ::-webkit-scrollbar-track { background: var(--bg-secondary); } ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+    </style>
+</head>
+<body>
+
+<nav class="nav">
+    <div class="nav-container">
+        <a href="index.html" class="nav-logo">
+            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            UploadM8
+        </a>
+        <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
+    </div>
+</nav>
+
+<div class="hero">
+    <div class="hero-inner">
+        <div class="hero-badge"><i class="fas fa-server"></i> Legal</div>
+        <h1>Subprocessors</h1>
+        <div class="hero-meta">
+            <span><i class="fas fa-calendar"></i> Last Updated: February 2026</span>
+            <span><i class="fas fa-bell"></i> Notify: privacy@uploadm8.com for updates</span>
+        </div>
+    </div>
+</div>
+
+<nav class="legal-nav">
+    <div class="legal-nav-inner">
+        <a href="privacy.html"><i class="fas fa-shield-alt"></i> Privacy</a>
+        <a href="terms.html"><i class="fas fa-file-contract"></i> Terms</a>
+        <a href="security.html"><i class="fas fa-lock"></i> Security</a>
+        <a href="cookies.html"><i class="fas fa-cookie-bite"></i> Cookies</a>
+        <a href="subprocessors.html" class="active"><i class="fas fa-server"></i> Subprocessors</a>
+        <a href="refunds.html"><i class="fas fa-undo"></i> Refunds</a>
+        <a href="dmca.html"><i class="fas fa-gavel"></i> DMCA</a>
+        <a href="support.html"><i class="fas fa-headset"></i> Support</a>
+    </div>
+</nav>
+
+<div class="content-wrapper">
+
+    <div class="callout callout-blue">
+        <i class="fas fa-info-circle"></i>
+        <div>UploadM8 uses a select set of third-party service providers ("subprocessors") to operate our platform. All subprocessors are bound by data processing agreements that require them to maintain appropriate data protection standards. We notify users of material subprocessor changes with 30 days advance notice.</div>
+    </div>
+
+    <div class="section-block">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-cloud"></i> Core Infrastructure</h2>
+        </div>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Service</th><th>Data Processed</th><th>Location</th><th>Privacy Policy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Render</td>
+                    <td>Application Hosting & PostgreSQL</td>
+                    <td>All application data, database storage</td>
+                    <td>USA (Oregon)</td>
+                    <td><a href="https://render.com/privacy" target="_blank" rel="noopener">render.com/privacy</a></td>
+                </tr>
+                <tr>
+                    <td>Cloudflare R2</td>
+                    <td>Video & Asset Storage</td>
+                    <td>Uploaded videos, thumbnails, transcoded files</td>
+                    <td>USA (multi-region)</td>
+                    <td><a href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noopener">cloudflare.com/privacypolicy</a></td>
+                </tr>
+                <tr>
+                    <td>Redis (Render)</td>
+                    <td>Job Queue</td>
+                    <td>Job metadata, queue state, temporary data</td>
+                    <td>USA (Oregon)</td>
+                    <td><a href="https://render.com/privacy" target="_blank" rel="noopener">render.com/privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-credit-card"></i> Payments</h2>
+        </div>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Service</th><th>Data Processed</th><th>Location</th><th>Privacy Policy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Stripe</td>
+                    <td>Payment Processing & Billing</td>
+                    <td>Payment method tokens, billing history, subscription data. UploadM8 never stores raw card numbers.</td>
+                    <td>USA / Global</td>
+                    <td><a href="https://stripe.com/privacy" target="_blank" rel="noopener">stripe.com/privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-share-alt"></i> Platform Integrations</h2>
+        </div>
+        <div class="callout callout-orange">
+            <i class="fas fa-exclamation-triangle"></i>
+            <div>Platform integrations only receive data you explicitly authorize via OAuth and only for the purpose of publishing your content. UploadM8 does not control these platforms' privacy practices for content after it is published.</div>
+        </div>
+        <table class="data-table">
+            <thead>
+                <tr><th>Platform</th><th>API Used</th><th>Data Shared</th><th>Location</th><th>Privacy Policy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><i class="fab fa-tiktok"></i> TikTok</td>
+                    <td>Content Posting API v2</td>
+                    <td>Video files, titles, captions, hashtags, cover image, OAuth tokens</td>
+                    <td>Global</td>
+                    <td><a href="https://www.tiktok.com/legal/page/us/privacy-policy/en" target="_blank" rel="noopener">tiktok.com privacy</a></td>
+                </tr>
+                <tr>
+                    <td><i class="fab fa-youtube" style="color:#FF0000"></i> YouTube</td>
+                    <td>YouTube Data API v3</td>
+                    <td>Video files, title, description, tags, thumbnail, OAuth tokens</td>
+                    <td>USA / Global</td>
+                    <td><a href="https://policies.google.com/privacy" target="_blank" rel="noopener">policies.google.com/privacy</a></td>
+                </tr>
+                <tr>
+                    <td><i class="fab fa-instagram" style="color:#E1306C"></i> Instagram</td>
+                    <td>Meta Graph API v21.0</td>
+                    <td>Video files, caption, cover image, OAuth tokens</td>
+                    <td>USA / Global</td>
+                    <td><a href="https://www.facebook.com/privacy/policy/" target="_blank" rel="noopener">facebook.com/privacy/policy</a></td>
+                </tr>
+                <tr>
+                    <td><i class="fab fa-facebook" style="color:#1877F2"></i> Facebook</td>
+                    <td>Meta Graph API v21.0</td>
+                    <td>Video files, title, description, cover image, OAuth tokens</td>
+                    <td>USA / Global</td>
+                    <td><a href="https://www.facebook.com/privacy/policy/" target="_blank" rel="noopener">facebook.com/privacy/policy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-robot"></i> AI & Optional Services</h2>
+        </div>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Service</th><th>Data Processed</th><th>Retention</th><th>Privacy Policy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Anthropic</td>
+                    <td>Claude API (AIC Token AI Features)</td>
+                    <td>Video frames, transcripts, metadata for generating captions, titles, and thumbnails. Only processed when you use AIC token features.</td>
+                    <td>Not retained by Anthropic beyond request</td>
+                    <td><a href="https://www.anthropic.com/privacy" target="_blank" rel="noopener">anthropic.com/privacy</a></td>
+                </tr>
+                <tr>
+                    <td>Discord</td>
+                    <td>Internal Webhook Notifications</td>
+                    <td>Operational alerts (job status, error notifications). Internal admin use only. No user PII transmitted.</td>
+                    <td>Standard Discord retention</td>
+                    <td><a href="https://discord.com/privacy" target="_blank" rel="noopener">discord.com/privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-globe"></i> International Data Transfers</h2>
+        </div>
+        <div class="prose">
+            <p>Some of our subprocessors are located outside your country. When processing personal data from the European Economic Area, UK, or Switzerland, we rely on appropriate legal transfer mechanisms including Standard Contractual Clauses (SCCs) and adequacy decisions where applicable.</p>
+            <p>All subprocessors contractually commit to maintaining data protection standards equivalent to those we apply to data processed within the US.</p>
+            <p>To request our Data Processing Agreements (DPAs) with any subprocessor, contact <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a>.</p>
+        </div>
+    </div>
+
+</div>
+
+<footer class="footer">
+    <div class="footer-inner">
+        <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
+        <div class="footer-links">
+            <a href="privacy.html">Privacy</a>
+            <a href="terms.html">Terms</a>
+            <a href="security.html">Security</a>
+            <a href="cookies.html">Cookies</a>
+            <a href="subprocessors.html" class="active">Subprocessors</a>
+            <a href="refunds.html">Refunds</a>
+            <a href="dmca.html">DMCA</a>
+            <a href="support.html">Support</a>
+        </div>
+    </div>
+</footer>
+
+</body>
+</html>

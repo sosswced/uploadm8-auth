@@ -118,16 +118,17 @@ class PlatformResult:
     platform: str
     success: bool
 
-    # Multi-account: which profile this result is for
-    account_id: Optional[str] = None  # platform_tokens.id
-    account_name: Optional[str] = None  # e.g. channel title or display name
-    account_username: Optional[str] = None  # e.g. @handle, YouTube custom URL
-    account_avatar: Optional[str] = None  # profile picture URL for Queue/Scheduled display
-
     # Step A (accepted)
     platform_video_id: Optional[str] = None
     platform_url: Optional[str] = None
     publish_id: Optional[str] = None
+
+    # Account identity — set by publish_stage so we always know which platform_tokens row was used
+    token_row_id: Optional[str] = None  # platform_tokens.id (UUID)
+    account_id: Optional[str] = None  # platform's own account ID
+    account_username: Optional[str] = None  # e.g. cedybandz5254
+    account_name: Optional[str] = None  # e.g. Cedy Bandz
+    account_avatar: Optional[str] = None  # avatar URL
 
     # Audit/debug
     attempt_id: Optional[str] = None

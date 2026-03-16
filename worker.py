@@ -940,13 +940,14 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             ctx.mark_error("INTERNAL", str(e))
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
         # ── Release wallet hold on failure ───────────────────────────────────
+        _uid_for_release = str(ctx.user_id) if ctx else user_id
+        _upid_for_release = ctx.upload_id if ctx else upload_id
         try:
-            put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
-            user_id_str = str(ctx.user_id) if ctx.user_id else None
-            if user_id_str and (put_cost > 0 or aic_cost > 0):
-                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
+            put_cost, aic_cost = await _get_upload_costs(_upid_for_release)
+            if _uid_for_release and (put_cost > 0 or aic_cost > 0):
+                await _release_tokens(_upid_for_release, _uid_for_release, put_cost, aic_cost, reason="upload_failed_refund")
         except Exception as wallet_err:
-            logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
+            logger.error(f"[{upload_id}] Wallet release failed: {wallet_err}")
         await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
         return False
     finally:
@@ -1000,10 +1001,10 @@ async def run_publish_and_notify(
                 )
             _wants_email = _prefs["email_notifications"] if _prefs else True
             if _wants_email:
+                import asyncio as _aio
                 _platforms = ctx.platforms or []
                 _put_cost, _aic_cost = await _get_upload_costs(ctx.upload_id)
                 if ctx.state in ("succeeded", "partial"):
-                    import asyncio as _aio
                     _aio.ensure_future(send_upload_completed_email(
                         _user_email,
                         _user_name,
@@ -1104,7 +1105,6 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             "job_id": f"deferred-publish-{upload_id}",
         }
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
-        ctx.user_record = user_record
         ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
@@ -1256,16 +1256,21 @@ async def _sync_one_upload_analytics(
     user_id: str,
     pr_list: list,
     token_map: dict,
+    token_map_by_platform: dict = None,
 ) -> dict:
     """
     Pull engagement stats for one completed upload from each platform API.
     Returns totals dict and writes them + analytics_synced_at to DB.
+
+    token_map: by token_id (account_id) for multi-account — use correct token per result
+    token_map_by_platform: fallback when account_id not in platform_results (legacy)
     """
     import httpx as _httpx
     from stages.publish_stage import decrypt_token
 
     total_views = total_likes = total_comments = total_shares = 0
     platform_stats = {}
+    platform_fallback = token_map_by_platform or {}
 
     async with _httpx.AsyncClient(timeout=15) as client:
         for pr in pr_list:
@@ -1277,7 +1282,11 @@ async def _sync_one_upload_analytics(
             if not ok:
                 continue
 
-            tok = token_map.get(plat, {})
+            # Multi-account: use token for this specific account; fallback to platform
+            account_id = pr.get("account_id")
+            tok = token_map.get(str(account_id), {}) if account_id else {}
+            if not tok:
+                tok = platform_fallback.get(plat, {})
             access_token = tok.get("access_token", "")
             if not access_token:
                 continue
@@ -1465,7 +1474,7 @@ async def run_analytics_sync_loop() -> None:
                     """
                     SELECT u.id AS upload_id, u.user_id, u.platform_results, u.platforms
                       FROM uploads u
-                     WHERE u.status = 'completed'
+                     WHERE u.status IN ('completed','succeeded','partial')
                        AND u.created_at >= $1
                        AND (u.analytics_synced_at IS NULL OR u.analytics_synced_at < $2)
                      ORDER BY u.analytics_synced_at ASC NULLS FIRST, u.created_at DESC
@@ -1514,21 +1523,23 @@ async def run_analytics_sync_loop() -> None:
                         # No platform results to query — stamp and skip
                         async with db_pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
+                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id = $1",
                                 row["upload_id"],
                             )
                         continue
 
-                    # Fetch active tokens for this user
+                    # Fetch active tokens for this user (include id for multi-account lookup)
                     async with db_pool.acquire() as conn:
                         token_rows = await conn.fetch(
-                            """SELECT platform, token_blob, account_id
+                            """SELECT id, platform, token_blob, account_id
                                   FROM platform_tokens
-                                 WHERE user_id= AND revoked_at IS NULL""",
+                                 WHERE user_id = $1 AND revoked_at IS NULL""",
                             row["user_id"],
                         )
 
+                    # token_map: by token_id for multi-account; fallback by platform
                     token_map = {}
+                    token_map_by_platform = {}
                     for tr in token_rows:
                         try:
                             blob = tr["token_blob"]
@@ -1540,7 +1551,9 @@ async def run_analytics_sync_loop() -> None:
                                     dec["ig_user_id"] = str(tr["account_id"])
                                 if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
                                     dec["page_id"] = str(tr["account_id"])
-                                token_map[tr["platform"]] = dec
+                                token_id = str(tr["id"])
+                                token_map[token_id] = dec
+                                token_map_by_platform[tr["platform"]] = dec
                         except Exception:
                             pass
 
@@ -1548,7 +1561,7 @@ async def run_analytics_sync_loop() -> None:
                         # User has no active tokens — stamp and skip
                         async with db_pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
+                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id = $1",
                                 row["upload_id"],
                             )
                         continue
@@ -1556,7 +1569,7 @@ async def run_analytics_sync_loop() -> None:
                     try:
                         async with db_pool.acquire() as conn:
                             result = await _sync_one_upload_analytics(
-                                conn, upload_id, user_id, pr_list, token_map
+                                conn, upload_id, user_id, pr_list, token_map, token_map_by_platform
                             )
                         synced += 1
                         logger.debug(
@@ -1681,10 +1694,13 @@ async def run_scheduler_loop() -> None:
                 # Only pull as many staged jobs as there are free process slots.
                 # This prevents dispatching 500-job batches into memory when
                 # workers are already saturated.
-                free_slots = WORKER_CONCURRENCY - (
-                    WORKER_CONCURRENCY - _process_semaphore._value
-                    if _process_semaphore else WORKER_CONCURRENCY
-                )
+                if _process_semaphore is not None:
+                    try:
+                        free_slots = _process_semaphore._value
+                    except AttributeError:
+                        free_slots = WORKER_CONCURRENCY
+                else:
+                    free_slots = 0
                 dispatch_limit = max(1, free_slots)
 
                 staged_jobs = await conn.fetch(

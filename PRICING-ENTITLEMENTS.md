@@ -5,6 +5,25 @@
 
 ---
 
+## 0. Canonical Schema (Backend ↔ Frontend)
+
+**Single source of truth:** `stages/entitlements.py`
+
+| Concept | Backend | Frontend |
+|---------|---------|----------|
+| **Tier slug** | `subscription_tier` (DB), `tier` (normalized) | `user.tier` or `user.subscription_tier` |
+| **Display name** | `tier_display` from `entitlements_to_dict` | `user.tier_display` or `getTierDisplayName(user)` |
+| **Entitlements** | `entitlements_to_dict(ent)` | `user.entitlements` |
+| **Plan** | Same as entitlements | `user.plan` (identical to entitlements) |
+
+**Tier slugs:** `free`, `creator_lite`, `creator_pro`, `studio`, `agency`, `friends_family`, `lifetime`, `master_admin`, `launch` (legacy → creator_lite)
+
+**Entitlement keys:** `tier`, `tier_display`, `put_daily`, `put_monthly`, `aic_monthly`, `max_accounts`, `can_watermark`, `can_ai`, `can_schedule`, `can_webhooks`, `can_white_label`, `can_excel`, `can_priority`, `can_flex`, `can_burn_hud`, `show_ads`, `priority_class`, `queue_depth`, `lookahead_hours`, `max_caption_frames`, `ai_depth`, `max_thumbnails`, `can_custom_thumbnails`, `can_ai_thumbnail_styling`, `max_parallel_uploads`, `team_seats`, `analytics`, `trial_days`, `is_internal`
+
+**API:** `GET /api/entitlements/tiers` returns `{ tiers, tier_slugs, entitlement_keys }`
+
+---
+
 ## 1. Overview
 
 - **Free:** Taste of paid — enough to experience value, limits create upgrade need

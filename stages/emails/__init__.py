@@ -98,6 +98,7 @@ from .auth import (
     send_password_changed_email,
     send_account_deleted_email,
     send_email_change_email,
+    send_admin_email_change_notice_to_old_email,
     send_admin_reset_password_email,
 )
 
@@ -155,6 +156,7 @@ __all__ = [
     "send_password_changed_email",
     "send_account_deleted_email",
     "send_email_change_email",
+    "send_admin_email_change_notice_to_old_email",
     "send_admin_reset_password_email",
     # Billing — Subscriptions
     "send_subscription_started_email",

@@ -759,29 +759,30 @@ async def publish_to_tiktok(
             # Safety clamp — chunk_size must be in [5 MB, 64 MB]
             chunk_size = max(_5MB, min(_64MB, chunk_size))
 
+        requested_privacy = getattr(ctx, "privacy", None) or "public"
+        privacy_level = resolve_privacy_level(requested_privacy, "tiktok")
+        attempted_creator_only_retry = False
+
         async with httpx.AsyncClient(timeout=120) as client:
             # Step 1: Initialize upload
             init_resp = await client.post(
                 "https://open.tiktokapis.com/v2/post/publish/video/init/",
                 headers={
                     "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json; charset=UTF-8"
+                    "Content-Type": "application/json; charset=UTF-8",
                 },
                 json={
                     "post_info": {
                         "title": tiktok_title,
-                        "privacy_level": resolve_privacy_level(
-                            getattr(ctx, "privacy", None) or "public",
-                            "tiktok",
-                        ),
+                        "privacy_level": privacy_level,
                     },
                     "source_info": {
                         "source": "FILE_UPLOAD",
                         "video_size": file_size,
                         "chunk_size": chunk_size,
                         "total_chunk_count": total_chunk_count,
-                    }
-                }
+                    },
+                },
             )
 
             if init_resp.status_code != 200:
@@ -801,6 +802,45 @@ async def publish_to_tiktok(
                         )
                 except Exception:
                     pass
+
+                # If TikTok is rejecting PUBLIC_TO_EVERYONE with "unaudited" errors,
+                # automatically retry with creator-only privacy to unblock uploads.
+                # This avoids depending on env flags when TikTok approval state changes.
+                if (
+                    (not attempted_creator_only_retry)
+                    and ("unaudited" in err_txt.lower())
+                    and str(privacy_level).upper() == "PUBLIC_TO_EVERYONE"
+                ):
+                    attempted_creator_only_retry = True
+                    creator_only_level = resolve_privacy_level("unlisted", "tiktok")  # SELF_ONLY
+                    logger.info(
+                        "TikTok unaudited public rejection detected; retrying init with SELF_ONLY "
+                        f"(requested_privacy={requested_privacy}, privacy_level={privacy_level}, retry_privacy={creator_only_level})"
+                    )
+                    init_resp2 = await client.post(
+                        "https://open.tiktokapis.com/v2/post/publish/video/init/",
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "application/json; charset=UTF-8",
+                        },
+                        json={
+                            "post_info": {
+                                "title": tiktok_title,
+                                "privacy_level": creator_only_level,
+                            },
+                            "source_info": {
+                                "source": "FILE_UPLOAD",
+                                "video_size": file_size,
+                                "chunk_size": chunk_size,
+                                "total_chunk_count": total_chunk_count,
+                            },
+                        },
+                    )
+                    if init_resp2.status_code == 200:
+                        init_resp = init_resp2
+                    else:
+                        err_txt = (init_resp2.text[:500] or err_txt)[:500]
+
                 return PlatformResult(
                     platform="tiktok",
                     success=False,

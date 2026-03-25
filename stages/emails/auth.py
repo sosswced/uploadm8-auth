@@ -298,10 +298,11 @@ async def send_email_change_email(
             section_tag("Verify Email", "#2563eb")
             + intro_row(
                 f"Verify your new email, {name} &#9993;&#65039;",
-                f"A request was made to change your UploadM8 account email from "
+                f"An <strong>UploadM8 administrator</strong> updated your sign-in email from "
                 f"<strong style='color:#9ca3af;'>{old_email}</strong> to "
                 f"<strong style='color:#60a5fa;'>{new_email}</strong>. "
-                "Click the button below to confirm this change.",
+                "Click the button below to confirm you can receive mail at this address. "
+                "Until you verify, some account notices may still go to your previous email.",
             )
             + cta_button("Verify New Email", verification_link, pt="24px", pb="20px")
             + alert_banner(
@@ -317,6 +318,66 @@ async def send_email_change_email(
     )
 
     await send_email(new_email, "Verify your new UploadM8 email address ✉️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5b. Security notice to the OLD inbox (admin-initiated change)
+# ─────────────────────────────────────────────────────────────────────────────
+async def send_admin_email_change_notice_to_old_email(
+    email: str,
+    new_email: str,
+    name: str,
+) -> None:
+    """
+    Sent to the OLD email address when an UploadM8 administrator changes the
+    user's sign-in email via:
+      PUT /api/admin/users/{id}/email
+
+    The NEW email receives the verification link email (send_email_change_email).
+    """
+    if not mailgun_ready():
+        return
+
+    html = email_shell(
+        gradient=GRAD_RED,
+        tagline="Security notice — email updated",
+        preheader_text=f"An admin updated your UploadM8 email to: {new_email}",
+        body_rows=(
+            section_tag("Security Notice", "#ef4444")
+            + intro_row(
+                f"Your UploadM8 email was updated, {name} &#128274;",
+                f"An <strong>UploadM8 administrator</strong> updated your sign-in email to "
+                f"<strong style='color:#60a5fa;'>{new_email}</strong>. "
+                "A verification link was sent to that new address. "
+                f"If you did <strong>not</strong> request this change, sign in and review your account settings immediately: "
+                f'<a href="{URL_SETTINGS}" style="color:#f97316;text-decoration:none;">Settings</a>.',
+            )
+            + tinted_box(
+                f'<p style="margin:0 0 6px;color:#6b7280;font-size:10px;text-transform:uppercase;'
+                f'letter-spacing:1.5px;font-weight:600;">New Email Address</p>'
+                f'<p style="margin:0;color:#60a5fa;font-size:18px;font-weight:800;">{new_email}</p>',
+                hex_color="#ef4444",
+                pb="28px",
+            )
+            + cta_button("Sign In to Review", f"{FRONTEND_URL}/login.html", pt="24px", pb="20px")
+            + alert_banner(
+                "&#9888;&#65039;&nbsp; If you did <strong>not</strong> request this change, contact us immediately at "
+                f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#ffffff;text-decoration:underline;">'
+                f"{SUPPORT_EMAIL}</a>.",
+                hex_color="#ef4444",
+                pb="36px",
+            )
+        ),
+        footer_note="You received this because an administrator changed the email on your UploadM8 account.",
+    )
+
+    await send_email(
+        email,
+        "Security notice: your UploadM8 email was updated 🔒",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,9 +409,10 @@ async def send_admin_reset_password_email(
             section_tag("Action Required", "#ef4444")
             + intro_row(
                 f"Your password has been reset, {name} &#128272;",
-                "An UploadM8 administrator has reset your account password. "
-                "Use the temporary password below to sign in, then you'll be "
-                "prompted to set a new one immediately.",
+                "An <strong>UploadM8 administrator</strong> set a new temporary password on your account "
+                "for security or support reasons. Use the temporary password below to sign in at "
+                f'<a href="{FRONTEND_URL}/login.html" style="color:#f97316;text-decoration:none;">login</a>. '
+                "After you sign in, you will be asked to choose a new password before using the app.",
             )
             + tinted_box(
                 f'<p style="margin:0 0 6px;color:#6b7280;font-size:10px;text-transform:uppercase;'

@@ -472,6 +472,7 @@ from stages.emails import (
     send_password_changed_email,
     send_account_deleted_email,
     send_email_change_email,
+    send_admin_email_change_notice_to_old_email,
     send_admin_reset_password_email,
     # Billing — Subscriptions
     send_subscription_started_email,
@@ -521,6 +522,8 @@ def init_enc_keys():
     CURRENT_KEY_ID = list(ENC_KEYS.keys())[-1]
 
 def encrypt_blob(data: dict) -> dict:
+    """Return encrypted token envelope (dict). Persist to `platform_tokens.token_blob` as JSONB only —
+    TEXT columns cause asyncpg to reject dict parameters (expected str, got dict)."""
     key = ENC_KEYS[CURRENT_KEY_ID]
     aesgcm = AESGCM(key)
     nonce = secrets.token_bytes(12)
@@ -1733,6 +1736,33 @@ async def run_migrations():
         updated_at              TIMESTAMPTZ DEFAULT NOW()
     );
 """),
+
+(811, """
+    -- platform_tokens.token_blob must be JSONB: encrypt_blob() passes a dict; TEXT columns make
+    -- asyncpg reject dict params ("expected str, got dict"). Normalize legacy TEXT/VARCHAR to JSONB.
+    DO $m811$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'platform_tokens'
+           AND column_name = 'token_blob'
+           AND data_type IN ('text', 'character varying')
+      ) THEN
+        ALTER TABLE platform_tokens
+          ALTER COLUMN token_blob TYPE jsonb USING (token_blob::text)::jsonb;
+      END IF;
+    END
+    $m811$;
+"""),
+
+(812, """
+    -- Force password reset flag (admin reset-password); email change completion tracking
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS must_reset_password BOOLEAN DEFAULT FALSE;
+    UPDATE users SET must_reset_password = FALSE WHERE must_reset_password IS NULL;
+    ALTER TABLE email_changes ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
+"""),
 ]
         
         for version, sql in migrations:
@@ -2680,11 +2710,20 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
 @app.post("/api/auth/login")
 async def login(data: UserLogin):
     async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT id, password_hash, status, email_verified FROM users WHERE LOWER(email) = $1", data.email.lower())
+        user = await conn.fetchrow(
+            "SELECT id, password_hash, status, email_verified, must_reset_password FROM users WHERE LOWER(email) = $1",
+            data.email.lower(),
+        )
         if not user or not verify_password(data.password, user["password_hash"]): raise HTTPException(401, "Invalid credentials")
         if user["status"] == "banned": raise HTTPException(403, "Account suspended")
         if not user.get("email_verified", True): raise HTTPException(403, "Please verify your email before signing in. Check your inbox for the confirmation link.")
-        return {"access_token": create_access_jwt(str(user["id"])), "refresh_token": await create_refresh_token(conn, str(user["id"])), "token_type": "bearer"}
+        must_reset = bool(user.get("must_reset_password"))
+        return {
+            "access_token": create_access_jwt(str(user["id"])),
+            "refresh_token": await create_refresh_token(conn, str(user["id"])),
+            "token_type": "bearer",
+            "must_reset_password": must_reset,
+        }
 
 @app.post("/api/auth/refresh")
 async def refresh(data: RefreshRequest):
@@ -2758,8 +2797,8 @@ async def reset_password(payload: ResetPasswordRequest, background: BackgroundTa
         new_hash = hash_password(payload.new_password)
 
         await conn.execute(
-            "UPDATE users SET password_hash=$1, updated_at=NOW() WHERE id=$2",
-            new_hash, pr["user_id"]
+            "UPDATE users SET password_hash=$1, must_reset_password=FALSE, updated_at=NOW() WHERE id=$2",
+            new_hash, pr["user_id"],
         )
         await conn.execute("UPDATE password_resets SET used_at=NOW() WHERE id=$1", pr["id"])
 
@@ -2812,6 +2851,40 @@ async def confirm_email(background_tasks: BackgroundTasks, token: str = Query(..
         "refresh_token": refresh,
         "token_type": "bearer",
     }
+
+
+@app.get("/api/auth/verify-email")
+async def verify_email_change(token: str = Query(...)):
+    """
+    Complete admin-initiated email change: user clicks link in email to verify the new address.
+    (Signup confirmation uses GET /api/auth/confirm-email instead.)
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, old_email, new_email, verification_token, used_at
+              FROM email_changes
+             WHERE verification_token = $1
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            token,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Invalid verification link")
+        if row["used_at"] is not None:
+            raise HTTPException(status_code=410, detail="This link was already used")
+
+        await conn.execute(
+            "UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1",
+            row["user_id"],
+        )
+        await conn.execute(
+            "UPDATE email_changes SET used_at = NOW() WHERE id = $1",
+            row["id"],
+        )
+
+    return {"ok": True, "email": row["new_email"], "new_email": row["new_email"]}
 
 
 # ============================================================
@@ -2957,6 +3030,7 @@ async def get_me(user: dict = Depends(get_current_user)):
         "entitlements": entitlements_to_dict(
             get_entitlements_from_user(dict(user))
         ),
+        "must_reset_password": bool(user.get("must_reset_password")),
     }
 
 
@@ -2990,11 +3064,15 @@ async def change_password(data: PasswordChange, background: BackgroundTasks, use
         
         # Update to new password
         new_hash = hash_password(data.new_password)
-        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", new_hash, user["id"])
-        
+        await conn.execute(
+            "UPDATE users SET password_hash = $1, must_reset_password = FALSE, updated_at = NOW() WHERE id = $2",
+            new_hash,
+            user["id"],
+        )
+
         # Optionally invalidate other sessions (refresh tokens)
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
-    
+
     logger.info(f"Password changed for user {user['id']}")
     background.add_task(send_password_changed_email, user["email"], user.get("name") or "there")
     return {"status": "password_changed"}
@@ -3121,14 +3199,18 @@ async def update_password_settings(data: PasswordChange, user: dict = Depends(ge
         user_row = await conn.fetchrow("SELECT password_hash FROM users WHERE id = $1", user["id"])
         if not user_row or not verify_password(data.current_password, user_row["password_hash"]):
             raise HTTPException(401, "Current password is incorrect")
-        
-        # Update to new password
+
+        # Update to new password; clear admin force-reset flag
         new_hash = hash_password(data.new_password)
-        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", new_hash, user["id"])
-        
+        await conn.execute(
+            "UPDATE users SET password_hash = $1, must_reset_password = FALSE, updated_at = NOW() WHERE id = $2",
+            new_hash,
+            user["id"],
+        )
+
         # Optionally invalidate other sessions (refresh tokens)
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
-    
+
     logger.info(f"Password changed via settings for user {user['id']}")
     return {"status": "success", "message": "Password changed successfully"}
 
@@ -5049,19 +5131,39 @@ async def sync_upload_analytics(
         except Exception:
             pass
 
-    # Refresh OAuth tokens so per-video queries succeed (YouTube ~1h TTL; TikTok refresh_token).
+    from services.sync_analytics_helpers import (
+        build_plat_account_token_map,
+        resolve_token_for_platform_result,
+    )
+
+    token_map_by_plat_account = build_plat_account_token_map(token_rows, decrypt_blob)
+
+    # Refresh OAuth for every connected row for platforms present on this upload (multi-account safe).
     uid_str = str(user["id"])
+    plats_in_upload = {str(pr.get("platform") or "").lower() for pr in pr_list}
     try:
         from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
 
-        if token_map_by_platform.get("tiktok"):
-            token_map_by_platform["tiktok"] = await _refresh_tiktok_token(
-                dict(token_map_by_platform["tiktok"]), db_pool=db_pool, user_id=uid_str
-            )
-        if token_map_by_platform.get("youtube"):
-            token_map_by_platform["youtube"] = await _refresh_youtube_token(
-                dict(token_map_by_platform["youtube"]), db_pool=db_pool, user_id=uid_str
-            )
+        if "tiktok" in plats_in_upload:
+            for tr in token_rows:
+                if tr["platform"] != "tiktok":
+                    continue
+                try:
+                    dec = decrypt_blob(tr["token_blob"])
+                    if dec:
+                        await _refresh_tiktok_token(dict(dec), db_pool=db_pool, user_id=uid_str)
+                except Exception:
+                    pass
+        if "youtube" in plats_in_upload:
+            for tr in token_rows:
+                if tr["platform"] != "youtube":
+                    continue
+                try:
+                    dec = decrypt_blob(tr["token_blob"])
+                    if dec:
+                        await _refresh_youtube_token(dict(dec), db_pool=db_pool, user_id=uid_str)
+                except Exception:
+                    pass
         async with db_pool.acquire() as conn:
             trs = await conn.fetch(
                 "SELECT id, platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
@@ -5081,11 +5183,18 @@ async def sync_upload_analytics(
                     token_map_by_platform[tr["platform"]] = dec
             except Exception:
                 pass
+        token_map_by_plat_account = build_plat_account_token_map(trs, decrypt_blob)
     except Exception as _sync_ref_e:
         logger.warning(f"sync-analytics OAuth refresh: {_sync_ref_e}")
 
     total_views = total_likes = total_comments = total_shares = 0
     platform_stats = {}
+
+    def _accum_platform_stats(pstat: dict, p: str, s: dict) -> None:
+        if p not in pstat:
+            pstat[p] = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+        for k in ("views", "likes", "comments", "shares"):
+            pstat[p][k] = int(pstat[p].get(k, 0)) + int(s.get(k, 0) or 0)
 
     async with httpx.AsyncClient(timeout=20) as client:
         for pr in pr_list:
@@ -5094,11 +5203,9 @@ async def sync_upload_analytics(
             if not ok:
                 continue
 
-            # Multi-account: use token for this specific account; fallback to platform
-            account_id = pr.get("account_id")
-            tok = token_map_by_id.get(str(account_id), {}) if account_id else {}
-            if not tok:
-                tok = token_map_by_platform.get(plat, {})
+            tok = resolve_token_for_platform_result(
+                pr, token_map_by_id, token_map_by_plat_account, token_map_by_platform
+            )
             access_token = tok.get("access_token", "")
             if not access_token:
                 continue
@@ -5133,23 +5240,28 @@ async def sync_upload_analytics(
                             v = vids[0]
                             s = {"views": int(v.get("view_count") or 0), "likes": int(v.get("like_count") or 0),
                                  "comments": int(v.get("comment_count") or 0), "shares": int(v.get("share_count") or 0)}
-                            platform_stats["tiktok"] = s
+                            _accum_platform_stats(platform_stats, "tiktok", s)
                             total_views    += s["views"];    total_likes   += s["likes"]
                             total_comments += s["comments"]; total_shares  += s["shares"]
 
                 elif plat == "youtube" and video_id:
+                    # statistics covers long-form and Shorts; snippet/contentDetails optional for debugging
                     resp = await client.get(
                         "https://www.googleapis.com/youtube/v3/videos",
-                        params={"part": "statistics", "id": str(video_id)},
+                        params={"part": "statistics,snippet", "id": str(video_id)},
                         headers={"Authorization": f"Bearer {access_token}"},
                     )
                     if resp.status_code == 200:
                         items = resp.json().get("items", []) or []
                         if items:
-                            st = items[0].get("statistics", {})
-                            s = {"views": int(st.get("viewCount") or 0), "likes": int(st.get("likeCount") or 0),
-                                 "comments": int(st.get("commentCount") or 0), "shares": 0}
-                            platform_stats["youtube"] = s
+                            st = items[0].get("statistics", {}) or {}
+                            s = {
+                                "views": int(st.get("viewCount") or 0),
+                                "likes": int(st.get("likeCount") or 0),
+                                "comments": int(st.get("commentCount") or 0),
+                                "shares": 0,
+                            }
+                            _accum_platform_stats(platform_stats, "youtube", s)
                             total_views    += s["views"];    total_likes   += s["likes"]
                             total_comments += s["comments"]
 
@@ -5174,7 +5286,7 @@ async def sync_upload_analytics(
                             elif name == "comments":  s["comments"] += val
                             elif name == "shares":    s["shares"]  += val
                         s["views"] = ig_views or ig_plays  # prefer views over deprecated plays
-                        platform_stats["instagram"] = s
+                        _accum_platform_stats(platform_stats, "instagram", s)
                         total_views    += s["views"];    total_likes   += s["likes"]
                         total_comments += s["comments"]; total_shares  += s["shares"]
 
@@ -5197,7 +5309,7 @@ async def sync_upload_analytics(
                             elif name == "total_video_reactions_by_type_total":  s["likes"]    += val
                             elif name == "total_video_comments":                  s["comments"] += val
                             elif name == "total_video_shares":                    s["shares"]   += val
-                        platform_stats["facebook"] = s
+                        _accum_platform_stats(platform_stats, "facebook", s)
                         total_views    += s["views"];    total_likes   += s["likes"]
                         total_comments += s["comments"]; total_shares  += s["shares"]
 
@@ -9556,12 +9668,16 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
             request=request,
         )
 
-    # Send verification email to the new address (name = target user, not admin)
-    _verify_link = f"{FRONTEND_URL}/verify-email?token={verification_token}"
+    # New address: verify link. Old address: security notice (admin-initiated change).
+    _verify_link = f"{FRONTEND_URL.rstrip('/')}/verify-email.html?token={verification_token}"
     _target_name = old.get("name") or "there"
     background_tasks.add_task(
         send_email_change_email,
-        new_email, old["email"], _target_name, _verify_link
+        new_email, old["email"], _target_name, _verify_link,
+    )
+    background_tasks.add_task(
+        send_admin_email_change_notice_to_old_email,
+        old["email"], new_email, _target_name,
     )
 
     return {"ok": True, "email": new_email}

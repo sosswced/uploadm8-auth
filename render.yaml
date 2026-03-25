@@ -19,7 +19,10 @@ services:
     plan: standard
     numInstances: 1         # Scale to 3-5 for 10K users
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 2
+    # Single worker: OAuth state lives in process memory (oauth_states). With --workers 2,
+    # /api/oauth/*/start and /callback can hit different workers → "Invalid or expired session".
+    # Scale API horizontally (more instances) if needed; for multi-instance OAuth, store state in Redis.
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL

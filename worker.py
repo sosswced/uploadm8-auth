@@ -1154,6 +1154,24 @@ async def run_publish_and_notify(
                 _platforms = ctx.platforms or []
                 _put_cost, _aic_cost = await _get_upload_costs(ctx.upload_id)
                 if ctx.state in ("succeeded", "partial"):
+                    _video_title = (
+                        getattr(ctx, "ai_title", None)
+                        or getattr(ctx, "title", None)
+                        or ctx.filename
+                        or upload_id
+                        or "Untitled"
+                    )
+                    _video_caption = (
+                        getattr(ctx, "ai_caption", None)
+                        or getattr(ctx, "caption", None)
+                        or ""
+                    )
+                    _video_hashtags = (
+                        getattr(ctx, "ai_hashtags", None)
+                        or getattr(ctx, "hashtags", None)
+                        or []
+                    )
+                    _platform_results = getattr(ctx, "platform_results", None) or []
                     _aio.ensure_future(send_upload_completed_email(
                         _user_email,
                         _user_name,
@@ -1162,10 +1180,32 @@ async def run_publish_and_notify(
                         int(_put_cost or 0),
                         int(_aic_cost or 0),
                         str(upload_id),
+                        video_title=_video_title,
+                        video_caption=_video_caption,
+                        video_hashtags=_video_hashtags,
+                        platform_results=_platform_results,
                     ))
                 elif ctx.state == "failed":
                     _err_reason = getattr(ctx, "error_message", "") or ""
                     _err_stage  = getattr(ctx, "current_stage", "") or ""
+                    _video_title = (
+                        getattr(ctx, "ai_title", None)
+                        or getattr(ctx, "title", None)
+                        or ctx.filename
+                        or upload_id
+                        or "Untitled"
+                    )
+                    _video_caption = (
+                        getattr(ctx, "ai_caption", None)
+                        or getattr(ctx, "caption", None)
+                        or ""
+                    )
+                    _video_hashtags = (
+                        getattr(ctx, "ai_hashtags", None)
+                        or getattr(ctx, "hashtags", None)
+                        or []
+                    )
+                    _platform_results = getattr(ctx, "platform_results", None) or []
                     _aio.ensure_future(send_upload_failed_email(
                         _user_email,
                         _user_name,
@@ -1174,6 +1214,10 @@ async def run_publish_and_notify(
                         _err_reason,
                         str(upload_id),
                         _err_stage,
+                        video_title=_video_title,
+                        video_caption=_video_caption,
+                        video_hashtags=_video_hashtags,
+                        platform_results=_platform_results,
                     ))
     except Exception as _email_err:
         logger.warning(f"[{upload_id}] Upload email notification failed (non-fatal): {_email_err}")
@@ -1395,20 +1439,28 @@ async def _sync_one_upload_analytics(
     pr_list: list,
     token_map: dict,
     token_map_by_platform: dict = None,
+    token_map_by_plat_account: dict = None,
 ) -> dict:
     """
     Pull engagement stats for one completed upload from each platform API.
     Returns totals dict and writes them + analytics_synced_at to DB.
 
-    token_map: by token_id (account_id) for multi-account — use correct token per result
-    token_map_by_platform: fallback when account_id not in platform_results (legacy)
+    token_map: keyed by platform_tokens.id (UUID). token_map_by_plat_account: (platform, account_id) → token.
     """
     import httpx as _httpx
     from stages.publish_stage import decrypt_token
+    from services.sync_analytics_helpers import resolve_token_for_platform_result
 
     total_views = total_likes = total_comments = total_shares = 0
     platform_stats = {}
     platform_fallback = token_map_by_platform or {}
+    plat_acct = token_map_by_plat_account or {}
+
+    def _accum_platform_stats(pstat: dict, p: str, s: dict) -> None:
+        if p not in pstat:
+            pstat[p] = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+        for k in ("views", "likes", "comments", "shares"):
+            pstat[p][k] = int(pstat[p].get(k, 0)) + int(s.get(k, 0) or 0)
 
     async with _httpx.AsyncClient(timeout=15) as client:
         for pr in pr_list:
@@ -1420,10 +1472,7 @@ async def _sync_one_upload_analytics(
             if not ok:
                 continue
 
-            account_id = pr.get("account_id")
-            tok = token_map.get(str(account_id), {}) if account_id else {}
-            if not tok:
-                tok = platform_fallback.get(plat, {})
+            tok = resolve_token_for_platform_result(pr, token_map, plat_acct, platform_fallback)
             access_token = tok.get("access_token", "")
             if not access_token:
                 continue
@@ -1465,7 +1514,7 @@ async def _sync_one_upload_analytics(
                                 "comments": int(v.get("comment_count") or 0),
                                 "shares":   int(v.get("share_count")   or 0),
                             }
-                            platform_stats["tiktok"] = s
+                            _accum_platform_stats(platform_stats, "tiktok", s)
                             total_views    += s["views"];    total_likes    += s["likes"]
                             total_comments += s["comments"]; total_shares   += s["shares"]
                     else:
@@ -1474,20 +1523,20 @@ async def _sync_one_upload_analytics(
                 elif plat == "youtube" and video_id:
                     resp = await client.get(
                         "https://www.googleapis.com/youtube/v3/videos",
-                        params={"part": "statistics", "id": str(video_id)},
+                        params={"part": "statistics,snippet", "id": str(video_id)},
                         headers={"Authorization": f"Bearer {access_token}"},
                     )
                     if resp.status_code == 200:
                         items = resp.json().get("items", []) or []
                         if items:
-                            st = items[0].get("statistics", {})
+                            st = items[0].get("statistics", {}) or {}
                             s = {
                                 "views":    int(st.get("viewCount")    or 0),
                                 "likes":    int(st.get("likeCount")    or 0),
                                 "comments": int(st.get("commentCount") or 0),
                                 "shares":   0,
                             }
-                            platform_stats["youtube"] = s
+                            _accum_platform_stats(platform_stats, "youtube", s)
                             total_views    += s["views"]; total_likes    += s["likes"]
                             total_comments += s["comments"]
                     else:
@@ -1515,7 +1564,7 @@ async def _sync_one_upload_analytics(
                             elif name == "comments": s["comments"] += val
                             elif name == "shares":   s["shares"]  += val
                         s["views"] = ig_views or ig_plays
-                        platform_stats["instagram"] = s
+                        _accum_platform_stats(platform_stats, "instagram", s)
                         total_views    += s["views"];    total_likes    += s["likes"]
                         total_comments += s["comments"]; total_shares   += s["shares"]
                     else:
@@ -1542,7 +1591,7 @@ async def _sync_one_upload_analytics(
                             elif name == "total_video_reactions_by_type_total": s["likes"]    += val
                             elif name == "total_video_comments":                 s["comments"] += val
                             elif name == "total_video_shares":                   s["shares"]   += val
-                        platform_stats["facebook"] = s
+                        _accum_platform_stats(platform_stats, "facebook", s)
                         total_views    += s["views"];    total_likes    += s["likes"]
                         total_comments += s["comments"]; total_shares   += s["shares"]
                     else:
@@ -1672,12 +1721,16 @@ async def run_analytics_sync_loop() -> None:
 
                     token_map = {}
                     token_map_by_platform = {}
+
+                    def _dec_blob_for_map(blob):
+                        if isinstance(blob, str):
+                            blob = json.loads(blob)
+                        return decrypt_token(blob)
+
                     for tr in token_rows:
                         try:
                             blob = tr["token_blob"]
-                            if isinstance(blob, str):
-                                blob = json.loads(blob)
-                            dec = decrypt_token(blob)
+                            dec = _dec_blob_for_map(blob)
                             if dec:
                                 if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
                                     dec["ig_user_id"] = str(tr["account_id"])
@@ -1688,6 +1741,10 @@ async def run_analytics_sync_loop() -> None:
                                 token_map_by_platform[tr["platform"]] = dec
                         except Exception:
                             pass
+
+                    from services.sync_analytics_helpers import build_plat_account_token_map
+
+                    token_map_by_plat_account = build_plat_account_token_map(token_rows, _dec_blob_for_map)
 
                     if not token_map:
                         async with db_pool.acquire() as conn:
@@ -1702,18 +1759,28 @@ async def run_analytics_sync_loop() -> None:
                         try:
                             from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
 
-                            if token_map_by_platform.get("tiktok"):
-                                await _refresh_tiktok_token(
-                                    dict(token_map_by_platform["tiktok"]),
-                                    db_pool=db_pool,
-                                    user_id=str(user_id),
-                                )
-                            if token_map_by_platform.get("youtube"):
-                                await _refresh_youtube_token(
-                                    dict(token_map_by_platform["youtube"]),
-                                    db_pool=db_pool,
-                                    user_id=str(user_id),
-                                )
+                            for tr in token_rows:
+                                if tr["platform"] != "tiktok":
+                                    continue
+                                try:
+                                    dec = _dec_blob_for_map(tr["token_blob"])
+                                    if dec:
+                                        await _refresh_tiktok_token(
+                                            dict(dec), db_pool=db_pool, user_id=str(user_id)
+                                        )
+                                except Exception:
+                                    pass
+                            for tr in token_rows:
+                                if tr["platform"] != "youtube":
+                                    continue
+                                try:
+                                    dec = _dec_blob_for_map(tr["token_blob"])
+                                    if dec:
+                                        await _refresh_youtube_token(
+                                            dict(dec), db_pool=db_pool, user_id=str(user_id)
+                                        )
+                                except Exception:
+                                    pass
                             async with db_pool.acquire() as conn:
                                 trs = await conn.fetch(
                                     """SELECT id, platform, token_blob, account_id
@@ -1726,9 +1793,7 @@ async def run_analytics_sync_loop() -> None:
                             for tr in trs:
                                 try:
                                     blob = tr["token_blob"]
-                                    if isinstance(blob, str):
-                                        blob = json.loads(blob)
-                                    dec = decrypt_token(blob)
+                                    dec = _dec_blob_for_map(blob)
                                     if dec:
                                         if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
                                             dec["ig_user_id"] = str(tr["account_id"])
@@ -1738,6 +1803,7 @@ async def run_analytics_sync_loop() -> None:
                                         token_map_by_platform[tr["platform"]] = dec
                                 except Exception:
                                     pass
+                            token_map_by_plat_account = build_plat_account_token_map(trs, _dec_blob_for_map)
                             _analytics_oauth_mark_refreshed(user_id)
                         except Exception as _wr:
                             logger.debug(f"[analytics-sync] oauth refresh skipped: {_wr}")
@@ -1745,7 +1811,13 @@ async def run_analytics_sync_loop() -> None:
                     try:
                         async with db_pool.acquire() as conn:
                             result = await _sync_one_upload_analytics(
-                                conn, upload_id, user_id, pr_list, token_map, token_map_by_platform
+                                conn,
+                                upload_id,
+                                user_id,
+                                pr_list,
+                                token_map,
+                                token_map_by_platform,
+                                token_map_by_plat_account,
                             )
                         synced += 1
                         logger.debug(

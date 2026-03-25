@@ -1,0 +1,15 @@
+# Exclude local/sensitive content from generated git archives
+.env export-ignore
+.env.* export-ignore
+.venv export-ignore
+.venv/** export-ignore
+.venv311 export-ignore
+.venv311/** export-ignore
+.git export-ignore
+.git/** export-ignore
+.cursor export-ignore
+.cursor/** export-ignore
+tests/screenshots/** export-ignore
+tests/.playwright-auth-state.json export-ignore
+*.pyc export-ignore
+__pycache__/** export-ignore

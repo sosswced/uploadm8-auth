@@ -12,6 +12,13 @@ Complete implementation with:
 import os
 import pathlib
 import csv
+
+# Load .env before any config reads (needed for local dev when running via uvicorn)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import io
 import json
 import re
@@ -84,7 +91,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 from decimal import Decimal
 from ipaddress import ip_address
-from urllib.parse import urlencode, quote, urlsplit, urlunsplit, parse_qsl
+from urllib.parse import urlencode, quote, urlsplit, urlunsplit, parse_qsl, urlparse
 
 # Sensitive query-param keys that must never appear in logs
 _SENSITIVE_KEYS = {"access_token", "client_secret", "code", "refresh_token", "fb_exchange_token"}
@@ -123,6 +130,7 @@ import redis.asyncio as aioredis
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Header, BackgroundTasks, Request, UploadFile, File, Body
 from fastapi.responses import RedirectResponse, StreamingResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from contextlib import asynccontextmanager
@@ -193,8 +201,61 @@ JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "uploadm8-app")
 ACCESS_TOKEN_MINUTES = int(os.environ.get("ACCESS_TOKEN_MINUTES", "15"))
 REFRESH_TOKEN_DAYS = int(os.environ.get("REFRESH_TOKEN_DAYS", "30"))
 TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://app.uploadm8.com,https://uploadm8.com,http://localhost:3000,http://localhost:8080")
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "https://app.uploadm8.com,https://uploadm8.com,"
+    "http://localhost:3000,http://127.0.0.1:3000,"
+    "http://localhost:8080,http://127.0.0.1:8080",
+)
 ALLOWED_ORIGINS_LIST = [x.strip() for x in ALLOWED_ORIGINS.split(",") if x.strip()]
+# Empty ALLOWED_ORIGINS in .env (e.g. ALLOWED_ORIGINS=) breaks CORS entirely — preflight has no ACAO.
+if not ALLOWED_ORIGINS_LIST:
+    ALLOWED_ORIGINS_LIST = [
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+# Any port on loopback (npx serve -p 8080, Vite, etc.). Set CORS_STRICT_ORIGINS=1 in production to disable.
+_CORS_STRICT = os.environ.get("CORS_STRICT_ORIGINS", "").strip().lower() in ("1", "true", "yes", "on")
+_CORS_LOCAL_REGEX = None if _CORS_STRICT else r"^http://(localhost|127\.0\.0\.1)(:\d+)?$"
+# When strict, the regex above is off — only ALLOWED_ORIGINS_LIST applies. Production envs often list 8080
+# but not 3000/5173, which breaks Vite / common dev servers. Merge these unless opted out.
+_CORS_LOCAL_DEV_ORIGINS = (
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+)
+_CORS_ALLOW_LOCAL_DEV = os.environ.get("CORS_ALLOW_LOCAL_DEV", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+# Always merge into the explicit list when enabled (not only under CORS_STRICT_ORIGINS).
+# Production preflight was returning 400 with no ACAO when the regex path failed to match
+# in some deployments; explicit origins are the reliable fix.
+if _CORS_ALLOW_LOCAL_DEV:
+    _cors_seen = set(ALLOWED_ORIGINS_LIST)
+    for _o in _CORS_LOCAL_DEV_ORIGINS:
+        if _o not in _cors_seen:
+            ALLOWED_ORIGINS_LIST.append(_o)
+            _cors_seen.add(_o)
+
+
+def _cors_reflect_origin(request) -> str:
+    """Pick Access-Control-Allow-Origin for error responses (matches CORSMiddleware rules)."""
+    origin = (request.headers.get("origin") or "").strip()
+    if origin in ALLOWED_ORIGINS_LIST:
+        return origin
+    if _CORS_LOCAL_REGEX and origin and re.fullmatch(_CORS_LOCAL_REGEX, origin):
+        return origin
+    return ALLOWED_ORIGINS_LIST[0] if ALLOWED_ORIGINS_LIST else "*"
+
+
 BOOTSTRAP_ADMIN_EMAIL = os.environ.get("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
 TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -264,7 +325,12 @@ STRIPE_SUCCESS_URL = os.environ.get(
 )
 STRIPE_CANCEL_URL = os.environ.get("STRIPE_CANCEL_URL", f"{FRONTEND_URL}/index.html#pricing")
 
-BILLING_MODE = os.environ.get("BILLING_MODE", "test").strip().lower()
+# "live" | "test" — explicit BILLING_MODE wins; else infer from Stripe secret (sk_live_* → live).
+_billing_env = os.environ.get("BILLING_MODE", "").strip().lower()
+if _billing_env in ("live", "test"):
+    BILLING_MODE = _billing_env
+else:
+    BILLING_MODE = "live" if STRIPE_SECRET_KEY.startswith("sk_live") else "test"
 
 # Discord Webhooks
 ADMIN_DISCORD_WEBHOOK_URL = os.environ.get("ADMIN_DISCORD_WEBHOOK_URL", "")
@@ -336,7 +402,12 @@ db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[aioredis.Redis] = None
 ENC_KEYS: Dict[str, bytes] = {}
 CURRENT_KEY_ID = "v1"
-admin_settings_cache: Dict[str, Any] = {"demo_data_enabled": False, "billing_mode": BILLING_MODE}
+admin_settings_cache: Dict[str, Any] = {
+    "demo_data_enabled": False,
+    "billing_mode": BILLING_MODE,
+    "promo_burst_week_enabled": False,
+    "promo_referral_enabled": False,
+}
 
 # ============================================================
 # Plan Configuration (PUT/AIC based)
@@ -344,11 +415,17 @@ admin_settings_cache: Dict[str, Any] = {"demo_data_enabled": False, "billing_mod
 # ── Entitlements: single source of truth ──────────────────────
 # PLAN_CONFIG removed. All tier data lives in entitlements.py.
 # Import everything we need from there.
+from stages.context import expand_hashtag_items
 from stages.entitlements import (
     TIER_CONFIG,
     STRIPE_LOOKUP_TO_TIER,
     TOPUP_PRODUCTS,
     PRIORITY_QUEUE_CLASSES,
+    TIER_SLUGS,
+    ENTITLEMENT_KEYS,
+    normalize_tier,
+    get_tier_display_name,
+    get_tiers_for_api,
     get_entitlements_for_tier,
     get_entitlements_from_user,
     entitlements_to_dict,
@@ -356,6 +433,35 @@ from stages.entitlements import (
     get_priority_lane,
     check_queue_depth,
     compute_upload_cost,   # canonical PUT/AIC formula
+)
+from services.wallet import (
+    get_wallet,
+    ledger_entry,
+    reserve_tokens,
+    spend_tokens,
+    refund_tokens,
+    credit_wallet,
+    transfer_tokens,
+    daily_refill,
+)
+from services.wallet_marketing import build_wallet_marketing_payload
+from services.billing import (
+    _tier_is_upgrade,
+    get_plan,
+    ensure_stripe_customer,
+    create_wallet_topup_checkout_session,
+    create_billing_checkout_session,
+)
+from services.uploads import (
+    calculate_smart_schedule,
+    get_existing_scheduled_days,
+)
+from services.notifications import (
+    discord_notify as _discord_notify_service,
+    notify_signup as _notify_signup_service,
+    notify_mrr as _notify_mrr_service,
+    notify_topup as _notify_topup_service,
+    notify_weekly_costs as _notify_weekly_costs_service,
 )
 
 # ── Email notifications ───────────────────────────────────────────────────────
@@ -391,21 +497,6 @@ from stages.emails import (
     send_trial_ending_reminder_email,
     send_low_token_warning_email,
 )
-
-# Tier ranking for upgrade/downgrade detection (higher index = higher tier)
-_TIER_RANK = {
-    "free": 0, "launch": 1, "creator_lite": 1, "creator_pro": 2, "studio": 3,
-    "agency": 4, "friends_family": 5, "lifetime": 6, "master_admin": 7,
-}
-def _tier_is_upgrade(old: str, new: str) -> bool:
-    return _TIER_RANK.get(new, 0) >= _TIER_RANK.get(old, 0)
-
-def get_plan(tier: str) -> dict:
-    """
-    Backward-compat shim — returns entitlements_to_dict() so existing callers
-    that do plan.get("ai") / plan.get("watermark") keep working unchanged.
-    """
-    return entitlements_to_dict(get_entitlements_for_tier(tier))
 
 # ============================================================
 # Helpers
@@ -448,7 +539,7 @@ def hash_password(pw: str) -> str:
 
 def verify_password(pw: str, hashed: str) -> bool:
     try: return bcrypt.checkpw(pw.encode(), hashed.encode())
-    except: return False
+    except Exception: return False
 
 def create_access_jwt(user_id: str) -> str:
     now = _now_utc()
@@ -467,7 +558,6 @@ def verify_access_jwt(token: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"JWT verification failed: {e}")
         return None
-    except: return None
 
 async def create_refresh_token(conn, user_id: str) -> str:
     token = secrets.token_urlsafe(64)
@@ -489,41 +579,19 @@ async def rotate_refresh_token(conn, old_token: str):
 # Discord & Email Notifications
 # ============================================================
 async def discord_notify(webhook_url: str, content: str = None, embeds: list = None):
-    if not webhook_url: return
-    payload = {}
-    if content: payload["content"] = content
-    if embeds: payload["embeds"] = embeds
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(webhook_url, json=payload)
-    except: pass
+    await _discord_notify_service(webhook_url, content=content, embeds=embeds)
 
 async def notify_signup(email: str, name: str):
-    wh = SIGNUP_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL
-    if wh:
-        await discord_notify(wh, embeds=[{"title": "🎉 New Signup", "color": 0x22c55e, "fields": [{"name": "Email", "value": email}, {"name": "Name", "value": name}]}])
+    await _notify_signup_service(email, name, SIGNUP_DISCORD_WEBHOOK_URL, ADMIN_DISCORD_WEBHOOK_URL)
 
 async def notify_mrr(amount: float, email: str, plan: str, event_type: str = "charge"):
-    wh = MRR_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL
-    if wh:
-        await discord_notify(wh, embeds=[{"title": f"💰 {event_type.title()}", "color": 0x22c55e, "fields": [{"name": "Amount", "value": f"${amount:.2f}"}, {"name": "Email", "value": email}, {"name": "Plan", "value": plan}]}])
+    await _notify_mrr_service(amount, email, plan, event_type, MRR_DISCORD_WEBHOOK_URL, ADMIN_DISCORD_WEBHOOK_URL)
 
 async def notify_topup(amount: float, email: str, wallet: str, tokens: int):
-    wh = MRR_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL
-    if wh:
-        await discord_notify(wh, embeds=[{"title": "💳 Top-up Purchase", "color": 0x8b5cf6, "fields": [{"name": "Amount", "value": f"${amount:.2f}"}, {"name": "Wallet", "value": wallet.upper()}, {"name": "Tokens", "value": str(tokens)}, {"name": "Email", "value": email}]}])
+    await _notify_topup_service(amount, email, wallet, tokens, MRR_DISCORD_WEBHOOK_URL, ADMIN_DISCORD_WEBHOOK_URL)
 
 async def notify_weekly_costs(openai_cost: float, storage_cost: float, compute_cost: float, revenue: float):
-    wh = ADMIN_DISCORD_WEBHOOK_URL
-    if wh:
-        margin = revenue - (openai_cost + storage_cost + compute_cost)
-        await discord_notify(wh, embeds=[{"title": "📊 Weekly Cost Report", "color": 0x3b82f6, "fields": [
-            {"name": "OpenAI", "value": f"${openai_cost:.2f}", "inline": True},
-            {"name": "Storage", "value": f"${storage_cost:.2f}", "inline": True},
-            {"name": "Compute", "value": f"${compute_cost:.2f}", "inline": True},
-            {"name": "Revenue", "value": f"${revenue:.2f}", "inline": True},
-            {"name": "Est. Margin", "value": f"${margin:.2f}", "inline": True},
-        ]}])
+    await _notify_weekly_costs_service(openai_cost, storage_cost, compute_cost, revenue, ADMIN_DISCORD_WEBHOOK_URL)
 
 async def send_email(to: str, subject: str, html: str):
     if not MAILGUN_API_KEY or not MAILGUN_DOMAIN: return
@@ -533,87 +601,136 @@ async def send_email(to: str, subject: str, html: str):
     except Exception as e:
         logger.warning(f"Email failed: {e}")
 
-# ============================================================
-# Wallet & Ledger Functions
-# ============================================================
-async def get_wallet(conn, user_id: str) -> dict:
-    row = await conn.fetchrow("SELECT * FROM wallets WHERE user_id = $1", user_id)
-    if not row:
-        await conn.execute("INSERT INTO wallets (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-        row = await conn.fetchrow("SELECT * FROM wallets WHERE user_id = $1", user_id)
-    return dict(row) if row else {"put_balance": 0, "aic_balance": 0, "put_reserved": 0, "aic_reserved": 0}
 
-async def ledger_entry(conn, user_id: str, token_type: str, delta: int, reason: str, upload_id: str = None, stripe_event_id: str = None, platform: str = None, meta: dict = None):
-    await conn.execute("""
-        INSERT INTO token_ledger (user_id, token_type, platform, delta, reason, upload_id, stripe_event_id, meta)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    """, user_id, token_type, platform, delta, reason, upload_id, stripe_event_id, json.dumps(meta) if meta else None)
-
-async def reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str) -> bool:
-    wallet = await get_wallet(conn, user_id)
-    available_put = wallet["put_balance"] - wallet["put_reserved"]
-    available_aic = wallet["aic_balance"] - wallet["aic_reserved"]
-    if available_put < put_count or available_aic < aic_count:
-        return False
-    await conn.execute("UPDATE wallets SET put_reserved = put_reserved + $1, aic_reserved = aic_reserved + $2 WHERE user_id = $3", put_count, aic_count, user_id)
-    if put_count > 0:
-        await ledger_entry(conn, user_id, "put", -put_count, "reserve", upload_id)
-    if aic_count > 0:
-        await ledger_entry(conn, user_id, "aic", -aic_count, "reserve", upload_id)
-    return True
-
-async def spend_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str, platforms: list = None):
-    await conn.execute("UPDATE wallets SET put_balance = put_balance - $1, aic_balance = aic_balance - $2, put_reserved = put_reserved - $1, aic_reserved = aic_reserved - $2 WHERE user_id = $3", put_count, aic_count, user_id)
-    if put_count > 0:
-        await ledger_entry(conn, user_id, "put", -put_count, "spend", upload_id, platform=",".join(platforms) if platforms else None)
-    if aic_count > 0:
-        await ledger_entry(conn, user_id, "aic", -aic_count, "spend", upload_id)
-
-async def refund_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str):
-    await conn.execute("UPDATE wallets SET put_reserved = put_reserved - $1, aic_reserved = aic_reserved - $2 WHERE user_id = $3", put_count, aic_count, user_id)
-    if put_count > 0:
-        await ledger_entry(conn, user_id, "put", put_count, "refund", upload_id)
-    if aic_count > 0:
-        await ledger_entry(conn, user_id, "aic", aic_count, "refund", upload_id)
-
-async def credit_wallet(conn, user_id: str, wallet_type: str, amount: int, reason: str, stripe_event_id: str = None):
-    if wallet_type == "put":
-        await conn.execute("UPDATE wallets SET put_balance = put_balance + $1 WHERE user_id = $2", amount, user_id)
-    else:
-        await conn.execute("UPDATE wallets SET aic_balance = aic_balance + $1 WHERE user_id = $2", amount, user_id)
-    await ledger_entry(conn, user_id, wallet_type, amount, reason, stripe_event_id=stripe_event_id)
-
-async def transfer_tokens(conn, user_id: str, from_platform: str, to_platform: str, amount: int, burn_pct: float = 0.02) -> bool:
-    # Check flex enabled
-    user = await conn.fetchrow("SELECT subscription_tier, flex_enabled FROM users WHERE id = $1", user_id)
-    if not user or not user.get("flex_enabled"):
-        return False
-    wallet = await get_wallet(conn, user_id)
-    if wallet["put_balance"] - wallet["put_reserved"] < amount:
-        return False
-    burn = int(amount * burn_pct)
-    net = amount - burn
-    await ledger_entry(conn, user_id, "put", -amount, "transfer_out", platform=from_platform)
-    await ledger_entry(conn, user_id, "put", net, "transfer_in", platform=to_platform)
-    if burn > 0:
-        await ledger_entry(conn, user_id, "put", -burn, "transfer_burn")
-        await conn.execute("UPDATE wallets SET put_balance = put_balance - $1 WHERE user_id = $2", burn, user_id)
-    return True
-
-async def daily_refill(conn, user_id: str, tier: str):
-    ent = get_entitlements_for_tier(tier)
-    daily = ent.put_daily * 4  # 4 platforms
-    wallet = await get_wallet(conn, user_id)
-    last_refill = wallet.get("last_refill_date")
-    today = _now_utc().date()
-    if last_refill and last_refill >= today:
+async def send_signup_confirmation_email(email: str, name: str, token: str):
+    """Send branded email confirmation link to newly registered user."""
+    if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
+        logger.info(f"Confirmation email skipped (no Mailgun): {email}")
         return
-    monthly_cap = ent.put_monthly
-    current = wallet["put_balance"]
-    if current < monthly_cap:
-        add = min(daily, monthly_cap - current)
-        await conn.execute("UPDATE wallets SET put_balance = put_balance + $1, last_refill_date = $2 WHERE user_id = $3", add, today, user_id)
-        await ledger_entry(conn, user_id, "put", add, "daily_refill")
+
+    confirm_url = f"{FRONTEND_URL.rstrip('/')}/confirm-email.html?token={quote(token)}"
+    first_name = name.split()[0] if name else "there"
+    subject = "Confirm your UploadM8 email address"
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Confirm your email – UploadM8</title>
+</head>
+<body style="margin:0;padding:0;background:#0f0f0f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f0f0f;padding:40px 20px;">
+    <tr>
+      <td align="center">
+        <table width="560" cellpadding="0" cellspacing="0" style="background:#1a1a1a;border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,0.08);">
+
+          <!-- Header -->
+          <tr>
+            <td style="background:linear-gradient(135deg,#1a1a1a 0%,#0f0f0f 100%);padding:36px 40px 28px;border-bottom:1px solid rgba(249,115,22,0.2);">
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td>
+                    <span style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:-0.5px;">
+                      Upload<span style="color:#f97316;">M8</span>
+                    </span>
+                  </td>
+                  <td align="right">
+                    <span style="background:rgba(249,115,22,0.15);border:1px solid rgba(249,115,22,0.3);color:#f97316;font-size:11px;font-weight:600;padding:4px 10px;border-radius:20px;letter-spacing:0.5px;">EMAIL VERIFICATION</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Icon row -->
+          <tr>
+            <td align="center" style="padding:40px 40px 0;">
+              <div style="width:72px;height:72px;background:rgba(249,115,22,0.1);border:1px solid rgba(249,115,22,0.25);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:30px;line-height:72px;">
+                ✉️
+              </div>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding:28px 40px 0;">
+              <h1 style="margin:0 0 12px;font-size:24px;font-weight:700;color:#ffffff;line-height:1.3;">
+                Confirm your email, {first_name}
+              </h1>
+              <p style="margin:0 0 20px;font-size:15px;color:#9ca3af;line-height:1.6;">
+                Thanks for signing up to UploadM8 — the fastest way to publish your videos across TikTok, YouTube Shorts, Instagram Reels, and Facebook Reels.
+              </p>
+              <p style="margin:0 0 32px;font-size:15px;color:#9ca3af;line-height:1.6;">
+                Click the button below to verify your email address and activate your account.
+              </p>
+            </td>
+          </tr>
+
+          <!-- CTA Button -->
+          <tr>
+            <td align="center" style="padding:0 40px 36px;">
+              <a href="{confirm_url}"
+                 style="display:inline-block;background:#f97316;color:#ffffff;text-decoration:none;font-size:16px;font-weight:700;padding:16px 40px;border-radius:10px;letter-spacing:0.2px;">
+                Confirm My Email →
+              </a>
+            </td>
+          </tr>
+
+          <!-- Divider -->
+          <tr>
+            <td style="padding:0 40px;">
+              <hr style="border:none;border-top:1px solid rgba(255,255,255,0.07);margin:0;">
+            </td>
+          </tr>
+
+          <!-- Fallback link -->
+          <tr>
+            <td style="padding:24px 40px;">
+              <p style="margin:0 0 8px;font-size:13px;color:#6b7280;">
+                Button not working? Copy and paste this link into your browser:
+              </p>
+              <p style="margin:0;font-size:12px;color:#f97316;word-break:break-all;">
+                {confirm_url}
+              </p>
+            </td>
+          </tr>
+
+          <!-- Expiry notice -->
+          <tr>
+            <td style="padding:0 40px 32px;">
+              <div style="background:rgba(249,115,22,0.06);border:1px solid rgba(249,115,22,0.15);border-radius:8px;padding:14px 16px;">
+                <p style="margin:0;font-size:13px;color:#9ca3af;line-height:1.5;">
+                  ⏱ This link expires in <strong style="color:#f97316;">24 hours</strong>. If you didn't create an UploadM8 account, you can safely ignore this email.
+                </p>
+              </div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background:#111111;padding:24px 40px;border-top:1px solid rgba(255,255,255,0.07);">
+              <p style="margin:0 0 6px;font-size:12px;color:#4b5563;text-align:center;">
+                © 2025 UploadM8 · Upload once, publish everywhere
+              </p>
+              <p style="margin:0;font-size:12px;color:#4b5563;text-align:center;">
+                <a href="{FRONTEND_URL}/privacy.html" style="color:#6b7280;text-decoration:none;">Privacy</a>
+                &nbsp;·&nbsp;
+                <a href="{FRONTEND_URL}/terms.html" style="color:#6b7280;text-decoration:none;">Terms</a>
+                &nbsp;·&nbsp;
+                <a href="{FRONTEND_URL}/support.html" style="color:#6b7280;text-decoration:none;">Support</a>
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+    await send_email(email, subject, html)
+
 
 # ============================================================
 # R2 Storage
@@ -625,12 +742,86 @@ def get_s3_client():
 
 
 # --- R2 helpers (single source of truth: users.avatar_r2_key) ---
-R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME") or os.getenv("R2_BUCKET") or os.getenv("R2_BUCKET_NAME".lower())
 
 def r2_presign_get_url(r2_key: str, expires_in: int = 3600) -> str:
 
     """Generate a short-lived signed URL for a private R2 object."""
     return generate_presigned_download_url(r2_key, ttl=int(expires_in))
+
+
+def _platform_account_avatar_to_url(stored: Optional[str]) -> str:
+    """
+    platform_tokens.account_avatar stores either a legacy HTTPS URL (external CDN)
+    or an R2 object key under platform-avatars/... after OAuth import mirroring.
+    """
+    if not stored or not isinstance(stored, str):
+        return ""
+    s = stored.strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    try:
+        return generate_presigned_download_url(s) or ""
+    except Exception:
+        return ""
+
+
+async def _mirror_oauth_profile_image_to_r2(user_id: str, platform: str, source_url: str) -> Optional[str]:
+    """
+    Fetch a provider profile image (FB/IG/TikTok CDNs often 403 hotlinked from the browser)
+    and store a private copy in R2. Returns the object key, or None if skipped/failed.
+    """
+    if not source_url or not str(source_url).startswith("http"):
+        return None
+    if not R2_BUCKET_NAME or not R2_ACCOUNT_ID:
+        return None
+    url = str(source_url).strip()
+    max_bytes = 5 * 1024 * 1024
+    ct_to_ext = {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                },
+            )
+        if r.status_code != 200:
+            logger.debug(f"OAuth avatar fetch HTTP {r.status_code} for {platform} user={user_id}")
+            return None
+        body = r.content
+        if not body or len(body) > max_bytes:
+            return None
+        ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+        ext = ct_to_ext.get(ctype, "jpg")
+        if ext == "jpg" and ctype and ctype not in ct_to_ext:
+            # Unknown image type — still store as .jpg; browsers tolerate most blobs as jpeg label for small avatars
+            ext = "jpg"
+        key = f"platform-avatars/{user_id}/{platform}/{uuid.uuid4()}.{ext}"
+        s3 = get_s3_client()
+        put_ct = ctype if ctype.startswith("image/") else "image/jpeg"
+        s3.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=_normalize_r2_key(key),
+            Body=body,
+            ContentType=put_ct,
+        )
+        logger.info(f"Mirrored OAuth avatar to R2 key={key[:64]}... platform={platform}")
+        return key
+    except Exception as e:
+        logger.warning(f"OAuth avatar mirror failed ({platform}): {e}")
+        return None
 
 def generate_presigned_upload_url(key: str, content_type: str, ttl: int = None) -> str:
     ttl = int(ttl) if ttl is not None else R2_PRESIGN_UPLOAD_TTL
@@ -743,6 +934,16 @@ class SettingsUpdate(BaseModel):
     hud_position: Optional[str] = Field(None, alias="hudPosition")
     speeding_mph: Optional[int] = Field(None, alias="speedingMph")
     euphoria_mph: Optional[int] = Field(None, alias="euphoriaMph")
+    hud_speed_unit: Optional[str] = None
+    hud_color: Optional[str] = None
+    hud_font_family: Optional[str] = None
+    hud_font_size: Optional[int] = None
+    ffmpeg_screenshot_interval: Optional[int] = None
+    auto_generate_thumbnails: Optional[bool] = None
+    auto_generate_captions: Optional[bool] = None
+    auto_generate_hashtags: Optional[bool] = None
+    default_hashtag_count: Optional[int] = None
+    always_use_hashtags: Optional[bool] = None
 
     class Config:
         populate_by_name = True
@@ -750,6 +951,13 @@ class SettingsUpdate(BaseModel):
 class CheckoutRequest(BaseModel):
     lookup_key: str
     kind: str = "subscription"  # subscription | topup | addon
+
+
+class PromoTogglesBody(BaseModel):
+    """PATCH /api/admin/settings/promo-toggles — omit a field to leave it unchanged."""
+    promo_burst_week_enabled: Optional[bool] = None
+    promo_referral_enabled: Optional[bool] = None
+
 
 class PasswordChange(BaseModel):
     current_password: str
@@ -839,147 +1047,6 @@ class ColorPreferencesUpdate(BaseModel):
     facebook_color: Optional[str] = None
     accent_color: Optional[str] = None
 
-# ============================================================
-# Smart Upload Scheduling
-# ============================================================
-# Platform-specific optimal posting times (in UTC)
-# Based on general social media engagement research
-PLATFORM_OPTIMAL_TIMES = {
-    "tiktok": [
-        {"hour": 7, "minute": 0, "weight": 0.8},   # 7 AM - morning scroll
-        {"hour": 12, "minute": 0, "weight": 0.9},  # 12 PM - lunch break
-        {"hour": 15, "minute": 0, "weight": 0.7},  # 3 PM - afternoon break
-        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - evening prime time
-        {"hour": 21, "minute": 0, "weight": 0.95}, # 9 PM - night engagement
-        {"hour": 23, "minute": 0, "weight": 0.6},  # 11 PM - late night
-    ],
-    "youtube": [
-        {"hour": 12, "minute": 0, "weight": 0.7},  # 12 PM - lunch views
-        {"hour": 14, "minute": 0, "weight": 0.8},  # 2 PM - afternoon
-        {"hour": 17, "minute": 0, "weight": 0.9},  # 5 PM - after work/school
-        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
-        {"hour": 21, "minute": 0, "weight": 0.95}, # 9 PM - evening viewing
-    ],
-    "instagram": [
-        {"hour": 6, "minute": 0, "weight": 0.7},   # 6 AM - early morning
-        {"hour": 11, "minute": 0, "weight": 0.85}, # 11 AM - mid-morning
-        {"hour": 13, "minute": 0, "weight": 0.9},  # 1 PM - lunch
-        {"hour": 17, "minute": 0, "weight": 0.8},  # 5 PM - commute
-        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
-        {"hour": 21, "minute": 0, "weight": 0.9},  # 9 PM - evening
-    ],
-    "facebook": [
-        {"hour": 9, "minute": 0, "weight": 0.8},   # 9 AM - morning check
-        {"hour": 11, "minute": 0, "weight": 0.7},  # 11 AM - mid-morning
-        {"hour": 13, "minute": 0, "weight": 0.9},  # 1 PM - lunch break
-        {"hour": 16, "minute": 0, "weight": 0.85}, # 4 PM - afternoon
-        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
-        {"hour": 20, "minute": 0, "weight": 0.9},  # 8 PM - evening
-    ],
-}
-
-# Best days for each platform (0=Monday, 6=Sunday)
-PLATFORM_OPTIMAL_DAYS = {
-    "tiktok": [1, 2, 3, 4],      # Tue, Wed, Thu, Fri - highest engagement
-    "youtube": [3, 4, 5],        # Thu, Fri, Sat - weekend viewing prep
-    "instagram": [0, 1, 2, 4],   # Mon, Tue, Wed, Fri - weekday engagement
-    "facebook": [0, 1, 2, 3],    # Mon, Tue, Wed, Thu - business days
-}
-
-import random
-def calculate_smart_schedule(platforms: List[str], num_days: int = 7, user_timezone: str = "UTC") -> Dict[str, datetime]:
-    """
-    Calculate optimal upload times for each platform.
-    Ensures uploads are spread across different days.
-    Returns a dict mapping platform -> scheduled datetime
-    """
-    now = _now_utc()
-    schedule = {}
-    used_days = set()
-    
-    # Sort platforms to ensure consistent ordering
-    platforms_sorted = sorted(platforms)
-    
-    for platform in platforms_sorted:
-        optimal_times = PLATFORM_OPTIMAL_TIMES.get(platform, PLATFORM_OPTIMAL_TIMES["tiktok"])
-        optimal_days = PLATFORM_OPTIMAL_DAYS.get(platform, [0, 1, 2, 3, 4])
-        
-        # Find an available day that hasn't been used
-        available_days = []
-        for day_offset in range(1, num_days + 1):
-            target_date = now + timedelta(days=day_offset)
-            weekday = target_date.weekday()
-            
-            # Prefer optimal days for this platform, but allow any day if needed
-            if day_offset not in used_days:
-                priority = 2 if weekday in optimal_days else 1
-                available_days.append((day_offset, priority, weekday))
-        
-        if not available_days:
-            # All days used, pick a random future day
-            day_offset = random.randint(1, num_days)
-        else:
-            # Sort by priority (optimal days first), then randomize within priority
-            available_days.sort(key=lambda x: (-x[1], random.random()))
-            day_offset = available_days[0][0]
-        
-        used_days.add(day_offset)
-        
-        # Pick an optimal time slot with weighted randomization
-        weights = [t["weight"] for t in optimal_times]
-        total_weight = sum(weights)
-        rand_val = random.uniform(0, total_weight)
-        
-        cumulative = 0
-        selected_time = optimal_times[0]
-        for t in optimal_times:
-            cumulative += t["weight"]
-            if rand_val <= cumulative:
-                selected_time = t
-                break
-        
-        # Add randomization to the time (±30 minutes)
-        minute_offset = random.randint(-30, 30)
-        
-        # Calculate the final datetime
-        target_date = now + timedelta(days=day_offset)
-        scheduled_dt = target_date.replace(
-            hour=selected_time["hour"],
-            minute=max(0, min(59, selected_time["minute"] + minute_offset)),
-            second=0,
-            microsecond=0
-        )
-        
-        # Make sure it's in the future
-        if scheduled_dt <= now:
-            scheduled_dt += timedelta(days=1)
-        
-        schedule[platform] = scheduled_dt
-    
-    return schedule
-
-async def get_existing_scheduled_days(conn, user_id: str, num_days: int = 7) -> set:
-    """Get days that already have scheduled uploads for this user"""
-    now = _now_utc()
-    end_date = now + timedelta(days=num_days)
-    
-    existing = await conn.fetch("""
-        SELECT DISTINCT DATE(scheduled_time) as sched_date 
-        FROM uploads 
-        WHERE user_id = $1 
-        AND scheduled_time >= $2 
-        AND scheduled_time <= $3 
-        AND status IN ('pending', 'queued', 'scheduled')
-    """, user_id, now, end_date)
-    
-    used_days = set()
-    for row in existing:
-        if row["sched_date"]:
-            day_diff = (row["sched_date"] - now.date()).days
-            if day_diff > 0:
-                used_days.add(day_diff)
-    
-    return used_days
 # App Lifespan & Migrations
 # ============================================================
 @asynccontextmanager
@@ -988,12 +1055,35 @@ async def lifespan(app: FastAPI):
     init_enc_keys()
     if STRIPE_SECRET_KEY: stripe.api_key = STRIPE_SECRET_KEY
     
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, init=_init_asyncpg_codecs)
+    _db_min = int(os.environ.get("DB_POOL_MIN", "5"))
+    _db_max = int(os.environ.get("DB_POOL_MAX", "20"))
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=_db_min,
+        max_size=_db_max,
+        command_timeout=30,
+        init=_init_asyncpg_codecs,
+    )
     await _load_uploads_columns(db_pool)
     logger.info("Database connected")
     
     await run_migrations()
-    
+
+    logger.info(
+        "Rate limits: profile=%s window=%ss global=%s login=%s auth=%s admin=%s presign=%s "
+        "localhost_bypass=%s enabled=%s redis_rl=%s",
+        _RATE_LIMIT_CFG.get("profile"),
+        _RATE_LIMIT_CFG.get("window_sec"),
+        _RATE_LIMIT_CFG.get("global"),
+        _RATE_LIMIT_CFG.get("login"),
+        _RATE_LIMIT_CFG.get("auth"),
+        _RATE_LIMIT_CFG.get("admin"),
+        _RATE_LIMIT_CFG.get("presign"),
+        _RL_LOCALHOST_BYPASS,
+        _RATE_LIMIT_ENABLED,
+        bool(REDIS_URL),
+    )
+
     if REDIS_URL:
         try:
             redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
@@ -1007,7 +1097,9 @@ async def lifespan(app: FastAPI):
             row = await conn.fetchrow("SELECT settings_json FROM admin_settings WHERE id = 1")
             if row and row["settings_json"]:
                 admin_settings_cache.update(json.loads(row["settings_json"]))
-    except: pass
+                admin_settings_cache.setdefault("promo_burst_week_enabled", False)
+                admin_settings_cache.setdefault("promo_referral_enabled", False)
+    except Exception: pass
     
     if BOOTSTRAP_ADMIN_EMAIL:
         async with db_pool.acquire() as conn:
@@ -1183,7 +1275,9 @@ async def run_migrations():
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_ai_enhance BOOLEAN DEFAULT TRUE;
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_openai_model VARCHAR(50) DEFAULT 'gpt-4o-mini';
             """),
+            (707, "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'"),
             (1030, "ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS styled_thumbnails BOOLEAN DEFAULT TRUE"),
+            (1031, "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'"),
         
 (103, """CREATE TABLE IF NOT EXISTS support_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1402,6 +1496,243 @@ async def run_migrations():
     );
     INSERT INTO kpi_sync_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 """),
+            (707, """
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}';
+    ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_font_family VARCHAR(100) DEFAULT 'Arial';
+    ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_font_size INT DEFAULT 24;
+    ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS ffmpeg_screenshot_interval INT DEFAULT 5;
+    ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS auto_generate_thumbnails BOOLEAN DEFAULT TRUE;
+    ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS auto_generate_captions BOOLEAN DEFAULT TRUE;
+    ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS auto_generate_hashtags BOOLEAN DEFAULT TRUE;
+    ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS default_hashtag_count INT DEFAULT 5;
+    ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS always_use_hashtags BOOLEAN DEFAULT FALSE;
+"""),
+
+# ═══════════════════════════════════════════════════════════════
+# ENTERPRISE SCALE MIGRATIONS (10K users)
+# ═══════════════════════════════════════════════════════════════
+
+(800, """
+    -- Performance indexes for high-read queries
+    CREATE INDEX IF NOT EXISTS idx_uploads_user_created     ON uploads(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_uploads_status_created   ON uploads(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_uploads_scheduled_time   ON uploads(scheduled_time)
+        WHERE scheduled_time IS NOT NULL AND status IN ('staged', 'ready_to_publish');
+    CREATE INDEX IF NOT EXISTS idx_uploads_user_completed   ON uploads(user_id, completed_at DESC)
+        WHERE status IN ('completed', 'succeeded', 'partial');
+    CREATE INDEX IF NOT EXISTS idx_users_email_lower        ON users(LOWER(email));
+    CREATE INDEX IF NOT EXISTS idx_users_role               ON users(role) WHERE role != 'user';
+    CREATE INDEX IF NOT EXISTS idx_users_tier               ON users(subscription_tier);
+    CREATE INDEX IF NOT EXISTS idx_users_active             ON users(last_active_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user      ON refresh_tokens(user_id)
+        WHERE revoked_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires   ON refresh_tokens(expires_at)
+        WHERE revoked_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_ledger_user_type         ON token_ledger(user_id, token_type, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_cost_tracking_category   ON cost_tracking(category, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_revenue_tracking_created ON revenue_tracking(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_wallets_low_balance      ON wallets(user_id)
+        WHERE put_balance <= 5 OR aic_balance <= 5;
+"""),
+
+(801, """
+    -- Dead-letter queue for failed jobs that exhausted retries
+    CREATE TABLE IF NOT EXISTS dead_letter_queue (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        upload_id       UUID REFERENCES uploads(id) ON DELETE SET NULL,
+        user_id         UUID REFERENCES users(id) ON DELETE SET NULL,
+        job_data        JSONB NOT NULL,
+        error_code      VARCHAR(100),
+        error_message   TEXT,
+        retry_count     INT DEFAULT 0,
+        max_retries     INT DEFAULT 3,
+        last_attempt_at TIMESTAMPTZ,
+        resolved_at     TIMESTAMPTZ,
+        resolved_by     VARCHAR(50),
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_dlq_unresolved ON dead_letter_queue(created_at)
+        WHERE resolved_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_dlq_user ON dead_letter_queue(user_id);
+"""),
+
+(802, """
+    -- API keys for enterprise integrations
+    CREATE TABLE IF NOT EXISTS api_keys (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        key_hash        VARCHAR(255) NOT NULL UNIQUE,
+        key_prefix      VARCHAR(12) NOT NULL,
+        name            VARCHAR(255) NOT NULL DEFAULT 'Default',
+        scopes          TEXT[] DEFAULT '{read}',
+        rate_limit      INT DEFAULT 100,
+        last_used_at    TIMESTAMPTZ,
+        expires_at      TIMESTAMPTZ,
+        revoked_at      TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_keys_user    ON api_keys(user_id) WHERE revoked_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_api_keys_hash    ON api_keys(key_hash) WHERE revoked_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_api_keys_prefix  ON api_keys(key_prefix);
+"""),
+
+(803, """
+    -- Upload processing metrics for SLA monitoring
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS put_cost INT DEFAULT 0;
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS aic_cost INT DEFAULT 0;
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS hold_status VARCHAR(20) DEFAULT 'none';
+
+    -- Wallet holds (pending deductions until job finishes)
+    CREATE TABLE IF NOT EXISTS wallet_holds (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        upload_id       UUID NOT NULL,
+        user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        put_amount      INT DEFAULT 0,
+        aic_amount      INT DEFAULT 0,
+        status          VARCHAR(20) DEFAULT 'held',
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        resolved_at     TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_wallet_holds_user    ON wallet_holds(user_id) WHERE status = 'held';
+    CREATE INDEX IF NOT EXISTS idx_wallet_holds_upload  ON wallet_holds(upload_id);
+"""),
+
+(804, """
+    -- Caption memory for few-shot AI learning
+    CREATE TABLE IF NOT EXISTS upload_caption_memory (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        upload_id       UUID,
+        category        VARCHAR(50) DEFAULT 'general',
+        platforms       JSONB DEFAULT '[]'::jsonb,
+        ai_title        TEXT,
+        ai_caption      TEXT,
+        ai_hashtags     JSONB DEFAULT '[]'::jsonb,
+        caption_voice   VARCHAR(50),
+        caption_tone    VARCHAR(50),
+        caption_style   VARCHAR(50),
+        source          VARCHAR(20) DEFAULT 'auto',
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_caption_memory_user ON upload_caption_memory(user_id, category, created_at DESC);
+"""),
+
+(805, """
+    -- Publish attempts ledger for delivery verification
+    CREATE TABLE IF NOT EXISTS publish_attempts (
+        id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        upload_id           UUID NOT NULL,
+        user_id             UUID NOT NULL,
+        platform            VARCHAR(50) NOT NULL,
+        status              VARCHAR(20) DEFAULT 'pending',
+        platform_post_id    TEXT,
+        platform_url        TEXT,
+        publish_id          TEXT,
+        http_status         INT,
+        response_payload    JSONB,
+        error_code          VARCHAR(100),
+        error_message       TEXT,
+        verify_status       VARCHAR(20),
+        verified_at         TIMESTAMPTZ,
+        created_at          TIMESTAMPTZ DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_publish_attempts_upload ON publish_attempts(upload_id);
+    CREATE INDEX IF NOT EXISTS idx_publish_attempts_verify ON publish_attempts(status, verify_status)
+        WHERE status = 'accepted' AND (verify_status IS NULL OR verify_status = 'pending');
+"""),
+
+(806, """
+    -- Entitlement overrides (admin can grant features per-user)
+    CREATE TABLE IF NOT EXISTS entitlement_overrides (
+        user_id             UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        max_thumbnails      INT,
+        max_caption_frames  INT,
+        can_burn_hud        BOOLEAN,
+        can_watermark       BOOLEAN,
+        can_ai              BOOLEAN,
+        can_schedule        BOOLEAN,
+        put_monthly         INT,
+        aic_monthly         INT,
+        notes               TEXT,
+        created_by          UUID,
+        created_at          TIMESTAMPTZ DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ DEFAULT NOW()
+    );
+"""),
+
+(807, """
+    -- Email confirmation for signup (users must verify before full access)
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT TRUE;
+    UPDATE users SET email_verified = TRUE WHERE email_verified IS NULL;
+    CREATE TABLE IF NOT EXISTS email_confirmations (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(255) NOT NULL UNIQUE,
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_confirmations_token ON email_confirmations(token_hash) WHERE used_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_email_confirmations_user ON email_confirmations(user_id) WHERE used_at IS NULL;
+"""),
+
+(808, """
+    -- Self-serve forgot-password uses token_hash + used_at (migration 702). Some DBs differ:
+    -- missing columns, or no temp_password_hash column at all — unconditional DROP NOT NULL fails.
+    ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token_hash TEXT;
+    ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
+    ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS temp_password_hash TEXT;
+    DO $migration808$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'password_resets'
+              AND column_name = 'temp_password_hash' AND is_nullable = 'NO'
+        ) THEN
+            ALTER TABLE password_resets ALTER COLUMN temp_password_hash DROP NOT NULL;
+        END IF;
+    END
+    $migration808$;
+    CREATE INDEX IF NOT EXISTS idx_password_resets_token_hash ON password_resets(token_hash)
+        WHERE token_hash IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_password_resets_user_unused ON password_resets(user_id)
+        WHERE used_at IS NULL;
+"""),
+
+(809, """
+    -- OAuth reconnection time (distinct from token refresh / identity backfill updated_at)
+    ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS last_oauth_reconnect_at TIMESTAMPTZ;
+"""),
+
+(810, """
+    -- Stripe invoice dedup + billing period log (wallet refills); calculator assumptions
+    CREATE TABLE IF NOT EXISTS stripe_invoice_log (
+        invoice_id    TEXT PRIMARY KEY,
+        user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        tier_slug     TEXT,
+        put_credited  INT DEFAULT 0,
+        aic_credited  INT DEFAULT 0,
+        period_start  TIMESTAMPTZ,
+        period_end    TIMESTAMPTZ,
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_stripe_invoice_log_user ON stripe_invoice_log(user_id);
+
+    CREATE TABLE IF NOT EXISTS cost_model_config (
+        id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        effective_date          DATE NOT NULL DEFAULT CURRENT_DATE,
+        worker_costs            JSONB NOT NULL DEFAULT '{}'::jsonb,
+        storage_costs           JSONB NOT NULL DEFAULT '{}'::jsonb,
+        ai_cost_per_aic         NUMERIC(14, 6),
+        ops_costs               JSONB NOT NULL DEFAULT '{}'::jsonb,
+        utilization_target      NUMERIC(6, 4),
+        lookahead_default_hours INT,
+        prep_limit_default      INT,
+        notes                   TEXT,
+        updated_at              TIMESTAMPTZ DEFAULT NOW()
+    );
+"""),
 ]
         
         for version, sql in migrations:
@@ -1414,7 +1745,10 @@ async def run_migrations():
                     logger.error(f"Migration v{version} failed: {e}")
 
 app = FastAPI(title="UploadM8 API", version="4.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS_LIST, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# NOTE: Do NOT add CORSMiddleware here. FastAPI prepends each add_middleware();
+# registering CORS first puts it *inside* later middlewares. The rate-limit layer
+# would then see OPTIONS preflights before CORS short-circuits them → 429 breaks CORS.
+# CORS is registered once after all @app.middleware hooks (see below).
 
 # ── CORS-safe exception handler ──────────────────────────────────────────────
 # FastAPI's CORSMiddleware does NOT add Access-Control-Allow-Origin to 500
@@ -1424,10 +1758,7 @@ app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS_LIST, allow_cre
 # browser (and developer tools) always see the real error.
 @app.exception_handler(Exception)
 async def _cors_safe_500_handler(request: Request, exc: Exception) -> JSONResponse:
-    origin = request.headers.get("origin", "")
-    allowed = ALLOWED_ORIGINS_LIST
-    # Only reflect the origin if it's in our allow-list
-    cors_origin = origin if origin in allowed else (allowed[0] if allowed else "*")
+    cors_origin = _cors_reflect_origin(request)
 
     logger.error(
         f"Unhandled exception on {request.method} {request.url.path}: "
@@ -1456,7 +1787,10 @@ async def rate_limit_allowed(key: str, limit: int, window_sec: int) -> bool:
     """
     Fixed-window rate limit. Prefers Redis (distributed) when configured,
     falls back to in-memory buckets for single-instance dev.
+    Set limit <= 0 to disable that bucket (always allow).
     """
+    if limit <= 0:
+        return True
     if redis_client is not None:
         try:
             count = await redis_client.incr(key)
@@ -1496,31 +1830,221 @@ def client_ip(req: Request) -> str:
 
     return (req.client.host if req.client else "unknown")
 
+
+def _parse_int_env(name: str, default: int) -> int:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+
+def _load_rate_limit_config() -> Dict[str, Any]:
+    """
+    Dynamic HTTP rate limits (per IP / per bucket).
+
+    RATE_LIMIT_PROFILE: strict | standard | relaxed | enterprise — baseline presets.
+    Override any bucket with RL_*_LIMIT or RL_WINDOW_SEC (seconds per window).
+
+    Set RL_*_LIMIT=0 to disable that bucket only. RATE_LIMIT_ENABLED=false disables middleware.
+    """
+    profile = os.environ.get("RATE_LIMIT_PROFILE", "standard").strip().lower()
+    presets: Dict[str, tuple] = {
+        "strict": (150, 8, 25, 40, 20),
+        "standard": (300, 15, 40, 60, 30),
+        "relaxed": (2000, 60, 200, 300, 120),
+        "enterprise": (5000, 120, 500, 800, 400),
+    }
+    g, lg, au, ad, pr = presets.get(profile, presets["standard"])
+    win = _parse_int_env("RL_WINDOW_SEC", 60)
+    return {
+        "profile": profile,
+        "window_sec": win if win > 0 else 60,
+        "global": _parse_int_env("RL_GLOBAL_LIMIT", g),
+        "login": _parse_int_env("RL_LOGIN_LIMIT", lg),
+        "auth": _parse_int_env("RL_AUTH_LIMIT", au),
+        "admin": _parse_int_env("RL_ADMIN_LIMIT", ad),
+        "presign": _parse_int_env("RL_PRESIGN_LIMIT", pr),
+    }
+
+
+_RATE_LIMIT_CFG: Dict[str, Any] = _load_rate_limit_config()
+_RL_LOCALHOST_BYPASS = os.environ.get("RL_LOCALHOST_BYPASS", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_RL_BYPASS_SECRET = os.environ.get("E2E_RATE_LIMIT_BYPASS_SECRET", "").strip()
+_RL_BYPASS_HEADER = (
+    os.environ.get("E2E_RATE_LIMIT_BYPASS_HEADER", "X-UploadM8-RL-Bypass").strip()
+    or "X-UploadM8-RL-Bypass"
+)
+
+
+def _parse_trusted_rl_ips() -> frozenset:
+    raw = os.environ.get("RATE_LIMIT_TRUSTED_IPS", "").strip()
+    if not raw:
+        return frozenset()
+    out = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(str(ip_address(x)))
+        except Exception:
+            out.append(x)
+    return frozenset(out)
+
+
+_RL_TRUSTED_IPS: frozenset = _parse_trusted_rl_ips()
+
+
+def _rate_limit_request_bypass(request: Request) -> bool:
+    """E2E/CI secret header, or optional trusted egress IPs (e.g. fixed runner)."""
+    if _RL_BYPASS_SECRET and (request.headers.get(_RL_BYPASS_HEADER) or "").strip() == _RL_BYPASS_SECRET:
+        return True
+    if _RL_TRUSTED_IPS:
+        ip = client_ip(request)
+        if ip in _RL_TRUSTED_IPS:
+            return True
+    return False
+
+
 def _json_429(detail: str) -> JSONResponse:
     return JSONResponse(status_code=429, content={"detail": detail})
+
+_RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "true").lower() in ("true", "1", "yes")
 
 def install_rate_limit_middleware(app: FastAPI) -> None:
     @app.middleware("http")
     async def rl_middleware(request: Request, call_next):
+        if not _RATE_LIMIT_ENABLED:
+            return await call_next(request)
+
+        if request.method.upper() == "OPTIONS":
+            return await call_next(request)
+
         ip = client_ip(request)
+
+        if _rate_limit_request_bypass(request):
+            return await call_next(request)
+
+        if _RL_LOCALHOST_BYPASS and ip in ("127.0.0.1", "::1", "localhost"):
+            return await call_next(request)
+
+        cfg = _RATE_LIMIT_CFG
+        w = int(cfg["window_sec"])
+
         path = request.url.path
 
-        # Global guardrail
-        if not await rate_limit_allowed(f"ip:{ip}:global", limit=300, window_sec=60):
+        if not await rate_limit_allowed(f"ip:{ip}:global", limit=int(cfg["global"]), window_sec=w):
             return _json_429("Rate limit exceeded (global)")
 
-        # Sensitive surfaces
         if path.startswith("/api/auth/"):
-            if not await rate_limit_allowed(f"ip:{ip}:auth", limit=30, window_sec=60):
+            if path in ("/api/auth/login", "/api/auth/refresh"):
+                if not await rate_limit_allowed(f"ip:{ip}:login", limit=int(cfg["login"]), window_sec=w):
+                    return _json_429("Rate limit exceeded (login)")
+            elif not await rate_limit_allowed(f"ip:{ip}:auth", limit=int(cfg["auth"]), window_sec=w):
                 return _json_429("Rate limit exceeded (auth)")
-        if path.startswith("/api/admin/"):
-            if not await rate_limit_allowed(f"ip:{ip}:admin", limit=60, window_sec=60):
+        elif path.startswith("/api/admin/"):
+            if not await rate_limit_allowed(f"ip:{ip}:admin", limit=int(cfg["admin"]), window_sec=w):
                 return _json_429("Rate limit exceeded (admin)")
+        elif path.startswith("/api/presign"):
+            if not await rate_limit_allowed(f"ip:{ip}:presign", limit=int(cfg["presign"]), window_sec=w):
+                return _json_429("Rate limit exceeded (uploads)")
 
-        return await call_next(request)
+        response = await call_next(request)
+        return response
 
-# Activate in-memory rate limiting
 install_rate_limit_middleware(app)
+
+
+# ============================================================
+# AUDIT LOGGING HELPER
+# ============================================================
+async def audit_log(
+    user_id: str,
+    action: str,
+    *,
+    event_category: str = "SYSTEM",
+    resource_type: str = None,
+    resource_id: str = None,
+    details: dict = None,
+    ip_address: str = None,
+    user_agent: str = None,
+    severity: str = "INFO",
+    outcome: str = "SUCCESS",
+):
+    """Write to system_event_log for full audit trail. Non-blocking, non-fatal."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO system_event_log
+                       (user_id, event_category, action, resource_type, resource_id,
+                        details, ip_address, user_agent, severity, outcome)
+                   VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10)""",
+                user_id, event_category, action, resource_type, resource_id,
+                json.dumps(details or {}), ip_address, user_agent, severity, outcome,
+            )
+    except Exception as e:
+        logger.debug(f"audit_log write failed (non-fatal): {e}")
+
+
+# ============================================================
+# REDIS CACHE HELPERS
+# ============================================================
+CACHE_TTL_SHORT = int(os.environ.get("CACHE_TTL_SHORT", "60"))
+CACHE_TTL_MEDIUM = int(os.environ.get("CACHE_TTL_MEDIUM", "300"))
+CACHE_TTL_LONG = int(os.environ.get("CACHE_TTL_LONG", "3600"))
+
+async def cache_get(key: str):
+    """Get from Redis cache. Returns None on miss or if Redis unavailable."""
+    if not redis_client:
+        return None
+    try:
+        val = await redis_client.get(f"cache:{key}")
+        return json.loads(val) if val else None
+    except Exception:
+        return None
+
+async def cache_set(key: str, value, ttl: int = CACHE_TTL_SHORT):
+    """Set in Redis cache. Non-fatal on failure."""
+    if not redis_client:
+        return
+    try:
+        await redis_client.setex(f"cache:{key}", ttl, json.dumps(value, default=str))
+    except Exception:
+        pass
+
+async def cache_delete(key: str):
+    """Delete from Redis cache."""
+    if not redis_client:
+        return
+    try:
+        await redis_client.delete(f"cache:{key}")
+    except Exception:
+        pass
+
+async def cache_delete_pattern(pattern: str):
+    """Delete all keys matching pattern from Redis cache."""
+    if not redis_client:
+        return
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = await redis_client.scan(cursor, match=f"cache:{pattern}", count=100)
+            if keys:
+                await redis_client.delete(*keys)
+            if cursor == 0:
+                break
+    except Exception:
+        pass
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
@@ -1536,25 +2060,83 @@ async def security_headers(request: Request, call_next):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
-    resp.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; script-src 'self' 'unsafe-inline' https:; connect-src 'self' https:;"
+    # connect-src includes http: so dev tools / local frontends aren't blocked if a client applies this CSP.
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
+        "script-src 'self' 'unsafe-inline' https:; connect-src 'self' http: https:;"
+    )
     return resp
+
+
+# CORS must be registered *after* other add_middleware / @app.middleware hooks so it sits
+# *outside* rate limiting on the request path. Browser OPTIONS preflights are answered
+# here without consuming auth/login rate-limit buckets (fixes 429 + bogus CORS errors).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS_LIST,
+    allow_origin_regex=_CORS_LOCAL_REGEX,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============================================================
 # Auth Dependencies
 # ============================================================
+async def _auth_via_api_key(api_key: str) -> Optional[dict]:
+    """Authenticate via API key (um8_... prefix). Returns user dict or None."""
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT ak.user_id, ak.scopes, ak.rate_limit, ak.expires_at
+                   FROM api_keys ak
+                   WHERE ak.key_hash = $1 AND ak.revoked_at IS NULL""",
+                key_hash,
+            )
+            if not row:
+                return None
+            if row["expires_at"] and row["expires_at"] < _now_utc():
+                return None
+            await conn.execute(
+                "UPDATE api_keys SET last_used_at = NOW() WHERE key_hash = $1",
+                key_hash,
+            )
+            user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", row["user_id"])
+            if not user or user["status"] == "banned":
+                return None
+            wallet = await get_wallet(conn, row["user_id"])
+            result = {**dict(user), "wallet": wallet, "_api_key": True, "_scopes": list(row["scopes"] or [])}
+            return result
+    except Exception:
+        return None
+
+
 async def get_current_user(request: Request, authorization: Optional[str] = Header(None)):
-    auth_token = authorization[7:] if authorization and authorization.startswith("Bearer ") else None
+    if not authorization:
+        raise HTTPException(401, "Missing authorization")
+
+    # API key auth (um8_... prefix)
+    if authorization.startswith("um8_"):
+        user = await _auth_via_api_key(authorization)
+        if not user:
+            raise HTTPException(401, "Invalid API key")
+        return user
+
+    auth_token = authorization[7:] if authorization.startswith("Bearer ") else None
     if not auth_token:
         raise HTTPException(401, "Missing authorization")
     user_id = verify_access_jwt(auth_token)
-    if not user_id: raise HTTPException(401, "Invalid token")
-    
+    if not user_id:
+        raise HTTPException(401, "Invalid token")
+
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        if not user: raise HTTPException(401, "User not found")
-        if user["status"] == "banned": raise HTTPException(403, "Account suspended")
+        if not user:
+            raise HTTPException(401, "User not found")
+        if user["status"] == "banned":
+            raise HTTPException(403, "Account suspended")
         await conn.execute("UPDATE users SET last_active_at = NOW() WHERE id = $1", user_id)
-        # Daily token refill
         await daily_refill(conn, user_id, user["subscription_tier"])
         wallet = await get_wallet(conn, user_id)
         return {**dict(user), "wallet": wallet}
@@ -1979,11 +2561,77 @@ async def process_telemetry(conn, upload_id: str, user_id: str, video_path: str,
         raise HTTPException(500, f"Telemetry processing failed: {str(e)}")
 
 # ============================================================
-# Health
+# Health, Readiness & Metrics
 # ============================================================
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": _now_utc().isoformat()}
+
+@app.get("/ready")
+async def readiness():
+    """Deep readiness probe — checks DB and Redis connectivity."""
+    checks = {}
+    healthy = True
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+        healthy = False
+
+    if redis_client:
+        try:
+            await redis_client.ping()
+            checks["redis"] = "ok"
+        except Exception as e:
+            checks["redis"] = f"error: {e}"
+            healthy = False
+    else:
+        checks["redis"] = "not_configured"
+
+    status = 200 if healthy else 503
+    return JSONResponse(
+        status_code=status,
+        content={"status": "ok" if healthy else "degraded", "checks": checks, "timestamp": _now_utc().isoformat()},
+    )
+
+@app.get("/metrics")
+async def metrics(request: Request):
+    """Lightweight metrics for monitoring dashboards. Admin-only or internal."""
+    auth = request.headers.get("authorization", "")
+    metrics_key = os.environ.get("METRICS_API_KEY", "")
+    if metrics_key and auth != f"Bearer {metrics_key}":
+        raise HTTPException(403, "Forbidden")
+    try:
+        async with db_pool.acquire() as conn:
+            total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            active_24h = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE last_active_at > NOW() - INTERVAL '24 hours'"
+            )
+            uploads_24h = await conn.fetchval(
+                "SELECT COUNT(*) FROM uploads WHERE created_at > NOW() - INTERVAL '24 hours'"
+            )
+            processing_now = await conn.fetchval(
+                "SELECT COUNT(*) FROM uploads WHERE status = 'processing'"
+            )
+            queued_now = await conn.fetchval(
+                "SELECT COUNT(*) FROM uploads WHERE status IN ('queued', 'staged')"
+            )
+            failed_24h = await conn.fetchval(
+                "SELECT COUNT(*) FROM uploads WHERE status = 'failed' AND updated_at > NOW() - INTERVAL '24 hours'"
+            )
+        pool_size = db_pool.get_size() if hasattr(db_pool, 'get_size') else -1
+        pool_free = db_pool.get_idle_size() if hasattr(db_pool, 'get_idle_size') else -1
+        return {
+            "users": {"total": total_users, "active_24h": active_24h},
+            "uploads": {"last_24h": uploads_24h, "processing": processing_now, "queued": queued_now, "failed_24h": failed_24h},
+            "db_pool": {"size": pool_size, "idle": pool_free},
+            "timestamp": _now_utc().isoformat(),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Metrics error: {e}")
 
 # ============================================================
 # Auth Endpoints
@@ -1999,12 +2647,14 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
         if country_code in ("XX", "T1", ""):
             country_code = None
         await conn.execute(
-            "INSERT INTO users (id, email, password_hash, name, country) VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO users (id, email, password_hash, name, country, email_verified) VALUES ($1, $2, $3, $4, $5, FALSE)",
             user_id, data.email.lower(), hash_password(data.password), data.name, country_code
         )
         await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
-        # Experience-first: generous signup to build value and product love
-        signup_put = 100
+        # Default credits from free tier entitlements — enough to try uploads + AI features
+        ent = get_entitlements_for_tier("free")
+        # Starter wallet: enough to exercise PUT + AI without waiting for monthly refill
+        signup_put = 75
         signup_aic = 75
         await conn.execute(
             "INSERT INTO wallets (user_id, put_balance, aic_balance) VALUES ($1, $2, $3)",
@@ -2012,18 +2662,28 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
         )
         await ledger_entry(conn, user_id, "put", signup_put, "signup_bonus")
         await ledger_entry(conn, user_id, "aic", signup_aic, "signup_bonus")
-        access = create_access_jwt(user_id)
-        refresh = await create_refresh_token(conn, user_id)
-    background_tasks.add_task(notify_signup, data.email, data.name)
-    background_tasks.add_task(send_welcome_email, data.email, data.name)
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+
+        # Email confirmation token (24h expiry)
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        await conn.execute(
+            "INSERT INTO email_confirmations (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+            user_id, token_hash, expires_at
+        )
+
+        background_tasks.add_task(notify_signup, data.email, data.name)
+        background_tasks.add_task(send_signup_confirmation_email, data.email, data.name, token)
+
+    return {"ok": True, "email": data.email.lower()}
 
 @app.post("/api/auth/login")
 async def login(data: UserLogin):
     async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT id, password_hash, status FROM users WHERE LOWER(email) = $1", data.email.lower())
+        user = await conn.fetchrow("SELECT id, password_hash, status, email_verified FROM users WHERE LOWER(email) = $1", data.email.lower())
         if not user or not verify_password(data.password, user["password_hash"]): raise HTTPException(401, "Invalid credentials")
         if user["status"] == "banned": raise HTTPException(403, "Account suspended")
+        if not user.get("email_verified", True): raise HTTPException(403, "Please verify your email before signing in. Check your inbox for the confirmation link.")
         return {"access_token": create_access_jwt(str(user["id"])), "refresh_token": await create_refresh_token(conn, str(user["id"])), "token_type": "bearer"}
 
 @app.post("/api/auth/refresh")
@@ -2114,6 +2774,75 @@ async def reset_password(payload: ResetPasswordRequest, background: BackgroundTa
 
     return {"ok": True}
 
+
+@app.get("/api/auth/confirm-email")
+async def confirm_email(background_tasks: BackgroundTasks, token: str = Query(...)):
+    """Verify signup email. Token from confirmation link. On success, returns tokens for auto-login."""
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    async with db_pool.acquire() as conn:
+        ec = await conn.fetchrow(
+            """
+            SELECT ec.id, ec.user_id, ec.expires_at, ec.used_at
+            FROM email_confirmations ec
+            WHERE ec.token_hash = $1
+            ORDER BY ec.created_at DESC
+            LIMIT 1
+            """,
+            token_hash,
+        )
+        if not ec or ec["used_at"] is not None:
+            raise HTTPException(status_code=410, detail="Link expired or already used")
+        if ec["expires_at"] < datetime.now(timezone.utc):
+            raise HTTPException(status_code=410, detail="Link expired")
+
+        await conn.execute("UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1", ec["user_id"])
+        await conn.execute("UPDATE email_confirmations SET used_at = NOW() WHERE id = $1", ec["id"])
+
+        user_row = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", ec["user_id"])
+        access = create_access_jwt(str(ec["user_id"]))
+        refresh = await create_refresh_token(conn, str(ec["user_id"]))
+
+    if user_row:
+        background_tasks.add_task(send_welcome_email, user_row["email"], user_row["name"] or "there")
+
+    return {
+        "ok": True,
+        "email": user_row["email"] if user_row else None,
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "bearer",
+    }
+
+
+# ============================================================
+# Entitlements Schema API (no auth — for frontend tier/entitlement sync)
+# ============================================================
+def _entitlements_tiers_payload():
+    """Canonical tier list and entitlement schema. Keys match ENTITLEMENT_KEYS in stages/entitlements.py."""
+    return {
+        "tiers": get_tiers_for_api(),
+        "tier_slugs": list(TIER_SLUGS),
+        "entitlement_keys": list(ENTITLEMENT_KEYS),
+    }
+
+@app.get("/api/entitlements/tiers")
+async def get_entitlements_tiers():
+    """Canonical tier list. Frontend uses this as single source."""
+    # #region agent log
+    try:
+        _dp = pathlib.Path(__file__).resolve().parent / "debug-0d13f7.log"
+        with open(_dp, "a", encoding="utf-8") as _f:
+            _f.write(__import__("json").dumps({"sessionId":"0d13f7","hypothesisId":"H2","location":"app.py:get_entitlements_tiers","message":"Route called","data":{"route":"/api/entitlements/tiers"},"timestamp":__import__("time").time()*1000}) + "\n")
+    except Exception: pass
+    # #endregion
+    return _entitlements_tiers_payload()
+
+@app.get("/api/entitlements")
+async def get_entitlements():
+    """Alias for /api/entitlements/tiers — backward compatibility."""
+    return _entitlements_tiers_payload()
+
+
 # ============================================================
 # Public Pricing API (no auth — for index.html, settings.html)
 # ============================================================
@@ -2132,6 +2861,7 @@ async def get_public_pricing():
     tiers = []
     for slug in ("free", "creator_lite", "creator_pro", "studio", "agency"):
         cfg = TIER_CONFIG.get(slug, {})
+        per_pf = cfg.get("max_accounts_per_platform", cfg.get("per_platform", 0))
         tiers.append({
             "slug": slug,
             "name": cfg.get("name", slug.replace("_", " ").title()),
@@ -2139,6 +2869,7 @@ async def get_public_pricing():
             "put_monthly": cfg.get("put_monthly", 0),
             "aic_monthly": cfg.get("aic_monthly", 0),
             "max_accounts": cfg.get("max_accounts", 0),
+            "max_accounts_per_platform": int(per_pf or 0),
             "lookahead_hours": cfg.get("lookahead_hours", 0),
             "queue_depth": cfg.get("queue_depth", 0),
             "max_thumbnails": cfg.get("max_thumbnails", 0),
@@ -2160,7 +2891,9 @@ async def get_public_pricing():
 # ============================================================
 @app.get("/api/me")
 async def get_me(user: dict = Depends(get_current_user)):
-    plan = get_plan(user.get("subscription_tier", "free"))
+    raw_tier = user.get("subscription_tier", "free")
+    ent = get_entitlements_from_user(dict(user))
+    plan = entitlements_to_dict(ent)  # plan = entitlements (single source)
     wallet = user.get("wallet", {})
     role = user.get("role", "user")
 
@@ -2196,7 +2929,9 @@ async def get_me(user: dict = Depends(get_current_user)):
         "avatar_signed_url": avatar_signed_url,
         "avatarSignedUrl": avatar_signed_url,
 
-        "subscription_tier":      user.get("subscription_tier", "free"),
+        "subscription_tier":      raw_tier,
+        "tier":                  ent.tier,           # canonical slug (launch->creator_lite)
+        "tier_display":          ent.tier_display,   # human-readable name
         "subscription_status":     user.get("subscription_status"),
         "current_period_end":      user.get("current_period_end").isoformat() if user.get("current_period_end") else None,
         "trial_end":               user.get("trial_end").isoformat() if user.get("trial_end") else None,
@@ -2211,12 +2946,12 @@ async def get_me(user: dict = Depends(get_current_user)):
         },
         "plan": plan,
         "features": {
-            "uploads":     plan.get("uploads", False),
-            "scheduler":   plan.get("scheduler", False),
-            "analytics":   plan.get("analytics", False),
-            "watermark":   plan.get("watermark", False),
-            "white_label": plan.get("white_label", False),
-            "support":     plan.get("support", False),
+            "uploads":     plan.get("put_monthly", 0) > 0,
+            "scheduler":   plan.get("can_schedule", False),
+            "analytics":   bool(plan.get("analytics") and plan.get("analytics") != "basic"),
+            "watermark":   plan.get("can_watermark", True),
+            "white_label": plan.get("can_white_label", False),
+            "support":     True,
         },
         # Full entitlements dict — used by hasEntitlement() in app.js
         "entitlements": entitlements_to_dict(
@@ -2749,37 +3484,73 @@ async def delete_account(request: Request, user: dict = Depends(get_current_user
 
 @app.get("/api/wallet")
 async def get_wallet_endpoint(user: dict = Depends(get_current_user)):
-    wallet = user.get("wallet", {})
     plan = get_plan(user.get("subscription_tier", "free"))
+    promo_defaults = {
+        "promo_burst_week_enabled": admin_settings_cache.get("promo_burst_week_enabled", False),
+        "promo_referral_enabled": admin_settings_cache.get("promo_referral_enabled", False),
+    }
     async with db_pool.acquire() as conn:
-        ledger = await conn.fetch("SELECT * FROM token_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50", user["id"])
+        wallet = await get_wallet(conn, user["id"])
+        ledger = await conn.fetch(
+            "SELECT * FROM token_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
+            user["id"],
+        )
+        settings_row = None
+        try:
+            settings_row = await conn.fetchrow(
+                """
+                SELECT auto_generate_captions, auto_generate_hashtags, auto_generate_thumbnails
+                FROM user_settings WHERE user_id = $1
+                """,
+                user["id"],
+            )
+        except Exception:
+            pass
+        marketing = await build_wallet_marketing_payload(
+            conn,
+            str(user["id"]),
+            user.get("subscription_tier"),
+            wallet,
+            plan,
+            dict(settings_row) if settings_row else None,
+            {**promo_defaults, **admin_settings_cache},
+            bool(user.get("flex_enabled")),
+        )
     return {
-        "wallet": wallet, "plan_limits": {"put_daily": plan.get("put_daily", 1), "put_monthly": plan.get("put_monthly", 30), "aic_monthly": plan.get("aic_monthly", 0)},
+        "wallet": wallet,
+        "plan_limits": {
+            "put_daily": plan.get("put_daily", 1),
+            "put_monthly": plan.get("put_monthly", 30),
+            "aic_monthly": plan.get("aic_monthly", 0),
+        },
         "ledger": [dict(l) for l in ledger],
+        "burn_put_pct": marketing["burn_put_pct"],
+        "burn_aic_pct": marketing["burn_aic_pct"],
+        "put_capacity": marketing["put_capacity"],
+        "aic_capacity": marketing["aic_capacity"],
+        "ai_enabled": marketing["ai_enabled"],
+        "banners": marketing["banners"],
+        "links": marketing.get("links", {}),
+        "period_start": marketing.get("period_start"),
+        "put_spent_period": marketing.get("put_spent_period"),
+        "aic_spent_period": marketing.get("aic_spent_period"),
+        "put_available": marketing.get("put_available"),
+        "aic_available": marketing.get("aic_available"),
     }
 
 @app.post("/api/wallet/topup")
 async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_user)):
-    product = TOPUP_PRODUCTS.get(data.lookup_key)
-    if not product: raise HTTPException(400, "Invalid product")
-    
     async with db_pool.acquire() as conn:
-        customer_id = user.get("stripe_customer_id")
-        if not customer_id:
-            customer = stripe.Customer.create(email=user["email"], name=user["name"])
-            customer_id = customer.id
-            await conn.execute("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", customer_id, user["id"])
-    
-    prices = stripe.Price.list(lookup_keys=[data.lookup_key], active=True)
-    if not prices.data: raise HTTPException(400, "Price not found")
-    
-    session = stripe.checkout.Session.create(
-        customer=customer_id,
-        line_items=[{"price": prices.data[0].id, "quantity": 1}],
-        mode="payment",
+        customer_id = await ensure_stripe_customer(conn, user, stripe)
+
+    session = create_wallet_topup_checkout_session(
+        stripe_client=stripe,
+        customer_id=customer_id,
+        lookup_key=data.lookup_key,
+        topup_products=TOPUP_PRODUCTS,
         success_url=STRIPE_SUCCESS_URL,
         cancel_url=STRIPE_CANCEL_URL,
-        metadata={"user_id": str(user["id"]), "wallet": product["wallet"], "amount": product["amount"]},
+        user_id=str(user["id"]),
     )
     return {"checkout_url": session.url}
 
@@ -2795,82 +3566,126 @@ async def wallet_transfer(data: TransferRequest, user: dict = Depends(get_curren
 # ============================================================
 # Settings
 # ============================================================
+_SETTINGS_DEFAULTS = {
+    "discord_webhook": None,
+    "telemetry_enabled": True,
+    "hud_enabled": True,
+    "hud_position": "bottom-left",
+    "speeding_mph": 80,
+    "euphoria_mph": 100,
+    "hud_speed_unit": "mph",
+    "hud_color": "#FFFFFF",
+    "hud_font_family": "Arial",
+    "hud_font_size": 24,
+    "ffmpeg_screenshot_interval": 5,
+    "auto_generate_thumbnails": True,
+    "auto_generate_captions": True,
+    "auto_generate_hashtags": True,
+    "default_hashtag_count": 5,
+    "always_use_hashtags": False,
+}
+
 @app.get("/api/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
     """Get user settings including Trill preferences"""
     async with db_pool.acquire() as conn:
-        settings = await conn.fetchrow("""
-            SELECT 
-                discord_webhook, telemetry_enabled, hud_enabled, hud_position,
-                speeding_mph, euphoria_mph, hud_speed_unit, hud_color,
-                hud_font_family, hud_font_size, ffmpeg_screenshot_interval,
-                auto_generate_thumbnails, auto_generate_captions,
-                auto_generate_hashtags, default_hashtag_count, always_use_hashtags
-            FROM user_settings 
-            WHERE user_id = $1
-        """, user["id"])
+        try:
+            settings = await conn.fetchrow("""
+                SELECT 
+                    discord_webhook, telemetry_enabled, hud_enabled, hud_position,
+                    speeding_mph, euphoria_mph, hud_speed_unit, hud_color,
+                    hud_font_family, hud_font_size, ffmpeg_screenshot_interval,
+                    auto_generate_thumbnails, auto_generate_captions,
+                    auto_generate_hashtags, default_hashtag_count, always_use_hashtags
+                FROM user_settings 
+                WHERE user_id = $1
+            """, user["id"])
+        except Exception as e:
+            # Fallback if extended columns not yet migrated (e.g. pre-707)
+            logger.warning(f"Full settings SELECT failed ({e}), using base columns")
+            settings = await conn.fetchrow("""
+                SELECT discord_webhook, telemetry_enabled, hud_enabled, hud_position,
+                    speeding_mph, euphoria_mph, hud_speed_unit, hud_color
+                FROM user_settings WHERE user_id = $1
+            """, user["id"])
+            if settings:
+                settings = dict(settings)
+                for k, v in _SETTINGS_DEFAULTS.items():
+                    settings.setdefault(k, v)
+                return settings
+            return dict(_SETTINGS_DEFAULTS)
 
         if not settings:
-            # Return defaults
-            return {
-                "discord_webhook": None,
-                "telemetry_enabled": True,
-                "hud_enabled": True,
-                "hud_position": "bottom-left",
-                "speeding_mph": 80,        # Default Trill threshold
-                "euphoria_mph": 100,       # Default Trill threshold
-                "hud_speed_unit": "mph",
-                "hud_color": "#FFFFFF",
-                "hud_font_family": "Arial",
-                "hud_font_size": 24,
-                "ffmpeg_screenshot_interval": 5,
-                "auto_generate_thumbnails": True,
-                "auto_generate_captions": True,
-                "auto_generate_hashtags": True,
-                "default_hashtag_count": 5,
-                "always_use_hashtags": False
-            }
+            return dict(_SETTINGS_DEFAULTS)
+        result = dict(settings)
+        for k, v in _SETTINGS_DEFAULTS.items():
+            result.setdefault(k, v)
+        return result
 
-    return dict(settings)
+# Base columns that exist in user_settings from migration 5 (before 707)
+_SETTINGS_BASE_FIELDS = [
+    "discord_webhook", "telemetry_enabled", "hud_enabled",
+    "hud_position", "speeding_mph", "euphoria_mph",
+    "hud_speed_unit", "hud_color",
+]
+# Extended columns added in migration 707
+_SETTINGS_EXTENDED_FIELDS = [
+    "hud_font_family", "hud_font_size", "ffmpeg_screenshot_interval",
+    "auto_generate_thumbnails", "auto_generate_captions", "auto_generate_hashtags",
+    "default_hashtag_count", "always_use_hashtags",
+]
 
 @app.put("/api/settings")
 async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current_user)):
     """Update user settings including Trill thresholds"""
+    # #region agent log
+    try:
+        import json as _dj3, time as _dt3
+        open("debug-2656c2.log","a").write(_dj3.dumps({"sessionId":"2656c2","hypothesisId":"PUT-SETTINGS","location":"app.py:update_settings","message":"PUT /api/settings called","data":{"user_id":str(user.get("id")),"data_fields":[f for f in dir(data) if not f.startswith('_') and getattr(data,f,None) is not None][:20]},"timestamp":int(_dt3.time()*1000)})+"\n")
+    except Exception: pass
+    # #endregion
+    all_fields = _SETTINGS_BASE_FIELDS + _SETTINGS_EXTENDED_FIELDS
     updates, params = [], [user["id"]]
 
-    # All possible settings fields
-    fields = [
-        "discord_webhook", "telemetry_enabled", "hud_enabled", 
-        "hud_position", "speeding_mph", "euphoria_mph",
-        "hud_speed_unit", "hud_color", "hud_font_family", "hud_font_size",
-        "ffmpeg_screenshot_interval", "auto_generate_thumbnails",
-        "auto_generate_captions", "auto_generate_hashtags",
-        "default_hashtag_count", "always_use_hashtags"
-    ]
-
-    for field in fields:
+    for field in all_fields:
         val = getattr(data, field, None)
         if val is not None:
             updates.append(f"{field} = ${len(params)+1}")
             params.append(val)
 
-    if updates:
-        async with db_pool.acquire() as conn:
-            # Create user_settings row if doesn't exist
-            await conn.execute("""
-                INSERT INTO user_settings (user_id) 
-                VALUES ($1) 
-                ON CONFLICT (user_id) DO NOTHING
-            """, user["id"])
+    if not updates:
+        return {"status": "updated"}
 
-            # Update settings
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO user_settings (user_id) 
+            VALUES ($1) 
+            ON CONFLICT (user_id) DO NOTHING
+        """, user["id"])
+
+        try:
             await conn.execute(
                 f"UPDATE user_settings SET {', '.join(updates)}, updated_at = NOW() WHERE user_id = $1",
                 *params
             )
+        except Exception as e:
+            # Fallback: update only base columns if extended columns not yet migrated
+            base_updates, base_params = [], [user["id"]]
+            for field in _SETTINGS_BASE_FIELDS:
+                val = getattr(data, field, None)
+                if val is not None:
+                    base_updates.append(f"{field} = ${len(base_params)+1}")
+                    base_params.append(val)
+            if base_updates:
+                await conn.execute(
+                    f"UPDATE user_settings SET {', '.join(base_updates)}, updated_at = NOW() WHERE user_id = $1",
+                    *base_params
+                )
+                logger.warning(f"Settings update fell back to base columns after: {e}")
+            else:
+                raise
 
-            logger.info(f"Updated settings for user {user['id']}: {updates}")
-
+    logger.info(f"Updated settings for user {user['id']}: {updates}")
     return {"status": "updated"}
 
 
@@ -3057,9 +3872,22 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
         prefs["captionVoice"] = prefs["caption_voice"] = v
 
     async with db_pool.acquire() as conn:
+        # MERGE with existing preferences — never replace entirely (frontend may send partial updates)
+        existing_row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
+        existing = {}
+        if existing_row and existing_row.get("preferences"):
+            raw = existing_row["preferences"]
+            if isinstance(raw, str):
+                try:
+                    existing = json.loads(raw) if raw else {}
+                except Exception:
+                    existing = {}
+            elif isinstance(raw, dict):
+                existing = dict(raw)
+        merged = {**existing, **prefs}
         await conn.execute(
             "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
-            json.dumps(prefs), user["id"]
+            json.dumps(merged), user["id"]
         )
         # Sync discord_webhook to user_settings and user_preferences so:
         # - Admin "Send to user webhooks" finds it (announcement query reads from these tables)
@@ -3158,6 +3986,9 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         combined = [h for h in combined if h and h not in blocked]
         data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
 
+        # Each account has unique platform_tokens.id; dedupe target_accounts to avoid duplicate publishes
+        target_accounts = list(dict.fromkeys(str(t) for t in (data.target_accounts or []) if t))
+
         # ── Compute PUT/AIC cost — canonical formula from entitlements ──
         ent_cost = get_entitlements_for_tier(user.get("subscription_tier", "free"))
         use_ai  = bool(getattr(data, "use_ai", False)) and ent_cost.can_ai
@@ -3166,7 +3997,7 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         # Each target account counts as a separate publish (costs +2 PUT per extra beyond 1)
         # When target_accounts provided: user selected specific accounts.
         # When empty: legacy one-per-platform.
-        num_publish_targets = len(data.target_accounts) if data.target_accounts else len(data.platforms)
+        num_publish_targets = len(target_accounts) if target_accounts else len(data.platforms)
         put_cost, aic_cost = compute_upload_cost(
             entitlements=ent_cost,
             num_platforms=num_publish_targets,
@@ -3245,7 +4076,7 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
             data.platforms, data.title, data.caption, data.hashtags,
             data.privacy, scheduled_time, data.schedule_mode, put_cost,
             aic_cost, json.dumps(schedule_metadata) if schedule_metadata else None,
-            json.dumps(user_prefs), data.target_accounts or []
+            json.dumps(user_prefs), target_accounts
         )
 
         # Reserve tokens
@@ -3259,7 +4090,7 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         "put_cost": put_cost,
         "aic_cost": aic_cost,
         "schedule_mode": data.schedule_mode,
-        "target_accounts": data.target_accounts or [],
+        "target_accounts": target_accounts,
         "preferences_applied": {
             "auto_captions": bool(user_prefs.get("auto_captions")),
             "auto_thumbnails": bool(user_prefs.get("auto_thumbnails")),
@@ -3329,7 +4160,7 @@ async def complete_upload(upload_id: str, request: Request, user: dict = Depends
     SMART      → status=staged, NOT pushed to Redis → scheduler fires at first scheduled_time - processing_window
 
     Request body may include title, caption, hashtags from the upload page (manual metadata for single-file uploads).
-    These override presign defaults and are stored before enqueue.
+    Title and caption override when provided. Hashtags are merged with any tags already on the upload row (deduped).
     """
     body = {}
     try:
@@ -3368,19 +4199,40 @@ async def complete_upload(upload_id: str, request: Request, user: dict = Depends
             raw_tags = body["hashtags"]
             if isinstance(raw_tags, str):
                 raw_tags = [t.strip() for t in re.split(r"[\s,]+", str(raw_tags)) if t.strip()]
-            tags = []
+            incoming = []
             for t in (raw_tags if isinstance(raw_tags, (list, tuple)) else []):
                 t = str(t).strip().lstrip("#")[:50]
                 if t:
-                    tags.append(f"#{t}" if not t.startswith("#") else t)
+                    incoming.append(f"#{t}")
             blocked = set(
                 str(x).strip().lstrip("#").lower()
                 for x in (user_prefs.get("blocked_hashtags") or user_prefs.get("blockedHashtags") or [])
             )
-            tags = [t for t in tags if t and t.lstrip("#").lower() not in blocked]
-            tags = list(dict.fromkeys(tags))[: int(user_prefs.get("max_hashtags", 30))]
+            existing = upload.get("hashtags")
+            merged_raw: List[str] = []
+            for tag in expand_hashtag_items(existing) + expand_hashtag_items(incoming):
+                t = str(tag).strip().lstrip("#").lower()
+                if not t or t in blocked:
+                    continue
+                merged_raw.append(f"#{t}" if not str(tag).startswith("#") else str(tag).strip())
+            seen: set = set()
+            tags: List[str] = []
+            for t in merged_raw:
+                k = t.lstrip("#").lower()
+                if k in seen:
+                    continue
+                seen.add(k)
+                tags.append(t)
+            tags = tags[: int(user_prefs.get("max_hashtags", 30))]
             updates.append(f"hashtags = ${idx}")
             params.append(tags)  # TEXT[] expects list
+            idx += 1
+
+        if body.get("target_accounts") is not None:
+            # Each account has unique platform_tokens.id; dedupe to avoid duplicate publishes
+            target_ids = list(dict.fromkeys(str(t) for t in (body["target_accounts"] or []) if t))
+            updates.append(f"target_accounts = ${idx}")
+            params.append(target_ids)
             idx += 1
 
         if updates:
@@ -3569,6 +4421,130 @@ _STATUS_LABEL = {
 }
 
 
+async def _enrich_platform_results(conn, upload_row: dict, user_id: str) -> list:
+    """
+    Return platform_results as a flat list. Each entry enriched with
+    account_name/username/avatar.
+
+    Priority:
+      1. Fields already stored IN the entry (set by worker after Fix 2/3)
+      2. target_accounts UUID → platform_tokens JOIN (for uploads before Fix 3)
+      3. Primary account per platform (last resort for very old uploads)
+    """
+    raw = upload_row.get("platform_results") or []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = []
+
+    if isinstance(raw, dict):
+        items = [{"platform": k, **v} for k, v in raw.items() if isinstance(v, dict)]
+    elif isinstance(raw, list):
+        items = list(raw)
+    else:
+        items = []
+
+    if not items:
+        return items
+
+    # If ALL successful entries already have full identity including avatar, skip DB join
+    successful = [e for e in items if e.get("success") is not False]
+    already_enriched = successful and all(
+        (e.get("account_username") or e.get("account_name") or e.get("account_id"))
+        and (e.get("account_avatar") or e.get("avatar"))
+        for e in successful
+    )
+    if already_enriched:
+        for e in items:
+            if e.get("account_avatar"):
+                e["account_avatar"] = _platform_account_avatar_to_url(e["account_avatar"])
+            if e.get("avatar"):
+                e["avatar"] = _platform_account_avatar_to_url(e["avatar"])
+        return items
+
+    # Build token_row_id → identity map from target_accounts
+    token_map = {}
+    target_ids = [str(t) for t in (upload_row.get("target_accounts") or []) if t]
+
+    if target_ids:
+        try:
+            rows = await conn.fetch(
+                """SELECT id, platform, account_id, account_name, account_username, account_avatar
+                   FROM platform_tokens
+                   WHERE user_id = $1 AND id = ANY($2::uuid[]) AND revoked_at IS NULL""",
+                user_id, target_ids
+            )
+            for r in rows:
+                token_map[str(r["id"])] = {
+                    "token_row_id":     str(r["id"]),
+                    "account_id":       r["account_id"]       or "",
+                    "account_name":     r["account_name"]     or "",
+                    "account_username": r["account_username"] or "",
+                    "account_avatar":   r["account_avatar"]   or "",
+                    "platform":         r["platform"],
+                }
+        except Exception as e:
+            logger.warning(f"_enrich_platform_results target lookup failed: {e}")
+
+    # Fallback: primary token per platform for old uploads
+    platform_fallback = {}
+    if not token_map:
+        try:
+            platforms_needed = list({(e.get("platform") or "").lower() for e in items if e.get("platform")})
+            if platforms_needed:
+                rows = await conn.fetch(
+                    """SELECT DISTINCT ON (platform)
+                              id, platform, account_id, account_name, account_username, account_avatar
+                       FROM platform_tokens
+                       WHERE user_id = $1 AND platform = ANY($2::text[]) AND revoked_at IS NULL
+                       ORDER BY platform, is_primary DESC NULLS LAST, updated_at DESC""",
+                    user_id, platforms_needed
+                )
+                for r in rows:
+                    platform_fallback[r["platform"]] = {
+                        "token_row_id":     str(r["id"]),
+                        "account_id":       r["account_id"]       or "",
+                        "account_name":     r["account_name"]     or "",
+                        "account_username": r["account_username"] or "",
+                        "account_avatar":   r["account_avatar"]   or "",
+                    }
+        except Exception as e:
+            logger.warning(f"_enrich_platform_results fallback lookup failed: {e}")
+
+    # Track which token_ids we've assigned to avoid giving same identity to multiple entries
+    used_token_ids: set[str] = set()
+    enriched = []
+    for entry in items:
+        p = (entry.get("platform") or "").lower()
+
+        stored_token_id = entry.get("token_row_id") or ""
+        if stored_token_id and stored_token_id in token_map:
+            acct = token_map[stored_token_id]
+        elif token_map:
+            # Multi-account: pick first unused token for this platform so each entry gets distinct identity
+            candidates = [v for v in token_map.values() if v.get("platform") == p and v.get("token_row_id") not in used_token_ids]
+            acct = candidates[0] if candidates else next((v for v in token_map.values() if v.get("platform") == p), {})
+            if acct.get("token_row_id"):
+                used_token_ids.add(acct["token_row_id"])
+        else:
+            acct = platform_fallback.get(p, {})
+
+        merged = {**entry}
+        for field in ("token_row_id", "account_id", "account_name", "account_username", "account_avatar"):
+            if not merged.get(field) and acct.get(field):
+                merged[field] = acct[field]
+
+        if merged.get("account_avatar"):
+            merged["account_avatar"] = _platform_account_avatar_to_url(merged["account_avatar"])
+        if merged.get("avatar"):
+            merged["avatar"] = _platform_account_avatar_to_url(merged["avatar"])
+
+        enriched.append(merged)
+
+    return enriched
+
+
 @app.get("/api/uploads")
 async def get_uploads(
     status: Optional[str] = None,
@@ -3610,6 +4586,7 @@ async def get_uploads(
         "video_url",
         "ai_title","ai_caption",
         "ai_generated_title","ai_generated_caption","ai_generated_hashtags",
+        "target_accounts",
     ]
     select_cols = _pick_cols(wanted, cols) or ["id","filename","platforms","status","created_at"]
     select_sql = f"SELECT {', '.join(select_cols)} FROM uploads WHERE user_id = $1"
@@ -3618,7 +4595,10 @@ async def get_uploads(
     count_params = [user["id"]]
 
     # view takes precedence over status for semantic filtering
-    if view and view in _UPLOAD_VIEW_STATUS:
+    # view=all: no status filter — show all uploads
+    if view == "all":
+        pass  # no status filter
+    elif view and view in _UPLOAD_VIEW_STATUS:
         statuses = _UPLOAD_VIEW_STATUS[view]
         if statuses is not None:
             placeholders = ", ".join(f"${i}" for i in range(len(params) + 1, len(params) + 1 + len(statuses)))
@@ -3647,138 +4627,93 @@ async def get_uploads(
     params.extend([limit, offset])
     select_sql += f" ORDER BY created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}"
 
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(select_sql, *params)
-        total = await conn.fetchval(count_sql, *count_params) if meta else None
-
-    def _normalize_platform_results(raw):
-        """
-        DB may store:
-          - list: [{platform:..., status:..., url:...}, ...]
-          - dict: {"tiktok": {...}, "youtube": {...}}
-        Always return list[dict].
-
-        Field aliasing (frontend-safe):
-          platform_video_id → video_id   (canonical worker field)
-          platform_url      → url        (canonical worker field)
-        Both original fields are kept so nothing breaks.
-        """
-        pr = _safe_json(raw, [])
-        if isinstance(pr, list):
-            items = [x for x in pr if isinstance(x, dict)]
-        elif isinstance(pr, dict):
-            items = []
-            for k, v in pr.items():
-                if isinstance(v, dict):
-                    items.append({"platform": k, **v})
-                else:
-                    items.append({"platform": k, "value": v})
-        else:
-            return []
-
-        # Alias platform_video_id → video_id and platform_url → url
-        # so buildPlatformUrl() in the frontend finds them with its
-        # existing entry.video_id / entry.url lookups.
-        # account_id and account_name (from item) support multi-account display.
-        out = []
-        for item in items:
-            d = dict(item)
-            if d.get("platform_video_id") and not d.get("video_id"):
-                d["video_id"] = d["platform_video_id"]
-            if d.get("platform_url") and not d.get("url"):
-                d["url"] = d["platform_url"]
-            out.append(d)
-        return out
-
     def _normalize_hashtags(raw):
         tags = _safe_json(raw, [])
         if isinstance(tags, list):
             return [str(t) for t in tags if t]
         if isinstance(tags, str) and tags.strip():
-            # If it's a single tag string, wrap it.
             return [tags.strip()]
         return []
 
     s3 = None
     out = []
-    for r in rows:
-        d = dict(r)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(select_sql, *params)
+        total = await conn.fetchval(count_sql, *count_params) if meta else None
 
-        # AI fields (explicit)
-        ai_title = (d.get("ai_title") or d.get("ai_generated_title") or "") or ""
-        ai_caption = (d.get("ai_caption") or d.get("ai_generated_caption") or "") or ""
-        ai_hashtags = _normalize_hashtags(d.get("ai_generated_hashtags"))
+        for r in rows:
+            d = dict(r)
 
-        # Base fields with fallback to AI if empty
-        title = (d.get("title") or "").strip() or ai_title
-        caption = (d.get("caption") or "").strip() or ai_caption
+            ai_title = (d.get("ai_title") or d.get("ai_generated_title") or "") or ""
+            ai_caption = (d.get("ai_caption") or d.get("ai_generated_caption") or "") or ""
+            ai_hashtags = _normalize_hashtags(d.get("ai_generated_hashtags"))
 
-        hashtags = _normalize_hashtags(d.get("hashtags"))
-        platform_results = _normalize_platform_results(d.get("platform_results"))
+            title = (d.get("title") or "").strip() or ai_title
+            caption = (d.get("caption") or "").strip() or ai_caption
 
-        thumbnail_url = None
-        thumb_key = d.get("thumbnail_r2_key")
-        if thumb_key:
-            try:
-                s3 = s3 or get_s3_client()
-                thumbnail_url = s3.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(thumb_key)},
-                    ExpiresIn=3600,
-                )
-            except Exception:
-                thumbnail_url = None
+            hashtags = _normalize_hashtags(d.get("hashtags"))
+            platform_results = await _enrich_platform_results(conn, d, str(user["id"]))
 
-        raw_status = d.get("status") or ""
-        item = {
-            "id": str(d.get("id")),
-            "filename": d.get("filename"),
-            "platforms": list(d.get("platforms") or []),
-            "status": raw_status,
-            "status_label": _STATUS_LABEL.get(raw_status, raw_status.replace("_", " ").title() if raw_status else "Unknown"),
-            "privacy": d.get("privacy", "public"),
-            "title": title,
-            "caption": caption,
-            "hashtags": hashtags,
+            thumbnail_url = None
+            thumb_key = d.get("thumbnail_r2_key")
+            if thumb_key:
+                try:
+                    s3 = s3 or get_s3_client()
+                    thumbnail_url = s3.generate_presigned_url(
+                        "get_object",
+                        Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(thumb_key)},
+                        ExpiresIn=3600,
+                    )
+                except Exception:
+                    thumbnail_url = None
 
-            "ai_title": ai_title,
-            "ai_caption": ai_caption,
-            "ai_hashtags": ai_hashtags,
+            raw_status = d.get("status") or ""
+            item = {
+                "id": str(d.get("id")),
+                "filename": d.get("filename"),
+                "platforms": list(d.get("platforms") or []),
+                "status": raw_status,
+                "status_label": _STATUS_LABEL.get(raw_status, raw_status.replace("_", " ").title() if raw_status else "Unknown"),
+                "privacy": d.get("privacy", "public"),
+                "title": title,
+                "caption": caption,
+                "hashtags": hashtags,
 
-            "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
-            "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
-            "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
+                "ai_title": ai_title,
+                "ai_caption": ai_caption,
+                "ai_hashtags": ai_hashtags,
 
-            "put_cost": int(d.get("put_reserved") or 0),
-            "aic_cost": int(d.get("aic_reserved") or 0),
+                "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
+                "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
+                "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
 
-            "error_code": d.get("error_code"),
-            "error": d.get("error_detail") or d.get("error_code") or None,
+                "put_cost": int(d.get("put_reserved") or 0),
+                "aic_cost": int(d.get("aic_reserved") or 0),
 
-            "thumbnail_url": thumbnail_url,
-            "platform_results": platform_results,
+                "error_code": d.get("error_code"),
+                "error": d.get("error_detail") or d.get("error_code") or None,
 
-            "file_size": d.get("file_size"),
-            "views":    int(d.get("views")    or 0),
-            "likes":    int(d.get("likes")    or 0),
-            "comments": int(d.get("comments") or 0),
-            "shares":   int(d.get("shares")   or 0),
+                "thumbnail_url": thumbnail_url,
+                "platform_results": platform_results,
 
-            "progress": int(d.get("processing_progress") or 0),
-            "current_stage": d.get("processing_stage"),
+                "file_size": d.get("file_size"),
+                "views":    int(d.get("views")    or 0),
+                "likes":    int(d.get("likes")    or 0),
+                "comments": int(d.get("comments") or 0),
+                "shares":   int(d.get("shares")   or 0),
 
-            # Schedule fields — lets frontend distinguish smart vs manual scheduled
-            "schedule_mode":     d.get("schedule_mode") or "immediate",
-            "schedule_metadata": _safe_json(d.get("schedule_metadata"), None),
-            "smart_schedule":    _safe_json(d.get("schedule_metadata"), None),  # alias for queue.html
+                "progress": int(d.get("processing_progress") or 0),
+                "current_stage": d.get("processing_stage"),
 
-            # Editable: pending, staged, queued, scheduled, ready_to_publish (queue.html edit button)
-            "is_editable": d.get("status") in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
+                "schedule_mode":     d.get("schedule_mode") or "immediate",
+                "schedule_metadata": _safe_json(d.get("schedule_metadata"), None),
+                "smart_schedule":    _safe_json(d.get("schedule_metadata"), None),
 
-            # Direct video URL if stored by worker
-            "video_url": d.get("video_url"),
-        }
-        out.append(item)
+                "is_editable": d.get("status") in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
+
+                "video_url": d.get("video_url"),
+            }
+            out.append(item)
 
     if not meta:
         return out
@@ -3889,47 +4824,6 @@ async def partial_refund_tokens(
         int(original_put_cost or 0),
     )
 
-async def credit_wallet(conn, user_id: str, wallet_type: str, amount: int, reason: str, stripe_event_id: str = None):
-    if wallet_type == "put":
-        await conn.execute("UPDATE wallets SET put_balance = put_balance + $1 WHERE user_id = $2", amount, user_id)
-    else:
-        await conn.execute("UPDATE wallets SET aic_balance = aic_balance + $1 WHERE user_id = $2", amount, user_id)
-    await ledger_entry(conn, user_id, wallet_type, amount, reason, stripe_event_id=stripe_event_id)
-
-async def transfer_tokens(conn, user_id: str, from_platform: str, to_platform: str, amount: int, burn_pct: float = 0.02) -> bool:
-    # Check flex enabled
-    user = await conn.fetchrow("SELECT subscription_tier, flex_enabled FROM users WHERE id = $1", user_id)
-    if not user or not user.get("flex_enabled"):
-        return False
-    wallet = await get_wallet(conn, user_id)
-    if wallet["put_balance"] - wallet["put_reserved"] < amount:
-        return False
-    burn = int(amount * burn_pct)
-    net = amount - burn
-    await ledger_entry(conn, user_id, "put", -amount, "transfer_out", platform=from_platform)
-    await ledger_entry(conn, user_id, "put", net, "transfer_in", platform=to_platform)
-    if burn > 0:
-        await ledger_entry(conn, user_id, "put", -burn, "transfer_burn")
-        await conn.execute("UPDATE wallets SET put_balance = put_balance - $1 WHERE user_id = $2", burn, user_id)
-    return True
-
-async def daily_refill(conn, user_id: str, tier: str):
-    ent = get_entitlements_for_tier(tier)
-    daily = ent.put_daily * 4  # 4 platforms
-    wallet = await get_wallet(conn, user_id)
-    last_refill = wallet.get("last_refill_date")
-    today = _now_utc().date()
-    if last_refill and last_refill >= today:
-        return
-    monthly_cap = ent.put_monthly
-    current = wallet["put_balance"]
-    if current < monthly_cap:
-        add = min(daily, monthly_cap - current)
-        await conn.execute("UPDATE wallets SET put_balance = put_balance + $1, last_refill_date = $2 WHERE user_id = $3", add, today, user_id)
-        await ledger_entry(conn, user_id, "put", add, "daily_refill")
-
-
-
 @app.get("/api/scheduled")
 async def get_scheduled(user: dict = Depends(get_current_user)):
     """Get scheduled uploads (scheduled + smart modes, all pending statuses)"""
@@ -3937,9 +4831,8 @@ async def get_scheduled(user: dict = Depends(get_current_user)):
         uploads = await conn.fetch("""
             SELECT * FROM uploads
             WHERE user_id = $1
-              AND schedule_mode IN ('scheduled', 'smart')
               AND status IN ('pending', 'queued', 'scheduled', 'staged', 'ready_to_publish')
-            ORDER BY scheduled_time ASC
+            ORDER BY scheduled_time ASC NULLS LAST, created_at ASC
         """, user["id"])
     return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "schedule_mode": u["schedule_mode"]} for u in uploads]
 
@@ -4098,7 +4991,11 @@ async def presign_thumbnail_upload(upload_id: str, user: dict = Depends(get_curr
 
 
 @app.post("/api/uploads/{upload_id}/sync-analytics")
-async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current_user)):
+async def sync_upload_analytics(
+    upload_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
     """
     Fetch latest engagement stats for a single completed upload from platform APIs.
     Uses the video IDs stored in platform_results to query per-video metrics.
@@ -4129,14 +5026,15 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
         if pr.get("platform_url") and not pr.get("url"):
             pr["url"] = pr["platform_url"]
 
-    # Get tokens for all connected platforms
+    # Get tokens for all connected platforms (include id for multi-account lookup)
     async with db_pool.acquire() as conn:
         token_rows = await conn.fetch(
-            "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            "SELECT id, platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
             user["id"],
         )
 
-    token_map = {}
+    token_map_by_id = {}
+    token_map_by_platform = {}
     for tr in token_rows:
         try:
             dec = decrypt_blob(tr["token_blob"])
@@ -4145,9 +5043,46 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
                     dec["ig_user_id"] = str(tr["account_id"])
                 if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
                     dec["page_id"] = str(tr["account_id"])
-                token_map[tr["platform"]] = dec
+                token_id = str(tr["id"])
+                token_map_by_id[token_id] = dec
+                token_map_by_platform[tr["platform"]] = dec
         except Exception:
             pass
+
+    # Refresh OAuth tokens so per-video queries succeed (YouTube ~1h TTL; TikTok refresh_token).
+    uid_str = str(user["id"])
+    try:
+        from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
+
+        if token_map_by_platform.get("tiktok"):
+            token_map_by_platform["tiktok"] = await _refresh_tiktok_token(
+                dict(token_map_by_platform["tiktok"]), db_pool=db_pool, user_id=uid_str
+            )
+        if token_map_by_platform.get("youtube"):
+            token_map_by_platform["youtube"] = await _refresh_youtube_token(
+                dict(token_map_by_platform["youtube"]), db_pool=db_pool, user_id=uid_str
+            )
+        async with db_pool.acquire() as conn:
+            trs = await conn.fetch(
+                "SELECT id, platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+                user["id"],
+            )
+        token_map_by_id = {}
+        token_map_by_platform = {}
+        for tr in trs:
+            try:
+                dec = decrypt_blob(tr["token_blob"])
+                if dec:
+                    if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
+                        dec["ig_user_id"] = str(tr["account_id"])
+                    if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
+                        dec["page_id"] = str(tr["account_id"])
+                    token_map_by_id[str(tr["id"])] = dec
+                    token_map_by_platform[tr["platform"]] = dec
+            except Exception:
+                pass
+    except Exception as _sync_ref_e:
+        logger.warning(f"sync-analytics OAuth refresh: {_sync_ref_e}")
 
     total_views = total_likes = total_comments = total_shares = 0
     platform_stats = {}
@@ -4159,7 +5094,11 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
             if not ok:
                 continue
 
-            tok = token_map.get(plat, {})
+            # Multi-account: use token for this specific account; fallback to platform
+            account_id = pr.get("account_id")
+            tok = token_map_by_id.get(str(account_id), {}) if account_id else {}
+            if not tok:
+                tok = token_map_by_platform.get(plat, {})
             access_token = tok.get("access_token", "")
             if not access_token:
                 continue
@@ -4174,14 +5113,22 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
 
             try:
                 if plat == "tiktok" and video_id:
+                    from services.tiktok_api import tiktok_envelope_error, tiktok_video_query_url
+
+                    qurl = tiktok_video_query_url()
                     resp = await client.post(
-                        "https://open.tiktokapis.com/v2/video/query/",
+                        qurl,
                         headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                        params={"fields": "id,view_count,like_count,comment_count,share_count"},
                         json={"filters": {"video_ids": [str(video_id)]}},
                     )
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = {}
+                    if tiktok_envelope_error(body):
+                        continue
                     if resp.status_code == 200:
-                        vids = resp.json().get("data", {}).get("videos", []) or []
+                        vids = body.get("data", {}).get("videos", []) or []
                         if vids:
                             v = vids[0]
                             s = {"views": int(v.get("view_count") or 0), "likes": int(v.get("like_count") or 0),
@@ -4267,6 +5214,16 @@ async def sync_upload_analytics(upload_id: str, user: dict = Depends(get_current
             upload_id, user["id"],
         )
 
+    async def _refresh_account_platform_cache():
+        try:
+            from services.platform_metrics_job import refresh_platform_metrics_for_user
+
+            await refresh_platform_metrics_for_user(db_pool, user["id"])
+        except Exception as ex:
+            logger.warning(f"post-sync platform_metrics_cache refresh: {ex}")
+
+    background_tasks.add_task(_refresh_account_platform_cache)
+
     return {
         "synced": True,
         "views": total_views, "likes": total_likes,
@@ -4295,126 +5252,128 @@ async def delete_upload(upload_id: str, request: Request, user: dict = Depends(g
 # ============================================================
 @app.get("/api/scheduled/stats")
 async def get_scheduled_stats(user: dict = Depends(get_current_user)):
-    """Get scheduled upload statistics for the current user"""
+    """Get scheduled upload statistics for the current user."""
+    cache_key = f"sched_stats:{user['id']}"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
     async with db_pool.acquire() as conn:
         now = _now_utc()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=1)
         week_end = now + timedelta(days=7)
-        
-        # Count pending uploads
+
         pending_count = await conn.fetchval("""
-            SELECT COUNT(*) FROM uploads 
-            WHERE user_id = $1 
-            AND scheduled_time IS NOT NULL 
-            AND scheduled_time > $2
-            AND status IN ('pending', 'scheduled', 'queued')
+            SELECT COUNT(*) FROM uploads
+            WHERE user_id = $1
+              AND scheduled_time IS NOT NULL
+              AND scheduled_time > $2
+              AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
         """, user["id"], now)
-        
-        # Count uploads today
+
         today_count = await conn.fetchval("""
-            SELECT COUNT(*) FROM uploads 
-            WHERE user_id = $1 
-            AND scheduled_time >= $2 
-            AND scheduled_time < $3
-            AND status IN ('pending', 'scheduled', 'queued')
+            SELECT COUNT(*) FROM uploads
+            WHERE user_id = $1
+              AND scheduled_time >= $2
+              AND scheduled_time < $3
+              AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
         """, user["id"], today_start, today_end)
-        
-        # Count uploads this week
+
         week_count = await conn.fetchval("""
-            SELECT COUNT(*) FROM uploads 
-            WHERE user_id = $1 
-            AND scheduled_time >= $2 
-            AND scheduled_time < $3
-            AND status IN ('pending', 'scheduled', 'queued')
+            SELECT COUNT(*) FROM uploads
+            WHERE user_id = $1
+              AND scheduled_time >= $2
+              AND scheduled_time < $3
+              AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
         """, user["id"], now, week_end)
-        
-    return {
+
+    result = {
         "pending": pending_count or 0,
         "today": today_count or 0,
-        "week": week_count or 0
+        "week": week_count or 0,
     }
+    await cache_set(cache_key, result, CACHE_TTL_SHORT)
+    return result
 
 @app.get("/api/scheduled/list")
 async def get_scheduled_list(user: dict = Depends(get_current_user)):
-    """Get list of all scheduled uploads for the current user"""
-    async with db_pool.acquire() as conn:
-        now = _now_utc()
-        
-        uploads = await conn.fetch("""
-            SELECT 
-                id, title, scheduled_time, platforms, target_accounts,
-                thumbnail_r2_key, caption, status, 
-                created_at, timezone, schedule_mode, schedule_metadata
-            FROM uploads 
-            WHERE user_id = $1 
-            AND scheduled_time IS NOT NULL 
-            AND scheduled_time > $2
-            AND schedule_mode IN ('scheduled', 'smart')
-            AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
-            ORDER BY scheduled_time ASC
-        """, user["id"], now)
-        
-    result = []
-    for upload in uploads:
-        thumbnail_url = None
-        if upload["thumbnail_r2_key"]:
-            # Generate presigned URL for thumbnail
-            try:
-                s3 = get_s3_client()
-                thumbnail_url = s3.generate_presigned_url(
-                    'get_object',
-                    Params={'Bucket': R2_BUCKET_NAME, 'Key': upload["thumbnail_r2_key"]},
-                    ExpiresIn=3600
-                )
-            except:
-                pass
-        
-        # Parse smart schedule metadata for per-platform times
-        smart_schedule = None
-        try:
-            sm = upload["schedule_metadata"]
-            if sm and upload["schedule_mode"] == "smart":
-                smart_schedule = sm if isinstance(sm, dict) else json.loads(sm)
-        except Exception:
-            pass
+    """Get list of all scheduled uploads for the current user."""
+    try:
+        async with db_pool.acquire() as conn:
+            uploads = await conn.fetch("""
+                SELECT
+                    id, filename, title, scheduled_time, platforms, target_accounts,
+                    thumbnail_r2_key, caption, status,
+                    created_at, timezone, schedule_mode, schedule_metadata
+                FROM uploads
+                WHERE user_id = $1
+                  AND status IN ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish')
+                ORDER BY scheduled_time ASC NULLS LAST, created_at ASC
+            """, user["id"])
 
-        target_ids = [str(x) for x in (upload.get("target_accounts") or []) if x]
-        target_account_details = []
-        if target_ids:
-            rows = await conn.fetch(
-                """SELECT id, platform, account_name, account_username, account_avatar
-                   FROM platform_tokens
-                   WHERE user_id = $1 AND id = ANY($2::uuid[]) AND revoked_at IS NULL""",
-                user["id"], target_ids
-            )
-            for r in rows:
-                target_account_details.append({
-                    "id": str(r["id"]),
-                    "platform": r["platform"],
-                    "name": r["account_name"] or "",
-                    "username": r["account_username"] or "",
-                    "avatar": r["account_avatar"] or "",
+            result = []
+            for upload in uploads:
+                thumbnail_url = None
+                if upload["thumbnail_r2_key"]:
+                    try:
+                        s3 = get_s3_client()
+                        thumbnail_url = s3.generate_presigned_url(
+                            'get_object',
+                            Params={'Bucket': R2_BUCKET_NAME, 'Key': _normalize_r2_key(upload["thumbnail_r2_key"])},
+                            ExpiresIn=3600
+                        )
+                    except Exception:
+                        pass
+
+                smart_schedule = None
+                try:
+                    sm = upload["schedule_metadata"]
+                    if sm and upload["schedule_mode"] == "smart":
+                        smart_schedule = sm if isinstance(sm, dict) else json.loads(sm)
+                except Exception:
+                    pass
+
+                target_ids = [str(x) for x in (upload.get("target_accounts") or []) if x]
+                target_account_details = []
+                if target_ids:
+                    rows = await conn.fetch(
+                        """SELECT id, platform, account_name, account_username, account_avatar
+                           FROM platform_tokens
+                           WHERE user_id = $1 AND id = ANY($2::uuid[]) AND revoked_at IS NULL""",
+                        user["id"], target_ids
+                    )
+                    for r in rows:
+                        target_account_details.append({
+                            "id": str(r["id"]),
+                            "platform": r["platform"],
+                            "name": r["account_name"] or "",
+                            "username": r["account_username"] or "",
+                            "avatar": _platform_account_avatar_to_url(r["account_avatar"]) or "",
+                        })
+
+                result.append({
+                    "id": str(upload["id"]),
+                    "filename": upload.get("filename") or "",
+                    "title": upload["title"] or "Untitled",
+                    "scheduled_time": upload["scheduled_time"].isoformat() if upload["scheduled_time"] else None,
+                    "timezone": upload["timezone"] or "UTC",
+                    "platforms": list(upload["platforms"]) if upload["platforms"] else [],
+                    "target_accounts": target_ids,
+                    "target_account_details": target_account_details,
+                    "thumbnail": thumbnail_url,
+                    "caption": upload["caption"],
+                    "status": upload["status"],
+                    "schedule_mode": upload["schedule_mode"] or "scheduled",
+                    "smart_schedule": smart_schedule,
+                    "is_editable": upload["status"] in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
+                    "created_at": upload["created_at"].isoformat() if upload["created_at"] else None
                 })
 
-        result.append({
-            "id": str(upload["id"]),
-            "title": upload["title"] or "Untitled",
-            "scheduled_time": upload["scheduled_time"].isoformat() if upload["scheduled_time"] else None,
-            "timezone": upload["timezone"] or "UTC",
-            "platforms": list(upload["platforms"]) if upload["platforms"] else [],
-            "target_accounts": target_ids,
-            "target_account_details": target_account_details,
-            "thumbnail": thumbnail_url,
-            "caption": upload["caption"],
-            "status": upload["status"],
-            "schedule_mode": upload["schedule_mode"] or "scheduled",
-            "smart_schedule": smart_schedule,
-            "is_editable": upload["status"] in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
-            "created_at": upload["created_at"].isoformat() if upload["created_at"] else None
-        })
-    
-    return result
+        return result
+    except Exception as _ex:
+        logger.exception("GET /api/scheduled/list failed")
+        raise HTTPException(500, f"Scheduled list error: {_ex!s}")
 
 @app.get("/api/scheduled/{upload_id}")
 async def get_scheduled_upload(upload_id: str, user: dict = Depends(get_current_user)):
@@ -4438,10 +5397,10 @@ async def get_scheduled_upload(upload_id: str, user: dict = Depends(get_current_
                 s3 = get_s3_client()
                 thumbnail_url = s3.generate_presigned_url(
                     'get_object',
-                    Params={'Bucket': R2_BUCKET_NAME, 'Key': upload["thumbnail_r2_key"]},
+                    Params={'Bucket': R2_BUCKET_NAME, 'Key': _normalize_r2_key(upload["thumbnail_r2_key"])},
                     ExpiresIn=3600
                 )
-            except:
+            except Exception:
                 pass
 
         sm = upload.get("schedule_metadata")
@@ -4617,7 +5576,8 @@ async def cancel_scheduled_upload(upload_id: str, user: dict = Depends(get_curre
         if not upload:
             raise HTTPException(404, "Scheduled upload not found")
         
-        if upload["status"] not in ['pending', 'scheduled', 'queued']:
+        # Allow cancel for all pending/scheduled states shown on scheduled page
+        if upload["status"] not in ('pending', 'scheduled', 'queued', 'staged', 'ready_to_publish'):
             raise HTTPException(400, "Cannot cancel upload that is already processing or completed")
         
         # Refund reserved tokens if any
@@ -4793,88 +5753,153 @@ async def update_color_preferences(
 # Account Groups
 # ============================================================
 
+_DEBUG_LOG_PATH = pathlib.Path(__file__).resolve().parent / "debug-0d13f7.log"
+
+def _dbg_write(msg: str, data: dict = None, hid: str = "H3"):
+    try:
+        import json as _j
+        line = _j.dumps({"sessionId":"0d13f7","hypothesisId":hid,"location":"app.py:get_user_preferences","message":msg,"data":data or {},"timestamp":__import__("time").time()*1000}) + "\n"
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
 @app.get("/api/settings/preferences")
 async def get_user_preferences(user: dict = Depends(get_current_user)):
     """GET user content preferences - used by settings page AND upload workflow"""
-    async with db_pool.acquire() as conn:
-        prefs = await conn.fetchrow(
-            "SELECT * FROM user_preferences WHERE user_id = $1",
-            user["id"]
-        )
-
-        if not prefs:
-            await conn.execute("INSERT INTO user_preferences (user_id) VALUES ($1)", user["id"])
-            prefs = await conn.fetchrow(
-                "SELECT * FROM user_preferences WHERE user_id = $1",
-                user["id"]
-            )
-
-        d = dict(prefs) if prefs else {}
-        
-        # Ensure arrays are properly formatted as lists
-        always_tags = d.get("always_hashtags")
-        blocked_tags = d.get("blocked_hashtags")
-        platform_tags = d.get("platform_hashtags")
-        
-        # DEBUG: Log what we loaded from database
-        logger.info(f"Loading preferences for user {user['id']}")
-        logger.info(f"always_hashtags from DB: {always_tags} (type: {type(always_tags)})")
-        logger.info(f"blocked_hashtags from DB: {blocked_tags} (type: {type(blocked_tags)})")
-        
-        # Parse JSON strings if needed (JSONB might come back as strings)
-        if isinstance(always_tags, str):
+    # #region agent log
+    _dbg_write("get_user_preferences ENTRY", {"user_id": str(user.get("id"))})
+    # #endregion
+    try:
+        async with db_pool.acquire() as conn:
+            # #region agent log
+            _dbg_write("Before SELECT user_preferences")
+            # #endregion
             try:
-                always_tags = json.loads(always_tags)
-            except:
-                always_tags = []
-        if isinstance(blocked_tags, str):
-            try:
-                blocked_tags = json.loads(blocked_tags)
-            except:
-                blocked_tags = []
-        if isinstance(platform_tags, str):
-            try:
-                platform_tags = json.loads(platform_tags)
-            except:
-                platform_tags = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+                prefs = await conn.fetchrow(
+                    "SELECT * FROM user_preferences WHERE user_id = $1",
+                    user["id"]
+                )
+            except Exception as e1:
+                _dbg_write("user_preferences SELECT failed", {"error": str(e1), "type": type(e1).__name__})
+                prefs = None  # fall through to INSERT-on-demand
 
-        out = {
-            "autoCaptions": d.get("auto_captions", False),
-            "autoThumbnails": d.get("auto_thumbnails", False),
-            "thumbnailInterval": str(d.get("thumbnail_interval", 5)),
-            "defaultPrivacy": d.get("default_privacy", "public"),
-            "aiHashtagsEnabled": d.get("ai_hashtags_enabled", False),
-            "aiHashtagCount": str(d.get("ai_hashtag_count", 5)),
-            "aiHashtagStyle": d.get("ai_hashtag_style", "mixed"),
-            "hashtagPosition": d.get("hashtag_position", "end"),
-            "maxHashtags": str(d.get("max_hashtags", 15)),
-            "alwaysHashtags": always_tags or [],
-            "blockedHashtags": blocked_tags or [],
-            "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
-            "emailNotifications": d.get("email_notifications", True),
-            "discordWebhook": d.get("discord_webhook"),
-            "trillEnabled": bool(d.get("trill_enabled", False)),
-            "trillMinScore": int(d.get("trill_min_score", 0) or 0),
-            "trillHudEnabled": bool(d.get("trill_hud_enabled", False)),
-            "trillAiEnhance": bool(d.get("trill_ai_enhance", False)),
-            "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
-            "styledThumbnails": d.get("styled_thumbnails", True),
-        }
-        # Caption & AI fields live in users.preferences (worker reads from there)
-        users_prefs = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user["id"])
-        if users_prefs:
-            up = json.loads(users_prefs) if isinstance(users_prefs, str) else (users_prefs or {})
-            if isinstance(up, dict):
+            if not prefs:
+                await conn.execute("INSERT INTO user_preferences (user_id) VALUES ($1)", user["id"])
+                prefs = await conn.fetchrow(
+                    "SELECT * FROM user_preferences WHERE user_id = $1",
+                    user["id"]
+                )
+
+            d = dict(prefs) if prefs else {}
+        
+            # Ensure arrays are properly formatted as lists
+            always_tags = d.get("always_hashtags")
+            blocked_tags = d.get("blocked_hashtags")
+            platform_tags = d.get("platform_hashtags")
+        
+            # DEBUG: Log what we loaded from database
+            logger.info(f"Loading preferences for user {user['id']}")
+            logger.info(f"always_hashtags from DB: {always_tags} (type: {type(always_tags)})")
+            logger.info(f"blocked_hashtags from DB: {blocked_tags} (type: {type(blocked_tags)})")
+        
+            # Parse JSON strings if needed (JSONB might come back as strings)
+            if isinstance(always_tags, str):
+                try:
+                    always_tags = json.loads(always_tags)
+                except Exception:
+                    always_tags = []
+            if isinstance(blocked_tags, str):
+                try:
+                    blocked_tags = json.loads(blocked_tags)
+                except Exception:
+                    blocked_tags = []
+            if isinstance(platform_tags, str):
+                try:
+                    platform_tags = json.loads(platform_tags)
+                except Exception:
+                    platform_tags = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+
+            out = {
+                "autoCaptions": d.get("auto_captions", False),
+                "autoThumbnails": d.get("auto_thumbnails", False),
+                "thumbnailInterval": str(d.get("thumbnail_interval", 5)),
+                "defaultPrivacy": d.get("default_privacy", "public"),
+                "aiHashtagsEnabled": d.get("ai_hashtags_enabled", False),
+                "aiHashtagCount": str(d.get("ai_hashtag_count", 5)),
+                "aiHashtagStyle": d.get("ai_hashtag_style", "mixed"),
+                "hashtagPosition": d.get("hashtag_position", "end"),
+                "maxHashtags": str(d.get("max_hashtags", 15)),
+                "alwaysHashtags": always_tags or [],
+                "blockedHashtags": blocked_tags or [],
+                "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
+                "emailNotifications": d.get("email_notifications", True),
+                "discordWebhook": d.get("discord_webhook"),
+                "trillEnabled": bool(d.get("trill_enabled", False)),
+                "trillMinScore": int(d.get("trill_min_score", 0) or 0),
+                "trillHudEnabled": bool(d.get("trill_hud_enabled", False)),
+                "trillAiEnhance": bool(d.get("trill_ai_enhance", False)),
+                "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
+                "styledThumbnails": d.get("styled_thumbnails", True),
+                "useAudioContext": bool(d.get("use_audio_context", True)),
+            }
+            # #region agent log
+            _dbg_write("Before SELECT users.preferences")
+            # #endregion
+            # Overlay users.preferences — source of truth for hashtags + caption (PUT /api/me/preferences)
+            users_prefs = None
+            try:
+                users_prefs = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user["id"])
+            except Exception as col_err:
+                _dbg_write("users.preferences SELECT failed (column may not exist)", {"error": str(col_err)})
+            # #region agent log
+            _dbg_write("After SELECT users.preferences", {"has_prefs": users_prefs is not None})
+            # #endregion
+            up = _parse_users_preferences(users_prefs) if users_prefs else {}
+            if up:
+                if up.get("alwaysHashtags") is not None or up.get("always_hashtags") is not None:
+                    v = up.get("alwaysHashtags") or up.get("always_hashtags")
+                    out["alwaysHashtags"] = v if isinstance(v, list) else []
+                if up.get("blockedHashtags") is not None or up.get("blocked_hashtags") is not None:
+                    v = up.get("blockedHashtags") or up.get("blocked_hashtags")
+                    out["blockedHashtags"] = v if isinstance(v, list) else []
+                if up.get("platformHashtags") is not None or up.get("platform_hashtags") is not None:
+                    v = up.get("platformHashtags") or up.get("platform_hashtags")
+                    out["platformHashtags"] = v if isinstance(v, dict) else {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+                if up.get("maxHashtags") is not None or up.get("max_hashtags") is not None:
+                    out["maxHashtags"] = str(up.get("maxHashtags") or up.get("max_hashtags") or 15)
+                if up.get("aiHashtagCount") is not None or up.get("ai_hashtag_count") is not None:
+                    out["aiHashtagCount"] = str(up.get("aiHashtagCount") or up.get("ai_hashtag_count") or 5)
                 out["captionStyle"] = up.get("captionStyle") or up.get("caption_style") or "story"
                 out["captionTone"] = up.get("captionTone") or up.get("caption_tone") or "authentic"
                 out["captionVoice"] = up.get("captionVoice") or up.get("caption_voice") or "default"
                 out["captionFrameCount"] = up.get("captionFrameCount") or up.get("caption_frame_count") or 6
-        else:
-            out.setdefault("captionStyle", "story")
-            out.setdefault("captionTone", "authentic")
-            out.setdefault("captionVoice", "default")
-            out.setdefault("captionFrameCount", 6)
-        return out
+                if up.get("useAudioContext") is not None or up.get("use_audio_context") is not None:
+                    out["useAudioContext"] = bool(up.get("useAudioContext", up.get("use_audio_context", True)))
+            else:
+                out.setdefault("captionStyle", "story")
+                out.setdefault("captionTone", "authentic")
+                out.setdefault("captionVoice", "default")
+                out.setdefault("captionFrameCount", 6)
+            return out
+    except Exception as e:
+        # #region agent log
+        _dbg_write("get_user_preferences EXCEPTION", {"error": str(e), "type": type(e).__name__})
+        # #endregion
+        logger.exception("get_user_preferences failed: %s", e)
+        # Return defaults so settings page loads; avoid 500 when DB schema mismatch or migration not run
+        return {
+            "autoCaptions": False, "autoThumbnails": False, "thumbnailInterval": "5",
+            "defaultPrivacy": "public", "aiHashtagsEnabled": False, "aiHashtagCount": "5",
+            "aiHashtagStyle": "mixed", "hashtagPosition": "end", "maxHashtags": "15",
+            "alwaysHashtags": [], "blockedHashtags": [],
+            "platformHashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
+            "emailNotifications": True, "discordWebhook": None,
+            "trillEnabled": False, "trillMinScore": 60, "trillHudEnabled": False,
+            "trillAiEnhance": True, "trillOpenaiModel": "gpt-4o-mini", "styledThumbnails": True,
+            "captionStyle": "story", "captionTone": "authentic", "captionVoice": "default", "captionFrameCount": 6,
+            "useAudioContext": True,
+        }
 
 @app.post("/api/settings/preferences")
 async def save_user_preferences(
@@ -4889,6 +5914,12 @@ async def save_user_preferences(
     - DB stores snake_case columns in user_preferences.
     - JSON columns are stored as jsonb (always_hashtags, blocked_hashtags, platform_hashtags).
     """
+    # #region agent log
+    try:
+        import json as _dj, time as _dt, pathlib as _dp
+        _dp.Path("debug-2656c2.log").open("a").write(_dj.dumps({"sessionId":"2656c2","hypothesisId":"SAVE-ENTRY","location":"app.py:save_user_preferences","message":"save_user_preferences called","data":{"user_id":str(user.get("id")),"payload_keys":list(payload.keys())[:30]},"timestamp":int(_dt.time()*1000)})+"\n")
+    except Exception: pass
+    # #endregion
 
     CAMEL_TO_SNAKE = {
         "autoCaptions": "auto_captions",
@@ -4915,6 +5946,7 @@ async def save_user_preferences(
         "captionTone": "caption_tone",
         "captionVoice": "caption_voice",
         "captionFrameCount": "caption_frame_count",
+        "useAudioContext": "use_audio_context",
     }
 
     def normalize_prefs_payload(p: dict) -> dict:
@@ -5024,12 +6056,32 @@ async def save_user_preferences(
     email_notifications = bool(p.get("email_notifications", True))
     discord_webhook = p.get("discord_webhook")
 
-    async with db_pool.acquire() as conn:
+    # Trill fields (user_preferences)
+    trill_enabled = bool(p.get("trill_enabled", False))
+    try:
+        trill_min_score = int(p.get("trill_min_score", 60))
+        trill_min_score = max(0, min(100, trill_min_score))
+    except (TypeError, ValueError):
+        trill_min_score = 60
+    trill_hud_enabled = bool(p.get("trill_hud_enabled", False))
+    trill_ai_enhance = bool(p.get("trill_ai_enhance", True))
+    trill_openai_model = str(p.get("trill_openai_model", "gpt-4o-mini") or "gpt-4o-mini")[:50]
+    use_audio_context = bool(p.get("useAudioContext", p.get("use_audio_context", True)))
+
+    try:
+      async with db_pool.acquire() as conn:
         # ensure row exists
         await conn.execute(
             "INSERT INTO user_preferences (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
             user["id"],
         )
+
+        # #region agent log
+        try:
+            import json as _dj2, time as _dt2
+            open("debug-2656c2.log","a").write(_dj2.dumps({"sessionId":"2656c2","hypothesisId":"SAVE-PRE-UPDATE","location":"app.py:save_prefs_update","message":"about to UPDATE user_preferences","data":{"user_id":str(user.get("id")),"auto_captions":auto_captions,"styled_thumbnails":styled_thumbnails,"trill_enabled":trill_enabled,"always_len":len(always),"blocked_len":len(blocked),"platform_keys":list(platform.keys())},"timestamp":int(_dt2.time()*1000)})+"\n")
+        except Exception: pass
+        # #endregion
 
         await conn.execute(
             """
@@ -5049,8 +6101,14 @@ async def save_user_preferences(
                 platform_hashtags = $13::jsonb,
                 email_notifications = $14,
                 discord_webhook = $15,
+                trill_enabled = $16,
+                trill_min_score = $17,
+                trill_hud_enabled = $18,
+                trill_ai_enhance = $19,
+                trill_openai_model = $20,
+                use_audio_context = $21,
                 updated_at = NOW()
-            WHERE user_id = $16
+            WHERE user_id = $22
             """,
             auto_captions,
             auto_thumbnails,
@@ -5062,13 +6120,25 @@ async def save_user_preferences(
             ai_hashtag_style,
             hashtag_position,
             max_hashtags,
-            json.dumps(always),  # Always use json.dumps for JSONB
-            json.dumps(blocked),  # Always use json.dumps for JSONB
-            json.dumps(platform),  # Always use json.dumps for JSONB
+            json.dumps(always),
+            json.dumps(blocked),
+            json.dumps(platform),
             email_notifications,
             discord_webhook,
+            trill_enabled,
+            trill_min_score,
+            trill_hud_enabled,
+            trill_ai_enhance,
+            trill_openai_model,
+            use_audio_context,
             user["id"],
         )
+
+        # #region agent log
+        try:
+            open("debug-2656c2.log","a").write(_dj2.dumps({"sessionId":"2656c2","hypothesisId":"SAVE-POST-UPDATE","location":"app.py:save_prefs_update","message":"UPDATE user_preferences succeeded","timestamp":int(_dt2.time()*1000)})+"\n")
+        except Exception: pass
+        # #endregion
 
         # Sync discord_webhook to user_settings so worker (load_user_settings) gets it
         await conn.execute(
@@ -5084,36 +6154,41 @@ async def save_user_preferences(
         caption_keys = ("captionStyle", "captionTone", "captionVoice", "captionFrameCount")
         caption_snake = ("caption_style", "caption_tone", "caption_voice", "caption_frame_count")
         if any(k in p or sk in p for k, sk in zip(caption_keys, caption_snake)):
-            _CAPTION_STYLES = ("story", "punchy", "factual")
-            _CAPTION_TONES = ("hype", "calm", "cinematic", "authentic")
-            _CAPTION_VOICES = ("default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator")
-            users_prefs_row = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user["id"])
-            users_prefs = {}
-            if users_prefs_row:
-                users_prefs = json.loads(users_prefs_row) if isinstance(users_prefs_row, str) else (users_prefs_row or {})
-            if not isinstance(users_prefs, dict):
+            try:
+                _CAPTION_STYLES = ("story", "punchy", "factual")
+                _CAPTION_TONES = ("hype", "calm", "cinematic", "authentic")
+                _CAPTION_VOICES = ("default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator")
+                users_prefs_row = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user["id"])
                 users_prefs = {}
-            if "captionStyle" in p or "caption_style" in p:
-                v = str(p.get("captionStyle") or p.get("caption_style") or "story").strip().lower()
-                users_prefs["captionStyle"] = users_prefs["caption_style"] = v if v in _CAPTION_STYLES else "story"
-            if "captionTone" in p or "caption_tone" in p:
-                v = str(p.get("captionTone") or p.get("caption_tone") or "authentic").strip().lower()
-                users_prefs["captionTone"] = users_prefs["caption_tone"] = v if v in _CAPTION_TONES else "authentic"
-            if "captionVoice" in p or "caption_voice" in p:
-                v = str(p.get("captionVoice") or p.get("caption_voice") or "default").strip().lower()
-                users_prefs["captionVoice"] = users_prefs["caption_voice"] = v if v in _CAPTION_VOICES else "default"
-            if "captionFrameCount" in p or "caption_frame_count" in p:
-                try:
-                    v = int(p.get("captionFrameCount") or p.get("caption_frame_count") or 6)
-                    v = max(2, min(v, 12))
-                    users_prefs["captionFrameCount"] = users_prefs["caption_frame_count"] = v
-                except (TypeError, ValueError):
-                    users_prefs["captionFrameCount"] = users_prefs["caption_frame_count"] = 6
-            await conn.execute(
-                "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
-                json.dumps(users_prefs),
-                user["id"],
-            )
+                if users_prefs_row:
+                    users_prefs = json.loads(users_prefs_row) if isinstance(users_prefs_row, str) else (users_prefs_row or {})
+                if not isinstance(users_prefs, dict):
+                    users_prefs = {}
+                if "captionStyle" in p or "caption_style" in p:
+                    v = str(p.get("captionStyle") or p.get("caption_style") or "story").strip().lower()
+                    users_prefs["captionStyle"] = users_prefs["caption_style"] = v if v in _CAPTION_STYLES else "story"
+                if "captionTone" in p or "caption_tone" in p:
+                    v = str(p.get("captionTone") or p.get("caption_tone") or "authentic").strip().lower()
+                    users_prefs["captionTone"] = users_prefs["caption_tone"] = v if v in _CAPTION_TONES else "authentic"
+                if "captionVoice" in p or "caption_voice" in p:
+                    v = str(p.get("captionVoice") or p.get("caption_voice") or "default").strip().lower()
+                    users_prefs["captionVoice"] = users_prefs["caption_voice"] = v if v in _CAPTION_VOICES else "default"
+                if "captionFrameCount" in p or "caption_frame_count" in p:
+                    try:
+                        ent = get_entitlements_for_tier(user.get("subscription_tier", "free"))
+                        max_frames = ent.max_caption_frames or 20
+                        v = int(p.get("captionFrameCount") or p.get("caption_frame_count") or 6)
+                        v = max(2, min(v, max_frames))
+                        users_prefs["captionFrameCount"] = users_prefs["caption_frame_count"] = v
+                    except (TypeError, ValueError):
+                        users_prefs["captionFrameCount"] = users_prefs["caption_frame_count"] = 6
+                await conn.execute(
+                    "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
+                    json.dumps(users_prefs),
+                    user["id"],
+                )
+            except Exception as _cap_err:
+                logger.warning(f"Caption sync to users.preferences failed (column may not exist): {_cap_err}")
 
         # immediate read-after-write to validate persistence (helps front-end debugging)
         row = await conn.fetchrow(
@@ -5121,7 +6196,38 @@ async def save_user_preferences(
             user["id"],
         )
 
-    return {"ok": True, "updatedAt": (row["updated_at"].isoformat() if row and row.get("updated_at") else None)}
+        # #region agent log
+        try:
+            open("debug-2656c2.log","a").write(_dj2.dumps({"sessionId":"2656c2","hypothesisId":"SAVE-COMPLETE","location":"app.py:save_prefs","message":"save complete","data":{"updated_at":str(row["updated_at"]) if row else None},"timestamp":int(_dt2.time()*1000)})+"\n")
+        except Exception: pass
+        # #endregion
+
+      return {"ok": True, "updatedAt": (row["updated_at"].isoformat() if row and row.get("updated_at") else None)}
+    except Exception as _save_err:
+        import traceback
+        logger.error(f"save_user_preferences UPDATE failed: {type(_save_err).__name__}: {_save_err}\n{traceback.format_exc()[-800:]}")
+        # Retry without trill columns (handles pre-migration schemas)
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """UPDATE user_preferences SET
+                        auto_captions=$1, auto_thumbnails=$2, thumbnail_interval=$3,
+                        default_privacy=$4, ai_hashtags_enabled=$5, ai_hashtag_count=$6,
+                        ai_hashtag_style=$7, hashtag_position=$8, max_hashtags=$9,
+                        always_hashtags=$10::jsonb, blocked_hashtags=$11::jsonb,
+                        platform_hashtags=$12::jsonb, email_notifications=$13,
+                        discord_webhook=$14, updated_at=NOW()
+                       WHERE user_id=$15""",
+                    auto_captions, auto_thumbnails, thumbnail_interval, default_privacy,
+                    ai_hashtags_enabled, ai_hashtag_count, ai_hashtag_style, hashtag_position,
+                    max_hashtags, json.dumps(always), json.dumps(blocked), json.dumps(platform),
+                    email_notifications, discord_webhook, user["id"],
+                )
+                row = await conn.fetchrow("SELECT updated_at FROM user_preferences WHERE user_id=$1", user["id"])
+            return {"ok": True, "updatedAt": (row["updated_at"].isoformat() if row and row.get("updated_at") else None)}
+        except Exception as _retry_err:
+            logger.error(f"save_user_preferences retry also failed: {_retry_err}")
+            raise HTTPException(500, f"Could not save preferences: {type(_retry_err).__name__}")
 
 
 
@@ -5133,12 +6239,52 @@ async def save_user_preferences_put(
     """Backward-compatible alias for clients that still call PUT"""
     return await save_user_preferences(prefs.model_dump(by_alias=True), user)
 
+def _parse_users_preferences(raw) -> dict:
+    """Parse users.preferences JSONB into a dict."""
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw) or {}
+        except Exception:
+            return {}
+    return dict(raw) if hasattr(raw, "keys") else {}
+
+
+def _overlay_users_prefs_on_result(result: dict, up: dict) -> None:
+    """Overlay users.preferences onto result. users.preferences wins for all fields."""
+    if not isinstance(up, dict) or not up:
+        return
+    # Hashtag fields
+    for camel, snake, key in [
+        ("alwaysHashtags", "always_hashtags", "always_hashtags"),
+        ("blockedHashtags", "blocked_hashtags", "blocked_hashtags"),
+        ("platformHashtags", "platform_hashtags", "platform_hashtags"),
+    ]:
+        v = up.get(camel) if up.get(camel) is not None else up.get(snake)
+        if v is not None:
+            result[camel] = result[key] = v
+    # Scalar prefs from users.preferences
+    for camel, snake in [
+        ("maxHashtags", "max_hashtags"), ("aiHashtagCount", "ai_hashtag_count"),
+        ("aiHashtagsEnabled", "ai_hashtags_enabled"), ("captionStyle", "caption_style"),
+        ("captionTone", "caption_tone"), ("captionVoice", "caption_voice"),
+        ("captionFrameCount", "caption_frame_count"), ("aiHashtagStyle", "ai_hashtag_style"),
+        ("hashtagPosition", "hashtag_position"), ("autoCaptions", "auto_captions"),
+        ("autoThumbnails", "auto_thumbnails"), ("styledThumbnails", "styled_thumbnails"),
+        ("defaultPrivacy", "default_privacy"), ("thumbnailInterval", "thumbnail_interval"),
+    ]:
+        v = up.get(camel) if up.get(camel) is not None else up.get(snake)
+        if v is not None:
+            result[camel] = result[snake] = v
+
+
 async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     """Helper to fetch user preferences for upload processing.
-    Merges user_preferences table + users.preferences so both PUT /api/me/preferences
-    and POST /api/settings/preferences are respected. users.preferences wins for
-    hashtag fields (always_hashtags, platform_hashtags, blocked_hashtags) since that's
-    where PUT /api/me/preferences writes.
+    Merges user_preferences table + users.preferences + user_settings so:
+    - PUT /api/me/preferences (users.preferences) wins for hashtag/caption fields
+    - POST /api/settings/preferences (user_preferences) provides defaults
+    - user_settings provides hud_enabled for Trill HUD cost calculation
     """
     result = {}
     # Read from user_preferences table
@@ -5167,26 +6313,20 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
             "discord_webhook": prefs_row["discord_webhook"]
         }
 
-    # Overlay users.preferences for hashtag fields (PUT /api/me/preferences writes here)
+    # Overlay users.preferences (PUT /api/me/preferences writes here) — full overlay
+    users_prefs_row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user_id)
+    up = _parse_users_preferences(users_prefs_row["preferences"] if users_prefs_row else None)
+    _overlay_users_prefs_on_result(result, up)
+
+    # Overlay user_settings for hud_enabled (Trill HUD; PUT /api/settings writes here)
+    try:
+        us_row = await conn.fetchrow("SELECT hud_enabled FROM user_settings WHERE user_id = $1", user_id)
+        if us_row and us_row.get("hud_enabled") is not None:
+            result["hud_enabled"] = bool(us_row["hud_enabled"])
+    except Exception:
+        pass
+
     if result:
-        users_prefs_row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user_id)
-        if users_prefs_row and users_prefs_row["preferences"]:
-            up = users_prefs_row["preferences"]
-            if isinstance(up, str):
-                try:
-                    up = json.loads(up)
-                except Exception:
-                    up = {}
-            if isinstance(up, dict) and up:
-                if up.get("alwaysHashtags") is not None or up.get("always_hashtags") is not None:
-                    v = up.get("alwaysHashtags") or up.get("always_hashtags")
-                    result["alwaysHashtags"] = result["always_hashtags"] = v
-                if up.get("blockedHashtags") is not None or up.get("blocked_hashtags") is not None:
-                    v = up.get("blockedHashtags") or up.get("blocked_hashtags")
-                    result["blockedHashtags"] = result["blocked_hashtags"] = v
-                if up.get("platformHashtags") is not None or up.get("platform_hashtags") is not None:
-                    v = up.get("platformHashtags") or up.get("platform_hashtags")
-                    result["platformHashtags"] = result["platform_hashtags"] = v
         return result
 
     # Fallback: Try legacy JSONB locations
@@ -5219,7 +6359,7 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     
     # Return preferences with defaults (convert camelCase to snake_case for internal use)
     styled = prefs.get("styledThumbnails", prefs.get("styled_thumbnails", True))
-    return {
+    out = {
         "auto_captions": prefs.get("autoCaptions", False),
         "auto_thumbnails": prefs.get("autoThumbnails", False),
         "styled_thumbnails": styled,
@@ -5237,6 +6377,14 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
         "email_notifications": prefs.get("emailNotifications", True),
         "discord_webhook": prefs.get("discordWebhook", None)
     }
+    # Add hud_enabled from user_settings for fallback path
+    try:
+        us_row = await conn.fetchrow("SELECT hud_enabled FROM user_settings WHERE user_id = $1", user_id)
+        if us_row and us_row.get("hud_enabled") is not None:
+            out["hud_enabled"] = bool(us_row["hud_enabled"])
+    except Exception:
+        pass
+    return out
 
 
 
@@ -5395,12 +6543,11 @@ async def get_platforms(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         accounts = await conn.fetch("""
             SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
-                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at, last_oauth_reconnect_at
             FROM platform_tokens
             WHERE user_id = $1
               AND revoked_at IS NULL
               AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
             ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
         """, user["id"])
     
@@ -5408,7 +6555,21 @@ async def get_platforms(user: dict = Depends(get_current_user)):
     for acc in accounts:
         p = acc["platform"]
         if p not in platforms: platforms[p] = []
-        platforms[p].append({"id": str(acc["id"]), "account_id": acc["account_id"], "name": acc["account_name"], "username": acc["account_username"], "avatar": acc["account_avatar"], "is_primary": acc["is_primary"], "status": "active", "connected_at": acc["created_at"].isoformat() if acc["created_at"] else None})
+        first_at = acc["created_at"].isoformat() if acc["created_at"] else None
+        _lr = acc.get("last_oauth_reconnect_at") or acc.get("created_at")
+        reconnect_at = _lr.isoformat() if _lr else None
+        platforms[p].append({
+            "id": str(acc["id"]),
+            "account_id": acc["account_id"],
+            "name": acc["account_name"],
+            "username": acc["account_username"],
+            "avatar": _platform_account_avatar_to_url(acc["account_avatar"]),
+            "is_primary": acc["is_primary"],
+            "status": "active",
+            "connected_at": first_at,
+            "first_connected_at": first_at,
+            "last_reconnected_at": reconnect_at,
+        })
     
     plan = get_plan(user.get("subscription_tier", "free"))
     total = sum(len(v) for v in platforms.values())
@@ -5421,27 +6582,31 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         accounts = await conn.fetch("""
             SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
-                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
+                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at, last_oauth_reconnect_at
             FROM platform_tokens
             WHERE user_id = $1
               AND revoked_at IS NULL
               AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
             ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
         """, user["id"])
     
     result = []
     for acc in accounts:
+        first_at = acc["created_at"].isoformat() if acc["created_at"] else None
+        _lr = acc.get("last_oauth_reconnect_at") or acc.get("created_at")
+        reconnect_at = _lr.isoformat() if _lr else None
         result.append({
             "id": str(acc["id"]),
             "platform": acc["platform"],
             "account_id": acc["account_id"],
             "account_name": acc["account_name"],
             "account_username": acc["account_username"],
-            "account_avatar_url": acc["account_avatar"],
+            "account_avatar_url": _platform_account_avatar_to_url(acc["account_avatar"]),
             "is_primary": acc["is_primary"],
             "status": "active",
-            "connected_at": acc["created_at"].isoformat() if acc["created_at"] else None,
+            "connected_at": first_at,
+            "first_connected_at": first_at,
+            "last_reconnected_at": reconnect_at,
         })
     return {"accounts": result}
 
@@ -5449,8 +6614,15 @@ async def get_platform_accounts(user: dict = Depends(get_current_user)):
 async def get_accounts_simple(user: dict = Depends(get_current_user)):
     """Simple accounts list for dashboard"""
     async with db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id) id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '' AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '') ORDER BY platform, account_id, created_at DESC", user["id"])
-    return [{"id": str(a["id"]), "platform": a["platform"], "name": a["account_name"], "username": a["account_username"], "avatar": a["account_avatar"], "status": "active"} for a in accounts]
+        accounts = await conn.fetch(
+            """SELECT DISTINCT ON (platform, account_id) id, platform, account_name, account_username, account_avatar
+               FROM platform_tokens
+               WHERE user_id = $1 AND revoked_at IS NULL
+                 AND account_id IS NOT NULL AND account_id <> ''
+               ORDER BY platform, account_id, created_at DESC""",
+            user["id"],
+        )
+    return [{"id": str(a["id"]), "platform": a["platform"], "name": a["account_name"], "username": a["account_username"], "avatar": _platform_account_avatar_to_url(a["account_avatar"]), "status": "active"} for a in accounts]
 
 @app.delete("/api/platforms/{platform}/accounts/{account_id}")
 async def disconnect_account(
@@ -5611,28 +6783,59 @@ FACEBOOK_CLIENT_SECRET = os.environ.get("FACEBOOK_CLIENT_SECRET", "") or META_AP
 def get_oauth_redirect_uri(platform: str) -> str:
     return f"{BASE_URL}/api/oauth/{platform}/callback"
 
+
+def _sanitize_oauth_parent_origin(raw: Optional[str]) -> str:
+    """
+    Target origin for window.opener.postMessage after OAuth. Must match the page that opened the popup
+    (typically window.location.origin), not necessarily FRONTEND_URL.
+    """
+    default = FRONTEND_URL.rstrip("/")
+    if not raw or not str(raw).strip():
+        return default
+    cand = str(raw).strip().rstrip("/")
+    try:
+        p = urlparse(cand if "://" in cand else f"http://{cand}")
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return default
+        host = (p.hostname or "").lower()
+        cand_norm = f"{p.scheme}://{p.netloc}".rstrip("/")
+        fe = urlparse(FRONTEND_URL if "://" in FRONTEND_URL else f"https://{FRONTEND_URL}")
+        if (p.scheme, p.netloc) == (fe.scheme, fe.netloc):
+            return cand_norm
+        bu = urlparse(BASE_URL if "://" in BASE_URL else f"https://{BASE_URL}")
+        if (p.scheme, p.netloc) == (bu.scheme, bu.netloc):
+            return cand_norm
+        if host in ("localhost", "127.0.0.1"):
+            return cand_norm
+        if host.endswith("uploadm8.com"):
+            return cand_norm
+    except Exception:
+        pass
+    return default
+
+
 @app.get("/api/oauth/{platform}/start")
-async def oauth_start(platform: str, user: dict = Depends(get_current_user)):
+async def oauth_start(
+    platform: str,
+    parent_origin: Optional[str] = Query(None),
+    user: dict = Depends(get_current_user),
+):
     """Start OAuth flow for a platform"""
     if platform not in OAUTH_CONFIG:
         raise HTTPException(400, f"Unsupported platform: {platform}")
-    
-    # Check account limits
-    plan = get_plan(user.get("subscription_tier", "free"))
-    async with db_pool.acquire() as conn:
-        current_count = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", user["id"])
-    
-    if current_count >= plan.get("max_accounts", 1):
-        raise HTTPException(403, f"Account limit reached ({plan.get('max_accounts', 1)}). Upgrade to add more.")
-    
+
+    # Account limits are enforced in the OAuth callback on *new* rows only, so users at the limit
+    # can still reconnect (UPDATE) existing platform identities.
+
     config = OAUTH_CONFIG[platform]
     state = secrets.token_urlsafe(32)
-    
+
     # Store state with user info
     oauth_states[state] = {
         "user_id": str(user["id"]),
         "platform": platform,
-        "created_at": _now_utc().isoformat()
+        "created_at": _now_utc().isoformat(),
+        "parent_origin": _sanitize_oauth_parent_origin(parent_origin),
     }
     
     redirect_uri = get_oauth_redirect_uri(platform)
@@ -5680,7 +6883,12 @@ async def oauth_start(platform: str, user: dict = Depends(get_current_user)):
 @app.get("/api/oauth/{platform}/callback")
 async def oauth_callback(platform: str, code: str = Query(None), state: str = Query(None), error: str = Query(None)):
     """Handle OAuth callback - returns HTML that communicates with parent window"""
-    
+    post_target = FRONTEND_URL.rstrip("/")
+    state_data = None
+    if state and state in oauth_states:
+        state_data = oauth_states.pop(state)
+        post_target = _sanitize_oauth_parent_origin(state_data.get("parent_origin"))
+
     def popup_response(success: bool, platform: str, error_msg: str = None):
         """Generate HTML that posts message to parent window and closes popup"""
         if success:
@@ -5688,7 +6896,8 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
         else:
             safe_error = (error_msg or "Unknown error").replace('"', '\\"').replace('\n', ' ')[:200]
             message = f'{{"type": "oauth_error", "platform": "{platform}", "error": "{safe_error}"}}'
-        
+        target_js = json.dumps(post_target)
+
         return HTMLResponse(f"""
         <!DOCTYPE html>
         <html>
@@ -5700,23 +6909,22 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
             </div>
             <script>
                 if (window.opener) {{
-                    window.opener.postMessage({message}, '{FRONTEND_URL}');
+                    window.opener.postMessage({message}, {target_js});
                 }}
                 setTimeout(() => window.close(), 1500);
             </script>
         </body>
         </html>
         """)
-    
+
     if error:
         return popup_response(False, platform, error)
-    
-    if not state or state not in oauth_states:
+
+    if not state_data:
         return popup_response(False, platform, "Invalid or expired session. Please try again.")
-    
-    state_data = oauth_states.pop(state)
+
     user_id = state_data["user_id"]
-    
+
     if not code:
         return popup_response(False, platform, "No authorization code received")
     
@@ -5736,10 +6944,45 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 })
                 token_data = token_response.json()
                 access_token = token_data.get("access_token")
-                account_id = token_data.get("open_id", secrets.token_hex(8))
+                account_id = (
+                    token_data.get("open_id")
+                    or (token_data.get("data") or {}).get("open_id")
+                    or secrets.token_hex(8)
+                )
                 account_name = "TikTok User"
                 account_username = ""
                 account_avatar = ""
+                # TikTok v2 user info requires POST + JSON body (GET with query params returns errors).
+                if access_token:
+                    try:
+                        ui_resp = await client.post(
+                            "https://open.tiktokapis.com/v2/user/info/",
+                            headers={
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                # user.info.basic — do not request fields that need extra scopes
+                                "fields": ["open_id", "union_id", "avatar_url", "display_name"],
+                            },
+                        )
+                        ui_body = ui_resp.json() if ui_resp.content else {}
+                        if ui_resp.status_code != 200:
+                            logger.warning(
+                                "TikTok user/info HTTP %s: %s",
+                                ui_resp.status_code,
+                                (ui_body.get("error") or ui_body.get("message") or str(ui_body))[:300],
+                            )
+                        user_obj = (ui_body.get("data") or {}).get("user") or ui_body.get("user") or {}
+                        display_name = (user_obj.get("display_name") or "").strip()
+                        avatar_url = (user_obj.get("avatar_url") or "").strip()
+                        if display_name:
+                            account_name = display_name
+                            account_username = display_name
+                        if avatar_url:
+                            account_avatar = avatar_url
+                    except Exception as e:
+                        logger.warning(f"TikTok user info fetch failed (non-fatal): {e}")
                 
             elif platform == "youtube":
                 token_response = await client.post(config["token_url"], data={
@@ -5763,7 +7006,8 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     snippet = channel.get("snippet", {})
                     account_id = channel.get("id")
                     account_name = snippet.get("title", "YouTube Channel")
-                    account_username = snippet.get("customUrl", "")
+                    # customUrl can be empty for channels without custom URL; use channel title as fallback
+                    account_username = (snippet.get("customUrl") or "").strip() or account_name
                     account_avatar = snippet.get("thumbnails", {}).get("default", {}).get("url", "")
                 else:
                     account_id = secrets.token_hex(8)
@@ -5827,7 +7071,8 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 
                 account_id = instagram_account.get("id")
                 account_name = instagram_account.get("name") or instagram_account.get("username", "Instagram Account")
-                account_username = instagram_account.get("username", "")
+                # username can be empty for some accounts; use name as fallback for display
+                account_username = (instagram_account.get("username") or "").strip() or account_name
                 account_avatar = instagram_account.get("profile_picture_url", "")
                 access_token = page_access_token  # Use Page token for API calls
                 
@@ -5848,7 +7093,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 # Fetch the user's Pages and use the first one.
                 pages_response = await client.get(
                     "https://graph.facebook.com/v18.0/me/accounts",
-                    params={"access_token": user_access_token, "fields": "id,name,access_token,picture"},
+                    params={"access_token": user_access_token, "fields": "id,name,username,access_token,picture"},
                 )
                 pages_data = pages_response.json()
                 pages = pages_data.get("data", [])
@@ -5863,9 +7108,25 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 page = pages[0]
                 account_id    = page["id"]                                         # Page ID
                 account_name  = page.get("name", "Facebook Page")
-                account_username = ""
+                # Page username (e.g. for facebook.com/PageName); fallback to page name when empty
+                account_username = (page.get("username") or "").strip() or account_name
                 account_avatar   = page.get("picture", {}).get("data", {}).get("url", "")
                 access_token     = page["access_token"]                            # Page token
+
+            # Copy profile image into R2 — FB/IG/TikTok CDN URLs often 403 when hotlinked from the browser.
+            if account_avatar and str(account_avatar).startswith("http") and platform in (
+                "facebook",
+                "instagram",
+                "tiktok",
+            ):
+                try:
+                    mirrored_key = await _mirror_oauth_profile_image_to_r2(
+                        str(user_id), platform, str(account_avatar)
+                    )
+                    if mirrored_key:
+                        account_avatar = mirrored_key
+                except Exception as _av_e:
+                    logger.debug(f"OAuth avatar mirror skipped ({platform}): {_av_e}")
             
             # Refuse to persist "ghost" connections with no identity
             if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
@@ -5890,18 +7151,32 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     "SELECT id FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND account_id = $3",
                     user_id, platform, account_id
                 )
-                
+
                 if existing:
                     await conn.execute("""
-                        UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3, 
-                        account_avatar = $4, updated_at = NOW() WHERE id = $5
-                    """, json.dumps(token_blob), account_name, account_username, account_avatar, existing["id"])
+                        UPDATE platform_tokens SET token_blob = $1, account_name = $2, account_username = $3,
+                        account_avatar = $4, updated_at = NOW(), last_oauth_reconnect_at = NOW() WHERE id = $5
+                    """, token_blob, account_name, account_username, account_avatar, existing["id"])
                     connect_action = "PLATFORM_RECONNECTED"
                 else:
+                    user_row = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
+                    tier = (user_row or {}).get("subscription_tier") or "free"
+                    plan = get_plan(tier)
+                    max_acc = plan.get("max_accounts", 1)
+                    current_count = await conn.fetchval(
+                        "SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1",
+                        user_id,
+                    )
+                    if current_count >= max_acc:
+                        return popup_response(
+                            False,
+                            platform,
+                            f"Account limit reached ({max_acc}). Disconnect an account or upgrade to add more.",
+                        )
                     await conn.execute("""
-                        INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7)
-                    """, user_id, platform, account_id, account_name, account_username, account_avatar, json.dumps(token_blob))
+                        INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob, last_oauth_reconnect_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                    """, user_id, platform, account_id, account_name, account_username, account_avatar, token_blob)
                     connect_action = "PLATFORM_CONNECTED"
 
                 await log_system_event(conn, user_id=str(user_id), action=connect_action,
@@ -5949,56 +7224,18 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
                 except Exception:
                     pass  # Fall through to new checkout if portal fails
 
-        customer_id = user.get("stripe_customer_id")
-        if not customer_id:
-            customer = stripe.Customer.create(email=user["email"], name=user.get("name") or user["email"])
-            customer_id = customer.id
-            await conn.execute("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", customer_id, user["id"])
+        customer_id = await ensure_stripe_customer(conn, user, stripe)
 
-    prices = stripe.Price.list(lookup_keys=[data.lookup_key], active=True)
-    if not prices.data:
-        raise HTTPException(400, f"Price not found for lookup_key: {data.lookup_key}. Run stripe_setup.py to create prices.")
-
-    if data.kind == "subscription":
-        # Resolve trial days from entitlements (7 days for all paid tiers)
-        tier = STRIPE_LOOKUP_TO_TIER.get(data.lookup_key, "free")
-        ent  = get_entitlements_for_tier(tier)
-        trial_days = ent.trial_days  # 0 for free/internal, 7 for paid
-
-        session_params = dict(
-            customer              = customer_id,
-            line_items            = [{"price": prices.data[0].id, "quantity": 1}],
-            mode                  = "subscription",
-            success_url           = STRIPE_SUCCESS_URL,
-            cancel_url            = STRIPE_CANCEL_URL,
-            allow_promotion_codes = True,
-            metadata              = {"user_id": str(user["id"]), "tier": tier},
-        )
-        if trial_days > 0:
-            session_params["subscription_data"] = {
-                "trial_period_days": trial_days,
-                "metadata": {"user_id": str(user["id"]), "tier": tier},
-            }
-
-        session = stripe.checkout.Session.create(**session_params)
-
-    else:  # topup / one-time payment
-        product = TOPUP_PRODUCTS.get(data.lookup_key, {})
-        if not product:
-            raise HTTPException(400, f"Unknown topup product: {data.lookup_key}")
-
-        session = stripe.checkout.Session.create(
-            customer    = customer_id,
-            line_items  = [{"price": prices.data[0].id, "quantity": 1}],
-            mode        = "payment",
-            success_url = STRIPE_SUCCESS_URL,
-            cancel_url  = STRIPE_CANCEL_URL,
-            metadata    = {
-                "user_id": str(user["id"]),
-                "wallet":  product.get("wallet", "put"),
-                "amount":  str(product.get("amount", 0)),
-            },
-        )
+    session = create_billing_checkout_session(
+        stripe_client=stripe,
+        customer_id=customer_id,
+        kind=data.kind,
+        lookup_key=data.lookup_key,
+        user_id=str(user["id"]),
+        success_url=STRIPE_SUCCESS_URL,
+        cancel_url=STRIPE_CANCEL_URL,
+        topup_products=TOPUP_PRODUCTS,
+    )
 
     return {"checkout_url": session.url, "session_id": session.id}
 
@@ -6105,6 +7342,20 @@ async def get_billing_session(
     }
 
 
+def _tier_from_stripe_price(price_obj: dict, fallback_tier: Optional[str] = None) -> str:
+    """Resolve internal tier from Stripe Price metadata (tier=...) or lookup_key."""
+    if not price_obj:
+        return normalize_tier(fallback_tier or "free")
+    pmd = price_obj.get("metadata") or {}
+    t = (pmd.get("tier") or "").strip().lower()
+    if t:
+        return normalize_tier(t)
+    lk = (price_obj.get("lookup_key") or "").strip()
+    if lk in STRIPE_LOOKUP_TO_TIER:
+        return normalize_tier(STRIPE_LOOKUP_TO_TIER[lk])
+    return normalize_tier(fallback_tier or "free")
+
+
 @app.post("/api/billing/webhook")
 async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     """Stripe billing webhook — idempotent, signature-verified."""
@@ -6131,8 +7382,8 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
 
             if session.mode == "subscription":
                 sub = stripe.Subscription.retrieve(session.subscription)
-                lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
-                tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
+                price_obj = sub["items"]["data"][0]["price"]
+                tier = _tier_from_stripe_price(price_obj, None)
                 ent  = get_entitlements_for_tier(tier)
                 status = sub.status
 
@@ -6180,17 +7431,34 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     )
 
             elif session.mode == "payment":
-                wallet_type   = session.metadata.get("wallet", "put")
-                amount_tokens = int(session.metadata.get("amount", 0))
+                wallet_type   = (session.metadata or {}).get("wallet", "put")
+                amount_tokens = int((session.metadata or {}).get("amount", 0) or 0)
+                try:
+                    sess_exp = stripe.checkout.Session.retrieve(
+                        session.id,
+                        expand=["line_items.data.price"],
+                    )
+                    li = sess_exp.line_items.data[0] if sess_exp.line_items and sess_exp.line_items.data else None
+                    if li and li.price:
+                        pmd = li.price.metadata or {}
+                        wallet_type = pmd.get("wallet") or wallet_type
+                        if pmd.get("amount") not in (None, ""):
+                            amount_tokens = int(pmd.get("amount") or 0)
+                except Exception as e:
+                    logger.warning(f"checkout topup: price metadata expand failed, using session metadata: {e}")
                 if amount_tokens > 0:
                     # First top-up bonus: +25% to incentivize trying paid credits
                     prior = await conn.fetchval(
-                        "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
-                        user_id
+                        """
+                        SELECT 1 FROM token_ledger
+                        WHERE user_id = $1 AND reason IN ('topup', 'topup_purchase')
+                        LIMIT 1
+                        """,
+                        user_id,
                     )
                     bonus = int(amount_tokens * 0.25) if not prior else 0
                     total = amount_tokens + bonus
-                    await credit_wallet(conn, user_id, wallet_type, total, "topup_purchase", session.id)
+                    await credit_wallet(conn, user_id, wallet_type, total, "topup", session.id)
                     amount = (session.amount_total or 0) / 100
                     await conn.execute(
                         "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
@@ -6222,8 +7490,8 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             email   = user_row["email"]
             uname   = user_row["name"] or "there"
             sub = stripe.Subscription.retrieve(sub_id)
-            lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
-            tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, user_row["subscription_tier"] or "free")
+            price_obj = sub["items"]["data"][0]["price"]
+            tier = _tier_from_stripe_price(price_obj, user_row["subscription_tier"] or "free")
             ent  = get_entitlements_for_tier(tier)
 
             period_start = datetime.fromtimestamp(invoice.period_start, tz=timezone.utc)
@@ -6261,13 +7529,16 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     elif etype == "customer.subscription.updated":
         sub = event.data.object
         async with db_pool.acquire() as conn:
-            lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
-            new_tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
+            price_obj = sub["items"]["data"][0]["price"]
             period_end = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
 
             # Fetch user before updating so we have old_tier for comparison
             user_row = await conn.fetchrow(
                 "SELECT id, email, name, subscription_tier FROM users WHERE stripe_subscription_id = $1", sub.id
+            )
+            new_tier = _tier_from_stripe_price(
+                price_obj,
+                user_row["subscription_tier"] if user_row else "free",
             )
             old_tier = user_row["subscription_tier"] if user_row else new_tier
 
@@ -6559,23 +7830,37 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
                 )
 
                 if upload:
-                    existing = _safe_json(upload["platform_results"], {})
-                    existing["tiktok"] = {
-                        "status": "published",
-                        "video_id": video_id,
-                        "share_id": share_id,
-                        "published_at": _now_utc().isoformat(),
-                    }
+                    raw_pr = _safe_json(upload["platform_results"], [])
+                    # Preserve array format (one entry per account); merge TikTok update into matching entry
+                    if isinstance(raw_pr, list):
+                        tiktok_updated = False
+                        for item in raw_pr:
+                            if isinstance(item, dict) and str(item.get("platform", "")).lower() == "tiktok":
+                                if str(item.get("account_id", "")) == user_openid:
+                                    item["platform_video_id"] = video_id
+                                    item["video_id"] = video_id
+                                    item["platform_url"] = f"https://www.tiktok.com/video/{video_id}"
+                                    item["url"] = item["platform_url"]
+                                    item["success"] = True
+                                    tiktok_updated = True
+                                    break
+                        if not tiktok_updated:
+                            raw_pr.append({"platform": "tiktok", "account_id": user_openid, "platform_video_id": video_id, "video_id": video_id, "success": True})
+                        updated_pr = raw_pr
+                    else:
+                        existing = raw_pr if isinstance(raw_pr, dict) else {}
+                        existing["tiktok"] = {"platform": "tiktok", "status": "published", "video_id": video_id, "share_id": share_id, "published_at": _now_utc().isoformat()}
+                        updated_pr = existing
                     await conn.execute(
                         """
                         UPDATE uploads
                         SET status           = 'completed',
                             completed_at     = NOW(),
-                            platform_results = $1,
+                            platform_results = $1::jsonb,
                             updated_at       = NOW()
                         WHERE id = $2
                         """,
-                        json.dumps(existing),
+                        json.dumps(updated_pr),
                         upload["id"],
                     )
                     notes += f" upload={upload['id']} marked=completed video_id={video_id}"
@@ -6611,23 +7896,29 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
                 )
 
                 if upload:
-                    existing = _safe_json(upload["platform_results"], {})
-                    existing["tiktok"] = {
-                        "status": "failed",
-                        "share_id": share_id,
-                        "failed_at": _now_utc().isoformat(),
-                    }
+                    raw_pr = _safe_json(upload["platform_results"], [])
+                    if isinstance(raw_pr, list):
+                        for item in raw_pr:
+                            if isinstance(item, dict) and str(item.get("platform", "")).lower() == "tiktok" and str(item.get("account_id", "")) == user_openid:
+                                item["success"] = False
+                                item["error_message"] = "TikTok reported upload failure via webhook"
+                                break
+                        updated_pr = raw_pr
+                    else:
+                        existing = raw_pr if isinstance(raw_pr, dict) else {}
+                        existing["tiktok"] = {"platform": "tiktok", "status": "failed", "share_id": share_id, "failed_at": _now_utc().isoformat()}
+                        updated_pr = existing
                     await conn.execute(
                         """
                         UPDATE uploads
                         SET status           = 'failed',
                             error_code       = 'tiktok_upload_failed',
                             error_detail     = 'TikTok reported upload failure via webhook',
-                            platform_results = $1,
+                            platform_results = $1::jsonb,
                             updated_at       = NOW()
                         WHERE id = $2
                         """,
-                        json.dumps(existing),
+                        json.dumps(updated_pr),
                         upload["id"],
                     )
                     # Refund reserved tokens so the user isn't charged
@@ -6988,74 +8279,135 @@ async def facebook_webhook(request: Request, background_tasks: BackgroundTasks):
 # ============================================================
 @app.get("/api/analytics")
 async def get_analytics(range: str = "30d", user: dict = Depends(get_current_user)):
-    # 'all' maps to 1y (largest supported window). 'partial' = at least one platform succeeded.
-    minutes = {"30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440,
-               "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600, "all": 525600}.get(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+    # 'all' = entire history (no created_at filter). '90d' explicit. '1y' = 365d preset.
+    minutes_map = {"30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440,
+                   "7d": 10080, "30d": 43200, "90d": 129600, "6m": 262800, "1y": 525600}
+    if range == "all":
+        since = None
+    else:
+        minutes = minutes_map.get(range, 43200)
+        since = _now_utc() - timedelta(minutes=minutes)
 
     async with db_pool.acquire() as conn:
         try:
-            stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total,
-                   SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
-                   COALESCE(SUM(views), 0)::bigint AS views,
-                   COALESCE(SUM(likes), 0)::bigint AS likes,
-                   COALESCE(SUM(put_spent), 0)::int AS put_used,
-                   COALESCE(SUM(aic_spent), 0)::int AS aic_used
-            FROM uploads WHERE user_id = $1 AND created_at >= $2
-            """, user["id"], since)
+            if since is None:
+                stats = await conn.fetchrow("""
+                SELECT COUNT(*)::int AS total,
+                       SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
+                       COALESCE(SUM(views), 0)::bigint AS views,
+                       COALESCE(SUM(likes), 0)::bigint AS likes,
+                       COALESCE(SUM(put_spent), 0)::int AS put_used,
+                       COALESCE(SUM(aic_spent), 0)::int AS aic_used
+                FROM uploads WHERE user_id = $1
+                """, user["id"])
+            else:
+                stats = await conn.fetchrow("""
+                SELECT COUNT(*)::int AS total,
+                       SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
+                       COALESCE(SUM(views), 0)::bigint AS views,
+                       COALESCE(SUM(likes), 0)::bigint AS likes,
+                       COALESCE(SUM(put_spent), 0)::int AS put_used,
+                       COALESCE(SUM(aic_spent), 0)::int AS aic_used
+                FROM uploads WHERE user_id = $1 AND created_at >= $2
+                """, user["id"], since)
         except Exception as e:
             if e.__class__.__name__ != "UndefinedColumnError":
                 raise
-            stats = await conn.fetchrow("""
-            SELECT COUNT(*)::int AS total,
-                   SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
-                   0::bigint AS views, 0::bigint AS likes,
-                   0::int AS put_used, 0::int AS aic_used
-            FROM uploads WHERE user_id = $1 AND created_at >= $2
-            """, user["id"], since)
+            if since is None:
+                stats = await conn.fetchrow("""
+                SELECT COUNT(*)::int AS total,
+                       SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
+                       0::bigint AS views, 0::bigint AS likes,
+                       0::int AS put_used, 0::int AS aic_used
+                FROM uploads WHERE user_id = $1
+                """, user["id"])
+            else:
+                stats = await conn.fetchrow("""
+                SELECT COUNT(*)::int AS total,
+                       SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
+                       0::bigint AS views, 0::bigint AS likes,
+                       0::int AS put_used, 0::int AS aic_used
+                FROM uploads WHERE user_id = $1 AND created_at >= $2
+                """, user["id"], since)
 
-        daily = await conn.fetch(
-            "SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads "
-            "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
-            "GROUP BY DATE(created_at) ORDER BY date", 
-            user["id"], since
-        )
-        platforms = await conn.fetch(
-            "SELECT unnest(platforms) AS platform, COUNT(*)::int AS count "
-            "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
-            "AND status IN ('completed','succeeded','partial') "
-            "GROUP BY platform",
-            user["id"], since
-        )
+        if since is None:
+            daily = await conn.fetch(
+                "SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads "
+                "FROM uploads WHERE user_id = $1 "
+                "GROUP BY DATE(created_at) ORDER BY date",
+                user["id"],
+            )
+            platforms = await conn.fetch(
+                "SELECT unnest(platforms) AS platform, COUNT(*)::int AS count "
+                "FROM uploads WHERE user_id = $1 "
+                "AND status IN ('completed','succeeded','partial') "
+                "GROUP BY platform",
+                user["id"],
+            )
+        else:
+            daily = await conn.fetch(
+                "SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads "
+                "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
+                "GROUP BY DATE(created_at) ORDER BY date",
+                user["id"], since
+            )
+            platforms = await conn.fetch(
+                "SELECT unnest(platforms) AS platform, COUNT(*)::int AS count "
+                "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
+                "AND status IN ('completed','succeeded','partial') "
+                "GROUP BY platform",
+                user["id"], since
+            )
 
         # ================================================================
         # TRILL TELEMETRY STATS
         # ================================================================
         trill_stats = None
         try:
-            trill_data = await conn.fetchrow("""
-                SELECT 
-                    COUNT(*)::int AS trill_uploads,
-                    COALESCE(AVG(trill_score), 0)::decimal AS avg_score,
-                    COALESCE(MAX(trill_score), 0)::decimal AS max_score,
-                    COALESCE(MAX(max_speed_mph), 0)::decimal AS max_speed_mph,
-                    COALESCE(SUM(distance_miles), 0)::decimal AS total_distance_miles
-                FROM uploads 
-                WHERE user_id = $1 
-                AND created_at >= $2 
-                AND trill_score IS NOT NULL
-            """, user["id"], since)
-
-            if trill_data and trill_data["trill_uploads"] > 0:
-                speed_buckets = await conn.fetch("""
-                    SELECT speed_bucket, COUNT(*)::int AS count
+            if since is None:
+                trill_data = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*)::int AS trill_uploads,
+                        COALESCE(AVG(trill_score), 0)::decimal AS avg_score,
+                        COALESCE(MAX(trill_score), 0)::decimal AS max_score,
+                        COALESCE(MAX(max_speed_mph), 0)::decimal AS max_speed_mph,
+                        COALESCE(SUM(distance_miles), 0)::decimal AS total_distance_miles
+                    FROM uploads
+                    WHERE user_id = $1
+                    AND trill_score IS NOT NULL
+                """, user["id"])
+            else:
+                trill_data = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*)::int AS trill_uploads,
+                        COALESCE(AVG(trill_score), 0)::decimal AS avg_score,
+                        COALESCE(MAX(trill_score), 0)::decimal AS max_score,
+                        COALESCE(MAX(max_speed_mph), 0)::decimal AS max_speed_mph,
+                        COALESCE(SUM(distance_miles), 0)::decimal AS total_distance_miles
                     FROM uploads
                     WHERE user_id = $1
                     AND created_at >= $2
-                    AND speed_bucket IS NOT NULL
-                    GROUP BY speed_bucket
+                    AND trill_score IS NOT NULL
                 """, user["id"], since)
+
+            if trill_data and trill_data["trill_uploads"] > 0:
+                if since is None:
+                    speed_buckets = await conn.fetch("""
+                        SELECT speed_bucket, COUNT(*)::int AS count
+                        FROM uploads
+                        WHERE user_id = $1
+                        AND speed_bucket IS NOT NULL
+                        GROUP BY speed_bucket
+                    """, user["id"])
+                else:
+                    speed_buckets = await conn.fetch("""
+                        SELECT speed_bucket, COUNT(*)::int AS count
+                        FROM uploads
+                        WHERE user_id = $1
+                        AND created_at >= $2
+                        AND speed_bucket IS NOT NULL
+                        GROUP BY speed_bucket
+                    """, user["id"], since)
 
                 bucket_counts = {
                     "gloryBoy": 0,
@@ -7081,6 +8433,22 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
             logger.warning(f"Trill stats unavailable: {e}")
         # ================================================================
 
+        live_aggregate = {"views": 0, "likes": 0, "comments": 0, "shares": 0, "platforms_included": []}
+        try:
+            prow = await conn.fetchrow(
+                "SELECT data FROM platform_metrics_cache WHERE user_id = $1",
+                user["id"],
+            )
+            if prow and prow["data"] is not None:
+                pdata = prow["data"]
+                if isinstance(pdata, str):
+                    pdata = json.loads(pdata)
+                if isinstance(pdata, dict):
+                    pl = pdata.get("platforms") or {}
+                    live_aggregate = _aggregate_platform_metrics_live(pl)
+        except Exception:
+            pass
+
     result = {
         "total_uploads": stats["total"] if stats else 0,
         "completed": stats["completed"] if stats else 0,
@@ -7089,7 +8457,8 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
         "put_used": stats["put_used"] if stats else 0,
         "aic_used": stats["aic_used"] if stats else 0,
         "daily": [{"date": str(d["date"]), "uploads": d["uploads"]} for d in daily],
-        "platforms": {p["platform"]: p["count"] for p in platforms}
+        "platforms": {p["platform"]: p["count"] for p in platforms},
+        "live_aggregate": live_aggregate,
     }
 
     if trill_stats:
@@ -7115,28 +8484,83 @@ _platform_metrics_cache: dict = {}
 _PLATFORM_CACHE_TTL = 3 * 60 * 60  # 3 hours
 
 
+def _aggregate_platform_metrics_live(platforms_result: dict) -> dict:
+    """
+    Sum engagement from platforms that returned status=='live' (TikTok/YouTube/etc.).
+    Meta platforms that only return errors do not contribute — avoids zeroing the sum.
+    """
+    agg = {"views": 0, "likes": 0, "comments": 0, "shares": 0, "platforms_included": []}
+
+    def _n(x) -> int:
+        try:
+            return int(x or 0)
+        except Exception:
+            return 0
+
+    if not isinstance(platforms_result, dict):
+        return agg
+
+    for plat, d in platforms_result.items():
+        if not isinstance(d, dict) or d.get("status") != "live":
+            continue
+        views = _n(d.get("views"))
+        # Facebook card uses reactions as the like-like metric
+        likes = _n(d.get("reactions")) if plat == "facebook" else _n(d.get("likes"))
+        comments = _n(d.get("comments"))
+        shares = _n(d.get("shares"))
+        if views or likes or comments or shares:
+            agg["views"] += views
+            agg["likes"] += likes
+            agg["comments"] += comments
+            agg["shares"] += shares
+            agg["platforms_included"].append(plat)
+    return agg
+
+
+def _attach_aggregate_to_metrics_payload(payload: dict) -> dict:
+    """Ensure every platform-metrics response includes aggregate (for older DB cache rows)."""
+    if not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+    pl = out.get("platforms")
+    if isinstance(pl, dict):
+        out["aggregate"] = _aggregate_platform_metrics_live(pl)
+    return out
+
+
 async def _fetch_tiktok_metrics(access_token: str) -> dict:
     """TikTok Content API — video list totals + follower stats (requires video.list + user.info.stats)."""
     if not access_token:
         return {"status": "not_connected"}
 
     try:
+        from services.tiktok_api import tiktok_envelope_error, tiktok_video_list_url
+
         async with httpx.AsyncClient(timeout=20) as client:
-            # 1) Video list (requires video.list)
+            # 1) Video list — fields MUST be query params per TikTok docs (not JSON body).
+            list_url = tiktok_video_list_url()
             resp = await client.post(
-                "https://open.tiktokapis.com/v2/video/list/",
+                list_url,
                 headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                # fields is REQUIRED — without it TikTok returns videos with every stat = 0
-                json={
-                    "max_count": 20,
-                    "fields": ["id","title","view_count","like_count","comment_count","share_count","duration","create_time"],
-                },
+                json={"max_count": 20},
             )
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            env_err = tiktok_envelope_error(body)
+            if env_err:
+                logger.warning(f"TikTok video list API error: {env_err}")
+                return {"status": "error", "error": env_err, "error_detail": env_err}
             if resp.status_code != 200:
                 logger.warning(f"TikTok video list HTTP {resp.status_code}: {resp.text[:200]}")
-                return {"status": "error", "error": f"video_list_http_{resp.status_code}"}
+                return {
+                    "status": "error",
+                    "error": f"video_list_http_{resp.status_code}",
+                    "error_detail": resp.text[:300],
+                }
 
-            videos = (resp.json().get("data", {}) or {}).get("videos", []) or []
+            videos = (body.get("data", {}) or {}).get("videos", []) or []
 
             def _i(v):
                 try:
@@ -7159,14 +8583,21 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
                 params={"fields": "follower_count,following_count,likes_count,video_count"},
                 headers={"Authorization": f"Bearer {access_token}"},
             )
-            if ui.status_code == 200:
-                user_obj    = ((ui.json().get("data", {}) or {}).get("user", {}) or {})
+            try:
+                ubody = ui.json() if ui.content else {}
+            except Exception:
+                ubody = {}
+            uenv = tiktok_envelope_error(ubody)
+            if ui.status_code == 200 and not uenv:
+                user_obj    = ((ubody.get("data", {}) or {}).get("user", {}) or {})
                 followers   = user_obj.get("follower_count")
                 following   = user_obj.get("following_count")
                 total_likes = user_obj.get("likes_count")
                 video_count = user_obj.get("video_count")
             else:
-                logger.warning(f"TikTok user.info.stats HTTP {ui.status_code}: {ui.text[:200]}")
+                logger.warning(
+                    f"TikTok user.info.stats HTTP {ui.status_code}: {uenv or ui.text[:200]}"
+                )
 
             return {
                 "status": "live",
@@ -7200,9 +8631,20 @@ async def _fetch_youtube_metrics(access_token: str) -> dict:
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             if ch.status_code != 200:
-                return {"status": "error", "error": f"HTTP {ch.status_code}"}
+                detail = ch.text[:400] if ch.text else ""
+                return {
+                    "status": "error",
+                    "error": f"channels_http_{ch.status_code}",
+                    "error_detail": detail or f"HTTP {ch.status_code}",
+                }
 
             items = ch.json().get("items", []) or []
+            if not items:
+                return {
+                    "status": "error",
+                    "error": "no_youtube_channel",
+                    "error_detail": "No channel returned for mine=true — reconnect Google/YouTube.",
+                }
             stats = items[0].get("statistics", {}) if items else {}
 
             views = likes = comments = shares = 0
@@ -7539,14 +8981,14 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
             result["cache_source"] = "memory"
             result["cache_age_minutes"] = int(age / 60)
             result["next_refresh_minutes"] = int((_PLATFORM_CACHE_TTL - age) / 60)
-            return result
+            return _attach_aggregate_to_metrics_payload(result)
 
     # 2) DB cache (survives restarts)
     async with db_pool.acquire() as conn:
         db_cached = await _platform_metrics_db_cache_get(conn, user_id)
         if db_cached and not force:
             _platform_metrics_cache[user_id] = {"fetched_at": now, "data": db_cached}
-            return db_cached
+            return _attach_aggregate_to_metrics_payload(db_cached)
 
         token_rows = await conn.fetch(
             "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
@@ -7578,6 +9020,22 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
             if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
                 decrypted["page_id"] = str(row["account_id"])
             token_map[plat] = decrypted
+
+    # Refresh OAuth tokens before live API calls (YouTube access ~1h; TikTok ~24h — refresh uses refresh_token).
+    uid_str = str(user["id"])
+    try:
+        from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
+
+        if "tiktok" in token_map:
+            token_map["tiktok"] = await _refresh_tiktok_token(
+                dict(token_map["tiktok"]), db_pool=db_pool, user_id=uid_str
+            )
+        if "youtube" in token_map:
+            token_map["youtube"] = await _refresh_youtube_token(
+                dict(token_map["youtube"]), db_pool=db_pool, user_id=uid_str
+            )
+    except Exception as _tok_e:
+        logger.warning(f"Platform metrics OAuth refresh skipped: {_tok_e}")
 
     async def run_tiktok():
         t = token_map.get("tiktok", {})
@@ -7624,6 +9082,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
         "cached": False,
         "cache_age_minutes": 0,
         "next_refresh_minutes": int(_PLATFORM_CACHE_TTL / 60),
+        "aggregate": _aggregate_platform_metrics_live(platforms_result),
     }
 
     _platform_metrics_cache[user_id] = {"fetched_at": now, "data": output}
@@ -7640,8 +9099,8 @@ async def get_platform_metrics_cached(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         cached = await _platform_metrics_db_cache_get(conn, user_id)
     if cached:
-        return cached
-    return {"platforms": {}, "cached": True, "cache_source": "db", "fetched_at": None}
+        return _attach_aggregate_to_metrics_payload(cached)
+    return {"platforms": {}, "aggregate": {"views": 0, "likes": 0, "comments": 0, "shares": 0, "platforms_included": []}, "cached": True, "cache_source": "db", "fetched_at": None}
 
 @app.get("/api/exports/excel")
 async def export_excel(type: str = "uploads", range: str = "30d", user: dict = Depends(get_current_user)):
@@ -8051,7 +9510,7 @@ async def admin_unban_user(user_id: str, request: Request, user: dict = Depends(
 
 
 @app.put("/api/admin/users/{user_id}/email")
-async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request: Request, user: dict = Depends(get_current_user)):
+async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     require_admin(user)
     new_email = payload.email.lower().strip()
 
@@ -8108,12 +9567,8 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
     return {"ok": True, "email": new_email}
 
 
-class AdminResetPasswordIn(BaseModel):
-    temp_password: str = Field(min_length=8, max_length=128)
-
-
 @app.post("/api/admin/users/{user_id}/reset-password")
-async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, request: Request, user: dict = Depends(get_current_user)):
+async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     require_admin(user)
     temp = payload.temp_password
     pw_hash = bcrypt.hashpw(temp.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -8356,6 +9811,7 @@ async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
 
     async with db_pool.acquire() as conn:
         launch_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='launch'")
+        creator_lite_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='creator_lite'")
         creator_pro_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='creator_pro'")
         studio_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='studio'")
         agency_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='agency'")
@@ -8363,6 +9819,7 @@ async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
     return {
         "mrr_estimate": 0.0,
         "launch_count": int(launch_count or 0),
+        "creator_lite_count": int(creator_lite_count or 0),
         "creator_pro_count": int(creator_pro_count or 0),
         "studio_count": int(studio_count or 0),
         "agency_count": int(agency_count or 0),
@@ -8928,7 +10385,7 @@ async def get_admin_calculator_pricing(user: dict = Depends(require_master_admin
     """
     # Revenue tiers (public pricing page)
     revenue_tiers = {}
-    for slug in ("free", "creator_lite", "creator_pro", "studio", "agency"):
+    for slug in ("free", "creator_lite", "creator_pro", "studio", "agency", "enterprise"):
         cfg = TIER_CONFIG.get(slug, {})
         revenue_tiers[slug] = {
             "name": cfg.get("name", slug.replace("_", " ").title()),
@@ -8956,11 +10413,13 @@ async def get_admin_calculator_pricing(user: dict = Depends(require_master_admin
     for lookup_key, meta in TOPUP_PRODUCTS.items():
         wallet = meta.get("wallet", "")
         amount = meta.get("amount", 0)
+        _price = meta.get("price_usd") or meta.get("price")
         topup_packs.append({
             "lookup_key": lookup_key,
             "wallet": wallet,
             "amount": amount,
-            "price_usd": meta.get("price_usd") or meta.get("price"),
+            "price_usd": _price,   # canonical field (new frontend reads this)
+            "price": _price,       # legacy alias  (older clients / backcompat)
             "label": f"{wallet.upper()} {amount} Pack",
         })
 
@@ -8975,9 +10434,40 @@ async def get_admin_calculator_pricing(user: dict = Depends(require_master_admin
 async def update_admin_settings(settings: dict, user: dict = Depends(require_master_admin)):
     global admin_settings_cache
     admin_settings_cache.update(settings)
+    admin_settings_cache.setdefault("promo_burst_week_enabled", False)
+    admin_settings_cache.setdefault("promo_referral_enabled", False)
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1", json.dumps(admin_settings_cache))
     return {"status": "updated", "settings": admin_settings_cache}
+
+
+@app.patch("/api/admin/settings/promo-toggles")
+async def update_promo_toggles(
+    data: PromoTogglesBody,
+    user: dict = Depends(require_master_admin),
+):
+    """Toggle Burst Week / Referral promo flags without sending full admin settings JSON."""
+    global admin_settings_cache
+    if data.promo_burst_week_enabled is None and data.promo_referral_enabled is None:
+        raise HTTPException(
+            400,
+            "Provide at least one of: promo_burst_week_enabled, promo_referral_enabled",
+        )
+    if data.promo_burst_week_enabled is not None:
+        admin_settings_cache["promo_burst_week_enabled"] = bool(data.promo_burst_week_enabled)
+    if data.promo_referral_enabled is not None:
+        admin_settings_cache["promo_referral_enabled"] = bool(data.promo_referral_enabled)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1",
+            json.dumps(admin_settings_cache),
+        )
+    return {
+        "status": "updated",
+        "promo_burst_week_enabled": admin_settings_cache.get("promo_burst_week_enabled", False),
+        "promo_referral_enabled": admin_settings_cache.get("promo_referral_enabled", False),
+    }
+
 
 @app.post("/api/admin/weekly-report")
 async def trigger_weekly_report(user: dict = Depends(require_master_admin)):
@@ -9040,7 +10530,22 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
             "SELECT id, filename, platforms, status, created_at FROM uploads WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5",
             user["id"],
         )
-    
+
+        dash_live = {"views": 0, "likes": 0, "comments": 0, "shares": 0, "platforms_included": []}
+        try:
+            drow = await conn.fetchrow(
+                "SELECT data FROM platform_metrics_cache WHERE user_id = $1",
+                user["id"],
+            )
+            if drow and drow["data"] is not None:
+                pdata = drow["data"]
+                if isinstance(pdata, str):
+                    pdata = json.loads(pdata)
+                if isinstance(pdata, dict):
+                    dash_live = _aggregate_platform_metrics_live(pdata.get("platforms") or {})
+        except Exception:
+            pass
+
     total = stats["total"] if stats else 0
     completed = stats["completed"] if stats else 0
     put_avail = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
@@ -9048,13 +10553,38 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     put_monthly = plan.get("put_monthly", 60)
     success_rate = (completed / max(total, 1)) * 100 if total else 0
     
+    # Credits display: PUT/AIC wallet balances (not monthly quota)
+    put_reserved = float(wallet.get("put_reserved", 0) or 0)
+    aic_reserved = float(wallet.get("aic_reserved", 0) or 0)
+    put_total = float(wallet.get("put_balance", 0) or 0)
+    aic_total = float(wallet.get("aic_balance", 0) or 0)
+
+    db_views = int(stats["views"] or 0) if stats else 0
+    db_likes = int(stats["likes"] or 0) if stats else 0
+    live_v = int(dash_live.get("views") or 0)
+    live_l = int(dash_live.get("likes") or 0)
+    show_views = db_views if db_views > 0 else live_v
+    show_likes = db_likes if db_likes > 0 else live_l
+
     return {
         "uploads": {"total": total, "completed": completed, "in_queue": stats["in_queue"] if stats else 0},
-        "engagement": {"views": stats["views"] if stats else 0, "likes": stats["likes"] if stats else 0},
+        "engagement": {
+            "views": show_views,
+            "likes": show_likes,
+            "views_db": db_views,
+            "likes_db": db_likes,
+            "live_views": live_v,
+            "live_likes": live_l,
+            "live_platforms": dash_live.get("platforms_included") or [],
+        },
         "success_rate": round(success_rate, 1),
         "scheduled": scheduled or 0,
         "quota": {"put_used": put_used_month or 0, "put_limit": put_monthly},
-        "wallet": {"put_available": put_avail, "put_total": wallet.get("put_balance", 0), "aic_available": aic_avail, "aic_total": wallet.get("aic_balance", 0)},
+        "wallet": {"put_available": put_avail, "put_total": put_total, "aic_available": aic_avail, "aic_total": aic_total},
+        "credits": {
+            "put": {"available": put_avail, "reserved": put_reserved, "total": put_total, "monthly_allowance": put_monthly},
+            "aic": {"available": aic_avail, "reserved": aic_reserved, "total": aic_total, "monthly_allowance": plan.get("aic_monthly", 0)},
+        },
         "accounts": {"connected": accounts or 0, "limit": plan.get("max_accounts", 1)},
         "recent": [{"id": str(r["id"]), "filename": r["filename"], "platforms": r["platforms"], "status": r["status"]} for r in recent],
         "plan": plan,
@@ -9100,6 +10630,39 @@ def _range_to_minutes(range_str: str | None, default_minutes: int) -> int:
 def _range_label(range_str: str | None, fallback: str = "30d") -> str:
     r = (range_str or "").strip()
     return r if r else fallback
+
+
+def _estimate_whisper_stt_cost_usd(successful_uploads: int) -> tuple[float, dict]:
+    """
+    Rough Whisper spend for the selected period: successful uploads × assumed minutes × $/min.
+    Tunable via WHISPER_USD_PER_MINUTE, WHISPER_ESTIMATE_AVG_SECONDS, WHISPER_ESTIMATE_AVG_CAP_MINUTES.
+    """
+    try:
+        usd_per_min = float(os.environ.get("WHISPER_USD_PER_MINUTE", "0.006"))
+    except ValueError:
+        usd_per_min = 0.006
+    try:
+        avg_sec = float(os.environ.get("WHISPER_ESTIMATE_AVG_SECONDS", "60"))
+    except ValueError:
+        avg_sec = 60.0
+    cap_raw = os.environ.get("WHISPER_ESTIMATE_AVG_CAP_MINUTES", "").strip()
+    cap_min: float | None = None
+    if cap_raw:
+        try:
+            cap_min = float(cap_raw)
+        except ValueError:
+            cap_min = None
+    eff_min = max(avg_sec / 60.0, 0.0)
+    if cap_min is not None and cap_min >= 0:
+        eff_min = min(eff_min, cap_min)
+    total = float(max(successful_uploads, 0)) * eff_min * usd_per_min
+    meta = {
+        "usd_per_minute": usd_per_min,
+        "avg_seconds_assumed": avg_sec,
+        "effective_minutes_per_upload": eff_min,
+    }
+    return round(total, 4), meta
+
 
 @app.get("/api/admin/kpis")
 async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):
@@ -9191,7 +10754,9 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         funnel_connect_upload = (funnel_uploaded / max(funnel_connected, 1)) * 100
         
         cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
-    
+
+    whisper_est_usd, whisper_meta = _estimate_whisper_stt_cost_usd(successful_uploads)
+
     return {
         "total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": mrr_by_tier,
         "mrr_launch": mrr_by_tier.get("launch", 0), "mrr_creator_pro": mrr_by_tier.get("creator_pro", 0),
@@ -9219,6 +10784,8 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "total_likes": upload_stats["likes"] if upload_stats else 0,
         "avg_uploads_per_user": round(total_uploads / max(active_users or 1, 1), 1),
         "tier_breakdown": tier_breakdown, "platform_distribution": platform_distribution,
+        "whisper_cost_estimate_usd": whisper_est_usd,
+        "whisper_estimate": whisper_meta,
     }
 
 
@@ -9815,6 +11382,8 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
                 d["video_id"] = d["platform_video_id"]
             if d.get("platform_url") and not d.get("url"):
                 d["url"] = d["platform_url"]
+            if d.get("account_id") and not d.get("token_id"):
+                d["token_id"] = d["account_id"]
             out.append(d)
         return out
 
@@ -10084,3 +11653,236 @@ async def admin_adjust_wallet(
         "after":  new_val,
         "delta":  int(delta),
     }
+
+
+# ════════════════════════════════════════════════════════════════
+# ENTERPRISE: API KEY MANAGEMENT
+# ════════════════════════════════════════════════════════════════
+
+@app.get("/api/keys")
+async def list_api_keys(user: dict = Depends(get_current_user)):
+    """List all API keys for the current user."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, key_prefix, name, scopes, rate_limit,
+                      last_used_at, expires_at, created_at
+               FROM api_keys
+               WHERE user_id = $1 AND revoked_at IS NULL
+               ORDER BY created_at DESC""",
+            user["id"],
+        )
+    return [
+        {
+            "id": str(r["id"]),
+            "key_prefix": r["key_prefix"],
+            "name": r["name"],
+            "scopes": list(r["scopes"] or []),
+            "rate_limit": r["rate_limit"],
+            "last_used_at": r["last_used_at"].isoformat() if r["last_used_at"] else None,
+            "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+class CreateApiKeyRequest(BaseModel):
+    name: str = Field("Default", max_length=255)
+    scopes: List[str] = Field(default_factory=lambda: ["read"])
+    expires_days: Optional[int] = Field(None, ge=1, le=365)
+
+
+@app.post("/api/keys")
+async def create_api_key(data: CreateApiKeyRequest, request: Request, user: dict = Depends(get_current_user)):
+    """Create a new API key. Returns the raw key only once."""
+    raw_key = f"um8_{secrets.token_urlsafe(32)}"
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    key_prefix = raw_key[:12]
+    expires_at = (_now_utc() + timedelta(days=data.expires_days)) if data.expires_days else None
+
+    async with db_pool.acquire() as conn:
+        key_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM api_keys WHERE user_id = $1 AND revoked_at IS NULL",
+            user["id"],
+        )
+        if key_count >= 10:
+            raise HTTPException(400, "Maximum 10 active API keys allowed")
+
+        key_id = str(uuid.uuid4())
+        await conn.execute(
+            """INSERT INTO api_keys (id, user_id, key_hash, key_prefix, name, scopes, expires_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+            key_id, user["id"], key_hash, key_prefix, data.name, data.scopes, expires_at,
+        )
+
+    await audit_log(
+        user["id"], "API_KEY_CREATED",
+        event_category="AUTH", resource_type="api_key", resource_id=key_id,
+        details={"name": data.name, "scopes": data.scopes},
+        ip_address=client_ip(request),
+    )
+
+    return {"id": key_id, "key": raw_key, "prefix": key_prefix, "name": data.name}
+
+
+@app.delete("/api/keys/{key_id}")
+async def revoke_api_key(key_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """Revoke an API key."""
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchval(
+            "UPDATE api_keys SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL RETURNING id",
+            key_id, user["id"],
+        )
+    if not result:
+        raise HTTPException(404, "API key not found")
+
+    await audit_log(
+        user["id"], "API_KEY_REVOKED",
+        event_category="AUTH", resource_type="api_key", resource_id=key_id,
+        ip_address=client_ip(request),
+    )
+    return {"status": "revoked", "id": key_id}
+
+
+# ════════════════════════════════════════════════════════════════
+# ENTERPRISE: AUDIT LOG EXPORT (CSV)
+# ════════════════════════════════════════════════════════════════
+
+@app.get("/api/admin/audit/export")
+async def export_audit_csv(
+    days: int = Query(30, ge=1, le=365),
+    event_category: Optional[str] = None,
+    user: dict = Depends(require_admin),
+):
+    """Export audit logs as CSV for compliance/enterprise customers."""
+    async with db_pool.acquire() as conn:
+        q = """
+            SELECT
+                created_at, event_category, action,
+                COALESCE(actor_user_id::text, admin_id::text) AS actor_id,
+                admin_email AS actor_email,
+                user_id::text AS target_user_id,
+                resource_type, resource_id,
+                severity, outcome,
+                ip_address, details::text
+            FROM admin_audit_log
+            WHERE created_at >= NOW() - ($1 || ' days')::interval
+        """
+        args: list = [str(days)]
+        if event_category:
+            args.append(event_category.upper())
+            q += f" AND UPPER(COALESCE(event_category,'ADMIN')) = ${len(args)}"
+        q += " ORDER BY created_at DESC LIMIT 10000"
+
+        rows = await conn.fetch(q, *args)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "timestamp", "category", "action", "actor_id", "actor_email",
+        "target_user_id", "resource_type", "resource_id",
+        "severity", "outcome", "ip_address", "details",
+    ])
+    for r in rows:
+        writer.writerow([
+            r["created_at"].isoformat() if r["created_at"] else "",
+            r["event_category"], r["action"],
+            r["actor_id"] or "", r["actor_email"] or "",
+            r["target_user_id"] or "",
+            r["resource_type"] or "", r["resource_id"] or "",
+            r["severity"], r["outcome"],
+            r["ip_address"] or "", r["details"] or "",
+        ])
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=audit-log-{days}d.csv"},
+    )
+
+
+# ════════════════════════════════════════════════════════════════
+# ENTERPRISE: DEAD LETTER QUEUE ADMIN
+# ════════════════════════════════════════════════════════════════
+
+@app.get("/api/admin/dead-letter")
+async def list_dead_letters(
+    limit: int = Query(50, ge=1, le=200),
+    user: dict = Depends(require_admin),
+):
+    """List unresolved dead-letter queue items."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, upload_id, user_id, error_code, error_message,
+                      retry_count, max_retries, last_attempt_at, created_at
+               FROM dead_letter_queue
+               WHERE resolved_at IS NULL
+               ORDER BY created_at DESC
+               LIMIT $1""",
+            limit,
+        )
+    return [
+        {k: (str(v) if isinstance(v, uuid.UUID) else v.isoformat() if hasattr(v, 'isoformat') else v)
+         for k, v in dict(r).items()}
+        for r in rows
+    ]
+
+
+@app.post("/api/admin/dead-letter/{dlq_id}/retry")
+async def retry_dead_letter(dlq_id: str, request: Request, user: dict = Depends(require_admin)):
+    """Re-enqueue a dead-letter item for processing."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM dead_letter_queue WHERE id = $1 AND resolved_at IS NULL",
+            dlq_id,
+        )
+        if not row:
+            raise HTTPException(404, "Dead letter not found or already resolved")
+
+        job_data = row["job_data"] if isinstance(row["job_data"], dict) else json.loads(row["job_data"])
+
+        if redis_client:
+            await redis_client.lpush(PROCESS_NORMAL_QUEUE, json.dumps(job_data))
+
+        await conn.execute(
+            "UPDATE dead_letter_queue SET resolved_at = NOW(), resolved_by = 'admin_retry' WHERE id = $1",
+            dlq_id,
+        )
+
+    await audit_log(
+        user["id"], "DLQ_RETRY",
+        event_category="ADMIN", resource_type="dead_letter", resource_id=dlq_id,
+        ip_address=client_ip(request),
+    )
+    return {"status": "re-queued", "id": dlq_id}
+
+
+@app.post("/api/admin/dead-letter/{dlq_id}/resolve")
+async def resolve_dead_letter(dlq_id: str, request: Request, user: dict = Depends(require_admin)):
+    """Mark a dead-letter item as manually resolved (discard)."""
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchval(
+            "UPDATE dead_letter_queue SET resolved_at = NOW(), resolved_by = 'admin_discard' WHERE id = $1 AND resolved_at IS NULL RETURNING id",
+            dlq_id,
+        )
+    if not result:
+        raise HTTPException(404, "Dead letter not found or already resolved")
+
+    await audit_log(
+        user["id"], "DLQ_RESOLVED",
+        event_category="ADMIN", resource_type="dead_letter", resource_id=dlq_id,
+        ip_address=client_ip(request),
+    )
+    return {"status": "resolved", "id": dlq_id}
+
+
+# ============================================================
+# Frontend static (local dev & single-process deploys)
+# Registered last so /api/* and /docs keep precedence.
+# ============================================================
+_frontend_static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
+if os.path.isdir(_frontend_static_dir):
+    try:
+        app.mount("/", StaticFiles(directory=_frontend_static_dir, html=True), name="frontend")
+    except Exception as _fe_mount_err:
+        logger.warning("Frontend static mount skipped: %s", _fe_mount_err)

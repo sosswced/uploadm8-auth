@@ -1,5 +1,5 @@
 """
-UploadM8 Worker Service v3 — Deferred Processing + Concurrent Jobs
+UploadM8 Worker Service v3 — Deferred Processing + Concurrent Jobs (Full Stack)
 
 Pipeline order (critical — DO NOT REORDER):
   1.  Download        — Fetch original video + telemetry from R2
@@ -7,8 +7,11 @@ Pipeline order (critical — DO NOT REORDER):
   3.  HUD             — Burn speed overlay onto raw video (before transcode!)
   4.  Watermark       — Burn text watermark (before transcode!)
   5.  Transcode       — Deduplicated per-platform MP4s
-  6.  Thumbnail       — Extract frame from FINAL processed video
-  7.  Caption         — AI title/caption/hashtags (vision + telemetry)
+  5.5 Audio Context   — Whisper + ACRCloud + YAMNet + Hume AI context
+  5.6 Vision          — Google Cloud Vision face/OCR on best frame
+  5.7 Twelve Labs     — Deep video understanding (if enabled)
+  6.  Thumbnail       — Playwright HTML + AI backgrounds + rembg + Pillow fallback
+  7.  Caption         — Transcript + Hume emotion + audio keywords (context feeds thumbnail/caption/hashtag)
   8.  Upload          — Per-platform R2 keys
   9.  Publish         — Send to each platform API
   10. Verify          — Delivery verification loop (background)
@@ -90,6 +93,9 @@ from stages.transcode_stage import (
     get_video_info, needs_transcode, build_ffmpeg_command,
     resolve_reframe_action,
 )
+from stages.audio_stage import run_audio_context_stage
+from stages.vision_stage import run_vision_stage
+from stages.twelvelabs_stage import run_twelvelabs_stage
 from stages.thumbnail_stage import run_thumbnail_stage
 from stages.caption_stage import run_caption_stage
 from stages.hud_stage import run_hud_stage
@@ -114,6 +120,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [worker] %(message)s",
 )
 logger = logging.getLogger("uploadm8-worker")
+
+try:
+    from stages.outbound_rl import startup_log_line as _outbound_rl_startup_log_line
+
+    logger.info(_outbound_rl_startup_log_line())
+except Exception as _e:
+    logger.warning("outbound_rl startup log skipped: %s", _e)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 REDIS_URL = os.environ.get("REDIS_URL", "")
@@ -142,8 +155,10 @@ PROCESSING_WINDOW_MINUTES = int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15"
 SCHEDULER_POLL_INTERVAL = int(os.environ.get("SCHEDULER_POLL_INTERVAL", "60"))
 
 # ── Analytics auto-sync ──────────────────────────────────────────
-# How often the analytics sync loop runs (seconds). Default: 6 hours.
-ANALYTICS_SYNC_INTERVAL = int(os.environ.get("ANALYTICS_SYNC_INTERVAL_SECONDS", str(6 * 3600)))
+# How often the analytics sync *loop cycle* wakes (seconds). Default: 10800 = 3 hours ≈ 8×/day.
+# Runs inside the worker process only: no browser, no "logged in" session — 24/7 while the worker is up.
+# Per-upload work is additionally gated by ANALYTICS_RESYNC_HOURS (stale rows only).
+ANALYTICS_SYNC_INTERVAL = int(os.environ.get("ANALYTICS_SYNC_INTERVAL_SECONDS", str(3 * 3600)))
 
 # ── KPI collector ─────────────────────────────────────────────────
 # How often to collect cost/revenue from Stripe, OpenAI, Mailgun, etc. (seconds). Default: 30 min.
@@ -151,13 +166,74 @@ KPI_COLLECTOR_INTERVAL = int(os.environ.get("KPI_COLLECTOR_INTERVAL_SECONDS", st
 # How many uploads to sync per cycle (avoids platform API rate-limit hammering)
 ANALYTICS_SYNC_BATCH    = int(os.environ.get("ANALYTICS_SYNC_BATCH_SIZE", "20"))
 # Only re-sync uploads whose analytics_synced_at is older than this many hours
-ANALYTICS_RESYNC_HOURS  = int(os.environ.get("ANALYTICS_RESYNC_HOURS", "6"))
+ANALYTICS_RESYNC_HOURS  = int(os.environ.get("ANALYTICS_RESYNC_HOURS", "3"))
+
+# Account-level platform_metrics_cache refresh (TikTok/YouTube/IG/FB live rollup in DB).
+# Default: 10800s = 3 hours ≈ 8×/day. Server-side worker only — not tied to user login.
+PLATFORM_METRICS_CACHE_INTERVAL = int(
+    os.environ.get("PLATFORM_METRICS_CACHE_INTERVAL_SECONDS", str(3 * 3600))
+)
 
 # Redis resilience
 REDIS_RETRY_DELAY = 5.0
 REDIS_MAX_RETRIES = 10
 
+# Dead-letter queue: max retries before moving to DLQ
+DLQ_MAX_RETRIES = int(os.environ.get("DLQ_MAX_RETRIES", "3"))
+
 db_pool: Optional[asyncpg.Pool] = None
+
+
+def _merge_upload_prefs_into_settings(user_settings: dict, upload_record: dict) -> dict:
+    """
+    Merge upload's user_preferences (captured at presign) into user_settings.
+    Fills in platform_hashtags, always_hashtags, etc. when DB sources are empty.
+
+    This fixes platform-specific hashtags not applying when users.preferences
+    and user_preferences are empty — the presign snapshot (get_user_prefs_for_upload)
+    is stored in the upload and used here.
+    """
+    out = dict(user_settings or {})
+    raw = upload_record.get("user_preferences")
+    if not raw:
+        return out
+    try:
+        prefs = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return out
+    if not isinstance(prefs, dict):
+        return out
+
+    def _has_content(v, is_platform_map: bool = False) -> bool:
+        if v is None:
+            return False
+        if is_platform_map and isinstance(v, dict):
+            return any(
+                (isinstance(x, list) and len(x) > 0) or (isinstance(x, str) and x.strip())
+                for x in (v.values() or [])
+            )
+        if isinstance(v, (list, tuple)):
+            return len(v) > 0
+        if isinstance(v, dict):
+            return len(v) > 0
+        return bool(v)
+
+    # Fill in hashtag fields from presign when current is empty
+    ph_up = prefs.get("platformHashtags") or prefs.get("platform_hashtags")
+    ph_out = out.get("platformHashtags") or out.get("platform_hashtags")
+    if _has_content(ph_up, is_platform_map=True) and not _has_content(ph_out, is_platform_map=True):
+        out["platformHashtags"] = ph_up
+        out["platform_hashtags"] = ph_up
+
+    for camel, snake in [("alwaysHashtags", "always_hashtags"), ("blockedHashtags", "blocked_hashtags")]:
+        val = prefs.get(camel) or prefs.get(snake)
+        cur = out.get(camel) or out.get(snake)
+        if _has_content(val) and not _has_content(cur):
+            out[camel] = val
+            out[snake] = val
+
+    return out
+
 redis_client: Optional[redis.Redis] = None
 
 # ── Wallet helpers (worker-side) ─────────────────────────────────────────────
@@ -355,6 +431,34 @@ async def partial_refund_tokens(
 shutdown_requested = False
 shutdown_event: Optional[asyncio.Event] = None
 
+
+async def _send_to_dead_letter(
+    upload_id: str,
+    user_id: str,
+    job_data: dict,
+    error_code: str,
+    error_message: str,
+    retry_count: int = 0,
+):
+    """Move a failed job to the dead-letter queue for admin review."""
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO dead_letter_queue
+                       (upload_id, user_id, job_data, error_code, error_message,
+                        retry_count, max_retries, last_attempt_at)
+                   VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, NOW())
+                   ON CONFLICT DO NOTHING""",
+                upload_id, user_id, json.dumps(job_data),
+                error_code, error_message[:2000],
+                retry_count, DLQ_MAX_RETRIES,
+            )
+        logger.warning(f"[{upload_id}] Sent to dead-letter queue: {error_code}")
+    except Exception as e:
+        logger.error(f"[{upload_id}] Failed to write to DLQ: {e}")
+
 # ── Separate semaphores for each lane ────────────────────────────
 # Process semaphore: guards FFmpeg transcode slots (CPU-bound)
 # Publish semaphore: guards platform API call slots (I/O-bound)
@@ -396,9 +500,10 @@ STAGE_PROGRESS = {
     "telemetry":  18,
     "hud":        26,
     "watermark":  32,
-    "transcode":  58,
-    "thumbnail":  65,
-    "caption":    75,
+    "transcode":  55,
+    "audio":      62,
+    "thumbnail":  68,
+    "caption":    78,
     "upload":     87,
     "publish":    96,
     "notify":     99,
@@ -595,6 +700,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             return False
 
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
+        # Merge upload's user_preferences (captured at presign) into user_settings — fixes platform_hashtags
+        # when users.preferences / user_preferences are empty, so platform-specific hashtags always apply
+        user_settings = _merge_upload_prefs_into_settings(user_settings, upload_record)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
         entitlements = get_entitlements_from_user(user_record, overrides)
 
@@ -609,37 +717,29 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         )
 
         # ── Server-side entitlement cap enforcement ───────────────────────
-        # Re-resolve entitlements from DB (authoritative — not from job_data).
-        # This prevents any client or stale job_data from bypassing tier limits.
         if ctx.user_record and ctx.entitlements:
             ent = ctx.entitlements
 
-            # Cap thumbnails to tier max
             if hasattr(ctx, "num_thumbnails") and ctx.num_thumbnails > ent.max_thumbnails:
                 logger.info(
                     f"[{ctx.upload_id}] Clamping thumbnails {ctx.num_thumbnails} → {ent.max_thumbnails} (tier cap)"
                 )
                 ctx.num_thumbnails = ent.max_thumbnails
 
-            # Cap caption frames
             if hasattr(ctx, "caption_frames") and ctx.caption_frames > ent.max_caption_frames:
                 ctx.caption_frames = ent.max_caption_frames
 
-            # Enforce HUD — if can_burn_hud is False, skip HUD stage
             if not ent.can_burn_hud and hasattr(ctx, "hud_enabled"):
                 ctx.hud_enabled = False
 
-            # Enforce watermark — if can_watermark=True (free tier), force it on
             if ent.can_watermark and hasattr(ctx, "watermark_text"):
                 if not ctx.watermark_text:
                     ctx.watermark_text = "UploadM8"
 
-            # Enforce AI depth
             if not ent.can_ai and hasattr(ctx, "use_ai"):
                 ctx.use_ai = False
 
         await db_stage.mark_processing_started(db_pool, ctx)
-        # Record processing_started_at for staged jobs
         try:
             async with db_pool.acquire() as conn:
                 await conn.execute(
@@ -737,6 +837,56 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         await maybe_cancel(ctx, "transcode")
 
         # ============================================================
+        # STAGE 5.5: Audio Context — Whisper + ACRCloud + YAMNet + Hume
+        # Runs AFTER transcode so ctx.video_info.audio_codec is populated.
+        # Runs BEFORE thumbnail so ctx.audio_context feeds thumbnail/caption.
+        # ============================================================
+        try:
+            ctx = await run_audio_context_stage(ctx)
+            logger.info(
+                f"[{upload_id}] Audio ✓ — category={ctx.get_audio_category()} "
+                f"emotion={ctx.get_audio_emotion()} mood={ctx.get_thumbnail_mood()}"
+            )
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Audio context skipped: {e.reason}")
+            ctx.audio_context = {}
+        except StageError as e:
+            logger.warning(f"[{upload_id}] Audio context error: {e.message}")
+            ctx.audio_context = {}
+        except Exception as e:
+            logger.warning(f"[{upload_id}] Audio error (non-fatal): {e}")
+            ctx.audio_context = {}
+        await maybe_cancel(ctx, "audio")
+
+        # ============================================================
+        # STAGE 5.6: Vision — Google Cloud Vision face/OCR on best frame
+        # Context feeds thumbnail (face-priority crop) + caption (OCR).
+        # ============================================================
+        try:
+            ctx = await run_vision_stage(ctx)
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Vision skipped: {e.reason}")
+            ctx.vision_context = {}
+        except Exception as e:
+            logger.warning(f"[{upload_id}] Vision error (non-fatal): {e}")
+            ctx.vision_context = {}
+        await maybe_cancel(ctx, "vision")
+
+        # ============================================================
+        # STAGE 5.7: Twelve Labs — deep video understanding (if enabled)
+        # Context feeds thumbnail/caption/hashtag design.
+        # ============================================================
+        try:
+            ctx = await run_twelvelabs_stage(ctx)
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Twelve Labs skipped: {e.reason}")
+            ctx.video_understanding = {}
+        except Exception as e:
+            logger.warning(f"[{upload_id}] Twelve Labs error (non-fatal): {e}")
+            ctx.video_understanding = {}
+        await maybe_cancel(ctx, "twelvelabs")
+
+        # ============================================================
         # STAGE 6: Thumbnail — extract frame then immediately upload to R2
         # ============================================================
         try:
@@ -747,9 +897,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
 
         # ── Upload the best thumbnail to R2 and record its key ─────────────
-        # thumbnail_stage sets ctx.thumbnail_path but never uploads it.
-        # We do it here so thumbnail_r2_key is persisted to the DB and the
-        # API can return a presigned URL for the dashboard to display.
         if ctx.thumbnail_path and Path(ctx.thumbnail_path).exists():
             thumb_r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/thumbnail.jpg"
             try:
@@ -759,8 +906,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     "image/jpeg",
                 )
                 ctx.thumbnail_r2_key = thumb_r2_key
-                # Persist immediately so the API can serve it even before the
-                # pipeline finishes (user sees the thumbnail as soon as it's ready).
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         "UPDATE uploads SET thumbnail_r2_key = $1, updated_at = NOW() WHERE id = $2",
@@ -771,9 +916,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except Exception as e:
                 logger.warning(f"[{upload_id}] Thumbnail R2 upload failed (non-fatal): {e}")
 
-        # ── Upload platform-specific styled thumbnails to R2 (for publish + deferred) ──
-        # platform_thumbnail_map has local paths per platform (youtube, instagram, facebook).
-        # Upload each so publish_stage can use platform-specific cover for IG/FB (9:16).
+        # ── Upload platform-specific styled thumbnails to R2 ──────────────
         platform_thumb_r2: Dict[str, str] = {}
         pm_json = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
         try:
@@ -793,7 +936,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         if platform_thumb_r2:
             ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2)
 
-        # Also upload any additional candidate thumbnails (for tier users who can pick)
         if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
             candidate_keys = []
             for i, cpath in enumerate(ctx.thumbnail_paths):
@@ -862,7 +1004,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except Exception as e:
                 logger.warning(f"[{upload_id}] Default R2 upload failed: {e}")
 
-        # Merge platform thumbnail R2 keys into processed_assets for deferred publish
         if platform_thumb_r2:
             for k, v in platform_thumb_r2.items():
                 processed_assets[f"thumb_{k}"] = v
@@ -879,7 +1020,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
         # ============================================================
         # DEFERRED PATH: mark ready_to_publish and STOP
-        # The scheduler will fire publish when scheduled_time arrives.
         # ============================================================
         if is_deferred:
             try:
@@ -908,7 +1048,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
     except CancelRequested:
         logger.info(f"[{upload_id}] Pipeline cancelled")
-        # ── Remove video and assets from R2 ───────────────────────────────────
         try:
             async with db_pool.acquire() as conn:
                 row = await conn.fetchrow(
@@ -925,7 +1064,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                                 logger.warning(f"[{upload_id}] R2 delete {col} failed: {del_err}")
         except Exception as r2_err:
             logger.warning(f"[{upload_id}] R2 cleanup on cancel failed: {r2_err}")
-        # ── Release wallet hold on failure ───────────────────────────────────
         try:
             put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
             user_id_str = str(ctx.user_id) if ctx.user_id else None
@@ -939,15 +1077,19 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         if ctx:
             ctx.mark_error("INTERNAL", str(e))
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
-        # ── Release wallet hold on failure ───────────────────────────────────
+        _uid_for_release = str(ctx.user_id) if ctx else user_id
+        _upid_for_release = ctx.upload_id if ctx else upload_id
         try:
-            put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
-            user_id_str = str(ctx.user_id) if ctx.user_id else None
-            if user_id_str and (put_cost > 0 or aic_cost > 0):
-                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
+            put_cost, aic_cost = await _get_upload_costs(_upid_for_release)
+            if _uid_for_release and (put_cost > 0 or aic_cost > 0):
+                await _release_tokens(_upid_for_release, _uid_for_release, put_cost, aic_cost, reason="upload_failed_refund")
         except Exception as wallet_err:
-            logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
+            logger.error(f"[{upload_id}] Wallet release failed: {wallet_err}")
         await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
+        await _send_to_dead_letter(
+            upload_id, user_id, job_data, "INTERNAL", str(e)[:1000],
+            retry_count=job_data.get("_retry_count", 0),
+        )
         return False
     finally:
         if temp_dir:
@@ -987,7 +1129,7 @@ async def run_publish_and_notify(
 
     await db_stage.mark_processing_completed(db_pool, ctx)
 
-    # ── Upload email notification (respects user_preferences.email_notifications) ──
+    # ── Upload email notification ──────────────────────────────────────────
     try:
         _u = ctx.user_record
         _user_email = _u.get("email") if _u else None
@@ -1000,10 +1142,10 @@ async def run_publish_and_notify(
                 )
             _wants_email = _prefs["email_notifications"] if _prefs else True
             if _wants_email:
+                import asyncio as _aio
                 _platforms = ctx.platforms or []
                 _put_cost, _aic_cost = await _get_upload_costs(ctx.upload_id)
                 if ctx.state in ("succeeded", "partial"):
-                    import asyncio as _aio
                     _aio.ensure_future(send_upload_completed_email(
                         _user_email,
                         _user_name,
@@ -1028,7 +1170,7 @@ async def run_publish_and_notify(
     except Exception as _email_err:
         logger.warning(f"[{upload_id}] Upload email notification failed (non-fatal): {_email_err}")
 
-    # ── Finalize wallet hold (capture on success/partial, release on failure) ──
+    # ── Finalize wallet hold ───────────────────────────────────────────────
     try:
         put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
         user_id_str = str(ctx.user_id) if ctx.user_id else None
@@ -1037,7 +1179,6 @@ async def run_publish_and_notify(
                 await _capture_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost)
 
             elif ctx.is_partial_success():
-                # Capture full cost first, then refund failed-platform slots (PUT only)
                 await _capture_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost)
                 async with db_pool.acquire() as _wconn:
                     await partial_refund_tokens(
@@ -1049,7 +1190,7 @@ async def run_publish_and_notify(
                         original_put_cost=put_cost,
                     )
 
-            else:  # full failure
+            else:
                 await _release_tokens(
                     ctx.upload_id,
                     user_id_str,
@@ -1059,7 +1200,6 @@ async def run_publish_and_notify(
                 )
 
     except Exception as wallet_err:
-        # Never let wallet accounting crash the job finalization
         logger.error(f"[{ctx.upload_id}] Wallet finalize failed (non-fatal): {wallet_err}")
 
     if ctx.is_success():
@@ -1068,7 +1208,8 @@ async def run_publish_and_notify(
         elapsed = (ctx.finished_at - ctx.started_at).total_seconds() if ctx.started_at else 0
         logger.info(
             f"[{upload_id}] Pipeline {ctx.state} in {elapsed:.1f}s | "
-            f"ok={ctx.get_success_platforms()} fail={ctx.get_failed_platforms()}"
+            f"ok={ctx.get_success_platforms()} fail={ctx.get_failed_platforms()} | "
+            f"category={ctx.get_audio_category()} mood={ctx.get_thumbnail_mood()}"
         )
         return ctx.is_success()
 
@@ -1094,10 +1235,10 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             return False
 
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
+        user_settings = _merge_upload_prefs_into_settings(user_settings, upload_record)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
         entitlements = get_entitlements_from_user(user_record, overrides)
 
-        # Reconstruct minimal job_data
         job_data = {
             "upload_id": upload_id,
             "user_id": user_id,
@@ -1105,44 +1246,26 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         }
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
         ctx.user_record = user_record
-        ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
 
-        # ── Server-side entitlement cap enforcement ───────────────────────
-        # Re-resolve entitlements from DB (authoritative — not from job_data).
-        # This prevents any client or stale job_data from bypassing tier limits.
         if ctx.user_record and ctx.entitlements:
             ent = ctx.entitlements
 
-            # Cap thumbnails to tier max
             if hasattr(ctx, "num_thumbnails") and ctx.num_thumbnails > ent.max_thumbnails:
-                logger.info(
-                    f"[{ctx.upload_id}] Clamping thumbnails {ctx.num_thumbnails} → {ent.max_thumbnails} (tier cap)"
-                )
                 ctx.num_thumbnails = ent.max_thumbnails
-
-            # Cap caption frames
             if hasattr(ctx, "caption_frames") and ctx.caption_frames > ent.max_caption_frames:
                 ctx.caption_frames = ent.max_caption_frames
-
-            # Enforce HUD — if can_burn_hud is False, skip HUD stage
             if not ent.can_burn_hud and hasattr(ctx, "hud_enabled"):
                 ctx.hud_enabled = False
-
-            # Enforce watermark — if can_watermark=True (free tier), force it on
             if ent.can_watermark and hasattr(ctx, "watermark_text"):
                 if not ctx.watermark_text:
                     ctx.watermark_text = "UploadM8"
-
-            # Enforce AI depth
             if not ent.can_ai and hasattr(ctx, "use_ai"):
                 ctx.use_ai = False
 
-        # Mark processing started again (publish phase)
         await db_stage.mark_processing_started(db_pool, ctx)
 
-        # Restore platform_videos from processed_assets stored in DB
         processed_assets_json = upload_record.get("processed_assets") or "{}"
         try:
             processed_assets: Dict[str, str] = json.loads(processed_assets_json)
@@ -1158,14 +1281,9 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
                 )
             return False
 
-        # platform_videos aren't local paths anymore — they're R2 keys.
-        # publish_stage needs to download them temporarily.
-        # We store them in ctx.output_artifacts for publish_stage to read.
         ctx.output_artifacts["processed_assets"] = json.dumps(processed_assets)
         ctx.processed_r2_key = processed_assets.get("default") or next(iter(processed_assets.values()), "")
 
-        # For publish_stage to get the right file per platform, we need temp downloads.
-        # Create a minimal temp dir and download each unique asset.
         temp_dir_obj = tempfile.TemporaryDirectory()
         temp_dir = Path(temp_dir_obj.name)
         ctx.temp_dir = temp_dir
@@ -1196,7 +1314,6 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             temp_dir_obj.cleanup()
             return False
 
-        # Also set processed_video_path for fallback
         default_key = processed_assets.get("default")
         if default_key:
             default_local = temp_dir / "default.mp4"
@@ -1206,7 +1323,6 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             except Exception:
                 pass
 
-        # Download platform-specific thumbnails for publish (thumb_youtube, thumb_instagram, thumb_facebook)
         platform_thumb_map: Dict[str, str] = {}
         platform_thumb_r2_keys: Dict[str, str] = {}
         for key, r2_key in processed_assets.items():
@@ -1256,16 +1372,21 @@ async def _sync_one_upload_analytics(
     user_id: str,
     pr_list: list,
     token_map: dict,
+    token_map_by_platform: dict = None,
 ) -> dict:
     """
     Pull engagement stats for one completed upload from each platform API.
     Returns totals dict and writes them + analytics_synced_at to DB.
+
+    token_map: by token_id (account_id) for multi-account — use correct token per result
+    token_map_by_platform: fallback when account_id not in platform_results (legacy)
     """
     import httpx as _httpx
     from stages.publish_stage import decrypt_token
 
     total_views = total_likes = total_comments = total_shares = 0
     platform_stats = {}
+    platform_fallback = token_map_by_platform or {}
 
     async with _httpx.AsyncClient(timeout=15) as client:
         for pr in pr_list:
@@ -1277,7 +1398,10 @@ async def _sync_one_upload_analytics(
             if not ok:
                 continue
 
-            tok = token_map.get(plat, {})
+            account_id = pr.get("account_id")
+            tok = token_map.get(str(account_id), {}) if account_id else {}
+            if not tok:
+                tok = platform_fallback.get(plat, {})
             access_token = tok.get("access_token", "")
             if not access_token:
                 continue
@@ -1290,17 +1414,27 @@ async def _sync_one_upload_analytics(
 
             try:
                 if plat == "tiktok" and video_id:
+                    from services.tiktok_api import tiktok_envelope_error, tiktok_video_query_url
+
+                    qurl = tiktok_video_query_url()
                     resp = await client.post(
-                        "https://open.tiktokapis.com/v2/video/query/",
+                        qurl,
                         headers={
                             "Authorization": f"Bearer {access_token}",
                             "Content-Type": "application/json",
                         },
-                        params={"fields": "id,view_count,like_count,comment_count,share_count"},
                         json={"filters": {"video_ids": [str(video_id)]}},
                     )
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = {}
+                    _terr = tiktok_envelope_error(body)
+                    if _terr:
+                        logger.debug(f"[analytics-sync] TikTok envelope error for {upload_id}: {_terr}")
+                        continue
                     if resp.status_code == 200:
-                        vids = resp.json().get("data", {}).get("videos", []) or []
+                        vids = body.get("data", {}).get("videos", []) or []
                         if vids:
                             v = vids[0]
                             s = {
@@ -1338,7 +1472,6 @@ async def _sync_one_upload_analytics(
                         logger.debug(f"[analytics-sync] YouTube HTTP {resp.status_code} for {upload_id}")
 
                 elif plat == "instagram" and video_id:
-                    # Instagram Insights API requires numeric media_id (not shortcode)
                     media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
                     resp = await client.get(
                         f"https://graph.facebook.com/v21.0/{media_id}/insights",
@@ -1355,11 +1488,11 @@ async def _sync_one_upload_analytics(
                             vals = m.get("values", [])
                             val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
                             if name == "views":      ig_views     = val
-                            elif name == "plays":    ig_plays     = val  # deprecated fallback
+                            elif name == "plays":    ig_plays     = val
                             elif name == "likes":    s["likes"]   += val
                             elif name == "comments": s["comments"] += val
                             elif name == "shares":   s["shares"]  += val
-                        s["views"] = ig_views or ig_plays  # prefer views over deprecated plays
+                        s["views"] = ig_views or ig_plays
                         platform_stats["instagram"] = s
                         total_views    += s["views"];    total_likes    += s["likes"]
                         total_comments += s["comments"]; total_shares   += s["shares"]
@@ -1397,8 +1530,6 @@ async def _sync_one_upload_analytics(
                 logger.warning(f"[analytics-sync] {plat}/{upload_id}: {e}")
                 continue
 
-    # Persist results + stamp analytics_synced_at regardless (even if all zeros)
-    # so we dont endlessly retry uploads whose scopes arent approved yet.
     await conn.execute(
         """
         UPDATE uploads
@@ -1429,30 +1560,23 @@ async def _sync_one_upload_analytics(
 async def run_analytics_sync_loop() -> None:
     """
     Background loop that periodically fetches engagement stats from platform APIs
-    for all completed uploads and writes them back to the DB.
+    for completed uploads and writes them to `uploads` (views/likes/...).
 
-    Config (env vars):
-      ANALYTICS_SYNC_INTERVAL_SECONDS  How often to run (default: 21600 = 6h)
-      ANALYTICS_SYNC_BATCH_SIZE        Uploads per cycle   (default: 20)
-      ANALYTICS_RESYNC_HOURS           Re-sync every N hrs (default: 6)
-
-    Only syncs uploads where:
-      • status IN (completed, succeeded, partial)
-      • analytics_synced_at IS NULL  OR  analytics_synced_at < NOW() - resync_interval
-      • created_at within the last 90 days (older content rarely changes)
-
-    Intentionally sequential — no concurrency within the batch to stay well
-    inside platform rate limits.
+    Schedule: every ANALYTICS_SYNC_INTERVAL_SECONDS (default 3h ≈ 8×/day). Runs on the
+    worker host — users do not need to be logged in or have the app open.
+    Manual: POST /api/uploads/{id}/sync-analytics or queue/dashboard sync actions.
     """
     from stages.publish_stage import decrypt_token
 
     global shutdown_requested
 
     logger.info(
-        f"[analytics-sync] loop started | "        f"interval={ANALYTICS_SYNC_INTERVAL}s | "        f"batch={ANALYTICS_SYNC_BATCH} | "        f"resync_every={ANALYTICS_RESYNC_HOURS}h"
+        f"[analytics-sync] loop started | "
+        f"interval={ANALYTICS_SYNC_INTERVAL}s | "
+        f"batch={ANALYTICS_SYNC_BATCH} | "
+        f"resync_every={ANALYTICS_RESYNC_HOURS}h"
     )
 
-    # Stagger startup — let the worker settle before hitting platform APIs
     await asyncio.sleep(60)
 
     while not shutdown_requested:
@@ -1465,7 +1589,7 @@ async def run_analytics_sync_loop() -> None:
                     """
                     SELECT u.id AS upload_id, u.user_id, u.platform_results, u.platforms
                       FROM uploads u
-                     WHERE u.status = 'completed'
+                     WHERE u.status IN ('completed','succeeded','partial')
                        AND u.created_at >= $1
                        AND (u.analytics_synced_at IS NULL OR u.analytics_synced_at < $2)
                      ORDER BY u.analytics_synced_at ASC NULLS FIRST, u.created_at DESC
@@ -1489,7 +1613,6 @@ async def run_analytics_sync_loop() -> None:
                     upload_id = str(row["upload_id"])
                     user_id   = str(row["user_id"])
 
-                    # Parse platform_results
                     try:
                         raw_pr = row["platform_results"]
                         if isinstance(raw_pr, str):
@@ -1505,30 +1628,28 @@ async def run_analytics_sync_loop() -> None:
                             {"platform": k, **(v if isinstance(v, dict) else {})}
                             for k, v in raw_pr.items()
                         ]
-                    # Normalise canonical field aliases
                     for pr in pr_list:
                         if pr.get("platform_video_id") and not pr.get("video_id"):
                             pr["video_id"] = pr["platform_video_id"]
 
                     if not pr_list:
-                        # No platform results to query — stamp and skip
                         async with db_pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
+                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id = $1",
                                 row["upload_id"],
                             )
                         continue
 
-                    # Fetch active tokens for this user
                     async with db_pool.acquire() as conn:
                         token_rows = await conn.fetch(
-                            """SELECT platform, token_blob, account_id
+                            """SELECT id, platform, token_blob, account_id
                                   FROM platform_tokens
-                                 WHERE user_id= AND revoked_at IS NULL""",
+                                 WHERE user_id = $1 AND revoked_at IS NULL""",
                             row["user_id"],
                         )
 
                     token_map = {}
+                    token_map_by_platform = {}
                     for tr in token_rows:
                         try:
                             blob = tr["token_blob"]
@@ -1540,32 +1661,78 @@ async def run_analytics_sync_loop() -> None:
                                     dec["ig_user_id"] = str(tr["account_id"])
                                 if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
                                     dec["page_id"] = str(tr["account_id"])
-                                token_map[tr["platform"]] = dec
+                                token_id = str(tr["id"])
+                                token_map[token_id] = dec
+                                token_map_by_platform[tr["platform"]] = dec
                         except Exception:
                             pass
 
                     if not token_map:
-                        # User has no active tokens — stamp and skip
                         async with db_pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
+                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id = $1",
                                 row["upload_id"],
                             )
                         continue
 
+                    # Refresh TikTok/YouTube OAuth, then reload tokens from DB (same as app sync-analytics).
+                    try:
+                        from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
+
+                        if token_map_by_platform.get("tiktok"):
+                            await _refresh_tiktok_token(
+                                dict(token_map_by_platform["tiktok"]),
+                                db_pool=db_pool,
+                                user_id=str(user_id),
+                            )
+                        if token_map_by_platform.get("youtube"):
+                            await _refresh_youtube_token(
+                                dict(token_map_by_platform["youtube"]),
+                                db_pool=db_pool,
+                                user_id=str(user_id),
+                            )
+                        async with db_pool.acquire() as conn:
+                            trs = await conn.fetch(
+                                """SELECT id, platform, token_blob, account_id
+                                     FROM platform_tokens
+                                    WHERE user_id = $1 AND revoked_at IS NULL""",
+                                row["user_id"],
+                            )
+                        token_map = {}
+                        token_map_by_platform = {}
+                        for tr in trs:
+                            try:
+                                blob = tr["token_blob"]
+                                if isinstance(blob, str):
+                                    blob = json.loads(blob)
+                                dec = decrypt_token(blob)
+                                if dec:
+                                    if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
+                                        dec["ig_user_id"] = str(tr["account_id"])
+                                    if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
+                                        dec["page_id"] = str(tr["account_id"])
+                                    token_map[str(tr["id"])] = dec
+                                    token_map_by_platform[tr["platform"]] = dec
+                            except Exception:
+                                pass
+                    except Exception as _wr:
+                        logger.debug(f"[analytics-sync] oauth refresh skipped: {_wr}")
+
                     try:
                         async with db_pool.acquire() as conn:
                             result = await _sync_one_upload_analytics(
-                                conn, upload_id, user_id, pr_list, token_map
+                                conn, upload_id, user_id, pr_list, token_map, token_map_by_platform
                             )
                         synced += 1
                         logger.debug(
-                            f"[analytics-sync] {upload_id}: "                            f"views={result['views']} likes={result['likes']} "                            f"comments={result['comments']} shares={result['shares']}"                        )
+                            f"[analytics-sync] {upload_id}: "
+                            f"views={result['views']} likes={result['likes']} "
+                            f"comments={result['comments']} shares={result['shares']}"
+                        )
                     except Exception as e:
                         errors += 1
                         logger.warning(f"[analytics-sync] {upload_id} failed: {e}")
 
-                    # Small delay between API calls — be a good citizen
                     await asyncio.sleep(1)
 
                 logger.info(
@@ -1577,17 +1744,57 @@ async def run_analytics_sync_loop() -> None:
         except Exception as e:
             logger.exception(f"[analytics-sync] unexpected error: {e}")
 
-        # Sleep until next cycle, but wake early on shutdown
         try:
             await asyncio.wait_for(
                 asyncio.shield(shutdown_event.wait()),
                 timeout=ANALYTICS_SYNC_INTERVAL,
             )
-            break  # shutdown signalled
+            break
         except asyncio.TimeoutError:
-            pass  # normal — continue loop
+            pass
 
     logger.info("[analytics-sync] loop stopped")
+
+
+# ---------------------------------------------------------------------------
+# PLATFORM METRICS CACHE (account-level live stats → platform_metrics_cache)
+# ---------------------------------------------------------------------------
+
+async def run_platform_metrics_cache_loop() -> None:
+    """
+    Periodically refresh `platform_metrics_cache` for every user with connected accounts
+    (account-level TikTok/YouTube/IG/FB rollups).
+
+    Schedule: every PLATFORM_METRICS_CACHE_INTERVAL_SECONDS (default 3h ≈ 8×/day), worker
+    only — independent of login. Same data as GET /api/analytics/platform-metrics, persisted
+    for dashboards/analytics when the API process reads DB cache. Manual: ?force=true on that endpoint.
+    """
+    global shutdown_requested, shutdown_event
+
+    logger.info(
+        f"[platform-metrics-cache] loop started | interval={PLATFORM_METRICS_CACHE_INTERVAL}s"
+    )
+    await asyncio.sleep(120)
+
+    while not shutdown_requested:
+        try:
+            from services.platform_metrics_job import refresh_all_users_platform_metrics_cache
+
+            n = await refresh_all_users_platform_metrics_cache(db_pool)
+            logger.info(f"[platform-metrics-cache] cycle complete | users_refreshed={n}")
+        except Exception as e:
+            logger.exception(f"[platform-metrics-cache] cycle error: {e}")
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=PLATFORM_METRICS_CACHE_INTERVAL,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[platform-metrics-cache] loop stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -1598,7 +1805,6 @@ async def run_kpi_collector_loop() -> None:
     """
     Every KPI_COLLECTOR_INTERVAL (default 30 min), fetch cost/revenue from
     Stripe, OpenAI, Mailgun, Cloudflare, etc. and post to cost_tracking.
-    Uses env keys: STRIPE_SECRET_KEY, OPENAI_API_KEY, MAILGUN_API_KEY, etc.
     """
     global shutdown_requested, shutdown_event
 
@@ -1606,7 +1812,7 @@ async def run_kpi_collector_loop() -> None:
 
     logger.info(f"[kpi-collector] loop started | interval={KPI_COLLECTOR_INTERVAL}s")
 
-    await asyncio.sleep(120)  # Stagger after analytics sync
+    await asyncio.sleep(120)
 
     while not shutdown_requested:
         try:
@@ -1639,25 +1845,6 @@ async def run_kpi_collector_loop() -> None:
 async def run_scheduler_loop() -> None:
     """
     Background loop that manages deferred (staged/ready_to_publish) uploads.
-
-    Runs every SCHEDULER_POLL_INTERVAL seconds.
-
-    Two checks per cycle:
-
-    1. STAGED JOBS — files uploaded, not yet processed:
-       Finds jobs where:
-         status = 'staged'
-         AND scheduled_time - NOW() <= processing_window_minutes
-       Fires processing pipeline with deferred=True flag.
-       Pipeline runs transcode/caption/etc., marks ready_to_publish.
-
-    2. READY_TO_PUBLISH JOBS — processed, waiting for publish time:
-       Finds jobs where:
-         status = 'ready_to_publish'
-         AND scheduled_time <= NOW()
-       Fires deferred publish pipeline.
-
-    Both dispatch as asyncio tasks governed by _job_semaphore.
     """
     global shutdown_requested, _job_semaphore
 
@@ -1674,17 +1861,13 @@ async def run_scheduler_loop() -> None:
 
             async with db_pool.acquire() as conn:
 
-                # --------------------------------------------------------
-                # CHECK 1: staged jobs entering processing window
-                # --------------------------------------------------------
-                # ── Capacity-aware dispatch ────────────────────────────────
-                # Only pull as many staged jobs as there are free process slots.
-                # This prevents dispatching 500-job batches into memory when
-                # workers are already saturated.
-                free_slots = WORKER_CONCURRENCY - (
-                    WORKER_CONCURRENCY - _process_semaphore._value
-                    if _process_semaphore else WORKER_CONCURRENCY
-                )
+                if _process_semaphore is not None:
+                    try:
+                        free_slots = _process_semaphore._value
+                    except AttributeError:
+                        free_slots = WORKER_CONCURRENCY
+                else:
+                    free_slots = 0
                 dispatch_limit = max(1, free_slots)
 
                 staged_jobs = await conn.fetch(
@@ -1705,7 +1888,6 @@ async def run_scheduler_loop() -> None:
                     upload_id = str(row["upload_id"])
                     user_id = str(row["user_id"])
 
-                    # Atomically claim the job (prevent duplicate dispatch)
                     updated = await conn.fetchval(
                         """
                         UPDATE uploads
@@ -1716,7 +1898,7 @@ async def run_scheduler_loop() -> None:
                         row["upload_id"],
                     )
                     if not updated:
-                        continue  # Already claimed by another worker instance
+                        continue
 
                     logger.info(
                         f"[{upload_id}] Scheduler: staging → queued for processing "
@@ -1727,15 +1909,12 @@ async def run_scheduler_loop() -> None:
                         "upload_id": upload_id,
                         "user_id": user_id,
                         "job_id": f"scheduled-{upload_id}",
-                        "deferred": True,  # <-- tells pipeline to stop before publish
+                        "deferred": True,
                     }
 
                     task = asyncio.create_task(_run_job_with_semaphore(job_data))
                     logger.debug(f"[{upload_id}] Processing task dispatched")
 
-                # --------------------------------------------------------
-                # CHECK 2: ready_to_publish jobs past scheduled_time
-                # --------------------------------------------------------
                 ready_jobs = await conn.fetch(
                     """
                     SELECT u.id AS upload_id, u.user_id, u.scheduled_time
@@ -1753,7 +1932,6 @@ async def run_scheduler_loop() -> None:
                     upload_id = str(row["upload_id"])
                     user_id = str(row["user_id"])
 
-                    # Atomically claim
                     updated = await conn.fetchval(
                         """
                         UPDATE uploads
@@ -1780,24 +1958,19 @@ async def run_scheduler_loop() -> None:
         except Exception as e:
             logger.exception(f"Scheduler loop error: {e}")
 
-        # Wait for next poll cycle
         try:
             await asyncio.wait_for(
                 asyncio.shield(shutdown_event.wait()),
                 timeout=SCHEDULER_POLL_INTERVAL,
             )
-            break  # shutdown was signalled
+            break
         except asyncio.TimeoutError:
-            pass  # normal — continue loop
+            pass
 
     logger.info("Scheduler loop stopped")
 
 
 async def _run_job_with_semaphore(job_data: dict) -> None:
-    """
-    Wrapper: run processing pipeline (FFmpeg-heavy) inside the PROCESS semaphore.
-    Uses _process_semaphore (WORKER_CONCURRENCY=3 slots by default).
-    """
     async with _process_semaphore:
         try:
             await run_processing_pipeline(job_data)
@@ -1806,11 +1979,6 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
 
 
 async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> None:
-    """
-    Wrapper: run deferred publish (API-light) inside the PUBLISH semaphore.
-    Uses _publish_semaphore (PUBLISH_CONCURRENCY=5 slots by default).
-    This NEVER blocks on FFmpeg transcode slots — separate lane entirely.
-    """
     async with _publish_semaphore:
         try:
             await run_deferred_publish(upload_id, user_id)
@@ -1838,25 +2006,25 @@ async def _process_one_job(job_json: str) -> None:
 async def process_jobs() -> None:
     """
     Consume process-lane jobs from Redis (FFmpeg-heavy).
-    Reads from [process:priority, process:normal] + legacy queues.
-    Scheduled/staged jobs are handled by run_scheduler_loop() instead.
     """
     global shutdown_requested, redis_client, _process_semaphore, _publish_semaphore, _job_semaphore
 
     _process_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
     _publish_semaphore = asyncio.Semaphore(PUBLISH_CONCURRENCY)
-    _job_semaphore     = _process_semaphore  # legacy alias
+    _job_semaphore     = _process_semaphore
 
-    # All queues worker should drain — priority first, then normal, then legacy
     all_process_queues = [
         PROCESS_PRIORITY_QUEUE,
         PROCESS_NORMAL_QUEUE,
-        PRIORITY_JOB_QUEUE,   # legacy
-        UPLOAD_JOB_QUEUE,     # legacy
+        PRIORITY_JOB_QUEUE,
+        UPLOAD_JOB_QUEUE,
     ]
 
     logger.info(
-        f"Job consumer started | "        f"process_concurrency={WORKER_CONCURRENCY} | "        f"publish_concurrency={PUBLISH_CONCURRENCY} | "        f"process_queues={PROCESS_PRIORITY_QUEUE}, {PROCESS_NORMAL_QUEUE}"
+        f"Job consumer started | "
+        f"process_concurrency={WORKER_CONCURRENCY} | "
+        f"publish_concurrency={PUBLISH_CONCURRENCY} | "
+        f"process_queues={PROCESS_PRIORITY_QUEUE}, {PROCESS_NORMAL_QUEUE}"
     )
 
     consecutive_redis_errors = 0
@@ -1930,9 +2098,14 @@ async def main() -> None:
         sys.exit(1)
 
     total_concurrency = WORKER_CONCURRENCY + PUBLISH_CONCURRENCY
-    db_min = max(2, total_concurrency)
-    db_max = max(15, total_concurrency * 3)
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=db_min, max_size=db_max)
+    db_min = int(os.environ.get("WORKER_DB_POOL_MIN", str(max(3, total_concurrency))))
+    db_max = int(os.environ.get("WORKER_DB_POOL_MAX", str(max(20, total_concurrency * 3))))
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=db_min,
+        max_size=db_max,
+        command_timeout=60,
+    )
     logger.info(f"Database connected | pool={db_min}-{db_max}")
 
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -1941,17 +2114,12 @@ async def main() -> None:
 
     shutdown_event = asyncio.Event()
 
-    # Six concurrent loops:
-    # 1. process_jobs          — Redis consumer for immediate uploads
-    # 2. run_scheduler_loop    — polls DB for staged/ready_to_publish jobs
-    # 3. run_verification_loop — delivery verification polling
-    # 4. run_analytics_sync_loop — periodic engagement stats fetch from platform APIs
-    # 5. run_kpi_collector_loop — every 30 min: Stripe/Mailgun/OpenAI costs → cost_tracking
     tasks = [
         asyncio.create_task(process_jobs()),
         asyncio.create_task(run_scheduler_loop()),
         asyncio.create_task(run_verification_loop(db_pool, shutdown_event)),
         asyncio.create_task(run_analytics_sync_loop()),
+        asyncio.create_task(run_platform_metrics_cache_loop()),
         asyncio.create_task(run_kpi_collector_loop()),
     ]
 
@@ -1967,6 +2135,12 @@ async def main() -> None:
             pass
         try:
             await notify_admin_worker_stop(db_pool)
+        except Exception:
+            pass
+        # Close Playwright browser on shutdown
+        try:
+            from stages.playwright_stage import close_browser
+            await close_browser()
         except Exception:
             pass
         if db_pool:

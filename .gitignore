@@ -1,6 +1,5 @@
 .env
 .env.*
-!.env.example
 
 # Python
 __pycache__/
@@ -15,6 +14,9 @@ __pycache__/
 venv/
 venv*/
 
+# Cursor / local agent
+.cursor/
+
 # IDE
 .vscode/
 
@@ -25,7 +27,18 @@ Desktop.ini
 # --- Secrets / env ---
 .env
 .env.*
-!.env.example
+*credentials*.json
+*credential*.json
+*service-account*.json
+*service_account*.json
+*secret*.json
+*apikey*.json
+*api-key*.json
+# Google Cloud service account JSON (private keys; never commit)
+social-media-*.json
+# Root-level JSON except known config (add !exceptions as needed)
+/*.json
+!r2-cors-policy.json
 
 # --- Python cache / build ---
 __pycache__/
@@ -63,6 +76,10 @@ logs/
 .coverage
 htmlcov/
 .pytest_cache/
+
+# --- Test artifacts ---
+tests/screenshots/*.png
+tests/.playwright-auth-state.json
 
 # --- Local tooling ---
 .mypy_cache/

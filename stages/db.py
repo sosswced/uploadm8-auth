@@ -78,9 +78,14 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                     # Merge preference columns so POST /api/settings/preferences is respected
                     for k in ("styled_thumbnails", "auto_thumbnails", "auto_captions", "thumbnail_interval",
                               "default_privacy", "ai_hashtags_enabled", "ai_hashtag_count", "always_hashtags",
-                              "blocked_hashtags", "platform_hashtags", "email_notifications", "discord_webhook"):
+                              "blocked_hashtags", "platform_hashtags", "email_notifications", "discord_webhook",
+                              "use_audio_context"):
                         if k in prefs_d and prefs_d[k] is not None:
                             result[k] = prefs_d[k]
+                    # Ensure camelCase aliases for hashtag fields (context.get_effective_hashtags checks both)
+                    for snake, camel in [("platform_hashtags", "platformHashtags"), ("always_hashtags", "alwaysHashtags"), ("blocked_hashtags", "blockedHashtags")]:
+                        if result.get(snake) is not None and result.get(camel) is None:
+                            result[camel] = result[snake]
                     result.setdefault("styled_thumbnails", True)
                     result.setdefault("styledThumbnails", result.get("styled_thumbnails", True))
         except asyncpg.exceptions.UndefinedTableError:
@@ -120,6 +125,7 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "captionFrameCount":"caption_frame_count",
                         "maxHashtags":      "max_hashtags",
                         "trillOpenaiModel": "openai_model",
+                        "useAudioContext":  "use_audio_context",
                     }
                     for camel, snake in FIELD_MAP.items():
                         val = prefs.get(camel)
@@ -185,6 +191,7 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                 {
                     "platform": r.platform,
                     "success": r.success,
+                    "token_row_id": getattr(r, "token_row_id", None),
                     "account_id": getattr(r, "account_id", None),
                     "account_name": getattr(r, "account_name", None),
                     "account_username": getattr(r, "account_username", None),
@@ -575,6 +582,80 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
         return None
 
 
+async def load_platform_token_with_identity(
+    pool: asyncpg.Pool,
+    user_id: str,
+    platform: str,
+    token_row_id: Optional[str] = None,
+) -> tuple:
+    """
+    Load a platform token AND its account identity fields.
+
+    If token_row_id is provided (a specific platform_tokens.id UUID),
+    load that exact row — used when target_accounts specifies which account to publish to.
+
+    Returns (token_blob_dict, identity_dict) or (None, None).
+    identity_dict = {token_row_id, account_id, account_username, account_name, account_avatar}
+    """
+    try:
+        async with pool.acquire() as conn:
+            if token_row_id:
+                row = await conn.fetchrow(
+                    """SELECT * FROM platform_tokens
+                       WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL""",
+                    token_row_id, user_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """SELECT * FROM platform_tokens
+                       WHERE user_id = $1 AND platform = $2 AND revoked_at IS NULL
+                       ORDER BY is_primary DESC NULLS LAST, updated_at DESC
+                       LIMIT 1""",
+                    user_id, platform,
+                )
+
+            if not row:
+                return None, None
+
+            row_dict = dict(row)
+            identity = {
+                "token_row_id":     str(row_dict["id"]),
+                "account_id":       row_dict.get("account_id") or "",
+                "account_username": row_dict.get("account_username") or "",
+                "account_name":     row_dict.get("account_name") or "",
+                "account_avatar":   row_dict.get("account_avatar") or "",
+            }
+
+            token_data = row_dict.get("token_blob") or row_dict.get("token_data")
+            if token_data:
+                if isinstance(token_data, str):
+                    parsed = json.loads(token_data)
+                    if isinstance(parsed, str):
+                        try:
+                            parsed = json.loads(parsed)
+                        except Exception:
+                            pass
+                else:
+                    parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
+
+                account_id_col = row_dict.get("account_id")
+                if account_id_col and isinstance(parsed, dict):
+                    if platform == "instagram" and not parsed.get("ig_user_id"):
+                        parsed["ig_user_id"] = str(account_id_col)
+
+                if isinstance(parsed, dict):
+                    parsed["_account_name"] = row_dict.get("account_name", "")
+                    parsed["_account_username"] = row_dict.get("account_username", "") or ""
+                    parsed["_account_avatar"] = row_dict.get("account_avatar", "") or ""
+                return parsed, identity
+
+            return None, None
+
+    except Exception as e:
+        logger.warning(f"load_platform_token_with_identity failed: {e}")
+        return None, None
+
+
 async def load_all_platform_token_ids(pool: asyncpg.Pool, user_id: str, platform: str) -> list[str]:
     """Return all platform_tokens.id for the user's connected accounts on this platform.
     Used for multi-account publishing: when no target_accounts specified, publish to ALL.
@@ -887,6 +968,51 @@ async def load_processed_assets(pool: asyncpg.Pool, upload_id: str) -> Dict[str,
             pass
 
     return {}
+
+
+async def update_platform_token_identity_from_upload(
+    pool: asyncpg.Pool,
+    token_row_id: str,
+    user_id: str,
+    account_username: Optional[str] = None,
+    account_name: Optional[str] = None,
+    account_id: Optional[str] = None,
+) -> None:
+    """
+    Backfill platform_tokens with account identity when we get it from post-upload
+    response (e.g. YouTube channelTitle). Only updates fields that are currently empty.
+    """
+    if not pool or not token_row_id or not user_id:
+        return
+    updates = []
+    params: list = [user_id, token_row_id]
+    idx = 3
+    if account_username and (account_username or "").strip():
+        updates.append(f"account_username = COALESCE(NULLIF(TRIM(account_username), ''), ${idx})")
+        params.append((account_username or "").strip())
+        idx += 1
+    if account_name and (account_name or "").strip():
+        updates.append(f"account_name = COALESCE(NULLIF(TRIM(account_name), ''), ${idx})")
+        params.append((account_name or "").strip())
+        idx += 1
+    if account_id and (account_id or "").strip():
+        updates.append(f"account_id = COALESCE(NULLIF(TRIM(account_id), ''), ${idx})")
+        params.append((account_id or "").strip())
+        idx += 1
+    if not updates:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"""UPDATE platform_tokens SET {', '.join(updates)}, updated_at = NOW()
+                    WHERE id = $2 AND user_id = $1 AND revoked_at IS NULL""",
+                params[0],
+                params[1],
+                *params[2:],
+            )
+            logger.debug(f"Updated platform_tokens identity for token_row_id={token_row_id[:8]}")
+    except Exception as e:
+        logger.warning(f"update_platform_token_identity_from_upload failed: {e}")
 
 
 async def save_refreshed_token(

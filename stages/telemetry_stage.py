@@ -334,8 +334,8 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
     ctx.telemetry_data = telemetry
 
     # Get user thresholds from settings
-    speeding_mph = int(ctx.user_settings.get("speeding_mph", DEFAULT_SPEEDING_MPH))
-    euphoria_mph = int(ctx.user_settings.get("euphoria_mph", DEFAULT_EUPHORIA_MPH))
+    speeding_mph = int((ctx.user_settings or {}).get("speeding_mph", DEFAULT_SPEEDING_MPH))
+    euphoria_mph = int((ctx.user_settings or {}).get("euphoria_mph", DEFAULT_EUPHORIA_MPH))
 
     # Calculate speeding/euphoria seconds
     if telemetry.points and len(telemetry.points) > 1:

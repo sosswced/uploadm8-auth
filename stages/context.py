@@ -14,6 +14,56 @@ from typing import Optional, List, Dict, Any
 from .entitlements import Entitlements
 
 
+def expand_hashtag_items(items: Any) -> List[str]:
+    """
+    Flatten hashtag inputs from DB/UI. Handles nested lists and JSON-looking strings
+    (e.g. '["tag1","tag2"]' stored as a single element) so publish never emits '#"[\"a\"]"' artifacts.
+    """
+    import json as _json
+
+    out: List[str] = []
+    if items is None:
+        return out
+    if isinstance(items, str):
+        s = items.strip()
+        if not s:
+            return out
+        if s.startswith("[") and "]" in s:
+            try:
+                parsed = _json.loads(s)
+                return expand_hashtag_items(parsed)
+            except Exception:
+                pass
+        return [t for t in s.replace(",", " ").split() if t.strip()]
+    if not isinstance(items, (list, tuple)):
+        return out
+    for item in items:
+        if item is None:
+            continue
+        s = str(item).strip()
+        if not s:
+            continue
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith('"[') and "]" in s):
+            try:
+                cleaned = s.strip('"').strip("'")
+                parsed = _json.loads(cleaned)
+                if isinstance(parsed, list):
+                    out.extend(expand_hashtag_items(parsed))
+                    continue
+            except Exception:
+                pass
+        if s.startswith("#") and "[" in s:
+            try:
+                parsed = _json.loads(s[1:])
+                if isinstance(parsed, list):
+                    out.extend(expand_hashtag_items(parsed))
+                    continue
+            except Exception:
+                pass
+        out.append(s)
+    return out
+
+
 @dataclass
 class TelemetryData:
     """Parsed telemetry data from .map file."""
@@ -118,16 +168,17 @@ class PlatformResult:
     platform: str
     success: bool
 
-    # Multi-account: which profile this result is for
-    account_id: Optional[str] = None  # platform_tokens.id
-    account_name: Optional[str] = None  # e.g. channel title or display name
-    account_username: Optional[str] = None  # e.g. @handle, YouTube custom URL
-    account_avatar: Optional[str] = None  # profile picture URL for Queue/Scheduled display
-
     # Step A (accepted)
     platform_video_id: Optional[str] = None
     platform_url: Optional[str] = None
     publish_id: Optional[str] = None
+
+    # Account identity — set by publish_stage so we always know which platform_tokens row was used
+    token_row_id: Optional[str] = None  # platform_tokens.id (UUID)
+    account_id: Optional[str] = None  # platform's own account ID
+    account_username: Optional[str] = None  # e.g. cedybandz5254
+    account_name: Optional[str] = None  # e.g. Cedy Bandz
+    account_avatar: Optional[str] = None  # avatar URL
 
     # Audit/debug
     attempt_id: Optional[str] = None
@@ -198,6 +249,10 @@ class JobContext:
     # Few-shot examples from upload_caption_memory (set by caption_stage when db_pool provided)
     caption_memory_examples: List[Dict[str, Any]] = field(default_factory=list)
 
+    # Audio context — populated by audio_stage when Whisper transcription succeeds
+    ai_transcript: Optional[str] = None
+    audio_path: Optional[Path] = None   # temp WAV path; cleaned up with temp_dir
+
     telemetry_data: Optional[TelemetryData] = None
     trill_score: Optional[TrillScore] = None
 
@@ -221,6 +276,19 @@ class JobContext:
     put_cost: int = 0
     aic_cost: int = 0
     compute_seconds: float = 0.0
+
+    # ── Intelligence context fields (populated by new stages) ────────────────
+    # audio_stage: Whisper + ACRCloud + YAMNet + Hume + GPT classification
+    audio_context: Optional[Dict[str, Any]] = None
+
+    # vision_stage: Google Cloud Vision face detection + OCR + labels
+    vision_context: Optional[Dict[str, Any]] = None
+
+    # twelvelabs_stage: Deep video understanding (scene description + title)
+    video_understanding: Optional[Dict[str, Any]] = None
+
+    # thumbnail_stage: AI creative brief for rendering
+    thumbnail_brief: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         # Keep legacy and new fields in sync
@@ -263,10 +331,27 @@ class JobContext:
             return self.processed_video_path
         return self.local_video_path
 
-    def get_effective_title(self) -> str:
-        return self.ai_title or self.title or self.filename
+    def get_effective_title(self, platform: str = "") -> str:
+        """Best title for publishing. Optional platform uses user_settings platformTitles (override)."""
+        us = self.user_settings or {}
+        if platform:
+            pt = us.get("platformTitles") or us.get("platform_titles") or {}
+            if isinstance(pt, dict) and pt:
+                pv = pt.get(platform) or pt.get((platform or "").lower())
+                if isinstance(pv, str) and pv.strip():
+                    return pv.strip()
+        tl_title = (self.video_understanding or {}).get("title_suggestion", "")
+        return self.ai_title or tl_title or self.title or self.filename
 
-    def get_effective_caption(self) -> str:
+    def get_effective_caption(self, platform: str = "") -> str:
+        """Best caption. Optional platform uses user_settings platformCaptions (override)."""
+        us = self.user_settings or {}
+        if platform:
+            pc = us.get("platformCaptions") or us.get("platform_captions") or {}
+            if isinstance(pc, dict) and pc:
+                cv = pc.get(platform) or pc.get((platform or "").lower())
+                if isinstance(cv, str) and cv.strip():
+                    return cv.strip()
         return self.ai_caption or self.caption or ""
 
     def get_effective_hashtags(self, platform: str = "") -> List[str]:
@@ -288,7 +373,9 @@ class JobContext:
             raw_always = [
                 t.strip() for t in raw_always.replace(",", " ").split() if t.strip()
             ]
-        always_tags: List[str] = list(raw_always) if isinstance(raw_always, list) else []
+        always_tags: List[str] = expand_hashtag_items(
+            raw_always if isinstance(raw_always, list) else []
+        )
 
         # ── Platform-specific hashtags (same logic as always_hashtags) ────
         # Case-insensitive key lookup: frontend may send "TikTok", "Instagram", etc.
@@ -311,7 +398,7 @@ class JobContext:
                             break
                 if isinstance(raw, str):
                     raw = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
-                platform_tags = list(raw) if isinstance(raw, list) else []
+                platform_tags = expand_hashtag_items(raw) if isinstance(raw, list) else []
 
         # ── Blocked hashtags from settings page ──────────────────────────
         raw_blocked = us.get("blockedHashtags") or us.get("blocked_hashtags") or []
@@ -324,9 +411,9 @@ class JobContext:
             for t in (raw_blocked if isinstance(raw_blocked, list) else [])
         }
 
-        # ── Merge: always → platform → base → AI (same pipeline for all) ─
-        base = list(self.hashtags or [])
-        ai   = list(self.ai_hashtags or [])
+        # ── Merge: always → platform → base → AI (hashtags merge only; no overwrite) ─
+        base = expand_hashtag_items(self.hashtags or [])
+        ai = expand_hashtag_items(self.ai_hashtags or [])
 
         seen: set = set()
         merged: List[str] = []
@@ -350,6 +437,87 @@ class JobContext:
 
     def get_success_platforms(self) -> List[str]:
         return [r.platform for r in self.platform_results if r.success]
+
+    # ── Audio context helpers ─────────────────────────────────────────────────
+    def get_audio_category(self) -> str:
+        return (self.audio_context or {}).get("category", "other")
+
+    def get_audio_emotion(self) -> str:
+        return (self.audio_context or {}).get("emotional_tone", "hype_energetic")
+
+    def get_thumbnail_mood(self) -> str:
+        return (self.audio_context or {}).get("thumbnail_mood", "bold_dramatic")
+
+    def get_transcript(self) -> str:
+        return (self.audio_context or {}).get("transcript", "")
+
+    def has_copyright_risk(self) -> bool:
+        return bool((self.audio_context or {}).get("copyright_risk", False))
+
+    def get_caption_style(self) -> str:
+        return (self.audio_context or {}).get("caption_style", "hype_street")
+
+    def get_audio_keywords(self) -> List[str]:
+        return (self.audio_context or {}).get("suggested_keywords", [])
+
+    def get_hume_dominant_emotion(self) -> str:
+        return (self.audio_context or {}).get("hume_emotions", {}).get("dominant_emotion", "")
+
+    def get_yamnet_profile(self) -> str:
+        return (self.audio_context or {}).get("sound_profile", "unknown")
+
+    def get_canonical_category(self) -> Optional[str]:
+        """
+        Unified category from supercharged signals. Used by caption and thumbnail
+        to stay consistent. Priority: audio_context > video_understanding (if we
+        infer from scene) > None (caller falls back to _detect_category).
+
+        Maps audio categories (e.g. music_performance, food_cooking) to
+        caption/thumbnail slugs (music, food).
+        """
+        ac = self.audio_context or {}
+        raw = ac.get("category", "other")
+        if not raw or raw == "other":
+            return None
+        # Map audio categories to caption/thumbnail category slugs
+        _AUDIO_TO_CANONICAL = {
+            "automotive": "automotive",
+            "sports_extreme": "sports",
+            "gaming": "gaming",
+            "music_performance": "music",
+            "food_cooking": "food",
+            "travel_vlog": "travel",
+            "fitness_workout": "fitness",
+            "comedy_entertainment": "comedy",
+            "educational": "education",
+            "lifestyle_fashion": "lifestyle",
+            "pets_animals": "pets",
+            "nature_outdoors": "travel",
+            "business_finance": "real_estate",
+            "technology": "tech",
+            "art_creative": "lifestyle",
+            "family_kids": "lifestyle",
+            "news_commentary": "general",
+        }
+        return _AUDIO_TO_CANONICAL.get(raw, raw)
+
+
+    # ── Vision context helpers ────────────────────────────────────────────────
+    def has_expressive_faces(self) -> bool:
+        return bool((self.vision_context or {}).get("expressive", False))
+
+    def get_ocr_text(self) -> str:
+        return (self.vision_context or {}).get("ocr_text", "")
+
+    def get_scene_labels(self) -> List[str]:
+        return (self.vision_context or {}).get("label_names", [])
+
+    # ── Twelve Labs helpers ───────────────────────────────────────────────────
+    def get_scene_description(self) -> str:
+        return (self.video_understanding or {}).get("scene_description", "")
+
+    def get_tl_title_suggestion(self) -> str:
+        return (self.video_understanding or {}).get("title_suggestion", "")
 
     # ── Convenience location properties ───────────────────────────────────────
     # The worker and some pipeline stages access ctx.location_name directly.
@@ -385,7 +553,8 @@ class JobContext:
         """
         Build variables for THUMBNAIL_BRIEF_PROMPT. Used by thumbnail_stage to
         generate platform-aware thumbnail briefs (headline, badge, props, etc.).
-        Pass category from thumbnail_stage (from _detect_category) when available.
+        Pass category from thumbnail_stage when available; otherwise uses
+        canonical_category (audio) or general.
         """
         trill = self.trill or self.trill_score
         telemetry = self.telemetry or self.telemetry_data
@@ -394,14 +563,23 @@ class JobContext:
             max_mph = getattr(telemetry, "max_speed_mph", 0) or 0
         platforms = [str(p).lower() for p in (self.platforms or [])]
         platforms_csv = ",".join(platforms) if platforms else "youtube,instagram,facebook,tiktok"
+        ac = self.audio_context or {}
+        # Category: caller arg > canonical (audio) > thumbnail_category > general
+        cat = category or self.get_canonical_category() or getattr(self, "thumbnail_category", None) or "general"
+        # Supercharged: emotional tone, suggested keywords for caption/thumbnail alignment
+        emotional_tone = ac.get("emotional_tone", "")
+        suggested_kw = ac.get("suggested_keywords", [])
+        keywords_str = ", ".join(suggested_kw[:8]) if suggested_kw else ""
         return {
             "effective_title": self.get_effective_title() or self.filename or "Video",
             "effective_caption": self.get_effective_caption() or "",
-            "category": category or getattr(self, "thumbnail_category", None) or "general",
+            "category": cat,
             "location_name": self.location_name or "",
             "trill_bucket": trill.bucket if trill else "",
             "max_speed_mph": str(max_mph),
             "platforms_csv": platforms_csv,
+            "emotional_tone": emotional_tone,
+            "suggested_keywords": keywords_str,
         }
 
 
@@ -419,6 +597,8 @@ CONTEXT
 - Trill bucket: {trill_bucket}
 - Max speed mph: {max_speed_mph}
 - Target platforms: {platforms_csv}
+- Emotional tone (from audio): {emotional_tone}
+- Suggested keywords (align with caption): {suggested_keywords}
 
 HARD RULES
 - No profanity, no hate, no nudity, no weapons emphasis, no illegal claims.
@@ -477,12 +657,14 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
         filename=upload_record.get("filename", ""),
         file_size=upload_record.get("file_size", 0),
         platforms=upload_record.get("platforms", []) or [],
-        target_accounts=upload_record.get("target_accounts", []) or [],
+        target_accounts=list(dict.fromkeys(str(t) for t in (upload_record.get("target_accounts") or []) if t)),
         title=upload_record.get("title", ""),
         caption=upload_record.get("caption", ""),
-        hashtags=upload_record.get("hashtags", []) or [],
+        hashtags=expand_hashtag_items(upload_record.get("hashtags") or []),
         privacy=upload_record.get("privacy", "public") or "public",
         reframe_mode=reframe_mode,
         user_settings=user_settings or {},
         entitlements=entitlements,
+        put_cost=upload_record.get("put_reserved", 0),
+        aic_cost=upload_record.get("aic_reserved", 0),
     )

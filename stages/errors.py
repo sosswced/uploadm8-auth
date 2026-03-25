@@ -10,7 +10,8 @@ Canonical exports:
   - SkipStage
   - CancelRequested
   - PublishError, StorageError, TelemetryError, TranscodeError,
-    ThumbnailError, CaptionError, WatermarkError, VerifyError, HUDError
+    ThumbnailError, CaptionError, WatermarkError, VerifyError, HUDError,
+    AudioError
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ class ErrorCode(str, Enum):
     VERIFY = "VERIFY"
     HUD = "HUD"
     HUD_GENERATION_FAILED = "HUD_GENERATION_FAILED"
+    AUDIO = "AUDIO_ERROR"
 
     # FFmpeg
     FFMPEG_FAILED = "FFMPEG_FAILED"
@@ -184,6 +186,12 @@ class HUDError(StageError):
         super().__init__(code=code, message=message, stage="hud", meta=meta, retryable=retryable, detail=detail)
 
 
+class AudioError(StageError):
+    def __init__(self, message: str = "Audio context stage failed", *, code=ErrorCode.AUDIO,
+                 meta: Optional[Dict[str, Any]] = None, retryable: bool = False, detail: str = None):
+        super().__init__(code=code, message=message, stage="audio", meta=meta, retryable=retryable, detail=detail)
+
+
 __all__ = [
     "ErrorCode",
     "StageError",
@@ -198,4 +206,5 @@ __all__ = [
     "WatermarkError",
     "VerifyError",
     "HUDError",
+    "AudioError",
 ]

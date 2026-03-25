@@ -1,9 +1,20 @@
 """
-UploadM8 Thumbnail Stage — AI-Powered Universal Edition
-========================================================
+UploadM8 Thumbnail Stage — AI-Powered Universal Edition (Supercharged)
+======================================================================
 Generate multiple candidate thumbnails, score each frame for sharpness,
 then run AI-powered content-category-aware selection to pick the most
 algorithmically compelling frame — not just the sharpest one.
+
+Rendering pipeline (when styled thumbnails enabled):
+  1. FFmpeg multi-frame extraction + blurdetect sharpness scoring
+  2. GPT-4o-mini vision — emotion/expressiveness scoring
+  3. Google Cloud Vision face data — face-priority crop (from ctx.vision_context)
+  4. rembg subject isolation (free, local)
+  5. AI background generation (fal.ai → Replicate → gradient fallback)
+  6. Playwright HTML/CSS rendering (primary) → Pillow fallback
+  7. Platform-aware canvas sizing
+
+Templates auto-selected by thumbnail_mood from audio_context.
 
 Flow:
   1. Probe video duration via ffprobe
@@ -50,6 +61,7 @@ Exports: run_thumbnail_stage(ctx)
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -57,9 +69,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import httpx
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 from .context import JobContext, THUMBNAIL_BRIEF_PROMPT
 from .errors import SkipStage
+from .entitlements import should_generate_thumbnails
+from .outbound_rl import outbound_slot
 
 logger = logging.getLogger("uploadm8-worker.thumbnail")
 
@@ -69,6 +84,33 @@ MAX_THUMBNAIL_OFFSET     = 300.0
 MIN_THUMB_SIZE           = 2048          # bytes — smaller = rejected
 OPENAI_API_KEY           = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_THUMB_MODEL       = os.environ.get("OPENAI_THUMB_MODEL", "gpt-4o-mini")
+
+# Full-stack rendering
+FFMPEG_PATH              = os.environ.get("FFMPEG_PATH", "ffmpeg")
+FFPROBE_PATH             = os.environ.get("FFPROBE_PATH", "ffprobe")
+MAX_FRAME_SAMPLES        = int(os.environ.get("THUMBNAIL_MAX_SAMPLES", "12"))
+PLAYWRIGHT_ENABLED       = os.environ.get("PLAYWRIGHT_ENABLED", "true").lower() == "true"
+
+PLATFORM_CANVAS: Dict[str, Tuple[int, int]] = {
+    "youtube":   (1280, 720),
+    "facebook":  (1280, 720),
+    "tiktok":    (1080, 1920),
+    "instagram": (1080, 1080),
+}
+DEFAULT_CANVAS = (1280, 720)
+
+MOOD_TO_TEMPLATE = {
+    "bold_dramatic":      "HEAT",
+    "neon_vibrant":       "NEON_DROP",
+    "dark_cinematic":     "CINEMATIC",
+    "clean_minimal":      "CLEAN_PRO",
+    "bright_energetic":   "BRIGHT_POP",
+    "professional_clean": "INFO_CARD",
+}
+
+_FONT_SEARCH = ["/app/assets/fonts", "/usr/share/fonts/truetype/google", "/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/truetype/liberation", "/usr/share/fonts/truetype/ubuntu", "/usr/share/fonts"]
+_FONT_BOLD    = ["BebasNeue-Regular.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "Ubuntu-Bold.ttf"]
+_FONT_REGULAR = ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "Ubuntu-Regular.ttf"]
 
 
 # ============================================================
@@ -337,6 +379,91 @@ _THUMB_CATEGORIES: Dict[str, Dict] = {
     },
 }
 
+def _load_font(names: List[str], size: int) -> ImageFont.FreeTypeFont:
+    """Load first available font from search paths."""
+    for directory in _FONT_SEARCH:
+        for name in names:
+            candidate = Path(directory) / name
+            if candidate.exists():
+                try:
+                    return ImageFont.truetype(str(candidate), size)
+                except Exception:
+                    continue
+    return ImageFont.load_default()
+
+
+def _primary_platform(platforms: List[str]) -> str:
+    for p in ["youtube", "tiktok", "instagram", "facebook"]:
+        if p in (platforms or []):
+            return p
+    return "youtube"
+
+
+def _primary_canvas(platforms: List[str]) -> Tuple[int, int]:
+    return PLATFORM_CANVAS.get(_primary_platform(platforms), DEFAULT_CANVAS)
+
+
+def _pick_headline(ctx: JobContext, brief: Dict) -> str:
+    h = brief.get("headline") or brief.get("selected_headline") or (brief.get("headline_options") or [""])[0]
+    if h:
+        return str(h).upper()
+    if ctx.audio_context and ctx.audio_context.get("thumbnail_headline"):
+        return ctx.audio_context["thumbnail_headline"].upper()
+    if ctx.title:
+        return " ".join(ctx.title.upper().split()[:6])
+    stem = Path(ctx.filename or "").stem
+    return " ".join(stem.replace("_", " ").replace("-", " ").upper().split()[:5]) if stem else "WATCH"
+
+
+def _pick_subtext(ctx: JobContext, brief: Dict) -> str:
+    if brief.get("subtext"):
+        return brief["subtext"]
+    if ctx.audio_context and ctx.audio_context.get("thumbnail_subtext"):
+        return ctx.audio_context["thumbnail_subtext"]
+    return ""
+
+
+def _get_badge(ctx: JobContext) -> str:
+    if ctx.audio_context:
+        mapping = {
+            "hype_energetic": "🔥 INSANE",
+            "dramatic_intense": "😱 MUST SEE",
+            "inspirational_motivational": "💪 MOTIVATION",
+            "funny_playful": "😂 HILARIOUS",
+            "educational_informative": "💡 LEARN THIS",
+            "controversial_bold": "⚠️ BOLD TAKE",
+        }
+        return mapping.get(ctx.audio_context.get("emotional_tone", ""), "")
+    return ""
+
+
+def _extract_palette(frame_path: Path) -> Dict:
+    """Extract dominant/accent/dark colors from frame for overlay styling."""
+    try:
+        img = Image.open(frame_path).convert("RGB").resize((150, 84), Image.LANCZOS)
+        quantized = img.quantize(colors=8)
+        palette_raw = quantized.getpalette()[:24]
+        colours = [(palette_raw[i], palette_raw[i + 1], palette_raw[i + 2]) for i in range(0, 24, 3)]
+
+        def brightness(c):
+            return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+
+        def saturation(c):
+            r, g, b = c[0] / 255, c[1] / 255, c[2] / 255
+            mx, mn = max(r, g, b), min(r, g, b)
+            return (mx - mn) / mx if mx > 0 else 0
+
+        colours_sorted = sorted(colours, key=brightness)
+        return {
+            "dominant": colours_sorted[-1],
+            "accent": max(colours, key=saturation),
+            "dark": colours_sorted[0],
+            "neutral": (30, 30, 30),
+        }
+    except Exception:
+        return {"dominant": (220, 50, 50), "accent": (255, 200, 0), "dark": (10, 10, 10), "neutral": (30, 30, 30)}
+
+
 _CATEGORY_PRIORITY = [
     "automotive", "beauty", "food", "home_renovation", "gardening",
     "fitness", "fashion", "gaming", "travel", "pets", "education",
@@ -347,7 +474,8 @@ _CATEGORY_PRIORITY = [
 
 def _detect_category(ctx: JobContext) -> str:
     """
-    3-layer content category detection.
+    4-layer content category detection (supercharged).
+    Layer 0: canonical from audio/vision — ctx.get_canonical_category() when available.
     Layer 1: user-provided caption/title hints
     Layer 2: filename keyword scan
     Layer 3: fall back to 'general' (GPT identifies from frames in the prompt)
@@ -363,6 +491,12 @@ def _detect_category(ctx: JobContext) -> str:
                 if kw in t:
                     return cat
         return None
+
+    # Layer 0: supercharged audio/vision
+    canonical = getattr(ctx, "get_canonical_category", lambda: None)()
+    if canonical and canonical in _THUMB_CATEGORIES:
+        logger.debug(f"Thumbnail category from canonical (audio/vision): {canonical}")
+        return canonical
 
     for text in (ctx.caption, ctx.title):
         result = _scan(text or "")
@@ -467,20 +601,21 @@ async def _ai_select_best_frame(
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": OPENAI_THUMB_MODEL,
-                    "messages": [{"role": "user", "content": content}],
-                    "max_tokens": 100,
-                    "temperature": 0.2,   # low temp = consistent, deterministic
-                },
-            )
+        async with outbound_slot("openai"):
+            async with httpx.AsyncClient(timeout=45) as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": OPENAI_THUMB_MODEL,
+                        "messages": [{"role": "user", "content": content}],
+                        "max_tokens": 100,
+                        "temperature": 0.2,   # low temp = consistent, deterministic
+                    },
+                )
 
         if response.status_code != 200:
             logger.warning(
@@ -538,20 +673,21 @@ async def _generate_thumbnail_brief(ctx: JobContext, category: str) -> Optional[
     vars_ = ctx.get_thumbnail_brief_vars(category=category)
     prompt = THUMBNAIL_BRIEF_PROMPT.format(**vars_)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": OPENAI_THUMB_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 400,
-                    "temperature": 0.5,
-                },
-            )
+        async with outbound_slot("openai"):
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": OPENAI_THUMB_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 400,
+                        "temperature": 0.5,
+                    },
+                )
         if response.status_code != 200:
             logger.warning(f"Thumbnail brief HTTP {response.status_code}: {response.text[:200]}")
             return None
@@ -573,6 +709,35 @@ async def _generate_thumbnail_brief(ctx: JobContext, category: str) -> Optional[
     except Exception as e:
         logger.warning(f"Thumbnail brief generation failed: {e}")
         return None
+
+
+# ============================================================
+# Background removal (rembg — super charge, no account)
+# ============================================================
+
+def _remove_background_rembg(input_path: Path, output_path: Path, bg_rgb: Tuple[int, int, int] = (255, 255, 255)) -> bool:
+    """
+    Remove background from image using rembg. Local, no API key.
+    First run downloads ~176MB model. Outputs RGB JPEG composited onto bg_rgb.
+    Returns True on success.
+    """
+    try:
+        from rembg import remove
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        with open(input_path, "rb") as f:
+            input_data = f.read()
+        output_data = remove(input_data)
+        img = Image.open(io.BytesIO(output_data)).convert("RGBA")
+        bg = Image.new("RGB", img.size, bg_rgb)
+        bg.paste(img, mask=img.split()[3])
+        bg.save(output_path, "JPEG", quality=90)
+        return output_path.exists() and output_path.stat().st_size >= MIN_THUMB_SIZE
+    except Exception as e:
+        logger.debug(f"rembg background removal failed: {e}")
+        return False
 
 
 # ============================================================
@@ -686,6 +851,138 @@ def _render_template_thumbnail(
 
 
 # ============================================================
+# Pillow Fallback Renderer (when Playwright unavailable)
+# ============================================================
+
+def _load_base(frame_path: Path, W: int, H: int) -> Image.Image:
+    """Load and crop frame to canvas size with darkening."""
+    base = Image.open(frame_path).convert("RGB")
+    iw, ih = base.size
+    scale = max(W / iw, H / ih)
+    nw, nh = int(iw * scale), int(ih * scale)
+    base = base.resize((nw, nh), Image.LANCZOS)
+    x0, y0 = (nw - W) // 2, (nh - H) // 2
+    base = base.crop((x0, y0, x0 + W, y0 + H))
+    enhancer = ImageEnhance.Brightness(base)
+    return enhancer.enhance(0.55)
+
+
+def _draw_wrapped(draw: ImageDraw.Draw, text: str, x: int, y: int, font: ImageFont.FreeTypeFont, color: tuple, max_w: float) -> None:
+    """Draw text with word wrap."""
+    words, lines, current = text.split(), [], ""
+    for word in words:
+        test = (current + " " + word).strip()
+        try:
+            w = font.getbbox(test)[2] - font.getbbox(test)[0]
+        except Exception:
+            w = len(test) * 12
+        if w <= max_w:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    lh = _single_lh(font) + 6
+    for i, line in enumerate(lines):
+        draw.text((x, y + i * lh), line, font=font, fill=color)
+
+
+def _text_h(text: str, font: ImageFont.FreeTypeFont, max_w: float) -> int:
+    """Return height of wrapped text."""
+    words, lines, current = text.split(), 0, ""
+    for word in words:
+        test = (current + " " + word).strip()
+        try:
+            w = font.getbbox(test)[2] - font.getbbox(test)[0]
+        except Exception:
+            w = len(test) * 12
+        if w <= max_w:
+            current = test
+        else:
+            lines += 1
+            current = word
+    if current:
+        lines += 1
+    return lines * (_single_lh(font) + 6)
+
+
+def _single_lh(font: ImageFont.FreeTypeFont) -> int:
+    """Single line height for font."""
+    try:
+        bbox = font.getbbox("Ag")
+        return bbox[3] - bbox[1]
+    except Exception:
+        return 20
+
+
+def _render_pillow(
+    template: str,
+    frame_path: Path,
+    subject_path: Optional[Path],
+    bg_path: Optional[Path],
+    palette: Dict,
+    W: int,
+    H: int,
+    headline: str,
+    subtext: str,
+    ctx: JobContext,
+) -> Image.Image:
+    """Simple Pillow renderer as fallback when Playwright is unavailable."""
+    if subject_path and bg_path:
+        try:
+            from .background_gen import composite_subject_on_background
+            canvas = composite_subject_on_background(subject_path, bg_path, W, H)
+        except Exception:
+            canvas = _load_base(frame_path, W, H)
+    else:
+        canvas = _load_base(frame_path, W, H)
+
+    draw = ImageDraw.Draw(canvas)
+    font_xl = _load_font(_FONT_BOLD, max(48, H // 8))
+    font_sm = _load_font(_FONT_BOLD, max(22, H // 22))
+
+    accent = (255, 80, 20) if template in ("HEAT",) else palette.get("accent", (255, 200, 0))
+
+    # Dark gradient overlay at bottom
+    overlay = Image.new("RGBA", (W, H // 2), (0, 0, 0, 0))
+    for i in range(H // 2):
+        alpha = int(200 * (i / (H // 2)))
+        ImageDraw.Draw(overlay).line([(0, i), (W, i)], fill=(0, 0, 0, alpha))
+    canvas = canvas.convert("RGBA")
+    canvas.paste(overlay, (0, H // 2), overlay)
+    canvas = canvas.convert("RGB")
+    draw = ImageDraw.Draw(canvas)
+
+    # Accent bars
+    draw.rectangle([(0, 0), (W, 6)], fill=accent)
+    draw.rectangle([(0, H - 8), (W, H)], fill=accent)
+
+    # Headline
+    tx, ty = int(W * 0.05), int(H * 0.55)
+    for dx, dy in [(3, 3), (4, 4)]:
+        _draw_wrapped(draw, headline, tx + dx, ty + dy, font_xl, (0, 0, 0), W * 0.90)
+    _draw_wrapped(draw, headline, tx, ty, font_xl, (255, 255, 255), W * 0.90)
+
+    if subtext:
+        sub_y = ty + _text_h(headline, font_xl, int(W * 0.9)) + 10
+        draw.text((tx, sub_y), subtext, font=font_sm, fill=accent)
+
+    badge = _get_badge(ctx)
+    if badge:
+        try:
+            bbox = font_sm.getbbox(badge)
+            bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.rectangle([(20, 20), (20 + bw + 20, 20 + bh + 12)], fill=accent)
+            draw.text((30, 26), badge, font=font_sm, fill=(255, 255, 255))
+        except Exception:
+            pass
+
+    return canvas
+
+
+# ============================================================
 # AI Image Edit (optional premium — with guardrails + fallback)
 # ============================================================
 
@@ -716,34 +1013,35 @@ async def _ai_edit_thumbnail(
     try:
         with open(base_path, "rb") as f:
             image_data = f.read()
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/images/edits",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                files={
-                    "image": ("frame.jpg", image_data, "image/jpeg"),
-                    "prompt": (None, instruction),
-                    "size": (None, "1024x1024"),
-                },
-            )
-        if response.status_code != 200:
-            logger.warning(f"AI thumbnail edit HTTP {response.status_code}: {response.text[:200]}")
-            return False
-        data = response.json()
-        items = data.get("data", [])
-        if not items:
-            return False
-        item = items[0]
-        if "b64_json" in item:
-            out_bytes = base64.b64decode(item["b64_json"])
-        elif "url" in item:
-            dl = await client.get(item["url"])
-            if dl.status_code != 200:
-                return False
-            out_bytes = dl.content
-        else:
-            return False
-        output_path.write_bytes(out_bytes)
+        async with outbound_slot("openai"):
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/images/edits",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    files={
+                        "image": ("frame.jpg", image_data, "image/jpeg"),
+                        "prompt": (None, instruction),
+                        "size": (None, "1024x1024"),
+                    },
+                )
+                if response.status_code != 200:
+                    logger.warning(f"AI thumbnail edit HTTP {response.status_code}: {response.text[:200]}")
+                    return False
+                data = response.json()
+                items = data.get("data", [])
+                if not items:
+                    return False
+                item = items[0]
+                if "b64_json" in item:
+                    out_bytes = base64.b64decode(item["b64_json"])
+                elif "url" in item:
+                    dl = await client.get(item["url"])
+                    if dl.status_code != 200:
+                        return False
+                    out_bytes = dl.content
+                else:
+                    return False
+                output_path.write_bytes(out_bytes)
         return output_path.exists() and output_path.stat().st_size >= MIN_THUMB_SIZE
     except Exception as e:
         logger.warning(f"AI thumbnail edit failed: {e}")
@@ -757,7 +1055,7 @@ async def _ai_edit_thumbnail(
 async def _get_video_duration(video_path: Path) -> float:
     """Return video duration in seconds via ffprobe. Returns 30.0 on failure."""
     cmd = [
-        "ffprobe", "-v", "quiet",
+        FFPROBE_PATH, "-v", "quiet",
         "-print_format", "json",
         "-show_streams",
         str(video_path),
@@ -787,7 +1085,7 @@ async def _get_video_duration(video_path: Path) -> float:
 async def _extract_frame(video_path: Path, output_path: Path, offset: float) -> bool:
     """Extract a single JPEG frame at `offset` seconds. Returns True on success."""
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_PATH, "-y",
         "-ss", f"{offset:.3f}",
         "-i", str(video_path),
         "-vframes", "1",
@@ -826,7 +1124,7 @@ async def _score_sharpness(image_path: Path) -> float:
     Returns 0.0 on failure (triggers file-size fallback in caller).
     """
     cmd = [
-        "ffmpeg", "-i", str(image_path),
+        FFMPEG_PATH, "-i", str(image_path),
         "-vf", "blurdetect=high=0.1",
         "-f", "null", "-",
     ]
@@ -918,6 +1216,15 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                                   thumbnail_selection_method
     """
     ctx.mark_stage("thumbnail")
+
+    # ── Tier gate: thumbnail generation enabled ──────────────────────────────
+    if not ctx.entitlements or not should_generate_thumbnails(ctx.entitlements):
+        raise SkipStage("Thumbnail generation not enabled for tier")
+
+    # ── User opt-out: auto_generate_thumbnails ──────────────────────────────
+    us = ctx.user_settings or {}
+    if not us.get("auto_generate_thumbnails", us.get("autoGenerateThumbnails", True)):
+        raise SkipStage("Auto thumbnail generation disabled in settings")
 
     # ── Source video ────────────────────────────────────────────────────────
     video_path: Optional[Path] = None
@@ -1107,6 +1414,7 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                 "notes": "No AI — minimal brief",
             }
         ctx.output_artifacts["thumbnail_brief_json"] = json.dumps(brief)
+        ctx.thumbnail_brief = brief
 
         # TikTok: no custom thumbnail via API — store thumb_offset for worker
         platform_map: Dict[str, str] = {}
@@ -1121,18 +1429,130 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                               and p in [pl.lower() for pl in (ctx.platforms or [])]]
         render_method = "none"
         primary_styled: Optional[Path] = None  # Prefer YouTube for primary
+        use_rembg = os.environ.get("REMBG_THUMBNAIL", "").lower() in ("1", "true", "yes")
+        # Categories where subject isolation (person/animal/product/food) improves thumbnails.
+        # Excludes automotive, travel, gaming where environment/screen is the point.
+        rembg_categories = (
+            "beauty", "fashion", "fitness", "comedy", "education", "pets",
+            "food", "music", "sports", "tech", "asmr", "lifestyle", "gardening",
+            "general",
+        )
+        base_for_render = best_path
+        if use_rembg and category in rembg_categories:
+            rembg_path = ctx.temp_dir / f"thumb_nobg_{ctx.upload_id}.jpg"
+            if _remove_background_rembg(best_path, rembg_path):
+                base_for_render = rembg_path
+
+        # ── Background gen: subject isolation + AI background (from audio_context) ──
+        subject_path: Optional[Path] = None
+        bg_path: Optional[Path] = None
+        audio_ctx = ctx.audio_context or {}
+        mood = audio_ctx.get("thumbnail_mood", "bold_dramatic")
+        template = MOOD_TO_TEMPLATE.get(mood, "HEAT")
+        # Playwright only has HEAT, NEON_DROP, CINEMATIC, BRIGHT_POP
+        template_playwright = template if template in ("HEAT", "NEON_DROP", "CINEMATIC", "BRIGHT_POP") else "HEAT"
+        headline = _pick_headline(ctx, brief)
+        subtext = _pick_subtext(ctx, brief)
+        badge = _get_badge(ctx)
+        try:
+            from .background_gen import (
+                isolate_subject,
+                generate_ai_background,
+                build_background_prompt,
+                composite_subject_on_background,
+            )
+            subject_path = await isolate_subject(best_path, ctx.temp_dir)
+            if subject_path:
+                W_prim, H_prim = _primary_canvas(ctx.platforms or [])
+                bg_prompt = build_background_prompt(
+                    audio_ctx.get("category", "other"),
+                    mood,
+                    audio_ctx.get("emotional_tone", "hype_energetic"),
+                    headline,
+                )
+                bg_path = await generate_ai_background(bg_prompt, W_prim, H_prim, ctx.temp_dir)
+        except Exception as e:
+            logger.warning(f"[thumbnail] Background gen error (non-fatal): {e}")
+
+        palette = _extract_palette(best_path)
         for platform in platforms_to_render:
             out_name = f"thumb_styled_{platform}_{ctx.upload_id}.jpg"
             out_path = ctx.temp_dir / out_name
             ok = False
-            if can_ai_style and OPENAI_API_KEY:
-                ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=False)
+            W_plat, H_plat = PLATFORM_CANVAS.get(platform, DEFAULT_CANVAS)
+
+            # Try Playwright HTML rendering first
+            if PLAYWRIGHT_ENABLED and not ok:
+                try:
+                    from .playwright_stage import render_template
+                    playwright_out = ctx.temp_dir / f"thumb_pw_{platform}_{ctx.upload_id}.jpg"
+                    result = await render_template(
+                        template=template_playwright,
+                        frame_path=best_path,
+                        headline=headline,
+                        subtext=subtext,
+                        badge=badge,
+                        W=W_plat,
+                        H=H_plat,
+                        out_path=playwright_out,
+                    )
+                    if result and result.exists():
+                        if subject_path and bg_path:
+                            try:
+                                from .background_gen import composite_subject_on_background
+                                composite = composite_subject_on_background(
+                                    subject_path, bg_path, W_plat, H_plat
+                                )
+                                pw_img = Image.open(playwright_out).convert("RGBA")
+                                comp_rgba = composite.convert("RGBA")
+                                blended = Image.blend(comp_rgba, pw_img, alpha=0.75)
+                                blended.convert("RGB").save(str(out_path), "JPEG", quality=92, optimize=True)
+                            except Exception as e:
+                                logger.warning(f"[thumbnail] Playwright composite error: {e}")
+                                import shutil
+                                shutil.copy(playwright_out, out_path)
+                        else:
+                            import shutil
+                            shutil.copy(playwright_out, out_path)
+                        ok = out_path.exists() and out_path.stat().st_size >= MIN_THUMB_SIZE
+                        if ok:
+                            render_method = "playwright"
+                        logger.info(f"[thumbnail] Playwright render ✓ template={template}")
+                except Exception as e:
+                    logger.warning(f"[thumbnail] Playwright error: {e} — falling back to Pillow")
+
+            # Pillow fallback
+            if not ok:
+                try:
+                    thumb_img = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        _render_pillow,
+                        template,
+                        best_path,
+                        subject_path,
+                        bg_path,
+                        palette,
+                        W_plat,
+                        H_plat,
+                        headline,
+                        subtext,
+                        ctx,
+                    )
+                    thumb_img.save(str(out_path), "JPEG", quality=92, optimize=True)
+                    ok = out_path.exists() and out_path.stat().st_size >= MIN_THUMB_SIZE
+                    if ok:
+                        render_method = "pillow"
+                except Exception as e:
+                    logger.debug(f"[thumbnail] Pillow render error: {e}")
+
+            if not ok and can_ai_style and OPENAI_API_KEY:
+                ok = await _ai_edit_thumbnail(base_for_render, brief, out_path, retry_reduce=False)
                 if not ok:
-                    ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=True)
+                    ok = await _ai_edit_thumbnail(base_for_render, brief, out_path, retry_reduce=True)
                 if ok:
                     render_method = "ai_edit"
             if not ok:
-                ok = _render_template_thumbnail(best_path, brief, platform, out_path)
+                ok = _render_template_thumbnail(base_for_render, brief, platform, out_path)
                 if ok:
                     render_method = "template"
             if ok:

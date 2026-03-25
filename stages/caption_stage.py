@@ -14,6 +14,9 @@ Key features:
     Each category carries tone guide, hook templates, and hashtag seeds.
   - Trill telemetry integration: when .map telemetry is present, speed/location/
     score bucket are injected as MUST-USE story beats.
+  - Audio transcript integration: when Whisper transcription is available
+    (ctx.ai_transcript, set by audio_stage), it is injected into the context
+    block as factual evidence of what was actually said in the video.
   - Platform-aware content: TikTok/IG/FB get caption only; YouTube gets title+desc.
   - Frame count pulled from user settings (captionFrameCount, default 6, clamped 2-12).
   - _finalise_hashtags() is NOW CALLED after AI generation — blocked hashtags
@@ -47,6 +50,7 @@ import httpx
 
 from .errors import SkipStage, StageError, ErrorCode
 from .context import JobContext
+from .outbound_rl import outbound_slot
 
 logger = logging.getLogger("uploadm8-worker.caption")
 
@@ -235,7 +239,7 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "The clip I've been waiting to post 🎮",
-            "Nobody expects this strat in ranked 👀",
+            "This strat worked in ranked 👀",
             "New personal best — I'm still shaking",
         ],
         "hashtag_seeds": [
@@ -406,8 +410,8 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "This goal took 3 years of practice 🥅",
-            "Nobody thought we'd make it to the finals",
-            "The play that silenced the critics",
+            "Here's the play that got us to the finals",
+            "The moment that defined this match",
         ],
         "hashtag_seeds": [
             "sports", "athlete", "sportsmotivation", "sportstok",
@@ -425,8 +429,8 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
             "Don't oversell it — let the content breathe. Less = more in ASMR."
         ),
         "hook_templates": [
-            "The most satisfying 60 seconds you'll watch today",
-            "Just watch until the end 🎧",
+            "60 seconds of satisfying sounds 🎧",
+            "No talking — just the triggers",
             "Instant calm — no talking",
         ],
         "hashtag_seeds": [
@@ -447,8 +451,8 @@ CONTENT_CATEGORIES: Dict[str, Dict[str, Any]] = {
         ),
         "hook_templates": [
             "A realistic day in my life (not the highlight reel)",
-            "I tried {challenge} for 30 days — here's what changed",
-            "Morning routine that actually changed my life",
+            "I tried {challenge} for 30 days — here's what I noticed",
+            "My morning routine — what works for me",
         ],
         "hashtag_seeds": [
             "dayinmylife", "vlog", "lifestylevlog", "morningroutine",
@@ -527,8 +531,9 @@ def _detect_category_from_text(text: str) -> Optional[str]:
 
 def _detect_content_category(ctx: JobContext) -> str:
     """
-    3-layer content category detection.
+    4-layer content category detection (supercharged).
 
+    Layer 0: Canonical from audio/vision — ctx.get_canonical_category() when available.
     Layer 1: User hint — ctx.caption and ctx.title keyword scan.
     Layer 2: Filename signal scan.
     Layer 3: Falls back to 'general'; the AI prompt instructs GPT to
@@ -536,6 +541,12 @@ def _detect_content_category(ctx: JobContext) -> str:
 
     Returns a key from CONTENT_CATEGORIES.
     """
+    # Layer 0: supercharged audio/vision
+    canonical = getattr(ctx, "get_canonical_category", lambda: None)()
+    if canonical and canonical in CONTENT_CATEGORIES:
+        logger.debug(f"Content category from canonical (audio/vision): {canonical}")
+        return canonical
+
     # Layer 1: user-provided hints
     for text in (ctx.caption, ctx.title):
         cat = _detect_category_from_text(text or "")
@@ -553,19 +564,29 @@ def _detect_content_category(ctx: JobContext) -> str:
     return "general"
 
 
-def _build_category_context_block(category: str, location: Optional[str] = None) -> str:
+def _build_category_context_block(
+    category: str,
+    location: Optional[str] = None,
+    suggested_keywords: Optional[List[str]] = None,
+) -> str:
     """
     Build the category-specific context block injected into the AI prompt.
     This gives GPT specific tone/hook/hashtag vocabulary instead of generic fallback.
+    suggested_keywords from audio_context are merged into hashtag seeds when present.
     """
     cat_data = CONTENT_CATEGORIES.get(category, CONTENT_CATEGORIES["general"])
     tone = cat_data["tone"]
     hooks = cat_data.get("hook_templates", [])
-    seeds = cat_data.get("hashtag_seeds", [])
+    seeds = list(cat_data.get("hashtag_seeds", []))
+    # Supercharged: merge audio suggested_keywords into hashtag seeds
+    if suggested_keywords:
+        for kw in suggested_keywords[:8]:
+            if kw and isinstance(kw, str) and kw.lower() not in {s.lower() for s in seeds}:
+                seeds.append(kw)
 
     lines = [
         f"CONTENT CATEGORY DETECTED: {category.upper().replace('_', ' ')}",
-        f"TONE GUIDE: {tone}",
+        f"CATEGORY NICHE TONE (secondary — user STYLE/TONE/VOICE settings in the main prompt take priority): {tone}",
     ]
     if hooks:
         hook_examples = " | ".join(f'"{h}"' for h in hooks[:2])
@@ -777,7 +798,25 @@ def _build_narrative_prompt(
         )
     tasks_block = "\n".join(tasks) if tasks else "(none requested)"
 
-    # ── Tone: user pref overrides category default ───────────────────────────
+    # ── Style: structure, length, hook pattern (distinct from tone & voice) ──
+    style_instruction = {
+        "story": (
+            "Narrative arc: beginning → tension → payoff. Use multi-frame progression when "
+            "multiple frames are provided. Prioritise clarity of the story over brevity."
+        ),
+        "punchy": (
+            "Ultra-short, scroll-stopping. The hook must land in the FIRST THREE WORDS. "
+            "No preamble — one vivid beat, then stop or one tight follow-up line."
+        ),
+        "factual": (
+            "Lead with the strongest concrete fact, number, or measurable outcome visible "
+            "in the footage. Then one supporting line; avoid flowery filler."
+        ),
+    }.get(caption_style) or (
+        "Match caption length and structure to the task list above; stay specific to the frames."
+    )
+
+    # ── Tone: emotional register (distinct from style structure & voice persona) ─
     tone_instruction = {
         "hype":      "Energy is HIGH. Power words, exclamation, urgency. Stop the scroll.",
         "calm":      "Measured and confident. Let the footage speak. Understated cool.",
@@ -820,6 +859,44 @@ def _build_narrative_prompt(
         context_lines.append(f"User caption hint: {ctx.caption}")
     if ctx.location_name:
         context_lines.append(f"Filming location: {ctx.location_name}")
+    # ── Audio transcript from Whisper (set by audio_stage) ───────────────────
+    ai_transcript = getattr(ctx, "ai_transcript", None)
+    if ai_transcript:
+        context_lines.append(f"Audio transcript (what was said/heard in the video): {ai_transcript}")
+    # ── Audio labels from YAMNet (super charge, when YAMNET_AUDIO_LABELS=1) ─
+    artifacts = getattr(ctx, "output_artifacts", None) or {}
+    audio_labels = artifacts.get("audio_labels")
+    if audio_labels:
+        context_lines.append(f"Audio classification (YAMNet): {audio_labels}")
+    # ── Supercharged: audio_context (category, caption_style, emotional_tone, suggested_keywords) ─
+    ac = getattr(ctx, "audio_context", None) or {}
+    if ac:
+        parts = []
+        if ac.get("category") and ac.get("category") != "other":
+            parts.append(f"category={ac['category']}")
+        if ac.get("emotional_tone"):
+            parts.append(f"emotional_tone={ac['emotional_tone']}")
+        if ac.get("caption_style"):
+            parts.append(f"caption_style_hint={ac['caption_style']}")
+        if ac.get("suggested_keywords"):
+            kw = ac["suggested_keywords"][:8]
+            parts.append(f"suggested_keywords={','.join(kw)}")
+        if parts:
+            context_lines.append(f"Audio analysis: {'; '.join(parts)}")
+    # ── Supercharged: vision_context (OCR, labels) ─────────────────────────
+    vc = getattr(ctx, "vision_context", None) or {}
+    if vc:
+        ocr = vc.get("ocr_text", "").strip()
+        labels = vc.get("label_names", [])
+        if ocr:
+            context_lines.append(f"Visible text in frame (OCR): {ocr[:200]}")
+        if labels:
+            context_lines.append(f"Scene labels: {', '.join(str(l) for l in labels[:12])}")
+    # ── Supercharged: video_understanding (Twelve Labs scene description) ────
+    vu = getattr(ctx, "video_understanding", None) or {}
+    scene_desc = vu.get("scene_description") or vu.get("description", "")
+    if scene_desc:
+        context_lines.append(f"Video understanding: {scene_desc[:300]}")
     context_block = "\n".join(f"• {ln}" for ln in context_lines)
 
     # ── Memory examples (few-shot from past uploads) ─────────────────────────
@@ -851,8 +928,11 @@ def _build_narrative_prompt(
             + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         )
 
-    # ── Category context block ────────────────────────────────────────────────
-    category_block = _build_category_context_block(category, ctx.location_name)
+    # ── Category context block (with supercharged suggested_keywords) ───────────
+    suggested_kw = (ac or {}).get("suggested_keywords", [])
+    category_block = _build_category_context_block(
+        category, ctx.location_name, suggested_keywords=suggested_kw
+    )
 
     # ── Trill beat ───────────────────────────────────────────────────────────
     trill_beat = _build_trill_beat(ctx)
@@ -872,9 +952,15 @@ def _build_narrative_prompt(
 {memory_block}
 {category_block}{trill_section}
 
-TONE DIRECTIVE: {tone_instruction}
-VOICE PROFILE: {voice_key.upper()} — {voice_instruction}
-CAPTION STYLE: {caption_style.upper()} — follow this style strictly.
+STYLE DIRECTIVE (structure & length — obey the task list): {style_instruction}
+TONE DIRECTIVE (emotional register): {tone_instruction}
+VOICE PROFILE (persona / delivery — maps to user setting): {voice_key.upper()} — {voice_instruction}
+
+Layering: STYLE controls how the caption is built (arc vs punch vs fact-led). TONE controls how it *feels*.
+VOICE controls *who is speaking* (mentor vs hypebeast vs narrator, etc.). Apply all three distinctly.
+If CONTENT CATEGORY CONTEXT or Audio analysis suggests a different tone or style, the three directives
+above take precedence — use category/audio only for niche vocabulary and factual hints, not to replace
+the user's caption preferences.
 {f"PLATFORM NOTE: {platform_note}" if platform_note else ""}
 
 Generate the following for this video:
@@ -893,6 +979,8 @@ Rules:
   NEVER return single characters or word fragments
 - Be SPECIFIC to what is actually visible — generic content gets buried
 - If Trill data provided: caption MUST reference at least one real data point
+- If audio transcript provided: you may reference what was said to enrich the caption
+- User STYLE / TONE / VOICE settings win over conflicting emotional_tone or caption_style hints from audio analysis
 
 Respond ONLY in this exact JSON format (no markdown, no explanation):
 {{"title": "...", "caption": "...", "hashtags": ["word1", "word2", ...]}}
@@ -935,20 +1023,21 @@ async def _call_openai(
             logger.warning(f"Could not attach frame {frame.name}: {e}")
 
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": content}],
-                    "max_tokens": 800,
-                    "temperature": 0.75,
-                },
-            )
+        async with outbound_slot("openai"):
+            async with httpx.AsyncClient(timeout=90) as client:
+                response = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": content}],
+                        "max_tokens": 800,
+                        "temperature": 0.75,
+                    },
+                )
 
             if response.status_code != 200:
                 logger.error(f"OpenAI API error: {response.status_code} — {response.text[:300]}")
@@ -1067,6 +1156,7 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                                      users.preferences JSONB by db.load_user_settings()
       - ctx.thumbnail_paths        — multi-frame story frames (from thumbnail_stage)
       - ctx.trill_score / ctx.telemetry_data — Trill telemetry if applicable
+      - ctx.ai_transcript          — Whisper transcript from audio_stage (optional)
 
     Writes to ctx:
       - ctx.ai_title
@@ -1139,10 +1229,11 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         except Exception as _mem_err:
             logger.debug(f"Caption memory fetch skipped: {_mem_err}")
 
+    has_audio = bool(getattr(ctx, "ai_transcript", None))
     logger.info(
         f"Caption stage: category={category}, style={caption_style}, tone={caption_tone}, "
         f"hashtag_style={hashtag_style}, count={hashtag_count}, "
-        f"model={model}, frames={num_frames}"
+        f"model={model}, frames={num_frames}, audio={'yes' if has_audio else 'no'}"
     )
 
     # ── Read hashtag enforcement settings ────────────────────────────────────

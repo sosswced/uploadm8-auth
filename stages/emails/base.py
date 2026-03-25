@@ -35,22 +35,36 @@ MAILGUN_DOMAIN  = os.environ.get("MAILGUN_DOMAIN", "")
 MAIL_FROM       = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
 MAIL_FROM_SUPPORT = os.environ.get("MAIL_FROM_SUPPORT", "UploadM8 Support <support@uploadm8.com>")
 MAIL_FROM_HELLO   = os.environ.get("MAIL_FROM_HELLO", "UploadM8 <hello@uploadm8.com>")
-FRONTEND_URL    = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
+FRONTEND_URL    = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com").rstrip("/")
+
+# Public Discord (community) — override via env for staging if needed
+DISCORD_INVITE_URL = os.environ.get("DISCORD_INVITE_URL", "https://discord.gg/TVDAc8fnwu")
 
 # ── Brand constants ───────────────────────────────────────────────────────────
 SUPPORT_EMAIL = "support@uploadm8.com"
-LOGO_URL      = "https://app.uploadm8.com/images/logo.png"
+LOGO_URL      = f"{FRONTEND_URL}/images/logo.png"
 
 URL_DASHBOARD    = f"{FRONTEND_URL}/dashboard.html"
 URL_SETTINGS     = f"{FRONTEND_URL}/settings.html"
+URL_SETTINGS_TOKENS = f"{FRONTEND_URL}/settings.html#billing-panel"
 URL_BILLING      = f"{FRONTEND_URL}/billing.html"
 URL_PRICING      = f"{FRONTEND_URL}/index.html#pricing"
 URL_UNSUBSCRIBE  = f"{FRONTEND_URL}/unsubscribe.html"
+URL_CONTACT      = f"{FRONTEND_URL}/contact.html"
+URL_SUPPORT      = f"{FRONTEND_URL}/support.html"
+URL_TERMS        = f"{FRONTEND_URL}/terms.html"
+URL_PRIVACY      = f"{FRONTEND_URL}/privacy.html"
+
+
+def asset_url(path: str) -> str:
+    """Absolute URL for static images in transactional email (logo, platform icons)."""
+    return f"{FRONTEND_URL}/{path.lstrip('/')}"
 
 # ── Tier display names ────────────────────────────────────────────────────────
 TIER_NAMES: dict = {
     "free":           "Free",
     "launch":         "Launch",
+    "creator_lite":   "Creator Lite",
     "creator_pro":    "Creator Pro",
     "studio":         "Studio",
     "agency":         "Agency",
@@ -175,11 +189,35 @@ def email_shell(
         '</div></td></tr>'
     )
 
+    quick_links = (
+        '<tr><td style="padding:22px 40px 0;text-align:center;">'
+        '<p style="margin:0 0 8px;color:#9ca3af;font-size:11px;font-weight:700;'
+        'text-transform:uppercase;letter-spacing:0.12em;">Quick links</p>'
+        '<p style="margin:0 0 10px;color:#6b7280;font-size:13px;line-height:1.85;">'
+        f'<a href="{URL_DASHBOARD}" style="color:#f97316;text-decoration:none;">Dashboard</a>'
+        f' &middot; '
+        f'<a href="{URL_SETTINGS_TOKENS}" style="color:#f97316;text-decoration:none;">Token balance</a>'
+        f' &middot; '
+        f'<a href="{URL_CONTACT}" style="color:#f97316;text-decoration:none;">Contact</a>'
+        f' &middot; '
+        f'<a href="{DISCORD_INVITE_URL}" style="color:#5865F2;text-decoration:none;">Discord community</a>'
+        '</p>'
+        '<p style="margin:0 0 14px;color:#6b7280;font-size:12px;line-height:1.75;">'
+        f'<a href="{URL_TERMS}" style="color:#6b7280;text-decoration:underline;">Terms of Service</a>'
+        f' &middot; '
+        f'<a href="{URL_PRIVACY}" style="color:#6b7280;text-decoration:underline;">Privacy Policy</a>'
+        f' &middot; '
+        f'<a href="{URL_SUPPORT}" style="color:#6b7280;text-decoration:underline;">Support</a>'
+        '</p>'
+        '</td></tr>'
+    )
+
     footer = (
-        '<tr><td style="padding:26px 40px 24px;text-align:center;'
+        quick_links
+        + '<tr><td style="padding:18px 40px 24px;text-align:center;'
         'border-top:1px solid rgba(255,255,255,0.06);">'
         '<p style="margin:0 0 6px;color:#4b5563;font-size:13px;">'
-        '&#169; 2025 UploadM8 &middot; All rights reserved</p>'
+        '&#169; 2026 UploadM8 &middot; All rights reserved</p>'
         f'<p style="margin:0 0 8px;color:#4b5563;font-size:12px;">Need help? '
         f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
         f'{SUPPORT_EMAIL}</a></p>'
@@ -373,12 +411,12 @@ def plan_change_visual(old_tier: str, new_tier: str, hex_new: str = "#f97316") -
 
 
 def platform_logos_row() -> str:
-    """TikTok / YouTube / Instagram / Facebook logo strip. v2: bordered badge squares."""
+    """TikTok / YouTube / Instagram / Facebook — hosted on FRONTEND_URL for reliable email loading."""
     logos = [
-        ("#1a1a1a", "https://logo.clearbit.com/tiktok.com",    "TikTok"),
-        ("#ff0000", "https://logo.clearbit.com/youtube.com",   "YouTube"),
-        ("#c13584", "https://logo.clearbit.com/instagram.com", "Instagram"),
-        ("#1877f2", "https://logo.clearbit.com/facebook.com",  "Facebook"),
+        ("#1a1a1a", asset_url("images/platforms/tiktok.png"), "TikTok"),
+        ("#ff0000", asset_url("images/platforms/youtube.png"), "YouTube"),
+        ("#c13584", asset_url("images/platforms/instagram.png"), "Instagram"),
+        ("#1877f2", asset_url("images/platforms/facebook.png"), "Facebook"),
     ]
     cells = "".join(
         f'<td style="padding:0 8px;text-align:center;">'

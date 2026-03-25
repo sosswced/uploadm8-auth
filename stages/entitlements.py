@@ -55,6 +55,16 @@ MAX PARALLEL UPLOADS:
   Plan-based cap for parallel batch upload mode (upload.html).
   Sequential mode always uses 1. Parallel mode uses min(selected, this cap).
   Free = 1, Creator Lite = 2, Creator Pro = 3, Studio = 4, Agency = 5, internal = 6.
+
+AUDIO CONTEXT (Whisper Transcription):
+  Runs as Stage 5.5 — after transcode, before thumbnail.
+  Extracts audio via FFmpeg → sends to OpenAI Whisper → stores transcript in
+  ctx.ai_transcript, which caption_stage injects into every GPT-4o prompt.
+  Rides on the existing `can_ai` entitlement flag — no separate gate.
+  Users may opt out via `use_audio_context = False` in user_settings.
+  audio_context flag in TIER_CONFIG is documentation-only; enforcement is
+  done in audio_stage.py (run_audio_context_stage) via can_ai + user.use_audio_context.
+  Cost: ~$0.006/min via whisper-1 (platform cost, not billed as AIC tokens).
 """
 
 from __future__ import annotations
@@ -73,7 +83,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
     "free": {
         "name": "Free", "price": 0,
         "put_daily": 4, "put_monthly": 80, "aic_monthly": 50,
-        "max_accounts": 4, "max_accounts_per_platform": 2, "per_platform": 2,
+        "max_accounts": 16, "max_accounts_per_platform": 4, "per_platform": 4,
         "watermark": True, "ads": True, "ai": True,
         "scheduling": True, "webhooks": False, "white_label": False,
         "hud": False, "excel": False, "flex": False,
@@ -83,11 +93,12 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_parallel_uploads": 1, "parallel_uploads": 1,
         "custom_thumbnails": True, "ai_thumbnail_styling": False,
         "team_seats": 1, "analytics": "basic", "trial_days": 0,
+        "audio_context": True,
     },
     "creator_lite": {
         "name": "Creator Lite", "price": 9.99,
         "put_daily": 16, "put_monthly": 400, "aic_monthly": 120,
-        "max_accounts": 10, "max_accounts_per_platform": 3, "per_platform": 3,
+        "max_accounts": 40, "max_accounts_per_platform": 10, "per_platform": 10,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
         "hud": False, "excel": False, "flex": False,
@@ -97,11 +108,12 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_parallel_uploads": 2, "parallel_uploads": 2,
         "custom_thumbnails": True, "ai_thumbnail_styling": False,
         "team_seats": 1, "analytics": "standard", "trial_days": 7,
+        "audio_context": True,
     },
     "creator_pro": {
         "name": "Creator Pro", "price": 19.99,
         "put_daily": 40, "put_monthly": 1200, "aic_monthly": 350,
-        "max_accounts": 25, "max_accounts_per_platform": 6, "per_platform": 6,
+        "max_accounts": 100, "max_accounts_per_platform": 25, "per_platform": 25,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
         "hud": True, "excel": False, "flex": False,
@@ -111,11 +123,12 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_parallel_uploads": 3, "parallel_uploads": 3,
         "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "team_seats": 3, "analytics": "full", "trial_days": 7,
+        "audio_context": True,
     },
     "studio": {
         "name": "Studio", "price": 49.99,
         "put_daily": 80, "put_monthly": 3500, "aic_monthly": 1000,
-        "max_accounts": 75, "max_accounts_per_platform": 20, "per_platform": 20,
+        "max_accounts": 300, "max_accounts_per_platform": 75, "per_platform": 75,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
         "hud": True, "excel": True, "flex": False,
@@ -125,11 +138,12 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_parallel_uploads": 4, "parallel_uploads": 4,
         "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "team_seats": 10, "analytics": "full_export", "trial_days": 7,
+        "audio_context": True,
     },
     "agency": {
         "name": "Agency", "price": 99.99,
         "put_daily": 350, "put_monthly": 8000, "aic_monthly": 2500,
-        "max_accounts": 300, "max_accounts_per_platform": 100, "per_platform": 100,
+        "max_accounts": 1200, "max_accounts_per_platform": 300, "per_platform": 300,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": True,
         "hud": True, "excel": True, "flex": True,
@@ -139,6 +153,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_parallel_uploads": 6, "parallel_uploads": 6,
         "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "team_seats": 25, "analytics": "full_export", "trial_days": 7,
+        "audio_context": True,
     },
     # ── Internal tiers (not sold via Stripe) ──
     "master_admin": {
@@ -152,9 +167,10 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
         "max_thumbnails": 20, "ai_depth": "max", "max_caption_frames": 20,
         "max_parallel_uploads": 6, "custom_thumbnails": True, "ai_thumbnail_styling": True,
         "team_seats": 9999, "analytics": "full_export", "internal": True,
+        "audio_context": True,
     },
     "friends_family": {
-        "name": "Friends", "price": 0,
+        "name": "Friends & Family", "price": 0,
         "put_daily": 999, "put_monthly": 12000, "aic_monthly": 5000,
         "max_accounts": 80, "max_accounts_per_platform": 80,
         "watermark": False, "ads": False, "ai": True,
@@ -181,7 +197,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
     "launch": {
         "name": "Creator Lite (Legacy)", "price": 9.99,
         "put_daily": 16, "put_monthly": 400, "aic_monthly": 120,
-        "max_accounts": 10, "max_accounts_per_platform": 3,
+        "max_accounts": 40, "max_accounts_per_platform": 10, "per_platform": 10,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
         "hud": False, "excel": False, "flex": False,
@@ -192,7 +208,32 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Stripe price lookup_key -> internal tier slug
+# ── Stripe Dashboard → Products → each Price → Metadata (Edit) ─────────────────
+# Copy keys exactly; values must match entitlements / lookup keys in this file.
+#
+# Subscription Prices (lookup_key must match STRIPE_LOOKUP_TO_TIER):
+#   kind              = subscription
+#   tier              = creator_lite | creator_pro | studio | agency | launch
+#   put_month         = <int>   (same as TIER_CONFIG put_monthly for that tier)
+#   aic_month         = <int>   (same as TIER_CONFIG aic_monthly)
+#   flex_enabled      = true | false   (agency tier: true; others usually false)
+#   price_usd         = <decimal>   (optional; for calculator / reporting)
+#   priority_class    = p1 | p2 | p3 | p4   (optional; must match tier routing)
+#
+# Example (Creator Pro monthly): tier=creator_pro, put_month=1200, aic_month=350,
+#   flex_enabled=false, priority_class=p2, kind=subscription
+#
+# Top-up Prices (lookup_key must match TOPUP_PRODUCTS):
+#   kind              = topup
+#   wallet            = put | aic
+#   amount            = <int>   (token pack size; must match TOPUP_PRODUCTS amount)
+#   price_usd         = <decimal>   (optional)
+#   promo             = true | false   (optional; Burst Week style promos)
+#   expires_days      = 7   (optional; promo window hint for ops)
+#
+# Example (uploadm8_put_500): kind=topup, wallet=put, amount=500
+#
+# Ledger: checkout top-ups credit token_ledger with reason "topup" (legacy rows may say "topup_purchase").
 STRIPE_LOOKUP_TO_TIER: Dict[str, str] = {
     "uploadm8_creatorlite_monthly": "creator_lite",
     "uploadm8_creatorpro_monthly":  "creator_pro",
@@ -222,6 +263,66 @@ TOPUP_PRODUCTS = {
 # Priority class routing sets
 PRIORITY_QUEUE_CLASSES = {"p0", "p1", "p2"}   # -> process:priority / publish:priority
 NORMAL_QUEUE_CLASSES   = {"p3", "p4"}          # -> process:normal  / publish:normal
+
+# ============================================================
+# Canonical Tier & Entitlement Schema (shared with frontend)
+# ============================================================
+# All valid subscription_tier values. Frontend and backend MUST use these slugs.
+TIER_SLUGS = ("free", "creator_lite", "creator_pro", "studio", "agency", "friends_family", "lifetime", "master_admin", "launch")
+
+# launch is legacy alias for creator_lite
+TIER_ALIASES = {"launch": "creator_lite"}
+
+
+def normalize_tier(tier: str) -> str:
+    """Return canonical tier slug. Maps launch->creator_lite, unknown->free."""
+    t = (tier or "free").lower().strip()
+    if t in TIER_ALIASES:
+        return TIER_ALIASES[t]
+    return t if t in TIER_CONFIG else "free"
+
+
+def get_tier_display_name(tier: str) -> str:
+    """Return human-readable tier name from TIER_CONFIG."""
+    t = normalize_tier(tier)
+    return TIER_CONFIG.get(t, TIER_CONFIG["free"]).get("name", t.replace("_", " ").title())
+
+
+# Entitlement keys returned by entitlements_to_dict — frontend uses these exact keys
+ENTITLEMENT_KEYS = (
+    "tier", "tier_display", "put_daily", "put_monthly", "aic_monthly",
+    "max_accounts", "max_accounts_per_platform", "can_watermark", "can_ai",
+    "can_schedule", "can_webhooks", "can_white_label", "can_excel", "can_priority",
+    "can_flex", "can_burn_hud", "show_ads", "priority_class", "queue_depth",
+    "lookahead_hours", "max_caption_frames", "ai_depth", "max_thumbnails",
+    "can_custom_thumbnails", "can_ai_thumbnail_styling", "max_parallel_uploads",
+    "team_seats", "analytics", "trial_days", "is_internal", "can_audio_context",
+)
+
+
+def get_tiers_for_api() -> list:
+    """Return tier metadata for /api/entitlements/tiers. Single source for frontend.
+    Includes revenue tiers + internal (friends_family, lifetime, master_admin) + launch alias.
+    app.js, wallet-tokens.js, and settings.html all consume this for consistent PUT/AIC/names."""
+    all_slugs = ("free", "creator_lite", "creator_pro", "studio", "agency",
+                 "friends_family", "lifetime", "master_admin", "launch")
+    out = []
+    for slug in all_slugs:
+        cfg = TIER_CONFIG.get(slug, {})
+        per_pf = cfg.get("max_accounts_per_platform", cfg.get("per_platform", 0))
+        out.append({
+            "slug": slug,
+            "name": cfg.get("name", slug.replace("_", " ").title()),
+            "price": float(cfg.get("price", 0)),
+            "put_monthly": cfg.get("put_monthly", 0),
+            "aic_monthly": cfg.get("aic_monthly", 0),
+            "max_accounts": cfg.get("max_accounts", 0),
+            "max_accounts_per_platform": int(per_pf or 0),
+            "queue_depth": cfg.get("queue_depth", 0),
+            "lookahead_hours": cfg.get("lookahead_hours", 0),
+            "internal": cfg.get("internal", False),
+        })
+    return out
 
 
 # ============================================================
@@ -282,6 +383,9 @@ class Entitlements:
     # Internal flag
     is_internal: bool = False
 
+    # Audio context (Whisper transcription) — rides on can_ai; True for all tiers
+    can_audio_context: bool = True
+
     # Per-user override audit trail
     custom_overrides: Dict[str, Any] = field(default_factory=dict)
 
@@ -291,12 +395,12 @@ class Entitlements:
 # ============================================================
 
 def get_entitlements_for_tier(tier: str) -> Entitlements:
-    """Build Entitlements from a tier slug. Falls back to free on unknown slugs."""
-    t = (tier or "free").lower().strip()
+    """Build Entitlements from a tier slug. Uses normalize_tier (launch->creator_lite, unknown->free)."""
+    t = normalize_tier(tier)
     cfg = TIER_CONFIG.get(t, TIER_CONFIG["free"])
     return Entitlements(
         tier=t,
-        tier_display=cfg.get("name", tier.title()),
+        tier_display=cfg.get("name", t.replace("_", " ").title()),
         put_daily=cfg.get("put_daily", 2),
         put_monthly=cfg.get("put_monthly", 60),
         aic_monthly=cfg.get("aic_monthly", 0),
@@ -308,7 +412,7 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         can_webhooks=cfg.get("webhooks", False),
         can_white_label=cfg.get("white_label", False),
         can_excel=cfg.get("excel", False),
-        can_priority=cfg.get("priority", False),
+        can_priority=cfg.get("priority_class", "p4") in PRIORITY_QUEUE_CLASSES,
         can_flex=cfg.get("flex", False),
         can_burn_hud=cfg.get("hud", False),
         show_ads=cfg.get("ads", True),
@@ -320,6 +424,7 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         max_thumbnails=cfg.get("max_thumbnails", 1),
         can_custom_thumbnails=cfg.get("custom_thumbnails", False),
         can_ai_thumbnail_styling=cfg.get("ai_thumbnail_styling", False),
+        can_audio_context=cfg.get("audio_context", True),
         max_parallel_uploads=cfg.get("max_parallel_uploads", 1),
         team_seats=cfg.get("team_seats", 1),
         analytics=cfg.get("analytics", "basic"),
@@ -345,7 +450,8 @@ def get_entitlements_from_user(
     if role in ("admin", "master_admin"):
         return get_entitlements_for_tier("master_admin")
 
-    tier = (user_record.get("subscription_tier") or "free").lower()
+    raw_tier = (user_record.get("subscription_tier") or "free").lower()
+    tier = normalize_tier(raw_tier)
     ent = get_entitlements_for_tier(tier)
 
     if overrides:
@@ -414,6 +520,7 @@ def entitlements_to_dict(ent: Entitlements) -> dict:
         "max_thumbnails":            ent.max_thumbnails,
         "can_custom_thumbnails":     ent.can_custom_thumbnails,
         "can_ai_thumbnail_styling":  ent.can_ai_thumbnail_styling,
+        "can_audio_context":          ent.can_audio_context,
         "max_parallel_uploads":      ent.max_parallel_uploads,
         "team_seats":                ent.team_seats,
         "analytics":                 ent.analytics,
@@ -484,15 +591,18 @@ def get_priority_lane(priority_class: str) -> str:
     return "priority" if priority_class in PRIORITY_QUEUE_CLASSES else "normal"
 
 
-def get_tier_display_name(tier: str) -> str:
-    """Get human-readable display name for a tier slug."""
-    cfg = TIER_CONFIG.get((tier or "free").lower(), {})
-    return cfg.get("name", tier.title())
-
-
 def get_tier_from_lookup_key(lookup_key: str) -> str:
     """Convert a Stripe price lookup_key to an internal tier slug."""
     return STRIPE_LOOKUP_TO_TIER.get((lookup_key or "").strip().lower(), "free")
+
+
+def should_generate_thumbnails(entitlements: Optional["Entitlements"]) -> bool:
+    """Return True if tier allows thumbnail generation (base or styled)."""
+    if not entitlements:
+        return False
+    return (getattr(entitlements, "max_thumbnails", 1) or 1) >= 1 or getattr(
+        entitlements, "can_custom_thumbnails", False
+    )
 
 
 # ============================================================

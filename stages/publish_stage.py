@@ -37,6 +37,7 @@ from .errors import PublishError, ErrorCode
 from .context import JobContext, PlatformResult
 from . import db as db_stage
 from . import r2 as r2_stage
+from .outbound_rl import outbound_slot
 
 
 logger = logging.getLogger("uploadm8-worker")
@@ -142,6 +143,20 @@ async def _push_thumbnail_to_platform(
         return False
 
 
+# TikTok Content Posting: public → PUBLIC_TO_EVERYONE when the app is approved.
+# Default is audited (public/live). Set TIKTOK_APP_AUDITED=false only for sandbox apps that
+# cannot post publicly yet (maps public → SELF_ONLY to avoid unaudited_client errors).
+_tiktok_aud_raw = os.environ.get("TIKTOK_APP_AUDITED", "true").strip().lower()
+TIKTOK_APP_AUDITED = _tiktok_aud_raw not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "unaudited",
+    "sandbox",
+)
+
+
 # =====================================================================
 # Privacy Level Resolution — single source of truth
 # =====================================================================
@@ -161,7 +176,7 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
     private   │ MUTUAL_FOLLOW_FRIENDS │ private   │ private   │ SELF
 
     TikTok notes:
-      - public   → PUBLIC_TO_EVERYONE (visible to everyone)
+      - public   → PUBLIC_TO_EVERYONE when TIKTOK_APP_AUDITED (default); else SELF_ONLY for sandbox
       - unlisted → SELF_ONLY ("Only You" — what we use for pre-approval uploads)
       - private  → MUTUAL_FOLLOW_FRIENDS (friends / mutual followers)
 
@@ -177,6 +192,9 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
         level = "public"
 
     if platform == "tiktok":
+        # Sandbox / unaudited apps cannot use PUBLIC_TO_EVERYONE (unaudited_client_can_only_post_to_private_accounts).
+        if not TIKTOK_APP_AUDITED and level == "public":
+            return "SELF_ONLY"
         return {
             "public":   "PUBLIC_TO_EVERYONE",
             "unlisted": "SELF_ONLY",              # "Only You" — safe for pre-approval testing
@@ -294,9 +312,17 @@ def decrypt_token(token_row: Any) -> Optional[dict]:
 # Content Derivation
 # =====================================================================
 
-def _get_title(ctx: JobContext) -> str:
-    """Get the best available title for publishing."""
-    return ctx.get_effective_title() if hasattr(ctx, "get_effective_title") else (
+def _get_title(ctx: JobContext, platform: str = "") -> str:
+    """Get the best available title for publishing (optional per-platform override)."""
+    if hasattr(ctx, "get_effective_title"):
+        return ctx.get_effective_title(platform) or (
+            getattr(ctx, "ai_title", None)
+            or getattr(ctx, "title", None)
+            or getattr(ctx, "video_title", None)
+            or getattr(ctx, "name", None)
+            or f"UploadM8 {getattr(ctx, 'upload_id', '')}".strip()
+        )
+    return (
         getattr(ctx, "ai_title", None)
         or getattr(ctx, "title", None)
         or getattr(ctx, "video_title", None)
@@ -305,9 +331,11 @@ def _get_title(ctx: JobContext) -> str:
     )
 
 
-def _get_caption(ctx: JobContext) -> str:
-    """Get the best available caption/description for publishing."""
-    return ctx.get_effective_caption() if hasattr(ctx, "get_effective_caption") else (
+def _get_caption(ctx: JobContext, platform: str = "") -> str:
+    """Get the best available caption/description (optional per-platform override)."""
+    if hasattr(ctx, "get_effective_caption"):
+        return ctx.get_effective_caption(platform) or ""
+    return (
         getattr(ctx, "ai_caption", None)
         or getattr(ctx, "caption", None)
         or getattr(ctx, "description", None)
@@ -341,7 +369,7 @@ def _build_platform_caption(ctx: JobContext, platform: str) -> str:
     Includes platform-specific hashtags from user_settings.
     Respects the user's hashtag_position preference (start / end).
     """
-    caption = _get_caption(ctx)
+    caption = _get_caption(ctx, platform)
     hashtags = _get_hashtags(ctx, platform=platform)
 
     if not hashtags:
@@ -432,48 +460,49 @@ async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = N
         return token_data
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://open.tiktokapis.com/v2/oauth/token/",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data={
-                    "client_key": client_key,
-                    "client_secret": client_secret,
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                },
-            )
-            if resp.status_code == 200:
-                new_tokens = resp.json()
-                logger.info("TikTok: Token refreshed successfully")
-                new_access  = new_tokens.get("access_token", token_data["access_token"])
-                new_refresh = new_tokens.get("refresh_token", refresh_token)
-                new_open_id = new_tokens.get("open_id") or token_data.get("open_id")
-                updated = {
-                    **token_data,
-                    "access_token":  new_access,
-                    "refresh_token": new_refresh,
-                    "expires_at":    new_tokens.get("expires_in"),
-                }
-                if new_open_id:
-                    updated["open_id"] = new_open_id
-                # Persist back to DB so future jobs use the fresh token
-                if db_pool and user_id:
-                    try:
-                        await db_stage.save_refreshed_token(
-                            db_pool,
-                            user_id=user_id,
-                            platform="tiktok",
-                            access_token=new_access,
-                            refresh_token=new_refresh,
-                            open_id=new_open_id,
-                        )
-                    except Exception as save_err:
-                        logger.warning(f"TikTok: Failed to persist refreshed token: {save_err}")
-                return updated
-            else:
-                logger.warning(f"TikTok: Token refresh failed: {resp.status_code} {resp.text[:200]}")
-                return token_data
+        async with outbound_slot("tiktok"):
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://open.tiktokapis.com/v2/oauth/token/",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    data={
+                        "client_key": client_key,
+                        "client_secret": client_secret,
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                    },
+                )
+                if resp.status_code == 200:
+                    new_tokens = resp.json()
+                    logger.info("TikTok: Token refreshed successfully")
+                    new_access  = new_tokens.get("access_token", token_data["access_token"])
+                    new_refresh = new_tokens.get("refresh_token", refresh_token)
+                    new_open_id = new_tokens.get("open_id") or token_data.get("open_id")
+                    updated = {
+                        **token_data,
+                        "access_token":  new_access,
+                        "refresh_token": new_refresh,
+                        "expires_at":    new_tokens.get("expires_in"),
+                    }
+                    if new_open_id:
+                        updated["open_id"] = new_open_id
+                    # Persist back to DB so future jobs use the fresh token
+                    if db_pool and user_id:
+                        try:
+                            await db_stage.save_refreshed_token(
+                                db_pool,
+                                user_id=user_id,
+                                platform="tiktok",
+                                access_token=new_access,
+                                refresh_token=new_refresh,
+                                open_id=new_open_id,
+                            )
+                        except Exception as save_err:
+                            logger.warning(f"TikTok: Failed to persist refreshed token: {save_err}")
+                    return updated
+                else:
+                    logger.warning(f"TikTok: Token refresh failed: {resp.status_code} {resp.text[:200]}")
+                    return token_data
     except Exception as e:
         logger.warning(f"TikTok: Token refresh exception: {e}")
         return token_data
@@ -502,140 +531,141 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
         return token_data
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            # Step 1: Exchange current token for a fresh long-lived user token
-            exchange_resp = await client.get(
-                "https://graph.facebook.com/v18.0/oauth/access_token",
-                params={
-                    "grant_type": "fb_exchange_token",
-                    "client_id": app_id,
-                    "client_secret": app_secret,
-                    "fb_exchange_token": access_token,
-                },
-            )
-            if exchange_resp.status_code != 200:
-                logger.warning(
-                    f"{platform}: Meta token exchange failed: "
-                    f"{exchange_resp.status_code} {exchange_resp.text[:200]}"
+        async with outbound_slot("meta"):
+            async with httpx.AsyncClient(timeout=30) as client:
+                # Step 1: Exchange current token for a fresh long-lived user token
+                exchange_resp = await client.get(
+                    "https://graph.facebook.com/v18.0/oauth/access_token",
+                    params={
+                        "grant_type": "fb_exchange_token",
+                        "client_id": app_id,
+                        "client_secret": app_secret,
+                        "fb_exchange_token": access_token,
+                    },
                 )
-                return token_data
-
-            new_user_token = exchange_resp.json().get("access_token")
-            if not new_user_token:
-                logger.warning(f"{platform}: Meta exchange returned no access_token")
-                return token_data
-
-            logger.info(f"{platform}: Meta user token refreshed successfully")
-
-            # Step 2: For Instagram/Facebook Page tokens, re-fetch the Page token
-            # Page tokens derived from a long-lived user token do not expire,
-            # so re-fetching gives us a stable non-expiring page token.
-            page_id = token_data.get("page_id") or token_data.get("ig_user_id")
-
-            if platform == "facebook" and page_id:
+                if exchange_resp.status_code != 200:
+                    logger.warning(
+                        f"{platform}: Meta token exchange failed: "
+                        f"{exchange_resp.status_code} {exchange_resp.text[:200]}"
+                    )
+                    return token_data
+    
+                new_user_token = exchange_resp.json().get("access_token")
+                if not new_user_token:
+                    logger.warning(f"{platform}: Meta exchange returned no access_token")
+                    return token_data
+    
+                logger.info(f"{platform}: Meta user token refreshed successfully")
+    
+                # Step 2: For Instagram/Facebook Page tokens, re-fetch the Page token
+                # Page tokens derived from a long-lived user token do not expire,
+                # so re-fetching gives us a stable non-expiring page token.
+                page_id = token_data.get("page_id") or token_data.get("ig_user_id")
+    
+                if platform == "facebook" and page_id:
+                    pages_resp = await client.get(
+                        "https://graph.facebook.com/v18.0/me/accounts",
+                        params={"access_token": new_user_token, "fields": "id,access_token"},
+                    )
+                    if pages_resp.status_code == 200:
+                        pages = pages_resp.json().get("data", [])
+                        matching = next((p for p in pages if p.get("id") == page_id), None)
+                        if matching:
+                            new_page_token = matching.get("access_token", new_user_token)
+                            updated = {
+                                **token_data,
+                                "access_token": new_page_token,
+                                "expires_at": None,  # Page tokens from LLT don't expire
+                            }
+                            if db_pool and user_id:
+                                try:
+                                    await db_stage.save_refreshed_token(
+                                        db_pool,
+                                        user_id=user_id,
+                                        platform=platform,
+                                        access_token=new_page_token,
+                                    )
+                                except Exception as save_err:
+                                    logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
+                            return updated
+    
+                # ── Recover missing ig_user_id / page_id ────────────────────────
+                # Old tokens stored before the OAuth fix may lack these IDs.
+                # Now that we have a fresh user token we can fetch them on the fly
+                # so the publish succeeds without forcing the user to reconnect.
+                # Step 1: Fetch user's Pages — id, name, page access_token only.
+                # instagram_business_account is NOT a valid inline field on /me/accounts;
+                # it must be fetched per-page via /{page_id}?fields=instagram_business_account
                 pages_resp = await client.get(
                     "https://graph.facebook.com/v18.0/me/accounts",
-                    params={"access_token": new_user_token, "fields": "id,access_token"},
+                    params={"access_token": new_user_token, "fields": "id,name,access_token"},
                 )
+    
+                recovered_ig_user_id = token_data.get("ig_user_id") or token_data.get("instagram_user_id")
+                recovered_page_id    = token_data.get("page_id") or token_data.get("facebook_page_id")
+                recovered_page_token = new_user_token  # fallback
+    
                 if pages_resp.status_code == 200:
                     pages = pages_resp.json().get("data", [])
-                    matching = next((p for p in pages if p.get("id") == page_id), None)
-                    if matching:
-                        new_page_token = matching.get("access_token", new_user_token)
-                        updated = {
-                            **token_data,
-                            "access_token": new_page_token,
-                            "expires_at": None,  # Page tokens from LLT don't expire
-                        }
-                        if db_pool and user_id:
-                            try:
-                                await db_stage.save_refreshed_token(
-                                    db_pool,
-                                    user_id=user_id,
-                                    platform=platform,
-                                    access_token=new_page_token,
-                                )
-                            except Exception as save_err:
-                                logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
-                        return updated
-
-            # ── Recover missing ig_user_id / page_id ────────────────────────
-            # Old tokens stored before the OAuth fix may lack these IDs.
-            # Now that we have a fresh user token we can fetch them on the fly
-            # so the publish succeeds without forcing the user to reconnect.
-            # Step 1: Fetch user's Pages — id, name, page access_token only.
-            # instagram_business_account is NOT a valid inline field on /me/accounts;
-            # it must be fetched per-page via /{page_id}?fields=instagram_business_account
-            pages_resp = await client.get(
-                "https://graph.facebook.com/v18.0/me/accounts",
-                params={"access_token": new_user_token, "fields": "id,name,access_token"},
-            )
-
-            recovered_ig_user_id = token_data.get("ig_user_id") or token_data.get("instagram_user_id")
-            recovered_page_id    = token_data.get("page_id") or token_data.get("facebook_page_id")
-            recovered_page_token = new_user_token  # fallback
-
-            if pages_resp.status_code == 200:
-                pages = pages_resp.json().get("data", [])
-
-                if platform == "instagram" and not recovered_ig_user_id:
-                    # instagram_business_account must be fetched per-page
-                    for page in pages:
-                        page_id_tmp    = page.get("id")
-                        page_token_tmp = page.get("access_token", new_user_token)
-                        if not page_id_tmp:
-                            continue
-                        ig_resp = await client.get(
-                            f"https://graph.facebook.com/v18.0/{page_id_tmp}",
-                            params={
-                                "access_token": page_token_tmp,
-                                "fields": "instagram_business_account",
-                            },
+    
+                    if platform == "instagram" and not recovered_ig_user_id:
+                        # instagram_business_account must be fetched per-page
+                        for page in pages:
+                            page_id_tmp    = page.get("id")
+                            page_token_tmp = page.get("access_token", new_user_token)
+                            if not page_id_tmp:
+                                continue
+                            ig_resp = await client.get(
+                                f"https://graph.facebook.com/v18.0/{page_id_tmp}",
+                                params={
+                                    "access_token": page_token_tmp,
+                                    "fields": "instagram_business_account",
+                                },
+                            )
+                            if ig_resp.status_code == 200:
+                                ig_biz = ig_resp.json().get("instagram_business_account")
+                                if ig_biz and ig_biz.get("id"):
+                                    recovered_ig_user_id = ig_biz["id"]
+                                    recovered_page_token = page_token_tmp
+                                    logger.info(
+                                        f"instagram: Recovered ig_user_id={recovered_ig_user_id} "
+                                        f"from Page '{page.get('name', '?')}' during token refresh"
+                                    )
+                                    break
+    
+                    if platform == "facebook" and not recovered_page_id and pages:
+                        first = pages[0]
+                        recovered_page_id    = first["id"]
+                        recovered_page_token = first.get("access_token", new_user_token)
+                        logger.info(
+                            f"facebook: Recovered page_id={recovered_page_id} "
+                            f"from Page '{first.get('name', '?')}' during token refresh"
                         )
-                        if ig_resp.status_code == 200:
-                            ig_biz = ig_resp.json().get("instagram_business_account")
-                            if ig_biz and ig_biz.get("id"):
-                                recovered_ig_user_id = ig_biz["id"]
-                                recovered_page_token = page_token_tmp
-                                logger.info(
-                                    f"instagram: Recovered ig_user_id={recovered_ig_user_id} "
-                                    f"from Page '{page.get('name', '?')}' during token refresh"
-                                )
-                                break
-
-                if platform == "facebook" and not recovered_page_id and pages:
-                    first = pages[0]
-                    recovered_page_id    = first["id"]
-                    recovered_page_token = first.get("access_token", new_user_token)
-                    logger.info(
-                        f"facebook: Recovered page_id={recovered_page_id} "
-                        f"from Page '{first.get('name', '?')}' during token refresh"
-                    )
-
-            # Build updated blob — preserve any existing IDs, override with recovered ones
-            updated = {
-                **token_data,
-                "access_token":  recovered_page_token if platform == "instagram" else new_user_token,
-                "expires_at":    None,
-            }
-            if platform == "instagram" and recovered_ig_user_id:
-                updated["ig_user_id"] = recovered_ig_user_id
-            if platform == "facebook" and recovered_page_id:
-                updated["page_id"]    = recovered_page_id
-                updated["access_token"] = recovered_page_token
-
-            if db_pool and user_id:
-                try:
-                    await db_stage.save_refreshed_token(
-                        db_pool,
-                        user_id=user_id,
-                        platform=platform,
-                        access_token=updated["access_token"],
-                    )
-                except Exception as save_err:
-                    logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
-            return updated
-
+    
+                # Build updated blob — preserve any existing IDs, override with recovered ones
+                updated = {
+                    **token_data,
+                    "access_token":  recovered_page_token if platform == "instagram" else new_user_token,
+                    "expires_at":    None,
+                }
+                if platform == "instagram" and recovered_ig_user_id:
+                    updated["ig_user_id"] = recovered_ig_user_id
+                if platform == "facebook" and recovered_page_id:
+                    updated["page_id"]    = recovered_page_id
+                    updated["access_token"] = recovered_page_token
+    
+                if db_pool and user_id:
+                    try:
+                        await db_stage.save_refreshed_token(
+                            db_pool,
+                            user_id=user_id,
+                            platform=platform,
+                            access_token=updated["access_token"],
+                        )
+                    except Exception as save_err:
+                        logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
+                return updated
+    
     except Exception as e:
         logger.warning(f"{platform}: Meta token refresh exception: {e}")
         return token_data
@@ -684,10 +714,10 @@ async def publish_to_tiktok(
             error_message="No access token"
         )
 
-    title = _get_title(ctx)
+    title = _get_title(ctx, "tiktok")
     caption = _build_platform_caption(ctx, "tiktok")
-    # TikTok uses title field (max 150 chars), caption goes in description
-    tiktok_title = (caption or title)[:150]
+    # TikTok uses title field (max 150 chars); prefer explicit title over full caption+tags
+    tiktok_title = (title or caption or "")[:150]
 
     try:
         file_size = video_path.stat().st_size
@@ -755,12 +785,28 @@ async def publish_to_tiktok(
             )
 
             if init_resp.status_code != 200:
+                err_txt = init_resp.text[:500]
+                try:
+                    ej = init_resp.json()
+                    err = ej.get("error") or {}
+                    code = (err.get("code") or err.get("message") or "") if isinstance(err, dict) else ""
+                    if isinstance(err, dict) and err.get("message"):
+                        err_txt = str(err.get("message", ""))[:400]
+                    if "unaudited" in str(code).lower() or "unaudited" in err_txt.lower():
+                        err_txt = (
+                            "TikTok rejected public posting (app still in unaudited mode on TikTok's side). "
+                            "Finish Content Posting review in the TikTok Developer Portal, or set "
+                            "TIKTOK_APP_AUDITED=false to force creator-only posts until then. "
+                            f"Details: {err_txt}"
+                        )
+                except Exception:
+                    pass
                 return PlatformResult(
                     platform="tiktok",
                     success=False,
                     http_status=init_resp.status_code,
                     error_code="INIT_FAILED",
-                    error_message=f"Init failed: {init_resp.text[:200]}"
+                    error_message=f"Init failed: {err_txt}",
                 )
 
             init_data = init_resp.json().get("data", {})
@@ -899,7 +945,7 @@ async def publish_to_youtube(
             error_message="No access token"
         )
 
-    title = _get_title(ctx)[:100]
+    title = _get_title(ctx, "youtube")[:100]
     caption = _build_platform_caption(ctx, "youtube")
     description = caption[:5000] if caption else ""
 
@@ -1453,17 +1499,19 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
             logger.warning(f"{account_label}: Could not create publish_attempt row: {e}")
             attempt_id = None
 
-        # -- Load platform token (by ID when multi-account, by platform otherwise) --
+        # -- Load platform token (use target_accounts token when specified) --
         token_data = None
+        token_identity = {}
         try:
-            if token_id:
-                raw_token = await db_stage.load_platform_token_by_id(db_pool, token_id)
-            else:
-                raw_token = await db_stage.load_platform_token(db_pool, ctx.user_id, db_key)
-            token_data = decrypt_token(raw_token) if raw_token else None
+            token_data, token_identity = await db_stage.load_platform_token_with_identity(
+                db_pool, ctx.user_id, db_key, token_row_id=token_id
+            )
+            if token_data:
+                token_data = decrypt_token(token_data) if isinstance(token_data, dict) and token_data.get("kid") else token_data
         except Exception as e:
             logger.warning(f"{account_label}: Token load failed: {e}")
             token_data = None
+            token_identity = {}
 
         if not token_data:
             msg = f"Not connected to {platform}" + (f" (account {token_id[:8]})" if token_id else "")
@@ -1484,7 +1532,7 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 attempt_id=attempt_id,
                 error_code="NOT_CONNECTED",
                 error_message=msg,
-                account_id=token_id,
+                token_row_id=token_id,
             )
             ctx.platform_results.append(pr)
             continue
@@ -1531,12 +1579,14 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 account_name=(token_data.get("_account_name") or "") if token_data else "",
             )
 
-        # -- Record result (include account for multi-account display) --
+        # -- Record result (stamp account identity from token so it's saved to DB) --
         result.attempt_id = attempt_id
-        result.account_id = token_id
-        result.account_name = (token_data.get("_account_name") or token_data.get("account_name") or "") if token_data else ""
-        result.account_username = (token_data.get("_account_username") or token_data.get("account_username") or "") if token_data else ""
-        result.account_avatar = (token_data.get("_account_avatar") or token_data.get("account_avatar") or "") if token_data else ""
+        if token_identity:
+            result.token_row_id     = token_identity.get("token_row_id")
+            result.account_id       = token_identity.get("account_id")
+            result.account_username = token_identity.get("account_username")
+            result.account_name     = token_identity.get("account_name")
+            result.account_avatar   = token_identity.get("account_avatar")
         ctx.platform_results.append(result)
 
         status_icon = "OK" if result.success else "FAIL"

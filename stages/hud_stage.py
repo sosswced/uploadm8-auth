@@ -41,7 +41,7 @@ def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
         )
     
     # Get speed unit preference
-    speed_unit = ctx.user_settings.get("hud_speed_unit", "mph")
+    speed_unit = (ctx.user_settings or {}).get("hud_speed_unit", "mph")
     
     def format_srt_time(seconds: float) -> str:
         h = int(seconds // 3600)
@@ -144,7 +144,7 @@ async def run_hud_stage(ctx: JobContext) -> JobContext:
         HUDError: If FFmpeg fails
     """
     # Check if HUD is enabled
-    if not ctx.user_settings.get("hud_enabled", True):
+    if not (ctx.user_settings or {}).get("hud_enabled", True):
         raise SkipStage("HUD disabled in user settings")
     
     # Check tier entitlements

@@ -184,6 +184,7 @@ async def verify_single_attempt(
     # PUBLISH_COMPLETE.  Without it, sync-analytics can't query TikTok metrics.
     if platform == "tiktok" and verify_status == "confirmed" and tiktok_video_id:
         upload_id = str(attempt.get("upload_id", ""))
+        attempt_publish_id = str(attempt.get("publish_id", ""))
         if upload_id:
             try:
                 async with db_pool.acquire() as conn:
@@ -198,12 +199,20 @@ async def verify_single_attempt(
                             updated = False
                             for item in pr_list:
                                 if isinstance(item, dict) and item.get("platform") == "tiktok":
-                                    item["platform_video_id"] = tiktok_video_id
-                                    item["video_id"] = tiktok_video_id
-                                    # Build the TikTok video URL
-                                    item["platform_url"] = f"https://www.tiktok.com/video/{tiktok_video_id}"
-                                    item["url"] = item["platform_url"]
-                                    updated = True
+                                    if attempt_publish_id and str(item.get("publish_id", "")) == attempt_publish_id:
+                                        item["platform_video_id"] = tiktok_video_id
+                                        item["video_id"] = tiktok_video_id
+                                        item["platform_url"] = f"https://www.tiktok.com/video/{tiktok_video_id}"
+                                        item["url"] = item["platform_url"]
+                                        updated = True
+                                        break
+                                    elif not attempt_publish_id:
+                                        item["platform_video_id"] = tiktok_video_id
+                                        item["video_id"] = tiktok_video_id
+                                        item["platform_url"] = f"https://www.tiktok.com/video/{tiktok_video_id}"
+                                        item["url"] = item["platform_url"]
+                                        updated = True
+                                        break
                             if updated:
                                 await conn.execute(
                                     "UPDATE uploads SET platform_results = $1::jsonb, updated_at = NOW() WHERE id = $2",

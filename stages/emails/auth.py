@@ -32,7 +32,44 @@ logger = logging.getLogger("uploadm8-worker")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. New user welcome
+# 0. Signup confirmation (must verify email before full access)
+# ─────────────────────────────────────────────────────────────────────────────
+async def send_signup_confirmation_email(email: str, name: str, confirmation_link: str) -> None:
+    """
+    Sent immediately after signup. User must click the link to verify their email.
+    confirmation_link points to {FRONTEND_URL}/confirm-email?token=xxx
+    """
+    if not mailgun_ready():
+        return
+
+    html = email_shell(
+        gradient=GRAD_ORANGE,
+        tagline="One more step to get started",
+        preheader_text=f"Click the link to confirm your UploadM8 account and start publishing.",
+        body_rows=(
+            section_tag("Confirm Your Email", "#f97316")
+            + intro_row(
+                f"Almost there, {name}! &#128640;",
+                "Thanks for signing up for UploadM8. Click the button below to confirm your "
+                "email address and activate your account. This link expires in "
+                "<strong style='color:#f97316;'>24 hours</strong>.",
+            )
+            + cta_button("Confirm My Email", confirmation_link, pt="24px", pb="20px")
+            + alert_banner(
+                "&#9888;&#65039;&nbsp; If you did <strong>not</strong> create an UploadM8 account, "
+                "you can safely ignore this email.",
+                hex_color="#374151",
+                pb="36px",
+            )
+        ),
+        footer_note="You received this because you signed up for an UploadM8 account.",
+    )
+
+    await send_email(email, "Confirm your UploadM8 email address ✉️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. New user welcome (sent AFTER email confirmation)
 # ─────────────────────────────────────────────────────────────────────────────
 async def send_welcome_email(email: str, name: str) -> None:
     """

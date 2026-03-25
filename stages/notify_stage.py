@@ -46,7 +46,7 @@ async def run_notify_stage(ctx: JobContext) -> JobContext:
     ctx.mark_stage("notify")
     
     # Get user's Discord webhook
-    user_webhook = ctx.user_settings.get("discord_webhook")
+    user_webhook = (ctx.user_settings or {}).get("discord_webhook")
     
     if user_webhook:
         await send_user_upload_notification(user_webhook, ctx)
@@ -144,8 +144,20 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
                 field_name = f"{icon} {plat_name}"
 
             if result.success:
-                if result.platform_url and result.platform_url.startswith("http"):
-                    value = f"[View Post]({result.platform_url})"
+                url = result.platform_url
+                if not url and getattr(result, "platform_video_id", None):
+                    plat = (result.platform or "").lower()
+                    vid = result.platform_video_id
+                    if plat == "tiktok":
+                        handle = getattr(result, "account_username", None) or "_"
+                        url = f"https://www.tiktok.com/@{handle}/video/{vid}"
+                    elif plat == "youtube":
+                        url = f"https://www.youtube.com/shorts/{vid}"
+                    elif plat == "facebook":
+                        url = f"https://www.facebook.com/watch/?v={vid}"
+                    # Instagram needs shortcode (from platform_url); media_id alone won't work
+                if url and str(url).startswith("http"):
+                    value = f"[View Post]({url})"
                 elif result.publish_id:
                     value = f"Accepted — publish_id: `{result.publish_id}`"
                 else:

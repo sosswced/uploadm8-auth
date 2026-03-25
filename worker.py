@@ -75,6 +75,7 @@ import asyncio
 import logging
 import tempfile
 import signal
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -167,6 +168,13 @@ KPI_COLLECTOR_INTERVAL = int(os.environ.get("KPI_COLLECTOR_INTERVAL_SECONDS", st
 ANALYTICS_SYNC_BATCH    = int(os.environ.get("ANALYTICS_SYNC_BATCH_SIZE", "20"))
 # Only re-sync uploads whose analytics_synced_at is older than this many hours
 ANALYTICS_RESYNC_HOURS  = int(os.environ.get("ANALYTICS_RESYNC_HOURS", "3"))
+
+# Per-user cooldown for TikTok/YouTube OAuth refresh inside analytics batch (avoids refresh storms
+# when many upload rows share the same user_id). Default 3600s; set 0 to refresh every row (old behavior).
+ANALYTICS_OAUTH_REFRESH_COOLDOWN_SEC = float(
+    os.environ.get("ANALYTICS_OAUTH_REFRESH_COOLDOWN_SECONDS", "3600")
+)
+_analytics_oauth_last_refresh: dict[str, float] = {}
 
 # Account-level platform_metrics_cache refresh (TikTok/YouTube/IG/FB live rollup in DB).
 # Default: 10800s = 3 hours ≈ 8×/day. Server-side worker only — not tied to user login.
@@ -1366,6 +1374,20 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
 # ANALYTICS SYNC LOOP
 # ---------------------------------------------------------------------------
 
+def _analytics_oauth_refresh_allowed(user_id: str) -> bool:
+    """True if TikTok/YouTube OAuth refresh may run for this user (per-worker-process cooldown)."""
+    if ANALYTICS_OAUTH_REFRESH_COOLDOWN_SEC <= 0:
+        return True
+    uid = str(user_id)
+    now = time.monotonic()
+    last = _analytics_oauth_last_refresh.get(uid)
+    return last is None or (now - last) >= ANALYTICS_OAUTH_REFRESH_COOLDOWN_SEC
+
+
+def _analytics_oauth_mark_refreshed(user_id: str) -> None:
+    _analytics_oauth_last_refresh[str(user_id)] = time.monotonic()
+
+
 async def _sync_one_upload_analytics(
     conn: asyncpg.Connection,
     upload_id: str,
@@ -1675,48 +1697,50 @@ async def run_analytics_sync_loop() -> None:
                             )
                         continue
 
-                    # Refresh TikTok/YouTube OAuth, then reload tokens from DB (same as app sync-analytics).
-                    try:
-                        from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
+                    # Refresh TikTok/YouTube OAuth at most once per user per cooldown (not once per upload row).
+                    if _analytics_oauth_refresh_allowed(user_id):
+                        try:
+                            from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
 
-                        if token_map_by_platform.get("tiktok"):
-                            await _refresh_tiktok_token(
-                                dict(token_map_by_platform["tiktok"]),
-                                db_pool=db_pool,
-                                user_id=str(user_id),
-                            )
-                        if token_map_by_platform.get("youtube"):
-                            await _refresh_youtube_token(
-                                dict(token_map_by_platform["youtube"]),
-                                db_pool=db_pool,
-                                user_id=str(user_id),
-                            )
-                        async with db_pool.acquire() as conn:
-                            trs = await conn.fetch(
-                                """SELECT id, platform, token_blob, account_id
-                                     FROM platform_tokens
-                                    WHERE user_id = $1 AND revoked_at IS NULL""",
-                                row["user_id"],
-                            )
-                        token_map = {}
-                        token_map_by_platform = {}
-                        for tr in trs:
-                            try:
-                                blob = tr["token_blob"]
-                                if isinstance(blob, str):
-                                    blob = json.loads(blob)
-                                dec = decrypt_token(blob)
-                                if dec:
-                                    if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
-                                        dec["ig_user_id"] = str(tr["account_id"])
-                                    if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
-                                        dec["page_id"] = str(tr["account_id"])
-                                    token_map[str(tr["id"])] = dec
-                                    token_map_by_platform[tr["platform"]] = dec
-                            except Exception:
-                                pass
-                    except Exception as _wr:
-                        logger.debug(f"[analytics-sync] oauth refresh skipped: {_wr}")
+                            if token_map_by_platform.get("tiktok"):
+                                await _refresh_tiktok_token(
+                                    dict(token_map_by_platform["tiktok"]),
+                                    db_pool=db_pool,
+                                    user_id=str(user_id),
+                                )
+                            if token_map_by_platform.get("youtube"):
+                                await _refresh_youtube_token(
+                                    dict(token_map_by_platform["youtube"]),
+                                    db_pool=db_pool,
+                                    user_id=str(user_id),
+                                )
+                            async with db_pool.acquire() as conn:
+                                trs = await conn.fetch(
+                                    """SELECT id, platform, token_blob, account_id
+                                         FROM platform_tokens
+                                        WHERE user_id = $1 AND revoked_at IS NULL""",
+                                    row["user_id"],
+                                )
+                            token_map = {}
+                            token_map_by_platform = {}
+                            for tr in trs:
+                                try:
+                                    blob = tr["token_blob"]
+                                    if isinstance(blob, str):
+                                        blob = json.loads(blob)
+                                    dec = decrypt_token(blob)
+                                    if dec:
+                                        if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
+                                            dec["ig_user_id"] = str(tr["account_id"])
+                                        if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
+                                            dec["page_id"] = str(tr["account_id"])
+                                        token_map[str(tr["id"])] = dec
+                                        token_map_by_platform[tr["platform"]] = dec
+                                except Exception:
+                                    pass
+                            _analytics_oauth_mark_refreshed(user_id)
+                        except Exception as _wr:
+                            logger.debug(f"[analytics-sync] oauth refresh skipped: {_wr}")
 
                     try:
                         async with db_pool.acquire() as conn:

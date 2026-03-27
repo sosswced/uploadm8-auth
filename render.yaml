@@ -124,6 +124,24 @@ services:
         sync: false
       - key: REPLICATE_ENABLED
         value: "true"
+      - key: REPLICATE_KONTEXT_MODEL
+        sync: false
+      - key: REPLICATE_TEXT_IMAGE_MODEL
+        sync: false
+      - key: REPLICATE_CONTROLNET_MODEL
+        sync: false
+
+      # ── Trend intel (SerpAPI / YouTube search) + YouTube A/B JPEGs ───────────
+      - key: TREND_INTEL_ENABLED
+        value: "false"
+      - key: SERPAPI_API_KEY
+        sync: false
+      - key: YOUTUBE_DATA_API_KEY
+        sync: false
+      - key: YOUTUBE_THUMBNAIL_AB_ENABLED
+        value: "false"
+      - key: YOUTUBE_THUMBNAIL_AB_EXTRA
+        value: "0"
 
       # ── fal.ai fast FLUX inference ───────────────────────────────────────────
       - key: FAL_KEY

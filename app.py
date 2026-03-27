@@ -22,6 +22,7 @@ except ImportError:
 import io
 import json
 import re
+import asyncio
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,9 @@ class UserPreferencesUpdate(BaseModel):
     blocked_hashtags: List[str] = Field(default_factory=list, alias="blockedHashtags")
     platform_hashtags: PlatformHashtags = Field(default_factory=PlatformHashtags, alias="platformHashtags")
     email_notifications: bool = Field(True, alias="emailNotifications")
+    auth_security_alerts: bool = Field(True, alias="authSecurityAlerts")
+    digest_emails: bool = Field(True, alias="digestEmails")
+    scheduled_alert_emails: bool = Field(True, alias="scheduledAlertEmails")
     discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
     # Caption & AI (stored in users.preferences; worker caption_stage reads these)
     caption_style: Literal["story", "punchy", "factual"] = Field("story", alias="captionStyle")
@@ -385,7 +389,7 @@ STYLE GUIDE:
 - Avoid: Illegal references, exact speeds, clickbait lies
 
 EMOJI USAGE:
-- Titles: 1-2 emojis max (fire 🔥, lightning ⚡, eyes 👀)
+- Titles: 1-2 emojis max (fire , lightning , eyes )
 - Captions: 2-3 emojis strategically placed
 - Never excessive or spammy
 
@@ -425,6 +429,7 @@ from stages.entitlements import (
     ENTITLEMENT_KEYS,
     normalize_tier,
     get_tier_display_name,
+    get_next_public_upgrade_tier,
     get_tiers_for_api,
     get_entitlements_for_tier,
     get_entitlements_from_user,
@@ -468,12 +473,15 @@ from services.notifications import (
 from stages.emails import (
     # Auth
     send_welcome_email,
+    send_fully_signed_up_guide_email,
     send_password_reset_email,
     send_password_changed_email,
     send_account_deleted_email,
     send_email_change_email,
     send_admin_email_change_notice_to_old_email,
+    send_user_email_change_notice_to_old_email,
     send_admin_reset_password_email,
+    send_login_anomaly_email,
     # Billing — Subscriptions
     send_subscription_started_email,
     send_trial_started_email,
@@ -484,6 +492,7 @@ from stages.emails import (
     send_plan_upgraded_email,
     send_plan_downgraded_email,
     send_topup_receipt_email,
+    send_refund_receipt_email,
     # Announcements
     send_announcement_email,
     # Heartfelt welcomes
@@ -497,6 +506,10 @@ from stages.emails import (
     send_payment_failed_email,
     send_trial_ending_reminder_email,
     send_low_token_warning_email,
+    send_monthly_user_kpi_digest_email,
+    send_admin_weekly_kpi_digest_email,
+    send_report_ready_email,
+    send_scheduled_publish_alert_email,
 )
 
 # ============================================================
@@ -505,6 +518,261 @@ from stages.emails import (
 def _now_utc(): return datetime.now(timezone.utc)
 def _sha256_hex(s: str): return hashlib.sha256(s.encode()).hexdigest()
 def _req_id(): return f"req_{int(time.time())}_{secrets.token_hex(4)}"
+
+# Email digest / reminder cron cadence
+EMAIL_CRON_INTERVAL_SECONDS = int(os.environ.get("EMAIL_CRON_INTERVAL_SECONDS", "3600"))
+
+
+async def _run_trial_ending_reminders_once():
+    """Send 3-day trial ending reminders (idempotent per trial period)."""
+    now = _now_utc()
+    window_end = now + timedelta(days=4)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, email, name, subscription_tier, trial_end, current_period_end, trial_reminder_sent_at
+            FROM users
+            WHERE subscription_status = 'trialing'
+              AND trial_end IS NOT NULL
+              AND trial_end > $1
+              AND trial_end <= $2
+              AND status = 'active'
+            """,
+            now, window_end,
+        )
+        for r in rows:
+            trial_end = r.get("trial_end")
+            if not trial_end:
+                continue
+            days_left = max(1, (trial_end.date() - now.date()).days)
+            if days_left > 3:
+                continue
+            sent_at = r.get("trial_reminder_sent_at")
+            if sent_at and sent_at.date() >= (trial_end - timedelta(days=3)).date():
+                continue
+            try:
+                amount = float(get_plan(r.get("subscription_tier") or "free").get("price", 0.0) or 0.0)
+            except Exception:
+                amount = 0.0
+            await send_trial_ending_reminder_email(
+                r["email"],
+                r["name"] or "there",
+                r.get("subscription_tier") or "free",
+                trial_end.strftime("%B %d, %Y"),
+                days_left=days_left,
+                amount=amount,
+            )
+            await conn.execute(
+                "UPDATE users SET trial_reminder_sent_at = NOW(), updated_at = NOW() WHERE id = $1",
+                r["id"],
+            )
+
+
+async def _run_monthly_user_kpi_digests_once():
+    """Send one monthly KPI digest per active user per month."""
+    now = _now_utc()
+    period_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    if now.day != 1:
+        return
+    prev_end = period_start
+    prev_start = datetime(prev_end.year, prev_end.month, 1, tzinfo=timezone.utc) - timedelta(days=1)
+    prev_start = datetime(prev_start.year, prev_start.month, 1, tzinfo=timezone.utc)
+    period_label = prev_start.strftime("%B %Y")
+
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch(
+            """
+            SELECT u.id, u.email, u.name, u.subscription_tier, u.monthly_digest_period,
+                   COALESCE(up.email_notifications, TRUE) AS email_notifications,
+                   COALESCE(up.digest_emails, TRUE) AS digest_emails
+            FROM users u
+            LEFT JOIN user_preferences up ON up.user_id = u.id
+            WHERE u.status = 'active'
+              AND u.email_verified = TRUE
+              AND COALESCE(up.email_notifications, TRUE) = TRUE
+              AND COALESCE(up.digest_emails, TRUE) = TRUE
+            """
+        )
+        for u in users:
+            if u.get("monthly_digest_period") and u["monthly_digest_period"] >= period_start.date():
+                continue
+            stats = await conn.fetchrow(
+                """
+                SELECT
+                  COUNT(*)::int AS uploads,
+                  COUNT(*) FILTER (WHERE status IN ('completed','succeeded'))::int AS success_uploads,
+                  COALESCE(SUM(views),0)::bigint AS views,
+                  COALESCE(SUM(likes),0)::bigint AS likes,
+                  COALESCE(SUM(put_spent),0)::int AS put_used,
+                  COALESCE(SUM(aic_spent),0)::int AS aic_used
+                FROM uploads
+                WHERE user_id = $1
+                  AND created_at >= $2
+                  AND created_at < $3
+                """,
+                u["id"], prev_start, prev_end,
+            )
+            wallet = await conn.fetchrow(
+                "SELECT COALESCE(put_balance,0)::int AS put_balance, COALESCE(aic_balance,0)::int AS aic_balance FROM wallets WHERE user_id = $1",
+                u["id"],
+            ) or {"put_balance": 0, "aic_balance": 0}
+            uploads = int((stats or {}).get("uploads") or 0)
+            success_uploads = int((stats or {}).get("success_uploads") or 0)
+            success_pct = int(round((success_uploads / max(uploads, 1)) * 100))
+            await send_monthly_user_kpi_digest_email(
+                u["email"],
+                u["name"] or "there",
+                u.get("subscription_tier") or "free",
+                period_label,
+                uploads,
+                success_pct,
+                int((stats or {}).get("views") or 0),
+                int((stats or {}).get("likes") or 0),
+                int((stats or {}).get("put_used") or 0),
+                int((stats or {}).get("aic_used") or 0),
+                int(wallet.get("put_balance") or 0),
+                int(wallet.get("aic_balance") or 0),
+            )
+            await conn.execute(
+                "UPDATE users SET monthly_digest_period = $2, updated_at = NOW() WHERE id = $1",
+                u["id"], period_start.date(),
+            )
+
+
+async def _run_admin_weekly_kpi_digest_once():
+    """Send one weekly KPI digest to admin/master_admin accounts."""
+    now = _now_utc()
+    week_key = now.strftime("%G-W%V")
+    # Send on Mondays only.
+    if now.weekday() != 0:
+        return
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT settings_json FROM admin_settings WHERE id = 1")
+        settings = {}
+        if row and row.get("settings_json"):
+            try:
+                settings = dict(row["settings_json"])
+            except Exception:
+                settings = {}
+        if not settings.get("notify_weekly_report", True):
+            return
+        if settings.get("weekly_kpi_digest_week") == week_key:
+            return
+
+        since = now - timedelta(days=7)
+        total_users = int(await conn.fetchval("SELECT COUNT(*) FROM users") or 0)
+        new_users = int(await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since) or 0)
+        paid_users = int(await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free','master_admin','friends_family','lifetime') AND subscription_status='active'") or 0)
+        uploads = int(await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since) or 0)
+        revenue = float(await conn.fetchval("SELECT COALESCE(SUM(amount),0)::decimal FROM revenue_tracking WHERE created_at >= $1", since) or 0.0)
+        cost = float(await conn.fetchval("SELECT COALESCE(SUM(cost_usd),0)::decimal FROM cost_tracking WHERE created_at >= $1", since) or 0.0)
+        margin_pct = ((revenue - cost) / revenue * 100.0) if revenue > 0 else 0.0
+        admins = await conn.fetch(
+            "SELECT email, name FROM users WHERE role IN ('admin','master_admin') AND status='active' AND email_verified=TRUE"
+        )
+        week_label = f"{since.strftime('%b %d')} - {now.strftime('%b %d, %Y')}"
+        for a in admins:
+            await send_admin_weekly_kpi_digest_email(
+                a["email"],
+                a["name"] or "admin",
+                week_label,
+                total_users,
+                new_users,
+                paid_users,
+                uploads,
+                revenue,
+                cost,
+                margin_pct,
+            )
+        settings["weekly_kpi_digest_week"] = week_key
+        await conn.execute(
+            "UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1",
+            json.dumps(settings),
+        )
+
+
+async def _run_scheduled_publish_alerts_once():
+    """Alert users when scheduled uploads are delayed or failed."""
+    now = _now_utc()
+    delayed_cutoff = now - timedelta(minutes=15)
+    async with db_pool.acquire() as conn:
+        delayed = await conn.fetch(
+            """
+            SELECT u.id, u.user_id, u.filename, u.status, u.scheduled_time, u.error_detail,
+                   usr.email, usr.name,
+                   COALESCE(up.email_notifications, TRUE) AS email_notifications,
+                   COALESCE(up.scheduled_alert_emails, TRUE) AS scheduled_alert_emails
+            FROM uploads u
+            JOIN users usr ON usr.id = u.user_id
+            LEFT JOIN user_preferences up ON up.user_id = u.user_id
+            WHERE u.schedule_mode IN ('scheduled', 'smart')
+              AND u.scheduled_time IS NOT NULL
+              AND u.scheduled_time <= $1
+              AND u.status IN ('pending','scheduled','queued','staged','ready_to_publish')
+              AND u.schedule_warn_email_sent_at IS NULL
+              AND usr.status = 'active'
+              AND usr.email_verified = TRUE
+              AND COALESCE(up.email_notifications, TRUE) = TRUE
+              AND COALESCE(up.scheduled_alert_emails, TRUE) = TRUE
+            """,
+            delayed_cutoff,
+        )
+        for r in delayed:
+            when = r["scheduled_time"].strftime("%B %d, %Y %H:%M UTC") if r.get("scheduled_time") else "scheduled time"
+            await send_scheduled_publish_alert_email(
+                r["email"],
+                r["name"] or "there",
+                r.get("filename") or "upload",
+                when,
+                r.get("status") or "pending",
+                r.get("error_detail") or "",
+                str(r["id"]),
+            )
+            await conn.execute("UPDATE uploads SET schedule_warn_email_sent_at = NOW() WHERE id = $1", r["id"])
+
+        failed = await conn.fetch(
+            """
+            SELECT u.id, u.user_id, u.filename, u.status, u.scheduled_time, u.error_detail,
+                   usr.email, usr.name,
+                   COALESCE(up.email_notifications, TRUE) AS email_notifications,
+                   COALESCE(up.scheduled_alert_emails, TRUE) AS scheduled_alert_emails
+            FROM uploads u
+            JOIN users usr ON usr.id = u.user_id
+            LEFT JOIN user_preferences up ON up.user_id = u.user_id
+            WHERE u.schedule_mode IN ('scheduled', 'smart')
+              AND u.status = 'failed'
+              AND u.schedule_fail_email_sent_at IS NULL
+              AND usr.status = 'active'
+              AND usr.email_verified = TRUE
+              AND COALESCE(up.email_notifications, TRUE) = TRUE
+              AND COALESCE(up.scheduled_alert_emails, TRUE) = TRUE
+            """
+        )
+        for r in failed:
+            when = r["scheduled_time"].strftime("%B %d, %Y %H:%M UTC") if r.get("scheduled_time") else "scheduled time"
+            await send_scheduled_publish_alert_email(
+                r["email"],
+                r["name"] or "there",
+                r.get("filename") or "upload",
+                when,
+                "failed",
+                r.get("error_detail") or "",
+                str(r["id"]),
+            )
+            await conn.execute("UPDATE uploads SET schedule_fail_email_sent_at = NOW() WHERE id = $1", r["id"])
+
+
+async def _email_cron_loop():
+    """Background loop for reminder/digest emails."""
+    while True:
+        try:
+            await _run_trial_ending_reminders_once()
+            await _run_monthly_user_kpi_digests_once()
+            await _run_admin_weekly_kpi_digest_once()
+            await _run_scheduled_publish_alerts_once()
+        except Exception as e:
+            logger.warning(f"email cron loop failed: {e}")
+        await asyncio.sleep(max(300, EMAIL_CRON_INTERVAL_SECONDS))
 
 def parse_enc_keys():
     if not TOKEN_ENC_KEYS:
@@ -548,10 +816,38 @@ def create_access_jwt(user_id: str) -> str:
     now = _now_utc()
     return jwt.encode({"sub": user_id, "iat": int(now.timestamp()), "exp": int((now + timedelta(minutes=ACCESS_TOKEN_MINUTES)).timestamp()), "iss": JWT_ISSUER, "aud": JWT_AUDIENCE}, JWT_SECRET, algorithm="HS256")
 
+def _normalize_jwt_subject(raw_sub) -> Optional[str]:
+    """
+    Normalize JWT `sub` into a string user id.
+    Defensively handles accidental object subjects so DB queries never receive dicts.
+    """
+    if isinstance(raw_sub, str):
+        s = raw_sub.strip()
+        return s or None
+
+    data = raw_sub
+    if isinstance(data, dict) and "kid" in data and "nonce" in data and "ciphertext" in data:
+        try:
+            data = decrypt_blob(data)
+        except Exception:
+            return None
+
+    if isinstance(data, dict):
+        for key in ("sub", "user_id", "id"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return None
+
 def verify_access_jwt(token: str) -> Optional[str]:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], audience=JWT_AUDIENCE, issuer=JWT_ISSUER)
-        return payload.get("sub")
+        subject = _normalize_jwt_subject(payload.get("sub"))
+        if not subject:
+            logger.warning("JWT verification failed: invalid subject type")
+            return None
+        return subject
     except jwt.ExpiredSignatureError:
         logger.warning("JWT token expired")
         return None
@@ -649,7 +945,7 @@ async def send_signup_confirmation_email(email: str, name: str, token: str):
           <tr>
             <td align="center" style="padding:40px 40px 0;">
               <div style="width:72px;height:72px;background:rgba(249,115,22,0.1);border:1px solid rgba(249,115,22,0.25);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:30px;line-height:72px;">
-                ✉️
+                ️
               </div>
             </td>
           </tr>
@@ -913,6 +1209,13 @@ class ResetPasswordRequest(BaseModel):
     token: str = Field(min_length=16)
     new_password: str = Field(min_length=8)
 
+class ResendConfirmationRequest(BaseModel):
+    email: EmailStr
+
+class UpdatePendingEmailRequest(BaseModel):
+    current_email: EmailStr
+    new_email: EmailStr
+
 
 class UploadInit(BaseModel):
     filename: str
@@ -971,6 +1274,10 @@ class ProfileUpdateSettings(BaseModel):
     last_name: Optional[str] = None
     timezone: Optional[str] = None
 
+class SettingsEmailChange(BaseModel):
+    new_email: EmailStr
+    current_password: str = Field(min_length=8)
+
 class PreferencesUpdate(BaseModel):
     """Settings page / legacy prefs — includes Caption & AI card fields for save/load."""
     emailNotifs: Optional[bool] = None
@@ -1000,6 +1307,41 @@ class TransferRequest(BaseModel):
     from_platform: str
     to_platform: str
     amount: int
+
+class MarketingEventIn(BaseModel):
+    event_type: str = Field(..., pattern="^(shown|clicked|dismissed|converted)$")
+    nudge_type: Optional[str] = Field(default="general", max_length=120)
+    nudge_severity: Optional[str] = Field(default=None, max_length=32)
+    cta_variant: Optional[str] = Field(default=None, max_length=8)
+    urgency_variant: Optional[str] = Field(default=None, max_length=8)
+    ordering_variant: Optional[str] = Field(default=None, max_length=8)
+    page: Optional[str] = Field(default=None, max_length=255)
+    session_id: Optional[str] = Field(default=None, max_length=120)
+    metadata: Optional[Dict[str, Any]] = None
+
+class MarketingCampaignIn(BaseModel):
+    name: str = Field(..., min_length=3, max_length=160)
+    objective: str = Field(..., min_length=3, max_length=400)
+    channel: str = Field(..., pattern="^(in_app|email|discount|mixed)$")
+    range: str = Field(default="30d", max_length=16)
+    tiers: List[str] = []
+    min_uploads_30d: int = Field(default=0, ge=0, le=10000)
+    min_enterprise_fit_score: float = Field(default=0, ge=0, le=100)
+    min_nudge_ctr_pct: float = Field(default=0, ge=0, le=100)
+    require_no_revenue_7d: bool = False
+    schedule_at: Optional[datetime] = None
+    notes: Optional[str] = Field(default="", max_length=4000)
+
+class MarketingCampaignStatusIn(BaseModel):
+    status: str = Field(..., pattern="^(draft|scheduled|active|paused|completed|cancelled)$")
+
+class MarketingAIGenerateIn(BaseModel):
+    range: str = Field(default="30d", max_length=16)
+    objective: str = Field(default="revenue_growth", max_length=120)
+    tone: str = Field(default="executive_clear", max_length=80)
+    offer_style: str = Field(default="value_first", max_length=80)
+    channel_mix: str = Field(default="mixed", max_length=40)
+    force_deploy: bool = False
 
 class AnnouncementRequest(BaseModel):
     title: str
@@ -1116,9 +1458,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Trill places seeding failed: {e}")
     
-    yield
-    if db_pool: await db_pool.close()
-    if redis_client: await redis_client.close()
+    email_cron_task = asyncio.create_task(_email_cron_loop())
+
+    try:
+        yield
+    finally:
+        email_cron_task.cancel()
+        try:
+            await email_cron_task
+        except asyncio.CancelledError:
+            pass
+        if db_pool:
+            await db_pool.close()
+        if redis_client:
+            await redis_client.close()
 
 async def run_migrations():
     async with db_pool.acquire() as conn:
@@ -1174,6 +1527,67 @@ async def run_migrations():
             (9, "CREATE TABLE IF NOT EXISTS admin_settings (id INT PRIMARY KEY DEFAULT 1, settings_json JSONB DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT NOW())"),
             (10, "CREATE TABLE IF NOT EXISTS cost_tracking (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID, category VARCHAR(100) NOT NULL, operation VARCHAR(255), tokens INT, cost_usd DECIMAL(10,6), created_at TIMESTAMPTZ DEFAULT NOW())"),
             (11, "CREATE TABLE IF NOT EXISTS revenue_tracking (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID, amount DECIMAL(10,2) NOT NULL, source VARCHAR(100), stripe_event_id VARCHAR(255), plan VARCHAR(100), created_at TIMESTAMPTZ DEFAULT NOW())"),
+            (205, """
+                CREATE TABLE IF NOT EXISTS marketing_events (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                    session_id VARCHAR(120),
+                    event_type VARCHAR(32) NOT NULL,
+                    nudge_type VARCHAR(120),
+                    nudge_severity VARCHAR(32),
+                    cta_variant VARCHAR(8),
+                    urgency_variant VARCHAR(8),
+                    ordering_variant VARCHAR(8),
+                    page VARCHAR(255),
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_marketing_events_created ON marketing_events(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_marketing_events_user_created ON marketing_events(user_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_marketing_events_type_created ON marketing_events(event_type, created_at DESC);
+            """),
+            (206, """
+                CREATE TABLE IF NOT EXISTS marketing_campaigns (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                    name VARCHAR(160) NOT NULL,
+                    objective VARCHAR(400) NOT NULL,
+                    channel VARCHAR(24) NOT NULL,
+                    status VARCHAR(24) NOT NULL DEFAULT 'draft',
+                    range_key VARCHAR(16) NOT NULL DEFAULT '30d',
+                    targeting JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    estimated_audience INT NOT NULL DEFAULT 0,
+                    schedule_at TIMESTAMPTZ,
+                    notes TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_marketing_campaigns_created ON marketing_campaigns(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_marketing_campaigns_status ON marketing_campaigns(status, schedule_at);
+            """),
+            (207, """
+                CREATE TABLE IF NOT EXISTS ai_marketing_decisions (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                    action VARCHAR(32) NOT NULL, -- generate | deploy
+                    objective VARCHAR(120),
+                    range_key VARCHAR(16),
+                    used_openai BOOLEAN DEFAULT FALSE,
+                    deploy_allowed BOOLEAN,
+                    forced BOOLEAN DEFAULT FALSE,
+                    confidence_score INT,
+                    status VARCHAR(24) NOT NULL, -- ok | blocked | error
+                    blocked_reasons JSONB DEFAULT '[]'::jsonb,
+                    snapshot JSONB DEFAULT '{}'::jsonb,
+                    decision JSONB DEFAULT '{}'::jsonb,
+                    plan JSONB DEFAULT '{}'::jsonb,
+                    campaign_id UUID,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_marketing_decisions_created ON ai_marketing_decisions(created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ai_marketing_decisions_action ON ai_marketing_decisions(action, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_ai_marketing_decisions_campaign ON ai_marketing_decisions(campaign_id);
+            """),
             (12, "CREATE TABLE IF NOT EXISTS account_groups (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, name VARCHAR(100) NOT NULL, account_ids TEXT[] DEFAULT '{}', color VARCHAR(20) DEFAULT '#3b82f6', created_at TIMESTAMPTZ DEFAULT NOW())"),
             (13, "CREATE TABLE IF NOT EXISTS white_label_settings (user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, enabled BOOLEAN DEFAULT FALSE, logo_url VARCHAR(512), company_name VARCHAR(255), primary_color VARCHAR(20), created_at TIMESTAMPTZ DEFAULT NOW())"),
             (14, "INSERT INTO admin_settings (id, settings_json) VALUES (1, '{}') ON CONFLICT DO NOTHING"),
@@ -1762,6 +2176,67 @@ async def run_migrations():
     ALTER TABLE users ADD COLUMN IF NOT EXISTS must_reset_password BOOLEAN DEFAULT FALSE;
     UPDATE users SET must_reset_password = FALSE WHERE must_reset_password IS NULL;
     ALTER TABLE email_changes ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
+"""),
+
+(813, """
+    -- Ensure admin email/password reset columns exist on older databases
+    ALTER TABLE email_changes ADD COLUMN IF NOT EXISTS changed_by_admin_id UUID REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE email_changes ADD COLUMN IF NOT EXISTS verification_token TEXT;
+    ALTER TABLE email_changes ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
+
+    ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS reset_by_admin_id UUID REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS temp_password_hash TEXT;
+    ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS force_change BOOLEAN DEFAULT TRUE;
+    ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+"""),
+
+(814, """
+    -- Email reminder/digest cursors
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_reminder_sent_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS monthly_digest_period DATE;
+"""),
+
+(815, """
+    -- Async analytics export jobs (secure one-time download link)
+    CREATE TABLE IF NOT EXISTS export_jobs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        token_hash TEXT UNIQUE NOT NULL,
+        report_type VARCHAR(50) NOT NULL DEFAULT 'analytics',
+        format VARCHAR(20) NOT NULL DEFAULT 'csv',
+        days INT NOT NULL DEFAULT 30,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        file_blob BYTEA,
+        content_type TEXT,
+        filename TEXT,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        ready_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS idx_export_jobs_user_created ON export_jobs(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_export_jobs_expires ON export_jobs(expires_at);
+"""),
+
+(816, """
+    -- Scheduled publish alert email flags
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS schedule_warn_email_sent_at TIMESTAMPTZ;
+    ALTER TABLE uploads ADD COLUMN IF NOT EXISTS schedule_fail_email_sent_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS idx_uploads_sched_warn_email ON uploads(schedule_warn_email_sent_at);
+    CREATE INDEX IF NOT EXISTS idx_uploads_sched_fail_email ON uploads(schedule_fail_email_sent_at);
+"""),
+
+(817, """
+    -- Login anomaly fingerprint fields
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_country VARCHAR(2);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_user_agent TEXT;
+"""),
+
+(818, """
+    -- Email category toggles
+    ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS auth_security_alerts BOOLEAN DEFAULT TRUE;
+    ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS digest_emails BOOLEAN DEFAULT TRUE;
+    ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS scheduled_alert_emails BOOLEAN DEFAULT TRUE;
 """),
 ]
         
@@ -2355,7 +2830,7 @@ GENERATE:
    - Create mystery/curiosity gap
    - Use 1-2 emojis strategically
    - Make it stop-the-scroll worthy
-   - Examples: "This road changed my perspective 🔥" or "POV: You find the perfect line ⚡"
+   - Examples: "This road changed my perspective " or "POV: You find the perfect line "
    
 2. CAPTION (max 200 chars)
    - First-person, conversational
@@ -2681,11 +3156,10 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
             user_id, data.email.lower(), hash_password(data.password), data.name, country_code
         )
         await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
-        # Default credits from free tier entitlements — enough to try uploads + AI features
+        # Default credits from canonical free-tier entitlements.
         ent = get_entitlements_for_tier("free")
-        # Starter wallet: enough to exercise PUT + AI without waiting for monthly refill
-        signup_put = 75
-        signup_aic = 75
+        signup_put = int(ent.put_monthly or 0)
+        signup_aic = int(ent.aic_monthly or 0)
         await conn.execute(
             "INSERT INTO wallets (user_id, put_balance, aic_balance) VALUES ($1, $2, $3)",
             user_id, signup_put, signup_aic
@@ -2707,16 +3181,149 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
 
     return {"ok": True, "email": data.email.lower()}
 
+@app.post("/api/auth/resend-confirmation")
+async def resend_confirmation(payload: ResendConfirmationRequest, background_tasks: BackgroundTasks):
+    """
+    Resend signup confirmation email for an unverified account.
+    Returns ok even when account does not exist to reduce enumeration.
+    """
+    email = payload.email.lower().strip()
+    async with db_pool.acquire() as conn:
+        user_row = await conn.fetchrow(
+            "SELECT id, email, name, email_verified, status FROM users WHERE LOWER(email) = $1",
+            email,
+        )
+        if not user_row:
+            return {"ok": True}
+        if user_row.get("email_verified", False):
+            return {"ok": True, "already_verified": True}
+        if user_row.get("status") in ("banned", "disabled"):
+            return {"ok": True}
+
+        # Invalidate old outstanding links and issue a fresh one.
+        await conn.execute(
+            "UPDATE email_confirmations SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL",
+            user_row["id"],
+        )
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        await conn.execute(
+            "INSERT INTO email_confirmations (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+            user_row["id"], token_hash, expires_at
+        )
+
+    background_tasks.add_task(
+        send_signup_confirmation_email,
+        user_row["email"],
+        user_row["name"] or "there",
+        token,
+    )
+    return {"ok": True}
+
+@app.post("/api/auth/update-pending-email")
+async def update_pending_email(payload: UpdatePendingEmailRequest, background_tasks: BackgroundTasks):
+    """
+    Let users fix a typo in their signup email before verification,
+    while keeping the same pending account.
+    """
+    current_email = payload.current_email.lower().strip()
+    new_email = payload.new_email.lower().strip()
+    if current_email == new_email:
+        return {"ok": True, "email": new_email}
+
+    async with db_pool.acquire() as conn:
+        user_row = await conn.fetchrow(
+            "SELECT id, name, email_verified, status FROM users WHERE LOWER(email) = $1",
+            current_email,
+        )
+        if not user_row:
+            raise HTTPException(status_code=404, detail="Pending account not found")
+        if user_row.get("email_verified", False):
+            raise HTTPException(status_code=409, detail="This account is already verified")
+        if user_row.get("status") in ("banned", "disabled"):
+            raise HTTPException(status_code=403, detail="Account is not eligible for email updates")
+
+        existing = await conn.fetchval(
+            "SELECT 1 FROM users WHERE LOWER(email) = $1 AND id <> $2",
+            new_email,
+            user_row["id"],
+        )
+        if existing:
+            raise HTTPException(status_code=409, detail="Email already in use")
+
+        await conn.execute(
+            "UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2",
+            new_email,
+            user_row["id"],
+        )
+        await conn.execute(
+            "UPDATE email_confirmations SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL",
+            user_row["id"],
+        )
+
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+        await conn.execute(
+            "INSERT INTO email_confirmations (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+            user_row["id"], token_hash, expires_at
+        )
+
+    background_tasks.add_task(
+        send_signup_confirmation_email,
+        new_email,
+        user_row["name"] or "there",
+        token,
+    )
+    return {"ok": True, "email": new_email}
+
 @app.post("/api/auth/login")
-async def login(data: UserLogin):
+async def login(data: UserLogin, request: Request, background_tasks: BackgroundTasks):
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow(
-            "SELECT id, password_hash, status, email_verified, must_reset_password FROM users WHERE LOWER(email) = $1",
+            "SELECT id, email, name, password_hash, status, email_verified, must_reset_password, subscription_tier, last_login_ip, last_login_country, last_login_user_agent FROM users WHERE LOWER(email) = $1",
             data.email.lower(),
         )
         if not user or not verify_password(data.password, user["password_hash"]): raise HTTPException(401, "Invalid credentials")
         if user["status"] == "banned": raise HTTPException(403, "Account suspended")
         if not user.get("email_verified", True): raise HTTPException(403, "Please verify your email before signing in. Check your inbox for the confirmation link.")
+        # Ensure daily refresh is applied on successful sign-in.
+        await daily_refill(conn, str(user["id"]), user.get("subscription_tier") or "free")
+        ip_now = client_ip(request)
+        country_now = ((request.headers.get("cf-ipcountry") or "").strip().upper()[:2] or None)
+        ua_now = (request.headers.get("user-agent") or "").strip()[:500]
+        prev_ip = (user.get("last_login_ip") or "").strip()
+        prev_country = (user.get("last_login_country") or "").strip().upper()
+        prev_ua = (user.get("last_login_user_agent") or "").strip()
+        ip_changed = bool(prev_ip and ip_now and prev_ip != ip_now)
+        country_changed = bool(prev_country and country_now and prev_country != country_now)
+        ua_changed = bool(prev_ua and ua_now and prev_ua != ua_now)
+        likely_new_device = ip_changed or country_changed or ua_changed
+        try:
+            security_alerts_enabled = bool(
+                await conn.fetchval(
+                    "SELECT COALESCE(auth_security_alerts, TRUE) FROM user_preferences WHERE user_id = $1",
+                    user["id"],
+                )
+            )
+        except Exception:
+            security_alerts_enabled = True
+        localhost_now = ip_now in ("127.0.0.1", "::1")
+        if likely_new_device and not localhost_now and security_alerts_enabled:
+            background_tasks.add_task(
+                send_login_anomaly_email,
+                user["email"],
+                user.get("name") or "there",
+                ip_now,
+                country_now or "",
+                ua_now,
+                prev_ip,
+            )
+        await conn.execute(
+            "UPDATE users SET last_login_ip = $1, last_login_country = $2, last_login_user_agent = $3, last_active_at = NOW(), updated_at = NOW() WHERE id = $4",
+            ip_now, country_now, ua_now, user["id"]
+        )
         must_reset = bool(user.get("must_reset_password"))
         return {
             "access_token": create_access_jwt(str(user["id"])),
@@ -2837,12 +3444,23 @@ async def confirm_email(background_tasks: BackgroundTasks, token: str = Query(..
         await conn.execute("UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1", ec["user_id"])
         await conn.execute("UPDATE email_confirmations SET used_at = NOW() WHERE id = $1", ec["id"])
 
-        user_row = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", ec["user_id"])
+        user_row = await conn.fetchrow("SELECT email, name, subscription_tier FROM users WHERE id = $1", ec["user_id"])
         access = create_access_jwt(str(ec["user_id"]))
         refresh = await create_refresh_token(conn, str(ec["user_id"]))
 
     if user_row:
         background_tasks.add_task(send_welcome_email, user_row["email"], user_row["name"] or "there")
+        ent = get_entitlements_for_tier(user_row.get("subscription_tier") or "free")
+        background_tasks.add_task(
+            send_fully_signed_up_guide_email,
+            user_row["email"],
+            user_row["name"] or "there",
+            user_row.get("subscription_tier") or "free",
+            int(ent.put_monthly or 0),
+            int(ent.aic_monthly or 0),
+            int(ent.max_accounts or 0),
+            int(ent.max_accounts_per_platform or 0),
+        )
 
     return {
         "ok": True,
@@ -2926,8 +3544,8 @@ async def get_public_pricing():
     Returns tiers with PUT/AIC, perks, and top-up packs (with suggested prices).
     """
     STRIPE_LOOKUP = {
-        "creator_lite": "uploadm8_creatorlite_monthly",
-        "creator_pro": "uploadm8_creatorpro_monthly",
+        "creator_lite": "uploadm8_creator_lite_monthly",
+        "creator_pro": "uploadm8_creator_pro_monthly",
         "studio": "uploadm8_studio_monthly",
         "agency": "uploadm8_agency_monthly",
     }
@@ -2986,6 +3604,7 @@ async def get_me(user: dict = Depends(get_current_user)):
     combined = f"{first} {last}".strip() if (first or last) else None
     email_prefix = (user.get("email") or "").split("@")[0] if user.get("email") else None
     display_name = raw_name or combined or email_prefix or "User"
+    next_upgrade_tier = get_next_public_upgrade_tier(raw_tier)
 
     # Stabilization window: return both snake_case + camelCase keys
     return {
@@ -3031,6 +3650,13 @@ async def get_me(user: dict = Depends(get_current_user)):
             get_entitlements_from_user(dict(user))
         ),
         "must_reset_password": bool(user.get("must_reset_password")),
+        # Lightweight upgrade ladder for clients that have not yet called GET /api/wallet
+        "billing_upgrade_hint": {
+            "next_tier": next_upgrade_tier,
+            "next_tier_display": get_tier_display_name(next_upgrade_tier),
+            "billing_url": "/settings.html#billing",
+            "pricing_url": "/index.html#pricing",
+        } if next_upgrade_tier else None,
     }
 
 
@@ -3192,7 +3818,7 @@ async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depend
 # (removed) obsolete /api/settings/preferences handler (used user_settings.preferences_json)
 
 @app.put("/api/settings/password")
-async def update_password_settings(data: PasswordChange, user: dict = Depends(get_current_user)):
+async def update_password_settings(data: PasswordChange, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     """Change user password (settings endpoint version)"""
     async with db_pool.acquire() as conn:
         # Verify current password
@@ -3212,7 +3838,58 @@ async def update_password_settings(data: PasswordChange, user: dict = Depends(ge
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
 
     logger.info(f"Password changed via settings for user {user['id']}")
+    background_tasks.add_task(send_password_changed_email, user["email"], user.get("name") or "there")
     return {"status": "success", "message": "Password changed successfully"}
+
+
+@app.put("/api/settings/email")
+async def update_settings_email(data: SettingsEmailChange, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    """Self-serve email change from settings, secured by current password."""
+    new_email = data.new_email.lower().strip()
+    old_email = (user.get("email") or "").lower().strip()
+    if not old_email:
+        raise HTTPException(status_code=400, detail="Current email not found")
+    if new_email == old_email:
+        return {"status": "success", "email": new_email, "message": "Email unchanged"}
+
+    async with db_pool.acquire() as conn:
+        user_row = await conn.fetchrow(
+            "SELECT password_hash, name FROM users WHERE id = $1",
+            user["id"],
+        )
+        if not user_row or not verify_password(data.current_password, user_row["password_hash"]):
+            raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+        exists = await conn.fetchval(
+            "SELECT 1 FROM users WHERE LOWER(email)=LOWER($1) AND id <> $2",
+            new_email,
+            user["id"],
+        )
+        if exists:
+            raise HTTPException(status_code=409, detail="Email already in use")
+
+        verification_token = secrets.token_urlsafe(32)
+        await conn.execute(
+            """
+            INSERT INTO email_changes (user_id, old_email, new_email, changed_by_admin_id, verification_token)
+            VALUES ($1::uuid, $2, $3, NULL, $4)
+            """,
+            user["id"],
+            old_email,
+            new_email,
+            verification_token,
+        )
+        await conn.execute(
+            "UPDATE users SET email=$1, email_verified=false, updated_at=NOW() WHERE id=$2",
+            new_email,
+            user["id"],
+        )
+
+    verify_link = f"{FRONTEND_URL.rstrip('/')}/verify-email.html?token={verification_token}"
+    target_name = (user_row["name"] if user_row else None) or "there"
+    background_tasks.add_task(send_email_change_email, new_email, old_email, target_name, verify_link)
+    background_tasks.add_task(send_user_email_change_notice_to_old_email, old_email, new_email, target_name)
+    return {"status": "success", "email": new_email, "message": "Verification email sent"}
 
 @app.post("/api/settings/avatar")
 async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
@@ -3618,6 +4295,9 @@ async def get_wallet_endpoint(user: dict = Depends(get_current_user)):
         "aic_spent_period": marketing.get("aic_spent_period"),
         "put_available": marketing.get("put_available"),
         "aic_available": marketing.get("aic_available"),
+        "sales_opportunities": marketing.get("sales_opportunities", []),
+        "experiments": marketing.get("experiments", {}),
+        "suppression": marketing.get("suppression", {}),
     }
 
 @app.post("/api/wallet/topup")
@@ -3644,6 +4324,96 @@ async def wallet_transfer(data: TransferRequest, user: dict = Depends(get_curren
         success = await transfer_tokens(conn, user["id"], data.from_platform, data.to_platform, data.amount)
     if not success: raise HTTPException(400, "Transfer failed - insufficient balance")
     return {"status": "transferred", "amount": data.amount, "burn": int(data.amount * 0.02)}
+
+@app.post("/api/marketing/events")
+async def ingest_marketing_event(data: MarketingEventIn, user: dict = Depends(get_current_user)):
+    sid = (data.session_id or "").strip()
+    if not sid:
+        sid = hashlib.sha256(
+            f"{user.get('id')}|{user.get('email')}|{datetime.now(timezone.utc).strftime('%Y-%m-%d')}".encode("utf-8")
+        ).hexdigest()[:24]
+    page = ((data.page or "").strip() or None)
+    meta = data.metadata if isinstance(data.metadata, dict) else {}
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO marketing_events (
+                user_id, session_id, event_type, nudge_type, nudge_severity,
+                cta_variant, urgency_variant, ordering_variant, page, metadata
+            ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+            """,
+            str(user["id"]),
+            sid,
+            data.event_type,
+            (data.nudge_type or "general")[:120],
+            (data.nudge_severity or "")[:32] or None,
+            (data.cta_variant or "")[:8] or None,
+            (data.urgency_variant or "")[:8] or None,
+            (data.ordering_variant or "")[:8] or None,
+            page[:255] if page else None,
+            json.dumps(meta),
+        )
+    return {"status": "ok"}
+
+
+@app.get("/api/admin/users/{user_id}/daily-refill-preview")
+async def admin_daily_refill_preview(user_id: str, admin: dict = Depends(require_admin)):
+    """
+    Dry-run view of daily refill logic for a user.
+    No wallet mutations are performed.
+    """
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT id, email, subscription_tier, status FROM users WHERE id = $1",
+            user_id,
+        )
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        wallet = await get_wallet(conn, user_id)
+        ent = get_entitlements_for_tier(target.get("subscription_tier") or "free")
+        today = _now_utc().date()
+        last_refill = wallet.get("last_refill_date")
+        current_put = int(wallet.get("put_balance") or 0)
+        monthly_cap = int(ent.put_monthly or 0)
+        daily_amount = int(ent.put_daily or 0)
+        can_refill_today = not (last_refill and last_refill >= today)
+        cap_headroom = max(0, monthly_cap - current_put)
+        projected_add = min(daily_amount, cap_headroom) if can_refill_today else 0
+        would_refill = projected_add > 0
+
+    return {
+        "ok": True,
+        "user_id": str(target["id"]),
+        "email": target["email"],
+        "status": target.get("status"),
+        "tier": target.get("subscription_tier") or "free",
+        "today_utc": today.isoformat(),
+        "last_refill_date": last_refill.isoformat() if hasattr(last_refill, "isoformat") else None,
+        "wallet": {
+            "put_balance": current_put,
+            "put_reserved": int(wallet.get("put_reserved") or 0),
+            "aic_balance": int(wallet.get("aic_balance") or 0),
+            "aic_reserved": int(wallet.get("aic_reserved") or 0),
+        },
+        "limits": {
+            "put_daily": daily_amount,
+            "put_monthly": monthly_cap,
+        },
+        "decision": {
+            "can_refill_today": can_refill_today,
+            "cap_headroom": cap_headroom,
+            "projected_add": projected_add,
+            "would_refill": would_refill,
+            "projected_balance_after_refill": current_put + projected_add,
+            "reason": (
+                "already_refilled_today" if not can_refill_today
+                else "monthly_cap_reached" if cap_headroom <= 0
+                else "eligible"
+            ),
+        },
+        "requested_by_admin_id": str(admin.get("id")),
+    }
 
 # ============================================================
 # Settings
@@ -3799,11 +4569,11 @@ async def test_user_discord_webhook(data: dict, user: dict = Depends(get_current
     if not webhook_url.startswith("https://discord.com/api/webhooks/"):
         raise HTTPException(400, "Invalid Discord webhook URL")
     test_embed = {
-        "title": "🔔 UploadM8 Webhook Test",
+        "title": " UploadM8 Webhook Test",
         "description": "If you see this message, your webhook is configured correctly!",
         "color": 0x22c55e,
         "fields": [
-            {"name": "Status", "value": "✅ Connected", "inline": True},
+            {"name": "Status", "value": " Connected", "inline": True},
             {"name": "Tested By", "value": user.get("email", "User"), "inline": True},
         ],
         "footer": {"text": "UploadM8 Notifications"},
@@ -3952,6 +4722,10 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
         if v not in _CAPTION_VOICES:
             v = "default"
         prefs["captionVoice"] = prefs["caption_voice"] = v
+
+    if "audioTranscription" in prefs or "audio_transcription" in prefs:
+        v = prefs.get("audioTranscription", prefs.get("audio_transcription", True))
+        prefs["audioTranscription"] = prefs["audio_transcription"] = bool(v)
 
     async with db_pool.acquire() as conn:
         # MERGE with existing preferences — never replace entirely (frontend may send partial updates)
@@ -5127,13 +5901,13 @@ async def sync_upload_analytics(
                     dec["page_id"] = str(tr["account_id"])
                 token_id = str(tr["id"])
                 token_map_by_id[token_id] = dec
-                token_map_by_platform[tr["platform"]] = dec
+                token_map_by_platform.setdefault(tr["platform"], []).append(dec)
         except Exception:
             pass
 
     from services.sync_analytics_helpers import (
         build_plat_account_token_map,
-        resolve_token_for_platform_result,
+        resolve_token_candidates_for_platform_result,
     )
 
     token_map_by_plat_account = build_plat_account_token_map(token_rows, decrypt_blob)
@@ -5180,7 +5954,7 @@ async def sync_upload_analytics(
                     if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
                         dec["page_id"] = str(tr["account_id"])
                     token_map_by_id[str(tr["id"])] = dec
-                    token_map_by_platform[tr["platform"]] = dec
+                    token_map_by_platform.setdefault(tr["platform"], []).append(dec)
             except Exception:
                 pass
         token_map_by_plat_account = build_plat_account_token_map(trs, decrypt_blob)
@@ -5203,13 +5977,6 @@ async def sync_upload_analytics(
             if not ok:
                 continue
 
-            tok = resolve_token_for_platform_result(
-                pr, token_map_by_id, token_map_by_plat_account, token_map_by_platform
-            )
-            access_token = tok.get("access_token", "")
-            if not access_token:
-                continue
-
             # platform_video_id is the canonical field written by db.py/mark_processing_completed
             # video_id / media_id / share_id etc. are legacy / webhook-written variants
             video_id = (
@@ -5219,99 +5986,137 @@ async def sync_upload_analytics(
             )
 
             try:
-                if plat == "tiktok" and video_id:
-                    from services.tiktok_api import tiktok_envelope_error, tiktok_video_query_url
+                candidates = resolve_token_candidates_for_platform_result(
+                    pr, token_map_by_id, token_map_by_plat_account, token_map_by_platform
+                )
+                if not candidates:
+                    continue
 
-                    qurl = tiktok_video_query_url()
-                    resp = await client.post(
-                        qurl,
-                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                        json={"filters": {"video_ids": [str(video_id)]}},
-                    )
-                    try:
-                        body = resp.json()
-                    except Exception:
-                        body = {}
-                    if tiktok_envelope_error(body):
+                resolved = False
+                for tok in candidates:
+                    access_token = tok.get("access_token", "")
+                    if not access_token:
                         continue
-                    if resp.status_code == 200:
-                        vids = body.get("data", {}).get("videos", []) or []
-                        if vids:
-                            v = vids[0]
-                            s = {"views": int(v.get("view_count") or 0), "likes": int(v.get("like_count") or 0),
-                                 "comments": int(v.get("comment_count") or 0), "shares": int(v.get("share_count") or 0)}
-                            _accum_platform_stats(platform_stats, "tiktok", s)
+
+                    if plat == "tiktok" and video_id:
+                        from services.tiktok_api import tiktok_envelope_error, tiktok_video_query_url
+
+                        qurl = tiktok_video_query_url()
+                        resp = await client.post(
+                            qurl,
+                            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                            json={"filters": {"video_ids": [str(video_id)]}},
+                        )
+                        try:
+                            body = resp.json()
+                        except Exception:
+                            body = {}
+                        if tiktok_envelope_error(body):
+                            continue
+                        if resp.status_code == 200:
+                            vids = body.get("data", {}).get("videos", []) or []
+                            if vids:
+                                v = vids[0]
+                                s = {
+                                    "views": int(v.get("view_count") or 0),
+                                    "likes": int(v.get("like_count") or 0),
+                                    "comments": int(v.get("comment_count") or 0),
+                                    "shares": int(v.get("share_count") or 0),
+                                }
+                                _accum_platform_stats(platform_stats, "tiktok", s)
+                                total_views    += s["views"];    total_likes   += s["likes"]
+                                total_comments += s["comments"]; total_shares  += s["shares"]
+                                resolved = True
+                                break
+
+                    elif plat == "youtube" and video_id:
+                        # statistics covers long-form and Shorts; snippet/contentDetails optional for debugging
+                        resp = await client.get(
+                            "https://www.googleapis.com/youtube/v3/videos",
+                            params={"part": "statistics,snippet", "id": str(video_id)},
+                            headers={"Authorization": f"Bearer {access_token}"},
+                        )
+                        if resp.status_code == 200:
+                            items = resp.json().get("items", []) or []
+                            if items:
+                                st = items[0].get("statistics", {}) or {}
+                                s = {
+                                    "views": int(st.get("viewCount") or 0),
+                                    "likes": int(st.get("likeCount") or 0),
+                                    "comments": int(st.get("commentCount") or 0),
+                                    "shares": 0,
+                                }
+                                _accum_platform_stats(platform_stats, "youtube", s)
+                                total_views    += s["views"];    total_likes   += s["likes"]
+                                total_comments += s["comments"]
+                                resolved = True
+                                break
+
+                    elif plat == "instagram" and video_id:
+                        # Instagram Insights API requires numeric media_id (not shortcode)
+                        media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
+                        resp = await client.get(
+                            f"https://graph.facebook.com/v21.0/{media_id}/insights",
+                            params={
+                                "access_token": access_token,
+                                "metric": "views,plays,likes,comments,saved,shares,reach",
+                            },
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json().get("data", []) or []
+                            if not data:
+                                continue  # probably no permission for this token
+                            s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                            ig_views = ig_plays = 0
+                            for m in data:
+                                name = m.get("name", "")
+                                vals = m.get("values", [])
+                                val = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
+                                if name == "views":       ig_views     = val
+                                elif name == "plays":     ig_plays     = val  # deprecated fallback
+                                elif name == "likes":     s["likes"]   += val
+                                elif name == "comments":  s["comments"] += val
+                                elif name == "shares":    s["shares"]  += val
+                            s["views"] = ig_views or ig_plays  # prefer views over deprecated plays
+                            _accum_platform_stats(platform_stats, "instagram", s)
                             total_views    += s["views"];    total_likes   += s["likes"]
                             total_comments += s["comments"]; total_shares  += s["shares"]
+                            resolved = True
+                            break
 
-                elif plat == "youtube" and video_id:
-                    # statistics covers long-form and Shorts; snippet/contentDetails optional for debugging
-                    resp = await client.get(
-                        "https://www.googleapis.com/youtube/v3/videos",
-                        params={"part": "statistics,snippet", "id": str(video_id)},
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
-                    if resp.status_code == 200:
-                        items = resp.json().get("items", []) or []
-                        if items:
-                            st = items[0].get("statistics", {}) or {}
-                            s = {
-                                "views": int(st.get("viewCount") or 0),
-                                "likes": int(st.get("likeCount") or 0),
-                                "comments": int(st.get("commentCount") or 0),
-                                "shares": 0,
-                            }
-                            _accum_platform_stats(platform_stats, "youtube", s)
+                    elif plat == "facebook" and video_id:
+                        resp = await client.get(
+                            f"https://graph.facebook.com/v21.0/{video_id}",
+                            params={
+                                "access_token": access_token,
+                                "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)",
+                            },
+                        )
+                        if resp.status_code == 200:
+                            data = (resp.json().get("insights", {}) or {}).get("data", []) or []
+                            if not data:
+                                continue
+                            s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                            for m in data:
+                                name = m.get("name", "")
+                                vals = m.get("values", [{}])
+                                val  = vals[-1].get("value", 0) if vals else 0
+                                if isinstance(val, dict):
+                                    val = sum(val.values())
+                                val = int(val or 0)
+                                if name == "total_video_views":                      s["views"]    += val
+                                elif name == "total_video_reactions_by_type_total":  s["likes"]    += val
+                                elif name == "total_video_comments":                  s["comments"] += val
+                                elif name == "total_video_shares":                    s["shares"]   += val
+                            _accum_platform_stats(platform_stats, "facebook", s)
                             total_views    += s["views"];    total_likes   += s["likes"]
-                            total_comments += s["comments"]
+                            total_comments += s["comments"]; total_shares  += s["shares"]
+                            resolved = True
+                            break
 
-                elif plat == "instagram" and video_id:
-                    # Instagram Insights API requires numeric media_id (not shortcode)
-                    media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
-                    resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{media_id}/insights",
-                        params={"access_token": access_token,
-                                "metric": "views,plays,likes,comments,saved,shares,reach"},
-                    )
-                    if resp.status_code == 200:
-                        s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
-                        ig_views = ig_plays = 0
-                        for m in resp.json().get("data", []) or []:
-                            name = m.get("name", "")
-                            vals = m.get("values", [])
-                            val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
-                            if name == "views":       ig_views     = val
-                            elif name == "plays":     ig_plays     = val  # deprecated fallback
-                            elif name == "likes":     s["likes"]   += val
-                            elif name == "comments":  s["comments"] += val
-                            elif name == "shares":    s["shares"]  += val
-                        s["views"] = ig_views or ig_plays  # prefer views over deprecated plays
-                        _accum_platform_stats(platform_stats, "instagram", s)
-                        total_views    += s["views"];    total_likes   += s["likes"]
-                        total_comments += s["comments"]; total_shares  += s["shares"]
-
-                elif plat == "facebook" and video_id:
-                    page_id = tok.get("page_id", "")
-                    resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{video_id}",
-                        params={"access_token": access_token,
-                                "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)"},
-                    )
-                    if resp.status_code == 200:
-                        s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
-                        for m in resp.json().get("insights", {}).get("data", []) or []:
-                            name = m.get("name", "")
-                            vals = m.get("values", [{}])
-                            val  = vals[-1].get("value", 0) if vals else 0
-                            if isinstance(val, dict): val = sum(val.values())
-                            val = int(val or 0)
-                            if name == "total_video_views":                      s["views"]    += val
-                            elif name == "total_video_reactions_by_type_total":  s["likes"]    += val
-                            elif name == "total_video_comments":                  s["comments"] += val
-                            elif name == "total_video_shares":                    s["shares"]   += val
-                        _accum_platform_stats(platform_stats, "facebook", s)
-                        total_views    += s["views"];    total_likes   += s["likes"]
-                        total_comments += s["comments"]; total_shares  += s["shares"]
+                # If we couldn't resolve for any candidate token, keep zeros.
+                if resolved:
+                    continue
 
             except Exception as e:
                 logger.warning(f"sync-analytics error for {plat}/{video_id}: {e}")
@@ -5946,6 +6751,9 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
                 "blockedHashtags": blocked_tags or [],
                 "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
                 "emailNotifications": d.get("email_notifications", True),
+                "authSecurityAlerts": d.get("auth_security_alerts", True),
+                "digestEmails": d.get("digest_emails", True),
+                "scheduledAlertEmails": d.get("scheduled_alert_emails", True),
                 "discordWebhook": d.get("discord_webhook"),
                 "trillEnabled": bool(d.get("trill_enabled", False)),
                 "trillMinScore": int(d.get("trill_min_score", 0) or 0),
@@ -5954,6 +6762,7 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
                 "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
                 "styledThumbnails": d.get("styled_thumbnails", True),
                 "useAudioContext": bool(d.get("use_audio_context", True)),
+                "audioTranscription": bool(d.get("audio_transcription", True)),
             }
             # #region agent log
             _dbg_write("Before SELECT users.preferences")
@@ -5988,6 +6797,8 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
                 out["captionFrameCount"] = up.get("captionFrameCount") or up.get("caption_frame_count") or 6
                 if up.get("useAudioContext") is not None or up.get("use_audio_context") is not None:
                     out["useAudioContext"] = bool(up.get("useAudioContext", up.get("use_audio_context", True)))
+                if up.get("audioTranscription") is not None or up.get("audio_transcription") is not None:
+                    out["audioTranscription"] = bool(up.get("audioTranscription", up.get("audio_transcription", True)))
             else:
                 out.setdefault("captionStyle", "story")
                 out.setdefault("captionTone", "authentic")
@@ -6007,10 +6818,12 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             "alwaysHashtags": [], "blockedHashtags": [],
             "platformHashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": True, "discordWebhook": None,
+            "authSecurityAlerts": True, "digestEmails": True, "scheduledAlertEmails": True,
             "trillEnabled": False, "trillMinScore": 60, "trillHudEnabled": False,
             "trillAiEnhance": True, "trillOpenaiModel": "gpt-4o-mini", "styledThumbnails": True,
             "captionStyle": "story", "captionTone": "authentic", "captionVoice": "default", "captionFrameCount": 6,
             "useAudioContext": True,
+            "audioTranscription": True,
         }
 
 @app.post("/api/settings/preferences")
@@ -6047,6 +6860,9 @@ async def save_user_preferences(
         "blockedHashtags": "blocked_hashtags",
         "platformHashtags": "platform_hashtags",
         "emailNotifications": "email_notifications",
+        "authSecurityAlerts": "auth_security_alerts",
+        "digestEmails": "digest_emails",
+        "scheduledAlertEmails": "scheduled_alert_emails",
         "discordWebhook": "discord_webhook",
         "trillEnabled": "trill_enabled",
         "trillMinScore": "trill_min_score",
@@ -6059,6 +6875,7 @@ async def save_user_preferences(
         "captionVoice": "caption_voice",
         "captionFrameCount": "caption_frame_count",
         "useAudioContext": "use_audio_context",
+        "audioTranscription": "audio_transcription",
     }
 
     def normalize_prefs_payload(p: dict) -> dict:
@@ -6166,6 +6983,9 @@ async def save_user_preferences(
         max_hashtags = 15
 
     email_notifications = bool(p.get("email_notifications", True))
+    auth_security_alerts = bool(p.get("auth_security_alerts", True))
+    digest_emails = bool(p.get("digest_emails", True))
+    scheduled_alert_emails = bool(p.get("scheduled_alert_emails", True))
     discord_webhook = p.get("discord_webhook")
 
     # Trill fields (user_preferences)
@@ -6212,15 +7032,18 @@ async def save_user_preferences(
                 blocked_hashtags = $12::jsonb,
                 platform_hashtags = $13::jsonb,
                 email_notifications = $14,
-                discord_webhook = $15,
-                trill_enabled = $16,
-                trill_min_score = $17,
-                trill_hud_enabled = $18,
-                trill_ai_enhance = $19,
-                trill_openai_model = $20,
-                use_audio_context = $21,
+                auth_security_alerts = $15,
+                digest_emails = $16,
+                scheduled_alert_emails = $17,
+                discord_webhook = $18,
+                trill_enabled = $19,
+                trill_min_score = $20,
+                trill_hud_enabled = $21,
+                trill_ai_enhance = $22,
+                trill_openai_model = $23,
+                use_audio_context = $24,
                 updated_at = NOW()
-            WHERE user_id = $22
+            WHERE user_id = $25
             """,
             auto_captions,
             auto_thumbnails,
@@ -6236,6 +7059,9 @@ async def save_user_preferences(
             json.dumps(blocked),
             json.dumps(platform),
             email_notifications,
+            auth_security_alerts,
+            digest_emails,
+            scheduled_alert_emails,
             discord_webhook,
             trill_enabled,
             trill_min_score,
@@ -6328,12 +7154,14 @@ async def save_user_preferences(
                         ai_hashtag_style=$7, hashtag_position=$8, max_hashtags=$9,
                         always_hashtags=$10::jsonb, blocked_hashtags=$11::jsonb,
                         platform_hashtags=$12::jsonb, email_notifications=$13,
-                        discord_webhook=$14, updated_at=NOW()
-                       WHERE user_id=$15""",
+                        auth_security_alerts=$14, digest_emails=$15, scheduled_alert_emails=$16,
+                        discord_webhook=$17, updated_at=NOW()
+                       WHERE user_id=$18""",
                     auto_captions, auto_thumbnails, thumbnail_interval, default_privacy,
                     ai_hashtags_enabled, ai_hashtag_count, ai_hashtag_style, hashtag_position,
                     max_hashtags, json.dumps(always), json.dumps(blocked), json.dumps(platform),
-                    email_notifications, discord_webhook, user["id"],
+                    email_notifications, auth_security_alerts, digest_emails, scheduled_alert_emails,
+                    discord_webhook, user["id"],
                 )
                 row = await conn.fetchrow("SELECT updated_at FROM user_preferences WHERE user_id=$1", user["id"])
             return {"ok": True, "updatedAt": (row["updated_at"].isoformat() if row and row.get("updated_at") else None)}
@@ -6385,6 +7213,7 @@ def _overlay_users_prefs_on_result(result: dict, up: dict) -> None:
         ("hashtagPosition", "hashtag_position"), ("autoCaptions", "auto_captions"),
         ("autoThumbnails", "auto_thumbnails"), ("styledThumbnails", "styled_thumbnails"),
         ("defaultPrivacy", "default_privacy"), ("thumbnailInterval", "thumbnail_interval"),
+        ("useAudioContext", "use_audio_context"), ("audioTranscription", "audio_transcription"),
     ]:
         v = up.get(camel) if up.get(camel) is not None else up.get(snake)
         if v is not None:
@@ -6422,6 +7251,9 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
             "blocked_hashtags": prefs_row["blocked_hashtags"] or [],
             "platform_hashtags": prefs_row["platform_hashtags"] or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "email_notifications": prefs_row["email_notifications"],
+            "auth_security_alerts": prefs_row.get("auth_security_alerts", True),
+            "digest_emails": prefs_row.get("digest_emails", True),
+            "scheduled_alert_emails": prefs_row.get("scheduled_alert_emails", True),
             "discord_webhook": prefs_row["discord_webhook"]
         }
 
@@ -6487,6 +7319,9 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
         "blocked_hashtags": prefs.get("blockedHashtags", []),
         "platform_hashtags": prefs.get("platformHashtags", {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}),
         "email_notifications": prefs.get("emailNotifications", True),
+        "auth_security_alerts": prefs.get("authSecurityAlerts", True),
+        "digest_emails": prefs.get("digestEmails", True),
+        "scheduled_alert_emails": prefs.get("scheduledAlertEmails", True),
         "discord_webhook": prefs.get("discordWebhook", None)
     }
     # Add hud_enabled from user_settings for fallback path
@@ -7016,7 +7851,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
         <head><title>Connecting...</title></head>
         <body style="font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1a1a2e; color: white;">
             <div style="text-align: center;">
-                <p>{"✓ Connected successfully!" if success else "✗ Connection failed"}</p>
+                <p>{" Connected successfully!" if success else " Connection failed"}</p>
                 <p style="color: #888; font-size: 14px;">This window will close automatically...</p>
             </div>
             <script>
@@ -7713,6 +8548,59 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     inv.get("id", ""),
                     failure_reason,
                 )
+
+    # ── charge.refunded — send billing adjustment receipt ────────────────
+    elif etype == "charge.refunded":
+        ch = event.data.object
+        customer_id = ch.get("customer")
+        if customer_id:
+            async with db_pool.acquire() as conn:
+                user_row = await conn.fetchrow(
+                    "SELECT email, name FROM users WHERE stripe_customer_id = $1",
+                    customer_id,
+                )
+            if user_row:
+                amount = float((ch.get("amount_refunded") or 0) / 100.0)
+                if amount > 0:
+                    background_tasks.add_task(
+                        send_refund_receipt_email,
+                        user_row["email"],
+                        user_row["name"] or "there",
+                        amount,
+                        (ch.get("currency") or "usd"),
+                        ch.get("id") or "",
+                        ch.get("reason") or "",
+                        "refund",
+                    )
+
+    # ── charge.dispute.created — notify potential chargeback ─────────────
+    elif etype == "charge.dispute.created":
+        dispute = event.data.object
+        charge_id = dispute.get("charge")
+        if charge_id:
+            try:
+                charge = stripe.Charge.retrieve(charge_id)
+            except Exception:
+                charge = None
+            customer_id = charge.get("customer") if charge else None
+            if customer_id:
+                async with db_pool.acquire() as conn:
+                    user_row = await conn.fetchrow(
+                        "SELECT email, name FROM users WHERE stripe_customer_id = $1",
+                        customer_id,
+                    )
+                if user_row:
+                    amount = float((dispute.get("amount") or 0) / 100.0)
+                    background_tasks.add_task(
+                        send_refund_receipt_email,
+                        user_row["email"],
+                        user_row["name"] or "there",
+                        amount,
+                        (dispute.get("currency") or "usd"),
+                        dispute.get("id") or "",
+                        dispute.get("reason") or "Card dispute opened",
+                        "chargeback",
+                    )
 
     # ── subscription.deleted — downgrade to free OR execute deferred account deletion ─
     elif etype == "customer.subscription.deleted":
@@ -9242,8 +10130,9 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
         raise HTTPException(500, "Excel export not available")
 
 # ============================================================
-# Admin Endpoints
-# ========================================@app.get("/api/analytics/overview")
+# User analytics overview (KPI dashboard / kpi.html)
+# ============================================================
+@app.get("/api/analytics/overview")
 async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = Depends(get_current_user)):
     """High-level KPI summary for analytics dashboard."""
     since = _now_utc() - timedelta(days=days)
@@ -9361,53 +10250,50 @@ async def my_avg_processing(user: dict = Depends(get_current_user)):
 
 
 
-@app.get("/api/analytics/export")
-async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Query("csv"), user: dict = Depends(get_current_user)):
-    """Export analytics for the last N days as CSV (default) or JSON."""
-    since = _now_utc() - timedelta(days=days)
+async def _analytics_export_rows(conn, user_id, since):
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT
+                id, filename, title, caption, platforms, privacy, status,
+                created_at, completed_at,
+                COALESCE(views, 0)::bigint AS views,
+                COALESCE(likes, 0)::bigint AS likes,
+                COALESCE(comments, 0)::bigint AS comments,
+                COALESCE(shares, 0)::bigint AS shares,
+                COALESCE(cost_attributed, 0)::double precision AS cost_attributed,
+                video_url
+            FROM uploads
+            WHERE user_id = $1 AND created_at >= $2
+            ORDER BY created_at DESC
+            """,
+            user_id, since
+        )
+    except Exception as e:
+        if e.__class__.__name__ != "UndefinedColumnError":
+            raise
+        rows = await conn.fetch(
+            """
+            SELECT
+                id, filename, title, caption, platforms, privacy, status,
+                created_at, completed_at,
+                0::bigint AS views,
+                0::bigint AS likes,
+                0::bigint AS comments,
+                0::bigint AS shares,
+                0::double precision AS cost_attributed,
+                video_url
+            FROM uploads
+            WHERE user_id = $1 AND created_at >= $2
+            ORDER BY created_at DESC
+            """,
+            user_id, since
+        )
+    return rows
 
-    async with db_pool.acquire() as conn:
-        try:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    id, filename, title, caption, platforms, privacy, status,
-                    created_at, completed_at,
-                    COALESCE(views, 0)::bigint AS views,
-                    COALESCE(likes, 0)::bigint AS likes,
-                    COALESCE(comments, 0)::bigint AS comments,
-                    COALESCE(shares, 0)::bigint AS shares,
-                    COALESCE(cost_attributed, 0)::double precision AS cost_attributed,
-                    video_url
-                FROM uploads
-                WHERE user_id = $1 AND created_at >= $2
-                ORDER BY created_at DESC
-                """,
-                user["id"], since
-            )
-        except Exception as e:
-            if e.__class__.__name__ != "UndefinedColumnError":
-                raise
-            # Older schema fallback
-            rows = await conn.fetch(
-                """
-                SELECT
-                    id, filename, title, caption, platforms, privacy, status,
-                    created_at, completed_at,
-                    0::bigint AS views,
-                    0::bigint AS likes,
-                    0::bigint AS comments,
-                    0::bigint AS shares,
-                    0::double precision AS cost_attributed,
-                    video_url
-                FROM uploads
-                WHERE user_id = $1 AND created_at >= $2
-                ORDER BY created_at DESC
-                """,
-                user["id"], since
-            )
 
-    data = [
+def _analytics_export_data(rows):
+    return [
         {
             "id": str(r["id"]),
             "filename": r["filename"],
@@ -9428,10 +10314,8 @@ async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Q
         for r in rows
     ]
 
-    if format.lower() == "json":
-        return {"range_days": days, "since": since.isoformat(), "rows": data}
 
-    # CSV default
+def _analytics_export_csv_bytes(data):
     output = io.StringIO()
     writer = csv.DictWriter(
         output,
@@ -9447,10 +10331,127 @@ async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Q
         item = dict(item)
         item["platforms"] = ",".join(item.get("platforms") or [])
         writer.writerow(item)
+    return output.getvalue().encode("utf-8")
 
-    csv_bytes = output.getvalue().encode("utf-8")
+
+@app.get("/api/analytics/export")
+async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Query("csv"), user: dict = Depends(get_current_user)):
+    """Export analytics for the last N days as CSV (default) or JSON."""
+    since = _now_utc() - timedelta(days=days)
+    async with db_pool.acquire() as conn:
+        rows = await _analytics_export_rows(conn, user["id"], since)
+    data = _analytics_export_data(rows)
+
+    if format.lower() == "json":
+        return {"range_days": days, "since": since.isoformat(), "rows": data}
+
+    # CSV default
+    csv_bytes = _analytics_export_csv_bytes(data)
     headers = {"Content-Disposition": f'attachment; filename="uploadm8-analytics-{days}d.csv"'}
     return Response(content=csv_bytes, media_type="text/csv", headers=headers)
+
+
+async def _process_analytics_export_job(job_id: str, user_id: str, email: str, name: str, token_plain: str, days: int, fmt: str):
+    since = _now_utc() - timedelta(days=days)
+    fmt = (fmt or "csv").lower()
+    if fmt not in ("csv", "json"):
+        fmt = "csv"
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await _analytics_export_rows(conn, user_id, since)
+            data = _analytics_export_data(rows)
+            if fmt == "json":
+                blob = json.dumps({"range_days": days, "since": since.isoformat(), "rows": data}).encode("utf-8")
+                content_type = "application/json"
+                filename = f"uploadm8-analytics-{days}d.json"
+            else:
+                blob = _analytics_export_csv_bytes(data)
+                content_type = "text/csv"
+                filename = f"uploadm8-analytics-{days}d.csv"
+            await conn.execute(
+                """
+                UPDATE export_jobs
+                SET status = 'ready', file_blob = $2, content_type = $3, filename = $4, ready_at = NOW()
+                WHERE id = $1
+                """,
+                job_id, blob, content_type, filename,
+            )
+            exp = await conn.fetchval("SELECT expires_at FROM export_jobs WHERE id = $1", job_id)
+        download_url = f"{FRONTEND_URL.rstrip('/')}/api/exports/download?token={quote(token_plain)}"
+        expires_lbl = exp.strftime("%B %d, %Y %H:%M UTC") if exp else "within 24 hours"
+        await send_report_ready_email(
+            email,
+            name or "there",
+            f"Analytics export ({days}d)",
+            download_url,
+            expires_lbl,
+        )
+    except Exception as e:
+        logger.warning(f"analytics export job failed {job_id}: {e}")
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE export_jobs SET status = 'failed' WHERE id = $1", job_id)
+        except Exception:
+            pass
+
+
+@app.post("/api/analytics/export/request")
+async def request_analytics_export(
+    background_tasks: BackgroundTasks,
+    days: int = Query(30, ge=1, le=3650),
+    format: str = Query("csv"),
+    user: dict = Depends(get_current_user),
+):
+    """Async analytics export: sends email when report is ready."""
+    token_plain = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token_plain.encode()).hexdigest()
+    expires_at = _now_utc() + timedelta(hours=24)
+    async with db_pool.acquire() as conn:
+        urow = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", user["id"])
+        job = await conn.fetchrow(
+            """
+            INSERT INTO export_jobs (user_id, token_hash, report_type, format, days, status, expires_at)
+            VALUES ($1, $2, 'analytics', $3, $4, 'pending', $5)
+            RETURNING id
+            """,
+            user["id"], token_hash, (format or "csv").lower(), int(days), expires_at,
+        )
+    background_tasks.add_task(
+        _process_analytics_export_job,
+        str(job["id"]),
+        str(user["id"]),
+        (urow["email"] if urow else user.get("email") or ""),
+        (urow["name"] if urow else user.get("name") or "there"),
+        token_plain,
+        int(days),
+        format,
+    )
+    return {"ok": True, "status": "queued"}
+
+
+@app.get("/api/exports/download")
+async def download_export(token: str = Query(...)):
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, file_blob, content_type, filename, expires_at
+            FROM export_jobs
+            WHERE token_hash = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            token_hash,
+        )
+    if not row:
+        raise HTTPException(404, "Export not found")
+    if row["expires_at"] < _now_utc():
+        raise HTTPException(410, "Export link expired")
+    if row["status"] != "ready" or not row.get("file_blob"):
+        raise HTTPException(409, "Export is not ready yet")
+    blob = bytes(row["file_blob"])
+    headers = {"Content-Disposition": f'attachment; filename="{row.get("filename") or "export.bin"}"'}
+    return Response(content=blob, media_type=row.get("content_type") or "application/octet-stream", headers=headers)
 # ====================
 class SupportContactRequest(BaseModel):
     name: Optional[str] = None
@@ -9554,9 +10555,14 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
     updates, params = [], [user_id]
     changes = {}
     if data.subscription_tier:
+        raw_tier = (data.subscription_tier or "").strip().lower()
+        if raw_tier not in TIER_CONFIG:
+            raise HTTPException(status_code=400, detail=f"Invalid subscription_tier: {data.subscription_tier}")
+        # launch -> creator_lite so DB matches Stripe/entitlements (single canonical slug)
+        normalized_tier = normalize_tier(raw_tier)
         updates.append(f"subscription_tier = ${len(params)+1}")
-        params.append(data.subscription_tier)
-        changes["subscription_tier"] = data.subscription_tier
+        params.append(normalized_tier)
+        changes["subscription_tier"] = normalized_tier
     if data.role and user.get("role") == "master_admin":
         updates.append(f"role = ${len(params)+1}")
         params.append(data.role)
@@ -9579,11 +10585,11 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
                                   resource_type="user", resource_id=user_id)
 
         # Fire tier-change and special welcome emails when subscription_tier changed
-        if data.subscription_tier and _target:
+        if changes.get("subscription_tier") and _target:
             _te = _target["email"]
             _tn = _target["name"] or "there"
             _old = _target["subscription_tier"] or "free"
-            _new = data.subscription_tier
+            _new = changes["subscription_tier"]
             if _old != _new:
                 background_tasks.add_task(
                     send_admin_tier_switch_email,
@@ -9622,20 +10628,26 @@ async def admin_unban_user(user_id: str, request: Request, user: dict = Depends(
 
 
 @app.put("/api/admin/users/{user_id}/email")
-async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
-    require_admin(user)
+async def admin_change_email(
+    user_id: uuid.UUID,
+    payload: AdminUpdateEmailIn,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_admin),
+):
     new_email = payload.email.lower().strip()
+    user_id_str = str(user_id)
 
     async with db_pool.acquire() as conn:
         exists = await conn.fetchval(
             "SELECT 1 FROM users WHERE LOWER(email)=LOWER($1) AND id <> $2",
             new_email,
-            user_id,
+            user_id_str,
         )
         if exists:
             raise HTTPException(status_code=409, detail="Email already in use")
 
-        old = await conn.fetchrow("SELECT email, name FROM users WHERE id=$1", user_id)
+        old = await conn.fetchrow("SELECT email, name FROM users WHERE id=$1", user_id_str)
         if not old:
             raise HTTPException(status_code=404, detail="User not found")
 
@@ -9646,7 +10658,7 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
             INSERT INTO email_changes (user_id, old_email, new_email, changed_by_admin_id, verification_token)
             VALUES ($1::uuid, $2, $3, $4::uuid, $5)
             """,
-            user_id,
+            user_id_str,
             old["email"],
             new_email,
             user["id"],
@@ -9656,12 +10668,12 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
         await conn.execute(
             "UPDATE users SET email=$1, email_verified=false, updated_at=NOW() WHERE id=$2",
             new_email,
-            user_id,
+            user_id_str,
         )
 
         await log_admin_audit(
             conn,
-            user_id=user_id,
+            user_id=user_id_str,
             admin=user,
             action="ADMIN_CHANGE_EMAIL",
             details={"old_email": old["email"], "new_email": new_email},
@@ -9684,13 +10696,19 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
 
 
 @app.post("/api/admin/users/{user_id}/reset-password")
-async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
-    require_admin(user)
+async def admin_reset_password(
+    user_id: uuid.UUID,
+    payload: AdminResetPasswordIn,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_admin),
+):
     temp = payload.temp_password
     pw_hash = bcrypt.hashpw(temp.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    user_id_str = str(user_id)
 
     async with db_pool.acquire() as conn:
-        target = await conn.fetchrow("SELECT id, role FROM users WHERE id=$1", user_id)
+        target = await conn.fetchrow("SELECT id, role FROM users WHERE id=$1", user_id_str)
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
         if target["role"] == "master_admin" and user.get("role") != "master_admin":
@@ -9705,7 +10723,7 @@ async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, requ
             WHERE id=$2
             """,
             pw_hash,
-            user_id,
+            user_id_str,
         )
 
         await conn.execute(
@@ -9713,14 +10731,14 @@ async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, requ
             INSERT INTO password_resets (user_id, reset_by_admin_id, temp_password_hash, force_change, expires_at)
             VALUES ($1::uuid, $2::uuid, $3, TRUE, NOW() + INTERVAL '7 days')
             """,
-            user_id,
+            user_id_str,
             user["id"],
             pw_hash,
         )
 
         await log_admin_audit(
             conn,
-            user_id=user_id,
+            user_id=user_id_str,
             admin=user,
             action="ADMIN_RESET_PASSWORD",
             details={"must_reset_password": True},
@@ -9729,7 +10747,7 @@ async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, requ
 
     # Email the user their temporary password
     async with db_pool.acquire() as _ec:
-        _tgt = await _ec.fetchrow("SELECT email, name FROM users WHERE id=$1", user_id)
+        _tgt = await _ec.fetchrow("SELECT email, name FROM users WHERE id=$1", user_id_str)
     if _tgt:
         background_tasks.add_task(send_admin_reset_password_email, _tgt["email"], _tgt["name"] or "there", payload.temp_password)
 
@@ -9944,13 +10962,15 @@ async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
 
 @app.post("/api/admin/users/assign-tier")
 async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), request: Request = None, background_tasks: BackgroundTasks = None, user: dict = Depends(require_master_admin)):
-    if tier not in TIER_CONFIG:
+    raw = (tier or "").strip().lower()
+    if raw not in TIER_CONFIG:
         raise HTTPException(400, "Invalid tier")
+    tier_norm = normalize_tier(raw)
     async with db_pool.acquire() as conn:
         old = await conn.fetchrow("SELECT subscription_tier, email, name FROM users WHERE id = $1", user_id)
-        await conn.execute("UPDATE users SET subscription_tier = $1 WHERE id = $2", tier, user_id)
+        await conn.execute("UPDATE users SET subscription_tier = $1 WHERE id = $2", tier_norm, user_id)
         await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_ASSIGN_TIER",
-                              details={"old_tier": old["subscription_tier"] if old else None, "new_tier": tier,
+                              details={"old_tier": old["subscription_tier"] if old else None, "new_tier": tier_norm,
                                        "target_email": old["email"] if old else None},
                               request=request, resource_type="user", resource_id=user_id,
                               severity="WARNING")
@@ -9959,19 +10979,19 @@ async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), r
         _te  = old["email"]
         _tn  = old["name"] or "there"
         _old = old["subscription_tier"] or "free"
-        if _old != tier:
+        if _old != tier_norm:
             background_tasks.add_task(
                 send_admin_tier_switch_email,
-                _te, _tn, _old, tier, "", _tier_is_upgrade(_old, tier),
+                _te, _tn, _old, tier_norm, "", _tier_is_upgrade(_old, tier_norm),
             )
-        if tier == "friends_family":
+        if tier_norm == "friends_family":
             background_tasks.add_task(send_friends_family_welcome_email, _te, _tn)
-        elif tier == "agency":
+        elif tier_norm == "agency":
             background_tasks.add_task(send_agency_welcome_email, _te, _tn)
-        elif tier == "master_admin":
+        elif tier_norm == "master_admin":
             background_tasks.add_task(send_master_admin_welcome_email, _te, _tn)
 
-    return {"status": "assigned", "tier": tier}
+    return {"status": "assigned", "tier": tier_norm}
 
 # ============================================================
 # Announcements
@@ -10131,12 +11151,12 @@ async def _execute_announcement_deliveries(conn, announcement_id: str, title: st
                 err = str(e)
 
         elif ch == "discord_community":
-            ok, err = await _discord_post_raw(dest, embeds=[{"title": f"📢 {title}", "description": body, "color": 0xf97316}])
+            ok, err = await _discord_post_raw(dest, embeds=[{"title": f" {title}", "description": body, "color": 0xf97316}])
             if ok:
                 discord_sent += 1
 
         elif ch == "user_webhook":
-            ok, err = await _discord_post_raw(dest, embeds=[{"title": f"📢 {title}", "description": body, "color": 0xf97316}])
+            ok, err = await _discord_post_raw(dest, embeds=[{"title": f" {title}", "description": body, "color": 0xf97316}])
             if ok:
                 webhook_sent += 1
 
@@ -10452,6 +11472,45 @@ async def kpi_burn(range: str = "30d", user: dict = Depends(require_admin)):
         
         hitting_quota = sum(1 for u in quota_data if (u["put_balance"] - u["put_reserved"]) <= get_plan(u["subscription_tier"]).get("put_daily", 1))
         total_active = len(quota_data)
+
+        free_active_uploaders_7d = await conn.fetchval(
+            """
+            SELECT COUNT(DISTINCT u.id)::int
+            FROM users u
+            INNER JOIN uploads up ON up.user_id = u.id AND up.created_at >= NOW() - INTERVAL '7 days'
+            WHERE u.subscription_tier = 'free' AND u.status = 'active'
+            """
+        ) or 0
+
+        low_put_available = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM users u
+            INNER JOIN wallets w ON w.user_id = u.id
+            WHERE u.status = 'active'
+              AND COALESCE(u.subscription_tier, 'free') NOT IN ('master_admin', 'friends_family', 'lifetime')
+              AND (w.put_balance - w.put_reserved) BETWEEN 0 AND 29
+            """
+        ) or 0
+
+        aic_starved = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM users u
+            INNER JOIN wallets w ON w.user_id = u.id
+            WHERE u.status = 'active'
+              AND COALESCE(u.subscription_tier, 'free') NOT IN ('master_admin', 'friends_family', 'lifetime')
+              AND (w.aic_balance - w.aic_reserved) BETWEEN 0 AND 9
+            """
+        ) or 0
+
+        multi_platform_users = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int FROM (
+              SELECT user_id FROM platform_tokens GROUP BY user_id HAVING COUNT(*) >= 3
+            ) s
+            """
+        ) or 0
     
     return {
         "put_spent": token_stats["put_spent"] if token_stats else 0,
@@ -10460,6 +11519,12 @@ async def kpi_burn(range: str = "30d", user: dict = Depends(require_admin)):
         "users_hitting_quota": hitting_quota,
         "total_active_users": total_active,
         "quota_hit_pct": (hitting_quota / max(total_active, 1)) * 100,
+        "sales_opportunity_levers": {
+            "free_users_uploading_last_7d": int(free_active_uploaders_7d),
+            "users_low_put_available_0_29": int(low_put_available),
+            "users_low_aic_available_0_9": int(aic_starved),
+            "users_3plus_platform_connections": int(multi_platform_users),
+        },
     }
 
 @app.get("/api/admin/kpi/funnels")
@@ -10599,6 +11664,29 @@ async def trigger_weekly_report(user: dict = Depends(require_master_admin)):
     
     await notify_weekly_costs(float(costs["openai"] or 0), float(costs["storage"] or 0), float(costs["compute"] or 0), float(revenue or 0))
     return {"status": "sent"}
+
+
+class AdminEmailJobRunRequest(BaseModel):
+    job: Literal["trial_reminders", "monthly_user_digest", "weekly_admin_digest", "scheduled_publish_alerts", "all"]
+
+
+@app.post("/api/admin/email-jobs/run")
+async def admin_run_email_jobs(data: AdminEmailJobRunRequest, user: dict = Depends(require_master_admin)):
+    """Force-run email cron jobs for live smoke testing."""
+    ran = []
+    if data.job in ("trial_reminders", "all"):
+        await _run_trial_ending_reminders_once()
+        ran.append("trial_reminders")
+    if data.job in ("monthly_user_digest", "all"):
+        await _run_monthly_user_kpi_digests_once()
+        ran.append("monthly_user_digest")
+    if data.job in ("weekly_admin_digest", "all"):
+        await _run_admin_weekly_kpi_digest_once()
+        ran.append("weekly_admin_digest")
+    if data.job in ("scheduled_publish_alerts", "all"):
+        await _run_scheduled_publish_alerts_once()
+        ran.append("scheduled_publish_alerts")
+    return {"status": "ok", "ran": ran}
 
 # ============================================================
 # Dashboard Stats
@@ -10783,7 +11871,7 @@ def _estimate_whisper_stt_cost_usd(successful_uploads: int) -> tuple[float, dict
 @app.get("/api/admin/kpis")
 async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):
     """Combined KPI endpoint that returns all metrics in one call"""
-    minutes = {"24h": 1440, "7d": 10080, "30d": 43200, "90d": 129600, "6m": 259200, "365d": 525600, "1y": 525600}.get(range, 43200)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
     prev_since = since - timedelta(minutes=minutes)
     
@@ -10827,7 +11915,8 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
                 COALESCE(SUM(CASE WHEN category = 'mailgun' THEN cost_usd ELSE 0 END), 0)::decimal AS mailgun,
                 COALESCE(SUM(CASE WHEN category = 'bandwidth' THEN cost_usd ELSE 0 END), 0)::decimal AS bandwidth,
                 COALESCE(SUM(CASE WHEN category = 'postgres' THEN cost_usd ELSE 0 END), 0)::decimal AS postgres,
-                COALESCE(SUM(CASE WHEN category = 'redis' THEN cost_usd ELSE 0 END), 0)::decimal AS redis
+                COALESCE(SUM(CASE WHEN category = 'redis' THEN cost_usd ELSE 0 END), 0)::decimal AS redis,
+                COALESCE(SUM(CASE WHEN category = 'tool_estimate' THEN cost_usd ELSE 0 END), 0)::decimal AS tool_estimate
             FROM cost_tracking WHERE created_at >= $1
         """, since)
         openai_cost = float(costs["openai"] or 0) if costs else 0
@@ -10838,7 +11927,8 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         bandwidth_cost = float(costs.get("bandwidth") or 0) if costs else 0
         postgres_cost = float(costs.get("postgres") or 0) if costs else 0
         redis_cost = float(costs.get("redis") or 0) if costs else 0
-        total_costs = openai_cost + storage_cost + compute_cost + stripe_fees + mailgun_cost + bandwidth_cost + postgres_cost + redis_cost
+        tool_estimate_cost = float(costs.get("tool_estimate") or 0) if costs else 0
+        total_costs = openai_cost + storage_cost + compute_cost + stripe_fees + mailgun_cost + bandwidth_cost + postgres_cost + redis_cost + tool_estimate_cost
         
         gross_margin = ((total_mrr - total_costs) / max(total_mrr, 1)) * 100 if total_mrr > 0 else 0
         
@@ -10871,6 +11961,110 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         
         cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
 
+        kpi_sales_free_active_7d = await conn.fetchval(
+            """
+            SELECT COUNT(DISTINCT u.id)::int
+            FROM users u
+            INNER JOIN uploads up ON up.user_id = u.id AND up.created_at >= NOW() - INTERVAL '7 days'
+            WHERE u.subscription_tier = 'free' AND u.status = 'active'
+            """
+        ) or 0
+        kpi_sales_low_put = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM users u
+            INNER JOIN wallets w ON w.user_id = u.id
+            WHERE u.status = 'active'
+              AND COALESCE(u.subscription_tier, 'free') NOT IN ('master_admin', 'friends_family', 'lifetime')
+              AND (w.put_balance - w.put_reserved) BETWEEN 0 AND 29
+            """
+        ) or 0
+        kpi_sales_low_aic = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM users u
+            INNER JOIN wallets w ON w.user_id = u.id
+            WHERE u.status = 'active'
+              AND COALESCE(u.subscription_tier, 'free') NOT IN ('master_admin', 'friends_family', 'lifetime')
+              AND (w.aic_balance - w.aic_reserved) BETWEEN 0 AND 9
+            """
+        ) or 0
+        kpi_sales_multipf = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int FROM (
+              SELECT user_id FROM platform_tokens GROUP BY user_id HAVING COUNT(*) >= 3
+            ) s
+            """
+        ) or 0
+
+        # Creative freshness (thumbnail style entropy)
+        thumb_entropy_avg = 0.0
+        thumb_low_entropy_entities = 0
+        thumb_entities_measured = 0
+        try:
+            trows = await conn.fetch(
+                """
+                WITH ranked AS (
+                    SELECT
+                        user_id,
+                        platform,
+                        COALESCE(NULLIF(style_pack, ''), 'unknown') AS style_pack,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY user_id, platform
+                            ORDER BY created_at DESC
+                        ) AS rn
+                    FROM upload_thumbnail_style_memory
+                    WHERE created_at >= $1
+                ),
+                limited AS (
+                    SELECT * FROM ranked WHERE rn <= 30
+                ),
+                counts AS (
+                    SELECT user_id, platform, style_pack, COUNT(*)::int AS c
+                    FROM limited
+                    GROUP BY user_id, platform, style_pack
+                ),
+                totals AS (
+                    SELECT user_id, platform, COUNT(*)::int AS n, COUNT(DISTINCT style_pack)::int AS distinct_packs
+                    FROM limited
+                    GROUP BY user_id, platform
+                ),
+                entropy AS (
+                    SELECT
+                        c.user_id,
+                        c.platform,
+                        SUM(
+                            - (c.c::double precision / NULLIF(t.n::double precision, 0))
+                              * LN(c.c::double precision / NULLIF(t.n::double precision, 0))
+                        ) AS h_nat,
+                        t.n,
+                        t.distinct_packs
+                    FROM counts c
+                    JOIN totals t
+                      ON t.user_id = c.user_id AND t.platform = c.platform
+                    GROUP BY c.user_id, c.platform, t.n, t.distinct_packs
+                )
+                SELECT
+                    n,
+                    CASE
+                        WHEN distinct_packs <= 1 THEN 0.0
+                        ELSE h_nat / NULLIF(LN(distinct_packs::double precision), 0)
+                    END AS entropy_norm
+                FROM entropy
+                """
+                ,
+                since,
+            )
+            entropies = [float(r.get("entropy_norm") or 0.0) for r in (trows or []) if int(r.get("n") or 0) >= 5]
+            thumb_entities_measured = len(entropies)
+            if entropies:
+                thumb_entropy_avg = float(sum(entropies) / max(len(entropies), 1))
+                thumb_low_entropy_entities = sum(1 for v in entropies if v < 0.55)
+        except asyncpg.exceptions.UndefinedTableError:
+            pass
+        except Exception as _thumb_err:
+            logger.debug(f"thumbnail entropy KPI skipped: {_thumb_err}")
+
     whisper_est_usd, whisper_meta = _estimate_whisper_stt_cost_usd(successful_uploads)
 
     return {
@@ -10884,7 +12078,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "refunds": 0, "refund_count": 0,
         "openai_cost": openai_cost, "storage_cost": storage_cost, "compute_cost": compute_cost,
         "stripe_fees": stripe_fees, "mailgun_cost": mailgun_cost, "bandwidth_cost": bandwidth_cost,
-        "postgres_cost": postgres_cost, "redis_cost": redis_cost,
+        "postgres_cost": postgres_cost, "redis_cost": redis_cost, "tool_estimate_cost": tool_estimate_cost,
         "total_costs": total_costs, "cost_per_upload": round(cost_per_upload, 4),
         "gross_margin": round(gross_margin, 1), "gross_margin_change": 0,
         "funnel_signups": new_users, "funnel_connected": funnel_connected, "funnel_uploaded": funnel_uploaded,
@@ -10902,12 +12096,23 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "tier_breakdown": tier_breakdown, "platform_distribution": platform_distribution,
         "whisper_cost_estimate_usd": whisper_est_usd,
         "whisper_estimate": whisper_meta,
+        "creative_freshness_score": round(thumb_entropy_avg * 100.0, 1),
+        "thumbnail_entropy_norm": round(thumb_entropy_avg, 4),
+        "thumbnail_low_entropy_entities": int(thumb_low_entropy_entities),
+        "thumbnail_entities_measured": int(thumb_entities_measured),
+        "sales_opportunity_levers": {
+            "free_users_uploading_last_7d": int(kpi_sales_free_active_7d),
+            "users_low_put_available_0_29": int(kpi_sales_low_put),
+            "users_low_aic_available_0_9": int(kpi_sales_low_aic),
+            "users_3plus_platform_connections": int(kpi_sales_multipf),
+        },
     }
 
 
 @app.get("/api/admin/kpi/revenue")
-async def get_kpi_revenue(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
+async def get_kpi_revenue(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'") or 1
@@ -10920,8 +12125,9 @@ async def get_kpi_revenue(user: dict = Depends(require_admin)):
 
 
 @app.get("/api/admin/kpi/costs")
-async def get_kpi_costs(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
+async def get_kpi_costs(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         costs = await conn.fetchrow("""
             SELECT
@@ -10932,12 +12138,13 @@ async def get_kpi_costs(user: dict = Depends(require_admin)):
                 COALESCE(SUM(CASE WHEN category = 'mailgun' THEN cost_usd ELSE 0 END), 0)::decimal AS mailgun,
                 COALESCE(SUM(CASE WHEN category = 'bandwidth' THEN cost_usd ELSE 0 END), 0)::decimal AS bandwidth,
                 COALESCE(SUM(CASE WHEN category = 'postgres' THEN cost_usd ELSE 0 END), 0)::decimal AS postgres,
-                COALESCE(SUM(CASE WHEN category = 'redis' THEN cost_usd ELSE 0 END), 0)::decimal AS redis
+                COALESCE(SUM(CASE WHEN category = 'redis' THEN cost_usd ELSE 0 END), 0)::decimal AS redis,
+                COALESCE(SUM(CASE WHEN category = 'tool_estimate' THEN cost_usd ELSE 0 END), 0)::decimal AS tool_estimate
             FROM cost_tracking WHERE created_at >= $1
         """, since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('completed','succeeded') AND created_at >= $1", since)
     if not costs:
-        return {"openai_cost": 0, "storage_cost": 0, "compute_cost": 0, "stripe_fees": 0, "mailgun_cost": 0, "bandwidth_cost": 0, "postgres_cost": 0, "redis_cost": 0, "total_costs": 0, "costs_change": 0, "cost_per_upload": 0, "successful_uploads": uploads or 0, "total_cogs": 0}
+        return {"openai_cost": 0, "storage_cost": 0, "compute_cost": 0, "stripe_fees": 0, "mailgun_cost": 0, "bandwidth_cost": 0, "postgres_cost": 0, "redis_cost": 0, "tool_estimate_cost": 0, "total_costs": 0, "costs_change": 0, "cost_per_upload": 0, "successful_uploads": uploads or 0, "total_cogs": 0}
     o = float(costs["openai"] or 0)
     s = float(costs["storage"] or 0)
     c = float(costs["compute"] or 0)
@@ -10946,8 +12153,40 @@ async def get_kpi_costs(user: dict = Depends(require_admin)):
     bw = float(costs.get("bandwidth") or 0)
     pg = float(costs.get("postgres") or 0)
     rd = float(costs.get("redis") or 0)
-    total = o + s + c + sf + mg + bw + pg + rd
-    return {"openai_cost": o, "storage_cost": s, "compute_cost": c, "stripe_fees": sf, "mailgun_cost": mg, "bandwidth_cost": bw, "postgres_cost": pg, "redis_cost": rd, "total_costs": total, "costs_change": 0, "cost_per_upload": round(total / max(uploads or 1, 1), 4), "successful_uploads": uploads or 0, "total_cogs": total}
+    te = float(costs.get("tool_estimate") or 0)
+    total = o + s + c + sf + mg + bw + pg + rd + te
+    return {"openai_cost": o, "storage_cost": s, "compute_cost": c, "stripe_fees": sf, "mailgun_cost": mg, "bandwidth_cost": bw, "postgres_cost": pg, "redis_cost": rd, "tool_estimate_cost": te, "total_costs": total, "costs_change": 0, "cost_per_upload": round(total / max(uploads or 1, 1), 4), "successful_uploads": uploads or 0, "total_cogs": total}
+
+
+@app.get("/api/admin/kpi/cost-tracker")
+async def get_admin_cost_tracker(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    """
+    Per-upload tool cost tracker used by the admin costs menu.
+    Combines static per-upload assumptions with observed successful upload volume.
+    """
+    from stages.kpi_collector import estimate_tool_costs
+
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
+    async with db_pool.acquire() as conn:
+        successful_uploads = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM uploads
+            WHERE status IN ('completed','succeeded','partial')
+              AND created_at >= $1
+            """,
+            since,
+        )
+
+    tracker = estimate_tool_costs(int(successful_uploads or 0))
+    return {
+        "range": _range_label(range),
+        "successful_uploads": int(successful_uploads or 0),
+        "estimated_total_per_upload_usd": tracker["total_usd_per_upload"],
+        "estimated_total_window_usd": tracker["total_window_cost_usd"],
+        "tools": tracker["tools"],
+    }
 
 
 @app.get("/api/admin/kpi/growth")
@@ -10967,8 +12206,9 @@ async def get_kpi_growth(user: dict = Depends(require_admin)):
 
 
 @app.get("/api/admin/kpi/reliability")
-async def get_kpi_reliability(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
+async def get_kpi_reliability(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         stats = await conn.fetchrow("SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed FROM uploads WHERE created_at >= $1", since)
         queue = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
@@ -10977,6 +12217,171 @@ async def get_kpi_reliability(user: dict = Depends(require_admin)):
     return {"success_rate": round(sr, 1), "reliability_change": 0, "failRates": {"ingest": 0.5, "processing": 1, "upload": round(100-sr, 1), "publish": 0.5, "average": round(100-sr, 1)},
             "retries": {"rate": 5, "one": 3, "two": 1.5, "threePlus": 0.5}, "processingTime": {"ingest": 2, "transcode": 15, "upload": 8, "average": 25},
             "cancels": {"rate": 2, "beforeProcessing": 1.5, "duringProcessing": 0.5, "total30d": 0}, "queue_depth": queue or 0}
+
+
+@app.get("/api/admin/kpi/thumbnail-diversity")
+async def get_kpi_thumbnail_diversity(
+    range: str = Query("30d"),
+    per_platform_limit: int = Query(30, ge=10, le=120),
+    user: dict = Depends(require_admin),
+):
+    """Style freshness KPI: normalized entropy of thumbnail style packs."""
+    _ = user
+    minutes = {
+        "24h": 1440,
+        "7d": 10080,
+        "30d": 43200,
+        "90d": 129600,
+        "6m": 259200,
+        "365d": 525600,
+        "1y": 525600,
+    }.get(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH ranked AS (
+                    SELECT
+                        user_id,
+                        platform,
+                        COALESCE(NULLIF(style_pack, ''), 'unknown') AS style_pack,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY user_id, platform
+                            ORDER BY created_at DESC
+                        ) AS rn
+                    FROM upload_thumbnail_style_memory
+                    WHERE created_at >= $1
+                ),
+                limited AS (
+                    SELECT * FROM ranked WHERE rn <= $2
+                ),
+                counts AS (
+                    SELECT user_id, platform, style_pack, COUNT(*)::int AS c
+                    FROM limited
+                    GROUP BY user_id, platform, style_pack
+                ),
+                totals AS (
+                    SELECT user_id, platform, COUNT(*)::int AS n, COUNT(DISTINCT style_pack)::int AS distinct_packs
+                    FROM limited
+                    GROUP BY user_id, platform
+                ),
+                entropy AS (
+                    SELECT
+                        c.user_id,
+                        c.platform,
+                        SUM(
+                            - (c.c::double precision / NULLIF(t.n::double precision, 0))
+                              * LN(c.c::double precision / NULLIF(t.n::double precision, 0))
+                        ) AS h_nat,
+                        t.n,
+                        t.distinct_packs
+                    FROM counts c
+                    JOIN totals t
+                      ON t.user_id = c.user_id AND t.platform = c.platform
+                    GROUP BY c.user_id, c.platform, t.n, t.distinct_packs
+                )
+                SELECT
+                    e.user_id,
+                    e.platform,
+                    e.n,
+                    e.distinct_packs,
+                    CASE
+                        WHEN e.distinct_packs <= 1 THEN 0.0
+                        ELSE e.h_nat / NULLIF(LN(e.distinct_packs::double precision), 0)
+                    END AS entropy_norm
+                FROM entropy e
+                ORDER BY entropy_norm ASC, e.n DESC
+                """,
+                since,
+                per_platform_limit,
+            )
+    except asyncpg.exceptions.UndefinedTableError:
+        return {
+            "range": range,
+            "since": since.isoformat(),
+            "window_per_platform": per_platform_limit,
+            "entities_measured": 0,
+            "avg_entropy_norm": 0.0,
+            "low_entropy_entities": 0,
+            "by_platform": {},
+            "riskiest": [],
+            "note": "upload_thumbnail_style_memory table is missing",
+        }
+    except Exception as e:
+        logger.warning(f"/api/admin/kpi/thumbnail-diversity failed: {e}")
+        return {
+            "range": range,
+            "since": since.isoformat(),
+            "window_per_platform": per_platform_limit,
+            "entities_measured": 0,
+            "avg_entropy_norm": 0.0,
+            "low_entropy_entities": 0,
+            "by_platform": {},
+            "riskiest": [],
+            "error": "thumbnail_diversity_unavailable",
+        }
+
+    entities = []
+    plat_bucket: Dict[str, List[float]] = {}
+    low_entropy_count = 0
+    for r in rows or []:
+        entropy = float(r.get("entropy_norm") or 0.0)
+        n = int(r.get("n") or 0)
+        if n < 5:
+            continue
+        platform = str(r.get("platform") or "unknown").lower()
+        user_id = str(r.get("user_id") or "")
+        distinct_packs = int(r.get("distinct_packs") or 0)
+        entities.append(
+            {
+                "user_id": user_id,
+                "platform": platform,
+                "sample_n": n,
+                "distinct_packs": distinct_packs,
+                "entropy_norm": round(entropy, 4),
+                "risk": "high" if entropy < 0.55 else ("medium" if entropy < 0.72 else "low"),
+            }
+        )
+        plat_bucket.setdefault(platform, []).append(entropy)
+        if entropy < 0.55:
+            low_entropy_count += 1
+
+    entities.sort(key=lambda x: (x["entropy_norm"], -x["sample_n"]))
+    by_platform = {
+        p: {
+            "avg_entropy_norm": round(sum(vals) / max(len(vals), 1), 4),
+            "entities": len(vals),
+        }
+        for p, vals in plat_bucket.items()
+    }
+    avg_entropy = (
+        round(sum(x["entropy_norm"] for x in entities) / max(len(entities), 1), 4)
+        if entities
+        else 0.0
+    )
+
+    return {
+        "range": range,
+        "since": since.isoformat(),
+        "window_per_platform": per_platform_limit,
+        "entities_measured": len(entities),
+        "avg_entropy_norm": avg_entropy,
+        "low_entropy_entities": low_entropy_count,
+        "by_platform": by_platform,
+        "riskiest": entities[:50],
+    }
+
+
+@app.get("/api/admin/kpi/provider-costs")
+async def admin_kpi_provider_costs(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    """Live provider estimates (Render, R2, Redis, Mailgun, Stripe fees) for admin KPI cards."""
+    from stages.kpi_collector import fetch_provider_costs_for_dashboard
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    data = await fetch_provider_costs_for_dashboard(window_minutes=minutes)
+    data["range"] = _range_label(range)
+    return data
 
 
 @app.post("/api/admin/kpi/refresh")
@@ -10997,9 +12402,10 @@ async def trigger_kpi_refresh(background_tasks: BackgroundTasks, user: dict = De
 
 
 @app.get("/api/admin/kpi/usage")
-async def get_kpi_usage(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
-    prev_since = since - timedelta(days=30)
+async def get_kpi_usage(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
+    prev_since = since - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         active = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since)
@@ -11012,9 +12418,1591 @@ async def get_kpi_usage(user: dict = Depends(require_admin)):
             "total_likes": engagement["likes"] if engagement else 0, "avg_uploads_per_user": round((uploads or 0) / max(active or 1, 1), 1)}
 
 
+@app.get("/api/admin/marketing/intel")
+async def get_admin_marketing_intel(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
+    async with db_pool.acquire() as conn:
+        levers = {
+            "free_users_uploading_last_7d": int(await conn.fetchval(
+                """
+                SELECT COUNT(DISTINCT u.id)::int
+                FROM users u
+                INNER JOIN uploads up ON up.user_id = u.id AND up.created_at >= NOW() - INTERVAL '7 days'
+                WHERE u.subscription_tier = 'free' AND u.status = 'active'
+                """
+            ) or 0),
+            "users_low_put_available_0_29": int(await conn.fetchval(
+                """
+                SELECT COUNT(*)::int
+                FROM users u
+                INNER JOIN wallets w ON w.user_id = u.id
+                WHERE u.status = 'active'
+                  AND COALESCE(u.subscription_tier, 'free') NOT IN ('master_admin', 'friends_family', 'lifetime')
+                  AND (w.put_balance - w.put_reserved) BETWEEN 0 AND 29
+                """
+            ) or 0),
+            "users_low_aic_available_0_9": int(await conn.fetchval(
+                """
+                SELECT COUNT(*)::int
+                FROM users u
+                INNER JOIN wallets w ON w.user_id = u.id
+                WHERE u.status = 'active'
+                  AND COALESCE(u.subscription_tier, 'free') NOT IN ('master_admin', 'friends_family', 'lifetime')
+                  AND (w.aic_balance - w.aic_reserved) BETWEEN 0 AND 9
+                """
+            ) or 0),
+            "users_3plus_platform_connections": int(await conn.fetchval(
+                "SELECT COUNT(*)::int FROM (SELECT user_id FROM platform_tokens GROUP BY user_id HAVING COUNT(*) >= 3) s"
+            ) or 0),
+        }
+
+        counts = await conn.fetchrow(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN event_type = 'shown' THEN 1 ELSE 0 END), 0)::bigint AS shown,
+              COALESCE(SUM(CASE WHEN event_type = 'clicked' THEN 1 ELSE 0 END), 0)::bigint AS clicked,
+              COALESCE(SUM(CASE WHEN event_type = 'dismissed' THEN 1 ELSE 0 END), 0)::bigint AS dismissed,
+              COALESCE(SUM(CASE WHEN event_type = 'converted' THEN 1 ELSE 0 END), 0)::bigint AS converted
+            FROM marketing_events
+            WHERE created_at >= $1
+            """,
+            since,
+        )
+        shown = int((counts["shown"] if counts else 0) or 0)
+        clicked = int((counts["clicked"] if counts else 0) or 0)
+        dismissed = int((counts["dismissed"] if counts else 0) or 0)
+        converted = int((counts["converted"] if counts else 0) or 0)
+
+        same_session = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(r.amount), 0)::decimal
+            FROM revenue_tracking r
+            WHERE r.created_at >= $1
+              AND EXISTS (
+                SELECT 1 FROM marketing_events e
+                WHERE e.user_id = r.user_id
+                  AND e.event_type IN ('shown', 'clicked')
+                  AND e.session_id IS NOT NULL
+                  AND e.session_id <> ''
+                  AND e.created_at <= r.created_at
+                  AND e.created_at >= r.created_at - INTERVAL '8 hours'
+              )
+            """,
+            since,
+        ) or 0
+        view_through_7d = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(r.amount), 0)::decimal
+            FROM revenue_tracking r
+            WHERE r.created_at >= $1
+              AND EXISTS (
+                SELECT 1 FROM marketing_events e
+                WHERE e.user_id = r.user_id
+                  AND e.event_type IN ('shown', 'clicked')
+                  AND e.created_at <= r.created_at
+                  AND e.created_at >= r.created_at - INTERVAL '7 days'
+              )
+            """,
+            since,
+        ) or 0
+
+        schedule_rows = await conn.fetch(
+            """
+            WITH clicks AS (
+              SELECT EXTRACT(DOW FROM created_at)::int AS dow, EXTRACT(HOUR FROM created_at)::int AS hr, COUNT(*)::bigint AS n
+              FROM marketing_events
+              WHERE event_type = 'clicked' AND created_at >= $1
+              GROUP BY 1,2
+            ),
+            conv AS (
+              SELECT EXTRACT(DOW FROM e.created_at)::int AS dow, EXTRACT(HOUR FROM e.created_at)::int AS hr, COUNT(*)::bigint AS n
+              FROM marketing_events e
+              WHERE e.event_type = 'clicked'
+                AND e.created_at >= $1
+                AND EXISTS (
+                  SELECT 1 FROM revenue_tracking r
+                  WHERE r.user_id = e.user_id
+                    AND r.created_at >= e.created_at
+                    AND r.created_at <= e.created_at + INTERVAL '7 days'
+                )
+              GROUP BY 1,2
+            )
+            SELECT c.dow, c.hr, c.n::bigint AS clicks, COALESCE(v.n, 0)::bigint AS conversions,
+                   (COALESCE(v.n, 0)::double precision / NULLIF(c.n::double precision, 0)) AS conv_rate
+            FROM clicks c
+            LEFT JOIN conv v ON v.dow = c.dow AND v.hr = c.hr
+            ORDER BY conv_rate DESC NULLS LAST, clicks DESC
+            LIMIT 6
+            """,
+            since,
+        )
+    dow_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    schedule = [{
+        "day": dow_names[int(r["dow"]) % 7],
+        "hour_utc": int(r["hr"]),
+        "clicks": int(r["clicks"] or 0),
+        "conversions_7d": int(r["conversions"] or 0),
+        "conv_rate_7d": round(float(r["conv_rate"] or 0.0) * 100.0, 2),
+    } for r in (schedule_rows or [])]
+    return {
+        "range": range,
+        "sales_opportunity_levers": levers,
+        "marketing_funnel": {
+            "shown": shown,
+            "clicked": clicked,
+            "dismissed": dismissed,
+            "converted": converted,
+            "ctr_pct": round((clicked / max(shown, 1)) * 100.0, 2),
+            "dismiss_rate_pct": round((dismissed / max(shown, 1)) * 100.0, 2),
+            "same_session_attributed_revenue": float(same_session or 0),
+            "view_through_7d_attributed_revenue": float(view_through_7d or 0),
+        },
+        "promo_schedule_recommendations": schedule,
+        "recommended_comms_plan": [
+            {"channel": "in_app_banner", "cadence": "always_on", "trigger": "quota pressure + feature gap"},
+            {"channel": "email_upgrade", "cadence": "twice_weekly", "trigger": "3+ clicks without conversion"},
+            {"channel": "discount_offer", "cadence": "end_of_cycle", "trigger": "high intent + no conversion in 7d"},
+        ],
+    }
+
+
+@app.get("/api/admin/marketing/accounts")
+async def get_admin_marketing_accounts(
+    range: str = Query("30d"),
+    q: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=300),
+    offset: int = Query(0, ge=0),
+    user: dict = Depends(require_admin),
+):
+    """
+    Account-level marketing intelligence for outreach and enterprise expansion.
+    """
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
+    needle = (q or "").strip()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH u AS (
+              SELECT id, email, name, subscription_tier, subscription_status, status, role, created_at
+              FROM users
+              WHERE ($3::text = '' OR email ILIKE ('%' || $3 || '%') OR COALESCE(name, '') ILIKE ('%' || $3 || '%'))
+            ),
+            up AS (
+              SELECT user_id, COUNT(*)::int AS uploads_30d
+              FROM uploads
+              WHERE created_at >= $1
+              GROUP BY user_id
+            ),
+            rev AS (
+              SELECT user_id,
+                     COALESCE(SUM(amount), 0)::decimal AS revenue_30d,
+                     COALESCE(SUM(CASE WHEN source = 'topup' THEN amount ELSE 0 END), 0)::decimal AS topup_30d
+              FROM revenue_tracking
+              WHERE created_at >= $1
+              GROUP BY user_id
+            ),
+            me AS (
+              SELECT user_id,
+                     COALESCE(SUM(CASE WHEN event_type = 'shown' THEN 1 ELSE 0 END), 0)::int AS shown,
+                     COALESCE(SUM(CASE WHEN event_type = 'clicked' THEN 1 ELSE 0 END), 0)::int AS clicked,
+                     COALESCE(SUM(CASE WHEN event_type = 'dismissed' THEN 1 ELSE 0 END), 0)::int AS dismissed,
+                     COALESCE(SUM(CASE WHEN event_type = 'converted' THEN 1 ELSE 0 END), 0)::int AS converted
+              FROM marketing_events
+              WHERE created_at >= $1
+              GROUP BY user_id
+            ),
+            pf AS (
+              SELECT user_id, COUNT(*)::int AS connected_accounts
+              FROM platform_tokens
+              GROUP BY user_id
+            )
+            SELECT
+              u.id,
+              u.email,
+              u.name,
+              u.subscription_tier,
+              u.subscription_status,
+              u.status,
+              u.role,
+              u.created_at,
+              COALESCE(up.uploads_30d, 0)::int AS uploads_30d,
+              COALESCE(rev.revenue_30d, 0)::decimal AS revenue_30d,
+              COALESCE(rev.topup_30d, 0)::decimal AS topup_30d,
+              COALESCE(me.shown, 0)::int AS nudge_shown,
+              COALESCE(me.clicked, 0)::int AS nudge_clicked,
+              COALESCE(me.dismissed, 0)::int AS nudge_dismissed,
+              COALESCE(me.converted, 0)::int AS nudge_converted,
+              COALESCE(pf.connected_accounts, 0)::int AS connected_accounts
+            FROM u
+            LEFT JOIN up  ON up.user_id = u.id
+            LEFT JOIN rev ON rev.user_id = u.id
+            LEFT JOIN me  ON me.user_id = u.id
+            LEFT JOIN pf  ON pf.user_id = u.id
+            ORDER BY revenue_30d DESC, uploads_30d DESC, created_at DESC
+            LIMIT $2 OFFSET $4
+            """,
+            since,
+            limit,
+            needle,
+            offset,
+        )
+        total = await conn.fetchval(
+            """
+            SELECT COUNT(*)::bigint
+            FROM users
+            WHERE ($1::text = '' OR email ILIKE ('%' || $1 || '%') OR COALESCE(name, '') ILIKE ('%' || $1 || '%'))
+            """,
+            needle,
+        )
+    out = []
+    for r in rows:
+        tier = normalize_tier((r.get("subscription_tier") or "free"))
+        paid = tier not in ("free", "master_admin", "friends_family", "lifetime")
+        shown = int(r.get("nudge_shown") or 0)
+        clicked = int(r.get("nudge_clicked") or 0)
+        ctr = (clicked / max(shown, 1)) * 100.0
+        uploads_30d = int(r.get("uploads_30d") or 0)
+        connected_accounts = int(r.get("connected_accounts") or 0)
+        # Heuristic enterprise-fit score (0..100)
+        score = 0.0
+        score += min(40.0, uploads_30d * 2.2)
+        score += min(25.0, connected_accounts * 4.5)
+        score += min(20.0, ctr * 0.6)
+        if paid:
+            score += 10.0
+        if tier in ("studio", "agency"):
+            score += 10.0
+        out.append({
+            "id": str(r["id"]),
+            "email": r.get("email"),
+            "name": r.get("name"),
+            "subscription_tier": tier,
+            "subscription_status": r.get("subscription_status"),
+            "status": r.get("status"),
+            "role": r.get("role"),
+            "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+            "uploads_30d": uploads_30d,
+            "revenue_30d": float(r.get("revenue_30d") or 0),
+            "topup_30d": float(r.get("topup_30d") or 0),
+            "nudge_shown": shown,
+            "nudge_clicked": clicked,
+            "nudge_dismissed": int(r.get("nudge_dismissed") or 0),
+            "nudge_converted": int(r.get("nudge_converted") or 0),
+            "nudge_ctr_pct": round(ctr, 2),
+            "connected_accounts": connected_accounts,
+            "enterprise_fit_score": round(max(0.0, min(score, 100.0)), 1),
+        })
+    return {"accounts": out, "total": int(total or 0), "range": range}
+
+
+async def _estimate_marketing_audience(conn, payload: MarketingCampaignIn) -> int:
+    minutes = _range_to_minutes(payload.range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
+    tiers = [normalize_tier(t) for t in (payload.tiers or []) if normalize_tier(t)]
+    rows = await conn.fetch(
+        """
+        WITH u AS (
+          SELECT id, subscription_tier
+          FROM users
+          WHERE status = 'active'
+            AND ($2::text[] IS NULL OR cardinality($2::text[]) = 0 OR COALESCE(subscription_tier, 'free') = ANY($2::text[]))
+        ),
+        up AS (
+          SELECT user_id, COUNT(*)::int AS uploads_30d
+          FROM uploads
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ),
+        rv AS (
+          SELECT user_id, COALESCE(SUM(amount), 0)::decimal AS revenue_7d
+          FROM revenue_tracking
+          WHERE created_at >= NOW() - INTERVAL '7 days'
+          GROUP BY user_id
+        ),
+        me AS (
+          SELECT user_id,
+                 COALESCE(SUM(CASE WHEN event_type='shown' THEN 1 ELSE 0 END),0)::int AS shown,
+                 COALESCE(SUM(CASE WHEN event_type='clicked' THEN 1 ELSE 0 END),0)::int AS clicked
+          FROM marketing_events
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ),
+        pf AS (
+          SELECT user_id, COUNT(*)::int AS connected_accounts
+          FROM platform_tokens
+          GROUP BY user_id
+        )
+        SELECT
+          u.id,
+          COALESCE(up.uploads_30d, 0)::int AS uploads_30d,
+          COALESCE(rv.revenue_7d, 0)::decimal AS revenue_7d,
+          COALESCE(me.shown, 0)::int AS shown,
+          COALESCE(me.clicked, 0)::int AS clicked,
+          COALESCE(pf.connected_accounts, 0)::int AS connected_accounts,
+          COALESCE(u.subscription_tier, 'free') AS tier
+        FROM u
+        LEFT JOIN up ON up.user_id = u.id
+        LEFT JOIN rv ON rv.user_id = u.id
+        LEFT JOIN me ON me.user_id = u.id
+        LEFT JOIN pf ON pf.user_id = u.id
+        """,
+        since,
+        tiers if tiers else None,
+    )
+    count = 0
+    for r in rows:
+        uploads_30d = int(r.get("uploads_30d") or 0)
+        shown = int(r.get("shown") or 0)
+        clicked = int(r.get("clicked") or 0)
+        ctr = (clicked / max(shown, 1)) * 100.0
+        connected_accounts = int(r.get("connected_accounts") or 0)
+        tier = normalize_tier(str(r.get("tier") or "free"))
+        score = 0.0
+        score += min(40.0, uploads_30d * 2.2)
+        score += min(25.0, connected_accounts * 4.5)
+        score += min(20.0, ctr * 0.6)
+        if tier not in ("free", "master_admin", "friends_family", "lifetime"):
+            score += 10.0
+        if tier in ("studio", "agency"):
+            score += 10.0
+
+        if uploads_30d < int(payload.min_uploads_30d or 0):
+            continue
+        if ctr < float(payload.min_nudge_ctr_pct or 0):
+            continue
+        if score < float(payload.min_enterprise_fit_score or 0):
+            continue
+        if payload.require_no_revenue_7d and float(r.get("revenue_7d") or 0) > 0:
+            continue
+        count += 1
+    return int(count)
+
+
+async def _resolve_marketing_campaign_audience(conn, range_key: str, targeting: Dict[str, Any], limit: int = 5000) -> List[Dict[str, Any]]:
+    minutes = _range_to_minutes(range_key, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
+    tiers = [normalize_tier(t) for t in (targeting.get("tiers") or []) if normalize_tier(t)]
+    min_uploads = int(targeting.get("min_uploads_30d") or 0)
+    min_score = float(targeting.get("min_enterprise_fit_score") or 0)
+    min_ctr = float(targeting.get("min_nudge_ctr_pct") or 0)
+    no_rev_7d = bool(targeting.get("require_no_revenue_7d"))
+    rows = await conn.fetch(
+        """
+        WITH u AS (
+          SELECT id, email, name, subscription_tier, subscription_status, status
+          FROM users
+          WHERE status = 'active'
+            AND ($2::text[] IS NULL OR cardinality($2::text[]) = 0 OR COALESCE(subscription_tier, 'free') = ANY($2::text[]))
+        ),
+        up AS (
+          SELECT user_id, COUNT(*)::int AS uploads_30d
+          FROM uploads
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ),
+        rv AS (
+          SELECT user_id, COALESCE(SUM(amount), 0)::decimal AS revenue_7d
+          FROM revenue_tracking
+          WHERE created_at >= NOW() - INTERVAL '7 days'
+          GROUP BY user_id
+        ),
+        me AS (
+          SELECT user_id,
+                 COALESCE(SUM(CASE WHEN event_type='shown' THEN 1 ELSE 0 END),0)::int AS shown,
+                 COALESCE(SUM(CASE WHEN event_type='clicked' THEN 1 ELSE 0 END),0)::int AS clicked,
+                 COALESCE(SUM(CASE WHEN event_type='dismissed' THEN 1 ELSE 0 END),0)::int AS dismissed,
+                 COALESCE(SUM(CASE WHEN event_type='converted' THEN 1 ELSE 0 END),0)::int AS converted
+          FROM marketing_events
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ),
+        pf AS (
+          SELECT user_id, COUNT(*)::int AS connected_accounts
+          FROM platform_tokens
+          GROUP BY user_id
+        )
+        SELECT
+          u.id, u.email, u.name, u.subscription_tier, u.subscription_status, u.status,
+          COALESCE(up.uploads_30d, 0)::int AS uploads_30d,
+          COALESCE(rv.revenue_7d, 0)::decimal AS revenue_7d,
+          COALESCE(me.shown, 0)::int AS shown,
+          COALESCE(me.clicked, 0)::int AS clicked,
+          COALESCE(me.dismissed, 0)::int AS dismissed,
+          COALESCE(me.converted, 0)::int AS converted,
+          COALESCE(pf.connected_accounts, 0)::int AS connected_accounts
+        FROM u
+        LEFT JOIN up ON up.user_id = u.id
+        LEFT JOIN rv ON rv.user_id = u.id
+        LEFT JOIN me ON me.user_id = u.id
+        LEFT JOIN pf ON pf.user_id = u.id
+        ORDER BY COALESCE(up.uploads_30d, 0) DESC, u.created_at DESC
+        LIMIT $3
+        """,
+        since,
+        tiers if tiers else None,
+        max(1, min(limit, 10000)),
+    )
+    out = []
+    for r in rows:
+        uploads_30d = int(r.get("uploads_30d") or 0)
+        shown = int(r.get("shown") or 0)
+        clicked = int(r.get("clicked") or 0)
+        ctr = (clicked / max(shown, 1)) * 100.0
+        connected_accounts = int(r.get("connected_accounts") or 0)
+        tier = normalize_tier(str(r.get("subscription_tier") or "free"))
+        score = 0.0
+        score += min(40.0, uploads_30d * 2.2)
+        score += min(25.0, connected_accounts * 4.5)
+        score += min(20.0, ctr * 0.6)
+        if tier not in ("free", "master_admin", "friends_family", "lifetime"):
+            score += 10.0
+        if tier in ("studio", "agency"):
+            score += 10.0
+        if uploads_30d < min_uploads:
+            continue
+        if ctr < min_ctr:
+            continue
+        if score < min_score:
+            continue
+        if no_rev_7d and float(r.get("revenue_7d") or 0) > 0:
+            continue
+        out.append({
+            "id": str(r["id"]),
+            "email": r.get("email"),
+            "name": r.get("name"),
+            "subscription_tier": tier,
+            "subscription_status": r.get("subscription_status"),
+            "uploads_30d": uploads_30d,
+            "revenue_7d": float(r.get("revenue_7d") or 0),
+            "nudge_shown": shown,
+            "nudge_clicked": clicked,
+            "nudge_dismissed": int(r.get("dismissed") or 0),
+            "nudge_converted": int(r.get("converted") or 0),
+            "nudge_ctr_pct": round(ctr, 2),
+            "connected_accounts": connected_accounts,
+            "enterprise_fit_score": round(max(0.0, min(score, 100.0)), 1),
+        })
+    return out
+
+
+async def _marketing_ai_snapshot(conn, range_key: str) -> Dict[str, Any]:
+    minutes = _range_to_minutes(range_key, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
+    users = await conn.fetchrow(
+        """
+        SELECT
+          COUNT(*)::int AS total_users,
+          COUNT(*) FILTER (WHERE status = 'active')::int AS active_users,
+          COUNT(*) FILTER (WHERE COALESCE(subscription_tier,'free') NOT IN ('free','master_admin','friends_family','lifetime')
+                           AND subscription_status = 'active')::int AS paid_users
+        FROM users
+        """
+    )
+    uploads = await conn.fetchrow(
+        """
+        SELECT
+          COUNT(*)::int AS total_uploads,
+          COUNT(*) FILTER (WHERE status IN ('completed','succeeded'))::int AS successful_uploads,
+          COALESCE(SUM(views), 0)::bigint AS views,
+          COALESCE(SUM(likes), 0)::bigint AS likes
+        FROM uploads
+        WHERE created_at >= $1
+        """,
+        since,
+    )
+    revenue = await conn.fetchrow(
+        """
+        SELECT
+          COALESCE(SUM(amount), 0)::decimal AS total_revenue,
+          COALESCE(SUM(CASE WHEN source='topup' THEN amount ELSE 0 END), 0)::decimal AS topup_revenue
+        FROM revenue_tracking
+        WHERE created_at >= $1
+        """,
+        since,
+    )
+    funnel = await conn.fetchrow(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN event_type='shown' THEN 1 ELSE 0 END), 0)::bigint AS shown,
+          COALESCE(SUM(CASE WHEN event_type='clicked' THEN 1 ELSE 0 END), 0)::bigint AS clicked,
+          COALESCE(SUM(CASE WHEN event_type='dismissed' THEN 1 ELSE 0 END), 0)::bigint AS dismissed,
+          COALESCE(SUM(CASE WHEN event_type='converted' THEN 1 ELSE 0 END), 0)::bigint AS converted
+        FROM marketing_events
+        WHERE created_at >= $1
+        """,
+        since,
+    )
+    pressure = await conn.fetchrow(
+        """
+        SELECT
+          COUNT(*) FILTER (WHERE (w.put_balance - w.put_reserved) BETWEEN 0 AND 29)::int AS low_put_users,
+          COUNT(*) FILTER (WHERE (w.aic_balance - w.aic_reserved) BETWEEN 0 AND 9)::int AS low_aic_users
+        FROM users u
+        JOIN wallets w ON w.user_id = u.id
+        WHERE u.status = 'active'
+          AND COALESCE(u.subscription_tier, 'free') NOT IN ('master_admin', 'friends_family', 'lifetime')
+        """
+    )
+    multi_pf = await conn.fetchval(
+        "SELECT COUNT(*)::int FROM (SELECT user_id FROM platform_tokens GROUP BY user_id HAVING COUNT(*) >= 3) s"
+    )
+    top_accounts = await conn.fetch(
+        """
+        SELECT
+          u.id, u.email, COALESCE(u.name, split_part(u.email,'@',1)) AS name,
+          COALESCE(u.subscription_tier,'free') AS tier,
+          COALESCE(r.rev,0)::decimal AS revenue_window,
+          COALESCE(up.cnt,0)::int AS uploads_window
+        FROM users u
+        LEFT JOIN (
+          SELECT user_id, SUM(amount) AS rev
+          FROM revenue_tracking
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ) r ON r.user_id = u.id
+        LEFT JOIN (
+          SELECT user_id, COUNT(*)::int AS cnt
+          FROM uploads
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ) up ON up.user_id = u.id
+        WHERE u.status = 'active'
+        ORDER BY COALESCE(r.rev,0) DESC, COALESCE(up.cnt,0) DESC
+        LIMIT 10
+        """,
+        since,
+    )
+    tier_rows = await conn.fetch(
+        """
+        SELECT COALESCE(subscription_tier, 'free') AS tier, COUNT(*)::int AS users
+        FROM users
+        WHERE status = 'active'
+        GROUP BY COALESCE(subscription_tier, 'free')
+        ORDER BY users DESC
+        """
+    )
+    segment_rows = await conn.fetchrow(
+        """
+        WITH active_users AS (
+          SELECT id, COALESCE(subscription_tier, 'free') AS tier
+          FROM users
+          WHERE status = 'active'
+        ),
+        up AS (
+          SELECT user_id, COUNT(*)::int AS uploads_window
+          FROM uploads
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ),
+        rev AS (
+          SELECT user_id, COALESCE(SUM(amount), 0)::decimal AS revenue_window
+          FROM revenue_tracking
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ),
+        m AS (
+          SELECT user_id,
+                 COALESCE(SUM(CASE WHEN event_type = 'shown' THEN 1 ELSE 0 END), 0)::int AS shown,
+                 COALESCE(SUM(CASE WHEN event_type = 'clicked' THEN 1 ELSE 0 END), 0)::int AS clicked
+          FROM marketing_events
+          WHERE created_at >= $1
+          GROUP BY user_id
+        ),
+        pf AS (
+          SELECT user_id, COUNT(*)::int AS connected_accounts
+          FROM platform_tokens
+          GROUP BY user_id
+        ),
+        w AS (
+          SELECT user_id,
+                 (put_balance - put_reserved)::bigint AS put_available,
+                 (aic_balance - aic_reserved)::bigint AS aic_available
+          FROM wallets
+        )
+        SELECT
+          COUNT(*) FILTER (
+              WHERE COALESCE(up.uploads_window, 0) >= 4
+                AND au.tier = 'free'
+          )::int AS free_high_intent_uploaders,
+          COUNT(*) FILTER (
+              WHERE COALESCE(w.put_available, 0) BETWEEN 0 AND 29
+                 OR COALESCE(w.aic_available, 0) BETWEEN 0 AND 9
+          )::int AS token_pressure_accounts,
+          COUNT(*) FILTER (
+              WHERE COALESCE(pf.connected_accounts, 0) >= 3
+                AND au.tier NOT IN ('agency', 'master_admin', 'friends_family', 'lifetime')
+          )::int AS expansion_ready_accounts,
+          COUNT(*) FILTER (
+              WHERE COALESCE(m.clicked, 0) >= 2
+                AND COALESCE(rev.revenue_window, 0) = 0
+          )::int AS engaged_no_purchase_accounts
+        FROM active_users au
+        LEFT JOIN up ON up.user_id = au.id
+        LEFT JOIN rev ON rev.user_id = au.id
+        LEFT JOIN m ON m.user_id = au.id
+        LEFT JOIN pf ON pf.user_id = au.id
+        LEFT JOIN w ON w.user_id = au.id
+        """,
+        since,
+    )
+    source_rows = await conn.fetch(
+        """
+        SELECT COALESCE(source, 'unknown') AS source, COALESCE(SUM(amount), 0)::decimal AS amount
+        FROM revenue_tracking
+        WHERE created_at >= $1
+        GROUP BY COALESCE(source, 'unknown')
+        ORDER BY amount DESC
+        LIMIT 8
+        """,
+        since,
+    )
+    platform_rows = await conn.fetch(
+        """
+        WITH p AS (
+          SELECT
+            LOWER(TRIM(unnest(platforms))) AS platform,
+            status,
+            COALESCE(views, 0)::bigint AS views,
+            COALESCE(likes, 0)::bigint AS likes
+          FROM uploads
+          WHERE created_at >= $1
+        )
+        SELECT
+          platform,
+          COUNT(*)::int AS uploads,
+          COUNT(*) FILTER (WHERE status IN ('completed', 'succeeded'))::int AS successful_uploads,
+          COALESCE(SUM(views), 0)::bigint AS views,
+          COALESCE(SUM(likes), 0)::bigint AS likes
+        FROM p
+        WHERE platform IS NOT NULL AND platform <> ''
+        GROUP BY platform
+        ORDER BY uploads DESC
+        LIMIT 8
+        """,
+        since,
+    )
+    platform_kpis = await conn.fetchrow(
+        """
+        WITH connected AS (
+          SELECT COUNT(DISTINCT user_id)::int AS connected_users
+          FROM platform_tokens
+          WHERE revoked_at IS NULL
+        ),
+        cached AS (
+          SELECT
+            COUNT(*)::int AS cached_users,
+            COALESCE(SUM(
+              CASE WHEN COALESCE(data->'aggregate'->>'views','') ~ '^[0-9]+$'
+                   THEN (data->'aggregate'->>'views')::bigint ELSE 0 END
+            ), 0)::bigint AS platform_views,
+            COALESCE(SUM(
+              CASE WHEN COALESCE(data->'aggregate'->>'likes','') ~ '^[0-9]+$'
+                   THEN (data->'aggregate'->>'likes')::bigint ELSE 0 END
+            ), 0)::bigint AS platform_likes,
+            COALESCE(SUM(
+              CASE WHEN COALESCE(data->'aggregate'->>'comments','') ~ '^[0-9]+$'
+                   THEN (data->'aggregate'->>'comments')::bigint ELSE 0 END
+            ), 0)::bigint AS platform_comments,
+            COALESCE(SUM(
+              CASE WHEN COALESCE(data->'aggregate'->>'shares','') ~ '^[0-9]+$'
+                   THEN (data->'aggregate'->>'shares')::bigint ELSE 0 END
+            ), 0)::bigint AS platform_shares
+          FROM platform_metrics_cache
+          WHERE fetched_at >= $1
+        )
+        SELECT
+          connected.connected_users,
+          cached.cached_users,
+          cached.platform_views,
+          cached.platform_likes,
+          cached.platform_comments,
+          cached.platform_shares
+        FROM connected
+        CROSS JOIN cached
+        """,
+        since,
+    )
+    mrr_rows = await conn.fetch(
+        """
+        SELECT COALESCE(subscription_tier, 'free') AS tier, COUNT(*)::int AS users
+        FROM users
+        WHERE subscription_status = 'active'
+          AND COALESCE(subscription_tier, 'free') NOT IN ('free', 'master_admin', 'friends_family', 'lifetime')
+        GROUP BY COALESCE(subscription_tier, 'free')
+        """
+    )
+    costs_row = await conn.fetchrow(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN category='openai' THEN cost_usd ELSE 0 END),0)::decimal AS openai,
+          COALESCE(SUM(CASE WHEN category='storage' THEN cost_usd ELSE 0 END),0)::decimal AS storage,
+          COALESCE(SUM(CASE WHEN category='compute' THEN cost_usd ELSE 0 END),0)::decimal AS compute,
+          COALESCE(SUM(CASE WHEN category IN ('stripe_fees','mailgun','bandwidth','postgres','redis','tool_estimate') THEN cost_usd ELSE 0 END),0)::decimal AS other
+        FROM cost_tracking
+        WHERE created_at >= $1
+        """,
+        since,
+    )
+    cancellations = await conn.fetchval(
+        "SELECT COUNT(*)::int FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1",
+        since,
+    )
+    same_session_attr = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(r.amount), 0)::decimal
+        FROM revenue_tracking r
+        WHERE r.created_at >= $1
+          AND EXISTS (
+            SELECT 1 FROM marketing_events e
+            WHERE e.user_id = r.user_id
+              AND e.event_type IN ('shown', 'clicked')
+              AND e.created_at <= r.created_at
+              AND e.created_at >= r.created_at - INTERVAL '8 hours'
+          )
+        """,
+        since,
+    ) or 0
+    view_through_7d = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM(r.amount), 0)::decimal
+        FROM revenue_tracking r
+        WHERE r.created_at >= $1
+          AND EXISTS (
+            SELECT 1 FROM marketing_events e
+            WHERE e.user_id = r.user_id
+              AND e.event_type IN ('shown', 'clicked')
+              AND e.created_at <= r.created_at
+              AND e.created_at >= r.created_at - INTERVAL '7 days'
+          )
+        """,
+        since,
+    ) or 0
+    promo_window_rows = await conn.fetch(
+        """
+        WITH clicks AS (
+          SELECT EXTRACT(DOW FROM created_at)::int AS dow, EXTRACT(HOUR FROM created_at)::int AS hr, COUNT(*)::bigint AS n
+          FROM marketing_events
+          WHERE event_type = 'clicked' AND created_at >= $1
+          GROUP BY 1,2
+        ),
+        conv AS (
+          SELECT EXTRACT(DOW FROM e.created_at)::int AS dow, EXTRACT(HOUR FROM e.created_at)::int AS hr, COUNT(*)::bigint AS n
+          FROM marketing_events e
+          WHERE e.event_type = 'clicked' AND e.created_at >= $1
+            AND EXISTS (
+              SELECT 1 FROM revenue_tracking r
+              WHERE r.user_id = e.user_id
+                AND r.created_at >= e.created_at
+                AND r.created_at <= e.created_at + INTERVAL '7 days'
+            )
+          GROUP BY 1,2
+        )
+        SELECT c.dow, c.hr, c.n::bigint AS clicks, COALESCE(v.n,0)::bigint AS conversions,
+               (COALESCE(v.n,0)::double precision / NULLIF(c.n::double precision,0)) AS conv_rate
+        FROM clicks c
+        LEFT JOIN conv v ON v.dow = c.dow AND v.hr = c.hr
+        ORDER BY conv_rate DESC NULLS LAST, clicks DESC
+        LIMIT 8
+        """,
+        since,
+    )
+    shown = int((funnel or {}).get("shown") or 0)
+    clicked = int((funnel or {}).get("clicked") or 0)
+    ctr = (clicked / max(shown, 1)) * 100.0
+    total_revenue = float((revenue or {}).get("total_revenue") or 0)
+    total_costs = float((costs_row or {}).get("openai") or 0) + float((costs_row or {}).get("storage") or 0) + float((costs_row or {}).get("compute") or 0) + float((costs_row or {}).get("other") or 0)
+    gross_margin_pct = ((total_revenue - total_costs) / max(total_revenue, 1.0)) * 100.0 if total_revenue > 0 else 0.0
+    platform_views = int((platform_kpis or {}).get("platform_views") or 0)
+    platform_likes = int((platform_kpis or {}).get("platform_likes") or 0)
+    platform_comments = int((platform_kpis or {}).get("platform_comments") or 0)
+    platform_shares = int((platform_kpis or {}).get("platform_shares") or 0)
+    platform_engagements = platform_likes + platform_comments + platform_shares
+    platform_engagement_rate_pct = (platform_engagements / max(platform_views, 1)) * 100.0 if platform_views > 0 else 0.0
+    mrr_by_tier: Dict[str, float] = {}
+    mrr_estimate = 0.0
+    for r in (mrr_rows or []):
+        t = normalize_tier(str(r.get("tier") or "free"))
+        amt = float(get_plan(t).get("price", 0) or 0) * int(r.get("users") or 0)
+        mrr_by_tier[t] = round(amt, 2)
+        mrr_estimate += amt
+    dow_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    tier_mix: Dict[str, int] = {}
+    for r in (tier_rows or []):
+        t = normalize_tier(str(r.get("tier") or "free"))
+        tier_mix[t] = tier_mix.get(t, 0) + int(r.get("users") or 0)
+    return {
+        "range": range_key,
+        "kpis": {
+            "total_users": int((users or {}).get("total_users") or 0),
+            "active_users": int((users or {}).get("active_users") or 0),
+            "paid_users": int((users or {}).get("paid_users") or 0),
+            "total_uploads": int((uploads or {}).get("total_uploads") or 0),
+            "successful_uploads": int((uploads or {}).get("successful_uploads") or 0),
+            "views": int((uploads or {}).get("views") or 0),
+            "likes": int((uploads or {}).get("likes") or 0),
+            "total_revenue": float((revenue or {}).get("total_revenue") or 0),
+            "topup_revenue": float((revenue or {}).get("topup_revenue") or 0),
+            "mrr_estimate": round(mrr_estimate, 2),
+            "mrr_by_tier": mrr_by_tier,
+            "cancellations_window": int(cancellations or 0),
+            "nudge_shown": shown,
+            "nudge_clicked": clicked,
+            "nudge_dismissed": int((funnel or {}).get("dismissed") or 0),
+            "nudge_converted": int((funnel or {}).get("converted") or 0),
+            "nudge_ctr_pct": round(ctr, 2),
+            "same_session_attributed_revenue": float(same_session_attr or 0),
+            "view_through_7d_attributed_revenue": float(view_through_7d or 0),
+            "openai_cost": float((costs_row or {}).get("openai") or 0),
+            "storage_cost": float((costs_row or {}).get("storage") or 0),
+            "compute_cost": float((costs_row or {}).get("compute") or 0),
+            "other_costs": float((costs_row or {}).get("other") or 0),
+            "total_costs": round(total_costs, 2),
+            "gross_margin_pct": round(gross_margin_pct, 2),
+            "low_put_users": int((pressure or {}).get("low_put_users") or 0),
+            "low_aic_users": int((pressure or {}).get("low_aic_users") or 0),
+            "users_3plus_platform_connections": int(multi_pf or 0),
+            "platform_connected_users": int((platform_kpis or {}).get("connected_users") or 0),
+            "platform_cached_users": int((platform_kpis or {}).get("cached_users") or 0),
+            "platform_views": platform_views,
+            "platform_likes": platform_likes,
+            "platform_comments": platform_comments,
+            "platform_shares": platform_shares,
+            "platform_engagements": platform_engagements,
+            "platform_engagement_rate_pct": round(platform_engagement_rate_pct, 2),
+        },
+        "best_promo_windows_utc": [{
+            "day": dow_names[int(r.get("dow") or 0) % 7],
+            "hour_utc": int(r.get("hr") or 0),
+            "clicks": int(r.get("clicks") or 0),
+            "conversions_7d": int(r.get("conversions") or 0),
+            "conv_rate_7d": round(float(r.get("conv_rate") or 0.0) * 100.0, 2),
+        } for r in (promo_window_rows or [])],
+        "tier_mix_active_users": tier_mix,
+        "segment_signals": {
+            "free_high_intent_uploaders": int((segment_rows or {}).get("free_high_intent_uploaders") or 0),
+            "token_pressure_accounts": int((segment_rows or {}).get("token_pressure_accounts") or 0),
+            "expansion_ready_accounts": int((segment_rows or {}).get("expansion_ready_accounts") or 0),
+            "engaged_no_purchase_accounts": int((segment_rows or {}).get("engaged_no_purchase_accounts") or 0),
+        },
+        "revenue_source_mix": [
+            {"source": str(r.get("source") or "unknown"), "amount": float(r.get("amount") or 0)}
+            for r in (source_rows or [])
+        ],
+        "platform_kpis": [{
+            "platform": str(r.get("platform") or "unknown"),
+            "uploads": int(r.get("uploads") or 0),
+            "successful_uploads": int(r.get("successful_uploads") or 0),
+            "success_rate_pct": round((int(r.get("successful_uploads") or 0) / max(int(r.get("uploads") or 0), 1)) * 100.0, 2),
+            "views": int(r.get("views") or 0),
+            "likes": int(r.get("likes") or 0),
+            "engagement_per_upload": round((int(r.get("likes") or 0) / max(int(r.get("uploads") or 0), 1)), 3),
+        } for r in (platform_rows or [])],
+        "top_accounts": [{
+            "id": str(r["id"]),
+            "name": r.get("name"),
+            "email": r.get("email"),
+            "tier": normalize_tier(str(r.get("tier") or "free")),
+            "revenue_window": float(r.get("revenue_window") or 0),
+            "uploads_window": int(r.get("uploads_window") or 0),
+        } for r in (top_accounts or [])],
+    }
+
+
+async def _log_ai_marketing_decision(
+    conn,
+    *,
+    created_by: str,
+    action: str,
+    objective: str,
+    range_key: str,
+    used_openai: bool,
+    status: str,
+    snapshot: Dict[str, Any],
+    plan: Dict[str, Any],
+    decision: Optional[Dict[str, Any]] = None,
+    campaign_id: Optional[str] = None,
+) -> None:
+    d = decision or {}
+    await conn.execute(
+        """
+        INSERT INTO ai_marketing_decisions (
+            created_by, action, objective, range_key, used_openai, deploy_allowed, forced, confidence_score,
+            status, blocked_reasons, snapshot, decision, plan, campaign_id
+        )
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb, $14::uuid)
+        """,
+        str(created_by),
+        action,
+        objective,
+        range_key,
+        bool(used_openai),
+        d.get("deploy_allowed"),
+        bool(d.get("force_deploy", False)),
+        int(d.get("confidence_score") or 0) if d.get("confidence_score") is not None else None,
+        status,
+        json.dumps(d.get("blocked_reasons") or []),
+        json.dumps(snapshot or {}),
+        json.dumps(d or {}),
+        json.dumps(plan or {}),
+        campaign_id,
+    )
+
+
+def _ai_marketing_metric_sources() -> List[Dict[str, str]]:
+    return [
+        {
+            "metric_group": "core_kpis",
+            "sql_source": "users, uploads, revenue_tracking, marketing_events, cost_tracking",
+            "description": "Windowed KPIs: active users, uploads, revenue, nudge funnel, and margin inputs",
+        },
+        {
+            "metric_group": "segment_signals",
+            "sql_source": "users + uploads + revenue_tracking + marketing_events + platform_tokens + wallets",
+            "description": "Opportunity cohorts: free high-intent, token pressure, expansion-ready, engaged-no-purchase",
+        },
+        {
+            "metric_group": "tier_and_revenue_mix",
+            "sql_source": "users + revenue_tracking",
+            "description": "Active tier distribution, MRR estimate by tier, revenue source mix",
+        },
+        {
+            "metric_group": "platform_analytics",
+            "sql_source": "platform_metrics_cache + uploads(unnest(platforms)) + platform_tokens",
+            "description": "Coverage and platform KPI rollups used for factual plan weighting",
+        },
+        {
+            "metric_group": "promo_windows",
+            "sql_source": "marketing_events joined to revenue_tracking conversion window (7d)",
+            "description": "Best day/hour UTC windows ranked by click->conversion performance",
+        },
+    ]
+
+
+@app.post("/api/admin/marketing/campaigns/preview")
+async def preview_marketing_campaign(payload: MarketingCampaignIn, user: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        audience = await _estimate_marketing_audience(conn, payload)
+    return {"estimated_audience": audience}
+
+
+@app.get("/api/admin/marketing/campaigns")
+async def list_marketing_campaigns(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), user: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, name, objective, channel, status, range_key, targeting, estimated_audience,
+                   schedule_at, notes, created_at, updated_at
+            FROM marketing_campaigns
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+        )
+    return {"campaigns": [dict(r) for r in rows]}
+
+
+@app.post("/api/admin/marketing/campaigns")
+async def create_marketing_campaign(payload: MarketingCampaignIn, user: dict = Depends(require_admin)):
+    targeting = {
+        "tiers": [normalize_tier(t) for t in payload.tiers or []],
+        "min_uploads_30d": int(payload.min_uploads_30d or 0),
+        "min_enterprise_fit_score": float(payload.min_enterprise_fit_score or 0),
+        "min_nudge_ctr_pct": float(payload.min_nudge_ctr_pct or 0),
+        "require_no_revenue_7d": bool(payload.require_no_revenue_7d),
+    }
+    status = "scheduled" if payload.schedule_at else "draft"
+    async with db_pool.acquire() as conn:
+        audience = await _estimate_marketing_audience(conn, payload)
+        row = await conn.fetchrow(
+            """
+            INSERT INTO marketing_campaigns (
+                created_by, name, objective, channel, status, range_key, targeting,
+                estimated_audience, schedule_at, notes
+            )
+            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
+            RETURNING id, name, objective, channel, status, range_key, targeting, estimated_audience, schedule_at, notes, created_at, updated_at
+            """,
+            str(user["id"]),
+            payload.name,
+            payload.objective,
+            payload.channel,
+            status,
+            payload.range,
+            json.dumps(targeting),
+            audience,
+            payload.schedule_at,
+            payload.notes or "",
+        )
+    return {"campaign": dict(row)}
+
+
+@app.post("/api/admin/marketing/campaigns/{campaign_id}/status")
+async def update_marketing_campaign_status(campaign_id: str, payload: MarketingCampaignStatusIn, user: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE marketing_campaigns
+            SET status = $2, updated_at = NOW()
+            WHERE id = $1::uuid
+            RETURNING id, name, status, updated_at
+            """,
+            campaign_id,
+            payload.status,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"campaign": dict(row)}
+
+
+@app.get("/api/admin/marketing/campaigns/{campaign_id}/audience.csv")
+async def export_marketing_campaign_audience_csv(campaign_id: str, user: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow(
+            """
+            SELECT id, name, range_key, targeting
+            FROM marketing_campaigns
+            WHERE id = $1::uuid
+            """,
+            campaign_id,
+        )
+        if not c:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        targeting = dict(c.get("targeting") or {})
+        rows = await _resolve_marketing_campaign_audience(conn, c.get("range_key") or "30d", targeting, limit=10000)
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow([
+        "user_id", "email", "name", "subscription_tier", "subscription_status", "uploads_30d",
+        "revenue_7d", "nudge_shown", "nudge_clicked", "nudge_ctr_pct", "connected_accounts", "enterprise_fit_score",
+    ])
+    for r in rows:
+        w.writerow([
+            r.get("id"), r.get("email"), r.get("name"), r.get("subscription_tier"), r.get("subscription_status"),
+            r.get("uploads_30d"), r.get("revenue_7d"), r.get("nudge_shown"), r.get("nudge_clicked"),
+            r.get("nudge_ctr_pct"), r.get("connected_accounts"), r.get("enterprise_fit_score"),
+        ])
+    data = output.getvalue()
+    headers = {
+        "Content-Disposition": f'attachment; filename="marketing_campaign_{campaign_id}_audience.csv"',
+        "Cache-Control": "no-store",
+    }
+    return PlainTextResponse(content=data, headers=headers, media_type="text/csv")
+
+
+@app.get("/api/admin/marketing/campaigns/{campaign_id}/handoff")
+async def handoff_marketing_campaign(campaign_id: str, user: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        c = await conn.fetchrow(
+            """
+            SELECT id, name, objective, channel, range_key, targeting, estimated_audience
+            FROM marketing_campaigns
+            WHERE id = $1::uuid
+            """,
+            campaign_id,
+        )
+        if not c:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        targeting = dict(c.get("targeting") or {})
+        audience = await _resolve_marketing_campaign_audience(conn, c.get("range_key") or "30d", targeting, limit=500)
+    audience_ids = [a["id"] for a in audience if a.get("id")]
+    tiers = targeting.get("tiers") or []
+    title = f"{c.get('name')} - campaign announcement"
+    body = (
+        f"{c.get('objective')}\n\n"
+        f"Channel: {c.get('channel')}\n"
+        f"Targeting tiers: {', '.join(tiers) if tiers else 'all active tiers'}\n"
+        f"Estimated audience: {int(c.get('estimated_audience') or 0)}\n\n"
+        "This message is generated from Marketing Ops handoff and should be finalized before send."
+    )
+    return {
+        "campaign_id": str(c["id"]),
+        "title": title,
+        "body": body,
+        "target": "specific" if audience_ids else "all",
+        "selected_user_ids": audience_ids,
+        "selected_user_count": len(audience_ids),
+    }
+
+
+def _marketing_ai_fortune500_plan(payload: MarketingAIGenerateIn, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministic lifecycle plan inspired by enterprise GTM playbooks:
+    segment -> pressure -> offer -> cadence -> measurable KPI.
+    """
+    k = snapshot.get("kpis", {}) or {}
+    seg = snapshot.get("segment_signals", {}) or {}
+    tier_mix = snapshot.get("tier_mix_active_users", {}) or {}
+    revenue_mix = snapshot.get("revenue_source_mix", []) or []
+    total_rev = float(k.get("total_revenue", 0) or 0)
+    topup_rev = float(k.get("topup_revenue", 0) or 0)
+    rev_share_topup = round((topup_rev / max(total_rev, 1.0)) * 100.0, 2)
+    active_users = int(k.get("active_users", 0) or 0)
+    paid_users = int(k.get("paid_users", 0) or 0)
+    paid_rate = round((paid_users / max(active_users, 1)) * 100.0, 2)
+    nudge_ctr = float(k.get("nudge_ctr_pct", 0) or 0)
+    platform_connected_users = int(k.get("platform_connected_users", 0) or 0)
+    platform_cached_users = int(k.get("platform_cached_users", 0) or 0)
+    platform_views = int(k.get("platform_views", 0) or 0)
+    platform_engagements = int(k.get("platform_engagements", 0) or 0)
+    platform_er = float(k.get("platform_engagement_rate_pct", 0) or 0)
+    platform_coverage_pct = round((platform_cached_users / max(platform_connected_users, 1)) * 100.0, 2) if platform_connected_users > 0 else 0.0
+
+    # Cohort sizing for plan confidence
+    free_high_intent = int(seg.get("free_high_intent_uploaders", 0) or 0)
+    token_pressure = int(seg.get("token_pressure_accounts", 0) or 0)
+    expansion_ready = int(seg.get("expansion_ready_accounts", 0) or 0)
+    engaged_no_purchase = int(seg.get("engaged_no_purchase_accounts", 0) or 0)
+
+    dominant_tier = "free"
+    if tier_mix:
+        dominant_tier = max(tier_mix, key=lambda x: int(tier_mix.get(x) or 0))
+
+    confidence_score = 45.0
+    if active_users >= 100:
+        confidence_score += 12.0
+    elif active_users >= 25:
+        confidence_score += 7.0
+    if platform_connected_users > 0:
+        confidence_score += min(20.0, platform_coverage_pct * 0.2)
+    if total_rev > 0:
+        confidence_score += 10.0
+    if nudge_ctr > 0:
+        confidence_score += 8.0
+    confidence_score = round(max(0.0, min(confidence_score, 95.0)), 1)
+
+    offer_stack: List[Dict[str, Any]] = [
+        {
+            "name": "Activation-to-Upgrade Ladder",
+            "target": "free_high_intent_uploaders",
+            "cta": "Start Creator Lite",
+            "value_prop": "Unlock higher PUT/AIC and reduce upload bottlenecks for active creators.",
+            "kpi_target": "Free->paid conversion lift +15% in 30 days",
+            "proof_points": {
+                "cohort_size": free_high_intent,
+                "current_paid_rate_pct": paid_rate,
+            },
+        },
+        {
+            "name": "Token Pressure Relief Pack",
+            "target": "token_pressure_accounts",
+            "cta": "Buy PUT/AIC top-up",
+            "value_prop": "Prevent stalled uploads and keep AI outputs fully available.",
+            "kpi_target": "Top-up conversion +12% with 7-day repeat usage",
+            "proof_points": {
+                "cohort_size": token_pressure,
+                "topup_revenue_share_pct": rev_share_topup,
+            },
+        },
+        {
+            "name": "Enterprise Expansion Motion",
+            "target": "expansion_ready_accounts",
+            "cta": "Book growth architecture call",
+            "value_prop": "Scale teams, multi-account workflows, and white-label operations.",
+            "kpi_target": "Pipeline meetings booked from top 10% fit cohort",
+            "proof_points": {
+                "cohort_size": expansion_ready,
+                "users_3plus_platform_connections": int(k.get("users_3plus_platform_connections", 0) or 0),
+            },
+        },
+    ]
+    if engaged_no_purchase > 0:
+        offer_stack.append(
+            {
+                "name": "High-Intent Rescue Offer",
+                "target": "engaged_no_purchase_accounts",
+                "cta": "Claim 72-hour conversion offer",
+                "value_prop": "Short-window incentive for users repeatedly clicking but not converting.",
+                "kpi_target": "Recover 8-12% of clickers with no purchase in window",
+                "proof_points": {"cohort_size": engaged_no_purchase, "current_nudge_ctr_pct": nudge_ctr},
+            }
+        )
+
+    revenue_mix_lines = []
+    for item in revenue_mix[:4]:
+        revenue_mix_lines.append(f"{item.get('source')}: ${int(float(item.get('amount') or 0)):,}")
+    revenue_mix_text = ", ".join(revenue_mix_lines) if revenue_mix_lines else "limited attribution data yet"
+
+    newsletter_subjects = [
+        f"Revenue playbook for {payload.range}: convert intent, not volume",
+        f"Where your next growth wins are hiding ({dominant_tier} majority cohort)",
+        f"Executive growth brief: {int(k.get('total_uploads', 0) or 0):,} uploads, ${int(total_rev):,} revenue",
+        "Top signals this cycle and the exact offer cadence to deploy",
+    ]
+    body_outline = [
+        f"North-star metrics: active users {active_users:,}, paid rate {paid_rate:.2f}%, nudge CTR {nudge_ctr:.2f}%",
+        f"Cohort priorities: free high-intent {free_high_intent:,}, token pressure {token_pressure:,}, expansion-ready {expansion_ready:,}",
+        f"Platform KPIs: {platform_views:,} views, {platform_engagements:,} engagements, ER {platform_er:.2f}% (coverage {platform_coverage_pct:.2f}%)",
+        f"Revenue source mix: {revenue_mix_text}",
+        "Channel sequence: in-app trigger -> email follow-up -> conditional offer (with suppression safeguards)",
+        "Weekly experiment protocol: rotate subject + CTA by segment and keep only positive-LTV winners",
+    ]
+
+    cadence = [
+        "Daily: event-triggered in-app nudges on quota pressure and feature unlock moments.",
+        "Twice weekly: lifecycle newsletters split by segment with one primary CTA each.",
+        "Weekly: executive review of conversion, retention, and payback by cohort.",
+        "End-of-cycle: rescue promotion only for engaged users with no purchase and no recent conversion.",
+    ]
+    if payload.channel_mix == "email":
+        cadence[0] = "Daily: behavior-triggered email flows replacing most in-app nudges for this run."
+    elif payload.channel_mix == "in_app":
+        cadence[1] = "Weekly: minimal email recap; keep most pressure/upsell orchestration inside product."
+
+    suggested_campaign = {
+        "name": f"Elite {payload.objective.replace('_', ' ').title()} Engine ({payload.range})",
+        "objective": "Maximize conversion and expansion using cohort-specific offer sequencing with suppression.",
+        "channel": payload.channel_mix if payload.channel_mix in ("in_app", "email", "discount", "mixed") else "mixed",
+        "range": payload.range,
+        "tiers": ["free", "creator_lite", "creator_pro", "studio"],
+        "min_uploads_30d": 3 if free_high_intent > 0 else 1,
+        "min_enterprise_fit_score": 55 if expansion_ready > 20 else 45,
+        "min_nudge_ctr_pct": max(5, int(nudge_ctr)),
+        "require_no_revenue_7d": True,
+        "notes": (
+            f"Tone={payload.tone}; offer_style={payload.offer_style}; objective={payload.objective}; "
+            f"prioritize cohorts in order: free_high_intent -> token_pressure -> expansion_ready."
+        ),
+    }
+
+    return {
+        "newsletter": {
+            "subject_lines": newsletter_subjects,
+            "body_outline": body_outline,
+        },
+        "offers": offer_stack,
+        "execution_plan": cadence,
+        "suggested_campaign": suggested_campaign,
+        "game_plan": {
+            "framework": "SEGMENT -> SIGNAL -> OFFER -> CHANNEL -> MEASURE",
+            "confidence_score": confidence_score,
+            "north_star": {
+                "paid_rate_pct": paid_rate,
+                "nudge_ctr_pct": round(nudge_ctr, 2),
+                "total_revenue": round(total_rev, 2),
+                "platform_views": platform_views,
+                "platform_engagement_rate_pct": round(platform_er, 2),
+            },
+            "data_quality": {
+                "platform_connected_users": platform_connected_users,
+                "platform_cached_users": platform_cached_users,
+                "platform_coverage_pct": platform_coverage_pct,
+            },
+            "priority_order": [
+                "Monetize active free users first",
+                "Relieve token pressure second",
+                "Expand multi-platform accounts third",
+                "Use rescue offers only with strict suppression",
+            ],
+        },
+    }
+
+
+@app.post("/api/admin/marketing/ai/generate")
+async def generate_marketing_ai_plan(payload: MarketingAIGenerateIn, user: dict = Depends(require_admin)):
+    """
+    AI strategist for newsletters, offers, promos, and campaign plans.
+    Uses a DB-wide business snapshot and can optionally call OpenAI.
+    """
+    async with db_pool.acquire() as conn:
+        snapshot = await _marketing_ai_snapshot(conn, payload.range)
+
+    base_plan = _marketing_ai_fortune500_plan(payload, snapshot)
+
+    used_openai = False
+    if OPENAI_API_KEY:
+        try:
+            import openai
+            openai.api_key = OPENAI_API_KEY
+            model = os.environ.get("MARKETING_AI_MODEL", "gpt-4o-mini")
+            system_prompt = (
+                "You are a Fortune-500 lifecycle marketing strategist. "
+                "Return strict JSON with keys: newsletter, offers, execution_plan, suggested_campaign. "
+                "Keep recommendations concrete, measurable, and ethical. "
+                "Use segment-aware, testable playbooks (activation, monetization pressure relief, expansion, rescue)."
+            )
+            user_prompt = json.dumps({
+                "objective": payload.objective,
+                "tone": payload.tone,
+                "offer_style": payload.offer_style,
+                "channel_mix": payload.channel_mix,
+                "snapshot": snapshot,
+                "deterministic_playbook": base_plan,
+                "constraints": {
+                    "avoid_spam": True,
+                    "respect_suppression": True,
+                    "focus_on_revenue_and_retention": True,
+                },
+            }, ensure_ascii=True)
+            resp = openai.chat.completions.create(
+                model=model,
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            txt = (resp.choices[0].message.content or "").strip()
+            parsed = None
+            try:
+                parsed = json.loads(txt)
+            except Exception:
+                a = txt.find("{")
+                b = txt.rfind("}")
+                if a >= 0 and b > a:
+                    parsed = json.loads(txt[a:b + 1])
+            if isinstance(parsed, dict):
+                base_plan = {
+                    "newsletter": parsed.get("newsletter", base_plan["newsletter"]),
+                    "offers": parsed.get("offers", base_plan["offers"]),
+                    "execution_plan": parsed.get("execution_plan", base_plan["execution_plan"]),
+                    "suggested_campaign": parsed.get("suggested_campaign", base_plan["suggested_campaign"]),
+                }
+                used_openai = True
+        except Exception as e:
+            logger.warning(f"Marketing AI generation fallback used: {e}")
+
+    result = {
+        "status": "ok",
+        "used_openai": used_openai,
+        "snapshot": snapshot,
+        "plan": base_plan,
+    }
+    try:
+        async with db_pool.acquire() as conn:
+            await _log_ai_marketing_decision(
+                conn,
+                created_by=str(user["id"]),
+                action="generate",
+                objective=payload.objective,
+                range_key=payload.range,
+                used_openai=used_openai,
+                status="ok",
+                snapshot=snapshot,
+                plan=base_plan,
+                decision={"deploy_allowed": None, "force_deploy": bool(payload.force_deploy), "confidence_score": None, "blocked_reasons": []},
+                campaign_id=None,
+            )
+    except Exception as e:
+        logger.warning(f"AI marketing decision log (generate) failed: {e}")
+    return result
+
+
+@app.post("/api/admin/marketing/ai/deploy")
+async def deploy_marketing_ai_plan(payload: MarketingAIGenerateIn, user: dict = Depends(require_admin)):
+    """
+    Generate AI strategist plan and immediately deploy suggested campaign draft/schedule.
+    """
+    generated = await generate_marketing_ai_plan(payload, user)
+    snapshot = generated.get("snapshot", {}) or {}
+    k = snapshot.get("kpis", {}) or {}
+    seg = snapshot.get("segment_signals", {}) or {}
+    reasons_blocked: List[str] = []
+    if int(k.get("active_users", 0) or 0) < 20:
+        reasons_blocked.append("Not enough active users for statistically useful deployment (<20).")
+    if int(k.get("total_uploads", 0) or 0) < 30:
+        reasons_blocked.append("Insufficient recent upload volume for reliable signal (<30).")
+    if int(k.get("nudge_shown", 0) or 0) < 50:
+        reasons_blocked.append("Insufficient nudge impressions for confidence (<50).")
+    if (
+        int(seg.get("free_high_intent_uploaders", 0) or 0) <= 0
+        and int(seg.get("token_pressure_accounts", 0) or 0) <= 0
+        and int(seg.get("expansion_ready_accounts", 0) or 0) <= 0
+    ):
+        reasons_blocked.append("No material opportunity cohort currently detected.")
+
+    confidence = 100
+    confidence -= 30 if int(k.get("nudge_shown", 0) or 0) < 50 else 0
+    confidence -= 25 if int(k.get("total_uploads", 0) or 0) < 30 else 0
+    confidence -= 20 if int(k.get("active_users", 0) or 0) < 20 else 0
+    confidence -= 15 if int(k.get("nudge_clicked", 0) or 0) < 8 else 0
+    confidence = max(0, min(confidence, 100))
+    decision = {
+        "deploy_allowed": (len(reasons_blocked) == 0) or bool(payload.force_deploy),
+        "force_deploy": bool(payload.force_deploy),
+        "confidence_score": confidence,
+        "blocked_reasons": reasons_blocked,
+    }
+    if not decision["deploy_allowed"]:
+        blocked_result = {
+            "status": "blocked",
+            "used_openai": generated.get("used_openai", False),
+            "snapshot": snapshot,
+            "plan": generated.get("plan", {}),
+            "decision": decision,
+        }
+        try:
+            async with db_pool.acquire() as conn:
+                await _log_ai_marketing_decision(
+                    conn,
+                    created_by=str(user["id"]),
+                    action="deploy",
+                    objective=payload.objective,
+                    range_key=payload.range,
+                    used_openai=bool(generated.get("used_openai", False)),
+                    status="blocked",
+                    snapshot=snapshot,
+                    plan=generated.get("plan", {}) or {},
+                    decision=decision,
+                    campaign_id=None,
+                )
+        except Exception as e:
+            logger.warning(f"AI marketing decision log (blocked deploy) failed: {e}")
+        return blocked_result
+    plan = generated.get("plan") or {}
+    suggested = plan.get("suggested_campaign") or {}
+    campaign_payload = MarketingCampaignIn(
+        name=str(suggested.get("name") or f"AI Campaign {payload.objective}"),
+        objective=str(suggested.get("objective") or "AI-generated lifecycle growth campaign"),
+        channel=str(suggested.get("channel") or payload.channel_mix or "mixed"),
+        range=str(suggested.get("range") or payload.range or "30d"),
+        tiers=list(suggested.get("tiers") or []),
+        min_uploads_30d=int(suggested.get("min_uploads_30d") or 0),
+        min_enterprise_fit_score=float(suggested.get("min_enterprise_fit_score") or 0),
+        min_nudge_ctr_pct=float(suggested.get("min_nudge_ctr_pct") or 0),
+        require_no_revenue_7d=bool(suggested.get("require_no_revenue_7d") or False),
+        schedule_at=suggested.get("schedule_at"),
+        notes=str(suggested.get("notes") or "Generated by AI strategist deploy"),
+    )
+    created = await create_marketing_campaign(campaign_payload, user)
+    ok_result = {
+        "status": "ok",
+        "used_openai": generated.get("used_openai", False),
+        "snapshot": snapshot,
+        "plan": plan,
+        "deployed_campaign": created.get("campaign"),
+        "decision": decision,
+    }
+    try:
+        async with db_pool.acquire() as conn:
+            await _log_ai_marketing_decision(
+                conn,
+                created_by=str(user["id"]),
+                action="deploy",
+                objective=payload.objective,
+                range_key=payload.range,
+                used_openai=bool(generated.get("used_openai", False)),
+                status="ok",
+                snapshot=snapshot,
+                plan=plan,
+                decision=decision,
+                campaign_id=str((created.get("campaign") or {}).get("id")) if (created.get("campaign") or {}).get("id") else None,
+            )
+    except Exception as e:
+        logger.warning(f"AI marketing decision log (deploy) failed: {e}")
+    return ok_result
+
+
+@app.get("/api/admin/marketing/ai/decisions")
+async def list_ai_marketing_decisions(limit: int = Query(25, ge=1, le=200), user: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, action, objective, range_key, used_openai, deploy_allowed, forced, confidence_score,
+                   status, blocked_reasons, snapshot, decision, plan, campaign_id, created_at
+            FROM ai_marketing_decisions
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    return {"decisions": [dict(r) for r in rows]}
+
+
+@app.get("/api/admin/marketing/ai/decisions.csv")
+async def export_ai_marketing_decisions_csv(limit: int = Query(500, ge=1, le=5000), user: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, action, objective, range_key, used_openai, deploy_allowed, forced, confidence_score,
+                   status, blocked_reasons, campaign_id, created_at
+            FROM ai_marketing_decisions
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow([
+        "id",
+        "action",
+        "objective",
+        "range",
+        "used_openai",
+        "deploy_allowed",
+        "forced",
+        "confidence_score",
+        "status",
+        "blocked_reasons",
+        "campaign_id",
+        "created_at",
+    ])
+    for r in rows:
+        d = dict(r)
+        w.writerow([
+            str(d.get("id") or ""),
+            d.get("action") or "",
+            d.get("objective") or "",
+            d.get("range_key") or "",
+            bool(d.get("used_openai")),
+            d.get("deploy_allowed"),
+            bool(d.get("forced")),
+            (int(d.get("confidence_score")) if d.get("confidence_score") is not None else ""),
+            d.get("status") or "",
+            json.dumps(d.get("blocked_reasons") or []),
+            (str(d.get("campaign_id")) if d.get("campaign_id") else ""),
+            (d.get("created_at").isoformat() if d.get("created_at") else ""),
+        ])
+    headers = {
+        "Content-Disposition": 'attachment; filename="ai_marketing_decisions.csv"',
+        "Cache-Control": "no-store",
+    }
+    return PlainTextResponse(content=out.getvalue(), headers=headers, media_type="text/csv")
+
+
+@app.get("/api/admin/marketing/ai/truth")
+async def get_ai_marketing_truth_dashboard(user: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, action, objective, range_key, used_openai, deploy_allowed, forced, confidence_score,
+                   status, blocked_reasons, snapshot, decision, plan, campaign_id, created_at
+            FROM ai_marketing_decisions
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+    if not row:
+        return {
+            "last_decision": None,
+            "metrics_used": {},
+            "metric_sources": _ai_marketing_metric_sources(),
+            "notes": "No AI decisions logged yet.",
+        }
+    d = dict(row)
+    snap = d.get("snapshot") or {}
+    metrics_used = {
+        "kpis": (snap.get("kpis") or {}),
+        "segment_signals": (snap.get("segment_signals") or {}),
+        "tier_mix_active_users": (snap.get("tier_mix_active_users") or {}),
+        "revenue_source_mix": (snap.get("revenue_source_mix") or []),
+        "platform_kpis": (snap.get("platform_kpis") or []),
+        "best_promo_windows_utc": (snap.get("best_promo_windows_utc") or []),
+    }
+    return {
+        "last_decision": d,
+        "metrics_used": metrics_used,
+        "metric_sources": _ai_marketing_metric_sources(),
+        "notes": "These are the exact snapshot metrics used at decision time.",
+    }
+
+
 @app.get("/api/admin/leaderboard")
 async def get_leaderboard(range: str = Query("30d"), sort: str = Query("uploads"), user: dict = Depends(require_admin)):
-    minutes = {"7d": 10080, "30d": 43200, "90d": 129600}.get(range, 43200)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
     async with db_pool.acquire() as conn:
         if sort == "revenue":
@@ -11027,8 +14015,8 @@ async def get_leaderboard(range: str = Query("30d"), sort: str = Query("uploads"
 @app.get("/api/admin/countries")
 async def get_countries(range: str = Query("30d"), user: dict = Depends(require_admin)):
     """Return user count by country. Populated from CF-IPCountry header at registration."""
-    days = int(range.replace("d", "")) if range.endswith("d") and range[:-1].isdigit() else 30
-    since = _now_utc() - timedelta(days=days)
+    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
+    since = _now_utc() - timedelta(minutes=minutes)
     try:
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(
@@ -11199,11 +14187,11 @@ async def test_webhook(data: dict, user: dict = Depends(require_admin)):
     if not webhook_url.startswith("https://discord.com/api/webhooks/"):
         raise HTTPException(400, "Invalid Discord webhook URL")
     test_embed = {
-        "title": "🔔 UploadM8 Webhook Test",
+        "title": " UploadM8 Webhook Test",
         "description": "If you see this message, your webhook is configured correctly!",
         "color": 0x22c55e,
         "fields": [
-            {"name": "Status", "value": "✅ Connected", "inline": True},
+            {"name": "Status", "value": " Connected", "inline": True},
             {"name": "Tested By", "value": user.get("email", "Admin"), "inline": True},
         ],
         "footer": {"text": "UploadM8 Admin Notifications"},
@@ -11246,14 +14234,14 @@ async def notify_revenue_event(event_type: str, email: str, tier: str, amount: f
     setting_map = {"mrr_charge": "notify_mrr_charge", "topup": "notify_topup", "upgrade": "notify_upgrade", "downgrade": "notify_downgrade", "cancel": "notify_cancel", "refund": "notify_refund"}
     if setting_map.get(event_type) and not settings.get(setting_map[event_type], True): return
     event_config = {
-        "mrr_charge": {"emoji": "💰", "color": 0x22c55e, "title": "MRR Charge"},
-        "topup": {"emoji": "💳", "color": 0x8b5cf6, "title": "Top-up Purchase"},
+        "mrr_charge": {"emoji": "", "color": 0x22c55e, "title": "MRR Charge"},
+        "topup": {"emoji": "", "color": 0x8b5cf6, "title": "Top-up Purchase"},
         "upgrade": {"emoji": "⬆️", "color": 0x3b82f6, "title": "Plan Upgrade"},
         "downgrade": {"emoji": "⬇️", "color": 0xf59e0b, "title": "Plan Downgrade"},
-        "cancel": {"emoji": "❌", "color": 0xef4444, "title": "Subscription Cancelled"},
+        "cancel": {"emoji": "", "color": 0xef4444, "title": "Subscription Cancelled"},
         "refund": {"emoji": "↩️", "color": 0xf97316, "title": "Refund Processed"},
     }
-    cfg = event_config.get(event_type, {"emoji": "📊", "color": 0x6b7280, "title": event_type.title()})
+    cfg = event_config.get(event_type, {"emoji": "", "color": 0x6b7280, "title": event_type.title()})
     fields = [{"name": "User", "value": mask_email(email), "inline": True}, {"name": "Tier", "value": tier.title(), "inline": True}, {"name": "Amount", "value": f"${amount:.2f}", "inline": True}]
     if stripe_id: fields.append({"name": "Stripe ID", "value": f"`{stripe_id[:20]}...`" if len(stripe_id) > 20 else f"`{stripe_id}`", "inline": False})
     if extra_fields: fields.extend(extra_fields)
@@ -11272,7 +14260,7 @@ async def notify_cost_report(report_type: str, costs: dict, period: str = "Weekl
         revenue = costs.get("revenue", 0)
         margin = revenue - total_cost
         margin_pct = (margin / max(revenue, 1)) * 100
-        embed = {"title": "📊 Weekly Cost Report", "color": 0x3b82f6, "fields": [
+        embed = {"title": " Weekly Cost Report", "color": 0x3b82f6, "fields": [
             {"name": "OpenAI", "value": f"${costs.get('openai', 0):.2f}", "inline": True},
             {"name": "Storage", "value": f"${costs.get('storage', 0):.2f}", "inline": True},
             {"name": "Compute", "value": f"${costs.get('compute', 0):.2f}", "inline": True},
@@ -11281,8 +14269,8 @@ async def notify_cost_report(report_type: str, costs: dict, period: str = "Weekl
             {"name": "Margin", "value": f"${margin:.2f} ({margin_pct:.1f}%)", "inline": True},
         ], "footer": {"text": f"UploadM8 {period} Report"}, "timestamp": _now_utc().isoformat()}
     else:
-        titles = {"openai": "🤖 OpenAI Cost", "storage": "💾 Storage Cost", "compute": "⚡ Compute Cost"}
-        embed = {"title": titles.get(report_type, "📈 Cost Report"), "color": 0xef4444, "fields": [
+        titles = {"openai": " OpenAI Cost", "storage": " Storage Cost", "compute": " Compute Cost"}
+        embed = {"title": titles.get(report_type, " Cost Report"), "color": 0xef4444, "fields": [
             {"name": "Cost", "value": f"${costs.get('amount', 0):.2f}", "inline": True},
             {"name": "Units", "value": str(costs.get("units", "N/A")), "inline": True},
             {"name": "vs Last Week", "value": f"{costs.get('change', 0):+.1f}%", "inline": True},
@@ -11297,8 +14285,8 @@ async def notify_billing_reminder(reminder_type: str, date: str, amount: float =
     if not webhook: return
     setting_map = {"stripe_payout": "notify_stripe_payout", "cloud_billing": "notify_cloud_billing", "render_renewal": "notify_render_renewal"}
     if setting_map.get(reminder_type) and not settings.get(setting_map[reminder_type], True): return
-    config = {"stripe_payout": {"emoji": "💸", "color": 0x6366f1, "title": "Stripe Payout Coming"}, "cloud_billing": {"emoji": "☁️", "color": 0xf97316, "title": "Cloud Billing Reminder"}, "render_renewal": {"emoji": "🚀", "color": 0x06b6d4, "title": "Render Renewal Reminder"}}
-    cfg = config.get(reminder_type, {"emoji": "📅", "color": 0x6b7280, "title": "Billing Reminder"})
+    config = {"stripe_payout": {"emoji": "", "color": 0x6366f1, "title": "Stripe Payout Coming"}, "cloud_billing": {"emoji": "️", "color": 0xf97316, "title": "Cloud Billing Reminder"}, "render_renewal": {"emoji": "", "color": 0x06b6d4, "title": "Render Renewal Reminder"}}
+    cfg = config.get(reminder_type, {"emoji": "", "color": 0x6b7280, "title": "Billing Reminder"})
     fields = [{"name": "Date", "value": date, "inline": True}]
     if service: fields.append({"name": "Service", "value": service, "inline": True})
     if amount: fields.append({"name": "Est. Amount", "value": f"${amount:.2f}", "inline": True})

@@ -10,6 +10,7 @@ Pipeline order (critical — DO NOT REORDER):
   5.5 Audio Context   — Whisper + ACRCloud + YAMNet + Hume AI context
   5.6 Vision          — Google Cloud Vision face/OCR on best frame
   5.7 Twelve Labs     — Deep video understanding (if enabled)
+  5.8 Video Intelligence — Google Cloud full-clip labels + shots (if enabled)
   6.  Thumbnail       — Playwright HTML + AI backgrounds + rembg + Pillow fallback
   7.  Caption         — Transcript + Hume emotion + audio keywords (context feeds thumbnail/caption/hashtag)
   8.  Upload          — Per-platform R2 keys
@@ -97,6 +98,7 @@ from stages.transcode_stage import (
 from stages.audio_stage import run_audio_context_stage
 from stages.vision_stage import run_vision_stage
 from stages.twelvelabs_stage import run_twelvelabs_stage
+from stages.video_intelligence_stage import run_video_intelligence_stage
 from stages.thumbnail_stage import run_thumbnail_stage
 from stages.caption_stage import run_caption_stage
 from stages.hud_stage import run_hud_stage
@@ -162,8 +164,11 @@ SCHEDULER_POLL_INTERVAL = int(os.environ.get("SCHEDULER_POLL_INTERVAL", "60"))
 ANALYTICS_SYNC_INTERVAL = int(os.environ.get("ANALYTICS_SYNC_INTERVAL_SECONDS", str(3 * 3600)))
 
 # ── KPI collector ─────────────────────────────────────────────────
-# How often to collect cost/revenue from Stripe, OpenAI, Mailgun, etc. (seconds). Default: 30 min.
-KPI_COLLECTOR_INTERVAL = int(os.environ.get("KPI_COLLECTOR_INTERVAL_SECONDS", str(30 * 60)))
+# How often to collect cost/revenue from Stripe, OpenAI, Mailgun, etc. (seconds).
+# Default aligns with platform metrics cache cadence unless explicitly overridden.
+KPI_COLLECTOR_INTERVAL = int(
+    os.environ.get("KPI_COLLECTOR_INTERVAL_SECONDS", os.environ.get("PLATFORM_METRICS_CACHE_INTERVAL_SECONDS", str(3 * 3600)))
+)
 # How many uploads to sync per cycle (avoids platform API rate-limit hammering)
 ANALYTICS_SYNC_BATCH    = int(os.environ.get("ANALYTICS_SYNC_BATCH_SIZE", "20"))
 # Only re-sync uploads whose analytics_synced_at is older than this many hours
@@ -631,12 +636,15 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
 # Settings helpers
 # ---------------------------------------------------------------------------
 
-def _should_run_trill(ctx: JobContext) -> bool:
-    has_file = (
+def _has_telemetry_file(ctx: JobContext) -> bool:
+    return (
         ctx.local_telemetry_path is not None
         and Path(ctx.local_telemetry_path).exists()
     )
-    if not has_file:
+
+
+def _should_run_trill(ctx: JobContext) -> bool:
+    if not _has_telemetry_file(ctx):
         return False
     setting = ctx.user_settings.get("telemetry_enabled", True)
     if isinstance(setting, str):
@@ -645,7 +653,8 @@ def _should_run_trill(ctx: JobContext) -> bool:
 
 
 def _should_run_hud(ctx: JobContext) -> bool:
-    if not _should_run_trill(ctx):
+    """Speed HUD overlay: needs a .map file + user HUD on + tier allows burn."""
+    if not _has_telemetry_file(ctx):
         return False
     hud = ctx.user_settings.get("hud_enabled", True)
     if isinstance(hud, str):
@@ -788,10 +797,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # ============================================================
         # STAGE 2: Telemetry
         # ============================================================
-        if trill_active:
+        if trill_active or hud_active:
             try:
                 ctx = await run_telemetry_stage(ctx)
-                _apply_trill_caption_settings(ctx)
+                if trill_active:
+                    _apply_trill_caption_settings(ctx)
             except SkipStage as e:
                 logger.info(f"[{upload_id}] Telemetry skipped: {e.reason}")
                 trill_active = False
@@ -852,7 +862,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         try:
             ctx = await run_audio_context_stage(ctx)
             logger.info(
-                f"[{upload_id}] Audio ✓ — category={ctx.get_audio_category()} "
+                f"[{upload_id}] Audio  — category={ctx.get_audio_category()} "
                 f"emotion={ctx.get_audio_emotion()} mood={ctx.get_thumbnail_mood()}"
             )
         except SkipStage as e:
@@ -895,8 +905,51 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         await maybe_cancel(ctx, "twelvelabs")
 
         # ============================================================
+        # STAGE 5.8: Google Video Intelligence — full-clip labels + shots
+        # ============================================================
+        try:
+            ctx = await run_video_intelligence_stage(ctx)
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Video Intelligence skipped: {e.reason}")
+            ctx.video_intelligence_context = ctx.video_intelligence_context or {}
+        except Exception as e:
+            logger.warning(f"[{upload_id}] Video Intelligence error (non-fatal): {e}")
+            ctx.video_intelligence_context = ctx.video_intelligence_context or {}
+        await maybe_cancel(ctx, "video_intelligence")
+
+        # ============================================================
         # STAGE 6: Thumbnail — extract frame then immediately upload to R2
         # ============================================================
+        try:
+            recent_style_sigs: Dict[str, List[str]] = {}
+            recent_style_packs: Dict[str, List[str]] = {}
+            for pl in ("youtube", "instagram", "facebook"):
+                if pl not in [str(x).lower() for x in (ctx.platforms or [])]:
+                    continue
+                recent_style_sigs[pl] = await db_stage.fetch_recent_thumbnail_style_signatures(
+                    db_pool,
+                    str(ctx.user_id),
+                    pl,
+                    limit=30,
+                )
+                hist = await db_stage.fetch_recent_thumbnail_style_history(
+                    db_pool,
+                    str(ctx.user_id),
+                    pl,
+                    limit=30,
+                )
+                recent_style_packs[pl] = [
+                    str(x.get("style_pack") or "").lower()
+                    for x in (hist or [])
+                    if isinstance(x, dict) and x.get("style_pack")
+                ]
+            if recent_style_sigs:
+                ctx.output_artifacts["_recent_thumbnail_style_signatures"] = json.dumps(recent_style_sigs)
+            if recent_style_packs:
+                ctx.output_artifacts["_recent_thumbnail_style_packs"] = json.dumps(recent_style_packs)
+        except Exception as e:
+            logger.debug(f"[{upload_id}] Could not load recent thumbnail style signatures: {e}")
+
         try:
             ctx = await run_thumbnail_stage(ctx)
         except SkipStage as e:
@@ -943,6 +996,26 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 logger.debug(f"[{upload_id}] Platform thumb {platform} upload failed: {e}")
         if platform_thumb_r2:
             ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2)
+            # Persist style signatures for anti-repeat memory.
+            try:
+                raw_style = ctx.output_artifacts.get("thumbnail_style_signatures", "{}")
+                style_map = json.loads(raw_style) if isinstance(raw_style, str) else (raw_style or {})
+                for pl, md in (style_map or {}).items():
+                    if pl not in platform_thumb_r2:
+                        continue
+                    if not isinstance(md, dict):
+                        continue
+                    await db_stage.insert_thumbnail_style_signature(
+                        db_pool,
+                        user_id=str(ctx.user_id),
+                        upload_id=str(upload_id),
+                        platform=str(pl).lower(),
+                        style_signature=str(md.get("signature") or ""),
+                        style_pack=str(md.get("style_pack") or ""),
+                        score=float(md.get("score") or 0.0),
+                    )
+            except Exception as e:
+                logger.debug(f"[{upload_id}] Could not persist thumbnail style memory: {e}")
 
         if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
             candidate_keys = []
@@ -961,6 +1034,30 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     logger.debug(f"[{upload_id}] Candidate thumb {i} upload failed: {e}")
             if candidate_keys:
                 ctx.output_artifacts["thumbnail_r2_candidates"] = json.dumps(candidate_keys)
+
+        # YouTube Test & Compare — extra JPEGs for Studio (public API has no experiment resource)
+        ab_raw = ctx.output_artifacts.get("youtube_thumbnail_ab_candidates", "")
+        try:
+            ab_list = json.loads(ab_raw) if isinstance(ab_raw, str) else (ab_raw or [])
+        except Exception:
+            ab_list = []
+        if ab_list:
+            ab_r2: Dict[str, str] = {}
+            for i, row in enumerate(ab_list):
+                if not isinstance(row, dict):
+                    continue
+                p = row.get("path")
+                if not p or not Path(p).exists():
+                    continue
+                ab_key = f"thumbnails/{ctx.user_id}/{upload_id}/youtube_ab_{i}.jpg"
+                try:
+                    await r2_stage.upload_file(Path(p), ab_key, "image/jpeg")
+                    ab_r2[str(row.get("label") or f"B{i + 1}")] = ab_key
+                    logger.info(f"[{upload_id}] YouTube AB variant {i} → {ab_key}")
+                except Exception as e:
+                    logger.debug(f"[{upload_id}] YouTube AB variant {i} upload failed: {e}")
+            if ab_r2:
+                ctx.output_artifacts["youtube_thumbnail_ab_r2_keys"] = json.dumps(ab_r2)
 
         await maybe_cancel(ctx, "thumbnail")
 
@@ -1154,15 +1251,25 @@ async def run_publish_and_notify(
                 _platforms = ctx.platforms or []
                 _put_cost, _aic_cost = await _get_upload_costs(ctx.upload_id)
                 if ctx.state in ("succeeded", "partial"):
+                    _effective_title = (
+                        ctx.get_effective_title("") if hasattr(ctx, "get_effective_title") else None
+                    )
+                    _effective_caption = (
+                        ctx.get_effective_caption("") if hasattr(ctx, "get_effective_caption") else None
+                    )
                     _video_title = (
-                        getattr(ctx, "ai_title", None)
+                        _effective_title
+                        or getattr(ctx, "title", None)
+                        or getattr(ctx, "ai_title", None)
                         or getattr(ctx, "title", None)
                         or ctx.filename
                         or upload_id
                         or "Untitled"
                     )
                     _video_caption = (
-                        getattr(ctx, "ai_caption", None)
+                        _effective_caption
+                        or getattr(ctx, "caption", None)
+                        or getattr(ctx, "ai_caption", None)
                         or getattr(ctx, "caption", None)
                         or ""
                     )
@@ -1188,15 +1295,25 @@ async def run_publish_and_notify(
                 elif ctx.state == "failed":
                     _err_reason = getattr(ctx, "error_message", "") or ""
                     _err_stage  = getattr(ctx, "current_stage", "") or ""
+                    _effective_title = (
+                        ctx.get_effective_title("") if hasattr(ctx, "get_effective_title") else None
+                    )
+                    _effective_caption = (
+                        ctx.get_effective_caption("") if hasattr(ctx, "get_effective_caption") else None
+                    )
                     _video_title = (
-                        getattr(ctx, "ai_title", None)
+                        _effective_title
+                        or getattr(ctx, "title", None)
+                        or getattr(ctx, "ai_title", None)
                         or getattr(ctx, "title", None)
                         or ctx.filename
                         or upload_id
                         or "Untitled"
                     )
                     _video_caption = (
-                        getattr(ctx, "ai_caption", None)
+                        _effective_caption
+                        or getattr(ctx, "caption", None)
+                        or getattr(ctx, "ai_caption", None)
                         or getattr(ctx, "caption", None)
                         or ""
                     )
@@ -1449,7 +1566,7 @@ async def _sync_one_upload_analytics(
     """
     import httpx as _httpx
     from stages.publish_stage import decrypt_token
-    from services.sync_analytics_helpers import resolve_token_for_platform_result
+    from services.sync_analytics_helpers import resolve_token_candidates_for_platform_result
 
     total_views = total_likes = total_comments = total_shares = 0
     platform_stats = {}
@@ -1472,10 +1589,15 @@ async def _sync_one_upload_analytics(
             if not ok:
                 continue
 
-            tok = resolve_token_for_platform_result(pr, token_map, plat_acct, platform_fallback)
-            access_token = tok.get("access_token", "")
-            if not access_token:
+            candidates = resolve_token_candidates_for_platform_result(
+                pr, token_map, plat_acct, platform_fallback
+            )
+            if not candidates:
                 continue
+
+            # Backwards-compat: the existing platform query code uses `access_token`.
+            # If we later add full per-candidate token iteration, this will be replaced.
+            access_token = candidates[0].get("access_token", "") if candidates else ""
 
             video_id = (
                 pr.get("platform_video_id")
@@ -1487,7 +1609,7 @@ async def _sync_one_upload_analytics(
                 if plat == "tiktok" and video_id:
                     from services.tiktok_api import tiktok_envelope_error, tiktok_video_query_url
 
-                    qurl = tiktok_video_query_url()
+                    qurl = tiktok_video_query_url()  # TikTok video stats query
                     resp = await client.post(
                         qurl,
                         headers={
@@ -1738,7 +1860,7 @@ async def run_analytics_sync_loop() -> None:
                                     dec["page_id"] = str(tr["account_id"])
                                 token_id = str(tr["id"])
                                 token_map[token_id] = dec
-                                token_map_by_platform[tr["platform"]] = dec
+                                token_map_by_platform.setdefault(tr["platform"], []).append(dec)
                         except Exception:
                             pass
 
@@ -1800,7 +1922,7 @@ async def run_analytics_sync_loop() -> None:
                                         if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
                                             dec["page_id"] = str(tr["account_id"])
                                         token_map[str(tr["id"])] = dec
-                                        token_map_by_platform[tr["platform"]] = dec
+                                        token_map_by_platform.setdefault(tr["platform"], []).append(dec)
                                 except Exception:
                                     pass
                             token_map_by_plat_account = build_plat_account_token_map(trs, _dec_blob_for_map)

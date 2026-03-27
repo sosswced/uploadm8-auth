@@ -53,7 +53,8 @@ pandas>=2.0.0,<3.0.0
 numpy>=1.24.0,<3.0.0
 
 # Image processing — used by thumbnail_stage for template rendering
-Pillow>=10.0.0,<11.0.0
+# Pillow 11+ required for Python 3.14+ (prebuilt wheels); 10.x still ok on 3.11–3.12
+Pillow>=10.0.0,<13.0.0
 
 # E2E testing
 playwright>=1.40.0,<2.0.0
@@ -82,3 +83,6 @@ fal-client>=0.4.0,<1.0.0
 
 # Google Cloud Vision — face detection, OCR, labels
 google-cloud-vision>=3.5.0,<4.0.0
+
+# Google Cloud Video Intelligence — full-video labels + shot detection
+google-cloud-videointelligence>=2.11.0,<3.0.0

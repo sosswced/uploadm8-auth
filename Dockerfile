@@ -60,7 +60,9 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright
 RUN playwright install chromium --with-deps 2>/dev/null || playwright install chromium
 
 # ── rembg model pre-download (isnet-general-use ~176MB) ──────────────────────
+# ORT_THREADS limits ONNX Runtime CPU threads per session (Render-friendly)
 ENV U2NET_HOME=/app/models/.u2net
+ENV ORT_THREADS=2
 RUN mkdir -p $U2NET_HOME && \
     python -c "from rembg import new_session; new_session('isnet-general-use'); print('rembg model ready')"
 

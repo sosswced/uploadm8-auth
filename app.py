@@ -1612,6 +1612,7 @@ async def run_migrations():
                 user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 auto_captions BOOLEAN DEFAULT FALSE,
                 auto_thumbnails BOOLEAN DEFAULT FALSE,
+                styled_thumbnails BOOLEAN DEFAULT TRUE,
                 thumbnail_interval INT DEFAULT 5,
                 default_privacy VARCHAR(50) DEFAULT 'public',
                 ai_hashtags_enabled BOOLEAN DEFAULT FALSE,
@@ -1624,6 +1625,8 @@ async def run_migrations():
                 platform_hashtags JSONB DEFAULT '{"tiktok":[],"youtube":[],"instagram":[],"facebook":[]}'::jsonb,
                 email_notifications BOOLEAN DEFAULT TRUE,
                 discord_webhook VARCHAR(512),
+                use_audio_context BOOLEAN DEFAULT TRUE,
+                audio_transcription BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW())"""),
             (25, """DO $$ 
@@ -1691,6 +1694,8 @@ async def run_migrations():
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_hud_enabled BOOLEAN DEFAULT FALSE;
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_ai_enhance BOOLEAN DEFAULT TRUE;
                 ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_openai_model VARCHAR(50) DEFAULT 'gpt-4o-mini';
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS use_audio_context BOOLEAN DEFAULT TRUE;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS audio_transcription BOOLEAN DEFAULT TRUE;
             """),
             (707, "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'"),
             (1030, "ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS styled_thumbnails BOOLEAN DEFAULT TRUE"),
@@ -3493,8 +3498,18 @@ async def verify_email_change(token: str = Query(...)):
         if row["used_at"] is not None:
             raise HTTPException(status_code=410, detail="This link was already used")
 
+        # Re-check uniqueness at verification time to avoid race collisions.
+        taken = await conn.fetchval(
+            "SELECT 1 FROM users WHERE LOWER(email)=LOWER($1) AND id <> $2",
+            row["new_email"],
+            row["user_id"],
+        )
+        if taken:
+            raise HTTPException(status_code=409, detail="Email already in use")
+
         await conn.execute(
-            "UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1",
+            "UPDATE users SET email = $1, email_verified = TRUE, updated_at = NOW() WHERE id = $2",
+            row["new_email"],
             row["user_id"],
         )
         await conn.execute(
@@ -3870,6 +3885,10 @@ async def update_settings_email(data: SettingsEmailChange, background_tasks: Bac
 
         verification_token = secrets.token_urlsafe(32)
         await conn.execute(
+            "UPDATE email_changes SET used_at = NOW() WHERE user_id = $1::uuid AND used_at IS NULL",
+            user["id"],
+        )
+        await conn.execute(
             """
             INSERT INTO email_changes (user_id, old_email, new_email, changed_by_admin_id, verification_token)
             VALUES ($1::uuid, $2, $3, NULL, $4)
@@ -3879,11 +3898,8 @@ async def update_settings_email(data: SettingsEmailChange, background_tasks: Bac
             new_email,
             verification_token,
         )
-        await conn.execute(
-            "UPDATE users SET email=$1, email_verified=false, updated_at=NOW() WHERE id=$2",
-            new_email,
-            user["id"],
-        )
+        # Keep current login email until verification link is used.
+        await conn.execute("UPDATE users SET updated_at=NOW() WHERE id=$1", user["id"])
 
     verify_link = f"{FRONTEND_URL.rstrip('/')}/verify-email.html?token={verification_token}"
     target_name = (user_row["name"] if user_row else None) or "there"
@@ -4819,13 +4835,13 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
 
         def _to_hash_tags(v):
             out = []
+            seen = set()
             for t in _split_tags(v):
-                t = str(t).strip()
-                if not t:
+                token = _sanitize_hashtag_token(t)
+                if not token or token in seen:
                     continue
-                t = t.lower().lstrip("#")[:50]
-                if t:
-                    out.append(f"#{t}")
+                seen.add(token)
+                out.append(f"#{token}")
             return out
 
         # Store ONLY form/manual hashtags here. always_hashtags and platform_hashtags
@@ -4840,7 +4856,7 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         # Step 3: Deduplicate, strip blocked, enforce limit — always runs.
         blocked = set(_to_hash_tags(user_prefs.get("blocked_hashtags", []) or user_prefs.get("blockedHashtags", [])))
         combined = [h for h in combined if h and h not in blocked]
-        data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
+        data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 15))]
 
         # Each account has unique platform_tokens.id; dedupe target_accounts to avoid duplicate publishes
         target_accounts = list(dict.fromkeys(str(t) for t in (data.target_accounts or []) if t))
@@ -5055,22 +5071,18 @@ async def complete_upload(upload_id: str, request: Request, user: dict = Depends
             raw_tags = body["hashtags"]
             if isinstance(raw_tags, str):
                 raw_tags = [t.strip() for t in re.split(r"[\s,]+", str(raw_tags)) if t.strip()]
-            incoming = []
-            for t in (raw_tags if isinstance(raw_tags, (list, tuple)) else []):
-                t = str(t).strip().lstrip("#")[:50]
-                if t:
-                    incoming.append(f"#{t}")
+            incoming = _sanitize_hashtag_list(raw_tags if isinstance(raw_tags, (list, tuple)) else [])
             blocked = set(
-                str(x).strip().lstrip("#").lower()
+                _sanitize_hashtag_token(x)
                 for x in (user_prefs.get("blocked_hashtags") or user_prefs.get("blockedHashtags") or [])
             )
             existing = upload.get("hashtags")
             merged_raw: List[str] = []
             for tag in expand_hashtag_items(existing) + expand_hashtag_items(incoming):
-                t = str(tag).strip().lstrip("#").lower()
+                t = _sanitize_hashtag_token(tag)
                 if not t or t in blocked:
                     continue
-                merged_raw.append(f"#{t}" if not str(tag).startswith("#") else str(tag).strip())
+                merged_raw.append(f"#{t}")
             seen: set = set()
             tags: List[str] = []
             for t in merged_raw:
@@ -5079,7 +5091,7 @@ async def complete_upload(upload_id: str, request: Request, user: dict = Depends
                     continue
                 seen.add(k)
                 tags.append(t)
-            tags = tags[: int(user_prefs.get("max_hashtags", 30))]
+            tags = tags[: int(user_prefs.get("max_hashtags", 15))]
             updates.append(f"hashtags = ${idx}")
             params.append(tags)  # TEXT[] expects list
             idx += 1
@@ -6398,6 +6410,25 @@ async def _apply_smart_schedule(conn, upload_id: str, user_id: str, sm: dict) ->
     """, json.dumps(metadata), scheduled_dt, upload_id, user_id)
 
 
+def _sanitize_hashtag_token(raw: Any) -> str:
+    """Normalize hashtag token to a plain lowercase word/identifier."""
+    token = re.sub(r"[^a-z0-9_]", "", str(raw or "").strip().lower().lstrip("#"))
+    return token[:50]
+
+
+def _sanitize_hashtag_list(raw_items: Any) -> List[str]:
+    items = expand_hashtag_items(raw_items)
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        token = _sanitize_hashtag_token(item)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(f"#{token}")
+    return out
+
+
 async def _update_upload_metadata(conn, upload_id: str, user_id: str, update_data: UploadUpdate) -> None:
     """PATCH /api/uploads - title, caption, hashtags, scheduled_time, smart_schedule."""
     upload = await conn.fetchrow(
@@ -6425,9 +6456,10 @@ async def _update_upload_metadata(conn, upload_id: str, user_id: str, update_dat
         params.append(update_data.caption)
 
     if update_data.hashtags is not None:
+        cleaned = _sanitize_hashtag_list(update_data.hashtags)
         param_count += 1
         updates.append(f"hashtags = ${param_count}")
-        params.append(update_data.hashtags)
+        params.append(cleaned)
 
     if update_data.scheduled_time is not None:
         param_count += 1
@@ -6897,7 +6929,7 @@ async def save_user_preferences(
             for item in v:
                 if isinstance(item, str) and item and not item.startswith('[') and not item.startswith('"'):
                     # Only add if it's a simple string, not JSON garbage
-                    clean = item.strip().lower().replace('#', '')
+                    clean = re.sub(r"[^a-z0-9_]", "", item.strip().lower().replace('#', ''))
                     if clean and len(clean) < 50:  # Reasonable hashtag length
                         result.append(clean)
             return result
@@ -6908,7 +6940,7 @@ async def save_user_preferences(
                 # Looks like JSON garbage, ignore it
                 return []
             # Normal comma-separated
-            parts = [p.strip().lower().replace('#', '') for p in s.split(',')]
+            parts = [re.sub(r"[^a-z0-9_]", "", p.strip().lower().replace('#', '')) for p in s.split(',')]
             return [p for p in parts if p and len(p) < 50]
         return []
 
@@ -6999,6 +7031,7 @@ async def save_user_preferences(
     trill_ai_enhance = bool(p.get("trill_ai_enhance", True))
     trill_openai_model = str(p.get("trill_openai_model", "gpt-4o-mini") or "gpt-4o-mini")[:50]
     use_audio_context = bool(p.get("useAudioContext", p.get("use_audio_context", True)))
+    audio_transcription = bool(p.get("audioTranscription", p.get("audio_transcription", True)))
 
     try:
       async with db_pool.acquire() as conn:
@@ -7042,8 +7075,9 @@ async def save_user_preferences(
                 trill_ai_enhance = $22,
                 trill_openai_model = $23,
                 use_audio_context = $24,
+                audio_transcription = $25,
                 updated_at = NOW()
-            WHERE user_id = $25
+            WHERE user_id = $26
             """,
             auto_captions,
             auto_thumbnails,
@@ -7069,6 +7103,7 @@ async def save_user_preferences(
             trill_ai_enhance,
             trill_openai_model,
             use_audio_context,
+            audio_transcription,
             user["id"],
         )
 
@@ -7314,7 +7349,7 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
         "ai_hashtag_count": prefs.get("aiHashtagCount", 5),
         "ai_hashtag_style": prefs.get("aiHashtagStyle", "mixed"),
         "hashtag_position": prefs.get("hashtagPosition", "end"),
-        "max_hashtags": prefs.get("maxHashtags", 30),
+        "max_hashtags": prefs.get("maxHashtags", 15),
         "always_hashtags": prefs.get("alwaysHashtags", []),
         "blocked_hashtags": prefs.get("blockedHashtags", []),
         "platform_hashtags": prefs.get("platformHashtags", {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}),
@@ -9325,7 +9360,7 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
                 stats = await conn.fetchrow("""
                 SELECT COUNT(*)::int AS total,
                        SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
-                       0::bigint AS views, 0::bigint AS likes,
+                       0::bigint AS views, 0::bigint AS likes, 0::bigint AS comments, 0::bigint AS shares,
                        0::int AS put_used, 0::int AS aic_used
                 FROM uploads WHERE user_id = $1 AND created_at >= $2
                 """, user["id"], since)
@@ -9454,6 +9489,8 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
         "completed": stats["completed"] if stats else 0,
         "views": stats["views"] if stats else 0,
         "likes": stats["likes"] if stats else 0,
+        "comments": stats["comments"] if stats and "comments" in stats else 0,
+        "shares": stats["shares"] if stats and "shares" in stats else 0,
         "put_used": stats["put_used"] if stats else 0,
         "aic_used": stats["aic_used"] if stats else 0,
         "daily": [{"date": str(d["date"]), "uploads": d["uploads"]} for d in daily],
@@ -9525,6 +9562,57 @@ def _attach_aggregate_to_metrics_payload(payload: dict) -> dict:
     pl = out.get("platforms")
     if isinstance(pl, dict):
         out["aggregate"] = _aggregate_platform_metrics_live(pl)
+    return out
+
+
+def _combine_platform_live_results(platform: str, results: List[dict]) -> dict:
+    """Combine multiple account-level metric responses into one platform payload."""
+    platform = (platform or "").lower()
+    live = [r for r in (results or []) if isinstance(r, dict) and r.get("status") == "live"]
+    if not live:
+        err = next((r for r in (results or []) if isinstance(r, dict) and r.get("status") == "error"), None)
+        if err:
+            return {"status": "error", "error": err.get("error", "unknown_error"), "error_detail": err.get("error_detail")}
+        return {"status": "not_connected"}
+
+    def _n(v):
+        try:
+            return int(v or 0)
+        except Exception:
+            return 0
+
+    out = {
+        "status": "live",
+        "analytics_source": ",".join(sorted({str(r.get("analytics_source") or "").strip() for r in live if r.get("analytics_source")})),
+        "views": sum(_n(r.get("views")) for r in live),
+        "likes": sum(_n(r.get("likes")) for r in live),
+        "comments": sum(_n(r.get("comments")) for r in live),
+        "shares": sum(_n(r.get("shares")) for r in live),
+        "accounts": len(live),
+    }
+
+    if platform == "youtube":
+        out["subscribers"] = sum(_n(r.get("subscribers")) for r in live)
+        out["minutes_watched"] = sum(_n(r.get("minutes_watched")) for r in live)
+        out["video_count"] = sum(_n(r.get("video_count")) for r in live)
+        durations = [float(r.get("avg_watch_seconds")) for r in live if r.get("avg_watch_seconds") is not None]
+        out["avg_watch_seconds"] = round(sum(durations) / len(durations), 1) if durations else None
+    elif platform == "tiktok":
+        out["followers"] = sum(_n(r.get("followers")) for r in live if r.get("followers") is not None)
+        out["following"] = sum(_n(r.get("following")) for r in live if r.get("following") is not None)
+        out["total_likes"] = sum(_n(r.get("total_likes")) for r in live if r.get("total_likes") is not None)
+        out["video_count"] = sum(_n(r.get("video_count")) for r in live)
+        durations = [float(r.get("avg_watch_seconds")) for r in live if r.get("avg_watch_seconds") is not None]
+        out["avg_watch_seconds"] = round(sum(durations) / len(durations), 1) if durations else None
+    elif platform == "instagram":
+        out["saves"] = sum(_n(r.get("saves")) for r in live)
+        out["reach"] = sum(_n(r.get("reach")) for r in live)
+        out["video_count"] = sum(_n(r.get("video_count")) for r in live)
+    elif platform == "facebook":
+        out["reactions"] = sum(_n(r.get("reactions")) for r in live)
+        out["followers"] = sum(_n(r.get("followers")) for r in live)
+        out["video_count"] = sum(_n(r.get("video_count")) for r in live)
+
     return out
 
 
@@ -10005,6 +10093,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
     upload_map = {r["platform"]: r["cnt"] for r in upload_counts}
 
     token_map: dict = {}
+    token_lists: dict = {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
     for row in token_rows:
         plat = row["platform"]
         blob = row["token_blob"]
@@ -10019,6 +10108,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
                 decrypted["ig_user_id"] = str(row["account_id"])
             if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
                 decrypted["page_id"] = str(row["account_id"])
+            token_lists.setdefault(plat, []).append(decrypted)
             token_map[plat] = decrypted
 
     # Refresh OAuth tokens before live API calls (YouTube access ~1h; TikTok ~24h — refresh uses refresh_token).
@@ -10026,34 +10116,66 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
     try:
         from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
 
-        if "tiktok" in token_map:
-            token_map["tiktok"] = await _refresh_tiktok_token(
-                dict(token_map["tiktok"]), db_pool=db_pool, user_id=uid_str
-            )
-        if "youtube" in token_map:
-            token_map["youtube"] = await _refresh_youtube_token(
-                dict(token_map["youtube"]), db_pool=db_pool, user_id=uid_str
-            )
+        if token_lists.get("tiktok"):
+            refreshed = []
+            for tok in token_lists["tiktok"]:
+                try:
+                    refreshed.append(await _refresh_tiktok_token(dict(tok), db_pool=db_pool, user_id=uid_str))
+                except Exception:
+                    refreshed.append(tok)
+            token_lists["tiktok"] = refreshed
+            token_map["tiktok"] = refreshed[-1]
+        if token_lists.get("youtube"):
+            refreshed = []
+            for tok in token_lists["youtube"]:
+                try:
+                    refreshed.append(await _refresh_youtube_token(dict(tok), db_pool=db_pool, user_id=uid_str))
+                except Exception:
+                    refreshed.append(tok)
+            token_lists["youtube"] = refreshed
+            token_map["youtube"] = refreshed[-1]
     except Exception as _tok_e:
         logger.warning(f"Platform metrics OAuth refresh skipped: {_tok_e}")
 
     async def run_tiktok():
-        t = token_map.get("tiktok", {})
-        return await _fetch_tiktok_metrics(t.get("access_token", ""))
+        tokens = token_lists.get("tiktok") or []
+        if not tokens:
+            return {"status": "not_connected"}
+        rs = await _asyncio.gather(*[_fetch_tiktok_metrics((t or {}).get("access_token", "")) for t in tokens], return_exceptions=True)
+        norm = [{"status": "error", "error": str(r)} if isinstance(r, Exception) else r for r in rs]
+        return _combine_platform_live_results("tiktok", norm)
 
     async def run_youtube():
-        t = token_map.get("youtube", {})
-        return await _fetch_youtube_metrics(t.get("access_token", ""))
+        tokens = token_lists.get("youtube") or []
+        if not tokens:
+            return {"status": "not_connected"}
+        rs = await _asyncio.gather(*[_fetch_youtube_metrics((t or {}).get("access_token", "")) for t in tokens], return_exceptions=True)
+        norm = [{"status": "error", "error": str(r)} if isinstance(r, Exception) else r for r in rs]
+        return _combine_platform_live_results("youtube", norm)
 
     async def run_instagram():
-        t = token_map.get("instagram", {})
-        ig_id = (t.get("ig_user_id") or t.get("instagram_user_id") or t.get("instagram_page_id") or "")
-        return await _fetch_instagram_metrics(t.get("access_token", ""), ig_id)
+        tokens = token_lists.get("instagram") or []
+        if not tokens:
+            return {"status": "not_connected"}
+        coros = []
+        for t in tokens:
+            ig_id = ((t or {}).get("ig_user_id") or (t or {}).get("instagram_user_id") or (t or {}).get("instagram_page_id") or "")
+            coros.append(_fetch_instagram_metrics((t or {}).get("access_token", ""), ig_id))
+        rs = await _asyncio.gather(*coros, return_exceptions=True)
+        norm = [{"status": "error", "error": str(r)} if isinstance(r, Exception) else r for r in rs]
+        return _combine_platform_live_results("instagram", norm)
 
     async def run_facebook():
-        t = token_map.get("facebook", {})
-        page_id = (t.get("page_id") or t.get("facebook_page_id") or t.get("fb_page_id") or "")
-        return await _fetch_facebook_metrics(t.get("access_token", ""), page_id)
+        tokens = token_lists.get("facebook") or []
+        if not tokens:
+            return {"status": "not_connected"}
+        coros = []
+        for t in tokens:
+            page_id = ((t or {}).get("page_id") or (t or {}).get("facebook_page_id") or (t or {}).get("fb_page_id") or "")
+            coros.append(_fetch_facebook_metrics((t or {}).get("access_token", ""), page_id))
+        rs = await _asyncio.gather(*coros, return_exceptions=True)
+        norm = [{"status": "error", "error": str(r)} if isinstance(r, Exception) else r for r in rs]
+        return _combine_platform_live_results("facebook", norm)
 
     tasks = {}
     if "tiktok" in token_map:
@@ -10149,6 +10271,8 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
                     COALESCE(AVG(EXTRACT(EPOCH FROM (processing_finished_at - processing_started_at))), 0)::double precision AS avg_processing_seconds,
                     COALESCE(SUM(views), 0)::bigint AS views_total,
                     COALESCE(SUM(likes), 0)::bigint AS likes_total,
+                    COALESCE(SUM(comments), 0)::bigint AS comments_total,
+                    COALESCE(SUM(shares), 0)::bigint AS shares_total,
                     COALESCE(SUM(cost_attributed), 0)::double precision AS cost_total
                 FROM uploads
                 WHERE user_id = $1 AND created_at >= $2
@@ -10167,6 +10291,8 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
                     0::double precision AS avg_processing_seconds,
                     0::bigint AS views_total,
                     0::bigint AS likes_total,
+                    0::bigint AS comments_total,
+                    0::bigint AS shares_total,
                     0::double precision AS cost_total
                 FROM uploads
                 WHERE user_id = $1 AND created_at >= $2
@@ -10198,6 +10324,8 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
         "engagement": {
             "views": int(row["views_total"] or 0),
             "likes": int(row["likes_total"] or 0),
+            "comments": int(row["comments_total"] or 0),
+            "shares": int(row["shares_total"] or 0),
         },
         "costs": {
             "cost_total": float(row["cost_total"] or 0),
@@ -10556,9 +10684,10 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
     changes = {}
     if data.subscription_tier:
         raw_tier = (data.subscription_tier or "").strip().lower()
-        if raw_tier not in TIER_CONFIG:
+        # Master admin is a role, not a billable tier; legacy tiers are blocked in admin UI.
+        allowed_admin_tiers = {"free", "creator_lite", "creator_pro", "studio", "agency", "friends_family"}
+        if raw_tier not in allowed_admin_tiers:
             raise HTTPException(status_code=400, detail=f"Invalid subscription_tier: {data.subscription_tier}")
-        # launch -> creator_lite so DB matches Stripe/entitlements (single canonical slug)
         normalized_tier = normalize_tier(raw_tier)
         updates.append(f"subscription_tier = ${len(params)+1}")
         params.append(normalized_tier)
@@ -10600,8 +10729,7 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
                 background_tasks.add_task(send_friends_family_welcome_email, _te, _tn)
             elif _new == "agency":
                 background_tasks.add_task(send_agency_welcome_email, _te, _tn)
-            elif _new == "master_admin":
-                background_tasks.add_task(send_master_admin_welcome_email, _te, _tn)
+            # master_admin is role-only; no subscription_tier path here.
 
     return {"status": "updated"}
 
@@ -10652,6 +10780,10 @@ async def admin_change_email(
             raise HTTPException(status_code=404, detail="User not found")
 
         verification_token = secrets.token_urlsafe(32)
+        await conn.execute(
+            "UPDATE email_changes SET used_at = NOW() WHERE user_id = $1::uuid AND used_at IS NULL",
+            user_id_str,
+        )
 
         await conn.execute(
             """
@@ -10665,11 +10797,8 @@ async def admin_change_email(
             verification_token,
         )
 
-        await conn.execute(
-            "UPDATE users SET email=$1, email_verified=false, updated_at=NOW() WHERE id=$2",
-            new_email,
-            user_id_str,
-        )
+        # Keep current login email until verification link is used.
+        await conn.execute("UPDATE users SET updated_at=NOW() WHERE id=$1", user_id_str)
 
         await log_admin_audit(
             conn,
@@ -11701,7 +11830,7 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
         stats = await conn.fetchrow("""
             SELECT COUNT(*)::int AS total,
                    SUM(CASE WHEN status IN ('completed','succeeded','partial') THEN 1 ELSE 0 END)::int AS completed,
-                   SUM(CASE WHEN status IN ('pending', 'queued', 'processing') THEN 1 ELSE 0 END)::int AS in_queue,
+                   SUM(CASE WHEN status IN ('pending','queued','processing','staged','scheduled','ready_to_publish') THEN 1 ELSE 0 END)::int AS in_queue,
                    COALESCE(SUM(views), 0)::bigint AS views,
                    COALESCE(SUM(likes), 0)::bigint AS likes
             FROM uploads WHERE user_id = $1

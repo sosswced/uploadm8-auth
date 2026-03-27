@@ -62,7 +62,7 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from .context import JobContext, THUMNAIL_BRIEF_PROMPT, resolve_fused_thumbnail_category
+from .context import JobContext, THUMBNAIL_BRIEF_PROMPT, resolve_fused_thumbnail_category
 from .entitlements import should_generate_thumbnails
 from .errors import SkipStage
 from .trend_intel import fetch_trend_intel

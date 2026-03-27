@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import re
 
 from .entitlements import Entitlements
 
@@ -20,6 +21,10 @@ def expand_hashtag_items(items: Any) -> List[str]:
     (e.g. '["tag1","tag2"]' stored as a single element) so publish never emits '#"[\"a\"]"' artifacts.
     """
     import json as _json
+
+    def _clean_token(raw: Any) -> str:
+        token = re.sub(r"[^a-z0-9_]", "", str(raw or "").strip().lower().lstrip("#"))
+        return token[:50]
 
     out: List[str] = []
     if items is None:
@@ -34,7 +39,12 @@ def expand_hashtag_items(items: Any) -> List[str]:
                 return expand_hashtag_items(parsed)
             except Exception:
                 pass
-        return [t for t in s.replace(",", " ").split() if t.strip()]
+        cleaned = []
+        for t in s.replace(",", " ").split():
+            token = _clean_token(t)
+            if token:
+                cleaned.append(token)
+        return cleaned
     if not isinstance(items, (list, tuple)):
         return out
     for item in items:
@@ -60,8 +70,17 @@ def expand_hashtag_items(items: Any) -> List[str]:
                     continue
             except Exception:
                 pass
-        out.append(s)
-    return out
+        token = _clean_token(s)
+        if token:
+            out.append(token)
+    deduped: List[str] = []
+    seen: set = set()
+    for t in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        deduped.append(t)
+    return deduped
 
 
 _LANDMARK_HINT_WORDS = frozenset({
@@ -741,10 +760,7 @@ class JobContext:
             raw_blocked = [
                 t.strip() for t in raw_blocked.replace(",", " ").split() if t.strip()
             ]
-        blocked_set = {
-            str(t).strip().lstrip("#").lower()
-            for t in (raw_blocked if isinstance(raw_blocked, list) else [])
-        }
+        blocked_set = set(expand_hashtag_items(raw_blocked if isinstance(raw_blocked, list) else []))
 
         # ── Merge: always → platform → base → AI (hashtags merge only; no overwrite) ─
         base = expand_hashtag_items(self.hashtags or [])
@@ -754,7 +770,7 @@ class JobContext:
                 (self.m8_platform_hashtags or {}).get((platform or "").lower())
             )
             if m8h:
-                return list(m8h)
+                ai = expand_hashtag_items(m8h)
 
         seen: set = set()
         merged: List[str] = []
@@ -764,7 +780,7 @@ class JobContext:
             if not t or t in seen or t in blocked_set:
                 continue
             seen.add(t)
-            merged.append(tag if str(tag).startswith("#") else f"#{tag}")
+            merged.append(f"#{t}")
 
         return merged
 
@@ -1067,6 +1083,9 @@ OUTPUT SCHEMA
   "notes": "1 sentence max"
 }}
 """
+
+# Backward-compat alias for older worker images or stale imports with a typo.
+THUMNAIL_BRIEF_PROMPT = THUMBNAIL_BRIEF_PROMPT
 
 
 def create_context(job_data: dict, upload_record: dict, user_settings: dict, entitlements: Entitlements) -> JobContext:

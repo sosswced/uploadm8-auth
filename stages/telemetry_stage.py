@@ -11,6 +11,7 @@ import asyncio
 import math
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+from datetime import datetime, timezone
 
 import httpx
 
@@ -28,6 +29,39 @@ DEFAULT_EUPHORIA_MPH = 100
 # Nominatim reverse geocoding (free, no API key required)
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 GEOCODE_TIMEOUT = 8  # seconds
+
+
+def _parse_dm_coord(raw: str, hemi: str) -> Optional[float]:
+    """
+    Parse DMM.mmmm coordinate format used by many dashcam/GPS .map files.
+    Example: 3759.6885 N -> 37.9948083
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    deg = int(v // 100)
+    mins = v - (deg * 100.0)
+    dec = float(deg) + (mins / 60.0)
+    h = (hemi or "").strip().upper()
+    if h in ("S", "W"):
+        dec = -dec
+    if not (-90.0 <= dec <= 90.0 and h in ("N", "S")) and not (-180.0 <= dec <= 180.0 and h in ("E", "W")):
+        return None
+    return dec
+
+
+def _parse_ymd_hms_epoch(yyMMdd: str, hhmmss: str) -> Optional[float]:
+    """Convert YYMMDD + HHMMSS -> unix epoch seconds (UTC)."""
+    y = (yyMMdd or "").strip()
+    t = (hhmmss or "").strip()
+    if len(y) != 6 or len(t) != 6:
+        return None
+    try:
+        dt = datetime.strptime(y + t, "%y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+    except ValueError:
+        return None
 
 
 def parse_map_file(map_path: Path) -> TelemetryData:
@@ -48,6 +82,7 @@ def parse_map_file(map_path: Path) -> TelemetryData:
     """
     data_points: List[Dict] = []
 
+    fallback_ts = 0.0
     try:
         with open(map_path, 'r') as f:
             for line_num, line in enumerate(f, 1):
@@ -56,19 +91,56 @@ def parse_map_file(map_path: Path) -> TelemetryData:
                     continue
 
                 parts = line.split(',')
-                if len(parts) < 4:
-                    continue
+                # Format A: timestamp,lat,lon,speed_mph,altitude
+                if len(parts) >= 4:
+                    try:
+                        point = {
+                            'timestamp': float(parts[0]),
+                            'lat': float(parts[1]),
+                            'lon': float(parts[2]),
+                            'speed_mph': float(parts[3]),
+                            'altitude': float(parts[4]) if len(parts) > 4 else 0.0,
+                        }
+                        data_points.append(point)
+                        continue
+                    except ValueError:
+                        pass
 
-                try:
-                    point = {
-                        'timestamp': float(parts[0]),
-                        'lat': float(parts[1]),
-                        'lon': float(parts[2]),
-                        'speed_mph': float(parts[3]),
-                        'altitude': float(parts[4]) if len(parts) > 4 else 0.0,
-                    }
-                    data_points.append(point)
-                except ValueError:
+                # Format B (dashcam style):
+                # A,YYMMDD,HHMMSS,lat_dm,N|S,lon_dm,E|W,speed,ax,ay,az;
+                if len(parts) >= 8 and parts[0].strip().upper() == "A":
+                    date_token = parts[1].strip()
+                    time_token = parts[2].strip()
+                    lat_dm = parts[3].strip()
+                    lat_hemi = parts[4].strip()
+                    lon_dm = parts[5].strip()
+                    lon_hemi = parts[6].strip()
+                    speed_token = parts[7].strip().rstrip(";")
+                    altitude_token = parts[10].strip().rstrip(";") if len(parts) > 10 else "0"
+
+                    lat = _parse_dm_coord(lat_dm, lat_hemi)
+                    lon = _parse_dm_coord(lon_dm, lon_hemi)
+                    if lat is None or lon is None:
+                        continue
+                    ts = _parse_ymd_hms_epoch(date_token, time_token)
+                    if ts is None:
+                        ts = fallback_ts
+                    fallback_ts = max(fallback_ts + 1.0, ts)
+                    try:
+                        speed = float(speed_token)
+                    except ValueError:
+                        continue
+                    try:
+                        altitude = float(altitude_token)
+                    except ValueError:
+                        altitude = 0.0
+                    data_points.append({
+                        "timestamp": ts,
+                        "lat": lat,
+                        "lon": lon,
+                        "speed_mph": speed,
+                        "altitude": altitude,
+                    })
                     continue
 
     except FileNotFoundError:
@@ -275,29 +347,30 @@ def calculate_trill_score(
         bucket = "chill"
 
     return TrillScore(
-        total=total,
-        speed_score=int(speed_score),
-        distance_score=0,
-        duration_score=0,
-        altitude_score=0,
-        thrill_factor=round(telemetry.max_speed_mph / max(telemetry.avg_speed_mph, 1), 2),
+        score=total,
+        bucket=bucket,
+        speed_score=round(speed_score, 2),
+        speeding_score=round(speeding_score, 2),
+        euphoria_score=round(euphoria_score, 2),
+        consistency_score=round(consistency_score, 2),
+        excessive_speed=telemetry.max_speed_mph >= float(euphoria_mph),
     )
 
 
 def get_trill_modifiers(score: int, max_speed: float, bucket: str) -> tuple:
     """Get title modifier and hashtags based on Trill score."""
     if bucket == "gloryBoy":
-        return " - GLORY BOY 🏆", ["GloryBoyTour", "TrillScore100", "SendIt", "DashCam", "CarLife"]
+        return " - GLORY BOY ", ["GloryBoyTour", "TrillScore100", "SendIt", "DashCam", "CarLife"]
     elif bucket == "euphoric":
-        return " - Euphoric Run 🔥", ["Euphoric", "TrillScore", "SpeedDemon", "DashCam"]
+        return " - Euphoric Run ", ["Euphoric", "TrillScore", "SpeedDemon", "DashCam"]
     elif bucket == "sendIt":
-        return " - Send It 🚀", ["SendIt", "TrillScore", "Spirited", "DashCam"]
+        return " - Send It ", ["SendIt", "TrillScore", "Spirited", "DashCam"]
     elif bucket == "spirited":
-        return " - Spirited Drive 🎯", ["SpiritedDrive", "TrillScore", "DashCam"]
+        return " - Spirited Drive ", ["SpiritedDrive", "TrillScore", "DashCam"]
     elif max_speed >= 100:
-        return " 🛣️", ["TrillScore", "RoadTrip", "DashCam"]
+        return " ️", ["TrillScore", "RoadTrip", "DashCam"]
     else:
-        return " 🚗", ["TrillScore", "CruiseControl", "DashCam"]
+        return " ", ["TrillScore", "CruiseControl", "DashCam"]
 
 
 async def run_telemetry_stage(ctx: JobContext) -> JobContext:
@@ -332,6 +405,8 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
         raise
 
     ctx.telemetry_data = telemetry
+    # HUD stage reads ctx.telemetry; __post_init__ only runs at context creation.
+    ctx.telemetry = telemetry
 
     # Get user thresholds from settings
     speeding_mph = int((ctx.user_settings or {}).get("speeding_mph", DEFAULT_SPEEDING_MPH))
@@ -364,14 +439,14 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
         logger.info(f"Reverse geocoding telemetry location ({lat:.5f}, {lon:.5f})...")
         location_name = await reverse_geocode(lat, lon)
         if location_name:
-            ctx.location_name = location_name
+            telemetry.location_display = location_name
             logger.info(f"Location resolved: {location_name}")
         else:
             logger.warning("Reverse geocode returned no result — location will be omitted from captions")
-            ctx.location_name = None
+            telemetry.location_display = None
     else:
         logger.warning("No valid GPS coordinates found in .map file")
-        ctx.location_name = None
+        telemetry.location_display = None
     # ─────────────────────────────────────────────────────────────────────────
 
     return ctx

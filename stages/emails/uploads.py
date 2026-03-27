@@ -20,7 +20,7 @@ from .base import (
     check_list, stat_grid, secondary_links, alert_banner, spacer,
     section_tag, metric_hero, divider_accent,
     GRAD_GREEN, GRAD_RED, GRAD_ORANGE,
-    URL_DASHBOARD, SUPPORT_EMAIL,
+    URL_DASHBOARD, FRONTEND_URL, SUPPORT_EMAIL,
 )
 
 logger = logging.getLogger("uploadm8-worker")
@@ -173,7 +173,7 @@ def _post_details_block(video_title: str, video_caption: str, video_hashtags: ob
     has_caption = bool(str(video_caption or "").strip())
 
     caption_header = (
-        "<div style='margin:0 0 14px;color:#9ca3af;'>📝 Caption</div>"
+        "<div style='margin:0 0 14px;color:#9ca3af;'> Caption</div>"
         if has_caption else ""
     )
     caption_body = (
@@ -185,7 +185,7 @@ def _post_details_block(video_title: str, video_caption: str, video_hashtags: ob
 
     hashtags_header = (
         "<div style='margin:0 0 10px;color:#9ca3af;font-size:12px;letter-spacing:.12em;"
-        "font-weight:800;text-transform:uppercase;'>🏷️ Hashtags</div>"
+        "font-weight:800;text-transform:uppercase;'>️ Hashtags</div>"
         if tags_str else ""
     )
     hashtags_body = (
@@ -198,7 +198,7 @@ def _post_details_block(video_title: str, video_caption: str, video_hashtags: ob
     inner_html = (
         "<div style='color:#ffffff;font-size:14px;line-height:1.65;'>"
         "<div style='margin:0 0 10px;color:#9ca3af;font-size:12px;letter-spacing:.12em;font-weight:800;text-transform:uppercase;'>"
-        "📹 Title</div>"
+        " Title</div>"
         f"<div style='margin:0 0 14px;font-size:18px;font-weight:900;'>{_escape_html(video_title)}</div>"
         f"{caption_header}{caption_body}"
         f"{hashtags_header}{hashtags_body}"
@@ -217,7 +217,7 @@ def _platform_results_list(platform_results: list[object]) -> str:
         p = (str(_get_result_field(r, "platform", "") or "")).lower() or "unknown"
         plat_name = PLATFORM_NAMES.get(p, p.title())
 
-        icon = "✅" if bool(_get_result_field(r, "success", False)) else "❌"
+        icon = "" if bool(_get_result_field(r, "success", False)) else ""
         username = _get_result_field(r, "account_username", None) or ""
         if username:
             u = str(username).lstrip("@").strip()
@@ -342,7 +342,7 @@ async def send_upload_completed_email(
 
     await send_email(
         email,
-        f"🌟 Your upload is live on {platform_count} {platform_word}!",
+        f"Your upload is live on {platform_count} {platform_word}",
         html,
     )
 
@@ -431,4 +431,52 @@ async def send_upload_failed_email(
         footer_note="You received this because upload email notifications are enabled on your account.",
     )
 
-    await send_email(email, f"❌ Upload failed — {filename}", html)
+    await send_email(email, f"Upload failed — {filename}", html)
+
+
+async def send_scheduled_publish_alert_email(
+    email: str,
+    name: str,
+    filename: str,
+    scheduled_time_label: str,
+    status: str,
+    reason: str = "",
+    upload_id: str = "",
+) -> None:
+    """Alert for delayed or failed scheduled/smart publish jobs."""
+    if not mailgun_ready():
+        return
+
+    is_failed = (status or "").lower() == "failed"
+    gradient = GRAD_RED if is_failed else GRAD_ORANGE
+    section = "Scheduled Publish Failed" if is_failed else "Scheduled Publish Delayed"
+    detail_reason = reason or ("The upload entered failed state during scheduled publish." if is_failed else "The upload was not published at the scheduled time and is awaiting attention.")
+    queue_url = f"{FRONTEND_URL}/queue.html"
+    html = email_shell(
+        gradient=gradient,
+        tagline="Scheduled publishing status alert",
+        preheader_text=f"{filename} needs attention in Queue. Scheduled time: {scheduled_time_label}.",
+        body_rows=(
+            section_tag(section, "#ef4444" if is_failed else "#f97316")
+            + intro_row(
+                f"Scheduled upload requires attention, {name}",
+                f"Your scheduled upload <strong style='color:#ffffff;'>{_escape_html(filename)}</strong> "
+                f"did not complete as expected at <strong style='color:#ffffff;'>{scheduled_time_label}</strong>.",
+            )
+            + tinted_box(
+                f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
+                f'<strong style="color:#ffffff;">Current status:</strong> {status}<br>'
+                f'<strong style="color:#ffffff;">Upload ID:</strong> {upload_id or "N/A"}<br>'
+                f'<strong style="color:#ffffff;">Details:</strong> {_escape_html(detail_reason)}</p>',
+                hex_color="#ef4444" if is_failed else "#f97316",
+            )
+            + cta_button("Open Queue", queue_url, pt="16px", pb="20px")
+            + secondary_links(("Dashboard", URL_DASHBOARD),)
+        ),
+        footer_note="You received this because upload email notifications are enabled.",
+    )
+    await send_email(
+        email,
+        f"UploadM8 scheduled publish alert — {_escape_html(filename)}",
+        html,
+    )

@@ -56,24 +56,32 @@ _PRESETS: Dict[str, Dict[str, tuple]] = {
         "playwright": (1, 200),
         "meta": (2, 300),
         "tiktok": (2, 300),
+        "serpapi": (2, 400),
+        "youtube_data": (2, 400),
     },
     "standard": {
         "openai": (4, 0),
         "playwright": (2, 0),
         "meta": (4, 0),
         "tiktok": (4, 0),
+        "serpapi": (4, 0),
+        "youtube_data": (4, 0),
     },
     "relaxed": {
         "openai": (8, 0),
         "playwright": (4, 0),
         "meta": (8, 0),
         "tiktok": (8, 0),
+        "serpapi": (8, 0),
+        "youtube_data": (8, 0),
     },
     "enterprise": {
         "openai": (16, 0),
         "playwright": (8, 0),
         "meta": (16, 0),
         "tiktok": (16, 0),
+        "serpapi": (16, 0),
+        "youtube_data": (16, 0),
     },
 }
 
@@ -142,13 +150,14 @@ def _get_gate(name: str) -> _Gate:
 @asynccontextmanager
 async def outbound_slot(provider: str):
     """
-    Gate outbound calls: openai (Whisper + GPT + image API), playwright, meta, tiktok.
+    Gate outbound calls: openai (Whisper + GPT + image API), playwright, meta, tiktok,
+    serpapi, youtube_data (trend intel).
     """
     if not _OUTBOUND_ENABLED:
         yield
         return
     p = (provider or "").strip().lower()
-    if p not in ("openai", "playwright", "meta", "tiktok"):
+    if p not in ("openai", "playwright", "meta", "tiktok", "serpapi", "youtube_data"):
         yield
         return
     async with _get_gate(p).acquire():
@@ -159,7 +168,7 @@ def startup_log_line() -> str:
     if not _OUTBOUND_ENABLED:
         return "outbound_rl: disabled (OUTBOUND_RL_ENABLED=0)"
     parts = [f"profile={_PROFILE}"]
-    for k in ("openai", "playwright", "meta", "tiktok"):
+    for k in ("openai", "playwright", "meta", "tiktok", "serpapi", "youtube_data"):
         mc, mi = _resolved_limits(k)
         parts.append(f"{k}=conc:{mc},space_ms:{int(mi)}")
     return "outbound_rl: " + " ".join(parts)

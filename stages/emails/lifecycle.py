@@ -124,7 +124,7 @@ async def send_payment_failed_email(
         footer_note="You received this because a payment failed on your UploadM8 subscription.",
     )
 
-    await send_email(email, f"⚠️ Payment failed — update your card to keep {plan} active", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, f"Payment failed — update your card to keep {plan} active", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,7 +215,7 @@ async def send_trial_ending_reminder_email(
         footer_note=f"You received this reminder because your {plan} trial ends on {trial_end_date}.",
     )
 
-    await send_email(email, f"⏳ Your {plan} trial ends in {days_word} — here's what happens next", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, f"Your {plan} trial ends in {days_word} — what happens next", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,7 +301,7 @@ async def send_low_token_warning_email(
 
     await send_email(
         email,
-        f"🪙 Low token balance — {current_balance} {wt_short} remaining",
+        f" Low token balance — {current_balance} {wt_short} remaining",
         html,
         from_addr=MAIL_FROM_SUPPORT,
         reply_to=SUPPORT_EMAIL,

@@ -48,6 +48,28 @@ LIKELIHOOD_MAP = {
 POSITIVE_EMOTIONS = {"LIKELY", "VERY_LIKELY"}
 
 
+def _resolve_gcp_credentials_path() -> Optional[Path]:
+    """
+    Resolve GOOGLE_APPLICATION_CREDENTIALS robustly:
+    - absolute path as-is
+    - relative to current working directory
+    - relative to repo root (one level above stages/)
+    """
+    raw = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    candidates = [p]
+    if not p.is_absolute():
+        candidates.append(Path.cwd() / p)
+        repo_root = Path(__file__).resolve().parents[1]
+        candidates.append(repo_root / p)
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+    return None
+
+
 def _get_gcv_client():
     """Lazy-load GCV client (avoids import errors when GCP not configured)."""
     global _gcv_client, _vision_module
@@ -55,6 +77,13 @@ def _get_gcv_client():
         return _gcv_client
 
     try:
+        creds = _resolve_gcp_credentials_path()
+        if not creds:
+            logger.warning("[vision] GOOGLE_APPLICATION_CREDENTIALS path not found on disk")
+            return None
+        # Ensure downstream google client can always locate credentials.
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds)
+
         from google.cloud import vision as v
         _vision_module = v
         _gcv_client    = v.ImageAnnotatorClient()
@@ -153,6 +182,9 @@ async def run_vision_stage(ctx: JobContext) -> JobContext:
 
     if not GCP_CREDENTIALS:
         raise SkipStage("GOOGLE_APPLICATION_CREDENTIALS not set")
+    creds = _resolve_gcp_credentials_path()
+    if not creds:
+        raise SkipStage("GOOGLE_APPLICATION_CREDENTIALS path not found")
 
     # Find best frame to analyze
     frame_to_analyze = _find_best_frame(ctx)
@@ -175,7 +207,7 @@ async def run_vision_stage(ctx: JobContext) -> JobContext:
         ctx.vision_context = result
 
         logger.info(
-            f"[vision] ✓ faces={result.get('face_count', 0)} "
+            f"[vision]  faces={result.get('face_count', 0)} "
             f"expressive={result.get('expressive', False)} "
             f"ocr_chars={len(result.get('ocr_text', ''))} "
             f"labels={result.get('label_names', [])[:3]}"

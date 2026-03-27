@@ -27,7 +27,7 @@ async def notify_signup(email: str, name: str, signup_webhook: Optional[str], ad
             wh,
             embeds=[
                 {
-                    "title": "🎉 New Signup",
+                    "title": " New Signup",
                     "color": 0x22C55E,
                     "fields": [{"name": "Email", "value": email}, {"name": "Name", "value": name}],
                 }
@@ -42,7 +42,7 @@ async def notify_mrr(amount: float, email: str, plan: str, event_type: str, mrr_
             wh,
             embeds=[
                 {
-                    "title": f"💰 {event_type.title()}",
+                    "title": f" {event_type.title()}",
                     "color": 0x22C55E,
                     "fields": [
                         {"name": "Amount", "value": f"${amount:.2f}"},
@@ -61,7 +61,7 @@ async def notify_topup(amount: float, email: str, wallet: str, tokens: int, mrr_
             wh,
             embeds=[
                 {
-                    "title": "💳 Top-up Purchase",
+                    "title": " Top-up Purchase",
                     "color": 0x8B5CF6,
                     "fields": [
                         {"name": "Amount", "value": f"${amount:.2f}"},
@@ -88,7 +88,7 @@ async def notify_weekly_costs(
         admin_webhook,
         embeds=[
             {
-                "title": "📊 Weekly Cost Report",
+                "title": " Weekly Cost Report",
                 "color": 0x3B82F6,
                 "fields": [
                     {"name": "OpenAI", "value": f"${openai_cost:.2f}", "inline": True},

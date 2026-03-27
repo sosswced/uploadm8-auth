@@ -52,6 +52,7 @@ URL_PRICING      = f"{FRONTEND_URL}/index.html#pricing"
 URL_UNSUBSCRIBE  = f"{FRONTEND_URL}/unsubscribe.html"
 URL_CONTACT      = f"{FRONTEND_URL}/contact.html"
 URL_SUPPORT      = f"{FRONTEND_URL}/support.html"
+URL_LOGIN        = f"{FRONTEND_URL}/login.html"
 URL_TERMS        = f"{FRONTEND_URL}/terms.html"
 URL_PRIVACY      = f"{FRONTEND_URL}/privacy.html"
 
@@ -189,6 +190,19 @@ def email_shell(
         '</div></td></tr>'
     )
 
+    sign_in_row = (
+        '<tr><td style="padding:18px 40px 4px;text-align:center;">'
+        f'<a href="{URL_LOGIN}" '
+        'style="display:inline-block;'
+        'background:linear-gradient(135deg,#2563eb 0%,#1d4ed8 100%);'
+        'color:#ffffff;text-decoration:none;padding:10px 26px;'
+        'border-radius:8px;font-size:13px;font-weight:700;letter-spacing:0.3px;'
+        'border:1px solid rgba(255,255,255,0.15);'
+        'box-shadow:0 2px 10px rgba(37,99,235,0.35);">'
+        'Sign In to UploadM8 &#8594;</a>'
+        '</td></tr>'
+    )
+
     quick_links = (
         '<tr><td style="padding:22px 40px 0;text-align:center;">'
         '<p style="margin:0 0 8px;color:#9ca3af;font-size:11px;font-weight:700;'
@@ -213,7 +227,8 @@ def email_shell(
     )
 
     footer = (
-        quick_links
+        sign_in_row
+        + quick_links
         + '<tr><td style="padding:18px 40px 24px;text-align:center;'
         'border-top:1px solid rgba(255,255,255,0.06);">'
         '<p style="margin:0 0 6px;color:#4b5563;font-size:13px;">'
@@ -389,7 +404,7 @@ def numbered_steps(*steps, pb: str = "32px") -> str:
 
 
 def plan_change_visual(old_tier: str, new_tier: str, hex_new: str = "#f97316") -> str:
-    """Old plan ➜ New plan visual inside a tinted box. v2: bolder type, strikethrough old plan."""
+    """Old plan  New plan visual inside a tinted box. v2: bolder type, strikethrough old plan."""
     inner = (
         f'<table cellpadding="0" cellspacing="0" align="center"><tr>'
         f'<td style="text-align:center;padding:0 22px;">'

@@ -67,15 +67,15 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
 
         if is_success:
             color = 0x22c55e        # green
-            status_title = "✅ Upload Completed"
+            status_title = " Upload Completed"
             status_desc  = "Your video has been published successfully!"
         elif ctx.is_partial_success():
             color = 0xf97316        # orange
-            status_title = "⚠️ Partial Upload"
+            status_title = "️ Partial Upload"
             status_desc  = "Some platforms failed — check your queue for details."
         else:
             color = 0xef4444        # red
-            status_title = "❌ Upload Failed"
+            status_title = " Upload Failed"
             status_desc  = f"Upload failed: {ctx.error_message or 'Unknown error'}"
 
         # ── Content (AI-first, fall back to user-supplied) ───────────────────
@@ -106,32 +106,32 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
 
         # ── Build fields ─────────────────────────────────────────────────────
         fields: List[dict] = [
-            {"name": "📹 Title",    "value": str(video_title)[:256],  "inline": False},
+            {"name": " Title",    "value": str(video_title)[:256],  "inline": False},
         ]
 
         if video_caption:
             cap_val = str(video_caption)
             fields.append({
-                "name": "📝 Caption",
+                "name": " Caption",
                 "value": (cap_val[:500] + "…") if len(cap_val) > 500 else cap_val,
                 "inline": False,
             })
 
         if hashtag_str:
             fields.append({
-                "name": "🏷️ Hashtags",
+                "name": "️ Hashtags",
                 "value": hashtag_str[:500],
                 "inline": False,
             })
 
         # Platforms summary (unique platforms; multi-account may repeat)
         plat_set = set(ctx.platforms) if ctx.platforms else set()
-        fields.append({"name": "📤 Platforms", "value": ", ".join(sorted(plat_set)) or "None", "inline": True})
-        fields.append({"name": "📁 File",      "value": (ctx.filename or "—")[:80],          "inline": True})
+        fields.append({"name": " Platforms", "value": ", ".join(sorted(plat_set)) or "None", "inline": True})
+        fields.append({"name": " File",      "value": (ctx.filename or "—")[:80],          "inline": True})
 
         # ── Per-platform/account results with live post URLs ────────────────────
         for result in ctx.platform_results:
-            icon      = "✅" if result.success else "❌"
+            icon      = "" if result.success else ""
             plat_name = result.platform.title()
             account_label = (
                 getattr(result, "account_username", None)
@@ -161,7 +161,7 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
                 elif result.publish_id:
                     value = f"Accepted — publish_id: `{result.publish_id}`"
                 else:
-                    value = "Published ✓"
+                    value = "Published "
             else:
                 raw_err = result.error_message or result.error_code or "Unknown error"
                 value = str(raw_err)[:256]
@@ -207,7 +207,7 @@ async def notify_admin_signup(email: str, name: str, tier: str = "free", db_pool
         return
     
     embed = {
-        "title": "🎉 New User Signup",
+        "title": " New User Signup",
         "color": 0x3b82f6,
         "fields": [
             {"name": "Email", "value": email, "inline": True},
@@ -227,7 +227,7 @@ async def notify_admin_trial_started(email: str, name: str, plan: str, db_pool=N
         return
     
     embed = {
-        "title": "🚀 Trial Started",
+        "title": " Trial Started",
         "color": 0x8b5cf6,
         "fields": [
             {"name": "Email", "value": email, "inline": True},
@@ -247,7 +247,7 @@ async def notify_admin_mrr_collected(amount: float, customer_email: str, plan: s
         return
     
     embed = {
-        "title": "💰 MRR Collected",
+        "title": " MRR Collected",
         "color": 0x22c55e,
         "fields": [
             {"name": "Amount", "value": f"${amount:.2f}", "inline": True},
@@ -267,7 +267,7 @@ async def notify_admin_error(error_type: str, details: dict, db_pool=None):
         return
     
     embed = {
-        "title": f"🚨 Error: {error_type}",
+        "title": f" Error: {error_type}",
         "color": 0xef4444,
         "description": f"```json\n{json.dumps(details, indent=2, default=str)[:1500]}\n```",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -284,7 +284,7 @@ async def notify_admin_worker_start(db_pool=None):
     
     await _send_discord_webhook(
         webhook,
-        content="🟢 UploadM8 Worker started"
+        content=" UploadM8 Worker started"
     )
 
 
@@ -296,7 +296,7 @@ async def notify_admin_worker_stop(db_pool=None):
     
     await _send_discord_webhook(
         webhook,
-        content="🔴 UploadM8 Worker stopped"
+        content=" UploadM8 Worker stopped"
     )
 
 
@@ -307,7 +307,7 @@ async def notify_admin_daily_summary(data: dict, db_pool=None):
         return
     
     embed = {
-        "title": "📊 Daily Summary",
+        "title": " Daily Summary",
         "color": 0x3b82f6,
         "fields": [
             {"name": "New Users", "value": str(data.get("new_users", 0)), "inline": True},
@@ -333,7 +333,7 @@ async def send_welcome_email(email: str, name: str):
         logger.info(f"Welcome email skipped (no Mailgun): {email}")
         return
     
-    subject = "Welcome to UploadM8! 🎉"
+    subject = "Welcome to UploadM8! "
     html = f"""
     <h1>Welcome to UploadM8, {name}!</h1>
     <p>Thanks for signing up. You're now ready to upload videos to multiple platforms with a single click.</p>
@@ -357,7 +357,7 @@ async def send_upgrade_email(email: str, name: str, new_tier: str):
     if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
         return
     
-    subject = f"Welcome to {new_tier.title()}! 🚀"
+    subject = f"Welcome to {new_tier.title()}! "
     html = f"""
     <h1>Upgrade Confirmed!</h1>
     <p>Hi {name},</p>
@@ -382,7 +382,7 @@ async def send_tier_change_email(email: str, name: str, old_tier: str, new_tier:
         return
     
     if is_upgrade:
-        subject = f"🎉 Upgraded to {new_tier.title()}"
+        subject = f" Upgraded to {new_tier.title()}"
         message = f"Your account has been upgraded from {old_tier.title()} to {new_tier.title()}!"
     else:
         subject = f"Plan Changed to {new_tier.title()}"

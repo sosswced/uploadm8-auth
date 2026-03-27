@@ -6,20 +6,14 @@ Rules align with product spec (PUT/AIC spend vs period capacity, AI upsell, flex
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
-from stages.entitlements import normalize_tier
+from stages.entitlements import TIER_CONFIG, get_next_public_upgrade_tier, normalize_tier
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _f(v: Any) -> float:
-    try:
-        return float(v or 0)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def _i(v: Any) -> int:
@@ -102,8 +96,61 @@ async def _platform_spare_slots(conn, user_id: str, per_platform_cap: int) -> in
     return spare
 
 
+async def _platform_connection_count(conn, user_id: str) -> int:
+    try:
+        return _i(await conn.fetchval(
+            "SELECT COUNT(*)::int FROM platform_tokens WHERE user_id = $1::uuid",
+            user_id,
+        ))
+    except Exception:
+        return 0
+
+
+async def _recent_revenue_conversion(conn, user_id: str, within_days: int = 7) -> bool:
+    try:
+        c = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int
+            FROM revenue_tracking
+            WHERE user_id = $1::uuid
+              AND created_at >= NOW() - ($2::text || ' days')::interval
+              AND source IN ('topup', 'subscription')
+            """,
+            user_id,
+            str(int(max(1, within_days))),
+        )
+        return _i(c) > 0
+    except Exception:
+        return False
+
+
+def _stable_ab_variant(user_id: str, key: str) -> str:
+    h = hashlib.sha256(f"{user_id}|{key}".encode("utf-8")).hexdigest()
+    return "B" if (int(h[:8], 16) % 2) else "A"
+
+
 def _internal_tier(tier: str) -> bool:
     return tier in ("master_admin", "friends_family", "lifetime")
+
+
+def _append_opportunity(
+    opps: List[Dict[str, Any]],
+    *,
+    type_: str,
+    severity: str,
+    title: str,
+    body: str,
+    cta_label: str,
+    cta_link: str,
+) -> None:
+    opps.append({
+        "type": type_,
+        "severity": severity,
+        "title": title,
+        "body": body,
+        "cta_label": cta_label,
+        "cta_link": cta_link,
+    })
 
 
 async def build_wallet_marketing_payload(
@@ -117,7 +164,7 @@ async def build_wallet_marketing_payload(
     flex_enabled: bool = False,
 ) -> Dict[str, Any]:
     """
-    Returns burn_put_pct, burn_aic_pct, put_capacity, aic_capacity, ai_enabled, banners[], links.
+    Returns burn %, capacities, ai_enabled, banners[], sales_opportunities[], links.
     """
     tier = normalize_tier(subscription_tier or "free")
     put_bal = _i(wallet.get("put_balance"))
@@ -130,6 +177,7 @@ async def build_wallet_marketing_payload(
     put_month = _i(plan.get("put_monthly"))
     aic_month = _i(plan.get("aic_monthly"))
     per_pf = _i(plan.get("max_accounts_per_platform"))
+    lookahead_h = _i(plan.get("lookahead_hours"))
 
     internal = _internal_tier(tier)
     period_start = await _period_anchor(conn, user_id)
@@ -150,9 +198,20 @@ async def build_wallet_marketing_payload(
     put_capacity = max(1, put_month + sums["put_topup"] + put_promo_total)
     aic_capacity = max(1, aic_month + sums["aic_topup"] + aic_promo_total)
 
+    links = {
+        "topup": "/settings.html#billing",
+        "upgrade": "/settings.html#billing",
+        "pricing": "/index.html#pricing",
+        "platforms": "/platforms.html",
+        "analytics": "/analytics.html",
+    }
+    experiments = {
+        "cta_variant": _stable_ab_variant(user_id, "cta_text"),
+        "urgency_variant": _stable_ab_variant(user_id, "urgency_language"),
+        "ordering_variant": _stable_ab_variant(user_id, "ordering_topup_upgrade"),
+    }
+
     if internal:
-        burn_put = 0.0
-        burn_aic = 0.0
         return {
             "burn_put_pct": 0.0,
             "burn_aic_pct": 0.0,
@@ -165,16 +224,14 @@ async def build_wallet_marketing_payload(
             "ai_enabled": True,
             "period_start": period_start.isoformat() if hasattr(period_start, "isoformat") else None,
             "banners": [],
-            "links": {
-                "topup": "/settings.html#billing",
-                "upgrade": "/settings.html#billing",
-                "pricing": "/index.html#pricing",
-            },
+            "sales_opportunities": [],
+            "links": links,
+            "experiments": experiments,
         }
+
     burn_put = float(sums["put_spent"]) / float(put_capacity)
     burn_aic = float(sums["aic_spent"]) / float(aic_capacity)
 
-    # AI enabled: any of the three prefs true (defaults True)
     us = user_settings or {}
     cap_on = us.get("auto_generate_captions")
     hash_on = us.get("auto_generate_hashtags")
@@ -187,71 +244,96 @@ async def build_wallet_marketing_payload(
     aic_low_threshold = max(5, int(aic_month * 0.10)) if aic_month > 0 else 5
     aic_low = aic_available < aic_low_threshold
 
-    links = {
-        "topup": "/settings.html#billing",
-        "upgrade": "/settings.html#billing",
-        "pricing": "/index.html#pricing",
-    }
+    opps: List[Dict[str, Any]] = []
 
-    banners: List[Dict[str, Any]] = []
+    # ── PUT capacity pressure ─────────────────────────────────────────────
+    if put_available <= 0:
+        _append_opportunity(
+            opps,
+            type_="put_blocking",
+            severity="blocking",
+            title="No PUT credits available",
+            body="Publishing is paused until you add PUT tokens or your plan renews.",
+            cta_label="Top up PUT",
+            cta_link=links["topup"],
+        )
+    elif burn_put >= 0.90:
+        _append_opportunity(
+            opps,
+            type_="put_urgent",
+            severity="urgent",
+            title="PUT usage is critically high",
+            body=f"You've used about {int(round(burn_put * 100))}% of this period's PUT capacity. Top up or upgrade to avoid interruptions.",
+            cta_label="Add credits",
+            cta_link=links["topup"],
+        )
+    elif burn_put >= 0.70:
+        _append_opportunity(
+            opps,
+            type_="put_warning",
+            severity="warning",
+            title="Running low on PUT allowance",
+            body=f"About {int(round(burn_put * 100))}% of this period's PUT credits are used. Consider topping up before you hit the limit.",
+            cta_label="Top up",
+            cta_link=links["topup"],
+        )
 
-    if not internal and put_available <= 0:
-        banners.append({
-            "type": "put_blocking",
-            "severity": "blocking",
-            "title": "No PUT credits available",
-            "body": "Publishing is paused until you add PUT tokens or your plan renews.",
-            "cta_label": "Top up PUT",
-            "cta_link": links["topup"],
-        })
-    elif not internal and burn_put >= 0.90:
-        banners.append({
-            "type": "put_urgent",
-            "severity": "urgent",
-            "title": "PUT usage is critically high",
-            "body": f"You've used about {int(round(burn_put * 100))}% of this period's PUT capacity. Top up or upgrade to avoid interruptions.",
-            "cta_label": "Add credits",
-            "cta_link": links["topup"],
-        })
-    elif not internal and burn_put >= 0.70:
-        banners.append({
-            "type": "put_warning",
-            "severity": "warning",
-            "title": "Running low on PUT allowance",
-            "body": f"About {int(round(burn_put * 100))}% of this period's PUT credits are used. Consider topping up before you hit the limit.",
-            "cta_label": "Top up",
-            "cta_link": links["topup"],
-        })
+    # ── AIC pressure (when plan includes AIC) ─────────────────────────────
+    if aic_month > 0:
+        if aic_available <= 0:
+            _append_opportunity(
+                opps,
+                type_="aic_blocking",
+                severity="urgent",
+                title="No AIC credits left",
+                body="AI captions, hashtags, and thumbnails need AIC. Add a pack or upgrade for a higher monthly AI allowance.",
+                cta_label="Buy AIC",
+                cta_link=links["topup"],
+            )
+        elif burn_aic >= 0.90:
+            _append_opportunity(
+                opps,
+                type_="aic_urgent",
+                severity="urgent",
+                title="AIC usage is critically high",
+                body=f"About {int(round(burn_aic * 100))}% of this period's AI credits are used. Top up AIC to avoid degraded AI output.",
+                cta_label="Add AIC",
+                cta_link=links["topup"],
+            )
+        elif burn_aic >= 0.70:
+            _append_opportunity(
+                opps,
+                type_="aic_warning",
+                severity="warning",
+                title="Running low on AI credits",
+                body=f"Roughly {int(round(burn_aic * 100))}% of this period's AIC is used. Stock up before long posting sessions.",
+                cta_label="Top up AIC",
+                cta_link=links["topup"],
+            )
 
-    # Burst week (paid + high burn + admin toggle)
     burst_on = bool(admin_settings.get("promo_burst_week_enabled"))
-    if (
-        burst_on
-        and tier not in ("free",)
-        and not internal
-        and burn_put >= 0.70
-    ):
-        banners.append({
-            "type": "promo_burst",
-            "severity": "promo",
-            "title": "Burst Week bonus",
-            "body": "High usage this period — check billing for limited-time bonus credit offers.",
-            "cta_label": "View billing",
-            "cta_link": links["upgrade"],
-        })
+    if burst_on and tier not in ("free",) and burn_put >= 0.70:
+        _append_opportunity(
+            opps,
+            type_="promo_burst",
+            severity="promo",
+            title="Burst Week bonus",
+            body="High usage this period — check billing for limited-time bonus credit offers.",
+            cta_label="View billing",
+            cta_link=links["upgrade"],
+        )
 
-    # AI upsell: captions off OR AIC low
-    if not internal and (not ai_enabled or aic_low):
-        banners.append({
-            "type": "ai_upsell",
-            "severity": "info",
-            "title": "Enable AI captions & thumbnails to save time",
-            "body": "Turn on AI generation in Settings, or add AIC packs if you're running low on AI credits.",
-            "cta_label": "Buy AIC / upgrade",
-            "cta_link": links["topup"],
-        })
+    if not ai_enabled or aic_low:
+        _append_opportunity(
+            opps,
+            type_="ai_upsell",
+            severity="info",
+            title="Enable AI captions & thumbnails to save time",
+            body="Turn on AI generation in Settings, or add AIC packs if you're running low on AI credits.",
+            cta_label="Buy AIC / upgrade",
+            cta_link=links["topup"],
+        )
 
-    # Flex opportunity — spare per-platform connection slots
     spare = await _platform_spare_slots(conn, user_id, per_pf)
     if spare > 0 and put_available > 0:
         flex_hint = (
@@ -259,35 +341,138 @@ async def build_wallet_marketing_payload(
             if (flex_enabled or plan.get("can_flex"))
             else ""
         )
-        banners.append({
-            "type": "flex_opportunity",
-            "severity": "info",
-            "title": "Unused platform allowance",
-            "body": "You have spare connection capacity on one or more platforms — connect more accounts to use your full plan."
+        _append_opportunity(
+            opps,
+            type_="flex_opportunity",
+            severity="info",
+            title="Unused platform allowance",
+            body="You have spare connection capacity on one or more platforms — connect more accounts to use your full plan."
             + flex_hint,
-            "cta_label": "Manage platforms",
-            "cta_link": "/platforms.html",
-        })
+            cta_label="Manage platforms",
+            cta_link=links["platforms"],
+        )
 
-    # Referral
     ref_on = bool(admin_settings.get("promo_referral_enabled"))
-    if ref_on and tier in ("free", "launch", "creator_lite", "creator_pro") and not internal:
-        banners.append({
-            "type": "referral",
-            "severity": "promo",
-            "title": "Refer creators, earn rewards",
-            "body": "Share UploadM8 with other creators when referrals are active.",
-            "cta_label": "Open settings",
-            "cta_link": links["upgrade"],
-        })
+    if ref_on and tier in ("free", "launch", "creator_lite", "creator_pro"):
+        _append_opportunity(
+            opps,
+            type_="referral",
+            severity="promo",
+            title="Refer creators, earn rewards",
+            body="Share UploadM8 with other creators when referrals are active.",
+            cta_label="Open settings",
+            cta_link=links["upgrade"],
+        )
 
-    # Severity order for clients that show one slot
+    next_slug = get_next_public_upgrade_tier(tier)
+    if next_slug:
+        ncfg = TIER_CONFIG.get(next_slug, {})
+        ccfg = TIER_CONFIG.get(tier, TIER_CONFIG["free"])
+        put_delta = _i(ncfg.get("put_monthly")) - _i(ccfg.get("put_monthly"))
+        aic_delta = _i(ncfg.get("aic_monthly")) - _i(ccfg.get("aic_monthly"))
+        q_delta = _i(ncfg.get("queue_depth")) - _i(ccfg.get("queue_depth"))
+        lh_delta = _i(ncfg.get("lookahead_hours")) - _i(ccfg.get("lookahead_hours"))
+        active_usage = burn_put >= 0.35 or burn_aic >= 0.35 or sums["put_spent"] >= 15
+        if active_usage:
+            bits = []
+            if put_delta > 0:
+                bits.append(f"+{put_delta:,} PUT/mo")
+            if aic_delta > 0:
+                bits.append(f"+{aic_delta:,} AIC/mo")
+            if q_delta > 0:
+                bits.append(f"queue {_i(ccfg.get('queue_depth')):,} → {_i(ncfg.get('queue_depth')):,}")
+            if lh_delta > 0:
+                bits.append(f"schedule up to {_i(ncfg.get('lookahead_hours'))}h ahead")
+            detail = "; ".join(bits) if bits else "More capacity and features for growing channels."
+            _append_opportunity(
+                opps,
+                type_="tier_upgrade",
+                severity="promo",
+                title=f"Upgrade to {ncfg.get('name', next_slug)}",
+                body=f"You're using UploadM8 heavily this period. {detail}",
+                cta_label=f"View {ncfg.get('name', 'plan')}",
+                cta_link=links["upgrade"],
+            )
+
+    if plan.get("analytics") == "basic":
+        _append_opportunity(
+            opps,
+            type_="analytics_upgrade",
+            severity="info",
+            title="Unlock deeper analytics",
+            body="Paid plans include richer performance insights — see what content drives views and engagement.",
+            cta_label="Compare plans",
+            cta_link=links["pricing"],
+        )
+
+    if tier in ("free", "creator_lite") and lookahead_h <= 24 and burn_put >= 0.12:
+        _append_opportunity(
+            opps,
+            type_="scheduler_upgrade",
+            severity="info",
+            title="Schedule further ahead",
+            body=f"Your plan schedules up to {lookahead_h}h out. Higher tiers add longer lookahead and larger queues for batch workflows.",
+            cta_label="See scheduling limits",
+            cta_link=links["pricing"],
+        )
+
+    n_conn = await _platform_connection_count(conn, user_id)
+    plan_flex = bool(plan.get("can_flex"))
+    if n_conn >= 3 and not flex_enabled and not plan_flex and tier in ("creator_lite", "creator_pro", "studio"):
+        _append_opportunity(
+            opps,
+            type_="flex_addon",
+            severity="info",
+            title="Multiple accounts connected",
+            body="Flex lets you move PUT between connected accounts so no platform sits idle.",
+            cta_label="Billing & add-ons",
+            cta_link=links["upgrade"],
+        )
+
+    if tier == "creator_pro" and burn_put >= 0.50:
+        _append_opportunity(
+            opps,
+            type_="team_upgrade",
+            severity="promo",
+            title="Growing a team?",
+            body="Studio and Agency add more seats, exports, and collaboration headroom for multi-creator workflows.",
+            cta_label="Explore Studio / Agency",
+            cta_link=links["pricing"],
+        )
+
+    if tier == "studio" and burn_put >= 0.5:
+        _append_opportunity(
+            opps,
+            type_="agency_upgrade",
+            severity="promo",
+            title="Agency-ready workflows",
+            body="White-label, maximum queue depth, and Flex are built for agencies managing many client accounts.",
+            cta_label="View Agency",
+            cta_link=links["pricing"],
+        )
+
     order = {"blocking": 0, "urgent": 1, "warning": 2, "info": 3, "promo": 4}
 
     def _sort_key(b: Dict[str, Any]) -> Tuple[int, str]:
         return (order.get(b.get("severity"), 9), b.get("type", ""))
 
-    banners.sort(key=_sort_key)
+    opps.sort(key=_sort_key)
+    recently_converted = await _recent_revenue_conversion(conn, user_id, within_days=7)
+    if recently_converted:
+        # Suppress low-intent/promotional nudges right after a purchase/upgrade.
+        opps = [o for o in opps if o.get("severity") in ("blocking", "urgent", "warning")]
+    sales_opportunities = [
+        {
+            **b,
+            "signals": {
+                "burn_put_pct": round(burn_put, 4),
+                "burn_aic_pct": round(burn_aic, 4),
+                "tier": tier,
+                "next_tier": next_slug,
+            },
+        }
+        for b in opps
+    ]
 
     return {
         "burn_put_pct": round(burn_put, 4),
@@ -300,6 +485,12 @@ async def build_wallet_marketing_payload(
         "aic_available": aic_available,
         "ai_enabled": ai_enabled,
         "period_start": period_start.isoformat() if hasattr(period_start, "isoformat") else None,
-        "banners": banners,
+        "banners": list(opps),
+        "sales_opportunities": sales_opportunities,
         "links": links,
+        "experiments": experiments,
+        "suppression": {
+            "recently_converted_7d": bool(recently_converted),
+            "suppressed_low_intent_nudges": bool(recently_converted),
+        },
     }

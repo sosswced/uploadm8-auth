@@ -90,7 +90,7 @@ async def _rembg_isolate(frame_path: Path, temp_dir: Path) -> Optional[Path]:
         await loop.run_in_executor(_rembg_executor, _do_remove)
 
         if out_path.exists() and out_path.stat().st_size > 1000:
-            logger.info("[bg] rembg subject isolation ✓")
+            logger.info("[bg] rembg subject isolation ")
             return out_path
 
     except Exception as e:
@@ -116,7 +116,7 @@ async def _removebg_api_isolate(frame_path: Path, temp_dir: Path) -> Optional[Pa
         if resp.status_code == 200:
             out_path.write_bytes(resp.content)
             credits_charged = resp.headers.get("X-Credits-Charged", "?")
-            logger.info(f"[bg] remove.bg API ✓ (credits charged: {credits_charged})")
+            logger.info(f"[bg] remove.bg API  (credits charged: {credits_charged})")
             return out_path
 
         elif resp.status_code == 429:
@@ -247,11 +247,13 @@ def build_background_prompt(
     mood:       str,
     emotion:    str,
     headline:   str,
+    extra_context: str = "",
 ) -> str:
     """
     Generate a FLUX background prompt from content context.
     The prompt should describe a dramatic background — NOT a full scene.
     Subject will be composited on top via rembg.
+    Optional extra_context: fused vision/geo/summary from pipeline (OpenAI + Flux).
     """
     category_prompts = {
         "automotive": "dramatic race track environment at golden hour, motion blur, asphalt, speed lines, cinematic",
@@ -282,6 +284,9 @@ def build_background_prompt(
     mod  = mood_modifiers.get(mood, "cinematic, dramatic")
 
     prompt = f"{base}, {mod}, background only, no people, no text, ultra-detailed, photorealistic, 4K"
+    extra = (extra_context or "").strip()
+    if extra:
+        prompt = f"{prompt}. Scene alignment: {extra[:500]}"
     return prompt
 
 
@@ -344,3 +349,115 @@ def _size_to_aspect(w: int, h: int) -> str:
     if abs(ratio - 1.0) < 0.1:     return "1:1"
     if abs(ratio - 4 / 3) < 0.1:   return "4:3"
     return "1:1"
+
+
+# ── Optional Replicate: text-forward hero images + ControlNet / Kontext ─────
+
+REPLICATE_TEXT_IMAGE_MODEL = os.environ.get("REPLICATE_TEXT_IMAGE_MODEL", "").strip()
+REPLICATE_CONTROLNET_MODEL = os.environ.get("REPLICATE_CONTROLNET_MODEL", "").strip()
+REPLICATE_KONTEXT_MODEL = os.environ.get("REPLICATE_KONTEXT_MODEL", "").strip()
+
+
+async def generate_text_hero_image_replicate(
+    prompt: str,
+    width: int,
+    height: int,
+    temp_dir: Path,
+) -> Optional[Path]:
+    """
+    Text-heavy hero still (Ideogram-class) when REPLICATE_TEXT_IMAGE_MODEL is set
+    (e.g. ideogram-ai/ideogram-v2 — check Replicate model card for input schema).
+    """
+    if not REPLICATE_TEXT_IMAGE_MODEL or not REPLICATE_ENABLED or not REPLICATE_API_TOKEN:
+        return None
+    try:
+        import replicate
+
+        aspect = _size_to_aspect(width, height)
+        out = await replicate.async_run(
+            REPLICATE_TEXT_IMAGE_MODEL,
+            input={
+                "prompt": prompt[:900],
+                "aspect_ratio": aspect,
+            },
+        )
+        if not out:
+            return None
+        image_url = out[0].url if hasattr(out[0], "url") else str(out[0])
+        return await _download_image(image_url, temp_dir / "text_hero_replicate.jpg")
+    except Exception as e:
+        logger.warning(f"[bg] text hero replicate error: {e}")
+        return None
+
+
+async def generate_controlnet_background_replicate(
+    prompt: str,
+    control_image_path: Path,
+    width: int,
+    height: int,
+    temp_dir: Path,
+) -> Optional[Path]:
+    """
+    Generic ControlNet-style pass-through: model id must match Replicate schema.
+    Set REPLICATE_CONTROLNET_MODEL to a model that accepts prompt + control image.
+    """
+    if not REPLICATE_CONTROLNET_MODEL or not REPLICATE_ENABLED or not REPLICATE_API_TOKEN:
+        return None
+    if not control_image_path.exists():
+        return None
+    try:
+        import replicate
+
+        with open(control_image_path, "rb") as fh:
+            out = await replicate.async_run(
+                REPLICATE_CONTROLNET_MODEL,
+                input={
+                    "prompt": prompt[:900],
+                    "image": fh,
+                    "width": width,
+                    "height": height,
+                },
+            )
+        if not out:
+            return None
+        image_url = out[0].url if hasattr(out[0], "url") else str(out[0])
+        return await _download_image(image_url, temp_dir / "controlnet_bg_replicate.jpg")
+    except Exception as e:
+        logger.warning(f"[bg] controlnet replicate error: {e}")
+        return None
+
+
+async def generate_kontext_background_replicate(
+    frame_path: Path,
+    prompt: str,
+    width: int,
+    height: int,
+    temp_dir: Path,
+) -> Optional[Path]:
+    """
+    FLUX Kontext–style reference image → new scene (set REPLICATE_KONTEXT_MODEL).
+    Useful when you want the model to respect framing while changing the backdrop.
+    """
+    if not REPLICATE_KONTEXT_MODEL or not REPLICATE_ENABLED or not REPLICATE_API_TOKEN:
+        return None
+    if not frame_path.exists():
+        return None
+    try:
+        import replicate
+
+        with open(frame_path, "rb") as fh:
+            out = await replicate.async_run(
+                REPLICATE_KONTEXT_MODEL,
+                input={
+                    "prompt": prompt[:900],
+                    "image": fh,
+                    "aspect_ratio": _size_to_aspect(width, height),
+                },
+            )
+        if not out:
+            return None
+        image_url = out[0].url if hasattr(out[0], "url") else str(out[0])
+        return await _download_image(image_url, temp_dir / "kontext_bg_replicate.jpg")
+    except Exception as e:
+        logger.warning(f"[bg] kontext replicate error: {e}")
+        return None

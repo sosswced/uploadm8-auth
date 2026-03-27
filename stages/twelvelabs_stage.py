@@ -18,6 +18,7 @@ Flow:
 """
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -81,7 +82,7 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
         }
 
         logger.info(
-            f"[twelvelabs] ✓ video_id={video_id} "
+            f"[twelvelabs]  video_id={video_id} "
             f"description_len={len(description)} chars"
         )
         return ctx
@@ -204,7 +205,7 @@ async def _generate_description(video_id: str) -> Optional[str]:
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
-            f"{TL_BASE_URL}/generate",
+            f"{TL_BASE_URL}/analyze",
             headers=headers,
             json={
                 "video_id": video_id,
@@ -214,8 +215,7 @@ async def _generate_description(video_id: str) -> Optional[str]:
         )
 
         if resp.status_code == 200:
-            data = resp.json()
-            return data.get("data") or data.get("text") or ""
+            return _extract_analyze_text(resp.text)
 
         logger.warning(f"[twelvelabs] Generate failed: {resp.status_code} {resp.text[:200]}")
         return None
@@ -227,7 +227,7 @@ async def _generate_title(video_id: str) -> Optional[str]:
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            f"{TL_BASE_URL}/generate",
+            f"{TL_BASE_URL}/analyze",
             headers=headers,
             json={
                 "video_id": video_id,
@@ -237,7 +237,36 @@ async def _generate_title(video_id: str) -> Optional[str]:
         )
 
         if resp.status_code == 200:
-            data = resp.json()
-            return (data.get("data") or data.get("text") or "").strip()
+            return _extract_analyze_text(resp.text).strip()
 
         return None
+
+
+def _extract_analyze_text(raw_body: str) -> str:
+    """
+    Twelve Labs /analyze currently returns NDJSON streaming events even on non-stream requests.
+    Parse both regular JSON objects and event-stream NDJSON payloads.
+    """
+    # Standard JSON response fallback (future-proof if API changes back).
+    try:
+        data = json.loads(raw_body)
+        if isinstance(data, dict):
+            return (data.get("data") or data.get("text") or "").strip()
+    except json.JSONDecodeError:
+        pass
+
+    chunks: List[str] = []
+    for line in raw_body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("event_type") == "text_generation":
+            text = event.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+
+    return "".join(chunks).strip()

@@ -5,7 +5,9 @@ Publish per-platform transcoded videos to social media platforms.
 
 Platform-specific publish flows:
   TikTok   - Content Posting API v2: init upload -> PUT binary -> publish_id
-  YouTube  - Resumable upload: init -> PUT binary -> video_id
+  YouTube  - Resumable upload: init -> PUT binary -> video_id; thumbnails.set for one custom
+              thumbnail. Extra A/B JPEGs are uploaded to R2 by the worker for Studio
+              “Test & Compare” (no public thumbnailTests API on Data API v3 as of 2025).
   Instagram - Graph API Reels: create container (video_url) -> poll status -> publish
   Facebook - Graph API: multipart upload or URL-based Reels
 
@@ -34,7 +36,7 @@ import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .errors import PublishError, ErrorCode
-from .context import JobContext, PlatformResult
+from .context import JobContext, PlatformResult, build_multimodal_scene_digest
 from . import db as db_stage
 from . import r2 as r2_stage
 from .outbound_rl import outbound_slot
@@ -370,6 +372,8 @@ def _build_platform_caption(ctx: JobContext, platform: str) -> str:
     Respects the user's hashtag_position preference (start / end).
     """
     caption = _get_caption(ctx, platform)
+    if not caption:
+        caption = _fallback_caption_from_context(ctx, platform)
     hashtags = _get_hashtags(ctx, platform=platform)
 
     if not hashtags:
@@ -394,6 +398,64 @@ def _build_platform_caption(ctx: JobContext, platform: str) -> str:
     if hashtag_position == "start":
         return f"{hashtags}\n\n{caption}"
     return f"{caption}\n\n{hashtags}"
+
+
+def _fallback_caption_from_context(ctx: JobContext, platform: str) -> str:
+    """
+    Deterministic fallback when AI/manual caption is empty.
+    Keeps publish stage grounded in multimodal evidence (geo/audio/vision).
+    """
+    ac = getattr(ctx, "audio_context", None) or {}
+    vc = getattr(ctx, "vision_context", None) or {}
+    tel = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
+
+    parts: list[str] = []
+    if getattr(ctx, "location_name", None):
+        parts.append(f"Shot near {ctx.location_name}")
+    if tel and getattr(tel, "location_road", None):
+        parts.append(f"route: {tel.location_road}")
+    if tel and getattr(tel, "max_speed_mph", 0):
+        parts.append(f"peak {float(getattr(tel, 'max_speed_mph', 0)):.0f} mph")
+
+    labels = list(vc.get("label_names") or [])
+    if labels:
+        parts.append("scene: " + ", ".join(str(x) for x in labels[:4]))
+
+    if ac.get("music_detected") and (ac.get("music_title") or ac.get("music_artist")):
+        mt = ac.get("music_title") or ""
+        ma = ac.get("music_artist") or ""
+        parts.append(f"soundtrack: {mt} {('- ' + ma) if ma else ''}".strip())
+    elif ac.get("top_sound_class"):
+        parts.append(f"audio vibe: {ac.get('top_sound_class')}")
+
+    if parts:
+        base = " | ".join(p for p in parts if p).strip()
+        return _format_platform_fallback_caption(base[:600], platform)
+
+    # Last resort: compact multimodal digest line
+    digest = (build_multimodal_scene_digest(ctx, max_chars=600) or "").strip()
+    if digest:
+        return _format_platform_fallback_caption(digest.replace("\n", " | ")[:600], platform)
+    return ""
+
+
+def _format_platform_fallback_caption(base: str, platform: str) -> str:
+    """Platform-native stylistic wrapper for deterministic fallback text."""
+    txt = (base or "").strip().strip("|")
+    if not txt:
+        return ""
+
+    p = (platform or "").lower()
+    if p == "tiktok":
+        # Hook-first short style
+        return f"POV: {txt}"[:600]
+    if p == "youtube":
+        # Description-style sentence framing
+        return f"Scene breakdown: {txt}"[:1200]
+    if p in ("instagram", "facebook"):
+        # Slightly aesthetic/social phrasing
+        return f"{txt} | captured in the moment."[:700]
+    return txt[:600]
 
 
 def _build_full_caption(ctx: JobContext) -> str:

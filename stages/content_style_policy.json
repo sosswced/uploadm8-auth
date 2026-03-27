@@ -1,0 +1,107 @@
+{
+  "defaults": {
+    "caption_style": "story",
+    "tone": "authentic",
+    "persona": "storyteller",
+    "risk_level": "safe",
+    "audience_intent": "engagement",
+    "constraints": {
+      "caption_length_min": 90,
+      "caption_length_max": 280,
+      "cta_aggressiveness": "medium",
+      "emoji_density": "low",
+      "hashtag_count": 10,
+      "banned_phrases": ["watch this", "road vibes", "goes insane"],
+      "hook_formula": "scene_hook"
+    }
+  },
+  "rules": [
+    {
+      "match": {
+        "category": "automotive",
+        "emotion": "hype_energetic",
+        "platform": "tiktok"
+      },
+      "output": {
+        "caption_style": "hook",
+        "tone": "bold",
+        "persona": "hype_friend",
+        "risk_level": "edgy",
+        "audience_intent": "virality",
+        "constraints": {
+          "caption_length_min": 70,
+          "caption_length_max": 180,
+          "cta_aggressiveness": "high",
+          "emoji_density": "medium",
+          "hashtag_count": 8,
+          "banned_phrases": ["watch this", "road vibes", "viral"],
+          "hook_formula": "speed_conflict"
+        }
+      }
+    },
+    {
+      "match": {
+        "category": "automotive",
+        "platform": "youtube"
+      },
+      "output": {
+        "caption_style": "story",
+        "tone": "professional",
+        "persona": "expert_analyst",
+        "risk_level": "safe",
+        "audience_intent": "search",
+        "constraints": {
+          "caption_length_min": 140,
+          "caption_length_max": 420,
+          "cta_aggressiveness": "low",
+          "emoji_density": "low",
+          "hashtag_count": 10,
+          "banned_phrases": ["watch this", "insane"],
+          "hook_formula": "specific_outcome"
+        }
+      }
+    },
+    {
+      "match": {
+        "category": "education"
+      },
+      "output": {
+        "caption_style": "educational",
+        "tone": "professional",
+        "persona": "creator_coach",
+        "risk_level": "safe",
+        "audience_intent": "retention",
+        "constraints": {
+          "caption_length_min": 120,
+          "caption_length_max": 320,
+          "cta_aggressiveness": "low",
+          "emoji_density": "low",
+          "hashtag_count": 9,
+          "banned_phrases": ["you won't believe", "viral"],
+          "hook_formula": "problem_solution"
+        }
+      }
+    },
+    {
+      "match": {
+        "platform": "instagram"
+      },
+      "output": {
+        "caption_style": "story",
+        "tone": "authentic",
+        "persona": "storyteller",
+        "risk_level": "safe",
+        "audience_intent": "engagement",
+        "constraints": {
+          "caption_length_min": 90,
+          "caption_length_max": 260,
+          "cta_aggressiveness": "medium",
+          "emoji_density": "low",
+          "hashtag_count": 10,
+          "banned_phrases": ["watch this"],
+          "hook_formula": "emotional_scene"
+        }
+      }
+    }
+  ]
+}

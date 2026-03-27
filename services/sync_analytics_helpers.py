@@ -9,7 +9,18 @@ platform_results rows store:
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
+
+
+def _as_token_list(v: Any) -> List[dict]:
+    """Normalize platform fallback storage into a list of decrypted token dicts."""
+    if not v:
+        return []
+    if isinstance(v, list):
+        return [t for t in v if isinstance(t, dict)]
+    if isinstance(v, dict):
+        return [v]
+    return []
 
 
 def resolve_token_for_platform_result(
@@ -19,25 +30,48 @@ def resolve_token_for_platform_result(
     token_map_by_platform: Dict[str, dict],
 ) -> dict:
     """Pick the correct decrypted token dict for one platform_results entry."""
+    # Backwards-compatible wrapper around the new candidate-based resolver.
+    candidates = resolve_token_candidates_for_platform_result(
+        pr=pr,
+        token_map_by_id=token_map_by_id,
+        token_map_by_plat_account=token_map_by_plat_account,
+        token_map_by_platform=token_map_by_platform,
+    )
+    return candidates[0] if candidates else {}
+
+
+def resolve_token_candidates_for_platform_result(
+    pr: Dict[str, Any],
+    token_map_by_id: Dict[str, dict],
+    token_map_by_plat_account: Dict[Tuple[str, str], dict],
+    token_map_by_platform: Dict[str, Any],
+) -> List[dict]:
+    """
+    Return decrypted token candidates for one `platform_results` entry.
+
+    If the entry includes `token_row_id`/`token_id` or `account_id`, return the single matching token.
+    Otherwise, return *all* active tokens for that platform (caller may try them in order).
+    """
     plat = str(pr.get("platform") or "").lower()
 
     tid = pr.get("token_row_id") or pr.get("token_id")
     if tid:
         tok = token_map_by_id.get(str(tid))
         if tok:
-            return tok
+            return [tok]
 
     aid = pr.get("account_id")
     if aid is not None and str(aid).strip() != "":
         a = str(aid).strip()
         tok = token_map_by_plat_account.get((plat, a))
         if tok:
-            return tok
+            return [tok]
         tok = token_map_by_id.get(a)
         if tok:
-            return tok
+            return [tok]
 
-    return dict(token_map_by_platform.get(plat) or {})
+    # Legacy/ambiguous rows: try all active tokens for that platform.
+    return _as_token_list(token_map_by_platform.get(plat))
 
 
 def build_plat_account_token_map(token_rows, decrypt_fn) -> Dict[Tuple[str, str], dict]:

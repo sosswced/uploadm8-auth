@@ -20,7 +20,7 @@ from .base import (
     receipt_row, spacer,
     section_tag, metric_hero, divider_accent,
     GRAD_GREEN, GRAD_ORANGE, GRAD_PURPLE,
-    URL_DASHBOARD, URL_BILLING, URL_PRICING, URL_SETTINGS,
+    URL_DASHBOARD, URL_BILLING, URL_PRICING, URL_SETTINGS, URL_SUPPORT,
     SUPPORT_EMAIL,
 )
 
@@ -85,7 +85,7 @@ async def send_plan_upgraded_email(
         footer_note="You received this because your UploadM8 subscription was upgraded.",
     )
 
-    await send_email(email, f"You're now on {new_plan} — welcome to the upgrade! 🚀", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, f"Your UploadM8 plan is now {new_plan}", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,7 +182,7 @@ async def send_topup_receipt_email(
         receipt_row("Tokens Added",    f"+{tokens_added:,} {wt_short}"),
     ]
     if bonus_tokens > 0:
-        receipt_rows.append(receipt_row("First-time bonus", f"+{bonus_tokens:,} {wt_short} 🎁"))
+        receipt_rows.append(receipt_row("First-time bonus", f"+{bonus_tokens:,} {wt_short} "))
     receipt_rows.extend([
         receipt_row("New Balance",     f"{new_balance:,} {wt_short}" if new_balance else "See dashboard"),
         receipt_row("Payment Ref",     inv_label),
@@ -194,7 +194,7 @@ async def send_topup_receipt_email(
         + "</table>"
     )
 
-    bonus_note = f" As a first-time top-up, we added a 25% bonus (+{bonus_tokens:,} {wt_short})! 🎁" if bonus_tokens > 0 else ""
+    bonus_note = f" As a first-time top-up, we added a 25% bonus (+{bonus_tokens:,} {wt_short})! " if bonus_tokens > 0 else ""
     html = email_shell(
         gradient=GRAD_PURPLE,
         tagline="Your token wallet has been topped up",
@@ -222,4 +222,53 @@ async def send_topup_receipt_email(
         footer_note="You received this because a token top-up payment was processed on your account.",
     )
 
-    await send_email(email, f"UploadM8 top-up confirmed — +{tokens_added:,} {wt_short} tokens 💰", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, f"UploadM8 top-up confirmed — +{tokens_added:,} {wt_short} tokens", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+
+
+async def send_refund_receipt_email(
+    email: str,
+    name: str,
+    amount: float,
+    currency: str = "usd",
+    payment_ref: str = "",
+    reason: str = "",
+    event_kind: str = "refund",
+) -> None:
+    """Send refund/chargeback receipt email."""
+    if not mailgun_ready():
+        return
+
+    kind_label = "Chargeback opened" if event_kind == "chargeback" else "Refund processed"
+    reason_line = (
+        f'<p style="margin:8px 0 0;color:#9ca3af;font-size:13px;line-height:1.6;">Reason: {reason}</p>'
+        if reason else ""
+    )
+    html = email_shell(
+        gradient=GRAD_ORANGE,
+        tagline="Billing update for your account",
+        preheader_text=f"{kind_label}: {amount:.2f} {currency.upper()} has been posted to your account activity.",
+        body_rows=(
+            section_tag(kind_label, "#f97316")
+            + intro_row(
+                f"{kind_label}, {name}",
+                f"We recorded a billing adjustment of <strong style='color:#f97316;'>{amount:.2f} {currency.upper()}</strong> "
+                "on your UploadM8 account.",
+            )
+            + tinted_box(
+                f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
+                f'<strong style="color:#ffffff;">Reference:</strong> {payment_ref or "N/A"}'
+                f'{reason_line}</p>',
+                hex_color="#f97316",
+            )
+            + cta_button("Open Billing", URL_BILLING, pt="18px", pb="20px")
+            + secondary_links(("Billing", URL_BILLING), ("Support", URL_SUPPORT))
+        ),
+        footer_note="You received this because a billing adjustment occurred on your account.",
+    )
+    await send_email(
+        email,
+        f"UploadM8 billing adjustment — {kind_label}",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+    )

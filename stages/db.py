@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -126,6 +127,7 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "maxHashtags":      "max_hashtags",
                         "trillOpenaiModel": "openai_model",
                         "useAudioContext":  "use_audio_context",
+                        "audioTranscription": "audio_transcription",
                     }
                     for camel, snake in FIELD_MAP.items():
                         val = prefs.get(camel)
@@ -417,6 +419,9 @@ async def insert_caption_memory(
     caption_tone: str = "",
     caption_style: str = "",
     source: str = "auto",
+    predicted_quality_score: Optional[float] = None,
+    strategy_json: Optional[Dict[str, Any]] = None,
+    platform_winners: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Persist one row for future few-shot retrieval. Non-fatal on missing table."""
     if not (ai_title or ai_caption or ai_hashtags):
@@ -424,34 +429,372 @@ async def insert_caption_memory(
     try:
         import json as _json
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO upload_caption_memory (
-                    user_id, upload_id, category, platforms,
-                    ai_title, ai_caption, ai_hashtags,
-                    caption_voice, caption_tone, caption_style, source
-                ) VALUES (
-                    $1, $2::uuid, $3, $4::jsonb,
-                    $5, $6, $7::jsonb,
-                    $8, $9, $10, $11
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO upload_caption_memory (
+                        user_id, upload_id, category, platforms,
+                        ai_title, ai_caption, ai_hashtags,
+                        caption_voice, caption_tone, caption_style, source,
+                        predicted_quality_score, strategy_json, platform_winners
+                    ) VALUES (
+                        $1, $2::uuid, $3, $4::jsonb,
+                        $5, $6, $7::jsonb,
+                        $8, $9, $10, $11,
+                        $12, $13::jsonb, $14::jsonb
+                    )
+                    """,
+                    user_id,
+                    upload_id,
+                    (category or "general").lower(),
+                    _json.dumps(platforms or []),
+                    ai_title,
+                    ai_caption,
+                    _json.dumps(ai_hashtags or []),
+                    caption_voice or None,
+                    caption_tone or None,
+                    caption_style or None,
+                    source,
+                    float(predicted_quality_score) if predicted_quality_score is not None else None,
+                    _json.dumps(strategy_json or {}),
+                    _json.dumps(platform_winners or {}),
                 )
-                """,
-                user_id,
-                upload_id,
-                (category or "general").lower(),
-                _json.dumps(platforms or []),
-                ai_title,
-                ai_caption,
-                _json.dumps(ai_hashtags or []),
-                caption_voice or None,
-                caption_tone or None,
-                caption_style or None,
-                source,
-            )
+            except asyncpg.exceptions.UndefinedColumnError:
+                await conn.execute(
+                    """
+                    INSERT INTO upload_caption_memory (
+                        user_id, upload_id, category, platforms,
+                        ai_title, ai_caption, ai_hashtags,
+                        caption_voice, caption_tone, caption_style, source
+                    ) VALUES (
+                        $1, $2::uuid, $3, $4::jsonb,
+                        $5, $6, $7::jsonb,
+                        $8, $9, $10, $11
+                    )
+                    """,
+                    user_id,
+                    upload_id,
+                    (category or "general").lower(),
+                    _json.dumps(platforms or []),
+                    ai_title,
+                    ai_caption,
+                    _json.dumps(ai_hashtags or []),
+                    caption_voice or None,
+                    caption_tone or None,
+                    caption_style or None,
+                    source,
+                )
     except asyncpg.exceptions.UndefinedTableError:
         pass
     except Exception as e:
         logger.debug(f"insert_caption_memory: {e}")
+
+
+async def fetch_recent_thumbnail_style_signatures(
+    pool: asyncpg.Pool,
+    user_id: str,
+    platform: str,
+    limit: int = 24,
+) -> List[str]:
+    """
+    Return recent style signatures for anti-repeat rendering memory.
+    Non-fatal if table is absent.
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT style_signature
+                  FROM upload_thumbnail_style_memory
+                 WHERE user_id = $1
+                   AND platform = $2
+                 ORDER BY created_at DESC
+                 LIMIT $3
+                """,
+                str(user_id),
+                str(platform or "").lower(),
+                max(1, min(limit, 100)),
+            )
+        out: List[str] = []
+        for r in rows or []:
+            s = str(r.get("style_signature") or "").strip()
+            if s:
+                out.append(s)
+        return out
+    except asyncpg.exceptions.UndefinedTableError:
+        return []
+    except Exception as e:
+        logger.debug(f"fetch_recent_thumbnail_style_signatures: {e}")
+        return []
+
+
+async def fetch_recent_thumbnail_style_history(
+    pool: asyncpg.Pool,
+    user_id: str,
+    platform: str,
+    limit: int = 30,
+) -> List[Dict[str, Any]]:
+    """
+    Return recent style history rows for diversity policy (signature + pack + score).
+    Non-fatal when table is missing.
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT style_signature, style_pack, score, created_at
+                  FROM upload_thumbnail_style_memory
+                 WHERE user_id = $1
+                   AND platform = $2
+                 ORDER BY created_at DESC
+                 LIMIT $3
+                """,
+                str(user_id),
+                str(platform or "").lower(),
+                max(1, min(limit, 120)),
+            )
+        out: List[Dict[str, Any]] = []
+        for r in rows or []:
+            out.append(
+                {
+                    "signature": str(r.get("style_signature") or "").strip(),
+                    "style_pack": str(r.get("style_pack") or "").strip().lower(),
+                    "score": float(r.get("score") or 0.0),
+                    "created_at": str(r.get("created_at") or ""),
+                }
+            )
+        return out
+    except asyncpg.exceptions.UndefinedTableError:
+        return []
+    except Exception as e:
+        logger.debug(f"fetch_recent_thumbnail_style_history: {e}")
+        return []
+
+
+async def insert_thumbnail_style_signature(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    upload_id: str,
+    platform: str,
+    style_signature: str,
+    style_pack: str = "",
+    score: float = 0.0,
+) -> None:
+    """
+    Persist a style signature for anti-repeat memory.
+    Ignores duplicates per (upload_id, platform, style_signature).
+    """
+    sig = (style_signature or "").strip()
+    if not sig:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO upload_thumbnail_style_memory (
+                    user_id, upload_id, platform, style_signature, style_pack, score
+                ) VALUES (
+                    $1, $2::uuid, $3, $4, $5, $6
+                )
+                ON CONFLICT (upload_id, platform, style_signature) DO NOTHING
+                """,
+                str(user_id),
+                str(upload_id),
+                str(platform or "").lower(),
+                sig,
+                (style_pack or None),
+                float(score or 0.0),
+            )
+    except asyncpg.exceptions.UndefinedTableError:
+        pass
+    except Exception as e:
+        logger.debug(f"insert_thumbnail_style_signature: {e}")
+
+
+def _m8_engagement_raw(views: int, likes: int, comments: int, shares: int) -> float:
+    """Weighted engagement for ranking priors (same spirit as KPI dashboards)."""
+    return float(
+        max(0, views)
+        + 2 * max(0, likes)
+        + 3 * max(0, comments)
+        + 2 * max(0, shares)
+    )
+
+
+def _m8_normalize_prior(avg_raw: float) -> float:
+    """Map rolling average raw engagement to a soft prior in [-5, 10] for M8 ranking."""
+    if avg_raw <= 0:
+        return 0.0
+    # Log-scaled: small accounts get small nudge; viral history gets a larger (capped) bump
+    x = math.log10(avg_raw + 1.0)
+    prior = (x - 1.5) * 4.0
+    return max(-5.0, min(10.0, prior))
+
+
+async def fetch_m8_historical_signals(
+    pool: asyncpg.Pool,
+    user_id: str,
+    category: str,
+    platforms: List[str],
+    *,
+    prior_row_limit: int = 40,
+    pattern_limit: int = 6,
+) -> Dict[str, Any]:
+    """
+    Analytics-backed priors + caption pattern memory for M8 v2.
+
+    Reads from `upload_caption_memory` JOIN `uploads` (views/likes/comments/shares
+    filled by the analytics sync loop). Per-platform rolling engagement and top
+    caption snippets for prompt injection.
+
+    Returns a dict suitable for m8_engine.rank_and_select (platform keys) plus
+    __pattern_corpus__ / __meta__ for prompts (ignored by score_variant).
+    """
+    out: Dict[str, Any] = {"__pattern_corpus__": [], "__meta__": {"source": "db", "ok": False}}
+    plats = [str(p).lower() for p in (platforms or []) if p]
+    if not plats or not user_id:
+        return out
+
+    cat = (category or "general").lower()
+
+    try:
+        async with pool.acquire() as conn:
+            for plat in plats:
+                plat_json = json.dumps([plat])
+                try:
+                    rows = await conn.fetch(
+                        """
+                        SELECT COALESCE(u.views, 0)::bigint AS views,
+                               COALESCE(u.likes, 0)::bigint AS likes,
+                               COALESCE(u.comments, 0)::bigint AS comments,
+                               COALESCE(u.shares, 0)::bigint AS shares
+                          FROM upload_caption_memory ucm
+                          INNER JOIN uploads u ON u.id = ucm.upload_id
+                         WHERE ucm.user_id = $1
+                           AND ucm.category = $2
+                           AND ucm.platforms @> $3::jsonb
+                           AND u.created_at > NOW() - INTERVAL '180 days'
+                         ORDER BY u.created_at DESC
+                         LIMIT $4
+                        """,
+                        user_id,
+                        cat,
+                        plat_json,
+                        max(5, min(prior_row_limit, 80)),
+                    )
+                except asyncpg.exceptions.UndefinedColumnError:
+                    rows = await conn.fetch(
+                        """
+                        SELECT COALESCE(u.views, 0)::bigint AS views,
+                               COALESCE(u.likes, 0)::bigint AS likes,
+                               COALESCE(u.comments, 0)::bigint AS comments,
+                               COALESCE(u.shares, 0)::bigint AS shares
+                          FROM upload_caption_memory ucm
+                          INNER JOIN uploads u ON u.id = ucm.upload_id
+                         WHERE ucm.user_id = $1
+                           AND ucm.category = $2
+                           AND ucm.platforms @> $3::jsonb
+                         ORDER BY u.created_at DESC
+                         LIMIT $4
+                        """,
+                        user_id,
+                        cat,
+                        plat_json,
+                        max(5, min(prior_row_limit, 80)),
+                    )
+
+                if not rows:
+                    continue
+                raws = [_m8_engagement_raw(int(r["views"]), int(r["likes"]), int(r["comments"]), int(r["shares"])) for r in rows]
+                avg_raw = sum(raws) / len(raws)
+                out[plat] = {
+                    "engagement_prior": round(_m8_normalize_prior(avg_raw), 4),
+                    "sample_n": len(rows),
+                    "avg_engagement_raw": round(avg_raw, 2),
+                }
+
+            # Pattern memory: best past captions for this category + platform (rolling pool)
+            patterns: List[Dict[str, Any]] = []
+            for plat in plats:
+                plat_json = json.dumps([plat])
+                try:
+                    prow = await conn.fetch(
+                        """
+                        SELECT ucm.ai_caption,
+                               COALESCE(ucm.caption_style, '') AS caption_style,
+                               COALESCE(ucm.caption_tone, '') AS caption_tone,
+                               (COALESCE(u.views, 0) + 2 * COALESCE(u.likes, 0)
+                                + 3 * COALESCE(u.comments, 0) + 2 * COALESCE(u.shares, 0))::double precision AS eng_raw
+                          FROM upload_caption_memory ucm
+                          INNER JOIN uploads u ON u.id = ucm.upload_id
+                         WHERE ucm.user_id = $1
+                           AND ucm.category = $2
+                           AND ucm.platforms @> $3::jsonb
+                           AND LENGTH(TRIM(COALESCE(ucm.ai_caption, ''))) > 24
+                           AND u.created_at > NOW() - INTERVAL '180 days'
+                         ORDER BY eng_raw DESC, u.created_at DESC
+                         LIMIT $4
+                        """,
+                        user_id,
+                        cat,
+                        plat_json,
+                        max(1, min(pattern_limit, 12)),
+                    )
+                except asyncpg.exceptions.UndefinedColumnError:
+                    prow = await conn.fetch(
+                        """
+                        SELECT ucm.ai_caption,
+                               COALESCE(ucm.caption_style, '') AS caption_style,
+                               COALESCE(ucm.caption_tone, '') AS caption_tone,
+                               (COALESCE(u.views, 0) + 2 * COALESCE(u.likes, 0)
+                                + 3 * COALESCE(u.comments, 0) + 2 * COALESCE(u.shares, 0))::double precision AS eng_raw
+                          FROM upload_caption_memory ucm
+                          INNER JOIN uploads u ON u.id = ucm.upload_id
+                         WHERE ucm.user_id = $1
+                           AND ucm.category = $2
+                           AND ucm.platforms @> $3::jsonb
+                           AND LENGTH(TRIM(COALESCE(ucm.ai_caption, ''))) > 24
+                         ORDER BY eng_raw DESC, u.created_at DESC
+                         LIMIT $4
+                        """,
+                        user_id,
+                        cat,
+                        plat_json,
+                        max(1, min(pattern_limit, 12)),
+                    )
+                for r in prow or []:
+                    cap = (r.get("ai_caption") or "").strip()
+                    if len(cap) < 24:
+                        continue
+                    patterns.append(
+                        {
+                            "platform": plat,
+                            "snippet": cap[:420],
+                            "caption_style": (r.get("caption_style") or "").strip(),
+                            "caption_tone": (r.get("caption_tone") or "").strip(),
+                            "engagement_raw": float(r.get("eng_raw") or 0),
+                        }
+                    )
+
+            # De-dup near-identical snippets while preserving order
+            seen: set = set()
+            uniq: List[Dict[str, Any]] = []
+            for p in patterns:
+                key = (p["platform"], p["snippet"][:80])
+                if key in seen:
+                    continue
+                seen.add(key)
+                uniq.append(p)
+            out["__pattern_corpus__"] = uniq[: max(3, pattern_limit)]
+            out["__meta__"] = {"source": "upload_caption_memory+uploads", "ok": True}
+    except asyncpg.exceptions.UndefinedTableError:
+        return {"__pattern_corpus__": [], "__meta__": {"source": "missing_table", "ok": False}}
+    except Exception as e:
+        logger.debug(f"fetch_m8_historical_signals: {e}")
+        return {"__pattern_corpus__": [], "__meta__": {"source": "error", "ok": False, "err": str(e)[:120]}}
+
+    return out
 
 
 async def increment_upload_count(pool: asyncpg.Pool, user_id: str):

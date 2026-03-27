@@ -36,7 +36,9 @@ Environment variables:
   FFMPEG_AUDIO_TIMEOUT          default: 120
 
 User opt-out:
-  ctx.user_settings["use_audio_context"] = False  →  SkipStage
+  ctx.user_settings["use_audio_context"] = False  →  SkipStage (entire pipeline)
+  ctx.user_settings["audio_transcription"] / audioTranscription = False  →  Skip Whisper only;
+    YAMNet, ACRCloud (if configured), Hume, GPT classification still run.
 
 Exports: run_audio_context_stage(ctx)
 """
@@ -72,9 +74,10 @@ FFMPEG_TIMEOUT: int = int(os.environ.get("FFMPEG_AUDIO_TIMEOUT", "120"))
 
 # Full-stack audio pipeline
 FFMPEG_PATH: str = os.environ.get("FFMPEG_PATH", "ffmpeg")
-ACRCLOUD_HOST: str = os.environ.get("ACRCLOUD_HOST", "")
-ACRCLOUD_ACCESS_KEY: str = os.environ.get("ACRCLOUD_ACCESS_KEY", "")
-ACRCLOUD_ACCESS_SECRET: str = os.environ.get("ACRCLOUD_ACCESS_SECRET", "")
+# ACRCloud: accept docs-style ACR_* aliases alongside ACRCLOUD_*
+ACRCLOUD_HOST: str = os.environ.get("ACRCLOUD_HOST") or os.environ.get("ACR_HOST", "")
+ACRCLOUD_ACCESS_KEY: str = os.environ.get("ACRCLOUD_ACCESS_KEY") or os.environ.get("ACR_ACCESS_KEY", "")
+ACRCLOUD_ACCESS_SECRET: str = os.environ.get("ACRCLOUD_ACCESS_SECRET") or os.environ.get("ACR_ACCESS_SECRET", "")
 AUDIO_STAGE_ENABLED: bool = os.environ.get("AUDIO_STAGE_ENABLED", "true").lower() == "true"
 YAMNET_ENABLED: bool = os.environ.get("YAMNET_ENABLED", "true").lower() == "true"
 HUME_ENABLED_FLAG: bool = os.environ.get("HUME_ENABLED", "true").lower() == "true"
@@ -453,19 +456,31 @@ async def _analyze_audio_context(
             "has_speech": bool(transcript_text),
             "music_detected": music_detected,
             "music_title": music_title,
+            "music_artist": music_artist,
             "music_genre": music_genre,
             "yamnet_sound_profile": sound_profile,
             "yamnet_top_class": yamnet_top,
             "platforms": platforms,
         }
         prompt = f"""You are a viral content strategist. Analyse the following video metadata and audio signals.
+
+CRITICAL: The transcript may be SONG LYRICS from a third-party track (especially when music_detected is true
+or a known title/artist is present). In that case the creator is usually filming a SCENE (drive, workout, etc.),
+not claiming they wrote the song. Set transcript_role accordingly — do not treat lyrics as the creator's own words.
+
+Valid transcript_role values:
+- third_party_lyrics — transcript is mostly recognizable song lyrics / performed vocal track
+- creator_speech — creator talking to camera or narrating (original speech)
+- mixed_speech_and_music — both speech and prominent music
+- ambient_or_unclear — no clear lyrics, ambient, or unclear
+
 Input: {json.dumps(analysis_input, indent=2)}
 Valid categories: {", ".join(CATEGORIES)}
 Valid emotional_tone: {", ".join(EMOTIONAL_TONES)}
 Valid thumbnail_mood: {", ".join(THUMBNAIL_MOODS)}
 Valid caption_style: {", ".join(CAPTION_STYLES)}
 Return ONLY valid JSON, no markdown:
-{{"category":"<cat>","subcategory":"<niche>","emotional_tone":"<tone>","content_signals":["sig1"],"caption_style":"<style>","target_audience":"<audience>","thumbnail_mood":"<mood>","copyright_risk":false,"suggested_keywords":["kw1"],"thumbnail_headline":"VIRAL HEADLINE","thumbnail_subtext":"optional subtext"}}"""
+{{"category":"<cat>","subcategory":"<niche>","transcript_role":"<transcript_role>","fusion_narrative":"<one sentence describing what is actually going on>","emotional_tone":"<tone>","content_signals":["sig1"],"caption_style":"<style>","target_audience":"<audience>","thumbnail_mood":"<mood>","copyright_risk":false,"suggested_keywords":["kw1"],"thumbnail_headline":"VIRAL HEADLINE","thumbnail_subtext":"optional subtext"}}"""
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.post(
@@ -485,6 +500,12 @@ Return ONLY valid JSON, no markdown:
         except Exception as e:
             logger.warning(f"[audio] GPT error: {e}")
 
+    tr_role = (analysis.get("transcript_role") or "").strip()
+    if not tr_role and transcript_text and music_detected and (music_title or music_artist):
+        tr_role = "third_party_lyrics"
+    if not tr_role and transcript_text and music_detected and copyright_flag:
+        tr_role = "third_party_lyrics"
+
     return {
         "transcript": transcript_text,
         "language": language,
@@ -496,6 +517,8 @@ Return ONLY valid JSON, no markdown:
         "copyright_risk": copyright_flag or bool(analysis.get("copyright_risk", False)),
         "category": analysis.get("category", "other"),
         "subcategory": analysis.get("subcategory", ""),
+        "transcript_role": tr_role,
+        "fusion_narrative": (analysis.get("fusion_narrative") or "").strip(),
         "emotional_tone": analysis.get("emotional_tone", "hype_energetic"),
         "content_signals": analysis.get("content_signals", []),
         "caption_style": analysis.get("caption_style", "hype_street"),
@@ -519,6 +542,8 @@ def _empty_context() -> Dict[str, Any]:
         "copyright_risk": False,
         "category": "other",
         "subcategory": "",
+        "transcript_role": "",
+        "fusion_narrative": "",
         "emotional_tone": "hype_energetic",
         "content_signals": [],
         "caption_style": "hype_street",
@@ -567,12 +592,17 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
     if not OPENAI_API_KEY:
         raise SkipStage("OPENAI_API_KEY not configured — audio context disabled")
 
-    if ctx.entitlements and not ctx.entitlements.can_ai:
-        raise SkipStage("AI not available for this tier — audio context skipped")
-
     use_audio = (ctx.user_settings or {}).get("use_audio_context", True)
+    if use_audio is None:
+        use_audio = (ctx.user_settings or {}).get("useAudioContext", True)
     if not use_audio:
         raise SkipStage("Audio context disabled by user preference")
+
+    us = ctx.user_settings or {}
+    use_whisper = us.get("audio_transcription")
+    if use_whisper is None:
+        use_whisper = us.get("audioTranscription", True)
+    use_whisper = bool(use_whisper)
 
     audio_codec = _video_info_get(ctx, "audio_codec")
     if not audio_codec:
@@ -616,8 +646,14 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
 
         ctx.audio_path = audio_path
 
-        # Run Whisper + ACRCloud in parallel
-        transcript_task = asyncio.create_task(_transcribe_audio(audio_path))
+        async def _whisper_or_skip() -> Optional[Dict[str, Any]]:
+            if not use_whisper:
+                logger.info("[audio] Whisper skipped — audio transcription disabled in user preferences")
+                return None
+            return await _transcribe_audio(audio_path)
+
+        # Run Whisper + ACRCloud in parallel (Whisper optional per user pref)
+        transcript_task = asyncio.create_task(_whisper_or_skip())
         acrcloud_task = asyncio.create_task(
             _recognize_music(audio_path)
             if (ACRCLOUD_HOST and ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET)
@@ -678,7 +714,7 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
             ctx.ai_transcript = transcript_text
 
         logger.info(
-            f"[audio] ✓ category={audio_context.get('category')} "
+            f"[audio]  category={audio_context.get('category')} "
             f"emotion={audio_context.get('emotional_tone')} "
             f"mood={audio_context.get('thumbnail_mood')} "
             f"yamnet={audio_context.get('top_sound_class', 'N/A')} "

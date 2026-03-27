@@ -125,7 +125,8 @@ async def transfer_tokens(
 
 async def daily_refill(conn, user_id: str, tier: str):
     ent = get_entitlements_for_tier(tier)
-    daily = ent.put_daily * 4
+    # Add one day's allowance once per calendar day; never exceed monthly cap.
+    daily = ent.put_daily
     wallet = await get_wallet(conn, user_id)
     last_refill = wallet.get("last_refill_date")
     today = _now_utc().date()

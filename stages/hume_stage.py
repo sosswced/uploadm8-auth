@@ -15,6 +15,7 @@ Then ~$0.064/min.
 """
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -92,90 +93,94 @@ async def analyze_voice_emotion(audio_path: Path) -> Optional[Dict[str, Any]]:
         logger.info("[hume] Audio too small — skipping emotion analysis")
         return None
 
-    try:
-        audio_bytes = audio_path.read_bytes()
-        headers = {
-            "X-Hume-Api-Key": HUME_API_KEY,
-        }
+    audio_bytes = audio_path.read_bytes()
+    headers = {"X-Hume-Api-Key": HUME_API_KEY}
+    job_config = {
+        "models": {"prosody": {}},
+        "transcription": {"language": "en"},
+        "notify": False,
+    }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # ── Submit batch job ──────────────────────────────────────────────
-            resp = await client.post(
-                f"{HUME_BASE_URL}/jobs",
-                headers={**headers, "Content-Type": "application/json"},
-                json={
-                    "models": {"prosody": {}},
-                    "transcription": {"language": "en"},
-                    "notify": False,
-                },
-            )
+    for run in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # ── Single multipart job (current Hume API: json + file on POST /jobs) ──
+                # Legacy two-step /jobs (JSON) + /jobs/{id}/files returns 404 on many accounts.
+                resp = await client.post(
+                    f"{HUME_BASE_URL}/jobs",
+                    headers=headers,
+                    data={"json": json.dumps(job_config)},
+                    files={"file": ("audio.mp3", audio_bytes, "audio/mpeg")},
+                )
 
-            if resp.status_code not in (200, 201):
-                logger.warning(f"[hume] Job submit failed: {resp.status_code} {resp.text[:200]}")
-                return None
+                if resp.status_code not in (200, 201):
+                    logger.warning(f"[hume] Job submit failed: {resp.status_code} {resp.text[:300]}")
+                    if run == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+                    return None
 
-            job_id = resp.json().get("job_id")
-            if not job_id:
-                logger.warning("[hume] No job_id in response")
-                return None
+                job_id = resp.json().get("job_id")
+                if not job_id:
+                    logger.warning("[hume] No job_id in response")
+                    if run == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+                    return None
 
-            # ── Upload audio file to the job ──────────────────────────────────
-            upload_resp = await client.post(
-                f"{HUME_BASE_URL}/jobs/{job_id}/files",
-                headers=headers,
-                files={"file": ("audio.mp3", audio_bytes, "audio/mpeg")},
-            )
+                # ── Poll for completion ───────────────────────────────────────────
+                retryable_terminal = False
+                for attempt in range(MAX_POLLS):
+                    await asyncio.sleep(POLL_INTERVAL)
 
-            if upload_resp.status_code not in (200, 201):
-                logger.warning(f"[hume] File upload failed: {upload_resp.status_code}")
-                return None
+                    status_resp = await client.get(
+                        f"{HUME_BASE_URL}/jobs/{job_id}",
+                        headers=headers,
+                    )
 
-            # ── Start the job ─────────────────────────────────────────────────
-            start_resp = await client.post(
-                f"{HUME_BASE_URL}/jobs/{job_id}/start",
-                headers=headers,
-            )
+                    if status_resp.status_code != 200:
+                        continue
 
-            # ── Poll for completion ───────────────────────────────────────────
-            for attempt in range(MAX_POLLS):
-                await asyncio.sleep(POLL_INTERVAL)
+                    state = status_resp.json().get("state", {})
+                    status = state.get("status", "")
 
-                status_resp = await client.get(
-                    f"{HUME_BASE_URL}/jobs/{job_id}",
+                    if status == "COMPLETED":
+                        break
+                    if status in ("FAILED", "CANCELLED"):
+                        logger.warning(f"[hume] Job {status}: {state}")
+                        retryable_terminal = True
+                        break
+                else:
+                    logger.warning("[hume] Job timed out after polling")
+                    retryable_terminal = True
+
+                if retryable_terminal:
+                    if run == 0:
+                        await asyncio.sleep(1.2)
+                        continue
+                    return None
+
+                # ── Fetch predictions ─────────────────────────────────────────────
+                pred_resp = await client.get(
+                    f"{HUME_BASE_URL}/jobs/{job_id}/predictions",
                     headers=headers,
                 )
 
-                if status_resp.status_code != 200:
-                    continue
-
-                state = status_resp.json().get("state", {})
-                status = state.get("status", "")
-
-                if status == "COMPLETED":
-                    break
-                elif status in ("FAILED", "CANCELLED"):
-                    logger.warning(f"[hume] Job {status}: {state}")
+                if pred_resp.status_code != 200:
+                    logger.warning(f"[hume] Predictions fetch failed: {pred_resp.status_code}")
+                    if run == 0:
+                        await asyncio.sleep(1.0)
+                        continue
                     return None
 
-            else:
-                logger.warning("[hume] Job timed out after polling")
-                return None
-
-            # ── Fetch predictions ─────────────────────────────────────────────
-            pred_resp = await client.get(
-                f"{HUME_BASE_URL}/jobs/{job_id}/predictions",
-                headers=headers,
-            )
-
-            if pred_resp.status_code != 200:
-                logger.warning(f"[hume] Predictions fetch failed: {pred_resp.status_code}")
-                return None
-
-            return _parse_hume_predictions(pred_resp.json())
-
-    except Exception as e:
-        logger.warning(f"[hume] Analysis error: {e}")
-        return None
+                return _parse_hume_predictions(pred_resp.json())
+        except Exception as e:
+            logger.warning(f"[hume] Analysis error: {e}")
+            if run == 0:
+                await asyncio.sleep(1.0)
+                continue
+            return None
+    return None
 
 
 def _parse_hume_predictions(raw: Any) -> Optional[Dict[str, Any]]:

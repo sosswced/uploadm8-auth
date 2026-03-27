@@ -60,10 +60,10 @@ AUDIO CONTEXT (Whisper Transcription):
   Runs as Stage 5.5 — after transcode, before thumbnail.
   Extracts audio via FFmpeg → sends to OpenAI Whisper → stores transcript in
   ctx.ai_transcript, which caption_stage injects into every GPT-4o prompt.
-  Rides on the existing `can_ai` entitlement flag — no separate gate.
-  Users may opt out via `use_audio_context = False` in user_settings.
-  audio_context flag in TIER_CONFIG is documentation-only; enforcement is
-  done in audio_stage.py (run_audio_context_stage) via can_ai + user.use_audio_context.
+  Whisper may be disabled per user via `audio_transcription` / `audioTranscription` while
+  keeping the rest of Stage 5.5 (YAMNet, ACRCloud, Hume, GPT classification).
+  Users may opt out of the entire stage via `use_audio_context = False` in user_settings.
+  Enforcement is in audio_stage.py (run_audio_context_stage); not gated on plan `can_ai`.
   Cost: ~$0.006/min via whisper-1 (platform cost, not billed as AIC tokens).
 """
 
@@ -235,6 +235,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
 #
 # Ledger: checkout top-ups credit token_ledger with reason "topup" (legacy rows may say "topup_purchase").
 STRIPE_LOOKUP_TO_TIER: Dict[str, str] = {
+    "uploadm8_creator_lite_monthly": "creator_lite",
     "uploadm8_creatorlite_monthly": "creator_lite",
     "uploadm8_creatorpro_monthly":  "creator_pro",
     "uploadm8_studio_monthly":      "studio",
@@ -286,6 +287,21 @@ def get_tier_display_name(tier: str) -> str:
     """Return human-readable tier name from TIER_CONFIG."""
     t = normalize_tier(tier)
     return TIER_CONFIG.get(t, TIER_CONFIG["free"]).get("name", t.replace("_", " ").title())
+
+
+# Public Stripe-sold tiers in upgrade order (excludes internal / legacy launch row key)
+PUBLIC_UPGRADE_TIER_CHAIN = ("free", "creator_lite", "creator_pro", "studio", "agency")
+
+
+def get_next_public_upgrade_tier(tier: str) -> Optional[str]:
+    """Next tier in the public upgrade ladder, or None if already at top / non-public."""
+    t = normalize_tier(tier)
+    if t not in PUBLIC_UPGRADE_TIER_CHAIN:
+        return None
+    i = PUBLIC_UPGRADE_TIER_CHAIN.index(t)
+    if i + 1 >= len(PUBLIC_UPGRADE_TIER_CHAIN):
+        return None
+    return PUBLIC_UPGRADE_TIER_CHAIN[i + 1]
 
 
 # Entitlement keys returned by entitlements_to_dict — frontend uses these exact keys

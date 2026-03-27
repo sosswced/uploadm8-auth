@@ -18,6 +18,10 @@ Flow:
      Set ctx.thumbnail_paths = all candidates in chronological order
      Set ctx.thumbnail_scores = {str(path): score} for all candidates
   8. Store metadata in ctx.output_artifacts for queue UI display
+  9. [When can_custom_thumbnails] Generate Thumbnail Brief (JSON) via GPT,
+     render MrBeast-style composite (headline, badge, arrow) per platform:
+     YouTube 16:9, Instagram/Facebook 9:16 center-safe, TikTok thumb_offset only.
+     Render via upgraded PIL template (gradient + type) or AI image edit (when can_ai_thumbnail_styling).
 
 AI Selection Criteria (per category):
   beauty      — best lighting, eyes open, makeup clearly visible
@@ -46,19 +50,27 @@ Exports: run_thumbnail_stage(ctx)
 
 import asyncio
 import base64
+import copy
+import hashlib
+import html as html_module
 import json
-import re
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
-
-from .context import JobContext
+from .context import JobContext, THUMBNAIL_BRIEF_PROMPT, resolve_fused_thumbnail_category
+from .entitlements import should_generate_thumbnails
 from .errors import SkipStage
+from .trend_intel import fetch_trend_intel
+from .thumbnail_qa import (
+    YOUTUBE_SEARCH_PREVIEW_QA,
+    assess_youtube_search_preview_readability,
+    pick_tiktok_cover_offset_seconds,
+)
 
 logger = logging.getLogger("uploadm8-worker.thumbnail")
 
@@ -68,6 +80,10 @@ MAX_THUMBNAIL_OFFSET     = 300.0
 MIN_THUMB_SIZE           = 2048          # bytes — smaller = rejected
 OPENAI_API_KEY           = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_THUMB_MODEL       = os.environ.get("OPENAI_THUMB_MODEL", "gpt-4o-mini")
+# Images /edits API now requires an explicit model (e.g. gpt-image-1, dall-e-2).
+OPENAI_IMAGE_EDIT_MODEL  = os.environ.get("OPENAI_IMAGE_EDIT_MODEL", "gpt-image-1")
+# Optional bold font for template thumbnails (falls back to Arial / DejaVu).
+THUMBNAIL_FONT_BOLD = os.environ.get("THUMBNAIL_FONT_BOLD", "").strip()
 
 
 # ============================================================
@@ -346,10 +362,8 @@ _CATEGORY_PRIORITY = [
 
 def _detect_category(ctx: JobContext) -> str:
     """
-    3-layer content category detection.
-    Layer 1: user-provided caption/title hints
-    Layer 2: filename keyword scan
-    Layer 3: fall back to 'general' (GPT identifies from frames in the prompt)
+    Content category for thumbnails: fusion override → audio/vision canonical →
+    user text → filename → general.
     """
     def _scan(text: str) -> Optional[str]:
         if not text:
@@ -362,6 +376,16 @@ def _detect_category(ctx: JobContext) -> str:
                 if kw in t:
                     return cat
         return None
+
+    fused = resolve_fused_thumbnail_category(ctx)
+    if fused and fused in _THUMB_CATEGORIES:
+        logger.debug(f"Thumbnail category from fusion override: {fused}")
+        return fused
+
+    canonical = getattr(ctx, "get_canonical_category", lambda: None)()
+    if canonical and canonical in _THUMB_CATEGORIES:
+        logger.debug(f"Thumbnail category from canonical (audio/vision): {canonical}")
+        return canonical
 
     for text in (ctx.caption, ctx.title):
         result = _scan(text or "")
@@ -524,6 +548,941 @@ async def _ai_select_best_frame(
 
 
 # ============================================================
+# Thumbnail Brief Generator (platform-aware JSON)
+# ============================================================
+
+async def _generate_thumbnail_brief(ctx: JobContext, category: str) -> Optional[Dict]:
+    """
+    Generate a platform-aware Thumbnail Brief (JSON) using GPT.
+    Returns parsed brief dict or None on failure.
+    """
+    if not OPENAI_API_KEY:
+        return None
+    vars_ = ctx.get_thumbnail_brief_vars(category=category)
+    prompt = THUMBNAIL_BRIEF_PROMPT.format(**vars_)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENAI_THUMB_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 400,
+                    "temperature": 0.5,
+                },
+            )
+        if response.status_code != 200:
+            logger.warning(f"Thumbnail brief HTTP {response.status_code}: {response.text[:200]}")
+            return None
+        data = response.json()
+        answer = data["choices"][0]["message"]["content"].strip()
+        if "```json" in answer:
+            answer = answer.split("```json")[1].split("```")[0]
+        elif "```" in answer:
+            answer = answer.split("```")[1].split("```")[0]
+        brief = json.loads(answer)
+        # Ensure platform_plan exists with defaults
+        brief.setdefault("platform_plan", {})
+        brief["platform_plan"].setdefault("youtube", {"enabled": True, "canvas": "16:9"})
+        brief["platform_plan"].setdefault("instagram", {"enabled": True, "canvas": "9:16", "safe_center_pct": 60})
+        brief["platform_plan"].setdefault("facebook", {"enabled": True, "canvas": "9:16", "safe_center_pct": 60})
+        brief["platform_plan"].setdefault("tiktok", {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5})
+        return brief
+    except (json.JSONDecodeError, KeyError) as e:
+        logger.warning(f"Thumbnail brief parse failed: {e}")
+        return None
+    except Exception as e:
+        logger.warning(f"Thumbnail brief generation failed: {e}")
+        return None
+
+
+# ============================================================
+# Template Renderer (PIL overlays — deterministic “last mile” without Photoshop)
+# ============================================================
+
+def _thumbnail_font_paths() -> List[str]:
+    paths: List[str] = []
+    if THUMBNAIL_FONT_BOLD:
+        paths.append(THUMBNAIL_FONT_BOLD)
+    paths.extend(
+        [
+            "C:/Windows/Fonts/arialbd.ttf",
+            "C:/Windows/Fonts/segoeuib.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/Arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "arial.ttf",
+            "Arial.ttf",
+        ]
+    )
+    return paths
+
+
+def _load_thumbnail_fonts(headline_px: int, badge_px: int):
+    from PIL import ImageFont
+
+    for path in _thumbnail_font_paths():
+        try:
+            return (
+                ImageFont.truetype(path, headline_px),
+                ImageFont.truetype(path, max(22, badge_px)),
+            )
+        except OSError:
+            continue
+    d = ImageFont.load_default()
+    return d, d
+
+
+def _wrap_headline_lines(
+    text: str,
+    font,
+    max_width: int,
+    draw,
+    max_lines: int = 3,
+) -> List[str]:
+    """Word-wrap headline to fit width; uppercase preserved."""
+    words = (text or "").upper().split()
+    if not words:
+        return []
+    lines: List[str] = []
+    cur: List[str] = []
+    for w in words:
+        trial = " ".join(cur + [w])
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            cur.append(w)
+        else:
+            if cur:
+                lines.append(" ".join(cur))
+                cur = [w]
+            else:
+                lines.append(w[:18])
+                cur = []
+            if len(lines) >= max_lines:
+                break
+    if cur and len(lines) < max_lines:
+        lines.append(" ".join(cur))
+    return lines[:max_lines]
+
+
+def _apply_bottom_readability_gradient(img_rgba: "Image.Image", band_frac: float = 0.42) -> "Image.Image":
+    """Darken bottom area with a vertical alpha ramp so white text pops."""
+    from PIL import Image, ImageDraw
+
+    w, h = img_rgba.size
+    band = max(1, int(h * band_frac))
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    for i in range(band):
+        y = h - band + i
+        a = min(235, int(210 * (i + 1) / band))
+        d.line([(0, y), (w, y)], fill=(0, 0, 0, a))
+    return Image.alpha_composite(img_rgba, overlay)
+
+
+def _mood_accent(brief: Dict) -> Tuple[str, str]:
+    """Return (stroke_hex, accent_hex) from brief.color_mood."""
+    mood = str(brief.get("color_mood") or "red_black").lower()
+    if mood in ("cool_blue", "blue", "cinematic"):
+        return "#001428", "#4fc3f7"
+    if mood in ("warm", "sunset", "gold"):
+        return "#2d1400", "#ffb74d"
+    if mood in ("neon", "electric"):
+        return "#120024", "#e040fb"
+    return "#000000", "#ffffff"
+
+
+def _sanitize_headline_strict(brief: Dict) -> str:
+    """
+    Hard text rules:
+    - uppercase only
+    - 3-4 words
+    - no hashtags / punctuation noise
+    """
+    raw = (
+        brief.get("selected_headline")
+        or (brief.get("headline_options") or [""])[0]
+        or ""
+    )
+    txt = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in str(raw))
+    words = [w for w in txt.upper().split() if w]
+    weak_fillers = {"GOES", "INSANE", "THING", "STUFF", "COOL", "VIBES"}
+    words = [w for w in words if w not in weak_fillers]
+    # Remove duplicates while preserving order to avoid mushy headlines.
+    deduped: List[str] = []
+    for w in words:
+        if w not in deduped:
+            deduped.append(w)
+    words = deduped
+    if len(words) > 4:
+        words = words[:4]
+    if len(words) < 3:
+        mood = str(brief.get("color_mood") or "").lower()
+        if "neon" in mood:
+            fill = ["ALERT", "NOW", "LIVE"]
+        elif "dark" in mood or "cinematic" in mood:
+            fill = ["NIGHT", "DRIVE", "AHEAD"]
+        else:
+            fill = ["WATCH", "THIS", "NOW"]
+        words.extend(fill[: max(0, 3 - len(words))])
+    return " ".join(words[:4]).strip()
+
+
+def _choose_style_variant(
+    brief: Dict,
+    platform: str,
+    base_path: Path,
+    headline: str,
+    nonce: int = 0,
+) -> Dict[str, str]:
+    """
+    Generate high-variety style combos from a large combinatorial set.
+    Deterministic per upload/frame/headline + nonce to avoid repetitive outputs.
+    """
+    salt = os.environ.get("THUMB_STYLE_SALT", "")
+    seed_src = f"{base_path.name}|{platform}|{headline}|{brief.get('color_mood','')}|{nonce}|{salt}"
+    h = hashlib.sha256(seed_src.encode("utf-8")).hexdigest()
+    pick = int(h[:12], 16)
+
+    packs = [
+        {"name": "neon_green", "stroke": "#001b00", "accent": "#39ff14", "badge": "#e53935"},
+        {"name": "warning_red", "stroke": "#220000", "accent": "#ff3d00", "badge": "#fdd835"},
+        {"name": "gold_premium", "stroke": "#2b1600", "accent": "#ffca28", "badge": "#1a1a1a"},
+        {"name": "electric_blue", "stroke": "#001428", "accent": "#4fc3f7", "badge": "#e53935"},
+        {"name": "violet_punch", "stroke": "#160026", "accent": "#e040fb", "badge": "#fdd835"},
+    ]
+    pack = packs[pick % len(packs)]
+    accent_kinds = ["ring", "arrow", "chart_burst"]
+    return {
+        "pack_name": pack["name"],
+        "stroke": pack["stroke"],
+        "accent": pack["accent"],
+        "badge_bg": pack["badge"],
+        "accent_kind": accent_kinds[(pick // 7) % len(accent_kinds)],
+        "stroke_w": str(3 + ((pick // 31) % 3)),
+        "gradient_frac": f"{0.38 + ((pick // 101) % 9) * 0.02:.2f}",
+        "sat_boost": f"{1.10 + ((pick // 211) % 7) * 0.08:.2f}",
+        "con_boost": f"{1.06 + ((pick // 401) % 6) * 0.07:.2f}",
+        "bri_boost": f"{1.04 + ((pick // 601) % 5) * 0.06:.2f}",
+    }
+
+
+def _style_signature(style: Dict[str, str], headline: str) -> str:
+    core = "|".join(
+        [
+            str(style.get("pack_name", "")),
+            str(style.get("accent_kind", "")),
+            str(style.get("stroke_w", "")),
+            str(headline.strip().upper()),
+        ]
+    )
+    return hashlib.sha1(core.encode("utf-8")).hexdigest()[:20]
+
+
+def _compute_pack_entropy(packs: List[str]) -> float:
+    """Normalized entropy in [0,1] over recent style packs."""
+    vals = [p for p in packs if p]
+    if not vals:
+        return 0.0
+    counts: Dict[str, int] = {}
+    for p in vals:
+        counts[p] = counts.get(p, 0) + 1
+    n = float(len(vals))
+    probs = [c / n for c in counts.values()]
+    h = -sum(p * math.log(p, 2) for p in probs if p > 0.0)
+    h_max = math.log(max(1, len(counts)), 2)
+    if h_max <= 0:
+        return 0.0
+    return max(0.0, min(1.0, h / h_max))
+
+
+def _detect_focal_point(img_rgb: "Image.Image") -> Tuple[float, float, float]:
+    """
+    Approximate focal object center from edge-energy map.
+    Returns (x_norm, y_norm, focal_strength_ratio).
+    """
+    from PIL import ImageFilter, ImageStat
+
+    s = img_rgb.convert("L").resize((320, 180))
+    edges = s.filter(ImageFilter.FIND_EDGES)
+    w, h = edges.size
+    win_w, win_h = 92, 56
+    best = (-1.0, 0, 0)
+    global_mean = float(ImageStat.Stat(edges).mean[0] or 1.0)
+    px = edges.load()
+    for y in range(0, h - win_h, 8):
+        for x in range(0, w - win_w, 8):
+            acc = 0
+            for yy in range(y, y + win_h, 4):
+                for xx in range(x, x + win_w, 4):
+                    acc += px[xx, yy]
+            sample_n = max(1, (win_w // 4) * (win_h // 4))
+            score = float(acc) / sample_n
+            # small center bias so we do not lock to corners
+            cx = x + win_w * 0.5
+            cy = y + win_h * 0.5
+            center_bias = 1.0 - (abs(cx - w * 0.5) / w) * 0.15 - (abs(cy - h * 0.5) / h) * 0.10
+            score *= max(0.75, center_bias)
+            if score > best[0]:
+                best = (score, x, y)
+    if best[0] <= 0:
+        return 0.5, 0.45, 1.0
+    bx, by = best[1], best[2]
+    nx = (bx + win_w * 0.5) / w
+    ny = (by + win_h * 0.5) / h
+    return max(0.08, min(0.92, nx)), max(0.08, min(0.92, ny)), float(best[0] / max(1.0, global_mean))
+
+
+def _crop_with_focal(img_rgba: "Image.Image", target_w: int, target_h: int, nx: float, ny: float) -> "Image.Image":
+    """Subject-first crop: preserve focal object, not geometric center."""
+    from PIL import Image
+
+    iw, ih = img_rgba.size
+    scale = max(target_w / iw, target_h / ih)
+    nw, nh = int(iw * scale), int(ih * scale)
+    img2 = img_rgba.resize((nw, nh), Image.Resampling.LANCZOS)
+
+    # Keep focal point slightly above center to leave room for text plate.
+    fx, fy = nx * nw, ny * nh
+    anchor_y = 0.43
+    x0 = int(fx - target_w * 0.50)
+    y0 = int(fy - target_h * anchor_y)
+    x0 = max(0, min(x0, max(0, nw - target_w)))
+    y0 = max(0, min(y0, max(0, nh - target_h)))
+    return img2.crop((x0, y0, x0 + target_w, y0 + target_h))
+
+
+def _clamp_focal_for_safe_center(nx: float, safe_center_pct: float) -> float:
+    """
+    Keep focal x within center-safe corridor for platforms that 1:1-crop vertical covers.
+    Example: 60% safe center -> x in [0.20, 0.80].
+    """
+    try:
+        pct = float(safe_center_pct)
+    except Exception:
+        pct = 60.0
+    pct = max(35.0, min(90.0, pct))
+    half = (pct / 100.0) * 0.5
+    lo = max(0.05, 0.5 - half)
+    hi = min(0.95, 0.5 + half)
+    return max(lo, min(hi, nx))
+
+
+def _score_frame_visual_quality(image_path: Path) -> float:
+    """
+    Visual quality proxy in [0,1] using contrast/saturation and center saliency.
+    """
+    try:
+        from PIL import Image, ImageFilter, ImageStat
+
+        img = Image.open(image_path).convert("RGB")
+        small = img.resize((320, 180))
+        lum = small.convert("L")
+        lum_std = float(ImageStat.Stat(lum).stddev[0] or 0.0)  # contrast
+        sat_mean = float(ImageStat.Stat(small.convert("HSV")).mean[1] or 0.0)
+
+        edges = lum.filter(ImageFilter.FIND_EDGES)
+        w, h = edges.size
+        px = edges.load()
+        cx0, cx1 = int(w * 0.30), int(w * 0.70)
+        cy0, cy1 = int(h * 0.22), int(h * 0.78)
+        center_acc = 0.0
+        outer_acc = 0.0
+        center_n = 0
+        outer_n = 0
+        for y in range(0, h, 3):
+            for x in range(0, w, 3):
+                v = float(px[x, y])
+                if cx0 <= x <= cx1 and cy0 <= y <= cy1:
+                    center_acc += v
+                    center_n += 1
+                else:
+                    outer_acc += v
+                    outer_n += 1
+        center_mean = center_acc / max(1, center_n)
+        outer_mean = outer_acc / max(1, outer_n)
+        center_ratio = center_mean / max(1.0, outer_mean)
+
+        contrast_norm = max(0.0, min(1.0, lum_std / 64.0))
+        sat_norm = max(0.0, min(1.0, sat_mean / 150.0))
+        center_norm = max(0.0, min(1.0, (center_ratio - 0.75) / 0.9))
+        return 0.45 * contrast_norm + 0.30 * sat_norm + 0.25 * center_norm
+    except Exception:
+        return 0.0
+
+
+def _auto_relight(img_rgba: "Image.Image", style: Dict[str, str]) -> "Image.Image":
+    """Lift shadows + boost local contrast/saturation for dark clips."""
+    from PIL import ImageEnhance, ImageFilter, ImageStat
+
+    base_rgb = img_rgba.convert("RGB")
+    lum_mean = float(ImageStat.Stat(base_rgb.convert("L")).mean[0] or 0)
+    dark = lum_mean < 74
+
+    b = float(style.get("bri_boost", "1.08"))
+    c = float(style.get("con_boost", "1.10"))
+    s = float(style.get("sat_boost", "1.18"))
+    if dark:
+        b += 0.14
+        c += 0.16
+        s += 0.12
+
+    out = ImageEnhance.Brightness(base_rgb).enhance(b)
+    out = ImageEnhance.Contrast(out).enhance(c)
+    out = ImageEnhance.Color(out).enhance(s)
+    out = out.filter(ImageFilter.UnsharpMask(radius=2.2, percent=130, threshold=3))
+    return out.convert("RGBA")
+
+
+def _composition_pop_score(img_rgb: "Image.Image", focal_strength: float, headline_words: int) -> Tuple[float, Dict[str, float]]:
+    """Reject low-pop outputs before save."""
+    from PIL import ImageStat
+
+    g = img_rgb.convert("L")
+    stat_g = ImageStat.Stat(g)
+    lum_mean = float(stat_g.mean[0] or 0)
+    lum_std = float(stat_g.stddev[0] or 0)
+
+    hsv = img_rgb.convert("HSV")
+    sat_mean = float(ImageStat.Stat(hsv).mean[1] or 0)
+
+    # score tuned to favor readable contrast + saturation + focal confidence + concise text.
+    text_fit = 1.0 if 3 <= headline_words <= 5 else 0.0
+    score = (
+        min(35.0, lum_std * 0.9)
+        + min(28.0, sat_mean * 0.22)
+        + min(25.0, max(0.0, focal_strength - 0.8) * 14.0)
+        + (12.0 * text_fit)
+    )
+    return score, {
+        "lum_mean": round(lum_mean, 2),
+        "lum_std": round(lum_std, 2),
+        "sat_mean": round(sat_mean, 2),
+        "focal_strength": round(float(focal_strength), 3),
+        "headline_words": float(headline_words),
+    }
+
+
+def _passes_template_qa(
+    img_rgb: "Image.Image",
+    text_box: Optional[Tuple[int, int, int, int]],
+    text_area_ratio: float,
+    accent_kind: str,
+    focal_strength: float,
+) -> Tuple[bool, Dict[str, float]]:
+    """
+    Hard QA gate for styled thumbnails.
+    Reject noisy/low-readability compositions so renderer re-tries style variants.
+    """
+    from PIL import ImageStat
+
+    max_text_ratio = float(os.environ.get("THUMB_QA_MAX_TEXT_AREA_RATIO", "0.14") or 0.14)
+    min_luma_std = float(os.environ.get("THUMB_QA_MIN_LUMA_STD", "23.0") or 23.0)
+    min_text_region_std = float(os.environ.get("THUMB_QA_MIN_TEXT_REGION_STD", "28.0") or 28.0)
+    min_focal_strength = float(os.environ.get("THUMB_QA_MIN_FOCAL_STRENGTH", "0.92") or 0.92)
+
+    gray = img_rgb.convert("L")
+    global_std = float(ImageStat.Stat(gray).stddev[0] or 0.0)
+    text_std = global_std
+    if text_box:
+        x0, y0, x1, y1 = text_box
+        x0 = max(0, min(img_rgb.width - 1, x0))
+        y0 = max(0, min(img_rgb.height - 1, y0))
+        x1 = max(x0 + 1, min(img_rgb.width, x1))
+        y1 = max(y0 + 1, min(img_rgb.height, y1))
+        crop = gray.crop((x0, y0, x1, y1))
+        text_std = float(ImageStat.Stat(crop).stddev[0] or 0.0)
+
+    # Arrows are intentionally constrained when focal certainty is weak.
+    arrow_penalty = 0.0
+    if accent_kind in ("arrow", "arrow_up", "arrow_right") and focal_strength < 1.0:
+        arrow_penalty = 0.05
+
+    ok = (
+        text_area_ratio <= (max_text_ratio - arrow_penalty)
+        and global_std >= min_luma_std
+        and text_std >= min_text_region_std
+        and focal_strength >= min_focal_strength
+    )
+    return ok, {
+        "text_area_ratio": round(float(text_area_ratio), 4),
+        "global_luma_std": round(float(global_std), 3),
+        "text_region_std": round(float(text_std), 3),
+        "focal_strength": round(float(focal_strength), 3),
+    }
+
+
+def _draw_focal_accent(
+    draw,
+    target_w: int,
+    target_h: int,
+    nx: float,
+    ny: float,
+    style: Dict[str, str],
+    explicit: str = "",
+) -> None:
+    """Draw ring/arrow/chart burst anchored near focal center."""
+    accent = style.get("accent", "#ffffff")
+    stroke_w = max(3, min(7, int(style.get("stroke_w", "4"))))
+    kind = explicit or style.get("accent_kind", "ring")
+
+    cx = int(nx * target_w)
+    cy = int(ny * target_h)
+    cx = max(60, min(target_w - 60, cx))
+    cy = max(60, min(target_h - 60, cy))
+
+    if kind in ("circle", "ring", "glow_box"):
+        r = max(44, int(min(target_w, target_h) * 0.06))
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=accent, width=stroke_w)
+    elif kind in ("arrow_up", "arrow_right", "arrow"):
+        # Arrow points toward focal point.
+        sx, sy = cx - 90, cy + 70
+        draw.line([(sx, sy), (cx, cy)], fill=accent, width=stroke_w)
+        draw.polygon([(cx, cy), (cx - 20, cy + 12), (cx - 12, cy - 20)], fill=accent)
+    else:
+        # chart_burst: jagged growth line near focal
+        x0 = max(14, cx - 120)
+        y0 = min(target_h - 20, cy + 90)
+        pts = [(x0, y0), (x0 + 45, y0 - 22), (x0 + 84, y0 - 10), (x0 + 125, y0 - 44), (x0 + 170, y0 - 30)]
+        draw.line(pts, fill=accent, width=stroke_w)
+        ax, ay = pts[-1]
+        draw.polygon([(ax + 18, ay - 2), (ax + 2, ay - 12), (ax + 4, ay + 6)], fill=accent)
+
+
+def _render_template_thumbnail(
+    base_path: Path,
+    brief: Dict,
+    platform: str,
+    output_path: Path,
+) -> bool:
+    """
+    Render headline + badge + directional cue onto base frame using PIL.
+
+    Bridge for “Photoshop-level” polish without Adobe: gradient plate, multi-line type,
+    mood accents, rounded badge.
+
+    Platform-aware: YouTube 16:9 (1280x720), IG/FB 9:16 (720x1280).
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        logger.warning("Pillow not installed — skipping template thumbnail render")
+        return False
+
+    plan = brief.get("platform_plan", {}).get(platform, {})
+    if not plan.get("enabled", True):
+        return False
+
+    if platform == "youtube":
+        target_w, target_h = 1280, 720
+    else:
+        target_w, target_h = 720, 1280  # 9:16
+
+    try:
+        source = Image.open(base_path).convert("RGBA")
+    except Exception as e:
+        logger.warning(f"Template render: could not load/crop base image: {e}")
+        return False
+
+    headline = _sanitize_headline_strict(brief)
+    best_img = None
+    best_score = -1.0
+    qa_rejections: List[Dict[str, float]] = []
+
+    avoid_map = (brief.get("_avoid_style_signatures") or {}) if isinstance(brief, dict) else {}
+    avoid_set = set(avoid_map.get(platform) or [])
+    recent_packs_map = (brief.get("_recent_style_packs") or {}) if isinstance(brief, dict) else {}
+    recent_packs = [str(x).lower() for x in (recent_packs_map.get(platform) or []) if x]
+    pack_counts: Dict[str, int] = {}
+    for p in recent_packs:
+        pack_counts[p] = pack_counts.get(p, 0) + 1
+    pack_recent_limit = int(os.environ.get("THUMB_STYLE_PACK_REPEAT_LIMIT", "2") or 2)
+    entropy_floor = float(os.environ.get("THUMB_STYLE_ENTROPY_FLOOR", "0.72") or 0.72)
+    recent_window = int(os.environ.get("THUMB_STYLE_ENTROPY_WINDOW", "30") or 30)
+    base_entropy = _compute_pack_entropy(recent_packs[:recent_window])
+
+    for nonce in range(10):
+        style = _choose_style_variant(brief, platform, base_path, headline, nonce=nonce)
+        sig = _style_signature(style, headline)
+        if sig in avoid_set:
+            continue
+        style_pack = str(style.get("pack_name") or "").lower()
+        if style_pack and pack_counts.get(style_pack, 0) >= pack_recent_limit:
+            # Hard cooldown on overused style packs in recent history.
+            continue
+        # Soft guard: if entropy is already weak, prefer introducing a less-used pack.
+        if base_entropy < entropy_floor and style_pack:
+            min_use = min(pack_counts.values()) if pack_counts else 0
+            if pack_counts.get(style_pack, 0) > min_use:
+                continue
+        nx, ny, focal_strength = _detect_focal_point(source.convert("RGB"))
+        safe_center_pct = float(plan.get("safe_center_pct", 60) or 60) if platform != "youtube" else 100.0
+        if platform != "youtube":
+            nx = _clamp_focal_for_safe_center(nx, safe_center_pct)
+        img = _crop_with_focal(source, target_w, target_h, nx, ny)
+        img = _auto_relight(img, style)
+
+        safe_margin = int(min(target_w, target_h) * (0.055 if platform == "youtube" else 0.065))
+        text_max_w = target_w - 2 * safe_margin
+        headline_px = 72 if target_w >= 1000 else 52
+        badge_px = 34 if target_w >= 1000 else 28
+        font_large, font_badge = _load_thumbnail_fonts(headline_px, badge_px)
+        draw_probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+        for _ in range(10):
+            lines = _wrap_headline_lines(headline, font_large, text_max_w, draw_probe, max_lines=3)
+            if lines:
+                bb = draw_probe.textbbox((0, 0), "\n".join(lines), font=font_large)
+                if bb[2] - bb[0] <= text_max_w + 6:
+                    break
+            if headline_px <= 34:
+                break
+            headline_px -= 4
+            badge_px = max(22, badge_px - 2)
+            font_large, font_badge = _load_thumbnail_fonts(headline_px, badge_px)
+            draw_probe = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+        lines = _wrap_headline_lines(headline, font_large, text_max_w, draw_probe, max_lines=2 if platform != "youtube" else 3)
+        # Keep text dominant but not overpowering frame area.
+        text_area_ratio = 0.0
+        for _ in range(8):
+            if not lines:
+                break
+            joined_probe = "\n".join(lines)
+            bb = draw_probe.textbbox((0, 0), joined_probe, font=font_large)
+            tw = max(1, bb[2] - bb[0])
+            th = max(1, bb[3] - bb[1])
+            area_ratio = (tw * th) / float(target_w * target_h)
+            text_area_ratio = area_ratio
+            max_ratio = 0.14 if platform == "youtube" else 0.11
+            if area_ratio <= max_ratio:
+                break
+            if headline_px <= 30:
+                break
+            headline_px -= 3
+            badge_px = max(20, badge_px - 1)
+            font_large, font_badge = _load_thumbnail_fonts(headline_px, badge_px)
+            lines = _wrap_headline_lines(headline, font_large, text_max_w, draw_probe, max_lines=2 if platform != "youtube" else 3)
+
+        img = _apply_bottom_readability_gradient(img, band_frac=float(style.get("gradient_frac", "0.44")))
+        draw = ImageDraw.Draw(img)
+
+        # Badge
+        badge_text = (brief.get("badge_text") or "").upper()[:14]
+        if badge_text:
+            pad = 10
+            bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
+            bw = bbox[2] - bbox[0] + pad * 2
+            bh = bbox[3] - bbox[1] + pad * 2
+            bx0, by0 = safe_margin, safe_margin
+            bx1, by1 = bx0 + bw, by0 + bh
+            try:
+                draw.rounded_rectangle([bx0, by0, bx1, by1], radius=12, fill=style.get("badge_bg", "#e53935"), outline="#ffffff", width=2)
+            except Exception:
+                draw.rectangle([bx0, by0, bx1, by1], fill=style.get("badge_bg", "#e53935"), outline="#ffffff", width=2)
+            draw.text((bx0 + pad, by0 + pad), badge_text, fill="#ffffff", font=font_badge)
+
+        # Headline block
+        text_box: Optional[Tuple[int, int, int, int]] = None
+        if lines:
+            joined = "\n".join(lines)
+            bbox = draw.textbbox((0, 0), joined, font=font_large)
+            block_w = bbox[2] - bbox[0]
+            block_h = bbox[3] - bbox[1]
+            ty0 = target_h - safe_margin - block_h - int(target_h * 0.02)
+            tx0 = (target_w - block_w) // 2
+            text_box = (tx0 - 12, ty0 - 10, tx0 + block_w + 12, ty0 + block_h + 10)
+            off = 0
+            sw = max(2, int(style.get("stroke_w", "4")))
+            for line in lines:
+                lb = draw.textbbox((0, 0), line, font=font_large)
+                lw = lb[2] - lb[0]
+                lx = (target_w - lw) // 2
+                ly = ty0 + off
+                for dx, dy in ((-sw, -sw), (-sw, sw), (sw, -sw), (sw, sw), (-sw, 0), (sw, 0), (0, -sw), (0, sw)):
+                    draw.text((lx + dx, ly + dy), line, fill=style.get("stroke", "#000000"), font=font_large)
+                draw.text((lx, ly), line, fill="#ffffff", font=font_large)
+                off += (lb[3] - lb[1]) + 6
+
+        explicit_elem = str(brief.get("directional_element") or "").strip().lower()
+        if explicit_elem not in ("none", "off", "false", "no"):
+            _draw_focal_accent(draw, target_w, target_h, nx, ny, style, explicit=explicit_elem)
+
+        qa_ok, qa_meta = _passes_template_qa(
+            img.convert("RGB"),
+            text_box=text_box,
+            text_area_ratio=text_area_ratio,
+            accent_kind=explicit_elem or style.get("accent_kind", ""),
+            focal_strength=focal_strength,
+        )
+        if not qa_ok:
+            if len(qa_rejections) < 12:
+                rec: Dict[str, float] = {
+                    "nonce": float(nonce),
+                    "focal_strength": round(float(focal_strength), 3),
+                }
+                for k, v in qa_meta.items():
+                    try:
+                        rec[k] = float(v)
+                    except Exception:
+                        continue
+                qa_rejections.append(rec)
+            try:
+                logger.debug(f"thumb-template qa-reject platform={platform} meta={qa_meta}")
+            except Exception:
+                pass
+            continue
+
+        score, meta = _composition_pop_score(img.convert("RGB"), focal_strength, len(headline.split()))
+        if score > best_score:
+            best_score = score
+            best_img = img.convert("RGB")
+            brief.setdefault("_render_meta", {})[platform] = {
+                "signature": sig,
+                "style_pack": style.get("pack_name", ""),
+                "score": round(float(score), 3),
+                "entropy_before": round(base_entropy, 4),
+                "qa": qa_meta,
+            }
+            if qa_rejections:
+                brief.setdefault("_qa_rejections", {})[platform] = qa_rejections[:]
+            try:
+                logger.debug(f"thumb-template pop-score={score:.2f} meta={meta} style={style.get('pack_name')}")
+            except Exception:
+                pass
+
+        # Hard quality gate: pass early if strong composition.
+        if score >= 56.0 and focal_strength >= 1.10:
+            try:
+                img.convert("RGB").save(output_path, "JPEG", quality=92, subsampling=0)
+                return output_path.exists() and output_path.stat().st_size >= MIN_THUMB_SIZE
+            except Exception:
+                continue
+
+    # Final fallback: only accept if composition is still above minimum threshold.
+    if best_img is None or best_score < 43.0:
+        logger.warning(f"Template render rejected by composition gate (best={best_score:.2f})")
+        return False
+    try:
+        best_img.save(output_path, "JPEG", quality=92, subsampling=0)
+        return output_path.exists() and output_path.stat().st_size >= MIN_THUMB_SIZE
+    except Exception as e:
+        logger.warning(f"Template render save failed: {e}")
+        return False
+
+
+# ============================================================
+# AI Image Edit (optional premium — with guardrails + fallback)
+# ============================================================
+
+async def _ai_edit_thumbnail(
+    base_path: Path,
+    brief: Dict,
+    output_path: Path,
+    retry_reduce: bool = False,
+) -> bool:
+    """
+    Use OpenAI image edit to add headline/badge/props to base frame.
+    Guardrails: no logos, no new objects except arrow/badge/simple props.
+    Max 2 retries; falls back to template in caller.
+    Note: OpenAI edits API may return base64 or URL; we handle both.
+    """
+    if not OPENAI_API_KEY:
+        return False
+    instruction = (
+        f"Add these elements to the image. Headline text (ALL CAPS): {brief.get('selected_headline', '')}. "
+        f"Badge: {brief.get('badge_text', '')}. "
+        f"Add a {brief.get('directional_element', 'circle')} highlight. "
+        "No new objects except: arrow, badge, simple prop icons. "
+        "No logos, no brand marks, no watermarks. "
+        "Keep key elements centered for mobile crop. "
+    )
+    if retry_reduce:
+        instruction += "Reduce text size, increase contrast, fewer effects. "
+    try:
+        with open(base_path, "rb") as f:
+            image_data = f.read()
+        async with httpx.AsyncClient(timeout=120) as client:
+            # Multipart: `model` must be form fields (data=), not only in files= — httpx/OpenAI
+            # otherwise the API returns missing_required_parameter model.
+            response = await client.post(
+                "https://api.openai.com/v1/images/edits",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                data={
+                    "model": OPENAI_IMAGE_EDIT_MODEL,
+                    "prompt": instruction,
+                    "size": "1024x1024",
+                },
+                files={"image": ("frame.jpg", image_data, "image/jpeg")},
+            )
+            if response.status_code != 200:
+                logger.warning(f"AI thumbnail edit HTTP {response.status_code}: {response.text[:200]}")
+                return False
+            data = response.json()
+            items = data.get("data", [])
+            if not items:
+                return False
+            item = items[0]
+            if "b64_json" in item:
+                out_bytes = base64.b64decode(item["b64_json"])
+            elif "url" in item:
+                dl = await client.get(item["url"])
+                if dl.status_code != 200:
+                    return False
+                out_bytes = dl.content
+            else:
+                return False
+        output_path.write_bytes(out_bytes)
+        return output_path.exists() and output_path.stat().st_size >= MIN_THUMB_SIZE
+    except Exception as e:
+        logger.warning(f"AI thumbnail edit failed: {e}")
+        return False
+
+
+async def _maybe_composite_viral_background(
+    ctx: JobContext,
+    frame_path: Path,
+    brief: Dict,
+    platform: str,
+    category: str,
+) -> Optional[Path]:
+    """
+    rembg/remove.bg subject isolation + fal/replicate AI background + composite.
+    Gated by can_ai_thumbnail_styling and THUMB_BG_COMPOSITE_ENABLED.
+    """
+    if str(os.environ.get("THUMB_BG_COMPOSITE_ENABLED", "true")).lower() != "true":
+        return None
+    if not ctx.entitlements or not getattr(ctx.entitlements, "can_ai_thumbnail_styling", False):
+        return None
+    plan = brief.get("platform_plan", {}).get(platform, {})
+    if not plan.get("enabled", True):
+        return None
+    if platform == "youtube":
+        w, h = 1280, 720
+    else:
+        w, h = 720, 1280
+
+    from .background_gen import (
+        build_background_prompt,
+        composite_subject_on_background,
+        generate_ai_background,
+        generate_kontext_background_replicate,
+        isolate_subject,
+    )
+
+    ac = ctx.audio_context or {}
+    mood = str(ac.get("thumbnail_mood") or ac.get("mood") or "neon_vibrant")
+    emotion = str(
+        ac.get("emotion")
+        or ac.get("dominant_emotion")
+        or ac.get("emotional_tone")
+        or ""
+    )
+    headline = str(brief.get("selected_headline") or "")[:80]
+    extra = ""
+    vu = getattr(ctx, "video_understanding", None) or {}
+    if isinstance(vu, dict):
+        extra = (vu.get("scene_description") or "")[:500]
+
+    try:
+        subject = await isolate_subject(frame_path, ctx.temp_dir)
+        if not subject:
+            return None
+        prompt = build_background_prompt(category, mood, emotion, headline, extra_context=extra)
+        bg_path = None
+        if os.environ.get("REPLICATE_KONTEXT_MODEL", "").strip():
+            bg_path = await generate_kontext_background_replicate(
+                frame_path, prompt, w, h, ctx.temp_dir
+            )
+        if not bg_path:
+            bg_path = await generate_ai_background(prompt, w, h, ctx.temp_dir)
+        if not bg_path:
+            return None
+        comp = composite_subject_on_background(subject, bg_path, w, h, anchor="right", scale=0.82)
+        out = ctx.temp_dir / f"thumb_composite_{platform}_{ctx.upload_id}.jpg"
+        comp.save(out, "JPEG", quality=92)
+        if out.exists() and out.stat().st_size >= MIN_THUMB_SIZE:
+            logger.info("[thumbnail] bg composite ok platform=%s -> %s", platform, out.name)
+            return out
+    except Exception as e:
+        logger.warning("[thumbnail] bg composite failed (non-fatal): %s", e)
+    return None
+
+
+async def _try_playwright_html_thumbnail(
+    ctx: JobContext,
+    frame_path: Path,
+    brief: Dict,
+    platform: str,
+    out_path: Path,
+) -> bool:
+    """
+    HTML/CSS thumbnail via headless Chromium (playwright_stage).
+    Gated by THUMB_HTML_RENDER_ENABLED and PLAYWRIGHT_ENABLED.
+    """
+    if str(os.environ.get("THUMB_HTML_RENDER_ENABLED", "true")).lower() != "true":
+        return False
+    try:
+        from .playwright_stage import PLAYWRIGHT_AVAILABLE, PLAYWRIGHT_ENABLED, render_template
+    except ImportError:
+        return False
+    if not PLAYWRIGHT_AVAILABLE or not PLAYWRIGHT_ENABLED:
+        return False
+    plan = brief.get("platform_plan", {}).get(platform, {})
+    if not plan.get("enabled", True):
+        return False
+    if platform == "youtube":
+        w, h = 1280, 720
+    else:
+        w, h = 720, 1280
+    headline = html_module.escape((brief.get("selected_headline") or "WATCH")[:80])
+    subtext = html_module.escape((brief.get("notes") or "")[:120])
+    badge = html_module.escape((brief.get("badge_text") or "")[:20])
+    te = str(brief.get("text_effect") or "").lower().strip()
+    if te == "glitch":
+        tpl = "GLITCH"
+    elif te == "chrome":
+        tpl = "CHROME"
+    elif te == "fire":
+        tpl = "FIRE_SCROLL"
+    elif te == "neon":
+        tpl = "NEON_DROP"
+    elif te == "clean":
+        tpl = "CINEMATIC"
+    else:
+        mood_key = str(brief.get("color_mood") or "").lower()
+        pal = getattr(ctx, "frame_color_palette", None)
+        if isinstance(pal, dict) and pal.get("mood_hint") == "warm" and "fire" not in mood_key:
+            tpl = "HEAT"
+        elif "neon" in mood_key or "violet" in mood_key or "magenta" in mood_key:
+            tpl = "NEON_DROP"
+        elif "gold" in mood_key or "premium" in mood_key:
+            tpl = "HEAT"
+        elif "fire" in mood_key or "ember" in mood_key:
+            tpl = "FIRE_SCROLL"
+        elif "glitch" in mood_key or "rgb" in mood_key:
+            tpl = "GLITCH"
+        elif "chrome" in mood_key or "metal" in mood_key:
+            tpl = "CHROME"
+        elif "cinema" in mood_key or "film" in mood_key:
+            tpl = "CINEMATIC"
+        else:
+            tpl = "BRIGHT_POP"
+    try:
+        result = await render_template(tpl, frame_path, headline, subtext, badge, w, h, out_path)
+        if result and Path(out_path).exists() and out_path.stat().st_size >= MIN_THUMB_SIZE:
+            logger.info("[thumbnail] Playwright HTML render ok platform=%s tpl=%s", platform, tpl)
+            return True
+    except Exception as e:
+        logger.warning("[thumbnail] Playwright HTML render failed: %s", e)
+    return False
+
+
+# ============================================================
 # ffprobe — get video duration
 # ============================================================
 
@@ -663,158 +1622,6 @@ def _distribute_offsets(
     return [start] + middle + [end]
 
 
-
-
-# ============================================================
-# Viral Thumbnail Design (Text Overlay)
-# ============================================================
-
-def _fallback_thumb_phrase(ctx: JobContext) -> str:
-    """Deterministic fallback: derive a short hook from title/caption/filename."""
-    base = (getattr(ctx, 'ai_title', None) or ctx.title or '').strip()
-    if not base:
-        base = (getattr(ctx, 'ai_caption', None) or ctx.caption or '').strip()
-    if not base:
-        base = (ctx.filename or '').replace('_', ' ').replace('-', ' ').strip()
-    # Keep it short and loud
-    words = [w for w in re.split(r"\s+", base) if w]
-    phrase = ' '.join(words[:4]).strip()
-    return phrase.upper() if phrase else 'WATCH THIS'
-
-
-async def _ai_thumb_phrase(ctx: JobContext, category: str) -> Optional[str]:
-    """Use OpenAI (cheap text-only) to generate a high-CTR thumbnail phrase."""
-    # Reuse envs already used in this file
-    if not OPENAI_API_KEY:
-        return None
-
-    title = (getattr(ctx, 'ai_title', None) or ctx.title or '')
-    caption = (getattr(ctx, 'ai_caption', None) or ctx.caption or '')
-
-    prompt = (
-        "You are a YouTube/Meta thumbnail copywriter. "
-        "Create ONE short, punchy thumbnail phrase that maximizes click-through. "
-        "Constraints: 2 to 4 words, ALL CAPS, no hashtags, no emojis, no quotes. "
-        "Avoid generic filler (\"LIKE\", \"SUBSCRIBE\"). "
-        f"Category: {category}. "
-        f"Title/context: {title}. "
-        f"Caption/context: {caption}. "
-        "Return ONLY the phrase text."
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(
-                'https://api.openai.com/v1/chat/completions',
-                headers={
-                    'Authorization': f'Bearer {OPENAI_API_KEY}',
-                    'Content-Type': 'application/json',
-                },
-                json={
-                    'model': OPENAI_THUMB_MODEL,
-                    'messages': [{'role': 'user', 'content': prompt}],
-                    'max_tokens': 20,
-                    'temperature': 0.7,
-                },
-            )
-        if r.status_code != 200:
-            return None
-        phrase = r.json()['choices'][0]['message']['content'].strip()
-        # Sanitize: keep first line, remove wrapping quotes
-        phrase = phrase.splitlines()[0].strip().strip('"').strip("'")
-        # Enforce caps and length
-        phrase = re.sub(r"[^A-Z0-9\s!?]", "", phrase.upper())
-        words = [w for w in phrase.split() if w]
-        if 2 <= len(words) <= 4:
-            return ' '.join(words)
-        return None
-    except Exception:
-        return None
-
-
-def _load_bold_font(size: int) -> ImageFont.FreeTypeFont:
-    # DejaVu is available on most linux images; fallback to default
-    candidates = [
-        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-        '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
-    ]
-    for fp in candidates:
-        try:
-            return ImageFont.truetype(fp, size=size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-
-def _render_designed_thumbnail(src_path: Path, dst_path: Path, phrase: str) -> None:
-    """Create a 1280x720 YouTube-style thumbnail with loud text overlay."""
-    img = Image.open(src_path).convert('RGB')
-
-    # Standard YouTube thumbnail canvas
-    canvas_w, canvas_h = 1280, 720
-    base = ImageOps.fit(img, (canvas_w, canvas_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.35))
-
-    draw = ImageDraw.Draw(base)
-
-    # Add a dark bottom gradient for readability (via RGBA overlay)
-    overlay = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-    grad_h = int(canvas_h * 0.45)
-    for i in range(grad_h):
-        alpha = int(200 * (i / grad_h))  # 0..200
-        y = canvas_h - grad_h + i
-        od.rectangle([(0, y), (canvas_w, y + 1)], fill=(0, 0, 0, alpha))
-    base = Image.alpha_composite(base.convert('RGBA'), overlay).convert('RGB')
-    draw = ImageDraw.Draw(base)
-
-    # Prepare text (split into 2 lines max)
-    words = phrase.split()
-    if len(words) <= 2:
-        lines = [' '.join(words)]
-    else:
-        # 2 lines: split roughly in half
-        mid = max(1, len(words) // 2)
-        lines = [' '.join(words[:mid]), ' '.join(words[mid:])]
-
-    # Find maximum font size that fits
-    margin_x = 60
-    margin_y = 40
-    max_text_w = canvas_w - (2 * margin_x)
-    max_text_h = int(canvas_h * 0.40)
-
-    font_size = 120
-    font = _load_bold_font(font_size)
-
-    def measure(lines_, font_):
-        widths, heights = [], []
-        for ln in lines_:
-            bbox = draw.textbbox((0, 0), ln, font=font_, stroke_width=8)
-            widths.append(bbox[2] - bbox[0])
-            heights.append(bbox[3] - bbox[1])
-        return max(widths), sum(heights) + (len(lines_) - 1) * 10
-
-    w, h = measure(lines, font)
-    while (w > max_text_w or h > max_text_h) and font_size > 48:
-        font_size -= 6
-        font = _load_bold_font(font_size)
-        w, h = measure(lines, font)
-
-    # Position bottom-left
-    x = margin_x
-    y = canvas_h - margin_y - h
-
-    # Draw each line with stroke + subtle shadow
-    stroke = 10
-    for ln in lines:
-        # shadow
-        draw.text((x + 6, y + 6), ln, font=font, fill=(0, 0, 0), stroke_width=0)
-        # main
-        draw.text((x, y), ln, font=font, fill=(255, 255, 255), stroke_width=stroke, stroke_fill=(0, 0, 0))
-        bbox = draw.textbbox((x, y), ln, font=font, stroke_width=stroke)
-        y = bbox[3] + 10
-
-    base.save(dst_path, format='JPEG', quality=92, optimize=True)
-
 # ============================================================
 # Stage Entry Point
 # ============================================================
@@ -826,11 +1633,11 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
 
     Tier gating:
       - Number of candidates exposed = ctx.entitlements.max_thumbnails
-      - AI selection runs only when: OPENAI_API_KEY is set AND
-        ctx.entitlements.can_ai is True
-      - When AI is not available: falls back cleanly to sharpest frame
+      - GPT vision frame selection + thumbnail briefs run when OPENAI_API_KEY is set
+        (supercharged path; not gated on plan can_ai)
+      - When OpenAI is not available: falls back cleanly to sharpest frame
 
-    When AI IS available, internally extracts max(max_thumbnails, 4) frames
+    When OPENAI_API_KEY is set, internally extracts max(max_thumbnails, 4) frames
     to give the AI meaningful choices, even on single-thumbnail tiers —
     the AI picks the single best one and only that one is exposed.
 
@@ -843,6 +1650,16 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                                   thumbnail_selection_method
     """
     ctx.mark_stage("thumbnail")
+
+    if not ctx.entitlements or not should_generate_thumbnails(ctx.entitlements):
+        raise SkipStage("Thumbnail generation not enabled for tier")
+
+    us0 = ctx.user_settings or {}
+    _auto = us0.get("auto_thumbnails", us0.get("autoThumbnails"))
+    if _auto is None:
+        _auto = us0.get("auto_generate_thumbnails", us0.get("autoGenerateThumbnails", True))
+    if not _auto:
+        raise SkipStage("Auto thumbnail generation disabled in settings")
 
     # ── Source video ────────────────────────────────────────────────────────
     video_path: Optional[Path] = None
@@ -863,11 +1680,11 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         max_thumbnails = max(1, int(getattr(ctx.entitlements, "max_thumbnails", 1) or 1))
 
     ai_key_present = bool(OPENAI_API_KEY)
-    can_ai = ai_key_present and bool(getattr(ctx.entitlements, "can_ai", False) if ctx.entitlements else False)
+    # Vision/brief frame selection uses OpenAI whenever the key is set (supercharged path).
+    thumb_supercharged_ai = ai_key_present
 
-    # When AI is active, extract at least 4 frames so it has meaningful choices.
-    # On free tier (can_ai=False), extraction_count == max_thumbnails.
-    extraction_count = max(max_thumbnails, 4 if can_ai else 1)
+    # When OpenAI vision is available, extract at least 4 frames for meaningful selection.
+    extraction_count = max(max_thumbnails, 4 if thumb_supercharged_ai else 1)
 
     # User-specified manual offset (single-thumbnail mode only)
     raw_offset = (ctx.user_settings or {}).get("thumbnail_offset", DEFAULT_THUMBNAIL_OFFSET)
@@ -880,11 +1697,16 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     # ── Category detection ──────────────────────────────────────────────────
     category = _detect_category(ctx)
 
+    try:
+        await fetch_trend_intel(ctx)
+    except Exception as e:
+        logger.debug("[thumbnail] trend_intel skipped: %s", e)
+
     logger.info(
         f"Thumbnail stage: video={video_path.name}, "
         f"max_thumbnails={max_thumbnails}, extraction_count={extraction_count}, "
         f"category={category}, "
-        f"ai={'enabled' if can_ai else ('no-key' if not ai_key_present else 'plan-gate')}"
+        f"ai={'supercharged' if thumb_supercharged_ai else 'no-openai-key'}"
     )
 
     # ── Duration probe ──────────────────────────────────────────────────────
@@ -901,6 +1723,8 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
 
     # ── Extract and score all frames ────────────────────────────────────────
     candidates: List[Tuple[Path, float]] = []
+    component_scores: Dict[str, Dict[str, float]] = {}
+    path_to_offset: Dict[str, float] = {}
 
     for idx, offset in enumerate(offsets):
         out_path = ctx.temp_dir / f"thumb_{ctx.upload_id}_{idx:02d}.jpg"
@@ -911,13 +1735,22 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             success = await _extract_frame(video_path, out_path, 0.0)
 
         if success:
-            score = await _score_sharpness(out_path)
-            if score == 0.0:
-                score = out_path.stat().st_size / 1_000_000  # file-size proxy
+            path_to_offset[str(out_path)] = float(offset)
+            sharpness = await _score_sharpness(out_path)
+            if sharpness == 0.0:
+                sharpness = min(1.0, out_path.stat().st_size / 1_000_000)  # file-size proxy
+            visual = _score_frame_visual_quality(out_path)
+            # Strong source frame selection: sharpness + clear subject + contrast/saturation.
+            score = (0.58 * sharpness) + (0.42 * visual)
+            component_scores[str(out_path)] = {
+                "sharpness": round(float(sharpness), 4),
+                "visual": round(float(visual), 4),
+                "combined": round(float(score), 4),
+            }
             candidates.append((out_path, score))
             logger.debug(
                 f"  Frame {idx}: {out_path.name} @ {offset:.1f}s — "
-                f"sharpness={score:.4f}, size={out_path.stat().st_size // 1024}KB"
+                f"sharpness={sharpness:.4f}, visual={visual:.4f}, combined={score:.4f}, size={out_path.stat().st_size // 1024}KB"
             )
         else:
             logger.warning(f"  Frame {idx} @ {offset:.1f}s failed — skipping")
@@ -933,7 +1766,7 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     ai_selected_path: Optional[Path] = None
     selection_method = "sharpness"
 
-    if can_ai and len(candidates) > 1:
+    if thumb_supercharged_ai and len(candidates) > 1:
         try:
             ai_selected_path = await _ai_select_best_frame(candidates, category, ctx)
         except Exception as e:
@@ -948,9 +1781,7 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                 f"{sharpness_best_path.name}"
             )
     else:
-        reason = "no API key" if not ai_key_present else (
-            "plan gate" if not can_ai else "only 1 candidate"
-        )
+        reason = "no OPENAI_API_KEY" if not ai_key_present else "only 1 candidate"
         logger.debug(f"AI thumbnail selection skipped: {reason}")
 
     # ── Final best frame ────────────────────────────────────────────────────
@@ -960,27 +1791,23 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         sharpness_best_score,
     )
 
-    
-
-    # ── Optional: Viral thumbnail design overlay (YouTube/Meta-ready) ───────
-    designed_path: Optional[Path] = None
+    tiktok_plats = {str(p).lower() for p in (ctx.platforms or [])}
+    tiktok_mode = os.environ.get("TIKTOK_COVER_FRAME_MODE", "").strip().lower()
+    if not tiktok_mode:
+        tiktok_mode = "motion_blur" if "tiktok" in tiktok_plats else "balanced"
+    tiktok_offset_seconds, tiktok_pick_reason = pick_tiktok_cover_offset_seconds(
+        candidates, path_to_offset, component_scores, tiktok_mode, best_path=best_path
+    )
     try:
-        auto_thumbs = bool((ctx.user_settings or {}).get('autoThumbnails') or (ctx.user_settings or {}).get('auto_thumbnails') or False)
-        if auto_thumbs:
-            phrase = await _ai_thumb_phrase(ctx, category) if can_ai else None
-            phrase = phrase or _fallback_thumb_phrase(ctx)
-            designed_path = ctx.temp_dir / f"thumb_designed_{ctx.upload_id}.jpg"
-            _render_designed_thumbnail(best_path, designed_path, phrase)
-            if designed_path.exists() and designed_path.stat().st_size > 10_000:
-                # Keep raw for debugging; promote designed for publishing
-                ctx.output_artifacts['thumbnail_raw'] = str(best_path)
-                best_path = designed_path
-                selection_method = selection_method + '_designed'
-                logger.info(f"Designed thumbnail created: {designed_path.name} (phrase='{phrase}')")
-    except Exception as e:
-        logger.warning(f"Thumbnail design overlay failed (non-fatal): {e}")
+        ctx.output_artifacts["tiktok_cover_frame_mode"] = tiktok_mode
+        ctx.output_artifacts["tiktok_cover_pick_reason"] = tiktok_pick_reason
+        ctx.output_artifacts["thumbnail_frame_offsets_json"] = json.dumps(
+            {Path(k).name: round(v, 3) for k, v in path_to_offset.items()}
+        )
+    except Exception:
+        pass
 
-# ── Populate ctx ────────────────────────────────────────────────────────
+    # ── Populate ctx ────────────────────────────────────────────────────────
     # Chronological candidate list (caption_stage uses these for multi-frame story)
     # Respect max_thumbnails tier cap for the exposed list
     ctx.thumbnail_paths = [p for p, _ in candidates[:max_thumbnails]]
@@ -993,6 +1820,17 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
 
     ctx.thumbnail_path = best_path
 
+    # Dominant colors from best frame → thumbnail brief + Playwright/CSS hints
+    ctx.frame_color_palette = None
+    try:
+        from .color_palette import extract_palette_from_image
+
+        ctx.frame_color_palette = extract_palette_from_image(best_path)
+        if ctx.frame_color_palette:
+            ctx.output_artifacts["thumbnail_color_palette_json"] = json.dumps(ctx.frame_color_palette)
+    except Exception:
+        pass
+
     # Artifacts — picked up by worker.py for R2 upload and DB save
     ctx.output_artifacts["thumbnail"]                   = str(best_path)
     ctx.output_artifacts["thumbnail_category"]          = category
@@ -1003,6 +1841,231 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     ctx.output_artifacts["thumbnail_scores"]            = json.dumps(
         {str(p): round(s, 4) for p, s in candidates}
     )
+    ctx.output_artifacts["thumbnail_score_components"]  = json.dumps(component_scores)
+
+    # ── Styled thumbnails (MrBeast-style composite) — Trill + non-Trill, every upload ──
+    # Gated by: can_custom_thumbnails + user pref styled_thumbnails (default True)
+    can_custom = bool(getattr(ctx.entitlements, "can_custom_thumbnails", False) if ctx.entitlements else False)
+    can_ai_style = bool(getattr(ctx.entitlements, "can_ai_thumbnail_styling", False) if ctx.entitlements else False)
+    us = ctx.user_settings or {}
+    styled_enabled = us.get("styled_thumbnails", us.get("styledThumbnails", True))
+    if can_custom and styled_enabled and ctx.temp_dir:
+        try:
+            brief: Optional[Dict] = None
+            if thumb_supercharged_ai:
+                brief = await _generate_thumbnail_brief(ctx, category)
+            if not brief and thumb_supercharged_ai:
+                # Fallback brief when GPT fails — minimal defaults
+                brief = {
+                    "selected_headline": (ctx.get_effective_title() or "WATCH")[:20].upper(),
+                    "headline_options": [],
+                    "badge_text": "",
+                    "badge_style": "red",
+                    "directional_element": "none",
+                    "props": [],
+                    "emotion_cue": "excited",
+                    "color_mood": "red_black",
+                    "platform_plan": {
+                        "youtube": {"enabled": True, "canvas": "16:9"},
+                        "instagram": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+                        "facebook": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+                        "tiktok": {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5},
+                    },
+                    "notes": "Fallback brief",
+                }
+            elif not brief:
+                brief = {
+                    "selected_headline": (ctx.get_effective_title() or "WATCH")[:20].upper(),
+                    "headline_options": [],
+                    "badge_text": "",
+                    "badge_style": "red",
+                    "directional_element": "none",
+                    "props": [],
+                    "emotion_cue": "excited",
+                    "color_mood": "red_black",
+                    "platform_plan": {
+                        "youtube": {"enabled": True, "canvas": "16:9"},
+                        "instagram": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+                        "facebook": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+                        "tiktok": {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5},
+                    },
+                    "notes": "No AI — minimal brief",
+                }
+            if brief is not None and "tiktok" in tiktok_plats:
+                brief.setdefault("platform_plan", {})
+                brief["platform_plan"].setdefault(
+                    "tiktok",
+                    {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5},
+                )
+                brief["platform_plan"]["tiktok"]["thumb_offset_seconds"] = round(
+                    float(tiktok_offset_seconds), 2
+                )
+            ctx.output_artifacts["thumbnail_brief_json"] = json.dumps(brief)
+            ctx.thumbnail_brief = brief
+            try:
+                prior_raw = ctx.output_artifacts.get("_recent_thumbnail_style_signatures", "{}")
+                prior_map = json.loads(prior_raw) if isinstance(prior_raw, str) else (prior_raw or {})
+            except Exception:
+                prior_map = {}
+            try:
+                prior_pack_raw = ctx.output_artifacts.get("_recent_thumbnail_style_packs", "{}")
+                prior_pack_map = json.loads(prior_pack_raw) if isinstance(prior_pack_raw, str) else (prior_pack_raw or {})
+            except Exception:
+                prior_pack_map = {}
+            brief["_avoid_style_signatures"] = prior_map
+            brief["_recent_style_packs"] = prior_pack_map
+
+            # TikTok: no custom thumbnail via API — store thumb_offset for worker
+            platform_map: Dict[str, str] = {}
+            tiktok_plan = brief.get("platform_plan", {}).get("tiktok", {})
+            ctx.output_artifacts["tiktok_thumb_offset_seconds"] = str(
+                tiktok_plan.get("thumb_offset_seconds", 1.5)
+            )
+
+            # Render per platform (YouTube, Instagram, Facebook)
+            platforms_to_render = [p for p in ("youtube", "instagram", "facebook")
+                                  if (brief.get("platform_plan", {}).get(p, {}).get("enabled", True))
+                                  and p in [pl.lower() for pl in (ctx.platforms or [])]]
+            render_method = "none"
+            # Default to deterministic template rendering for consistency.
+            # AI image edits can be flashy/inconsistent, so keep them as fallback unless explicitly preferred.
+            ai_style_mode = str(os.environ.get("THUMB_AI_STYLE_MODE", "fallback")).strip().lower()
+            prefer_ai_edit = ai_style_mode in ("prefer_ai", "ai_first")
+            primary_styled: Optional[Path] = None  # Prefer YouTube for primary
+            youtube_frame_src: Optional[Path] = None
+            for platform in platforms_to_render:
+                out_name = f"thumb_styled_{platform}_{ctx.upload_id}.jpg"
+                out_path = ctx.temp_dir / out_name
+                ok = False
+                frame_src = best_path
+                if can_ai_style:
+                    try:
+                        comp_path = await _maybe_composite_viral_background(
+                            ctx, best_path, brief, platform, category
+                        )
+                        if comp_path and comp_path.exists():
+                            frame_src = comp_path
+                    except Exception as e:
+                        logger.debug("[thumbnail] bg composite not used: %s", e)
+                if prefer_ai_edit and can_ai_style and OPENAI_API_KEY:
+                    ok = await _ai_edit_thumbnail(frame_src, brief, out_path, retry_reduce=False)
+                    if not ok:
+                        ok = await _ai_edit_thumbnail(frame_src, brief, out_path, retry_reduce=True)
+                    if ok:
+                        render_method = "ai_edit"
+                if not ok and can_ai_style:
+                    ok = await _try_playwright_html_thumbnail(ctx, frame_src, brief, platform, out_path)
+                    if ok:
+                        render_method = "playwright_html"
+                if not ok:
+                    ok = _render_template_thumbnail(frame_src, brief, platform, out_path)
+                    if ok:
+                        render_method = "template"
+                if not ok and (not prefer_ai_edit) and can_ai_style and OPENAI_API_KEY:
+                    ok = await _ai_edit_thumbnail(frame_src, brief, out_path, retry_reduce=False)
+                    if not ok:
+                        ok = await _ai_edit_thumbnail(frame_src, brief, out_path, retry_reduce=True)
+                    if ok:
+                        render_method = "ai_edit"
+                if ok:
+                    platform_map[platform] = str(out_path)
+                    if primary_styled is None or platform == "youtube":
+                        primary_styled = out_path
+                    if platform == "youtube":
+                        youtube_frame_src = frame_src
+            if primary_styled and primary_styled.exists():
+                ctx.thumbnail_path = primary_styled
+                ctx.output_artifacts["thumbnail"] = str(primary_styled)
+
+            ctx.output_artifacts["thumbnail_render_method"] = render_method
+            ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_map)
+            # YouTube search-result size legibility (168×94 proxy)
+            try:
+                yt_local = platform_map.get("youtube")
+                if YOUTUBE_SEARCH_PREVIEW_QA and yt_local and Path(yt_local).exists():
+                    qa_prev = assess_youtube_search_preview_readability(Path(yt_local))
+                    ctx.output_artifacts["youtube_search_preview_qa_json"] = json.dumps(qa_prev)
+            except Exception as e:
+                logger.debug("[thumbnail] youtube preview QA skipped: %s", e)
+            # Extra YouTube JPEGs for Studio "Test & Compare" (manual — API has no thumbnailTests)
+            ab_extra = max(0, min(2, int(os.environ.get("YOUTUBE_THUMBNAIL_AB_EXTRA", "0") or 0)))
+            ab_enabled = os.environ.get("YOUTUBE_THUMBNAIL_AB_ENABLED", "false").lower() == "true"
+            if (
+                ab_enabled
+                and ab_extra > 0
+                and "youtube" in platform_map
+                and youtube_frame_src
+                and isinstance(brief, dict)
+            ):
+                opts = [str(x).strip() for x in (brief.get("headline_options") or []) if str(x).strip()]
+                main_h = str(brief.get("selected_headline") or "WATCH")[:80]
+                pool = ([main_h] + opts)[:6]
+                effects = ["glitch", "neon", "chrome"]
+                ab_list = []
+                for i in range(ab_extra):
+                    vb = copy.deepcopy(brief)
+                    alt = pool[(i + 1) % len(pool)] if len(pool) > 1 else main_h
+                    vb["selected_headline"] = alt[:80]
+                    vb["text_effect"] = effects[i % len(effects)]
+                    out_ab = ctx.temp_dir / f"thumb_styled_youtube_ab{i}_{ctx.upload_id}.jpg"
+                    ok_ab = False
+                    if prefer_ai_edit and can_ai_style and OPENAI_API_KEY:
+                        ok_ab = await _ai_edit_thumbnail(youtube_frame_src, vb, out_ab, retry_reduce=False)
+                        if not ok_ab:
+                            ok_ab = await _ai_edit_thumbnail(youtube_frame_src, vb, out_ab, retry_reduce=True)
+                    if not ok_ab and can_ai_style:
+                        ok_ab = await _try_playwright_html_thumbnail(
+                            ctx, youtube_frame_src, vb, "youtube", out_ab
+                        )
+                    if not ok_ab:
+                        ok_ab = _render_template_thumbnail(youtube_frame_src, vb, "youtube", out_ab)
+                    if not ok_ab and (not prefer_ai_edit) and can_ai_style and OPENAI_API_KEY:
+                        ok_ab = await _ai_edit_thumbnail(youtube_frame_src, vb, out_ab, retry_reduce=False)
+                        if not ok_ab:
+                            ok_ab = await _ai_edit_thumbnail(youtube_frame_src, vb, out_ab, retry_reduce=True)
+                    if ok_ab:
+                        ab_list.append(
+                            {
+                                "path": str(out_ab),
+                                "label": f"B{i + 1}",
+                                "headline": alt[:80],
+                                "text_effect": vb.get("text_effect"),
+                            }
+                        )
+                if ab_list:
+                    ctx.output_artifacts["youtube_thumbnail_ab_candidates"] = json.dumps(ab_list)
+                    ctx.output_artifacts["youtube_thumbnail_ab_note"] = (
+                        "Public YouTube Data API v3 supports thumbnails.set only. "
+                        "Use Studio Test & Compare with these extra JPEGs (R2 keys in worker)."
+                    )
+            style_meta = (brief.get("_render_meta") or {}) if isinstance(brief, dict) else {}
+            if isinstance(style_meta, dict) and style_meta:
+                ctx.output_artifacts["thumbnail_style_signatures"] = json.dumps(style_meta)
+                qa_rejections = (brief.get("_qa_rejections") or {}) if isinstance(brief, dict) else {}
+                if isinstance(qa_rejections, dict) and qa_rejections:
+                    try:
+                        ctx.output_artifacts["thumbnail_qa_rejections"] = json.dumps(qa_rejections)
+                    except Exception:
+                        pass
+                # Emit audit block for enterprise governance / dashboards.
+                try:
+                    policy = {}
+                    for p, md in style_meta.items():
+                        if not isinstance(md, dict):
+                            continue
+                        policy[p] = {
+                            "style_pack": str(md.get("style_pack") or ""),
+                            "signature": str(md.get("signature") or ""),
+                            "score": float(md.get("score") or 0.0),
+                            "entropy_before": float(md.get("entropy_before") or 0.0),
+                            "pack_repeat_limit": int(os.environ.get("THUMB_STYLE_PACK_REPEAT_LIMIT", "2") or 2),
+                            "entropy_floor": float(os.environ.get("THUMB_STYLE_ENTROPY_FLOOR", "0.72") or 0.72),
+                        }
+                    ctx.output_artifacts["thumbnail_style_policy"] = json.dumps(policy)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"[thumbnail] Styled thumbnail pipeline failed (non-fatal): {e}")
 
     logger.info(
         f"Thumbnail stage complete: {len(candidates)} frames, "

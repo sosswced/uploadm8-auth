@@ -23,6 +23,7 @@ import io
 import json
 import re
 import asyncio
+import socket
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +457,96 @@ admin_settings_cache: Dict[str, Any] = {
     "promo_burst_week_enabled": False,
     "promo_referral_enabled": False,
 }
+
+
+class DatabaseUnavailableError(RuntimeError):
+    """Raised when a request needs DB access but the pool is unavailable."""
+
+
+class _UnavailableDatabasePool:
+    """Drop-in pool placeholder that raises a clean 503 path on access."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def __bool__(self) -> bool:
+        # Keep "if not db_pool" checks working in helpers.
+        return False
+
+    def acquire(self, *args, **kwargs):
+        raise DatabaseUnavailableError(self.reason)
+
+    def get_size(self) -> int:
+        return 0
+
+    def get_idle_size(self) -> int:
+        return 0
+
+    async def close(self) -> None:
+        return None
+
+
+def _iter_exception_chain(exc: Exception):
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        yield cur
+        cur = cur.__cause__ or cur.__context__
+
+
+def _is_dns_resolution_error(exc: Exception) -> bool:
+    for e in _iter_exception_chain(exc):
+        if isinstance(e, socket.gaierror):
+            return True
+        msg = str(e).lower()
+        if (
+            "getaddrinfo failed" in msg
+            or "name or service not known" in msg
+            or "temporary failure in name resolution" in msg
+        ):
+            return True
+    return False
+
+
+async def _create_db_pool_with_retries(database_url: str, min_size: int, max_size: int) -> asyncpg.Pool:
+    retries_raw = os.environ.get("DB_CONNECT_RETRIES", "3").strip()
+    delay_raw = os.environ.get("DB_CONNECT_RETRY_DELAY_SECONDS", "1.5").strip()
+    try:
+        retries = max(1, int(retries_raw))
+    except Exception:
+        retries = 3
+    try:
+        base_delay = max(0.1, float(delay_raw))
+    except Exception:
+        base_delay = 1.5
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await asyncpg.create_pool(
+                database_url,
+                min_size=min_size,
+                max_size=max_size,
+                command_timeout=30,
+                init=_init_asyncpg_codecs,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= retries:
+                break
+            sleep_s = round(base_delay * attempt, 2)
+            logger.warning(
+                "Database connect attempt %s/%s failed: %s. Retrying in %.2fs",
+                attempt,
+                retries,
+                exc,
+                sleep_s,
+            )
+            await asyncio.sleep(sleep_s)
+
+    assert last_exc is not None
+    raise last_exc
 
 # Keep in sync with the highest migration tuple in run_migrations().
 MIGRATIONS_LATEST_VERSION = 818
@@ -1352,17 +1443,28 @@ async def lifespan(app: FastAPI):
     
     _db_min = int(os.environ.get("DB_POOL_MIN", "5"))
     _db_max = int(os.environ.get("DB_POOL_MAX", "20"))
-    db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=_db_min,
-        max_size=_db_max,
-        command_timeout=30,
-        init=_init_asyncpg_codecs,
-    )
-    await _load_uploads_columns(db_pool)
-    logger.info("Database connected")
-    
-    await run_migrations()
+    db_available = False
+    email_cron_task = None
+    try:
+        db_pool = await _create_db_pool_with_retries(DATABASE_URL, _db_min, _db_max)
+        await _load_uploads_columns(db_pool)
+        logger.info("Database connected")
+        db_available = True
+    except Exception as e:
+        if _is_dns_resolution_error(e):
+            reason = (
+                "Database hostname could not be resolved during startup. "
+                f"Starting in degraded mode. Original error: {type(e).__name__}: {e}"
+            )
+            db_pool = _UnavailableDatabasePool(reason)
+            logger.warning(reason)
+        else:
+            raise
+
+    if db_available:
+        await run_migrations()
+    else:
+        logger.warning("Skipping DB migrations and DB-dependent startup tasks while database is unavailable.")
 
     logger.info(
         "Rate limits: profile=%s window=%ss global=%s login=%s auth=%s admin=%s presign=%s "
@@ -1387,37 +1489,42 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Redis failed: {e}")
     
-    try:
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT settings_json FROM admin_settings WHERE id = 1")
-            if row and row["settings_json"]:
-                admin_settings_cache.update(json.loads(row["settings_json"]))
-                admin_settings_cache.setdefault("promo_burst_week_enabled", False)
-                admin_settings_cache.setdefault("promo_referral_enabled", False)
-    except Exception: pass
-    
-    if BOOTSTRAP_ADMIN_EMAIL:
-        async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE users SET role='master_admin', subscription_tier='master_admin' WHERE LOWER(email)=$1", BOOTSTRAP_ADMIN_EMAIL)
-    
-    # Seed trill places for geo-targeting
-    try:
-        async with db_pool.acquire() as conn:
-            await seed_trill_places(conn)
-            logger.info("Trill places seeded")
-    except Exception as e:
-        logger.warning(f"Trill places seeding failed: {e}")
-    
-    email_cron_task = asyncio.create_task(_email_cron_loop())
+    if db_available:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT settings_json FROM admin_settings WHERE id = 1")
+                if row and row["settings_json"]:
+                    admin_settings_cache.update(json.loads(row["settings_json"]))
+                    admin_settings_cache.setdefault("promo_burst_week_enabled", False)
+                    admin_settings_cache.setdefault("promo_referral_enabled", False)
+        except Exception:
+            pass
+
+        if BOOTSTRAP_ADMIN_EMAIL:
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET role='master_admin', subscription_tier='master_admin' WHERE LOWER(email)=$1", BOOTSTRAP_ADMIN_EMAIL)
+
+        # Seed trill places for geo-targeting
+        try:
+            async with db_pool.acquire() as conn:
+                await seed_trill_places(conn)
+                logger.info("Trill places seeded")
+        except Exception as e:
+            logger.warning(f"Trill places seeding failed: {e}")
+
+        email_cron_task = asyncio.create_task(_email_cron_loop())
+    else:
+        logger.warning("Email cron disabled until database connectivity is restored.")
 
     try:
         yield
     finally:
-        email_cron_task.cancel()
-        try:
-            await email_cron_task
-        except asyncio.CancelledError:
-            pass
+        if email_cron_task:
+            email_cron_task.cancel()
+            try:
+                await email_cron_task
+            except asyncio.CancelledError:
+                pass
         if db_pool:
             await db_pool.close()
         if redis_client:
@@ -2349,6 +2456,20 @@ app = FastAPI(title="UploadM8 API", version="4.0.0", lifespan=lifespan)
 # would then see OPTIONS preflights before CORS short-circuits them → 429 breaks CORS.
 # CORS is registered once after all @app.middleware hooks (see below).
 
+
+@app.exception_handler(DatabaseUnavailableError)
+async def _db_unavailable_handler(request: Request, exc: DatabaseUnavailableError) -> JSONResponse:
+    cors_origin = _cors_reflect_origin(request)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database unavailable", "reason": str(exc)},
+        headers={
+            "Access-Control-Allow-Origin": cors_origin,
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
+
+
 # ── CORS-safe exception handler ──────────────────────────────────────────────
 # FastAPI's CORSMiddleware does NOT add Access-Control-Allow-Origin to 500
 # responses when an unhandled exception propagates — the browser then reports
@@ -3255,13 +3376,20 @@ async def readiness():
     checks = {}
     healthy = True
 
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        checks["database"] = "ok"
-    except Exception as e:
-        checks["database"] = f"error: {e}"
+    if isinstance(db_pool, _UnavailableDatabasePool):
+        checks["database"] = f"error: {db_pool.reason}"
         healthy = False
+    elif not db_pool:
+        checks["database"] = "error: database pool not initialised"
+        healthy = False
+    else:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            checks["database"] = "ok"
+        except Exception as e:
+            checks["database"] = f"error: {e}"
+            healthy = False
 
     if redis_client:
         try:
@@ -3286,6 +3414,10 @@ async def metrics(request: Request):
     metrics_key = os.environ.get("METRICS_API_KEY", "")
     if metrics_key and auth != f"Bearer {metrics_key}":
         raise HTTPException(403, "Forbidden")
+    if isinstance(db_pool, _UnavailableDatabasePool):
+        raise HTTPException(503, f"Database unavailable: {db_pool.reason}")
+    if not db_pool:
+        raise HTTPException(503, "Database unavailable: pool not initialised")
     try:
         async with db_pool.acquire() as conn:
             total_users = await conn.fetchval("SELECT COUNT(*) FROM users")

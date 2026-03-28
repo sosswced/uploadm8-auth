@@ -55,6 +55,21 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
     """
     result: dict = {}
 
+    def _has_content(v, is_platform_map: bool = False) -> bool:
+        if v is None:
+            return False
+        if is_platform_map and isinstance(v, dict):
+            return any(
+                (isinstance(x, list) and len(x) > 0)
+                or (isinstance(x, str) and x.strip())
+                for x in (v.values() or [])
+            )
+        if isinstance(v, (list, tuple)):
+            return len(v) > 0
+        if isinstance(v, dict):
+            return len(v) > 0
+        return bool(v)
+
     async with pool.acquire() as conn:
         # ── 1. user_settings table ────────────────────────────────────────
         try:
@@ -134,6 +149,12 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         if val is None:
                             val = prefs.get(snake)
                         if val is not None:
+                            # Do not let empty hashtag prefs from users.preferences
+                            # wipe non-empty platform/always/blocked tags from user_preferences.
+                            if snake in ("always_hashtags", "blocked_hashtags") and not _has_content(val):
+                                continue
+                            if snake == "platform_hashtags" and not _has_content(val, is_platform_map=True):
+                                continue
                             # Frontend values override worker-side settings rows
                             result[camel] = val
                             result[snake] = val
@@ -1143,6 +1164,45 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
 # ============================================================
 # Publish Attempts / Ledger (used by publish_stage + verify_stage)
 # ============================================================
+
+async def write_system_event_log(
+    pool: asyncpg.Pool,
+    *,
+    user_id: str,
+    event_category: str,
+    action: str,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    details: Optional[dict] = None,
+    severity: str = "INFO",
+    outcome: str = "SUCCESS",
+):
+    """Write a user-facing audit event to system_event_log (non-fatal best effort)."""
+    try:
+        async with pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO system_event_log
+                        (user_id, event_category, action, resource_type, resource_id,
+                         details, severity, outcome, created_at)
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7, $8, NOW())
+                    """,
+                    user_id,
+                    event_category,
+                    action,
+                    resource_type,
+                    resource_id,
+                    json.dumps(details or {}),
+                    severity,
+                    outcome,
+                )
+            except asyncpg.exceptions.UndefinedTableError:
+                # Older DBs may not have migration 700 yet.
+                return
+    except Exception as e:
+        logger.debug(f"write_system_event_log failed (non-fatal): {e}")
+
 
 async def insert_publish_attempt(
     pool: asyncpg.Pool,

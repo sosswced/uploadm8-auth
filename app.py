@@ -97,6 +97,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 from decimal import Decimal
+from html import escape
 from ipaddress import ip_address
 from urllib.parse import urlencode, quote, urlsplit, urlunsplit, parse_qsl, urlparse
 
@@ -562,6 +563,7 @@ from stages.emails import (
     send_report_ready_email,
     send_scheduled_publish_alert_email,
 )
+from stages.emails.base import send_email, MAIL_FROM_SUPPORT, URL_BILLING, URL_SETTINGS, SUPPORT_EMAIL
 
 # ============================================================
 # Helpers
@@ -1200,6 +1202,18 @@ class SettingsUpdate(BaseModel):
 class CheckoutRequest(BaseModel):
     lookup_key: str
     kind: str = "subscription"  # subscription | topup | addon
+
+
+class BillingSubscriptionActionRequest(BaseModel):
+    action: Literal[
+        "pause_payment_collection",
+        "share_payment_update_link",
+        "create_one_time_invoice",
+        "cancel_subscription",
+    ]
+    amount_cents: Optional[int] = Field(default=None, ge=100, le=5000000)
+    currency: str = "usd"
+    description: Optional[str] = None
 
 
 class UploadCostEstimateRequest(BaseModel):
@@ -3518,18 +3532,28 @@ async def refresh(data: RefreshRequest):
 @app.post("/api/auth/logout")
 async def logout(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
+        prow = await conn.fetch(
+            "SELECT DISTINCT platform FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            user["id"],
+        )
+        connected_platforms = [str(r["platform"]) for r in prow if r.get("platform")]
         await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", user["id"])
-    return {"status": "logged_out"}
+    return {"status": "logged_out", "connected_platforms": connected_platforms}
 
 @app.post("/api/auth/logout-all")
 async def logout_all(user: dict = Depends(get_current_user)):
     """Revoke all refresh tokens for current user (log out all devices)."""
     async with db_pool.acquire() as conn:
+        prow = await conn.fetch(
+            "SELECT DISTINCT platform FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            user["id"],
+        )
+        connected_platforms = [str(r["platform"]) for r in prow if r.get("platform")]
         await conn.execute(
             "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
             user["id"],
         )
-    return {"status": "logged_out_all"}
+    return {"status": "logged_out_all", "connected_platforms": connected_platforms}
 
 
 
@@ -4460,36 +4484,70 @@ async def delete_account(request: Request, user: dict = Depends(get_current_user
 async def get_wallet_endpoint(user: dict = Depends(get_current_user)):
     plan = get_plan(user.get("subscription_tier", "free"))
     promo_defaults = {
-        "promo_burst_week_enabled": admin_settings_cache.get("promo_burst_week_enabled", False),
-        "promo_referral_enabled": admin_settings_cache.get("promo_referral_enabled", False),
+        "promo_burst_week_enabled": bool(admin_settings_cache.get("promo_burst_week_enabled", False)),
+        "promo_referral_enabled": bool(admin_settings_cache.get("promo_referral_enabled", False)),
     }
-    async with db_pool.acquire() as conn:
-        wallet = await get_wallet(conn, user["id"])
-        ledger = await conn.fetch(
-            "SELECT * FROM token_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
-            user["id"],
-        )
-        settings_row = None
-        try:
-            settings_row = await conn.fetchrow(
-                """
-                SELECT auto_generate_captions, auto_generate_hashtags, auto_generate_thumbnails
-                FROM user_settings WHERE user_id = $1
-                """,
-                user["id"],
-            )
-        except Exception:
-            pass
-        marketing = await build_wallet_marketing_payload(
-            conn,
-            str(user["id"]),
-            user.get("subscription_tier"),
-            wallet,
-            plan,
-            dict(settings_row) if settings_row else None,
-            {**promo_defaults, **admin_settings_cache},
-            bool(user.get("flex_enabled")),
-        )
+    fallback_wallet = {"put_balance": 0, "aic_balance": 0, "put_reserved": 0, "aic_reserved": 0}
+    fallback_marketing = {
+        "burn_put_pct": 0.0,
+        "burn_aic_pct": 0.0,
+        "put_capacity": int(plan.get("put_monthly", 30) or 30),
+        "aic_capacity": int(plan.get("aic_monthly", 0) or 0),
+        "ai_enabled": True,
+        "banners": [],
+        "links": {"topup": "/settings.html#billing", "upgrade": "/settings.html#billing"},
+        "period_start": None,
+        "put_spent_period": 0,
+        "aic_spent_period": 0,
+        "put_available": 0,
+        "aic_available": 0,
+        "sales_opportunities": [],
+        "experiments": {},
+        "suppression": {},
+    }
+
+    try:
+        async with db_pool.acquire() as conn:
+            wallet = await get_wallet(conn, user["id"])
+            try:
+                ledger = await conn.fetch(
+                    "SELECT * FROM token_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
+                    user["id"],
+                )
+            except Exception:
+                ledger = []
+
+            settings_row = None
+            try:
+                settings_row = await conn.fetchrow(
+                    """
+                    SELECT auto_generate_captions, auto_generate_hashtags, auto_generate_thumbnails
+                    FROM user_settings WHERE user_id = $1
+                    """,
+                    user["id"],
+                )
+            except Exception:
+                pass
+            try:
+                marketing = await build_wallet_marketing_payload(
+                    conn,
+                    str(user["id"]),
+                    user.get("subscription_tier"),
+                    wallet,
+                    plan,
+                    dict(settings_row) if settings_row else None,
+                    {**promo_defaults, **admin_settings_cache},
+                    bool(user.get("flex_enabled")),
+                )
+            except Exception as e:
+                logger.error(f"/api/wallet marketing payload failed user={user.get('id')}: {e}")
+                marketing = fallback_marketing
+    except Exception as e:
+        logger.error(f"/api/wallet failed user={user.get('id')}: {e}")
+        wallet = fallback_wallet
+        ledger = []
+        marketing = fallback_marketing
+
     return {
         "wallet": wallet,
         "plan_limits": {
@@ -4498,16 +4556,16 @@ async def get_wallet_endpoint(user: dict = Depends(get_current_user)):
             "aic_monthly": plan.get("aic_monthly", 0),
         },
         "ledger": [dict(l) for l in ledger],
-        "burn_put_pct": marketing["burn_put_pct"],
-        "burn_aic_pct": marketing["burn_aic_pct"],
-        "put_capacity": marketing["put_capacity"],
-        "aic_capacity": marketing["aic_capacity"],
-        "ai_enabled": marketing["ai_enabled"],
-        "banners": marketing["banners"],
+        "burn_put_pct": marketing.get("burn_put_pct", 0.0),
+        "burn_aic_pct": marketing.get("burn_aic_pct", 0.0),
+        "put_capacity": marketing.get("put_capacity", int(plan.get("put_monthly", 30) or 30)),
+        "aic_capacity": marketing.get("aic_capacity", int(plan.get("aic_monthly", 0) or 0)),
+        "ai_enabled": bool(marketing.get("ai_enabled", True)),
+        "banners": marketing.get("banners", []),
         "links": marketing.get("links", {}),
         "period_start": marketing.get("period_start"),
-        "put_spent_period": marketing.get("put_spent_period"),
-        "aic_spent_period": marketing.get("aic_spent_period"),
+        "put_spent_period": marketing.get("put_spent_period", 0),
+        "aic_spent_period": marketing.get("aic_spent_period", 0),
         "put_available": marketing.get("put_available"),
         "aic_available": marketing.get("aic_available"),
         "sales_opportunities": marketing.get("sales_opportunities", []),
@@ -5052,9 +5110,10 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
         if user_prefs.get("ai_hashtags_enabled") and plan.get("ai"):
             pass  # ai_hashtags merged into ctx later by caption_stage
 
-        # Step 3: Deduplicate, strip blocked, enforce limit — always runs.
-        blocked = set(_to_hash_tags(user_prefs.get("blocked_hashtags", []) or user_prefs.get("blockedHashtags", [])))
-        combined = [h for h in combined if h and h not in blocked]
+        # Step 3: Deduplicate + enforce limit.
+        # NOTE: For single-video manual metadata, do not remove user-entered tags
+        # based on saved blocked settings. Blocked tags are an AI/settings guardrail
+        # and are applied in context layering for non-manual sources.
         data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 15))]
 
         # Each account has unique platform_tokens.id; dedupe target_accounts to avoid duplicate publishes
@@ -5488,6 +5547,31 @@ _STATUS_LABEL = {
 }
 
 
+def _rollup_engagement_from_platform_results(entries: list) -> dict[str, int]:
+    """Sum per-platform metrics stored on platform_results when uploads.views/likes are stale."""
+    tv = tl = tc = ts = 0
+    if not entries:
+        return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+
+    def _pick_int(d: dict, *keys: str) -> int:
+        for k in keys:
+            if k in d and d[k] is not None:
+                try:
+                    return int(d[k] or 0)
+                except Exception:
+                    return 0
+        return 0
+
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        tv += _pick_int(e, "views", "play_count", "playCount", "video_views")
+        tl += _pick_int(e, "likes", "like_count", "likeCount")
+        tc += _pick_int(e, "comments", "comment_count", "commentCount")
+        ts += _pick_int(e, "shares", "share_count", "shareCount")
+    return {"views": tv, "likes": tl, "comments": tc, "shares": ts}
+
+
 async def _enrich_platform_results(conn, upload_row: dict, user_id: str) -> list:
     """
     Return platform_results as a flat list. Each entry enriched with
@@ -5888,6 +5972,11 @@ async def get_uploads(
 
             hashtags = _normalize_hashtags(d.get("hashtags"))
             platform_results = enriched_map.get(str(d.get("id")), [])
+            rollup = _rollup_engagement_from_platform_results(platform_results)
+            v_row = int(d.get("views") or 0)
+            l_row = int(d.get("likes") or 0)
+            c_row = int(d.get("comments") or 0)
+            s_row = int(d.get("shares") or 0)
 
             raw_status = d.get("status") or ""
             item = {
@@ -5919,10 +6008,10 @@ async def get_uploads(
                 "platform_results": platform_results,
 
                 "file_size": d.get("file_size"),
-                "views":    int(d.get("views")    or 0),
-                "likes":    int(d.get("likes")    or 0),
-                "comments": int(d.get("comments") or 0),
-                "shares":   int(d.get("shares")   or 0),
+                "views":    max(v_row, rollup["views"]),
+                "likes":    max(l_row, rollup["likes"]),
+                "comments": max(c_row, rollup["comments"]),
+                "shares":   max(s_row, rollup["shares"]),
 
                 "progress": int(d.get("processing_progress") or 0),
                 "current_stage": d.get("processing_stage"),
@@ -7191,15 +7280,33 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             # #endregion
             up = _parse_users_preferences(users_prefs) if users_prefs else {}
             if up:
+                def _has_content(v, is_platform_map: bool = False) -> bool:
+                    if v is None:
+                        return False
+                    if is_platform_map and isinstance(v, dict):
+                        return any(
+                            (isinstance(x, list) and len(x) > 0)
+                            or (isinstance(x, str) and x.strip())
+                            for x in (v.values() or [])
+                        )
+                    if isinstance(v, (list, tuple)):
+                        return len(v) > 0
+                    if isinstance(v, dict):
+                        return len(v) > 0
+                    return bool(v)
+
                 if up.get("alwaysHashtags") is not None or up.get("always_hashtags") is not None:
                     v = up.get("alwaysHashtags") or up.get("always_hashtags")
-                    out["alwaysHashtags"] = v if isinstance(v, list) else []
+                    if _has_content(v):
+                        out["alwaysHashtags"] = v if isinstance(v, list) else []
                 if up.get("blockedHashtags") is not None or up.get("blocked_hashtags") is not None:
                     v = up.get("blockedHashtags") or up.get("blocked_hashtags")
-                    out["blockedHashtags"] = v if isinstance(v, list) else []
+                    if _has_content(v):
+                        out["blockedHashtags"] = v if isinstance(v, list) else []
                 if up.get("platformHashtags") is not None or up.get("platform_hashtags") is not None:
                     v = up.get("platformHashtags") or up.get("platform_hashtags")
-                    out["platformHashtags"] = v if isinstance(v, dict) else {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
+                    if _has_content(v, is_platform_map=True):
+                        out["platformHashtags"] = v if isinstance(v, dict) else {"tiktok": [], "youtube": [], "instagram": [], "facebook": []}
                 if up.get("maxHashtags") is not None or up.get("max_hashtags") is not None:
                     out["maxHashtags"] = str(up.get("maxHashtags") or up.get("max_hashtags") or 15)
                 if up.get("aiHashtagCount") is not None or up.get("ai_hashtag_count") is not None:
@@ -7611,6 +7718,22 @@ def _overlay_users_prefs_on_result(result: dict, up: dict) -> None:
     """Overlay users.preferences onto result. users.preferences wins for all fields."""
     if not isinstance(up, dict) or not up:
         return
+
+    def _has_content(v, is_platform_map: bool = False) -> bool:
+        if v is None:
+            return False
+        if is_platform_map and isinstance(v, dict):
+            return any(
+                (isinstance(x, list) and len(x) > 0)
+                or (isinstance(x, str) and x.strip())
+                for x in (v.values() or [])
+            )
+        if isinstance(v, (list, tuple)):
+            return len(v) > 0
+        if isinstance(v, dict):
+            return len(v) > 0
+        return bool(v)
+
     # Hashtag fields
     for camel, snake, key in [
         ("alwaysHashtags", "always_hashtags", "always_hashtags"),
@@ -7618,7 +7741,8 @@ def _overlay_users_prefs_on_result(result: dict, up: dict) -> None:
         ("platformHashtags", "platform_hashtags", "platform_hashtags"),
     ]:
         v = up.get(camel) if up.get(camel) is not None else up.get(snake)
-        if v is not None:
+        is_platform_map = key == "platform_hashtags"
+        if _has_content(v, is_platform_map=is_platform_map):
             result[camel] = result[key] = v
     # Scalar prefs from users.preferences
     for camel, snake in [
@@ -8043,7 +8167,17 @@ async def disconnect_account(
                                         "provider_revoked": ok, "provider_error": err},
                                severity="WARNING")
 
-    return {"status": "disconnected", "provider_revoked": ok}
+        removed_token_id = str(row["id"])
+        removed_platform = str(row["platform"] or "")
+
+    try:
+        from services.platform_metrics_job import prune_platform_metrics_cache_for_disconnected_token
+
+        await prune_platform_metrics_cache_for_disconnected_token(db_pool, user["id"], removed_token_id)
+    except Exception as e:
+        logger.warning(f"[disconnect] metrics cache prune failed user={user['id']} token={removed_token_id}: {e}")
+
+    return {"status": "disconnected", "provider_revoked": ok, "platform": removed_platform}
 
 
 @app.delete("/api/platform-accounts/{account_id}")
@@ -8136,6 +8270,43 @@ async def _oauth_state_pop(key: str) -> dict | None:
             pass
     return _oauth_states_mem.pop(key, None)
 
+
+def _sanitize_oauth_login_hint(raw: Optional[str]) -> Optional[str]:
+    """Conservative Google OAuth login_hint (email-shaped ASCII only)."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if len(s) < 3 or len(s) > 254 or "@" not in s:
+        return None
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@._+-")
+    if not all(c in allowed for c in s):
+        return None
+    return s
+
+
+def _oauth_verify_resolved_account(
+    *,
+    oauth_mode: str,
+    expected_account_id: Optional[str],
+    resolved_account_id: Any,
+    platform: str,
+) -> None:
+    """Reconnect flows must not silently bind a different provider identity."""
+    if oauth_mode != "reconnect" or not expected_account_id:
+        return
+    if str(resolved_account_id or "").strip() != str(expected_account_id).strip():
+        label = {
+            "youtube": "YouTube channel",
+            "tiktok": "TikTok account",
+            "instagram": "Instagram account",
+            "facebook": "Facebook Page",
+        }.get(platform, "account")
+        raise Exception(
+            f"That is not the same {label} you started reconnecting. "
+            "Sign in with the original profile, or disconnect and connect this one as new."
+        )
+
+
 # OAuth credentials from environment
 # TikTok
 # OAuth credentials from environment
@@ -8202,6 +8373,19 @@ def _sanitize_oauth_parent_origin(raw: Optional[str]) -> str:
 async def oauth_start(
     platform: str,
     parent_origin: Optional[str] = Query(None),
+    force_login: bool = Query(False, description="Force account chooser/reauth where provider supports it"),
+    mode: Optional[str] = Query(
+        None,
+        description="connect (default) | reconnect — reconnect requires reconnect_token_id",
+    ),
+    reconnect_token_id: Optional[str] = Query(
+        None,
+        description="platform_tokens row id; server loads expected provider account_id for strict reconnect",
+    ),
+    login_hint: Optional[str] = Query(
+        None,
+        description="Optional Google account email hint (YouTube only)",
+    ),
     user: dict = Depends(get_current_user),
 ):
     """Start OAuth flow for a platform"""
@@ -8210,6 +8394,37 @@ async def oauth_start(
 
     # Account limits are enforced in the OAuth callback on *new* rows only, so users at the limit
     # can still reconnect (UPDATE) existing platform identities.
+
+    oauth_mode = (mode or "connect").strip().lower()
+    if oauth_mode not in ("connect", "reconnect"):
+        oauth_mode = "connect"
+
+    expected_account_id: Optional[str] = None
+    if reconnect_token_id:
+        try:
+            uuid.UUID(str(reconnect_token_id))
+        except Exception:
+            raise HTTPException(400, "Invalid reconnect_token_id")
+        async with db_pool.acquire() as conn:
+            trow = await conn.fetchrow(
+                """
+                SELECT id, platform, account_id
+                  FROM platform_tokens
+                 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+                """,
+                reconnect_token_id,
+                user["id"],
+            )
+        if not trow:
+            raise HTTPException(404, "Connection not found or already removed")
+        if str(trow["platform"] or "").lower() != platform:
+            raise HTTPException(400, "That saved connection is not for this platform")
+        expected_account_id = str(trow["account_id"] or "").strip() or None
+        if not expected_account_id:
+            raise HTTPException(400, "Saved connection has no provider id; disconnect and connect again")
+        oauth_mode = "reconnect"
+    elif oauth_mode == "reconnect":
+        raise HTTPException(400, "reconnect_token_id is required for reconnect mode")
 
     config = OAUTH_CONFIG[platform]
     state = secrets.token_urlsafe(32)
@@ -8220,6 +8435,8 @@ async def oauth_start(
         "platform": platform,
         "created_at": _now_utc().isoformat(),
         "parent_origin": _sanitize_oauth_parent_origin(parent_origin),
+        "oauth_mode": oauth_mode,
+        "expected_account_id": expected_account_id,
     })
     
     redirect_uri = get_oauth_redirect_uri(platform)
@@ -8232,7 +8449,12 @@ async def oauth_start(
             "redirect_uri": redirect_uri,
             "state": state,
         }
+        if force_login:
+            params["prompt"] = "login"
     elif platform == "youtube":
+        lh = _sanitize_oauth_login_hint(login_hint)
+        # select_account: picker; consent: refresh grants; login: re-auth (pair with force_login)
+        prompt = "select_account consent login" if force_login else "select_account consent"
         params = {
             "client_id": YOUTUBE_CLIENT_ID,
             "redirect_uri": redirect_uri,
@@ -8240,8 +8462,10 @@ async def oauth_start(
             "scope": config["scope"],
             "state": state,
             "access_type": "offline",
-            "prompt": "select_account consent",  # Forces account picker + fresh consent
+            "prompt": prompt,
         }
+        if lh:
+            params["login_hint"] = lh
     elif platform == "instagram":
         params = {
             "client_id": INSTAGRAM_CLIENT_ID,
@@ -8249,8 +8473,10 @@ async def oauth_start(
             "scope": config["scope"],
             "response_type": "code",
             "state": state,
-            "auth_type": "rerequest",  # Force re-authentication
+            "auth_type": "reauthenticate" if force_login else "rerequest",
         }
+        if force_login:
+            params["auth_nonce"] = secrets.token_hex(12)
     elif platform == "facebook":
         params = {
             "client_id": FACEBOOK_CLIENT_ID,
@@ -8258,8 +8484,10 @@ async def oauth_start(
             "scope": config["scope"],
             "response_type": "code",
             "state": state,
-            "auth_type": "rerequest",  # Force re-authentication
+            "auth_type": "reauthenticate" if force_login else "rerequest",
         }
+        if force_login:
+            params["auth_nonce"] = secrets.token_hex(12)
     
     auth_url = f"{config['auth_url']}?{urlencode(params)}"
     return {"auth_url": auth_url, "state": state}
@@ -8271,7 +8499,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
     state_data = None
     if state:
         state_data = await _oauth_state_pop(state)
-        post_target = _sanitize_oauth_parent_origin(state_data.get("parent_origin"))
+        post_target = _sanitize_oauth_parent_origin((state_data or {}).get("parent_origin"))
 
     def popup_response(success: bool, platform: str, error_msg: str = None):
         """Generate HTML that posts message to parent window and closes popup"""
@@ -8308,6 +8536,13 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
         return popup_response(False, platform, "Invalid or expired session. Please try again.")
 
     user_id = state_data["user_id"]
+    oauth_mode = (state_data.get("oauth_mode") or "connect").strip().lower()
+    if oauth_mode not in ("connect", "reconnect"):
+        oauth_mode = "connect"
+    _exp = state_data.get("expected_account_id")
+    expected_account_id = str(_exp).strip() if _exp else None
+    if not expected_account_id:
+        expected_account_id = None
 
     if not code:
         return popup_response(False, platform, "No authorization code received")
@@ -8328,14 +8563,15 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 })
                 token_data = token_response.json()
                 access_token = token_data.get("access_token")
-                account_id = (
+                account_id = str(
                     token_data.get("open_id")
                     or (token_data.get("data") or {}).get("open_id")
-                    or secrets.token_hex(8)
-                )
+                    or ""
+                ).strip()
                 account_name = "TikTok User"
                 account_username = ""
                 account_avatar = ""
+                user_obj: dict = {}
                 # TikTok v2 user info requires POST + JSON body (GET with query params returns errors).
                 if access_token:
                     try:
@@ -8384,6 +8620,41 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                             account_avatar = avatar_url
                     except Exception as e:
                         logger.warning(f"TikTok user info fetch failed (non-fatal): {e}")
+
+                    # Some app configurations / API versions accept GET + query fields when POST fails.
+                    if access_token and (not account_username or account_name == "TikTok User"):
+                        try:
+                            ui_get = await client.get(
+                                "https://open.tiktokapis.com/v2/user/info/",
+                                params={
+                                    "fields": "display_name,username,avatar_url,avatar_url_100,avatar_large_url,open_id",
+                                },
+                                headers={"Authorization": f"Bearer {access_token}"},
+                            )
+                            gbody = ui_get.json() if ui_get.content else {}
+                            if ui_get.status_code == 200:
+                                user_obj = (gbody.get("data") or {}).get("user") or gbody.get("user") or {}
+                                display_name = (user_obj.get("display_name") or "").strip()
+                                username = (user_obj.get("username") or "").strip()
+                                avatar_url = (
+                                    (user_obj.get("avatar_large_url") or "").strip()
+                                    or (user_obj.get("avatar_url_100") or "").strip()
+                                    or (user_obj.get("avatar_url") or "").strip()
+                                )
+                                if display_name:
+                                    account_name = display_name
+                                if username:
+                                    account_username = username
+                                elif display_name:
+                                    account_username = display_name
+                                if avatar_url:
+                                    account_avatar = avatar_url
+                        except Exception as e2:
+                            logger.debug(f"TikTok user info GET fallback skipped: {e2}")
+
+                    u_open = (user_obj.get("open_id") or "").strip()
+                    if u_open:
+                        account_id = u_open
                 
             elif platform == "youtube":
                 token_response = await client.post(config["token_url"], data={
@@ -8396,25 +8667,46 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 token_data = token_response.json()
                 access_token = token_data.get("access_token")
                 
-                # Get channel info
-                user_response = await client.get(
-                    "https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true",
-                    headers={"Authorization": f"Bearer {access_token}"}
+                ch_resp = await client.get(
+                    "https://www.googleapis.com/youtube/v3/channels",
+                    params={"part": "snippet", "mine": "true", "maxResults": "50"},
+                    headers={"Authorization": f"Bearer {access_token}"},
                 )
-                channels = user_response.json().get("items", [])
-                if channels:
-                    channel = channels[0]
-                    snippet = channel.get("snippet", {})
-                    account_id = channel.get("id")
-                    account_name = snippet.get("title", "YouTube Channel")
-                    # customUrl can be empty for channels without custom URL; use channel title as fallback
-                    account_username = (snippet.get("customUrl") or "").strip() or account_name
-                    account_avatar = snippet.get("thumbnails", {}).get("default", {}).get("url", "")
-                else:
-                    account_id = secrets.token_hex(8)
-                    account_name = "YouTube Channel"
-                    account_username = ""
-                    account_avatar = ""
+                ch_payload = ch_resp.json() if ch_resp.content else {}
+                if ch_resp.status_code != 200:
+                    err_msg = (ch_payload.get("error") or {}).get("message") if isinstance(ch_payload.get("error"), dict) else None
+                    raise Exception(err_msg or "Could not load YouTube channels for this Google account.")
+                channels = ch_payload.get("items") or []
+                channel = None
+                if oauth_mode == "reconnect" and expected_account_id:
+                    channel = next((c for c in channels if c.get("id") == expected_account_id), None)
+                    if not channel:
+                        raise Exception(
+                            "That YouTube channel was not found for the Google account you signed in with. "
+                            "Use the same Google login that owns this channel."
+                        )
+                elif channels:
+                    if len(channels) == 1:
+                        channel = channels[0]
+                    else:
+                        channels_sorted = sorted(channels, key=lambda c: c.get("id") or "")
+                        channel = channels_sorted[0]
+                        logger.warning(
+                            "YouTube OAuth connect: user %s has %s channels on one login; using channel %s",
+                            user_id,
+                            len(channels),
+                            channel.get("id"),
+                        )
+                if not channel:
+                    raise Exception(
+                        "No YouTube channel found for this Google account. "
+                        "Create a channel in YouTube Studio, then try again."
+                    )
+                snippet = channel.get("snippet", {})
+                account_id = channel.get("id")
+                account_name = snippet.get("title", "YouTube Channel")
+                account_username = (snippet.get("customUrl") or "").strip() or account_name
+                account_avatar = snippet.get("thumbnails", {}).get("default", {}).get("url", "")
                     
             elif platform == "instagram":
                 # Instagram Graph API: authenticate via Facebook, get Instagram Business Account
@@ -8440,36 +8732,40 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 if not pages:
                     raise Exception("No Facebook Pages found. You need a Facebook Page connected to an Instagram Business account.")
                 
-                # Find Instagram Business Account connected to any page
-                instagram_account = None
-                page_access_token = None
-                
+                candidates: list = []
                 for page in pages:
                     page_id = page.get("id")
                     page_token = page.get("access_token")
-                    
-                    # Check if this page has an Instagram Business Account
                     ig_response = await client.get(
                         f"https://graph.facebook.com/v18.0/{page_id}?fields=instagram_business_account&access_token={page_token}"
                     )
                     ig_data = ig_response.json()
-                    
-                    if "instagram_business_account" in ig_data:
-                        ig_account_id = ig_data["instagram_business_account"]["id"]
-                        
-                        # Get Instagram account details
-                        ig_details_response = await client.get(
-                            f"https://graph.facebook.com/v18.0/{ig_account_id}?fields=id,username,name,profile_picture_url&access_token={page_token}"
-                        )
-                        ig_details = ig_details_response.json()
-                        
-                        instagram_account = ig_details
-                        page_access_token = page_token
-                        break
-                
-                if not instagram_account:
+                    if "instagram_business_account" not in ig_data:
+                        continue
+                    ig_account_id = ig_data["instagram_business_account"]["id"]
+                    ig_details_response = await client.get(
+                        f"https://graph.facebook.com/v18.0/{ig_account_id}?fields=id,username,name,profile_picture_url&access_token={page_token}"
+                    )
+                    ig_details = ig_details_response.json()
+                    candidates.append((ig_details, page_token))
+
+                if not candidates:
                     raise Exception("No Instagram Business account found connected to your Facebook Pages. Connect your Instagram Business/Creator account to a Facebook Page first.")
-                
+
+                if oauth_mode == "reconnect" and expected_account_id:
+                    pair = next(
+                        (c for c in candidates if str((c[0] or {}).get("id") or "") == str(expected_account_id)),
+                        None,
+                    )
+                    if not pair:
+                        raise Exception(
+                            "That Instagram account was not found for the Facebook login you used. "
+                            "Use the Meta login that owns this profile, or disconnect and connect again."
+                        )
+                    instagram_account, page_access_token = pair
+                else:
+                    instagram_account, page_access_token = candidates[0]
+
                 account_id = instagram_account.get("id")
                 account_name = instagram_account.get("name") or instagram_account.get("username", "Instagram Account")
                 # username can be empty for some accounts; use name as fallback for display
@@ -8505,8 +8801,16 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                         "Create a Page at facebook.com/pages/create and try again."
                     )
 
-                # Use the first Page
-                page = pages[0]
+                page = None
+                if oauth_mode == "reconnect" and expected_account_id:
+                    page = next((p for p in pages if str(p.get("id") or "") == str(expected_account_id)), None)
+                    if not page:
+                        raise Exception(
+                            "That Facebook Page was not found for the account you signed in with. "
+                            "Use the Facebook login that manages this Page, or disconnect and connect again."
+                        )
+                else:
+                    page = pages[0]
                 account_id    = page["id"]                                         # Page ID
                 account_name  = page.get("name", "Facebook Page")
                 # Page username (e.g. for facebook.com/PageName); fallback to page name when empty
@@ -8529,6 +8833,13 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 except Exception as _av_e:
                     logger.debug(f"OAuth avatar mirror skipped ({platform}): {_av_e}")
             
+            _oauth_verify_resolved_account(
+                oauth_mode=oauth_mode,
+                expected_account_id=expected_account_id,
+                resolved_account_id=account_id,
+                platform=platform,
+            )
+
             # Refuse to persist "ghost" connections with no identity
             if not account_id or (isinstance(account_id, str) and account_id.strip() == ""):
                 raise Exception("Provider did not return account_id; refusing to store token (prevents phantom accounts).")
@@ -8544,6 +8855,8 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 blob_payload["ig_user_id"] = str(account_id)
             if platform == "facebook" and account_id:
                 blob_payload["page_id"] = str(account_id)
+            if platform == "youtube" and account_id:
+                blob_payload["channel_id"] = str(account_id)
             token_blob = encrypt_blob(blob_payload)
             
             async with db_pool.acquire() as conn:
@@ -8617,43 +8930,237 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing not configured")
 
-    async with db_pool.acquire() as conn:
-        # ── Double-subscribe guard ────────────────────────────────────
-        if data.kind == "subscription":
-            existing_sub_id  = user.get("stripe_subscription_id")
-            existing_status  = user.get("subscription_status")
-            if existing_sub_id and existing_status in ("active", "trialing"):
-                # User already has an active sub — send straight to billing portal
-                # so they can upgrade/downgrade there rather than creating a duplicate
-                try:
-                    portal = stripe.billing_portal.Session.create(
-                        customer=user["stripe_customer_id"],
-                        return_url=f"{FRONTEND_URL}/settings.html#billing",
-                    )
-                    return {"checkout_url": portal.url, "session_id": None, "portal_redirect": True}
-                except Exception:
-                    pass  # Fall through to new checkout if portal fails
+    try:
+        async with db_pool.acquire() as conn:
+            # ── Double-subscribe guard ────────────────────────────────────
+            if data.kind == "subscription":
+                existing_sub_id = user.get("stripe_subscription_id")
+                existing_status = (user.get("subscription_status") or "").lower()
+                if existing_sub_id and existing_status in ("active", "trialing"):
+                    cust = user.get("stripe_customer_id")
+                    if not cust:
+                        cust = await ensure_stripe_customer(conn, user, stripe)
+                    try:
+                        portal = stripe.billing_portal.Session.create(
+                            customer=cust,
+                            return_url=f"{FRONTEND_URL}/settings.html#billing",
+                        )
+                        return {"checkout_url": portal.url, "session_id": None, "portal_redirect": True}
+                    except stripe.error.StripeError as e:
+                        logger.warning(f"Stripe billing portal redirect failed user={user.get('id')}: {e}")
 
-        customer_id = await ensure_stripe_customer(conn, user, stripe)
+            customer_id = await ensure_stripe_customer(conn, user, stripe)
 
-    session = create_billing_checkout_session(
-        stripe_client=stripe,
-        customer_id=customer_id,
-        kind=data.kind,
-        lookup_key=data.lookup_key,
-        user_id=str(user["id"]),
-        success_url=STRIPE_SUCCESS_URL,
-        cancel_url=STRIPE_CANCEL_URL,
-        topup_products=TOPUP_PRODUCTS,
-    )
+        session = create_billing_checkout_session(
+            stripe_client=stripe,
+            customer_id=customer_id,
+            kind=data.kind,
+            lookup_key=data.lookup_key,
+            user_id=str(user["id"]),
+            success_url=STRIPE_SUCCESS_URL,
+            cancel_url=STRIPE_CANCEL_URL,
+            topup_products=TOPUP_PRODUCTS,
+        )
 
-    return {"checkout_url": session.url, "session_id": session.id}
+        return {"checkout_url": session.url, "session_id": session.id}
+    except HTTPException:
+        raise
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe checkout error user={user.get('id')}: {e}")
+        msg = getattr(e, "user_message", None) or str(e) or "Billing provider error"
+        raise HTTPException(502, msg)
 
 @app.post("/api/billing/portal")
-async def create_portal(user: dict = Depends(get_current_user)):
+async def create_portal(background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     if not user.get("stripe_customer_id"): raise HTTPException(400, "No billing account")
     session = stripe.billing_portal.Session.create(customer=user["stripe_customer_id"], return_url=f"{FRONTEND_URL}/settings.html#billing")
+    if user.get("email"):
+        background_tasks.add_task(
+            _send_billing_action_email,
+            user.get("email"),
+            user.get("name") or user.get("email") or "there",
+            "Billing portal opened",
+            "A secure Stripe billing portal session was requested from your account.",
+        )
     return {"portal_url": session.url}
+
+
+async def _send_billing_action_email(email: str, name: str, action_title: str, details_html: str):
+    """Simple transactional note for billing manager actions initiated by the user."""
+    try:
+        html = f"""
+        <div style="font-family:Inter,Arial,sans-serif;background:#0f172a;color:#e5e7eb;padding:24px">
+          <div style="max-width:640px;margin:0 auto;background:#111827;border:1px solid #374151;border-radius:12px;padding:24px">
+            <h2 style="margin:0 0 8px;color:#f8fafc;">{action_title}</h2>
+            <p style="margin:0 0 16px;color:#9ca3af;">Hi {escape(email if not name else name)}, this confirms your recent billing action in UploadM8.</p>
+            <div style="background:#0b1220;border:1px solid #334155;border-radius:10px;padding:14px 16px;line-height:1.6;color:#d1d5db;">
+              {details_html}
+            </div>
+            <p style="margin:18px 0 0;">
+              <a href="{URL_BILLING}" style="color:#fb923c;text-decoration:none;">Open Billing</a>
+              &nbsp;·&nbsp;
+              <a href="{URL_SETTINGS}" style="color:#fb923c;text-decoration:none;">Settings</a>
+            </p>
+          </div>
+        </div>
+        """
+        await send_email(
+            email,
+            f"UploadM8 billing update: {action_title}",
+            html,
+            from_addr=MAIL_FROM_SUPPORT,
+            reply_to=SUPPORT_EMAIL,
+        )
+    except Exception as e:
+        logger.warning(f"billing action email failed for {email}: {e}")
+
+
+@app.get("/api/billing/subscription/actions")
+async def get_subscription_actions(user: dict = Depends(get_current_user)):
+    """Actions shown in Settings > Billing manager dropdown."""
+    can_manage = bool(user.get("stripe_subscription_id"))
+    actions = [
+        {
+            "id": "pause_payment_collection",
+            "label": "Pause payment collection",
+            "requires_subscription": True,
+        },
+        {
+            "id": "share_payment_update_link",
+            "label": "Share payment update link",
+            "requires_subscription": False,
+        },
+        {
+            "id": "create_one_time_invoice",
+            "label": "Create one-time invoice",
+            "requires_subscription": False,
+        },
+        {
+            "id": "cancel_subscription",
+            "label": "Cancel subscription",
+            "requires_subscription": True,
+        },
+    ]
+    return {
+        "can_manage_subscription": can_manage,
+        "actions": actions,
+    }
+
+
+@app.post("/api/billing/subscription/action")
+async def run_subscription_action(
+    data: BillingSubscriptionActionRequest,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Billing not configured")
+
+    action = (data.action or "").strip().lower()
+    sub_id = user.get("stripe_subscription_id")
+    user_name = (user.get("name") or user.get("email") or "there")
+    user_email = (user.get("email") or "").strip()
+
+    async with db_pool.acquire() as conn:
+        customer_id = user.get("stripe_customer_id")
+        if not customer_id:
+            customer_id = await ensure_stripe_customer(conn, user, stripe)
+
+    try:
+        if action == "pause_payment_collection":
+            if not sub_id:
+                raise HTTPException(400, "No active subscription to pause")
+            sub = stripe.Subscription.modify(
+                sub_id,
+                pause_collection={"behavior": "keep_as_draft"},
+            )
+            if user_email:
+                background_tasks.add_task(
+                    _send_billing_action_email,
+                    user_email,
+                    user_name,
+                    "Payment collection paused",
+                    "Your subscription is still active, but automatic collection is paused until resumed in Stripe.",
+                )
+            return {"ok": True, "action": action, "status": sub.get("status"), "pause_collection": sub.get("pause_collection")}
+
+        if action == "share_payment_update_link":
+            try:
+                portal = stripe.billing_portal.Session.create(
+                    customer=customer_id,
+                    return_url=f"{FRONTEND_URL}/settings.html#billing",
+                    flow_data={"type": "payment_method_update"},
+                )
+            except Exception:
+                portal = stripe.billing_portal.Session.create(
+                    customer=customer_id,
+                    return_url=f"{FRONTEND_URL}/settings.html#billing",
+                )
+            if user_email:
+                background_tasks.add_task(
+                    _send_billing_action_email,
+                    user_email,
+                    user_name,
+                    "Payment update link created",
+                    f"A secure payment-method update link was created.<br><br><a href='{escape(str(portal.url))}' style='color:#fb923c;'>Open payment update link</a>",
+                )
+            return {"ok": True, "action": action, "share_url": portal.url}
+
+        if action == "create_one_time_invoice":
+            amount_cents = int(data.amount_cents or 0)
+            if amount_cents < 100:
+                raise HTTPException(400, "amount_cents must be at least 100")
+            currency = (data.currency or "usd").lower()
+            desc = (data.description or "One-time UploadM8 invoice").strip()[:240]
+            stripe.InvoiceItem.create(
+                customer=customer_id,
+                amount=amount_cents,
+                currency=currency,
+                description=desc,
+            )
+            inv = stripe.Invoice.create(
+                customer=customer_id,
+                auto_advance=True,
+                collection_method="charge_automatically",
+                description=desc,
+            )
+            finalized = stripe.Invoice.finalize_invoice(inv.id)
+            if user_email:
+                background_tasks.add_task(
+                    _send_billing_action_email,
+                    user_email,
+                    user_name,
+                    "One-time invoice created",
+                    f"A one-time invoice for ${(amount_cents/100):.2f} {currency.upper()} was created with reference <code>{escape(str(finalized.id))}</code>.",
+                )
+            return {"ok": True, "action": action, "invoice_id": finalized.id, "invoice_url": finalized.get("hosted_invoice_url")}
+
+        if action == "cancel_subscription":
+            if not sub_id:
+                raise HTTPException(400, "No active subscription to cancel")
+            sub = stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+            period_end = sub.get("current_period_end")
+            pretty_end = (
+                datetime.fromtimestamp(period_end, tz=timezone.utc).strftime("%B %d, %Y")
+                if period_end else "the period end"
+            )
+            if user_email:
+                background_tasks.add_task(
+                    _send_billing_action_email,
+                    user_email,
+                    user_name,
+                    "Subscription cancellation scheduled",
+                    f"Your subscription is set to cancel at period end ({escape(pretty_end)}). You retain access until then.",
+                )
+            return {"ok": True, "action": action, "cancel_at_period_end": bool(sub.get("cancel_at_period_end")), "current_period_end": period_end}
+
+        raise HTTPException(400, "Unsupported action")
+    except HTTPException:
+        raise
+    except stripe.error.StripeError as e:
+        logger.error(f"billing action {action} failed user={user.get('id')}: {e}")
+        msg = getattr(e, "user_message", None) or str(e) or "Stripe error"
+        raise HTTPException(502, msg)
 
 
 @app.get("/api/billing/overview")
@@ -9466,6 +9973,7 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
     Returns a short string describing what was done (stored in handling_notes).
     """
     notes = f"event={event_type}"
+    metrics_prune_jobs: list[tuple[str, str]] = []
 
     try:
         async with db_pool.acquire() as conn:
@@ -9626,6 +10134,7 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
                 for row in rows:
                     # Hard-delete after marking revoked
                     await conn.execute("DELETE FROM platform_tokens WHERE id = $1", row["id"])
+                    metrics_prune_jobs.append((str(row["user_id"]), str(row["id"])))
                     await conn.execute(
                         """
                         INSERT INTO platform_disconnect_log
@@ -9645,6 +10154,14 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
 
             else:
                 notes += " unhandled-event-type"
+
+        for uid, tid in metrics_prune_jobs:
+            try:
+                from services.platform_metrics_job import prune_platform_metrics_cache_for_disconnected_token
+
+                await prune_platform_metrics_cache_for_disconnected_token(db_pool, uid, tid)
+            except Exception as pe:
+                logger.warning(f"[tiktok-webhook] metrics prune failed user={uid} token={tid}: {pe}")
 
     except Exception as exc:
         notes += f" ERROR:{exc}"
@@ -11698,7 +12215,10 @@ async def log_activity(data: ActivityLogIn, request: Request, user: dict = Depen
 
 @app.get("/api/admin/users")
 async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = None, limit: int = 50, offset: int = 0, user: dict = Depends(require_admin)):
-    query = "SELECT id, email, name, role, subscription_tier, subscription_status, status, created_at, last_active_at FROM users WHERE 1=1"
+    query = (
+        "SELECT id, email, name, role, subscription_tier, subscription_status, status, created_at, "
+        "last_active_at, stripe_subscription_id FROM users WHERE 1=1"
+    )
     params = []
     if search:
         params.append(f"%{search}%")
@@ -11712,7 +12232,26 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
     async with db_pool.acquire() as conn:
         users = await conn.fetch(query, *params)
         total = await conn.fetchval("SELECT COUNT(*) FROM users")
-    return {"users": [dict(u) for u in users], "total": total}
+        active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status = 'active'")
+        banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status = 'banned'")
+        # "Paying" = Stripe subscription exists and is active or past_due (excludes trialing = no successful charge yet).
+        stripe_paying_users = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM users
+            WHERE stripe_subscription_id IS NOT NULL
+              AND LOWER(COALESCE(subscription_status, '')) IN ('active', 'past_due')
+            """
+        )
+    return {
+        "users": [dict(u) for u in users],
+        "total": total,
+        "summary": {
+            "total_users": int(total or 0),
+            "active_users": int(active_users or 0),
+            "banned_users": int(banned_users or 0),
+            "stripe_paying_users": int(stripe_paying_users or 0),
+        },
+    }
 
 @app.put("/api/admin/users/{user_id}")
 async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(require_admin)):
@@ -11899,42 +12438,64 @@ async def admin_reset_password(
     user_id_str = str(user_id)
 
     async with db_pool.acquire() as conn:
-        target = await conn.fetchrow("SELECT id, role FROM users WHERE id=$1", user_id_str)
-        if not target:
-            raise HTTPException(status_code=404, detail="User not found")
-        if target["role"] == "master_admin" and user.get("role") != "master_admin":
-            raise HTTPException(status_code=403, detail="Cannot reset master_admin password")
+        try:
+            target = await conn.fetchrow("SELECT id, role FROM users WHERE id=$1", user_id_str)
+            if not target:
+                raise HTTPException(status_code=404, detail="User not found")
+            if target["role"] == "master_admin" and user.get("role") != "master_admin":
+                raise HTTPException(status_code=403, detail="Cannot reset master_admin password")
 
-        await conn.execute(
-            """
-            UPDATE users
-            SET password_hash=$1,
-                must_reset_password=true,
-                updated_at=NOW()
-            WHERE id=$2
-            """,
-            pw_hash,
-            user_id_str,
-        )
+            await conn.execute(
+                """
+                UPDATE users
+                SET password_hash=$1,
+                    must_reset_password=true,
+                    updated_at=NOW()
+                WHERE id=$2
+                """,
+                pw_hash,
+                user_id_str,
+            )
 
-        await conn.execute(
-            """
-            INSERT INTO password_resets (user_id, reset_by_admin_id, temp_password_hash, force_change, expires_at)
-            VALUES ($1::uuid, $2::uuid, $3, TRUE, NOW() + INTERVAL '7 days')
-            """,
-            user_id_str,
-            user["id"],
-            pw_hash,
-        )
+            # Prefer full admin reset audit row; gracefully degrade for legacy schemas.
+            admin_reset_token = secrets.token_urlsafe(32)
+            admin_token_hash = _sha256_hex(admin_reset_token)
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO password_resets (user_id, reset_by_admin_id, temp_password_hash, token_hash, force_change, expires_at)
+                    VALUES ($1::uuid, $2::uuid, $3, $4, TRUE, NOW() + INTERVAL '7 days')
+                    """,
+                    user_id_str,
+                    user["id"],
+                    pw_hash,
+                    admin_token_hash,
+                )
+            except Exception as e:
+                logger.warning(f"admin reset_password legacy insert fallback user={user_id_str}: {e}")
+                await conn.execute(
+                    """
+                    INSERT INTO password_resets (user_id, temp_password_hash, token_hash, expires_at)
+                    VALUES ($1::uuid, $2, $3, NOW() + INTERVAL '7 days')
+                    """,
+                    user_id_str,
+                    pw_hash,
+                    admin_token_hash,
+                )
 
-        await log_admin_audit(
-            conn,
-            user_id=user_id_str,
-            admin=user,
-            action="ADMIN_RESET_PASSWORD",
-            details={"must_reset_password": True},
-            request=request,
-        )
+            await log_admin_audit(
+                conn,
+                user_id=user_id_str,
+                admin=user,
+                action="ADMIN_RESET_PASSWORD",
+                details={"must_reset_password": True},
+                request=request,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"ADMIN_RESET_PASSWORD failed user={user_id_str}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to reset password")
 
     # Email the user their temporary password
     async with db_pool.acquire() as _ec:
@@ -11951,6 +12512,8 @@ async def admin_audit(
     event_category: Optional[str] = None,
     action: Optional[str] = None,
     severity: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
     source: str = "all",           # "all" | "admin" | "system"
     limit: int = 100,
     offset: int = 0,
@@ -11960,6 +12523,8 @@ async def admin_audit(
     Corporate-grade audit log endpoint.
     - Returns rolling 6-month window across both admin_audit_log and system_event_log
     - Supports filtering by category, action, severity, user, source table
+    - Optional resource_type + resource_id (e.g. resource_type=upload & resource_id=<upload uuid>)
+      for publish metadata / per-upload trails in system_event_log
     - Auto-purges records older than 6 months on each call (once per hour max via in-memory flag)
     - Pagination via limit/offset
     """
@@ -12024,6 +12589,12 @@ async def admin_audit(
                     if severity:
                         aargs.append(severity.upper())
                         aq += f" AND UPPER(COALESCE(severity,'INFO')) = ${len(aargs)}"
+                    if resource_type:
+                        aargs.append(resource_type.strip())
+                        aq += f" AND resource_type = ${len(aargs)}"
+                    if resource_id:
+                        aargs.append(str(resource_id).strip())
+                        aq += f" AND resource_id = ${len(aargs)}"
 
                     admin_rows = await conn.fetch(aq, *aargs)
                     items.extend([_ser_row(dict(r)) for r in admin_rows])
@@ -12062,6 +12633,12 @@ async def admin_audit(
                     if severity:
                         sargs.append(severity.upper())
                         sq += f" AND UPPER(COALESCE(severity,'INFO')) = ${len(sargs)}"
+                    if resource_type:
+                        sargs.append(resource_type.strip())
+                        sq += f" AND resource_type = ${len(sargs)}"
+                    if resource_id:
+                        sargs.append(str(resource_id).strip())
+                        sq += f" AND resource_id = ${len(sargs)}"
 
                     sys_rows = await conn.fetch(sq, *sargs)
                     items.extend([_ser_row(dict(r)) for r in sys_rows])
@@ -12104,6 +12681,110 @@ async def admin_audit(
     except Exception as e:
         logger.error(f"[admin_audit] Error fetching audit log: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Audit log error: {str(e)}")
+
+
+@app.get("/api/admin/audit/publish-events")
+async def admin_audit_publish_events(
+    upload_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Publish metadata + outcome audit trail (worker `system_event_log`).
+
+    Rows are written per platform attempt:
+    - PUBLISH_METADATA_RESOLVED — effective title/caption/hashtags, privacy, account
+    - PUBLISH_ATTEMPT_RESULT — success/failure, error, publish_id, platform_url
+
+    Query examples:
+    - By upload:   ?upload_id=<uuid>
+    - By user:     ?user_id=<uuid>
+    - Both:        narrow to that user's events for one upload
+    """
+    require_admin(user)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+
+    actions = ("PUBLISH_METADATA_RESOLVED", "PUBLISH_ATTEMPT_RESULT")
+    try:
+        async with db_pool.acquire() as conn:
+            where_sql = """
+                created_at >= NOW() - INTERVAL '6 months'
+                  AND event_category = 'UPLOAD'
+                  AND action = ANY($1::text[])
+            """
+            args: List[Any] = [list(actions)]
+            p = 2
+            if upload_id:
+                args.append(str(upload_id).strip())
+                where_sql += f" AND resource_type = 'upload' AND resource_id = ${p}"
+                p += 1
+            if user_id:
+                args.append(str(user_id).strip())
+                where_sql += f" AND user_id = ${p}::uuid"
+                p += 1
+
+            total = int(
+                await conn.fetchval(
+                    f"SELECT COUNT(*) FROM system_event_log WHERE {where_sql}",
+                    *args,
+                )
+                or 0
+            )
+
+            lim_p, off_p = p, p + 1
+            q = f"""
+                SELECT
+                    id,
+                    user_id,
+                    event_category,
+                    action,
+                    resource_type,
+                    resource_id,
+                    details,
+                    severity,
+                    outcome,
+                    created_at
+                FROM system_event_log
+                WHERE {where_sql}
+                ORDER BY created_at DESC
+                LIMIT ${lim_p} OFFSET ${off_p}
+            """
+            rows = await conn.fetch(q, *args, limit, offset)
+            page = [dict(r) for r in rows]
+
+            def _ser(v):
+                if v is None:
+                    return None
+                if hasattr(v, "isoformat"):
+                    return v.isoformat()
+                if isinstance(v, uuid.UUID):
+                    return str(v)
+                return v
+
+            for it in page:
+                for k, v in list(it.items()):
+                    it[k] = _ser(v)
+                d = it.get("details")
+                if isinstance(d, str):
+                    try:
+                        it["details"] = json.loads(d)
+                    except Exception:
+                        pass
+
+        return {
+            "items": page,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": (offset + limit) < total,
+            "actions": list(actions),
+        }
+    except Exception as e:
+        logger.error(f"[admin_audit_publish_events] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Publish audit query failed: {str(e)}")
 
 
 @app.get("/api/admin/audit/data-integrity")
@@ -12276,7 +12957,13 @@ async def admin_analytics_users(user: dict = Depends(get_current_user)):
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='active'")
         banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='banned'")
-        paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier <> 'free'")
+        paid_users = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM users
+            WHERE stripe_subscription_id IS NOT NULL
+              AND LOWER(COALESCE(subscription_status, '')) IN ('active', 'past_due')
+            """
+        )
         new_users_30d = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '30 days'")
         new_users_7d = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days'")
         new_users_24h = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")

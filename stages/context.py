@@ -674,8 +674,15 @@ class JobContext:
         return self.local_video_path
 
     def get_effective_title(self, platform: str = "") -> str:
-        """Best title for publishing. Optional platform uses user_settings platformTitles (override)."""
+        """Best title for publishing.
+
+        Single-video manual metadata (self.title) must win over saved settings and AI.
+        For uploads without manual title, fall back to platform settings, then AI/model output.
+        """
         us = self.user_settings or {}
+        # Single-video manual override always wins.
+        if isinstance(self.title, str) and self.title.strip():
+            return self.title.strip()
         if platform:
             pt = us.get("platformTitles") or us.get("platform_titles") or {}
             if isinstance(pt, dict) and pt:
@@ -687,13 +694,20 @@ class JobContext:
             )
             if isinstance(m8t, str) and m8t.strip():
                 return m8t.strip()
-        # Manual user input (self.title) must win over AI for single-video overrides.
+        # No manual override present: AI / understanding / filename fallbacks.
         tl_title = (self.video_understanding or {}).get("title_suggestion", "")
-        return self.title or self.ai_title or tl_title or self.filename
+        return self.ai_title or tl_title or self.filename
 
     def get_effective_caption(self, platform: str = "") -> str:
-        """Best caption. Optional platform uses user_settings platformCaptions (override)."""
+        """Best caption.
+
+        Single-video manual metadata (self.caption) must win over saved settings and AI.
+        For uploads without manual caption, fall back to platform settings, then AI.
+        """
         us = self.user_settings or {}
+        # Single-video manual override always wins.
+        if isinstance(self.caption, str) and self.caption.strip():
+            return self.caption.strip()
         if platform:
             pc = us.get("platformCaptions") or us.get("platform_captions") or {}
             if isinstance(pc, dict) and pc:
@@ -705,8 +719,8 @@ class JobContext:
             )
             if isinstance(m8c, str) and m8c.strip():
                 return m8c.strip()
-        # Manual user input (self.caption) must win over AI for single-video overrides.
-        return self.caption or self.ai_caption or ""
+        # No manual override present: AI fallback.
+        return self.ai_caption or ""
 
     def get_effective_hashtags(self, platform: str = "") -> List[str]:
         """
@@ -762,7 +776,8 @@ class JobContext:
             ]
         blocked_set = set(expand_hashtag_items(raw_blocked if isinstance(raw_blocked, list) else []))
 
-        # ── Merge: always → platform → base → AI (hashtags merge only; no overwrite) ─
+        # ── Merge: base(manual) → always → platform → AI (hashtags merge only; no overwrite) ─
+        # Manual upload hashtags must never be removed by saved blocked tags.
         base = expand_hashtag_items(self.hashtags or [])
         ai = expand_hashtag_items(self.ai_hashtags or [])
         if platform:
@@ -775,7 +790,16 @@ class JobContext:
         seen: set = set()
         merged: List[str] = []
 
-        for tag in always_tags + platform_tags + base + ai:
+        # 1) Manual/base tags: keep as entered (except empty/dupe).
+        for tag in base:
+            t = str(tag).strip().lstrip("#").lower()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            merged.append(f"#{t}")
+
+        # 2) Saved settings + AI tags: apply blocked list.
+        for tag in always_tags + platform_tags + ai:
             t = str(tag).strip().lstrip("#").lower()
             if not t or t in seen or t in blocked_set:
                 continue

@@ -159,6 +159,29 @@ TIKTOK_APP_AUDITED = _tiktok_aud_raw not in (
 )
 
 
+def _tiktok_error_suggests_creator_only_fallback(code: Any, message: str, raw_text: str) -> bool:
+    """True when TikTok init likely failed because PUBLIC_TO_EVERYONE is not allowed for this client/token."""
+    blob = " ".join(
+        [
+            str(code or "").lower(),
+            (message or "").lower(),
+            (raw_text or "").lower(),
+        ]
+    )
+    needles = (
+        "unaudited",
+        "not_audited",
+        "private_account",
+        "can_only_post",
+        "only_post_to_private",
+        "sandbox",
+        "content-sharing-guidelines",
+        "content sharing guidelines",
+        "integration guidelines",
+    )
+    return any(n in blob for n in needles)
+
+
 # =====================================================================
 # Privacy Level Resolution — single source of truth
 # =====================================================================
@@ -343,6 +366,24 @@ def _get_caption(ctx: JobContext, platform: str = "") -> str:
         or getattr(ctx, "description", None)
         or ""
     )
+
+
+def _tiktok_post_title(ctx: JobContext) -> str:
+    """Build TikTok Content Posting `post_info.title` (max 150 chars).
+
+    The API exposes a single title field. We must not use ``(hook_title or caption)``
+    because a non-empty upload title would skip ``_build_platform_caption`` entirely,
+    dropping platform-specific / always / merged hashtags.
+    """
+    body = _build_platform_caption(ctx, "tiktok").strip()
+    hook = (_get_title(ctx, "tiktok") or "").strip()
+    if body:
+        if hook and not body.lower().startswith(hook.lower()):
+            merged = f"{hook}\n\n{body}".strip()
+        else:
+            merged = body
+        return merged[:150]
+    return hook[:150]
 
 
 def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
@@ -786,10 +827,8 @@ async def publish_to_tiktok(
             error_message="No access token"
         )
 
-    title = _get_title(ctx, "tiktok")
-    caption = _build_platform_caption(ctx, "tiktok")
-    # TikTok uses title field (max 150 chars); prefer explicit title over full caption+tags
-    tiktok_title = (title or caption or "")[:150]
+    # Single title field: include caption + hashtag merge (platform / always / AI)
+    tiktok_title = _tiktok_post_title(ctx)
 
     try:
         file_size = video_path.stat().st_size
@@ -858,29 +897,46 @@ async def publish_to_tiktok(
             )
 
             if init_resp.status_code != 200:
-                err_txt = init_resp.text[:500]
+                err_snippet = (init_resp.text or "")[:800]
+                code: Any = None
+                api_message = ""
+                log_id = None
                 try:
                     ej = init_resp.json()
                     err = ej.get("error") or {}
-                    code = (err.get("code") or err.get("message") or "") if isinstance(err, dict) else ""
-                    if isinstance(err, dict) and err.get("message"):
-                        err_txt = str(err.get("message", ""))[:400]
-                    if "unaudited" in str(code).lower() or "unaudited" in err_txt.lower():
-                        err_txt = (
-                            "TikTok rejected public posting (app still in unaudited mode on TikTok's side). "
-                            "Finish Content Posting review in the TikTok Developer Portal, or set "
-                            "TIKTOK_APP_AUDITED=false to force creator-only posts until then. "
-                            f"Details: {err_txt}"
-                        )
+                    if isinstance(err, dict):
+                        code = err.get("code")
+                        api_message = str(err.get("message") or "")
+                        log_id = err.get("log_id")
                 except Exception:
                     pass
 
-                # If TikTok is rejecting PUBLIC_TO_EVERYONE with "unaudited" errors,
-                # automatically retry with creator-only privacy to unblock uploads.
-                # This avoids depending on env flags when TikTok approval state changes.
+                orig_detail = (api_message.strip() or err_snippet)[:500]
+                suggest_creator_only = _tiktok_error_suggests_creator_only_fallback(
+                    code, api_message, err_snippet
+                )
+                if suggest_creator_only:
+                    bits = [orig_detail]
+                    if log_id:
+                        bits.append(f"log_id={log_id}")
+                    err_txt = (
+                        "TikTok rejected public posting. Common causes even after portal approval: "
+                        "using Sandbox Client Key/Secret instead of production, stale OAuth tokens "
+                        "(disconnect and reconnect TikTok), or Content Posting not Live for this app. "
+                        "Verify production credentials match TIKTOK_CLIENT_KEY/SECRET, portal "
+                        "Products → Content Posting API shows Live, and TIKTOK_APP_AUDITED is not "
+                        "false in server env (default is true). Or set TIKTOK_APP_AUDITED=false to "
+                        "post creator-only until "
+                        "TikTok accepts PUBLIC_TO_EVERYONE. Details: "
+                        + " | ".join(bits)
+                    )
+                else:
+                    err_txt = orig_detail
+
+                # Retry init with SELF_ONLY when TikTok disallows public posting for this client.
                 if (
                     (not attempted_creator_only_retry)
-                    and ("unaudited" in err_txt.lower())
+                    and suggest_creator_only
                     and str(privacy_level).upper() == "PUBLIC_TO_EVERYONE"
                 ):
                     attempted_creator_only_retry = True
@@ -1655,6 +1711,9 @@ async def _publish_single(
     """Publish to ONE platform/account. Isolated — exceptions caught internally."""
     from stages import db as db_stage
 
+    def _clip(s: str, n: int) -> str:
+        return (s or "")[:n]
+
     video_file = ctx.get_video_for_platform(platform)
     if not video_file or not video_file.exists():
         video_file = default_video
@@ -1688,6 +1747,50 @@ async def _publish_single(
         logger.warning(f"{account_label}: Token load failed: {e}")
         token_data = None
         token_identity = {}
+
+    # Audit trail: effective metadata that this publish attempt will use.
+    try:
+        eff_title = (
+            ctx.get_effective_title(platform)
+            if hasattr(ctx, "get_effective_title")
+            else (getattr(ctx, "title", None) or "")
+        )
+        eff_caption = (
+            ctx.get_effective_caption(platform)
+            if hasattr(ctx, "get_effective_caption")
+            else (getattr(ctx, "caption", None) or "")
+        )
+        eff_tags = (
+            ctx.get_effective_hashtags(platform)
+            if hasattr(ctx, "get_effective_hashtags")
+            else (getattr(ctx, "hashtags", None) or [])
+        )
+        requested_privacy = getattr(ctx, "privacy", None) or "public"
+        native_privacy = resolve_privacy_level(requested_privacy, platform)
+        await db_stage.write_system_event_log(
+            db_pool,
+            user_id=str(ctx.user_id),
+            event_category="UPLOAD",
+            action="PUBLISH_METADATA_RESOLVED",
+            resource_type="upload",
+            resource_id=str(ctx.upload_id),
+            details={
+                "attempt_id": attempt_id,
+                "platform": platform,
+                "token_row_id": token_id,
+                "account_id": token_identity.get("account_id"),
+                "account_username": token_identity.get("account_username"),
+                "requested_privacy": requested_privacy,
+                "native_privacy": native_privacy,
+                "effective_title": _clip(str(eff_title or ""), 300),
+                "effective_caption": _clip(str(eff_caption or ""), 1200),
+                "effective_hashtags": list(eff_tags or [])[:80],
+            },
+            severity="INFO",
+            outcome="SUCCESS",
+        )
+    except Exception:
+        pass
 
     if not token_data:
         msg = f"Not connected to {platform}" + (f" (account {token_id[:8]})" if token_id else "")
@@ -1778,5 +1881,34 @@ async def _publish_single(
                 )
         except Exception as e:
             logger.warning(f"{account_label}: Could not update publish_attempt: {e}")
+
+    # Audit trail: final platform outcome for this attempt.
+    try:
+        await db_stage.write_system_event_log(
+            db_pool,
+            user_id=str(ctx.user_id),
+            event_category="UPLOAD",
+            action="PUBLISH_ATTEMPT_RESULT",
+            resource_type="upload",
+            resource_id=str(ctx.upload_id),
+            details={
+                "attempt_id": attempt_id,
+                "platform": platform,
+                "token_row_id": token_id,
+                "account_id": token_identity.get("account_id"),
+                "account_username": token_identity.get("account_username"),
+                "success": bool(result.success),
+                "error_code": result.error_code,
+                "error_message": _clip(str(result.error_message or ""), 500),
+                "http_status": result.http_status,
+                "publish_id": result.publish_id,
+                "platform_video_id": result.platform_video_id,
+                "platform_url": result.platform_url,
+            },
+            severity="INFO" if result.success else "WARN",
+            outcome="SUCCESS" if result.success else "FAIL",
+        )
+    except Exception:
+        pass
 
     return result

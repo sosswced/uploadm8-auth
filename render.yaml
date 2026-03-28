@@ -118,6 +118,17 @@ services:
       - key: OPENAI_API_KEY
         sync: false
 
+      # ── TikTok Content Posting API (worker publishes; OAuth on API) ───────────
+      # TIKTOK_APP_AUDITED: omit or "true" for production (PUBLIC_TO_EVERYONE).
+      # Set "false" only if TikTok still rejects public posts (sandbox / review).
+      # Read in stages/publish_stage.py — not in app.py.
+      - key: TIKTOK_CLIENT_KEY
+        sync: false
+      - key: TIKTOK_CLIENT_SECRET
+        sync: false
+      - key: TIKTOK_APP_AUDITED
+        value: "true"
+
       # ── ACRCloud music recognition ───────────────────────────────────────────
       - key: ACRCLOUD_HOST
         sync: false

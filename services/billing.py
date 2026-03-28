@@ -31,7 +31,11 @@ def get_plan(tier: str) -> dict:
 async def ensure_stripe_customer(conn, user: dict, stripe_client) -> str:
     customer_id = user.get("stripe_customer_id")
     if customer_id:
-        return customer_id
+        try:
+            stripe_client.Customer.retrieve(customer_id)
+            return customer_id
+        except stripe_client.error.InvalidRequestError:
+            pass
     customer = stripe_client.Customer.create(email=user["email"], name=user.get("name") or user["email"])
     customer_id = customer.id
     await conn.execute("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", customer_id, user["id"])

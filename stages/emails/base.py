@@ -428,20 +428,20 @@ def plan_change_visual(old_tier: str, new_tier: str, hex_new: str = "#f97316") -
 def platform_logos_row() -> str:
     """TikTok / YouTube / Instagram / Facebook — hosted on FRONTEND_URL for reliable email loading."""
     logos = [
-        ("#1a1a1a", asset_url("images/platforms/tiktok.png"), "TikTok"),
-        ("#ff0000", asset_url("images/platforms/youtube.png"), "YouTube"),
-        ("#c13584", asset_url("images/platforms/instagram.png"), "Instagram"),
-        ("#1877f2", asset_url("images/platforms/facebook.png"), "Facebook"),
+        (asset_url("images/platforms/tiktok.png"), "TikTok"),
+        (asset_url("images/platforms/youtube.png"), "YouTube"),
+        (asset_url("images/platforms/instagram.png"), "Instagram"),
+        (asset_url("images/platforms/facebook.png"), "Facebook"),
     ]
     cells = "".join(
         f'<td style="padding:0 8px;text-align:center;">'
-        f'<div style="width:52px;height:52px;background:{bg};border-radius:14px;'
-        f'display:inline-block;border:1px solid rgba(255,255,255,0.14);">'
-        f'<img src="{src}" alt="{name}" width="30" height="30" '
-        f'style="display:block;margin:11px auto;border-radius:4px;"></div>'
+        f'<div style="width:52px;height:52px;border-radius:14px;'
+        f'display:inline-block;border:1px solid rgba(255,255,255,0.14);overflow:hidden;background:#0b0f1a;">'
+        f'<img src="{src}" alt="{name}" width="52" height="52" '
+        f'style="display:block;width:52px;height:52px;object-fit:cover;"></div>'
         f'<p style="margin:7px 0 0;color:#9ca3af;font-size:11px;font-weight:600;">{name}</p>'
         f'</td>'
-        for bg, src, name in logos
+        for src, name in logos
     )
     inner = (
         '<p style="margin:0 0 16px;color:#f97316;font-size:10px;font-weight:700;'

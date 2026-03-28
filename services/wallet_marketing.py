@@ -37,7 +37,11 @@ async def _period_anchor(conn, user_id: str) -> datetime:
         last_refill = row["m"] if row else None
     except Exception:
         last_refill = None
-    month_start = await conn.fetchval("SELECT date_trunc('month', timezone('utc', now()))")
+    month_start = await conn.fetchval(
+        "SELECT date_trunc('month', now() AT TIME ZONE 'utc') AT TIME ZONE 'utc'"
+    )
+    if month_start and month_start.tzinfo is None:
+        month_start = month_start.replace(tzinfo=timezone.utc)
     if last_refill:
         return max(last_refill, month_start)
     return month_start

@@ -301,7 +301,7 @@ async def send_low_token_warning_email(
 
     await send_email(
         email,
-        f" Low token balance — {current_balance} {wt_short} remaining",
+        f"Low token balance — {current_balance} {wt_short} remaining",
         html,
         from_addr=MAIL_FROM_SUPPORT,
         reply_to=SUPPORT_EMAIL,

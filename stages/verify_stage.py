@@ -199,18 +199,21 @@ async def verify_single_attempt(
                             updated = False
                             for item in pr_list:
                                 if isinstance(item, dict) and item.get("platform") == "tiktok":
+                                    matched = False
                                     if attempt_publish_id and str(item.get("publish_id", "")) == attempt_publish_id:
-                                        item["platform_video_id"] = tiktok_video_id
-                                        item["video_id"] = tiktok_video_id
-                                        item["platform_url"] = f"https://www.tiktok.com/video/{tiktok_video_id}"
-                                        item["url"] = item["platform_url"]
-                                        updated = True
-                                        break
+                                        matched = True
                                     elif not attempt_publish_id:
+                                        matched = True
+                                    if matched:
+                                        uname = (item.get("account_username") or "").strip().lstrip("@")
+                                        if uname:
+                                            tiktok_url = f"https://www.tiktok.com/@{uname}/video/{tiktok_video_id}"
+                                        else:
+                                            tiktok_url = f"https://www.tiktok.com/video/{tiktok_video_id}"
                                         item["platform_video_id"] = tiktok_video_id
                                         item["video_id"] = tiktok_video_id
-                                        item["platform_url"] = f"https://www.tiktok.com/video/{tiktok_video_id}"
-                                        item["url"] = item["platform_url"]
+                                        item["platform_url"] = tiktok_url
+                                        item["url"] = tiktok_url
                                         updated = True
                                         break
                             if updated:

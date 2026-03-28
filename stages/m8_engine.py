@@ -281,6 +281,28 @@ def _build_m8_prompt(
                 + "\n"
             )
 
+    strategy_priors_block = ""
+    pri = hist.get("__strategy_priors__") or {}
+    pri_top = pri.get("top") if isinstance(pri, dict) else []
+    if isinstance(pri_top, list) and pri_top:
+        s_lines: List[str] = []
+        for i, row in enumerate(pri_top[:5], 1):
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("strategy_key") or "default")
+            wm = float(row.get("weighted_mean_engagement") or 0.0)
+            ci = float(row.get("max_ci95_high") or 0.0)
+            n = int(row.get("samples") or 0)
+            s_lines.append(f"{i}. key={key} | mean={wm:.2f}% | ci95_high={ci:.2f}% | n={n}")
+        if s_lines:
+            strategy_priors_block = (
+                "\nML STRATEGY PRIORS (from upload_quality_scores_daily; use as directional bias, not hard rules):\n"
+                + "\n".join(s_lines)
+                + "\n"
+                + "Bias guidance: favor hooks/angles that resemble higher-ranked keys, but always stay grounded in current Scene Graph evidence."
+                + "\n"
+            )
+
     return f"""You are M8 Engine — UploadM8's multimodal publishing brain (version {M8_ENGINE_VERSION}).
 
 Your job: produce HIGH-SPECIFICITY, NON-GENERIC titles/captions that clearly come from THIS footage,
@@ -303,6 +325,7 @@ STRATEGY MASTER: style={base_style} tone={base_tone} persona={base_persona}
 
 {fusion}
 {pattern_block}
+{strategy_priors_block}
 PLATFORM RULES:
 {chr(10).join(plat_blocks)}
 
@@ -966,6 +989,7 @@ async def run_m8_caption_engine(
     ranked = _ensure_platform_completeness(ranked, scene)
     ranked["scene_graph"] = scene
     ranked["historical_signals"] = historical
+    ranked["strategy_priors"] = (historical or {}).get("__strategy_priors__", {})
 
     apply_selection_to_context(
         ctx,
@@ -984,6 +1008,7 @@ async def run_m8_caption_engine(
         "model": model,
         "tokens": tokens,
         "strategy_version": ((strategy or {}).get("version") or ""),
+        "ml_strategy_priors": (historical or {}).get("__strategy_priors__", {}),
     }
 
     try:

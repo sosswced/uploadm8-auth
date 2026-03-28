@@ -19,10 +19,9 @@ services:
     plan: standard
     numInstances: 1         # Scale to 3-5 for 10K users
     buildCommand: pip install -r requirements.txt
-    # Single worker: OAuth state lives in process memory (oauth_states). With --workers 2,
-    # /api/oauth/*/start and /callback can hit different workers → "Invalid or expired session".
-    # Scale API horizontally (more instances) if needed; for multi-instance OAuth, store state in Redis.
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    # OAuth state is stored in Redis — safe to run multiple uvicorn workers per instance.
+    # On a 4GB plan 2 workers is ideal; scale to 3-4 on 8GB.
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 2
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
@@ -76,6 +75,14 @@ services:
       # Metrics key (set to secure random for production)
       - key: METRICS_API_KEY
         sync: false
+      # Structured logging (JSON) — default on; set to 0 for human-readable
+      - key: JSON_LOGS
+        value: "1"
+      # Sentry error tracking (optional — set DSN to enable)
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENV
+        value: production
 
   # ── Background Worker (Docker — FFmpeg + Chromium + TF) ──────────────────────
   - type: worker
@@ -219,6 +226,12 @@ services:
         value: "3"
       - key: PUBLISH_CONCURRENCY
         value: "5"
+      - key: PUBLISH_PARALLEL
+        value: "true"
+      - key: PUBLISH_PER_PLATFORM_TIMEOUT
+        value: "600"
+      - key: JOB_TIMEOUT_SECONDS
+        value: "1800"
       # DB pool tuning
       - key: WORKER_DB_POOL_MIN
         value: "5"
@@ -240,6 +253,13 @@ services:
       - key: ANALYTICS_SYNC_INTERVAL_SECONDS
         value: "10800"
 
+      # ── Observability ─────────────────────────────────────────────────────────
+      - key: JSON_LOGS
+        value: "1"
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENV
+        value: production
       # ── Processing config ─────────────────────────────────────────────────────
       - key: POLL_INTERVAL_SECONDS
         value: "1.0"

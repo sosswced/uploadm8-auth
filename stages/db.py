@@ -236,6 +236,32 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
             ctx.compute_seconds,
             ctx.thumbnail_r2_key or None,
         )
+        # ML-ready feature persistence (non-fatal): keeps rich context per upload so
+        # offline scorers can learn what creative strategies perform over time.
+        try:
+            await conn.execute(
+                """
+                INSERT INTO upload_feature_events
+                    (user_id, upload_id, category, audio_context, vision_context,
+                     video_understanding, thumbnail_brief, output_artifacts,
+                     ai_title, ai_caption, ai_hashtags)
+                VALUES
+                    ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10, $11::jsonb)
+                """,
+                str(ctx.user_id),
+                str(ctx.upload_id),
+                str(ctx.get_canonical_category() or ""),
+                json.dumps(getattr(ctx, "audio_context", None) or {}),
+                json.dumps(getattr(ctx, "vision_context", None) or {}),
+                json.dumps(getattr(ctx, "video_understanding", None) or {}),
+                json.dumps(getattr(ctx, "thumbnail_brief", None) or {}),
+                json.dumps(getattr(ctx, "output_artifacts", None) or {}),
+                getattr(ctx, "ai_title", None),
+                getattr(ctx, "ai_caption", None),
+                json.dumps(getattr(ctx, "ai_hashtags", None) or []),
+            )
+        except Exception as e:
+            logger.debug(f"upload_feature_events insert skipped: {e}")
 
 
 async def mark_processing_failed(
@@ -649,9 +675,13 @@ async def fetch_m8_historical_signals(
     caption snippets for prompt injection.
 
     Returns a dict suitable for m8_engine.rank_and_select (platform keys) plus
-    __pattern_corpus__ / __meta__ for prompts (ignored by score_variant).
+    __pattern_corpus__ / __strategy_priors__ / __meta__ for prompts.
     """
-    out: Dict[str, Any] = {"__pattern_corpus__": [], "__meta__": {"source": "db", "ok": False}}
+    out: Dict[str, Any] = {
+        "__pattern_corpus__": [],
+        "__strategy_priors__": {"top": [], "lookback_days": 180},
+        "__meta__": {"source": "db", "ok": False},
+    }
     plats = [str(p).lower() for p in (platforms or []) if p]
     if not plats or not user_id:
         return out
@@ -787,6 +817,52 @@ async def fetch_m8_historical_signals(
                 seen.add(key)
                 uniq.append(p)
             out["__pattern_corpus__"] = uniq[: max(3, pattern_limit)]
+
+            # First-class ML priors from upload_quality_scores_daily.
+            # We pull a user-level top strategy table for prompt biasing.
+            try:
+                strat_rows = await conn.fetch(
+                    """
+                    SELECT
+                        strategy_key,
+                        SUM(samples)::bigint AS samples,
+                        CASE
+                          WHEN SUM(samples) > 0
+                          THEN SUM(mean_engagement * samples)::double precision / NULLIF(SUM(samples)::double precision, 0)
+                          ELSE 0.0
+                        END AS weighted_mean_engagement,
+                        MAX(ci95_high)::double precision AS max_ci95_high,
+                        COUNT(DISTINCT day)::int AS days_with_data
+                    FROM upload_quality_scores_daily
+                    WHERE user_id = $1::uuid
+                      AND day >= (CURRENT_DATE - (180::int || ' days')::interval)::date
+                      AND (
+                            platform = 'all'
+                            OR platform = ANY($2::text[])
+                      )
+                    GROUP BY strategy_key
+                    ORDER BY weighted_mean_engagement DESC, samples DESC
+                    LIMIT 10
+                    """,
+                    user_id,
+                    ["all"] + plats,
+                )
+                out["__strategy_priors__"] = {
+                    "lookback_days": 180,
+                    "top": [
+                        {
+                            "strategy_key": str(r.get("strategy_key") or "default"),
+                            "samples": int(r.get("samples") or 0),
+                            "weighted_mean_engagement": float(r.get("weighted_mean_engagement") or 0),
+                            "max_ci95_high": float(r.get("max_ci95_high") or 0),
+                            "days_with_data": int(r.get("days_with_data") or 0),
+                        }
+                        for r in (strat_rows or [])
+                    ],
+                }
+            except Exception as strat_err:
+                logger.debug(f"fetch_m8_historical_signals strategy priors skipped: {strat_err}")
+
             out["__meta__"] = {"source": "upload_caption_memory+uploads", "ok": True}
     except asyncpg.exceptions.UndefinedTableError:
         return {"__pattern_corpus__": [], "__meta__": {"source": "missing_table", "ok": False}}
@@ -1365,6 +1441,7 @@ async def save_refreshed_token(
     access_token: str,
     refresh_token: Optional[str] = None,
     open_id: Optional[str] = None,
+    extra_fields: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Persist a refreshed platform OAuth token back to the database.
@@ -1480,6 +1557,10 @@ async def save_refreshed_token(
                     current_plain["refresh_token"] = refresh_token
                 if open_id:
                     current_plain["open_id"] = open_id
+                if extra_fields:
+                    for k, v in extra_fields.items():
+                        if v is not None:
+                            current_plain[k] = v
 
                 # Re-encrypt and write back as clean TEXT
                 new_blob_str = _encrypt(current_plain)

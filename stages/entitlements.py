@@ -304,6 +304,40 @@ def get_next_public_upgrade_tier(tier: str) -> Optional[str]:
     return PUBLIC_UPGRADE_TIER_CHAIN[i + 1]
 
 
+# Human labels for /api/entitlements/tiers (marketing + success UIs)
+_ANALYTICS_LABELS: Dict[str, str] = {
+    "basic": "Basic analytics",
+    "standard": "Standard analytics",
+    "full": "Full account intel",
+    "full_export": "Full + export-ready",
+}
+
+_PRIORITY_LANE_LABELS: Dict[str, str] = {
+    "p0": "Dedicated (p0)",
+    "p1": "Turbo (p1)",
+    "p2": "Priority (p2)",
+    "p3": "Standard (p3)",
+    "p4": "Standard",
+}
+
+
+def _scheduling_window_phrase(lookahead_hours: Any) -> str:
+    h = int(lookahead_hours or 0)
+    if h >= 168:
+        return "7 days"
+    if h == 72:
+        return "72 hours"
+    if h == 24:
+        return "24 hours"
+    if h == 12:
+        return "12 hours"
+    if h == 4:
+        return "4 hours"
+    if h <= 0:
+        return "this billing period"
+    return f"{h} hours"
+
+
 # Entitlement keys returned by entitlements_to_dict — frontend uses these exact keys
 ENTITLEMENT_KEYS = (
     "tier", "tier_display", "put_daily", "put_monthly", "aic_monthly",
@@ -326,6 +360,9 @@ def get_tiers_for_api() -> list:
     for slug in all_slugs:
         cfg = TIER_CONFIG.get(slug, {})
         per_pf = cfg.get("max_accounts_per_platform", cfg.get("per_platform", 0))
+        pc = str(cfg.get("priority_class", "p4"))
+        ak = str(cfg.get("analytics", "basic"))
+        lh = int(cfg.get("lookahead_hours", 0) or 0)
         out.append({
             "slug": slug,
             "name": cfg.get("name", slug.replace("_", " ").title()),
@@ -335,8 +372,29 @@ def get_tiers_for_api() -> list:
             "max_accounts": cfg.get("max_accounts", 0),
             "max_accounts_per_platform": int(per_pf or 0),
             "queue_depth": cfg.get("queue_depth", 0),
-            "lookahead_hours": cfg.get("lookahead_hours", 0),
+            "lookahead_hours": lh,
             "internal": cfg.get("internal", False),
+            "trial_days": int(cfg.get("trial_days", 0) or 0),
+            "team_seats": int(cfg.get("team_seats", 1) or 1),
+            "analytics": ak,
+            "analytics_label": _ANALYTICS_LABELS.get(ak, ak.replace("_", " ").title()),
+            "ai_depth": str(cfg.get("ai_depth", "basic")),
+            "webhooks": bool(cfg.get("webhooks", False)),
+            "white_label": bool(cfg.get("white_label", False)),
+            "hud": bool(cfg.get("hud", False)),
+            "excel": bool(cfg.get("excel", False)),
+            "flex": bool(cfg.get("flex", False)),
+            "watermark": bool(cfg.get("watermark", True)),
+            "max_parallel_uploads": int(
+                cfg.get("max_parallel_uploads", cfg.get("parallel_uploads", 1)) or 1
+            ),
+            "max_thumbnails": int(cfg.get("max_thumbnails", 1) or 1),
+            "max_caption_frames": int(
+                cfg.get("max_caption_frames", cfg.get("caption_frames", 3)) or 3
+            ),
+            "priority_class": pc,
+            "queue_lane_label": _PRIORITY_LANE_LABELS.get(pc, pc),
+            "scheduling_window_label": _scheduling_window_phrase(lh),
         })
     return out
 
@@ -352,13 +410,13 @@ class Entitlements:
     tier_display: str = "Free"
 
     # Wallet
-    put_daily: int = 2
-    put_monthly: int = 60
-    aic_monthly: int = 0
+    put_daily: int = 4
+    put_monthly: int = 80
+    aic_monthly: int = 50
 
     # Accounts
-    max_accounts: int = 4
-    max_accounts_per_platform: int = 1
+    max_accounts: int = 16
+    max_accounts_per_platform: int = 4
 
     # Features
     can_watermark: bool = True          # True = watermark IS burned onto video
@@ -374,8 +432,8 @@ class Entitlements:
 
     # Queue / scheduler
     priority_class: str = "p4"         # p0 (highest) -> p4 (lowest)
-    queue_depth: int = 25
-    lookahead_hours: int = 2
+    queue_depth: int = 10
+    lookahead_hours: int = 4
 
     # AI
     max_caption_frames: int = 3
@@ -417,11 +475,11 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
     return Entitlements(
         tier=t,
         tier_display=cfg.get("name", t.replace("_", " ").title()),
-        put_daily=cfg.get("put_daily", 2),
-        put_monthly=cfg.get("put_monthly", 60),
-        aic_monthly=cfg.get("aic_monthly", 0),
-        max_accounts=cfg.get("max_accounts", 4),
-        max_accounts_per_platform=cfg.get("max_accounts_per_platform", 1),
+        put_daily=cfg.get("put_daily", 4),
+        put_monthly=cfg.get("put_monthly", 80),
+        aic_monthly=cfg.get("aic_monthly", 50),
+        max_accounts=cfg.get("max_accounts", 16),
+        max_accounts_per_platform=cfg.get("max_accounts_per_platform", 4),
         can_watermark=cfg.get("watermark", True),
         can_ai=cfg.get("ai", False),
         can_schedule=cfg.get("scheduling", False),
@@ -433,8 +491,8 @@ def get_entitlements_for_tier(tier: str) -> Entitlements:
         can_burn_hud=cfg.get("hud", False),
         show_ads=cfg.get("ads", True),
         priority_class=cfg.get("priority_class", "p4"),
-        queue_depth=cfg.get("queue_depth", 25),
-        lookahead_hours=cfg.get("lookahead_hours", 2),
+        queue_depth=cfg.get("queue_depth", 10),
+        lookahead_hours=cfg.get("lookahead_hours", 4),
         max_caption_frames=cfg.get("max_caption_frames", 3),
         ai_depth=cfg.get("ai_depth", "basic"),
         max_thumbnails=cfg.get("max_thumbnails", 1),

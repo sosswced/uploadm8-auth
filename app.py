@@ -28,13 +28,19 @@ import asyncio
 # ---------------------------------------------------------------------------
 # DB JSON CODECS (architectural cleanliness)
 # Forces asyncpg to decode json/jsonb into Python objects.
-# Keep _safe_json as a belt-and-suspenders fallback until schema is fully normalized.
+# Encoder is idempotent: strings pass through unchanged so callers that
+# already json.dumps() before binding won't be double-encoded.
 # ---------------------------------------------------------------------------
+def _json_encoder(v):
+    if isinstance(v, str):
+        return v
+    return json.dumps(v, separators=(',', ':'), ensure_ascii=False)
+
 async def _init_asyncpg_codecs(conn):
     try:
         await conn.set_type_codec(
             'json',
-            encoder=lambda v: json.dumps(v, separators=(',', ':'), ensure_ascii=False),
+            encoder=_json_encoder,
             decoder=json.loads,
             schema='pg_catalog',
         )
@@ -43,7 +49,7 @@ async def _init_asyncpg_codecs(conn):
     try:
         await conn.set_type_codec(
             'jsonb',
-            encoder=lambda v: json.dumps(v, separators=(',', ':'), ensure_ascii=False),
+            encoder=_json_encoder,
             decoder=json.loads,
             schema='pg_catalog',
         )
@@ -182,14 +188,52 @@ class UserPreferencesUpdate(BaseModel):
 
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+_JSON_LOGS = os.environ.get("JSON_LOGS", "1").strip().lower() in ("1", "true", "yes")
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record):
+        import json as _j
+        entry = {
+            "ts": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if hasattr(record, "trace_id") and record.trace_id:
+            entry["trace_id"] = record.trace_id
+        if record.exc_info and record.exc_info[0]:
+            entry["exc"] = self.formatException(record.exc_info)
+        return _j.dumps(entry, default=str, ensure_ascii=False)
+
+_handler = logging.StreamHandler()
+if _JSON_LOGS:
+    _handler.setFormatter(_JsonFormatter())
+else:
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.root.handlers = [_handler]
+logging.root.setLevel(LOG_LEVEL)
 logger = logging.getLogger("uploadm8-api")
 
-# httpx logs every outbound request URL at INFO level — including access_token,
-# client_secret, and OAuth codes in query params. Suppress to WARNING so those
-# URLs never appear in logs or log aggregators.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# ── Sentry (opt-in via SENTRY_DSN) ──────────────────────────
+_SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        from sentry_sdk.integrations.asyncpg import AsyncPGIntegration
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            environment=os.environ.get("SENTRY_ENV", "production"),
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.1")),
+            send_default_pii=False,
+            integrations=[FastApiIntegration(), AsyncPGIntegration()],
+        )
+        logger.info("Sentry initialised (env=%s)", os.environ.get("SENTRY_ENV", "production"))
+    except ImportError:
+        logger.warning("SENTRY_DSN set but sentry-sdk not installed — skipping")
 
 # ============================================================
 # Configuration
@@ -413,6 +457,10 @@ admin_settings_cache: Dict[str, Any] = {
     "promo_referral_enabled": False,
 }
 
+# Keep in sync with the highest migration tuple in run_migrations().
+MIGRATIONS_LATEST_VERSION = 818
+MIGRATIONS_CRITICAL_VERSIONS = [606, 607, 608, 609, 811]
+
 # ============================================================
 # Plan Configuration (PUT/AIC based)
 # ============================================================
@@ -437,6 +485,7 @@ from stages.entitlements import (
     get_tier_from_lookup_key,
     get_priority_lane,
     check_queue_depth,
+    can_user_connect_platform,
     compute_upload_cost,   # canonical PUT/AIC formula
 )
 from services.wallet import (
@@ -472,6 +521,7 @@ from services.notifications import (
 # ── Email notifications ───────────────────────────────────────────────────────
 from stages.emails import (
     # Auth
+    send_signup_confirmation_email as send_signup_confirmation_email_v2,
     send_welcome_email,
     send_fully_signed_up_guide_email,
     send_password_reset_email,
@@ -502,6 +552,7 @@ from stages.emails import (
     # Admin actions
     send_admin_wallet_topup_email,
     send_admin_tier_switch_email,
+    send_admin_account_status_email,
     # Lifecycle
     send_payment_failed_email,
     send_trial_ending_reminder_email,
@@ -762,14 +813,27 @@ async def _run_scheduled_publish_alerts_once():
             await conn.execute("UPDATE uploads SET schedule_fail_email_sent_at = NOW() WHERE id = $1", r["id"])
 
 
+async def _acquire_cron_lock(lock_name: str, ttl_seconds: int = 300) -> bool:
+    """Try to acquire a distributed Redis lock for cron leadership.
+    Returns True if this instance won the lock (should run the cron tick).
+    Falls back to always-True when Redis is unavailable (single-instance mode)."""
+    if not redis_client:
+        return True
+    try:
+        acquired = await redis_client.set(f"cron_lock:{lock_name}", "1", nx=True, ex=ttl_seconds)
+        return bool(acquired)
+    except Exception:
+        return True
+
 async def _email_cron_loop():
-    """Background loop for reminder/digest emails."""
+    """Background loop for reminder/digest emails (leader-elected via Redis lock)."""
     while True:
         try:
-            await _run_trial_ending_reminders_once()
-            await _run_monthly_user_kpi_digests_once()
-            await _run_admin_weekly_kpi_digest_once()
-            await _run_scheduled_publish_alerts_once()
+            if await _acquire_cron_lock("email_cron", ttl_seconds=max(280, EMAIL_CRON_INTERVAL_SECONDS - 20)):
+                await _run_trial_ending_reminders_once()
+                await _run_monthly_user_kpi_digests_once()
+                await _run_admin_weekly_kpi_digest_once()
+                await _run_scheduled_publish_alerts_once()
         except Exception as e:
             logger.warning(f"email cron loop failed: {e}")
         await asyncio.sleep(max(300, EMAIL_CRON_INTERVAL_SECONDS))
@@ -902,133 +966,12 @@ async def send_email(to: str, subject: str, html: str):
 
 
 async def send_signup_confirmation_email(email: str, name: str, token: str):
-    """Send branded email confirmation link to newly registered user."""
-    if not MAILGUN_API_KEY or not MAILGUN_DOMAIN:
-        logger.info(f"Confirmation email skipped (no Mailgun): {email}")
-        return
-
+    """
+    Send signup confirmation using the centralized stages.emails template set.
+    This keeps all auth emails visually consistent and link-safe.
+    """
     confirm_url = f"{FRONTEND_URL.rstrip('/')}/confirm-email.html?token={quote(token)}"
-    first_name = name.split()[0] if name else "there"
-    subject = "Confirm your UploadM8 email address"
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Confirm your email – UploadM8</title>
-</head>
-<body style="margin:0;padding:0;background:#0f0f0f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f0f0f;padding:40px 20px;">
-    <tr>
-      <td align="center">
-        <table width="560" cellpadding="0" cellspacing="0" style="background:#1a1a1a;border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,0.08);">
-
-          <!-- Header -->
-          <tr>
-            <td style="background:linear-gradient(135deg,#1a1a1a 0%,#0f0f0f 100%);padding:36px 40px 28px;border-bottom:1px solid rgba(249,115,22,0.2);">
-              <table width="100%" cellpadding="0" cellspacing="0">
-                <tr>
-                  <td>
-                    <span style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:-0.5px;">
-                      Upload<span style="color:#f97316;">M8</span>
-                    </span>
-                  </td>
-                  <td align="right">
-                    <span style="background:rgba(249,115,22,0.15);border:1px solid rgba(249,115,22,0.3);color:#f97316;font-size:11px;font-weight:600;padding:4px 10px;border-radius:20px;letter-spacing:0.5px;">EMAIL VERIFICATION</span>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
-          <!-- Icon row -->
-          <tr>
-            <td align="center" style="padding:40px 40px 0;">
-              <div style="width:72px;height:72px;background:rgba(249,115,22,0.1);border:1px solid rgba(249,115,22,0.25);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:30px;line-height:72px;">
-                ️
-              </div>
-            </td>
-          </tr>
-
-          <!-- Body -->
-          <tr>
-            <td style="padding:28px 40px 0;">
-              <h1 style="margin:0 0 12px;font-size:24px;font-weight:700;color:#ffffff;line-height:1.3;">
-                Confirm your email, {first_name}
-              </h1>
-              <p style="margin:0 0 20px;font-size:15px;color:#9ca3af;line-height:1.6;">
-                Thanks for signing up to UploadM8 — the fastest way to publish your videos across TikTok, YouTube Shorts, Instagram Reels, and Facebook Reels.
-              </p>
-              <p style="margin:0 0 32px;font-size:15px;color:#9ca3af;line-height:1.6;">
-                Click the button below to verify your email address and activate your account.
-              </p>
-            </td>
-          </tr>
-
-          <!-- CTA Button -->
-          <tr>
-            <td align="center" style="padding:0 40px 36px;">
-              <a href="{confirm_url}"
-                 style="display:inline-block;background:#f97316;color:#ffffff;text-decoration:none;font-size:16px;font-weight:700;padding:16px 40px;border-radius:10px;letter-spacing:0.2px;">
-                Confirm My Email →
-              </a>
-            </td>
-          </tr>
-
-          <!-- Divider -->
-          <tr>
-            <td style="padding:0 40px;">
-              <hr style="border:none;border-top:1px solid rgba(255,255,255,0.07);margin:0;">
-            </td>
-          </tr>
-
-          <!-- Fallback link -->
-          <tr>
-            <td style="padding:24px 40px;">
-              <p style="margin:0 0 8px;font-size:13px;color:#6b7280;">
-                Button not working? Copy and paste this link into your browser:
-              </p>
-              <p style="margin:0;font-size:12px;color:#f97316;word-break:break-all;">
-                {confirm_url}
-              </p>
-            </td>
-          </tr>
-
-          <!-- Expiry notice -->
-          <tr>
-            <td style="padding:0 40px 32px;">
-              <div style="background:rgba(249,115,22,0.06);border:1px solid rgba(249,115,22,0.15);border-radius:8px;padding:14px 16px;">
-                <p style="margin:0;font-size:13px;color:#9ca3af;line-height:1.5;">
-                  ⏱ This link expires in <strong style="color:#f97316;">24 hours</strong>. If you didn't create an UploadM8 account, you can safely ignore this email.
-                </p>
-              </div>
-            </td>
-          </tr>
-
-          <!-- Footer -->
-          <tr>
-            <td style="background:#111111;padding:24px 40px;border-top:1px solid rgba(255,255,255,0.07);">
-              <p style="margin:0 0 6px;font-size:12px;color:#4b5563;text-align:center;">
-                © 2025 UploadM8 · Upload once, publish everywhere
-              </p>
-              <p style="margin:0;font-size:12px;color:#4b5563;text-align:center;">
-                <a href="{FRONTEND_URL}/privacy.html" style="color:#6b7280;text-decoration:none;">Privacy</a>
-                &nbsp;·&nbsp;
-                <a href="{FRONTEND_URL}/terms.html" style="color:#6b7280;text-decoration:none;">Terms</a>
-                &nbsp;·&nbsp;
-                <a href="{FRONTEND_URL}/support.html" style="color:#6b7280;text-decoration:none;">Support</a>
-              </p>
-            </td>
-          </tr>
-
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>"""
-
-    await send_email(email, subject, html)
+    await send_signup_confirmation_email_v2(email, name or "there", confirm_url)
 
 
 # ============================================================
@@ -1257,6 +1200,13 @@ class SettingsUpdate(BaseModel):
 class CheckoutRequest(BaseModel):
     lookup_key: str
     kind: str = "subscription"  # subscription | topup | addon
+
+
+class UploadCostEstimateRequest(BaseModel):
+    num_publish_targets: int = Field(default=1, ge=1, le=100)
+    use_ai: bool = True
+    use_hud: bool = False
+    num_thumbnails: int = Field(default=1, ge=1, le=20)
 
 
 class PromoTogglesBody(BaseModel):
@@ -1832,6 +1782,75 @@ async def run_migrations():
         WHERE status IN ('completed', 'succeeded', 'partial');
 """),
 
+# ── Per-account metrics events + daily rollups (scalable analytics backbone) ──
+(606, """
+    CREATE TABLE IF NOT EXISTS platform_account_metrics_events (
+        id           BIGSERIAL PRIMARY KEY,
+        fetched_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        token_row_id UUID,
+        platform     VARCHAR(50) NOT NULL,
+        account_id   TEXT,
+        metrics      JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+    CREATE INDEX IF NOT EXISTS idx_pame_user_time ON platform_account_metrics_events(user_id, fetched_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_pame_plat_time ON platform_account_metrics_events(platform, fetched_at DESC);
+"""),
+
+(607, """
+    CREATE TABLE IF NOT EXISTS platform_user_metrics_rollups_daily (
+        user_id        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        day            DATE NOT NULL,
+        views          BIGINT NOT NULL DEFAULT 0,
+        likes          BIGINT NOT NULL DEFAULT 0,
+        comments       BIGINT NOT NULL DEFAULT 0,
+        shares         BIGINT NOT NULL DEFAULT 0,
+        platforms_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, day)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pumrd_day ON platform_user_metrics_rollups_daily(day DESC);
+"""),
+
+# ── ML-ready feature/outcome datasets ─────────────────────────────────────────
+(608, """
+    CREATE TABLE IF NOT EXISTS upload_feature_events (
+        id                    BIGSERIAL PRIMARY KEY,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        user_id               UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        upload_id             UUID NOT NULL,
+        category              TEXT,
+        audio_context         JSONB,
+        vision_context        JSONB,
+        video_understanding   JSONB,
+        thumbnail_brief       JSONB,
+        output_artifacts      JSONB,
+        ai_title              TEXT,
+        ai_caption            TEXT,
+        ai_hashtags           JSONB
+    );
+    CREATE INDEX IF NOT EXISTS idx_ufe_user_time ON upload_feature_events(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_ufe_upload ON upload_feature_events(upload_id);
+"""),
+
+(609, """
+    CREATE TABLE IF NOT EXISTS upload_quality_scores_daily (
+        user_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        day                DATE NOT NULL,
+        platform           VARCHAR(50) NOT NULL DEFAULT 'all',
+        strategy_key       TEXT NOT NULL DEFAULT 'default',
+        samples            INT NOT NULL DEFAULT 0,
+        mean_engagement    DOUBLE PRECISION NOT NULL DEFAULT 0,
+        mean_views         DOUBLE PRECISION NOT NULL DEFAULT 0,
+        engagement_stddev  DOUBLE PRECISION NOT NULL DEFAULT 0,
+        ci95_low           DOUBLE PRECISION NOT NULL DEFAULT 0,
+        ci95_high          DOUBLE PRECISION NOT NULL DEFAULT 0,
+        updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, day, platform, strategy_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_uqsd_day ON upload_quality_scores_daily(day DESC);
+"""),
+
 # ── Comprehensive audit system — corporate-grade event logging ──────────────
 (700, """
     -- Upgrade admin_audit_log with full corporate columns
@@ -2253,6 +2272,7 @@ async def run_migrations():
                     logger.info(f"Migration v{version} applied")
                 except Exception as e:
                     logger.error(f"Migration v{version} failed: {e}")
+                    raise
 
 app = FastAPI(title="UploadM8 API", version="4.0.0", lifespan=lifespan)
 # NOTE: Do NOT add CORSMiddleware here. FastAPI prepends each add_middleware();
@@ -2564,13 +2584,33 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
+import contextvars as _contextvars
+_trace_id_var: _contextvars.ContextVar[str] = _contextvars.ContextVar("trace_id", default="")
+
+class _TraceFilter(logging.Filter):
+    def filter(self, record):
+        record.trace_id = _trace_id_var.get("")
+        return True
+
+for _h in logging.root.handlers:
+    _h.addFilter(_TraceFilter())
+
+@app.middleware("http")
+async def trace_id_middleware(request: Request, call_next):
+    trace_id = request.headers.get("X-Request-ID") or secrets.token_hex(8)
+    _trace_id_var.set(trace_id)
+    resp = await call_next(request)
+    resp.headers["X-Request-ID"] = trace_id
+    return resp
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
-    # connect-src includes http: so dev tools / local frontends aren't blocked if a client applies this CSP.
+    resp.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     resp.headers["Content-Security-Policy"] = (
         "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
         "script-src 'self' 'unsafe-inline' https:; connect-src 'self' http: https:;"
@@ -2658,6 +2698,69 @@ async def require_admin(user: dict = Depends(get_current_user)):
 async def require_master_admin(user: dict = Depends(get_current_user)):
     if user.get("role") != "master_admin": raise HTTPException(403, "Master admin required")
     return user
+
+
+@app.get("/api/admin/migrations/status")
+async def admin_migrations_status(user: dict = Depends(require_master_admin)):
+    """
+    DB/schema migration status from live app DB.
+    """
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (version INT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT NOW())"
+        )
+        rows = await conn.fetch(
+            "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+        )
+    applied_versions = [int(r["version"]) for r in rows]
+    applied_set = set(applied_versions)
+    latest_applied = max(applied_versions) if applied_versions else 0
+    critical = [
+        {
+            "version": v,
+            "applied": v in applied_set,
+        }
+        for v in MIGRATIONS_CRITICAL_VERSIONS
+    ]
+    return {
+        "latest_code_version": MIGRATIONS_LATEST_VERSION,
+        "latest_applied_version": latest_applied,
+        "applied_count": len(applied_versions),
+        "applied_versions": applied_versions,
+        "critical_versions": critical,
+        "missing_critical_versions": [v for v in MIGRATIONS_CRITICAL_VERSIONS if v not in applied_set],
+        "in_sync_to_latest": latest_applied >= MIGRATIONS_LATEST_VERSION,
+        "applied_at": {
+            str(int(r["version"])): (r["applied_at"].isoformat() if r["applied_at"] else None)
+            for r in rows
+        },
+    }
+
+
+@app.post("/api/admin/migrations/run")
+async def admin_run_migrations(user: dict = Depends(require_master_admin)):
+    """
+    Trigger run_migrations from the live app process.
+    """
+    async with db_pool.acquire() as conn:
+        before_rows = await conn.fetch("SELECT version FROM schema_migrations")
+    before_set = {int(r["version"]) for r in before_rows}
+
+    await run_migrations()
+
+    async with db_pool.acquire() as conn:
+        after_rows = await conn.fetch(
+            "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+        )
+    after_set = {int(r["version"]) for r in after_rows}
+    newly_applied = sorted(after_set - before_set)
+    return {
+        "ok": True,
+        "newly_applied_versions": newly_applied,
+        "latest_applied_version": (max(after_set) if after_set else 0),
+        "latest_code_version": MIGRATIONS_LATEST_VERSION,
+        "in_sync_to_latest": (max(after_set) if after_set else 0) >= MIGRATIONS_LATEST_VERSION,
+    }
 
 
 async def log_admin_audit(conn, *, user_id: str, admin: dict, action: str, details: dict = None,
@@ -3382,7 +3485,7 @@ async def forgot_password(payload: ForgotPasswordRequest, background: Background
                 user_row["id"], token_hash, expires_at
             )
 
-            reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password?token={quote(token)}"
+            reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password.html?token={quote(token)}"
             background.add_task(send_password_reset_email, user_row["email"], reset_link)
 
     return {"ok": True}
@@ -3621,6 +3724,30 @@ async def get_me(user: dict = Depends(get_current_user)):
     display_name = raw_name or combined or email_prefix or "User"
     next_upgrade_tier = get_next_public_upgrade_tier(raw_tier)
 
+    accounts_connected = 0
+    accounts_by_platform: Dict[str, int] = {}
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT platform, COUNT(*)::int AS n
+                FROM platform_tokens
+                WHERE user_id = $1
+                  AND revoked_at IS NULL
+                GROUP BY platform
+                """,
+                user["id"],
+            )
+        for r in rows:
+            p = (r.get("platform") or "").lower()
+            n = int(r.get("n") or 0)
+            if not p:
+                continue
+            accounts_by_platform[p] = n
+            accounts_connected += n
+    except Exception:
+        pass
+
     # Stabilization window: return both snake_case + camelCase keys
     return {
         "id": user["id"],
@@ -3643,7 +3770,10 @@ async def get_me(user: dict = Depends(get_current_user)):
         "current_period_end":      user.get("current_period_end").isoformat() if user.get("current_period_end") else None,
         "trial_end":               user.get("trial_end").isoformat() if user.get("trial_end") else None,
         "stripe_subscription_id":  user.get("stripe_subscription_id"),
+        "stripe_customer_id":      user.get("stripe_customer_id"),
         "billing_mode":            BILLING_MODE,   # "test" | "live"
+        "accounts_connected":      accounts_connected,
+        "accounts_by_platform":    accounts_by_platform,
         "wallet": {
             "put_balance":  float(wallet.get("put_balance", 0.0) or 0.0),
             "aic_balance":  float(wallet.get("aic_balance", 0.0) or 0.0),
@@ -5413,12 +5543,139 @@ async def _enrich_platform_results(conn, upload_row: dict, user_id: str) -> list
     return enriched
 
 
+async def _batch_enrich_platform_results(conn, rows: list, user_id: str) -> dict:
+    """Pre-fetch all platform_tokens needed by a batch of upload rows in ONE query.
+    Returns {upload_id: enriched_list}. Eliminates N+1 DB calls."""
+    all_target_ids: set[str] = set()
+    all_platforms: set[str] = set()
+    per_upload_raw: dict[str, list] = {}
+
+    for r in rows:
+        uid = str(r.get("id") or r["id"])
+        raw = r.get("platform_results") or []
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = []
+        if isinstance(raw, dict):
+            items = [{"platform": k, **v} for k, v in raw.items() if isinstance(v, dict)]
+        elif isinstance(raw, list):
+            items = list(raw)
+        else:
+            items = []
+
+        per_upload_raw[uid] = items
+
+        for tid in (r.get("target_accounts") or []):
+            if tid:
+                all_target_ids.add(str(tid))
+        for e in items:
+            p = (e.get("platform") or "").lower()
+            if p:
+                all_platforms.add(p)
+
+    token_map: dict[str, dict] = {}
+    if all_target_ids:
+        try:
+            tok_rows = await conn.fetch(
+                """SELECT id, platform, account_id, account_name, account_username, account_avatar
+                   FROM platform_tokens
+                   WHERE user_id = $1 AND id = ANY($2::uuid[]) AND revoked_at IS NULL""",
+                user_id, list(all_target_ids)
+            )
+            for tr in tok_rows:
+                token_map[str(tr["id"])] = {
+                    "token_row_id":     str(tr["id"]),
+                    "account_id":       tr["account_id"]       or "",
+                    "account_name":     tr["account_name"]     or "",
+                    "account_username": tr["account_username"] or "",
+                    "account_avatar":   tr["account_avatar"]   or "",
+                    "platform":         tr["platform"],
+                }
+        except Exception as e:
+            logger.warning(f"_batch_enrich target lookup: {e}")
+
+    platform_fallback: dict[str, dict] = {}
+    if not token_map and all_platforms:
+        try:
+            fb_rows = await conn.fetch(
+                """SELECT DISTINCT ON (platform)
+                          id, platform, account_id, account_name, account_username, account_avatar
+                   FROM platform_tokens
+                   WHERE user_id = $1 AND platform = ANY($2::text[]) AND revoked_at IS NULL
+                   ORDER BY platform, is_primary DESC NULLS LAST, updated_at DESC""",
+                user_id, list(all_platforms)
+            )
+            for r in fb_rows:
+                platform_fallback[r["platform"]] = {
+                    "token_row_id":     str(r["id"]),
+                    "account_id":       r["account_id"]       or "",
+                    "account_name":     r["account_name"]     or "",
+                    "account_username": r["account_username"] or "",
+                    "account_avatar":   r["account_avatar"]   or "",
+                }
+        except Exception as e:
+            logger.warning(f"_batch_enrich fallback lookup: {e}")
+
+    result: dict[str, list] = {}
+    for uid, items in per_upload_raw.items():
+        if not items:
+            result[uid] = items
+            continue
+
+        successful = [e for e in items if e.get("success") is not False]
+        already_enriched = successful and all(
+            (e.get("account_username") or e.get("account_name") or e.get("account_id"))
+            and (e.get("account_avatar") or e.get("avatar"))
+            for e in successful
+        )
+        if already_enriched:
+            for e in items:
+                if e.get("account_avatar"):
+                    e["account_avatar"] = _platform_account_avatar_to_url(e["account_avatar"])
+                if e.get("avatar"):
+                    e["avatar"] = _platform_account_avatar_to_url(e["avatar"])
+            result[uid] = items
+            continue
+
+        used_token_ids: set[str] = set()
+        enriched = []
+        for entry in items:
+            p = (entry.get("platform") or "").lower()
+            stored_token_id = entry.get("token_row_id") or ""
+            if stored_token_id and stored_token_id in token_map:
+                acct = token_map[stored_token_id]
+            elif token_map:
+                candidates = [v for v in token_map.values() if v.get("platform") == p and v.get("token_row_id") not in used_token_ids]
+                acct = candidates[0] if candidates else next((v for v in token_map.values() if v.get("platform") == p), {})
+                if acct.get("token_row_id"):
+                    used_token_ids.add(acct["token_row_id"])
+            else:
+                acct = platform_fallback.get(p, {})
+
+            merged = {**entry}
+            for field in ("token_row_id", "account_id", "account_name", "account_username", "account_avatar"):
+                if not merged.get(field) and acct.get(field):
+                    merged[field] = acct[field]
+            if merged.get("account_avatar"):
+                merged["account_avatar"] = _platform_account_avatar_to_url(merged["account_avatar"])
+            if merged.get("avatar"):
+                merged["avatar"] = _platform_account_avatar_to_url(merged["avatar"])
+            enriched.append(merged)
+
+        result[uid] = enriched
+
+    return result
+
+
 @app.get("/api/uploads")
 async def get_uploads(
     status: Optional[str] = None,
     view: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
+    cursor: Optional[str] = None,
     trill_only: bool = False,
     meta: bool = False,
     user: dict = Depends(get_current_user),
@@ -5492,8 +5749,29 @@ async def get_uploads(
         select_sql += " AND trill_score IS NOT NULL"
         count_sql += " AND trill_score IS NOT NULL"
 
-    params.extend([limit, offset])
-    select_sql += f" ORDER BY created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}"
+    cursor_ts = None
+    cursor_id = None
+    if cursor:
+        try:
+            parts = base64.b64decode(cursor).decode().split("|", 1)
+            cursor_ts = datetime.fromisoformat(parts[0])
+            cursor_id = parts[1] if len(parts) > 1 else None
+        except Exception:
+            pass
+
+    if cursor_ts and cursor_id:
+        params.append(cursor_ts)
+        params.append(cursor_id)
+        select_sql += f" AND (created_at, id) < (${len(params)-1}, ${len(params)}::uuid)"
+    elif cursor_ts:
+        params.append(cursor_ts)
+        select_sql += f" AND created_at < ${len(params)}"
+
+    params.append(limit)
+    select_sql += f" ORDER BY created_at DESC, id DESC LIMIT ${len(params)}"
+    if not cursor:
+        params.append(offset)
+        select_sql += f" OFFSET ${len(params)}"
 
     def _normalize_hashtags(raw):
         tags = _safe_json(raw, [])
@@ -5509,9 +5787,29 @@ async def get_uploads(
         rows = await conn.fetch(select_sql, *params)
         total = await conn.fetchval(count_sql, *count_params) if meta else None
 
-        for r in rows:
-            d = dict(r)
+        row_dicts = [dict(r) for r in rows]
 
+        enriched_map = await _batch_enrich_platform_results(conn, row_dicts, str(user["id"]))
+
+        thumb_keys = [(i, d.get("thumbnail_r2_key")) for i, d in enumerate(row_dicts)]
+        thumb_urls: dict[int, str | None] = {}
+        keys_to_sign = [(i, _normalize_r2_key(k)) for i, k in thumb_keys if k]
+        if keys_to_sign:
+            try:
+                s3 = get_s3_client()
+                for i, nk in keys_to_sign:
+                    try:
+                        thumb_urls[i] = s3.generate_presigned_url(
+                            "get_object",
+                            Params={"Bucket": R2_BUCKET_NAME, "Key": nk},
+                            ExpiresIn=3600,
+                        )
+                    except Exception:
+                        thumb_urls[i] = None
+            except Exception:
+                pass
+
+        for idx, d in enumerate(row_dicts):
             ai_title = (d.get("ai_title") or d.get("ai_generated_title") or "") or ""
             ai_caption = (d.get("ai_caption") or d.get("ai_generated_caption") or "") or ""
             ai_hashtags = _normalize_hashtags(d.get("ai_generated_hashtags"))
@@ -5520,20 +5818,7 @@ async def get_uploads(
             caption = (d.get("caption") or "").strip() or ai_caption
 
             hashtags = _normalize_hashtags(d.get("hashtags"))
-            platform_results = await _enrich_platform_results(conn, d, str(user["id"]))
-
-            thumbnail_url = None
-            thumb_key = d.get("thumbnail_r2_key")
-            if thumb_key:
-                try:
-                    s3 = s3 or get_s3_client()
-                    thumbnail_url = s3.generate_presigned_url(
-                        "get_object",
-                        Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(thumb_key)},
-                        ExpiresIn=3600,
-                    )
-                except Exception:
-                    thumbnail_url = None
+            platform_results = enriched_map.get(str(d.get("id")), [])
 
             raw_status = d.get("status") or ""
             item = {
@@ -5561,7 +5846,7 @@ async def get_uploads(
                 "error_code": d.get("error_code"),
                 "error": d.get("error_detail") or d.get("error_code") or None,
 
-                "thumbnail_url": thumbnail_url,
+                "thumbnail_url": thumb_urls.get(idx),
                 "platform_results": platform_results,
 
                 "file_size": d.get("file_size"),
@@ -5586,7 +5871,22 @@ async def get_uploads(
     if not meta:
         return out
 
-    return {"uploads": out, "total": int(total or 0), "limit": limit, "offset": offset}
+    next_cursor = None
+    if out:
+        last = row_dicts[-1]
+        last_ts = last.get("created_at")
+        last_id = str(last.get("id") or "")
+        if last_ts:
+            raw_cursor = f"{last_ts.isoformat()}|{last_id}"
+            next_cursor = base64.b64encode(raw_cursor.encode()).decode()
+
+    return {
+        "uploads": out,
+        "total": int(total or 0),
+        "limit": limit,
+        "offset": offset,
+        "next_cursor": next_cursor,
+    }
 
 
 @app.get("/api/uploads/queue-stats")
@@ -5928,7 +6228,7 @@ async def sync_upload_analytics(
     uid_str = str(user["id"])
     plats_in_upload = {str(pr.get("platform") or "").lower() for pr in pr_list}
     try:
-        from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
+        from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token, _refresh_meta_token
 
         if "tiktok" in plats_in_upload:
             for tr in token_rows:
@@ -5950,6 +6250,17 @@ async def sync_upload_analytics(
                         await _refresh_youtube_token(dict(dec), db_pool=db_pool, user_id=uid_str)
                 except Exception:
                     pass
+        for meta_plat in ("instagram", "facebook"):
+            if meta_plat in plats_in_upload:
+                for tr in token_rows:
+                    if tr["platform"] != meta_plat:
+                        continue
+                    try:
+                        dec = decrypt_blob(tr["token_blob"])
+                        if dec:
+                            await _refresh_meta_token(dict(dec), platform=meta_plat, db_pool=db_pool, user_id=uid_str)
+                    except Exception:
+                        pass
         async with db_pool.acquire() as conn:
             trs = await conn.fetch(
                 "SELECT id, platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
@@ -6593,7 +6904,8 @@ async def retry_upload(upload_id: str, user: dict = Depends(get_current_user)):
         "action": "retry",
     }
 
-    await enqueue_job(job_data, priority=plan.get("priority", False))
+    pc = plan.get("priority_class", "p4")
+    await enqueue_job(job_data, lane="process", priority_class=pc)
     return {"status": "requeued", "upload_id": upload_id}
 
 
@@ -7731,8 +8043,29 @@ OAUTH_CONFIG = {
 }
 
 
-# OAuth state storage (in production, use Redis)
-oauth_states: Dict[str, dict] = {}
+# OAuth state storage — Redis-backed when available for multi-instance scaling,
+# falls back to in-memory dict for single-instance / local dev.
+_oauth_states_mem: Dict[str, dict] = {}
+_OAUTH_STATE_TTL = 600  # 10 minutes
+
+async def _oauth_state_set(key: str, data: dict):
+    if redis_client:
+        try:
+            await redis_client.setex(f"oauth_state:{key}", _OAUTH_STATE_TTL, json.dumps(data))
+            return
+        except Exception:
+            pass
+    _oauth_states_mem[key] = data
+
+async def _oauth_state_pop(key: str) -> dict | None:
+    if redis_client:
+        try:
+            raw = await redis_client.getdel(f"oauth_state:{key}")
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+    return _oauth_states_mem.pop(key, None)
 
 # OAuth credentials from environment
 # TikTok
@@ -7813,12 +8146,12 @@ async def oauth_start(
     state = secrets.token_urlsafe(32)
 
     # Store state with user info
-    oauth_states[state] = {
+    await _oauth_state_set(state, {
         "user_id": str(user["id"]),
         "platform": platform,
         "created_at": _now_utc().isoformat(),
         "parent_origin": _sanitize_oauth_parent_origin(parent_origin),
-    }
+    })
     
     redirect_uri = get_oauth_redirect_uri(platform)
     
@@ -7867,8 +8200,8 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
     """Handle OAuth callback - returns HTML that communicates with parent window"""
     post_target = FRONTEND_URL.rstrip("/")
     state_data = None
-    if state and state in oauth_states:
-        state_data = oauth_states.pop(state)
+    if state:
+        state_data = await _oauth_state_pop(state)
         post_target = _sanitize_oauth_parent_origin(state_data.get("parent_origin"))
 
     def popup_response(success: bool, platform: str, error_msg: str = None):
@@ -7944,8 +8277,17 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                                 "Content-Type": "application/json",
                             },
                             json={
-                                # user.info.basic — do not request fields that need extra scopes
-                                "fields": ["open_id", "union_id", "avatar_url", "display_name"],
+                                # user.info.basic — request multiple avatar/name variants because
+                                # different TikTok app modes return different field subsets.
+                                "fields": [
+                                    "open_id",
+                                    "union_id",
+                                    "display_name",
+                                    "username",
+                                    "avatar_url",
+                                    "avatar_url_100",
+                                    "avatar_large_url",
+                                ],
                             },
                         )
                         ui_body = ui_resp.json() if ui_resp.content else {}
@@ -7957,9 +8299,17 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                             )
                         user_obj = (ui_body.get("data") or {}).get("user") or ui_body.get("user") or {}
                         display_name = (user_obj.get("display_name") or "").strip()
-                        avatar_url = (user_obj.get("avatar_url") or "").strip()
+                        username = (user_obj.get("username") or "").strip()
+                        avatar_url = (
+                            (user_obj.get("avatar_large_url") or "").strip()
+                            or (user_obj.get("avatar_url_100") or "").strip()
+                            or (user_obj.get("avatar_url") or "").strip()
+                        )
                         if display_name:
                             account_name = display_name
+                        if username:
+                            account_username = username
+                        elif display_name:
                             account_username = display_name
                         if avatar_url:
                             account_avatar = avatar_url
@@ -8141,19 +8491,28 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     """, token_blob, account_name, account_username, account_avatar, existing["id"])
                     connect_action = "PLATFORM_RECONNECTED"
                 else:
-                    user_row = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
-                    tier = (user_row or {}).get("subscription_tier") or "free"
-                    plan = get_plan(tier)
-                    max_acc = plan.get("max_accounts", 1)
-                    current_count = await conn.fetchval(
-                        "SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1",
+                    user_row = await conn.fetchrow(
+                        "SELECT id, role, subscription_tier FROM users WHERE id = $1",
                         user_id,
                     )
-                    if current_count >= max_acc:
+                    current_count = int(await conn.fetchval(
+                        "SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+                        user_id,
+                    ) or 0)
+                    current_for_platform = int(await conn.fetchval(
+                        "SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1 AND platform = $2 AND revoked_at IS NULL",
+                        user_id, platform,
+                    ) or 0)
+                    allowed, reason = can_user_connect_platform(
+                        dict(user_row or {}),
+                        current_total=current_count,
+                        current_for_platform=current_for_platform,
+                    )
+                    if not allowed:
                         return popup_response(
                             False,
                             platform,
-                            f"Account limit reached ({max_acc}). Disconnect an account or upgrade to add more.",
+                            reason,
                         )
                     await conn.execute("""
                         INSERT INTO platform_tokens (user_id, platform, account_id, account_name, account_username, account_avatar, token_blob, last_oauth_reconnect_at)
@@ -8224,8 +8583,118 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
 @app.post("/api/billing/portal")
 async def create_portal(user: dict = Depends(get_current_user)):
     if not user.get("stripe_customer_id"): raise HTTPException(400, "No billing account")
-    session = stripe.billing_portal.Session.create(customer=user["stripe_customer_id"], return_url=f"{FRONTEND_URL}/settings.html")
+    session = stripe.billing_portal.Session.create(customer=user["stripe_customer_id"], return_url=f"{FRONTEND_URL}/settings.html#billing")
     return {"portal_url": session.url}
+
+
+@app.get("/api/billing/overview")
+async def get_billing_overview(user: dict = Depends(get_current_user)):
+    """
+    Consolidated billing snapshot for Settings > Billing.
+    Includes current Stripe subscription status, payment method, and invoices.
+    """
+    out = {
+        "customer_id": user.get("stripe_customer_id"),
+        "subscription_id": user.get("stripe_subscription_id"),
+        "subscription": None,
+        "default_payment_method": None,
+        "invoices": [],
+        "portal_available": bool(user.get("stripe_customer_id")),
+    }
+    if not STRIPE_SECRET_KEY:
+        return out
+
+    customer_id = user.get("stripe_customer_id")
+    if not customer_id:
+        return out
+
+    try:
+        customer = stripe.Customer.retrieve(
+            customer_id,
+            expand=["invoice_settings.default_payment_method"],
+        )
+        pm = (customer.get("invoice_settings") or {}).get("default_payment_method")
+        if pm:
+            card = pm.get("card") or {}
+            out["default_payment_method"] = {
+                "brand": card.get("brand"),
+                "last4": card.get("last4"),
+                "exp_month": card.get("exp_month"),
+                "exp_year": card.get("exp_year"),
+            }
+    except Exception as e:
+        logger.warning(f"billing overview: customer fetch failed for {customer_id}: {e}")
+
+    sub_id = user.get("stripe_subscription_id")
+    if sub_id:
+        try:
+            sub = stripe.Subscription.retrieve(
+                sub_id,
+                expand=["items.data.price", "default_payment_method"],
+            )
+            price = None
+            try:
+                price = sub["items"]["data"][0]["price"]
+            except Exception:
+                price = None
+            tier = _tier_from_stripe_price(price or {}, user.get("subscription_tier") or "free")
+            out["subscription"] = {
+                "id": sub.get("id"),
+                "status": sub.get("status"),
+                "cancel_at_period_end": bool(sub.get("cancel_at_period_end")),
+                "trial_end": sub.get("trial_end"),
+                "current_period_start": sub.get("current_period_start"),
+                "current_period_end": sub.get("current_period_end"),
+                "tier": tier,
+                "lookup_key": (price or {}).get("lookup_key"),
+            }
+        except Exception as e:
+            logger.warning(f"billing overview: subscription fetch failed for {sub_id}: {e}")
+
+    try:
+        invoices = stripe.Invoice.list(customer=customer_id, limit=12)
+        out["invoices"] = [
+            {
+                "id": inv.get("id"),
+                "status": inv.get("status"),
+                "amount_paid": ((inv.get("amount_paid") or 0) / 100.0),
+                "amount_due": ((inv.get("amount_due") or 0) / 100.0),
+                "currency": (inv.get("currency") or "usd").upper(),
+                "created": inv.get("created"),
+                "period_start": inv.get("period_start"),
+                "period_end": inv.get("period_end"),
+                "hosted_invoice_url": inv.get("hosted_invoice_url"),
+                "invoice_pdf": inv.get("invoice_pdf"),
+            }
+            for inv in (invoices.data or [])
+        ]
+    except Exception as e:
+        logger.warning(f"billing overview: invoice fetch failed for {customer_id}: {e}")
+
+    return out
+
+
+@app.post("/api/billing/upload-estimate")
+async def estimate_upload_cost(
+    data: UploadCostEstimateRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Canonical PUT/AIC estimator based on backend entitlement logic."""
+    ent = get_entitlements_from_user(dict(user))
+    put_cost, aic_cost = compute_upload_cost(
+        entitlements=ent,
+        num_platforms=max(1, int(data.num_publish_targets or 1)),
+        use_ai=bool(data.use_ai),
+        use_hud=bool(data.use_hud),
+        num_thumbnails=max(1, int(data.num_thumbnails or 1)),
+    )
+    return {
+        "put_cost": int(put_cost),
+        "aic_cost": int(aic_cost),
+        "tier": ent.tier,
+        "ai_depth": ent.ai_depth,
+        "max_thumbnails": int(ent.max_thumbnails or 1),
+    }
 
 @app.get("/api/billing/session")
 async def get_billing_session(
@@ -8305,6 +8774,42 @@ async def get_billing_session(
     elif not plan_name:
         plan_name = "Your Plan"
 
+    # Fallback sync path: if webhook is delayed or misconfigured, hydrate subscription
+    # state from Stripe session directly so UI and entitlements are immediately coherent.
+    if mode == "subscription" and tier and sub_status in ("active", "trialing", "past_due"):
+        try:
+            ent = get_entitlements_for_tier(tier)
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE users SET
+                        subscription_tier      = $1,
+                        stripe_customer_id     = COALESCE(stripe_customer_id, $2),
+                        stripe_subscription_id = COALESCE($3, stripe_subscription_id),
+                        subscription_status    = $4,
+                        current_period_end     = COALESCE($5, current_period_end),
+                        trial_end              = COALESCE($6, trial_end),
+                        updated_at             = NOW()
+                    WHERE id = $7
+                    """,
+                    tier,
+                    sess.get("customer"),
+                    (sess.get("subscription") or {}).get("id") if isinstance(sess.get("subscription"), dict) else sess.get("subscription"),
+                    sub_status,
+                    (datetime.fromtimestamp(current_period_end_ts, tz=timezone.utc) if current_period_end_ts else None),
+                    (datetime.fromtimestamp(trial_end_ts, tz=timezone.utc) if trial_end_ts else None),
+                    user["id"],
+                )
+                await _ensure_wallet_floor_for_tier(
+                    conn,
+                    str(user["id"]),
+                    ent,
+                    "tier_floor_adjustment",
+                    stripe_event_id=session_id,
+                )
+        except Exception as e:
+            logger.warning(f"billing session fallback sync failed for user={user.get('id')}: {e}")
+
     return {
         "session_id":          session_id,
         "mode":                mode,
@@ -8338,7 +8843,36 @@ def _tier_from_stripe_price(price_obj: dict, fallback_tier: Optional[str] = None
     return normalize_tier(fallback_tier or "free")
 
 
+async def _ensure_wallet_floor_for_tier(conn, user_id: str, ent, reason: str, stripe_event_id: Optional[str] = None):
+    """
+    Ensure wallet balances are at least the tier monthly minimums.
+    Preserve any higher balances (topups/carryover).
+    """
+    wallet = await get_wallet(conn, user_id)
+    put_now = int(wallet.get("put_balance") or 0)
+    aic_now = int(wallet.get("aic_balance") or 0)
+    put_floor = int(getattr(ent, "put_monthly", 0) or 0)
+    aic_floor = int(getattr(ent, "aic_monthly", 0) or 0)
+
+    if put_now < put_floor:
+        delta = put_floor - put_now
+        await conn.execute(
+            "UPDATE wallets SET put_balance = put_balance + $1, updated_at = NOW() WHERE user_id = $2",
+            delta, user_id,
+        )
+        await ledger_entry(conn, user_id, "put", delta, reason, stripe_event_id=stripe_event_id)
+
+    if aic_now < aic_floor:
+        delta = aic_floor - aic_now
+        await conn.execute(
+            "UPDATE wallets SET aic_balance = aic_balance + $1, updated_at = NOW() WHERE user_id = $2",
+            delta, user_id,
+        )
+        await ledger_entry(conn, user_id, "aic", delta, reason, stripe_event_id=stripe_event_id)
+
+
 @app.post("/api/billing/webhook")
+@app.post("/api/stripe/webhook")
 async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     """Stripe billing webhook — idempotent, signature-verified."""
     payload = await request.body()
@@ -8376,17 +8910,19 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                 await conn.execute("""
                     UPDATE users SET
                         subscription_tier      = $1,
-                        stripe_subscription_id = $2,
-                        subscription_status    = $3,
-                        current_period_end     = $4,
-                        trial_end              = $5,
+                        stripe_customer_id     = COALESCE(stripe_customer_id, $2),
+                        stripe_subscription_id = $3,
+                        subscription_status    = $4,
+                        current_period_end     = $5,
+                        trial_end              = $6,
                         updated_at             = NOW()
-                    WHERE id = $6
-                """, tier, session.subscription, status, period_end, trial_end, user_id)
+                    WHERE id = $7
+                """, tier, session.customer, session.subscription, status, period_end, trial_end, user_id)
 
                 # Seed wallet for first period / trial — deduped by invoice id
                 refill_ref = sub.get("latest_invoice") or session.id
                 await _do_monthly_refill(conn, user_id, tier, ent, refill_ref, period_start, period_end)
+                await _ensure_wallet_floor_for_tier(conn, user_id, ent, "tier_floor_adjustment", stripe_event_id=session.id)
 
                 amount = (session.amount_total or 0) / 100
                 await conn.execute(
@@ -8491,6 +9027,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
 
             # Monthly wallet refill — deduped by invoice_id
             await _do_monthly_refill(conn, user_id, tier, ent, invoice_id, period_start, period_end)
+            await _ensure_wallet_floor_for_tier(conn, user_id, ent, "tier_floor_adjustment", stripe_event_id=invoice_id)
 
             amount = (invoice.amount_paid or 0) / 100
             await conn.execute(
@@ -8513,25 +9050,38 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
         async with db_pool.acquire() as conn:
             price_obj = sub["items"]["data"][0]["price"]
             period_end = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
+            trial_end = datetime.fromtimestamp(sub.trial_end, tz=timezone.utc) if sub.get("trial_end") else None
 
             # Fetch user before updating so we have old_tier for comparison
             user_row = await conn.fetchrow(
-                "SELECT id, email, name, subscription_tier FROM users WHERE stripe_subscription_id = $1", sub.id
+                "SELECT id, email, name, subscription_tier, subscription_status FROM users WHERE stripe_subscription_id = $1", sub.id
             )
             new_tier = _tier_from_stripe_price(
                 price_obj,
                 user_row["subscription_tier"] if user_row else "free",
             )
             old_tier = user_row["subscription_tier"] if user_row else new_tier
+            old_status = user_row["subscription_status"] if user_row else None
+            ent = get_entitlements_for_tier(new_tier)
 
             await conn.execute("""
                 UPDATE users SET
                     subscription_tier   = $1,
                     subscription_status = $2,
                     current_period_end  = $3,
+                    trial_end           = $4,
                     updated_at          = NOW()
-                WHERE stripe_subscription_id = $4
-            """, new_tier, sub.status, period_end, sub.id)
+                WHERE stripe_subscription_id = $5
+            """, new_tier, sub.status, period_end, trial_end, sub.id)
+
+            if user_row:
+                await _ensure_wallet_floor_for_tier(
+                    conn,
+                    str(user_row["id"]),
+                    ent,
+                    "tier_floor_adjustment",
+                    stripe_event_id=sub.id,
+                )
 
             # Send tier change email only when tier actually changed
             if user_row and old_tier != new_tier:
@@ -8549,6 +9099,24 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                         send_plan_downgraded_email,
                         _email, _name, old_tier, new_tier, _amount,
                         period_end.strftime("%B %d, %Y"),
+                    )
+
+            if user_row and old_status != sub.status:
+                _email = user_row["email"]
+                _name = user_row["name"] or "there"
+                if sub.status == "trialing":
+                    td = ent.trial_days or 7
+                    t_end = trial_end.strftime("%B %d, %Y") if trial_end else "in 7 days"
+                    background_tasks.add_task(
+                        send_trial_started_email,
+                        _email, _name, new_tier, t_end, td,
+                    )
+                elif sub.status == "active" and old_status not in ("active",):
+                    amount = float(get_plan(new_tier).get("price", 0.0) or 0.0)
+                    next_date = period_end.strftime("%B %d, %Y")
+                    background_tasks.add_task(
+                        send_subscription_started_email,
+                        _email, _name, new_tier, amount, next_date,
                     )
 
     # ── invoice.payment_failed — notify user to update payment method ────
@@ -8778,12 +9346,14 @@ def _verify_tiktok_signature(raw_body: bytes, header: str, secret: str) -> tuple
     ok=True  → signature is valid and timestamp is fresh.
     ok=False → verification failed (reason explains why).
 
-    If TIKTOK_WEBHOOK_SECRET is empty the check is skipped and we return
-    (True, "sig-check-skipped-no-secret") so the developer can still receive
-    events during initial setup without crashing.
+    If TIKTOK_WEBHOOK_SECRET is empty the check is skipped in development
+    (localhost/127.0.0.1). In production, missing secret rejects the event.
     """
     if not secret:
-        return True, "sig-check-skipped-no-secret"
+        base = os.environ.get("BASE_URL", "")
+        if "localhost" in base or "127.0.0.1" in base or not base:
+            return True, "sig-check-skipped-no-secret-dev"
+        return False, "webhook-secret-not-configured"
 
     if not header:
         return False, "missing-Tiktok-Signature-header"
@@ -9248,9 +9818,13 @@ async def facebook_webhook(request: Request, background_tasks: BackgroundTasks):
             logger.warning(f"[facebook-webhook] signature mismatch — header={sig_header[:60]}")
             raise HTTPException(403, "Invalid signature")
     elif META_APP_SECRET and not sig_header:
-        # Signature header missing entirely — reject in production
         logger.warning("[facebook-webhook] missing X-Hub-Signature-256 header")
         raise HTTPException(400, "Missing signature")
+    elif not META_APP_SECRET:
+        base = os.environ.get("BASE_URL", "")
+        if base and "localhost" not in base and "127.0.0.1" not in base:
+            logger.error("[facebook-webhook] META_APP_SECRET not configured in production — rejecting")
+            raise HTTPException(500, "Webhook secret not configured")
 
     # ── Parse payload ───────────────────────────────────────────────────────
     try:
@@ -9484,11 +10058,16 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
         except Exception:
             pass
 
+    # Prefer highest seen totals so stale per-upload rollups do not mask
+    # fresher cross-platform live aggregates.
+    show_views = max(int(stats["views"] if stats else 0), int(live_aggregate.get("views") or 0))
+    show_likes = max(int(stats["likes"] if stats else 0), int(live_aggregate.get("likes") or 0))
+
     result = {
         "total_uploads": stats["total"] if stats else 0,
         "completed": stats["completed"] if stats else 0,
-        "views": stats["views"] if stats else 0,
-        "likes": stats["likes"] if stats else 0,
+        "views": show_views,
+        "likes": show_likes,
         "comments": stats["comments"] if stats and "comments" in stats else 0,
         "shares": stats["shares"] if stats and "shares" in stats else 0,
         "put_used": stats["put_used"] if stats else 0,
@@ -9502,6 +10081,41 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
         result["trill"] = trill_stats
 
     return result
+
+
+@app.get("/api/analytics/quality-scores")
+async def get_quality_scores(
+    days: int = 30,
+    platform: str = "all",
+    user: dict = Depends(get_current_user),
+):
+    """
+    ML strategy score rows (daily aggregates + confidence intervals).
+    Used to inspect what's working over time and to drive model/prompt biasing.
+    """
+    days = max(1, min(int(days or 30), 365))
+    platform = (platform or "all").strip().lower()
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT day, platform, strategy_key, samples,
+                   mean_engagement, mean_views, engagement_stddev, ci95_low, ci95_high, updated_at
+              FROM upload_quality_scores_daily
+             WHERE user_id = $1
+               AND day >= (CURRENT_DATE - ($2::int || ' days')::interval)::date
+               AND ($3 = 'all' OR platform = $3)
+             ORDER BY day DESC, mean_engagement DESC, samples DESC
+             LIMIT 5000
+            """,
+            user["id"],
+            days,
+            platform,
+        )
+    return {
+        "days": days,
+        "platform": platform,
+        "rows": [dict(r) for r in rows],
+    }
 
 # ============================================================
 # Platform Metrics — Live data from each platform API
@@ -9563,6 +10177,116 @@ def _attach_aggregate_to_metrics_payload(payload: dict) -> dict:
     if isinstance(pl, dict):
         out["aggregate"] = _aggregate_platform_metrics_live(pl)
     return out
+
+
+def _sanitize_aggregate_numbers(aggregate: dict) -> tuple[dict, bool]:
+    changed = False
+    clean = {}
+    for key in ("views", "likes", "comments", "shares"):
+        raw = (aggregate or {}).get(key, 0)
+        try:
+            val = int(raw or 0)
+        except Exception:
+            val = 0
+        if val < 0:
+            val = 0
+        if raw != val:
+            changed = True
+        clean[key] = val
+    plats = (aggregate or {}).get("platforms_included", [])
+    if not isinstance(plats, list):
+        plats = []
+        changed = True
+    clean["platforms_included"] = [str(x) for x in plats if x]
+    return clean, changed
+
+
+async def _enforce_metrics_rollup_standards(conn, user_id: str, payload: dict) -> tuple[dict, dict]:
+    """
+    Post-rollup standards guardrail:
+    - recompute aggregate from platform payload
+    - sanitize numeric fields (non-negative ints)
+    - persist corrected payload/rollup when drift is detected
+    """
+    out = dict(payload or {})
+    platforms = out.get("platforms")
+    computed = _aggregate_platform_metrics_live(platforms if isinstance(platforms, dict) else {})
+    sanitized, sanitized_changed = _sanitize_aggregate_numbers(computed)
+    if not isinstance(platforms, dict):
+        await audit_log(
+            str(user_id),
+            "METRICS_PAYLOAD_MISSING_PLATFORMS",
+            event_category="DATA_INTEGRITY",
+            resource_type="platform_metrics_cache",
+            resource_id=str(user_id),
+            details={"reason": "missing_or_invalid_platforms_payload"},
+            severity="WARNING",
+            outcome="FAILED",
+        )
+    current = out.get("aggregate") if isinstance(out.get("aggregate"), dict) else {}
+    current_sanitized, _ = _sanitize_aggregate_numbers(current)
+    corrected = current_sanitized != sanitized
+    if corrected or sanitized_changed:
+        out["aggregate"] = sanitized
+        await _platform_metrics_db_cache_set(conn, str(user_id), out)
+        await audit_log(
+            str(user_id),
+            "METRICS_ROLLUP_CORRECTED",
+            event_category="DATA_INTEGRITY",
+            resource_type="platform_metrics_cache",
+            resource_id=str(user_id),
+            details={
+                "before": current_sanitized,
+                "after": sanitized,
+                "sanitized_changed": bool(sanitized_changed),
+            },
+            severity="WARNING",
+            outcome="SUCCESS",
+        )
+        try:
+            await conn.execute(
+                """
+                INSERT INTO platform_user_metrics_rollups_daily
+                    (user_id, day, views, likes, comments, shares, platforms_json, updated_at)
+                VALUES
+                    ($1, CURRENT_DATE, $2, $3, $4, $5, $6::jsonb, NOW())
+                ON CONFLICT (user_id, day) DO UPDATE
+                SET views = EXCLUDED.views,
+                    likes = EXCLUDED.likes,
+                    comments = EXCLUDED.comments,
+                    shares = EXCLUDED.shares,
+                    platforms_json = EXCLUDED.platforms_json,
+                    updated_at = NOW()
+                """,
+                str(user_id),
+                int(sanitized.get("views", 0)),
+                int(sanitized.get("likes", 0)),
+                int(sanitized.get("comments", 0)),
+                int(sanitized.get("shares", 0)),
+                json.dumps(platforms if isinstance(platforms, dict) else {}),
+            )
+        except Exception as e:
+            logger.warning(f"rollup standards update skipped user={user_id}: {e}")
+            await audit_log(
+                str(user_id),
+                "ROLLUP_DAILY_UPSERT_FAILED",
+                event_category="DATA_INTEGRITY",
+                resource_type="platform_user_metrics_rollups_daily",
+                resource_id=str(user_id),
+                details={"error": str(e)},
+                severity="ERROR",
+                outcome="FAILED",
+            )
+    return out, {
+        "corrected": bool(corrected or sanitized_changed),
+        "aggregate": sanitized,
+    }
+
+
+async def _apply_metrics_standards_for_user(user_id: str, payload: dict) -> tuple[dict, dict]:
+    """Single standards path for any platform-metrics payload returned to UI."""
+    async with db_pool.acquire() as conn:
+        return await _enforce_metrics_rollup_standards(conn, str(user_id), _attach_aggregate_to_metrics_payload(payload or {}))
 
 
 def _combine_platform_live_results(platform: str, results: List[dict]) -> dict:
@@ -9664,11 +10388,12 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
             durs      = [_i(v.get("duration")) for v in videos if v.get("duration") is not None]
             avg_watch = round(sum(durs) / len(durs), 1) if durs else None
 
-            # 2) User info stats (requires user.info.stats scope)
+            # 2) User info stats + profile (requires user.info.basic + user.info.stats scopes)
             followers = following = total_likes = video_count = None
+            display_name = username = avatar_url = None
             ui = await client.get(
                 "https://open.tiktokapis.com/v2/user/info/",
-                params={"fields": "follower_count,following_count,likes_count,video_count"},
+                params={"fields": "follower_count,following_count,likes_count,video_count,display_name,username,avatar_url"},
                 headers={"Authorization": f"Bearer {access_token}"},
             )
             try:
@@ -9677,19 +10402,25 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
                 ubody = {}
             uenv = tiktok_envelope_error(ubody)
             if ui.status_code == 200 and not uenv:
-                user_obj    = ((ubody.get("data", {}) or {}).get("user", {}) or {})
-                followers   = user_obj.get("follower_count")
-                following   = user_obj.get("following_count")
-                total_likes = user_obj.get("likes_count")
-                video_count = user_obj.get("video_count")
+                user_obj     = ((ubody.get("data", {}) or {}).get("user", {}) or {})
+                followers    = user_obj.get("follower_count")
+                following    = user_obj.get("following_count")
+                total_likes  = user_obj.get("likes_count")
+                video_count  = user_obj.get("video_count")
+                display_name = (user_obj.get("display_name") or "").strip() or None
+                username     = (user_obj.get("username") or "").strip() or None
+                avatar_url   = (user_obj.get("avatar_url") or "").strip() or None
             else:
                 logger.warning(
-                    f"TikTok user.info.stats HTTP {ui.status_code}: {uenv or ui.text[:200]}"
+                    f"TikTok user.info HTTP {ui.status_code}: {uenv or ui.text[:200]}"
                 )
 
             return {
                 "status": "live",
                 "analytics_source": "video.list+user.info.stats",
+                "display_name": display_name,
+                "username":    username,
+                "avatar_url":  avatar_url,
                 "followers":   _i(followers)   if followers   is not None else None,
                 "following":   _i(following)   if following   is not None else None,
                 "total_likes": _i(total_likes) if total_likes is not None else None,
@@ -9738,53 +10469,143 @@ async def _fetch_youtube_metrics(access_token: str) -> dict:
             views = likes = comments = shares = 0
             avg_watch = minutes_watched = None
             analytics_source = "channel_stats_fallback"
+            analytics_diagnostic = ""
+            shorts_views = shorts_likes = shorts_comments = shorts_count = 0
+
+            def _dur_to_seconds(iso: str) -> int:
+                # Parse a subset of ISO-8601 durations (PT#H#M#S) without extra deps.
+                if not iso or not isinstance(iso, str) or not iso.startswith("PT"):
+                    return 0
+                h = m = s = 0
+                try:
+                    import re as _re
+
+                    hh = _re.search(r"(\d+)H", iso)
+                    mm = _re.search(r"(\d+)M", iso)
+                    ss = _re.search(r"(\d+)S", iso)
+                    if hh:
+                        h = int(hh.group(1))
+                    if mm:
+                        m = int(mm.group(1))
+                    if ss:
+                        s = int(ss.group(1))
+                except Exception:
+                    return 0
+                return h * 3600 + m * 60 + s
             try:
                 today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 thirty = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+                # Primary: aggregated report (no dimensions) is more tolerant
+                # across channel/account states than day-dimension queries.
                 an = await client.get(
                     "https://youtubeanalytics.googleapis.com/v2/reports",
                     params={
                         "ids":        "channel==MINE",
                         "startDate":  thirty,
                         "endDate":    today,
-                        # dimensions=day locks column order: [0]=day [1]=views [2]=likes
-                        # [3]=comments [4]=shares [5]=avgDuration [6]=minutesWatched
-                        # Without it r[0] returns a date string, not view count
-                        "dimensions": "day",
                         "metrics":    "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
-                        "sort":       "day",
                     },
                     headers={"Authorization": f"Bearer {access_token}"},
                 )
                 if an.status_code == 200:
                     rows = an.json().get("rows", []) or []
                     if rows:
-                        views           = sum(int(r[1] or 0) for r in rows)
-                        likes           = sum(int(r[2] or 0) for r in rows)
-                        comments        = sum(int(r[3] or 0) for r in rows)
-                        shares          = sum(int(r[4] or 0) for r in rows)
-                        dur_vals        = [float(r[5]) for r in rows if r[5]]
-                        avg_watch       = round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else None
-                        minutes_watched = int(sum(float(r[6] or 0) for r in rows))
+                        r0 = rows[0] if isinstance(rows[0], list) else []
+                        views           = int(r0[0] or 0) if len(r0) > 0 else 0
+                        likes           = int(r0[1] or 0) if len(r0) > 1 else 0
+                        comments        = int(r0[2] or 0) if len(r0) > 2 else 0
+                        shares          = int(r0[3] or 0) if len(r0) > 3 else 0
+                        avg_watch       = round(float(r0[4]), 1) if len(r0) > 4 and r0[4] is not None else None
+                        minutes_watched = int(float(r0[5] or 0)) if len(r0) > 5 else 0
                         analytics_source = "yt-analytics"
                     else:
-                        views    = int(stats.get("viewCount",    0))
-                        likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
-                        comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+                        # Fallback attempt: day-dimension report to avoid edge-case
+                        # empty aggregate responses.
+                        an_day = await client.get(
+                            "https://youtubeanalytics.googleapis.com/v2/reports",
+                            params={
+                                "ids":        "channel==MINE",
+                                "startDate":  thirty,
+                                "endDate":    today,
+                                "dimensions": "day",
+                                "metrics":    "views,likes,comments,shares,averageViewDuration,estimatedMinutesWatched",
+                                "sort":       "day",
+                            },
+                            headers={"Authorization": f"Bearer {access_token}"},
+                        )
+                        if an_day.status_code == 200:
+                            drows = an_day.json().get("rows", []) or []
+                            if drows:
+                                views           = sum(int(r[1] or 0) for r in drows if isinstance(r, list) and len(r) > 1)
+                                likes           = sum(int(r[2] or 0) for r in drows if isinstance(r, list) and len(r) > 2)
+                                comments        = sum(int(r[3] or 0) for r in drows if isinstance(r, list) and len(r) > 3)
+                                shares          = sum(int(r[4] or 0) for r in drows if isinstance(r, list) and len(r) > 4)
+                                dur_vals        = [float(r[5]) for r in drows if isinstance(r, list) and len(r) > 5 and r[5] is not None]
+                                avg_watch       = round(sum(dur_vals) / len(dur_vals), 1) if dur_vals else None
+                                minutes_watched = int(sum(float(r[6] or 0) for r in drows if isinstance(r, list) and len(r) > 6))
+                                analytics_source = "yt-analytics"
+                            else:
+                                analytics_diagnostic = "yt_analytics_200_empty_rows"
+                        else:
+                            analytics_diagnostic = f"yt_analytics_day_http_{an_day.status_code}"
                 elif an.status_code == 403:
                     logger.warning("YouTube Analytics 403 — yt-analytics.readonly missing from token; user must reconnect")
+                    analytics_diagnostic = "yt_analytics_http_403"
                     views    = int(stats.get("viewCount",    0))
                     likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
                     comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
                 else:
+                    analytics_diagnostic = f"yt_analytics_http_{an.status_code}"
                     views    = int(stats.get("viewCount",    0))
                     likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
                     comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
             except Exception as ae:
                 logger.warning(f"YouTube Analytics error (non-fatal): {ae}")
+                analytics_diagnostic = f"yt_analytics_exception:{type(ae).__name__}"
                 views    = int(stats.get("viewCount",    0))
                 likes    = int(stats.get("likeCount",    0)) if "likeCount"    in stats else 0
                 comments = int(stats.get("commentCount", 0)) if "commentCount" in stats else 0
+
+            # Shorts-focused rollup for high-scale analytics quality.
+            # We classify Shorts as <= 60s duration from recent uploads playlist.
+            try:
+                ch_details = await client.get(
+                    "https://www.googleapis.com/youtube/v3/channels",
+                    params={"part": "contentDetails", "mine": "true"},
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if ch_details.status_code == 200:
+                    items2 = (ch_details.json() or {}).get("items") or []
+                    uploads_playlist = (((items2[0] if items2 else {}).get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads")
+                    if uploads_playlist:
+                        pl = await client.get(
+                            "https://www.googleapis.com/youtube/v3/playlistItems",
+                            params={"part": "contentDetails", "playlistId": uploads_playlist, "maxResults": 50},
+                            headers={"Authorization": f"Bearer {access_token}"},
+                        )
+                        if pl.status_code == 200:
+                            ids = [
+                                ((it.get("contentDetails") or {}).get("videoId") or "")
+                                for it in ((pl.json() or {}).get("items") or [])
+                            ]
+                            ids = [v for v in ids if v]
+                            if ids:
+                                vids = await client.get(
+                                    "https://www.googleapis.com/youtube/v3/videos",
+                                    params={"part": "contentDetails,statistics", "id": ",".join(ids[:50]), "maxResults": 50},
+                                    headers={"Authorization": f"Bearer {access_token}"},
+                                )
+                                if vids.status_code == 200:
+                                    for v in (vids.json() or {}).get("items") or []:
+                                        cd = v.get("contentDetails") or {}
+                                        st = v.get("statistics") or {}
+                                        if _dur_to_seconds(str(cd.get("duration") or "")) <= 60:
+                                            shorts_count += 1
+                                            shorts_views += int(st.get("viewCount") or 0)
+                                            shorts_likes += int(st.get("likeCount") or 0)
+                                            shorts_comments += int(st.get("commentCount") or 0)
+            except Exception as _shorts_e:
+                logger.debug(f"YouTube Shorts rollup skipped: {_shorts_e}")
 
             return {
                 "status": "live",
@@ -9797,6 +10618,11 @@ async def _fetch_youtube_metrics(access_token: str) -> dict:
                 "avg_watch_seconds": avg_watch,
                 "minutes_watched": minutes_watched,
                 "video_count":     int(stats.get("videoCount", 0)) if "videoCount" in stats else 0,
+                "shorts_views": shorts_views,
+                "shorts_likes": shorts_likes,
+                "shorts_comments": shorts_comments,
+                "shorts_count": shorts_count,
+                "analytics_diagnostic": analytics_diagnostic,
             }
     except Exception as e:
         logger.error(f"YouTube metrics error: {e}")
@@ -10069,15 +10895,66 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
             result["cache_source"] = "memory"
             result["cache_age_minutes"] = int(age / 60)
             result["next_refresh_minutes"] = int((_PLATFORM_CACHE_TTL - age) / 60)
-            return _attach_aggregate_to_metrics_payload(result)
+            corrected_payload, _ = await _apply_metrics_standards_for_user(user_id, result)
+            _platform_metrics_cache[user_id] = {"fetched_at": now, "data": corrected_payload}
+            return corrected_payload
 
     # 2) DB cache (survives restarts)
     async with db_pool.acquire() as conn:
         db_cached = await _platform_metrics_db_cache_get(conn, user_id)
         if db_cached and not force:
-            _platform_metrics_cache[user_id] = {"fetched_at": now, "data": db_cached}
-            return _attach_aggregate_to_metrics_payload(db_cached)
+            corrected_payload, _ = await _apply_metrics_standards_for_user(user_id, db_cached)
+            _platform_metrics_cache[user_id] = {"fetched_at": now, "data": corrected_payload}
+            return corrected_payload
 
+    # Scale-safe path: API reads cache/rollups; polling runs in background job service.
+    if not force:
+        async with db_pool.acquire() as conn:
+            roll = await conn.fetchrow(
+                """
+                SELECT views, likes, comments, shares
+                  FROM platform_user_metrics_rollups_daily
+                 WHERE user_id = $1
+                 ORDER BY day DESC
+                 LIMIT 1
+                """,
+                user["id"],
+            )
+        agg = {
+            "views": int((roll or {}).get("views") or 0),
+            "likes": int((roll or {}).get("likes") or 0),
+            "comments": int((roll or {}).get("comments") or 0),
+            "shares": int((roll or {}).get("shares") or 0),
+            "platforms_included": [],
+        }
+        # No platform payload here — only clamp/sanitize DB rollup (same non-negative rules)
+        agg_sanitized, _ = _sanitize_aggregate_numbers(agg)
+        return {
+            "platforms": {},
+            "aggregate": agg_sanitized,
+            "cached": True,
+            "cache_source": "rollup",
+            "fetched_at": None,
+            "cache_age_minutes": 9999,
+            "next_refresh_minutes": int(_PLATFORM_CACHE_TTL / 60),
+        }
+
+    # Manual refresh path (?force=true): run scalable poller, then read DB cache.
+    try:
+        from services.platform_metrics_job import refresh_platform_metrics_for_user
+
+        await refresh_platform_metrics_for_user(db_pool, user["id"])
+    except Exception as e:
+        logger.warning(f"platform-metrics forced refresh failed: {e}")
+
+    async with db_pool.acquire() as conn:
+        db_cached_after = await _platform_metrics_db_cache_get(conn, user_id)
+    if db_cached_after:
+        corrected_payload, _ = await _apply_metrics_standards_for_user(user_id, db_cached_after)
+        _platform_metrics_cache[user_id] = {"fetched_at": now, "data": corrected_payload}
+        return corrected_payload
+
+    async with db_pool.acquire() as conn:
         token_rows = await conn.fetch(
             "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
             user["id"],
@@ -10111,10 +10988,10 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
             token_lists.setdefault(plat, []).append(decrypted)
             token_map[plat] = decrypted
 
-    # Refresh OAuth tokens before live API calls (YouTube access ~1h; TikTok ~24h — refresh uses refresh_token).
+    # Refresh OAuth tokens before live API calls (YouTube ~1h; TikTok ~24h; Meta ~60 days).
     uid_str = str(user["id"])
     try:
-        from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
+        from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token, _refresh_meta_token
 
         if token_lists.get("tiktok"):
             refreshed = []
@@ -10134,6 +11011,24 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
                     refreshed.append(tok)
             token_lists["youtube"] = refreshed
             token_map["youtube"] = refreshed[-1]
+        if token_lists.get("instagram"):
+            refreshed = []
+            for tok in token_lists["instagram"]:
+                try:
+                    refreshed.append(await _refresh_meta_token(dict(tok), platform="instagram", db_pool=db_pool, user_id=uid_str))
+                except Exception:
+                    refreshed.append(tok)
+            token_lists["instagram"] = refreshed
+            token_map["instagram"] = refreshed[-1]
+        if token_lists.get("facebook"):
+            refreshed = []
+            for tok in token_lists["facebook"]:
+                try:
+                    refreshed.append(await _refresh_meta_token(dict(tok), platform="facebook", db_pool=db_pool, user_id=uid_str))
+                except Exception:
+                    refreshed.append(tok)
+            token_lists["facebook"] = refreshed
+            token_map["facebook"] = refreshed[-1]
     except Exception as _tok_e:
         logger.warning(f"Platform metrics OAuth refresh skipped: {_tok_e}")
 
@@ -10210,8 +11105,9 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
     _platform_metrics_cache[user_id] = {"fetched_at": now, "data": output}
     async with db_pool.acquire() as conn:
         await _platform_metrics_db_cache_set(conn, user_id, output)
-
-    return output
+    corrected_payload, _ = await _apply_metrics_standards_for_user(user_id, output)
+    _platform_metrics_cache[user_id] = {"fetched_at": now, "data": corrected_payload}
+    return corrected_payload
 
 
 @app.get("/api/analytics/platform-metrics/cached")
@@ -10221,8 +11117,79 @@ async def get_platform_metrics_cached(user: dict = Depends(get_current_user)):
     async with db_pool.acquire() as conn:
         cached = await _platform_metrics_db_cache_get(conn, user_id)
     if cached:
-        return _attach_aggregate_to_metrics_payload(cached)
+        corrected_payload, _ = await _apply_metrics_standards_for_user(user_id, cached)
+        _platform_metrics_cache[user_id] = {"fetched_at": _time.time(), "data": corrected_payload}
+        return corrected_payload
     return {"platforms": {}, "aggregate": {"views": 0, "likes": 0, "comments": 0, "shares": 0, "platforms_included": []}, "cached": True, "cache_source": "db", "fetched_at": None}
+
+
+@app.post("/api/analytics/refresh-all")
+async def refresh_all_analytics(user: dict = Depends(get_current_user)):
+    """
+    Force-refresh cross-platform aggregate cache for this user.
+    This keeps dashboard/queue/analytics numerics aligned after a manual refresh.
+    """
+    refreshed = False
+    try:
+        from services.platform_metrics_job import refresh_platform_metrics_for_user
+
+        refreshed = await refresh_platform_metrics_for_user(db_pool, user["id"])
+    except Exception as e:
+        logger.warning(f"/api/analytics/refresh-all failed user={user.get('id')}: {e}")
+        await audit_log(
+            str(user.get("id")),
+            "ANALYTICS_REFRESH_ALL_FAILED",
+            event_category="DATA_INTEGRITY",
+            resource_type="platform_metrics_cache",
+            resource_id=str(user.get("id")),
+            details={"error": str(e)},
+            severity="ERROR",
+            outcome="FAILED",
+        )
+
+    standards = {"corrected": False, "aggregate": {"views": 0, "likes": 0, "comments": 0, "shares": 0, "platforms_included": []}}
+    async with db_pool.acquire() as conn:
+        cached = await _platform_metrics_db_cache_get(conn, str(user["id"]))
+        if not cached:
+            await audit_log(
+                str(user.get("id")),
+                "ANALYTICS_REFRESH_ALL_CACHE_MISS",
+                event_category="DATA_INTEGRITY",
+                resource_type="platform_metrics_cache",
+                resource_id=str(user.get("id")),
+                details={"note": "no cached payload available after refresh"},
+                severity="WARNING",
+                outcome="FAILED",
+            )
+        payload, standards = await _enforce_metrics_rollup_standards(
+            conn,
+            str(user["id"]),
+            _attach_aggregate_to_metrics_payload(cached or {}),
+        )
+    if standards.get("corrected"):
+        await audit_log(
+            str(user.get("id")),
+            "ANALYTICS_REFRESH_ALL_CORRECTED",
+            event_category="DATA_INTEGRITY",
+            resource_type="platform_metrics_cache",
+            resource_id=str(user.get("id")),
+            details={"aggregate": standards.get("aggregate") or {}},
+            severity="WARNING",
+            outcome="SUCCESS",
+        )
+    return {
+        "ok": bool(refreshed),
+        "refreshed": bool(refreshed),
+        "standards": standards,
+        "fetched_at": payload.get("fetched_at"),
+        "aggregate": payload.get("aggregate") or {
+            "views": 0,
+            "likes": 0,
+            "comments": 0,
+            "shares": 0,
+            "platforms_included": [],
+        },
+    }
 
 @app.get("/api/exports/excel")
 async def export_excel(type: str = "uploads", range: str = "30d", user: dict = Depends(get_current_user)):
@@ -10734,24 +11701,50 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
     return {"status": "updated"}
 
 @app.post("/api/admin/users/{user_id}/ban")
-async def admin_ban_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
+async def admin_ban_user(
+    user_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_admin),
+):
     async with db_pool.acquire() as conn:
-        target = await conn.fetchrow("SELECT email FROM users WHERE id = $1", user_id)
+        target = await conn.fetchrow("SELECT email, name, status FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET status = 'banned' WHERE id = $1", user_id)
         await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_BAN_USER",
                               details={"target_email": target["email"] if target else None},
                               request=request, resource_type="user", resource_id=user_id,
                               severity="WARNING")
+    if target and target.get("email") and (target.get("status") != "banned"):
+        background_tasks.add_task(
+            send_admin_account_status_email,
+            target["email"],
+            target.get("name") or "there",
+            "banned",
+            "Your account was restricted by an UploadM8 administrator.",
+        )
     return {"status": "banned"}
 
 @app.post("/api/admin/users/{user_id}/unban")
-async def admin_unban_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
+async def admin_unban_user(
+    user_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_admin),
+):
     async with db_pool.acquire() as conn:
-        target = await conn.fetchrow("SELECT email FROM users WHERE id = $1", user_id)
+        target = await conn.fetchrow("SELECT email, name, status FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
         await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_UNBAN_USER",
                               details={"target_email": target["email"] if target else None},
                               request=request, resource_type="user", resource_id=user_id)
+    if target and target.get("email") and (target.get("status") != "active"):
+        background_tasks.add_task(
+            send_admin_account_status_email,
+            target["email"],
+            target.get("name") or "there",
+            "active",
+            "Your account access has been restored.",
+        )
     return {"status": "unbanned"}
 
 
@@ -11042,6 +12035,168 @@ async def admin_audit(
     except Exception as e:
         logger.error(f"[admin_audit] Error fetching audit log: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Audit log error: {str(e)}")
+
+
+@app.get("/api/admin/audit/data-integrity")
+async def admin_data_integrity_audit(
+    limit: int = 200,
+    offset: int = 0,
+    severity: Optional[str] = None,
+    since_hours: int = 72,
+    user: dict = Depends(get_current_user),
+):
+    """Dedicated admin feed for data-integrity and rollup correction events."""
+    require_admin(user)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    since_hours = max(1, min(int(since_hours or 72), 24 * 180))
+    sev_filter = (severity or "").upper().strip() or None
+
+    async with db_pool.acquire() as conn:
+        q = """
+            SELECT
+                id, event_category, action, user_id, resource_type, resource_id,
+                details, severity, outcome, created_at
+            FROM system_event_log
+            WHERE created_at >= (NOW() - ($1::int * INTERVAL '1 hour'))
+              AND UPPER(COALESCE(event_category, '')) = 'DATA_INTEGRITY'
+        """
+        args: List[Any] = [since_hours]
+        if sev_filter:
+            args.append(sev_filter)
+            q += f" AND UPPER(COALESCE(severity,'INFO')) = ${len(args)}"
+        q += " ORDER BY created_at DESC"
+        rows = await conn.fetch(q, *args)
+        items = [dict(r) for r in rows]
+        total = len(items)
+        page = items[offset: offset + limit]
+        summary = {
+            "total": total,
+            "failed": sum(1 for x in items if str(x.get("outcome") or "").upper() == "FAILED"),
+            "corrected": sum(1 for x in items if "CORRECTED" in str(x.get("action") or "").upper()),
+            "errors": sum(1 for x in items if str(x.get("severity") or "").upper() == "ERROR"),
+            "warnings": sum(1 for x in items if str(x.get("severity") or "").upper() == "WARNING"),
+        }
+
+    return {
+        "summary": summary,
+        "items": page,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + limit) < total,
+    }
+
+
+@app.get("/api/admin/ml/priors/latest")
+async def admin_ml_priors_latest(
+    limit: int = 100,
+    offset: int = 0,
+    since_hours: int = 72,
+    user_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Debug feed for latest ML priors actually applied per upload.
+    Includes both:
+      - thumbnail bias decisions (_ml_thumbnail_selection_bias)
+      - M8 strategy priors (from upload_quality_scores_daily, injected into m8_engine_json)
+    """
+    require_admin(user)
+    limit = max(1, min(int(limit or 100), 500))
+    offset = max(0, int(offset or 0))
+    since_hours = max(1, min(int(since_hours or 72), 24 * 180))
+    uid = (user_id or "").strip() or None
+
+    def _to_dict(val: Any) -> Dict[str, Any]:
+        if isinstance(val, dict):
+            return val
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    async with db_pool.acquire() as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    fe.created_at,
+                    fe.user_id,
+                    u.email AS user_email,
+                    fe.upload_id,
+                    fe.category,
+                    fe.output_artifacts
+                FROM upload_feature_events fe
+                LEFT JOIN users u ON u.id = fe.user_id
+                WHERE fe.created_at >= (NOW() - ($1::int * INTERVAL '1 hour'))
+                  AND ($2::uuid IS NULL OR fe.user_id = $2::uuid)
+                ORDER BY fe.created_at DESC
+                LIMIT $3 OFFSET $4
+                """,
+                since_hours,
+                uid,
+                limit,
+                offset,
+            )
+        except Exception as e:
+            if e.__class__.__name__ in ("UndefinedTableError", "UndefinedColumnError"):
+                return {
+                    "summary": {
+                        "total": 0,
+                        "thumbnail_bias_present": 0,
+                        "m8_strategy_priors_present": 0,
+                    },
+                    "items": [],
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": False,
+                    "note": "ML debug tables/columns not available in this environment yet.",
+                }
+            raise
+
+    items: List[Dict[str, Any]] = []
+    thumb_present = 0
+    m8_present = 0
+    for r in rows:
+        d = dict(r)
+        oa = _to_dict(d.get("output_artifacts"))
+        thumb_bias = _to_dict(oa.get("_ml_thumbnail_selection_bias"))
+        if thumb_bias:
+            thumb_present += 1
+
+        m8_json = _to_dict(oa.get("m8_engine_json"))
+        strategy_priors = _to_dict(m8_json.get("strategy_priors"))
+        if strategy_priors:
+            m8_present += 1
+
+        items.append(
+            {
+                "created_at": d.get("created_at"),
+                "user_id": str(d.get("user_id")) if d.get("user_id") else None,
+                "user_email": d.get("user_email"),
+                "upload_id": str(d.get("upload_id")) if d.get("upload_id") else None,
+                "category": d.get("category"),
+                "thumbnail_selection_method": oa.get("thumbnail_selection_method"),
+                "thumbnail_render_method": oa.get("thumbnail_render_method"),
+                "thumbnail_bias": thumb_bias,
+                "m8_strategy_priors": strategy_priors,
+            }
+        )
+
+    return {
+        "summary": {
+            "total": len(items),
+            "thumbnail_bias_present": thumb_present,
+            "m8_strategy_priors_present": m8_present,
+        },
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+        "has_more": len(items) >= limit,
+    }
 
 
 @app.get("/api/admin/analytics/users")
@@ -11851,6 +13006,19 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
             """, user["id"])
         except Exception:
             put_used_month = 0
+        # Monthly upload count (true upload quota semantics).
+        try:
+            uploads_used_month = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int
+                  FROM uploads
+                 WHERE user_id = $1
+                   AND created_at >= date_trunc('month', CURRENT_DATE)
+                """,
+                user["id"],
+            )
+        except Exception:
+            uploads_used_month = 0
         # Connected accounts (exclude revoked)
         try:
             accounts = await conn.fetchval(
@@ -11884,6 +13052,20 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     put_avail = wallet.get("put_balance", 0) - wallet.get("put_reserved", 0)
     aic_avail = wallet.get("aic_balance", 0) - wallet.get("aic_reserved", 0)
     put_monthly = plan.get("put_monthly", 60)
+    uploads_limit = (
+        plan.get("monthly_uploads")
+        or plan.get("max_uploads_monthly")
+        or user.get("entitlements", {}).get("monthly_uploads")
+        or 0
+    )
+    role = str(user.get("role") or "").lower()
+    tier = str(user.get("subscription_tier") or "").lower()
+    unlimited_uploads = bool(
+        role == "master_admin"
+        or tier in ("master_admin", "friends_family", "lifetime")
+        or int(uploads_limit or 0) >= 999999
+        or int(put_monthly or 0) >= 999999
+    )
     success_rate = (completed / max(total, 1)) * 100 if total else 0
     
     # Credits display: PUT/AIC wallet balances (not monthly quota)
@@ -11896,8 +13078,10 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
     db_likes = int(stats["likes"] or 0) if stats else 0
     live_v = int(dash_live.get("views") or 0)
     live_l = int(dash_live.get("likes") or 0)
-    show_views = db_views if db_views > 0 else live_v
-    show_likes = db_likes if db_likes > 0 else live_l
+    # Prefer the freshest higher value so live sync can surface immediately
+    # while per-upload DB rollups catch up.
+    show_views = max(db_views, live_v)
+    show_likes = max(db_likes, live_l)
 
     return {
         "uploads": {"total": total, "completed": completed, "in_queue": stats["in_queue"] if stats else 0},
@@ -11912,7 +13096,13 @@ async def get_dashboard_stats(user: dict = Depends(get_current_user)):
         },
         "success_rate": round(success_rate, 1),
         "scheduled": scheduled or 0,
-        "quota": {"put_used": put_used_month or 0, "put_limit": put_monthly},
+        "quota": {
+            "put_used": put_used_month or 0,
+            "put_limit": put_monthly,
+            "uploads_used": int(uploads_used_month or 0),
+            "uploads_limit": (-1 if unlimited_uploads else int(uploads_limit or 0)),
+            "uploads_unlimited": unlimited_uploads,
+        },
         "wallet": {"put_available": put_avail, "put_total": put_total, "aic_available": aic_avail, "aic_total": aic_total},
         "credits": {
             "put": {"available": put_avail, "reserved": put_reserved, "total": put_total, "monthly_allowance": put_monthly},
@@ -13356,6 +14546,44 @@ async def _marketing_ai_snapshot(conn, range_key: str) -> Dict[str, Any]:
         amt = float(get_plan(t).get("price", 0) or 0) * int(r.get("users") or 0)
         mrr_by_tier[t] = round(amt, 2)
         mrr_estimate += amt
+    # ML truth: top-performing creative strategies from empirical outcomes.
+    ml_truth_top_strategies: List[Dict[str, Any]] = []
+    try:
+        ml_days = max(1, int(minutes / (60.0 * 24.0)))
+        ml_rows = await conn.fetch(
+            """
+            SELECT
+                strategy_key,
+                SUM(samples)::bigint AS samples,
+                CASE
+                  WHEN SUM(samples) > 0
+                  THEN SUM(mean_engagement * samples)::double precision / NULLIF(SUM(samples)::double precision, 0)
+                  ELSE 0.0
+                END AS weighted_mean_engagement,
+                MAX(ci95_high)::double precision AS max_ci95_high,
+                COUNT(DISTINCT day)::int AS days_with_data
+            FROM upload_quality_scores_daily
+            WHERE day >= (CURRENT_DATE - ($1::int || ' days')::interval)::date
+              AND platform = 'all'
+            GROUP BY strategy_key
+            ORDER BY weighted_mean_engagement DESC, samples DESC
+            LIMIT 8
+            """,
+            ml_days,
+        )
+        ml_truth_top_strategies = [
+            {
+                "strategy_key": str(r.get("strategy_key") or "default"),
+                "samples": int(r.get("samples") or 0),
+                "weighted_mean_engagement": float(r.get("weighted_mean_engagement") or 0),
+                "max_ci95_high": float(r.get("max_ci95_high") or 0),
+                "days_with_data": int(r.get("days_with_data") or 0),
+            }
+            for r in (ml_rows or [])
+        ]
+    except Exception as e:
+        logger.debug(f"ml_truth_top_strategies query failed: {e}")
+
     dow_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
     tier_mix: Dict[str, int] = {}
     for r in (tier_rows or []):
@@ -13363,6 +14591,7 @@ async def _marketing_ai_snapshot(conn, range_key: str) -> Dict[str, Any]:
         tier_mix[t] = tier_mix.get(t, 0) + int(r.get("users") or 0)
     return {
         "range": range_key,
+        "ml_truth": {"top_strategies": ml_truth_top_strategies},
         "kpis": {
             "total_users": int((users or {}).get("total_users") or 0),
             "active_users": int((users or {}).get("active_users") or 0),
@@ -14113,6 +15342,45 @@ async def get_ai_marketing_truth_dashboard(user: dict = Depends(require_admin)):
         }
     d = dict(row)
     snap = d.get("snapshot") or {}
+    ml_truth = snap.get("ml_truth") or {}
+    try:
+        if not isinstance(ml_truth, dict) or not ml_truth.get("top_strategies"):
+            # Backfill: if older decisions were logged before ML truth was added,
+            # compute it on-demand so the UI still shows something useful.
+            ml_rows = await conn.fetch(
+                """
+                SELECT
+                    strategy_key,
+                    SUM(samples)::bigint AS samples,
+                    CASE
+                      WHEN SUM(samples) > 0
+                      THEN SUM(mean_engagement * samples)::double precision / NULLIF(SUM(samples)::double precision, 0)
+                      ELSE 0.0
+                    END AS weighted_mean_engagement,
+                    MAX(ci95_high)::double precision AS max_ci95_high,
+                    COUNT(DISTINCT day)::int AS days_with_data
+                FROM upload_quality_scores_daily
+                WHERE day >= (CURRENT_DATE - (30::int || ' days')::interval)::date
+                  AND platform = 'all'
+                GROUP BY strategy_key
+                ORDER BY weighted_mean_engagement DESC, samples DESC
+                LIMIT 8
+                """
+            )
+            ml_truth = {
+                "top_strategies": [
+                    {
+                        "strategy_key": str(r.get("strategy_key") or "default"),
+                        "samples": int(r.get("samples") or 0),
+                        "weighted_mean_engagement": float(r.get("weighted_mean_engagement") or 0),
+                        "max_ci95_high": float(r.get("max_ci95_high") or 0),
+                        "days_with_data": int(r.get("days_with_data") or 0),
+                    }
+                    for r in (ml_rows or [])
+                ]
+            }
+    except Exception as e:
+        logger.debug(f"ml_truth backfill failed: {e}")
     metrics_used = {
         "kpis": (snap.get("kpis") or {}),
         "segment_signals": (snap.get("segment_signals") or {}),
@@ -14120,6 +15388,7 @@ async def get_ai_marketing_truth_dashboard(user: dict = Depends(require_admin)):
         "revenue_source_mix": (snap.get("revenue_source_mix") or []),
         "platform_kpis": (snap.get("platform_kpis") or []),
         "best_promo_windows_utc": (snap.get("best_promo_windows_utc") or []),
+        "ml_truth": ml_truth,
     }
     return {
         "last_decision": d,
@@ -14575,7 +15844,7 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
         "scheduled_time","created_at","completed_at",
         "put_reserved","aic_reserved",
         "error_code","error_detail",
-        "thumbnail_r2_key","platform_results",
+        "thumbnail_r2_key","platform_results","target_accounts",
         "processing_started_at","processing_finished_at",
         "processing_stage","processing_progress",
         "views","likes",
@@ -14590,35 +15859,13 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(sql, upload_id, user["id"])
 
-    if not row:
-        raise HTTPException(status_code=404, detail="Upload not found")
+        if not row:
+            raise HTTPException(status_code=404, detail="Upload not found")
 
-    d = dict(row)
+        d = dict(row)
 
-    def _normalize_platform_results(raw):
-        pr = _safe_json(raw, [])
-        if isinstance(pr, list):
-            items = [x for x in pr if isinstance(x, dict)]
-        elif isinstance(pr, dict):
-            items = []
-            for k, v in pr.items():
-                if isinstance(v, dict):
-                    items.append({"platform": k, **v})
-                else:
-                    items.append({"platform": k, "value": v})
-        else:
-            return []
-        out = []
-        for item in items:
-            d = dict(item)
-            if d.get("platform_video_id") and not d.get("video_id"):
-                d["video_id"] = d["platform_video_id"]
-            if d.get("platform_url") and not d.get("url"):
-                d["url"] = d["platform_url"]
-            if d.get("account_id") and not d.get("token_id"):
-                d["token_id"] = d["account_id"]
-            out.append(d)
-        return out
+        # Enrich platform_results with account names/avatars from platform_tokens
+        enriched_pr = await _enrich_platform_results(conn, d, str(user["id"]))
 
     def _normalize_hashtags(raw):
         tags = _safe_json(raw, [])
@@ -14635,7 +15882,7 @@ async def get_upload_details(upload_id: str, user: dict = Depends(get_current_us
     title = (d.get("title") or "").strip() or ai_title
     caption = (d.get("caption") or "").strip() or ai_caption
     hashtags = _normalize_hashtags(d.get("hashtags"))
-    platform_results = _normalize_platform_results(d.get("platform_results"))
+    platform_results = enriched_pr
 
     thumbnail_url = None
     thumb_key = d.get("thumbnail_r2_key")

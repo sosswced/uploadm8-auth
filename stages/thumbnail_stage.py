@@ -62,9 +62,11 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from .context import JobContext, THUMBNAIL_BRIEF_PROMPT, resolve_fused_thumbnail_category
+from . import context as _context_mod
+from .context import JobContext, resolve_fused_thumbnail_category
 from .entitlements import should_generate_thumbnails
 from .errors import SkipStage
+from services.ml_strategy_utils import prefer_ai_thumbnail_vs_sharpness
 from .trend_intel import fetch_trend_intel
 from .thumbnail_qa import (
     YOUTUBE_SEARCH_PREVIEW_QA,
@@ -73,6 +75,15 @@ from .thumbnail_qa import (
 )
 
 logger = logging.getLogger("uploadm8-worker.thumbnail")
+
+# Import-compat guard:
+# some environments may still export the typo alias (THUMNAIL_BRIEF_PROMPT)
+# while others export the corrected constant (THUMBNAIL_BRIEF_PROMPT).
+THUMBNAIL_BRIEF_PROMPT = getattr(
+    _context_mod,
+    "THUMBNAIL_BRIEF_PROMPT",
+    getattr(_context_mod, "THUMNAIL_BRIEF_PROMPT", ""),
+)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_THUMBNAIL_OFFSET = 1.0
@@ -1626,7 +1637,7 @@ def _distribute_offsets(
 # Stage Entry Point
 # ============================================================
 
-async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
+async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
     """
     Generate candidate thumbnails, score for sharpness, then run AI-powered
     content-category-aware selection to pick the most engaging frame.
@@ -1759,27 +1770,124 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         logger.warning("Thumbnail generation failed for all offsets (non-fatal)")
         raise SkipStage("FFmpeg thumbnail extraction produced no output")
 
+    async def _ml_pick_thumbnail_ai_vs_sharpness() -> tuple[bool, dict]:
+        """
+        Decide whether to run the AI frame selection pass.
+        Uses per-user empirical strategy performance from `upload_quality_scores_daily`.
+        """
+        try:
+            if not db_pool:
+                return False, {"reason": "no_db_pool"}
+            user_id = str(getattr(ctx, "user_id", "") or "")
+            if not user_id:
+                return False, {"reason": "no_user_id"}
+
+            lookback_days = int(os.environ.get("ML_THUMBNAIL_BIAS_LOOKBACK_DAYS", os.environ.get("ML_SCORING_LOOKBACK_DAYS", "30")) or 30)
+            lookback_days = max(7, min(lookback_days, 180))
+
+            category_key = str(category or "general").strip().lower().replace("-", "_")
+            ai_key = f"ai_{category_key}"
+            sharp_key = "sharpness"
+
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        strategy_key,
+                        SUM(samples)::bigint AS samples,
+                        CASE
+                            WHEN SUM(samples) > 0 THEN
+                                SUM(mean_engagement * samples::double precision)
+                                / NULLIF(SUM(samples::double precision), 0)
+                            ELSE 0.0
+                        END AS w_mean_engagement
+                    FROM upload_quality_scores_daily
+                    WHERE user_id = $1::uuid
+                      AND platform = 'all'
+                      AND strategy_key = ANY($2::text[])
+                      AND day >= (CURRENT_DATE - ($3::int || ' days')::interval)::date
+                    GROUP BY strategy_key
+                    """,
+                    user_id,
+                    [sharp_key, ai_key],
+                    lookback_days,
+                )
+
+            by_key: Dict[str, Dict[str, float]] = {}
+            for r in rows or []:
+                sk = (r.get("strategy_key") or "").strip().lower()
+                by_key[sk] = {
+                    "samples": float(r.get("samples") or 0),
+                    "w_mean_engagement": float(r.get("w_mean_engagement") or 0.0),
+                }
+
+            sharp_row = by_key.get(sharp_key) or {}
+            ai_row = by_key.get(ai_key) or {}
+            min_ai = int(os.environ.get("ML_THUMBNAIL_MIN_SAMPLES_AI", "4") or 4)
+            min_sharp = int(os.environ.get("ML_THUMBNAIL_MIN_SAMPLES_SHARP", "2") or 2)
+            margin = float(os.environ.get("ML_THUMBNAIL_EB_MARGIN", "0.12") or 0.12)
+
+            decision, detail = prefer_ai_thumbnail_vs_sharpness(
+                sharp_mean=sharp_row.get("w_mean_engagement"),
+                sharp_samples=int(sharp_row.get("samples") or 0),
+                ai_mean=ai_row.get("w_mean_engagement"),
+                ai_samples=int(ai_row.get("samples") or 0),
+                min_samples_ai=max(1, min_ai),
+                min_samples_sharp=max(0, min_sharp),
+                margin=margin,
+            )
+            return decision, {
+                "reason": "ml_thumbnail_selection_bias",
+                "category": category_key,
+                "strategy_keys": {"sharpness": sharp_key, "ai": ai_key},
+                "lookback_days": lookback_days,
+                "aggregates": {
+                    "sharpness": sharp_row,
+                    "ai": ai_row,
+                },
+                **detail,
+            }
+        except Exception as e:
+            return False, {"reason": "ml_decide_failed", "error": str(e)}
+
     # ── Sharpness-best (always computed; used as fallback) ──────────────────
     sharpness_best_path, sharpness_best_score = max(candidates, key=lambda x: x[1])
 
     # ── AI selection pass ───────────────────────────────────────────────────
     ai_selected_path: Optional[Path] = None
     selection_method = "sharpness"
+    ml_bias = None
 
     if thumb_supercharged_ai and len(candidates) > 1:
+        # Empirical bias: decide whether AI selection historically beats sharpness.
+        use_ai = False
+        ml_bias, ml_decision = None, None
         try:
-            ai_selected_path = await _ai_select_best_frame(candidates, category, ctx)
-        except Exception as e:
-            logger.warning(f"AI thumbnail selection raised unexpectedly: {e}")
-            ai_selected_path = None
+            use_ai, ml_decision = await _ml_pick_thumbnail_ai_vs_sharpness()
+            ml_bias = ml_decision
+        except Exception:
+            use_ai = False
 
-        if ai_selected_path and Path(ai_selected_path).exists():
-            selection_method = f"ai_{category}"
+        ctx.output_artifacts["_ml_thumbnail_selection_bias"] = ml_bias or {"reason": "ml_decide_skipped"}
+
+        if use_ai:
+            try:
+                ai_selected_path = await _ai_select_best_frame(candidates, category, ctx)
+            except Exception as e:
+                logger.warning(f"AI thumbnail selection raised unexpectedly: {e}")
+                ai_selected_path = None
+
+            if ai_selected_path and Path(ai_selected_path).exists():
+                selection_method = f"ai_{category}"
+            else:
+                logger.info(
+                    f"ML-preferred AI selection returned nothing — falling back to sharpest: "
+                    f"{sharpness_best_path.name}"
+                )
         else:
-            logger.info(
-                f"AI selection returned nothing — falling back to sharpest: "
-                f"{sharpness_best_path.name}"
-            )
+            reason = "ml_bias_says_sharpness_better_or_no_samples"
+            logger.debug(f"AI thumbnail selection skipped: {reason}")
+            ai_selected_path = None
     else:
         reason = "no OPENAI_API_KEY" if not ai_key_present else "only 1 candidate"
         logger.debug(f"AI thumbnail selection skipped: {reason}")

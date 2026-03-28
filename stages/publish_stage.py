@@ -631,13 +631,13 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                     )
                     if pages_resp.status_code == 200:
                         pages = pages_resp.json().get("data", [])
-                        matching = next((p for p in pages if p.get("id") == page_id), None)
+                        matching = next((p for p in pages if p.get("id") == str(page_id)), None)
                         if matching:
                             new_page_token = matching.get("access_token", new_user_token)
                             updated = {
                                 **token_data,
                                 "access_token": new_page_token,
-                                "expires_at": None,  # Page tokens from LLT don't expire
+                                "expires_at": None,
                             }
                             if db_pool and user_id:
                                 try:
@@ -646,18 +646,16 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                                         user_id=user_id,
                                         platform=platform,
                                         access_token=new_page_token,
+                                        extra_fields={"page_id": str(page_id)},
                                     )
                                 except Exception as save_err:
                                     logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
                             return updated
     
-                # ── Recover missing ig_user_id / page_id ────────────────────────
-                # Old tokens stored before the OAuth fix may lack these IDs.
-                # Now that we have a fresh user token we can fetch them on the fly
-                # so the publish succeeds without forcing the user to reconnect.
-                # Step 1: Fetch user's Pages — id, name, page access_token only.
-                # instagram_business_account is NOT a valid inline field on /me/accounts;
-                # it must be fetched per-page via /{page_id}?fields=instagram_business_account
+                # ── Refresh page token for Instagram and Facebook ───────────────
+                # Instagram Insights API requires a PAGE token (not user token).
+                # Always fetch /me/accounts to get fresh page tokens for both
+                # platforms — even when ig_user_id / page_id are already known.
                 pages_resp = await client.get(
                     "https://graph.facebook.com/v18.0/me/accounts",
                     params={"access_token": new_user_token, "fields": "id,name,access_token"},
@@ -666,12 +664,12 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                 recovered_ig_user_id = token_data.get("ig_user_id") or token_data.get("instagram_user_id")
                 recovered_page_id    = token_data.get("page_id") or token_data.get("facebook_page_id")
                 recovered_page_token = new_user_token  # fallback
-    
+
                 if pages_resp.status_code == 200:
                     pages = pages_resp.json().get("data", [])
-    
-                    if platform == "instagram" and not recovered_ig_user_id:
-                        # instagram_business_account must be fetched per-page
+
+                    if platform == "instagram":
+                        # Find the page whose instagram_business_account matches ig_user_id
                         for page in pages:
                             page_id_tmp    = page.get("id")
                             page_token_tmp = page.get("access_token", new_user_token)
@@ -687,42 +685,54 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                             if ig_resp.status_code == 200:
                                 ig_biz = ig_resp.json().get("instagram_business_account")
                                 if ig_biz and ig_biz.get("id"):
-                                    recovered_ig_user_id = ig_biz["id"]
-                                    recovered_page_token = page_token_tmp
-                                    logger.info(
-                                        f"instagram: Recovered ig_user_id={recovered_ig_user_id} "
-                                        f"from Page '{page.get('name', '?')}' during token refresh"
-                                    )
-                                    break
-    
-                    if platform == "facebook" and not recovered_page_id and pages:
-                        first = pages[0]
-                        recovered_page_id    = first["id"]
-                        recovered_page_token = first.get("access_token", new_user_token)
-                        logger.info(
-                            f"facebook: Recovered page_id={recovered_page_id} "
-                            f"from Page '{first.get('name', '?')}' during token refresh"
-                        )
-    
-                # Build updated blob — preserve any existing IDs, override with recovered ones
+                                    found_ig_id = ig_biz["id"]
+                                    if not recovered_ig_user_id or found_ig_id == str(recovered_ig_user_id):
+                                        recovered_ig_user_id = found_ig_id
+                                        recovered_page_token = page_token_tmp
+                                        logger.info(
+                                            f"instagram: Refreshed page token for ig_user_id={recovered_ig_user_id} "
+                                            f"via Page '{page.get('name', '?')}'"
+                                        )
+                                        break
+
+                    if platform == "facebook":
+                        if recovered_page_id:
+                            matching = next((p for p in pages if p.get("id") == str(recovered_page_id)), None)
+                            if matching:
+                                recovered_page_token = matching.get("access_token", new_user_token)
+                        elif pages:
+                            first = pages[0]
+                            recovered_page_id    = first["id"]
+                            recovered_page_token = first.get("access_token", new_user_token)
+                            logger.info(
+                                f"facebook: Recovered page_id={recovered_page_id} "
+                                f"from Page '{first.get('name', '?')}' during token refresh"
+                            )
+
+                # Both platforms always use the page token (not user token)
                 updated = {
                     **token_data,
-                    "access_token":  recovered_page_token if platform == "instagram" else new_user_token,
-                    "expires_at":    None,
+                    "access_token": recovered_page_token,
+                    "expires_at":   None,
                 }
                 if platform == "instagram" and recovered_ig_user_id:
                     updated["ig_user_id"] = recovered_ig_user_id
                 if platform == "facebook" and recovered_page_id:
-                    updated["page_id"]    = recovered_page_id
-                    updated["access_token"] = recovered_page_token
-    
+                    updated["page_id"] = recovered_page_id
+
                 if db_pool and user_id:
                     try:
+                        extra = {}
+                        if platform == "instagram" and recovered_ig_user_id:
+                            extra["ig_user_id"] = str(recovered_ig_user_id)
+                        if platform == "facebook" and recovered_page_id:
+                            extra["page_id"] = str(recovered_page_id)
                         await db_stage.save_refreshed_token(
                             db_pool,
                             user_id=user_id,
                             platform=platform,
                             access_token=updated["access_token"],
+                            extra_fields=extra or None,
                         )
                     except Exception as save_err:
                         logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
@@ -1572,166 +1582,201 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
     if not publish_targets:
         publish_targets = [(p, None) for p in ctx.platforms]
 
-    logger.info(f"Publishing to {len(publish_targets)} target(s)")
+    PUBLISH_TIMEOUT = int(os.environ.get("PUBLISH_PER_PLATFORM_TIMEOUT", "600"))
+    parallel_mode = os.environ.get("PUBLISH_PARALLEL", "true").lower() in ("1", "true", "yes")
 
-    for platform, token_id in publish_targets:
+    logger.info(
+        f"Publishing to {len(publish_targets)} target(s) | "
+        f"mode={'parallel' if parallel_mode else 'sequential'} | "
+        f"timeout={PUBLISH_TIMEOUT}s"
+    )
+
+    async def _publish_one_target(platform: str, token_id: str | None) -> PlatformResult | None:
+        """Publish to a single platform/account with timeout. Returns result or None."""
         account_label = f"{platform}:{token_id[:8]}" if token_id else platform
         db_key = platform_to_db_key.get(platform, platform)
-
-        # -- Select the correct video file for this platform --
-        video_file = ctx.get_video_for_platform(platform)
-        if not video_file or not video_file.exists():
-            video_file = default_video
-            if video_file:
-                logger.warning(
-                    f"{account_label}: Platform-specific video not found, "
-                    f"using fallback: {video_file.name}"
-                )
-
-        # -- Create ledger row (before API call) --
-        attempt_id = None
         try:
-            attempt_id = await db_stage.insert_publish_attempt(
-                db_pool,
-                upload_id=str(ctx.upload_id),
-                user_id=str(ctx.user_id),
-                platform=str(platform),
+            return await asyncio.wait_for(
+                _publish_single(ctx, db_pool, platform, token_id, db_key, account_label, default_video),
+                timeout=PUBLISH_TIMEOUT,
             )
-        except Exception as e:
-            logger.warning(f"{account_label}: Could not create publish_attempt row: {e}")
-            attempt_id = None
-
-        # -- Load platform token (use target_accounts token when specified) --
-        token_data = None
-        token_identity = {}
-        try:
-            token_data, token_identity = await db_stage.load_platform_token_with_identity(
-                db_pool, ctx.user_id, db_key, token_row_id=token_id
-            )
-            if token_data:
-                token_data = decrypt_token(token_data) if isinstance(token_data, dict) and token_data.get("kid") else token_data
-        except Exception as e:
-            logger.warning(f"{account_label}: Token load failed: {e}")
-            token_data = None
-            token_identity = {}
-
-        if not token_data:
-            msg = f"Not connected to {platform}" + (f" (account {token_id[:8]})" if token_id else "")
-            logger.warning(f"{account_label}: {msg}")
-            if attempt_id:
-                try:
-                    await db_stage.update_publish_attempt_failed(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        error_code="NOT_CONNECTED",
-                        error_message=msg,
-                    )
-                except Exception:
-                    pass
-            pr = PlatformResult(
+        except asyncio.TimeoutError:
+            logger.error(f"{account_label}: Publish timed out after {PUBLISH_TIMEOUT}s")
+            return PlatformResult(
                 platform=platform,
                 success=False,
-                attempt_id=attempt_id,
-                error_code="NOT_CONNECTED",
-                error_message=msg,
+                error_code="PUBLISH_TIMEOUT",
+                error_message=f"Publish timed out after {PUBLISH_TIMEOUT}s",
                 token_row_id=token_id,
             )
-            ctx.platform_results.append(pr)
-            continue
 
-        # -- Publish to platform --
-        result = None
-        try:
-            if platform == "tiktok":
-                result = await publish_to_tiktok(video_file, ctx, token_data, db_pool=db_pool)
-
-            elif platform == "youtube":
-                result = await publish_to_youtube(video_file, ctx, token_data, db_pool=db_pool)
-
-            elif platform == "instagram":
-                video_url = _get_video_public_url(ctx, "instagram")
-                result = await publish_to_instagram(
-                    video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
-                )
-
-            elif platform == "facebook":
-                video_url = _get_video_public_url(ctx, "facebook")
-                result = await publish_to_facebook(
-                    video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
-                )
-
-            else:
-                result = PlatformResult(
-                    platform=platform,
-                    success=False,
-                    error_code="UNSUPPORTED",
-                    error_message=f"Unsupported platform: {platform}",
-                    account_id=token_id,
-                    account_name=(token_data.get("_account_name") or "") if token_data else "",
-                )
-
-        except Exception as e:
-            logger.exception(f"Error publishing to {account_label}")
-            result = PlatformResult(
-                platform=platform,
-                success=False,
-                error_code="PUBLISH_EXCEPTION",
-                error_message=str(e),
-                account_id=token_id,
-                account_name=(token_data.get("_account_name") or "") if token_data else "",
-            )
-
-        # -- Record result (stamp account identity from token so it's saved to DB) --
-        result.attempt_id = attempt_id
-        if token_identity:
-            result.token_row_id     = token_identity.get("token_row_id")
-            result.account_id       = token_identity.get("account_id")
-            result.account_username = token_identity.get("account_username")
-            result.account_name     = token_identity.get("account_name")
-            result.account_avatar   = token_identity.get("account_avatar")
-        ctx.platform_results.append(result)
-
-        status_icon = "OK" if result.success else "FAIL"
-        extra = ""
-        if token_id:
-            extra += f" account={token_id[:8]}"
-        if result.publish_id:
-            extra += f" publish_id={result.publish_id}"
-        if result.platform_video_id:
-            extra += f" video_id={result.platform_video_id}"
-        if result.error_message and not result.success:
-            extra += f" error={result.error_message[:100]}"
-
-        logger.info(f"{account_label} [{status_icon}]: {result.error_code or 'accepted'}{extra}")
-
-        # -- Update ledger row --
-        if attempt_id:
-            try:
-                if result.success:
-                    await db_stage.update_publish_attempt_success(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        platform_post_id=result.platform_video_id,
-                        platform_url=result.platform_url,
-                        http_status=result.http_status,
-                        response_payload=result.response_payload,
-                        publish_id=result.publish_id,
-                    )
-                else:
-                    await db_stage.update_publish_attempt_failed(
-                        db_pool,
-                        attempt_id=attempt_id,
-                        error_code=result.error_code or "PUBLISH_FAILED",
-                        error_message=result.error_message or "Publish failed",
-                        http_status=result.http_status,
-                        response_payload=result.response_payload,
-                    )
-            except Exception as e:
-                logger.warning(f"{account_label}: Could not update publish_attempt: {e}")
+    if parallel_mode and len(publish_targets) > 1:
+        results = await asyncio.gather(
+            *[_publish_one_target(p, tid) for p, tid in publish_targets],
+            return_exceptions=True,
+        )
+        for i, res in enumerate(results):
+            if isinstance(res, Exception):
+                plat, tid = publish_targets[i]
+                logger.exception(f"Parallel publish {plat} raised: {res}")
+                ctx.platform_results.append(PlatformResult(
+                    platform=plat, success=False,
+                    error_code="PUBLISH_EXCEPTION", error_message=str(res)[:500],
+                    token_row_id=tid,
+                ))
+            elif res:
+                ctx.platform_results.append(res)
+    else:
+        for platform, token_id in publish_targets:
+            res = await _publish_one_target(platform, token_id)
+            if res:
+                ctx.platform_results.append(res)
 
     # -- Summary --
     succeeded = [r.platform for r in ctx.platform_results if r.success]
     failed = [r.platform for r in ctx.platform_results if not r.success]
-    logger.info(f"Publish complete: succeeded={succeeded}, failed={failed}")
+    logger.info(
+        f"Publish complete for {ctx.upload_id}: "
+        f"succeeded={succeeded}, failed={failed}"
+    )
 
     return ctx
+
+
+async def _publish_single(
+    ctx: "JobContext",
+    db_pool,
+    platform: str,
+    token_id: str | None,
+    db_key: str,
+    account_label: str,
+    default_video,
+) -> PlatformResult:
+    """Publish to ONE platform/account. Isolated — exceptions caught internally."""
+    from stages import db as db_stage
+
+    video_file = ctx.get_video_for_platform(platform)
+    if not video_file or not video_file.exists():
+        video_file = default_video
+        if video_file:
+            logger.warning(
+                f"{account_label}: Platform-specific video not found, "
+                f"using fallback: {video_file.name}"
+            )
+
+    attempt_id = None
+    try:
+        attempt_id = await db_stage.insert_publish_attempt(
+            db_pool,
+            upload_id=str(ctx.upload_id),
+            user_id=str(ctx.user_id),
+            platform=str(platform),
+        )
+    except Exception as e:
+        logger.warning(f"{account_label}: Could not create publish_attempt row: {e}")
+        attempt_id = None
+
+    token_data = None
+    token_identity = {}
+    try:
+        token_data, token_identity = await db_stage.load_platform_token_with_identity(
+            db_pool, ctx.user_id, db_key, token_row_id=token_id
+        )
+        if token_data:
+            token_data = decrypt_token(token_data) if isinstance(token_data, dict) and token_data.get("kid") else token_data
+    except Exception as e:
+        logger.warning(f"{account_label}: Token load failed: {e}")
+        token_data = None
+        token_identity = {}
+
+    if not token_data:
+        msg = f"Not connected to {platform}" + (f" (account {token_id[:8]})" if token_id else "")
+        logger.warning(f"{account_label}: {msg}")
+        if attempt_id:
+            try:
+                await db_stage.update_publish_attempt_failed(
+                    db_pool, attempt_id=attempt_id,
+                    error_code="NOT_CONNECTED", error_message=msg,
+                )
+            except Exception:
+                pass
+        return PlatformResult(
+            platform=platform, success=False, attempt_id=attempt_id,
+            error_code="NOT_CONNECTED", error_message=msg, token_row_id=token_id,
+        )
+
+    result = None
+    try:
+        if platform == "tiktok":
+            result = await publish_to_tiktok(video_file, ctx, token_data, db_pool=db_pool)
+        elif platform == "youtube":
+            result = await publish_to_youtube(video_file, ctx, token_data, db_pool=db_pool)
+        elif platform == "instagram":
+            video_url = _get_video_public_url(ctx, "instagram")
+            result = await publish_to_instagram(
+                video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
+            )
+        elif platform == "facebook":
+            video_url = _get_video_public_url(ctx, "facebook")
+            result = await publish_to_facebook(
+                video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
+            )
+        else:
+            result = PlatformResult(
+                platform=platform, success=False,
+                error_code="UNSUPPORTED", error_message=f"Unsupported platform: {platform}",
+                account_id=token_id,
+                account_name=(token_data.get("_account_name") or "") if token_data else "",
+            )
+    except Exception as e:
+        logger.exception(f"Error publishing to {account_label}")
+        result = PlatformResult(
+            platform=platform, success=False,
+            error_code="PUBLISH_EXCEPTION", error_message=str(e),
+            account_id=token_id,
+            account_name=(token_data.get("_account_name") or "") if token_data else "",
+        )
+
+    result.attempt_id = attempt_id
+    if token_identity:
+        result.token_row_id     = token_identity.get("token_row_id")
+        result.account_id       = token_identity.get("account_id")
+        result.account_username = token_identity.get("account_username")
+        result.account_name     = token_identity.get("account_name")
+        result.account_avatar   = token_identity.get("account_avatar")
+
+    status_icon = "OK" if result.success else "FAIL"
+    extra = ""
+    if token_id:
+        extra += f" account={token_id[:8]}"
+    if result.publish_id:
+        extra += f" publish_id={result.publish_id}"
+    if result.platform_video_id:
+        extra += f" video_id={result.platform_video_id}"
+    if result.error_message and not result.success:
+        extra += f" error={result.error_message[:100]}"
+    logger.info(f"{account_label} [{status_icon}]: {result.error_code or 'accepted'}{extra}")
+
+    if attempt_id:
+        try:
+            if result.success:
+                await db_stage.update_publish_attempt_success(
+                    db_pool, attempt_id=attempt_id,
+                    platform_post_id=result.platform_video_id,
+                    platform_url=result.platform_url,
+                    http_status=result.http_status,
+                    response_payload=result.response_payload,
+                    publish_id=result.publish_id,
+                )
+            else:
+                await db_stage.update_publish_attempt_failed(
+                    db_pool, attempt_id=attempt_id,
+                    error_code=result.error_code or "PUBLISH_FAILED",
+                    error_message=result.error_message or "Publish failed",
+                    http_status=result.http_status,
+                    response_payload=result.response_payload,
+                )
+        except Exception as e:
+            logger.warning(f"{account_label}: Could not update publish_attempt: {e}")
+
+    return result

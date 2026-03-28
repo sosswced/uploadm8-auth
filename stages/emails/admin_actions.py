@@ -88,7 +88,7 @@ async def send_admin_wallet_topup_email(
 
     await send_email(
         email,
-        f" You received +{tokens_added:,} {wt_short} tokens — compliments of UploadM8",
+        f"You received +{tokens_added:,} {wt_short} tokens — compliments of UploadM8",
         html,
     )
 
@@ -120,7 +120,6 @@ async def send_admin_tier_switch_email(
 
     action_word = "upgraded" if is_upgrade else "updated"
     emoji_html  = "&#128640;" if is_upgrade else "&#128295;"
-    emoji_text  = "" if is_upgrade else ""
     tag_text    = f"Plan {action_word.title()} {emoji_html}"
     tag_color   = "#22c55e" if is_upgrade else "#d97706"
 
@@ -170,7 +169,7 @@ async def send_admin_tier_switch_email(
 
     await send_email(
         email,
-        f"{emoji_text} Your UploadM8 plan has been {action_word} to {new_plan}",
+        f"Your UploadM8 plan has been {action_word} to {new_plan}",
         html,
     )
 

@@ -22,7 +22,7 @@ import logging
 from .base import (
     send_email, mailgun_ready, MAIL_FROM_SUPPORT,
     email_shell, intro_row, body_row, cta_button, tinted_box,
-    check_list, alert_banner, numbered_steps, spacer,
+    check_list, alert_banner, numbered_steps, spacer, stat_grid, secondary_links,
     section_tag, metric_hero, divider_accent,
     GRAD_ORANGE, GRAD_RED, GRAD_DARK, GRAD_GREEN, GRAD_BLUE,
     URL_DASHBOARD, URL_SETTINGS, URL_BILLING, URL_PRICING, DISCORD_INVITE_URL, SUPPORT_EMAIL, FRONTEND_URL,
@@ -37,7 +37,7 @@ logger = logging.getLogger("uploadm8-worker")
 async def send_signup_confirmation_email(email: str, name: str, confirmation_link: str) -> None:
     """
     Sent immediately after signup. User must click the link to verify their email.
-    confirmation_link points to {FRONTEND_URL}/confirm-email?token=xxx
+    confirmation_link points to {FRONTEND_URL}/confirm-email.html?token=xxx
     """
     if not mailgun_ready():
         return
@@ -211,7 +211,7 @@ async def send_fully_signed_up_guide_email(
 async def send_password_reset_email(email: str, reset_link: str) -> None:
     """
     Fired from /api/auth/forgot-password.
-    reset_link points to {FRONTEND_URL}/reset-password?token=xxx
+    reset_link points to {FRONTEND_URL}/reset-password.html?token=xxx
     """
     if not mailgun_ready():
         return
@@ -356,10 +356,10 @@ async def send_email_change_email(
 ) -> None:
     """
     Sent to the NEW email address when a user (or admin) requests an email change.
-    verification_link points to {FRONTEND_URL}/verify-email?token=xxx
+    verification_link points to {FRONTEND_URL}/verify-email.html?token=xxx
 
     Hook into /api/admin/users/{id}/email after inserting into email_changes:
-        verification_link = f"{FRONTEND_URL}/verify-email?token={verification_token}"
+        verification_link = f"{FRONTEND_URL}/verify-email.html?token={verification_token}"
         background_tasks.add_task(
             send_email_change_email,
             new_email, old["email"], target_user["name"], verification_link
@@ -395,7 +395,7 @@ async def send_email_change_email(
         footer_note="You received this because an email change was requested for your UploadM8 account.",
     )
 
-    await send_email(new_email, "Verify your new UploadM8 email address ️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(new_email, "Verify your new UploadM8 email address", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -451,7 +451,7 @@ async def send_admin_email_change_notice_to_old_email(
 
     await send_email(
         email,
-        "Security notice: your UploadM8 email was updated ",
+        "Security notice: your UploadM8 email was updated",
         html,
         from_addr=MAIL_FROM_SUPPORT,
         reply_to=SUPPORT_EMAIL,
@@ -497,7 +497,7 @@ async def send_user_email_change_notice_to_old_email(
 
     await send_email(
         email,
-        "Security notice: your UploadM8 email was changed ",
+        "Security notice: your UploadM8 email was changed",
         html,
         from_addr=MAIL_FROM_SUPPORT,
         reply_to=SUPPORT_EMAIL,

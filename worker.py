@@ -84,6 +84,22 @@ from typing import Optional, Dict, List, Tuple
 import asyncpg
 import redis.asyncio as redis
 
+
+def _json_encoder(v):
+    if isinstance(v, str):
+        return v
+    return json.dumps(v, separators=(',', ':'), ensure_ascii=False)
+
+async def _init_asyncpg_codecs(conn):
+    try:
+        await conn.set_type_codec('json', encoder=_json_encoder, decoder=json.loads, schema='pg_catalog')
+    except Exception:
+        pass
+    try:
+        await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=json.loads, schema='pg_catalog')
+    except Exception:
+        pass
+
 from stages.errors import StageError, SkipStage, CancelRequested
 from stages.context import JobContext, create_context
 from stages.entitlements import get_entitlements_from_user
@@ -118,11 +134,45 @@ from stages.emails import (
 )
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s [worker] %(message)s",
-)
+_JSON_LOGS = os.environ.get("JSON_LOGS", "1").strip().lower() in ("1", "true", "yes")
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record):
+        import json as _j
+        entry = {
+            "ts": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            entry["exc"] = self.formatException(record.exc_info)
+        return _j.dumps(entry, default=str, ensure_ascii=False)
+
+_handler = logging.StreamHandler()
+if _JSON_LOGS:
+    _handler.setFormatter(_JsonFormatter())
+else:
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [worker] %(message)s"))
+logging.root.handlers = [_handler]
+logging.root.setLevel(LOG_LEVEL)
 logger = logging.getLogger("uploadm8-worker")
+
+_SENTRY_DSN = os.environ.get("SENTRY_DSN", "")
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.asyncpg import AsyncPGIntegration
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            environment=os.environ.get("SENTRY_ENV", "production"),
+            traces_sample_rate=float(os.environ.get("SENTRY_TRACES_RATE", "0.05")),
+            send_default_pii=False,
+            integrations=[AsyncPGIntegration()],
+        )
+        logger.info("Sentry initialised (worker, env=%s)", os.environ.get("SENTRY_ENV", "production"))
+    except ImportError:
+        logger.warning("SENTRY_DSN set but sentry-sdk not installed — skipping")
 
 try:
     from stages.outbound_rl import startup_log_line as _outbound_rl_startup_log_line
@@ -133,6 +183,17 @@ except Exception as _e:
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 REDIS_URL = os.environ.get("REDIS_URL", "")
+
+async def _acquire_cron_lock(lock_name: str, ttl_seconds: int = 300) -> bool:
+    """Distributed Redis lock for cron leadership. Only one worker instance
+    runs a given cron tick. Falls back to always-True when Redis is missing."""
+    if not redis_client:
+        return True
+    try:
+        acquired = await redis_client.set(f"cron_lock:{lock_name}", "1", nx=True, ex=ttl_seconds)
+        return bool(acquired)
+    except Exception:
+        return True
 
 # ── 4-Lane Queue Names (must match app.py env vars) ──────────────
 PROCESS_PRIORITY_QUEUE = os.environ.get("PROCESS_PRIORITY_QUEUE", "uploadm8:process:priority")
@@ -186,6 +247,12 @@ _analytics_oauth_last_refresh: dict[str, float] = {}
 PLATFORM_METRICS_CACHE_INTERVAL = int(
     os.environ.get("PLATFORM_METRICS_CACHE_INTERVAL_SECONDS", str(3 * 3600))
 )
+ML_SCORING_INTERVAL = int(
+    os.environ.get("ML_SCORING_INTERVAL_SECONDS", str(6 * 3600))
+)
+ML_SCORING_LOOKBACK_DAYS = int(
+    os.environ.get("ML_SCORING_LOOKBACK_DAYS", "180")
+)
 
 # Redis resilience
 REDIS_RETRY_DELAY = 5.0
@@ -193,6 +260,10 @@ REDIS_MAX_RETRIES = 10
 
 # Dead-letter queue: max retries before moving to DLQ
 DLQ_MAX_RETRIES = int(os.environ.get("DLQ_MAX_RETRIES", "3"))
+
+# Overall pipeline timeout — kills a stuck job so it doesn't hog a semaphore slot forever.
+# Default 30 min covers even large videos (10 min transcode + 5 min AI + 10 min publish).
+JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "1800"))
 
 db_pool: Optional[asyncpg.Pool] = None
 
@@ -258,6 +329,13 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
     if not db_pool:
         return
     async with db_pool.acquire() as conn:
+        before_wallet = await conn.fetchrow(
+            "SELECT put_balance, aic_balance FROM wallets WHERE user_id = $1",
+            user_id,
+        )
+        before_put = int((before_wallet or {}).get("put_balance") or 0)
+        before_aic = int((before_wallet or {}).get("aic_balance") or 0)
+
         # Debit balance and clear reservation simultaneously
         await conn.execute("""
             UPDATE wallets SET
@@ -311,7 +389,9 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
             if wants_email and user_row and user_row.get("email"):
                 put_bal = int(wallet.get("put_balance") or 0)
                 aic_bal = int(wallet.get("aic_balance") or 0)
-                if put_bal <= LOW_THRESHOLD and put_cost > 0:
+                put_crossed_threshold = (put_cost > 0 and before_put > LOW_THRESHOLD and put_bal <= LOW_THRESHOLD)
+                aic_crossed_threshold = (aic_cost > 0 and before_aic > LOW_THRESHOLD and aic_bal <= LOW_THRESHOLD)
+                if put_crossed_threshold:
                     import asyncio as _aio
                     _aio.ensure_future(send_low_token_warning_email(
                         user_row["email"],
@@ -320,7 +400,7 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
                         put_bal,
                         LOW_THRESHOLD,
                     ))
-                elif aic_bal <= LOW_THRESHOLD and aic_cost > 0:
+                elif aic_crossed_threshold:
                     import asyncio as _aio
                     _aio.ensure_future(send_low_token_warning_email(
                         user_row["email"],
@@ -951,7 +1031,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             logger.debug(f"[{upload_id}] Could not load recent thumbnail style signatures: {e}")
 
         try:
-            ctx = await run_thumbnail_stage(ctx)
+            ctx = await run_thumbnail_stage(ctx, db_pool=db_pool)
         except SkipStage as e:
             logger.info(f"[{upload_id}] Thumbnail skipped: {e.reason}")
         except StageError as e:
@@ -1595,10 +1675,6 @@ async def _sync_one_upload_analytics(
             if not candidates:
                 continue
 
-            # Backwards-compat: the existing platform query code uses `access_token`.
-            # If we later add full per-candidate token iteration, this will be replaced.
-            access_token = candidates[0].get("access_token", "") if candidates else ""
-
             video_id = (
                 pr.get("platform_video_id")
                 or pr.get("video_id") or pr.get("videoId") or pr.get("id")
@@ -1606,118 +1682,134 @@ async def _sync_one_upload_analytics(
             )
 
             try:
-                if plat == "tiktok" and video_id:
-                    from services.tiktok_api import tiktok_envelope_error, tiktok_video_query_url
-
-                    qurl = tiktok_video_query_url()  # TikTok video stats query
-                    resp = await client.post(
-                        qurl,
-                        headers={
-                            "Authorization": f"Bearer {access_token}",
-                            "Content-Type": "application/json",
-                        },
-                        json={"filters": {"video_ids": [str(video_id)]}},
-                    )
-                    try:
-                        body = resp.json()
-                    except Exception:
-                        body = {}
-                    _terr = tiktok_envelope_error(body)
-                    if _terr:
-                        logger.debug(f"[analytics-sync] TikTok envelope error for {upload_id}: {_terr}")
+                resolved = False
+                for tok in candidates:
+                    access_token = tok.get("access_token", "")
+                    if not access_token:
                         continue
-                    if resp.status_code == 200:
-                        vids = body.get("data", {}).get("videos", []) or []
-                        if vids:
-                            v = vids[0]
-                            s = {
-                                "views":    int(v.get("view_count")    or 0),
-                                "likes":    int(v.get("like_count")     or 0),
-                                "comments": int(v.get("comment_count") or 0),
-                                "shares":   int(v.get("share_count")   or 0),
-                            }
-                            _accum_platform_stats(platform_stats, "tiktok", s)
+
+                    if plat == "tiktok" and video_id:
+                        from services.tiktok_api import tiktok_envelope_error, tiktok_video_query_url
+
+                        qurl = tiktok_video_query_url()
+                        resp = await client.post(
+                            qurl,
+                            headers={
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "application/json",
+                            },
+                            json={"filters": {"video_ids": [str(video_id)]}},
+                        )
+                        try:
+                            body = resp.json()
+                        except Exception:
+                            body = {}
+                        if tiktok_envelope_error(body):
+                            continue
+                        if resp.status_code == 200:
+                            vids = body.get("data", {}).get("videos", []) or []
+                            if vids:
+                                v = vids[0]
+                                s = {
+                                    "views":    int(v.get("view_count")    or 0),
+                                    "likes":    int(v.get("like_count")     or 0),
+                                    "comments": int(v.get("comment_count") or 0),
+                                    "shares":   int(v.get("share_count")   or 0),
+                                }
+                                _accum_platform_stats(platform_stats, "tiktok", s)
+                                total_views    += s["views"];    total_likes    += s["likes"]
+                                total_comments += s["comments"]; total_shares   += s["shares"]
+                                resolved = True
+                                break
+
+                    elif plat == "youtube" and video_id:
+                        resp = await client.get(
+                            "https://www.googleapis.com/youtube/v3/videos",
+                            params={"part": "statistics,snippet", "id": str(video_id)},
+                            headers={"Authorization": f"Bearer {access_token}"},
+                        )
+                        if resp.status_code == 200:
+                            items = resp.json().get("items", []) or []
+                            if items:
+                                st = items[0].get("statistics", {}) or {}
+                                s = {
+                                    "views":    int(st.get("viewCount")    or 0),
+                                    "likes":    int(st.get("likeCount")    or 0),
+                                    "comments": int(st.get("commentCount") or 0),
+                                    "shares":   0,
+                                }
+                                _accum_platform_stats(platform_stats, "youtube", s)
+                                total_views    += s["views"]; total_likes    += s["likes"]
+                                total_comments += s["comments"]
+                                resolved = True
+                                break
+                        elif resp.status_code == 401:
+                            continue
+
+                    elif plat == "instagram" and video_id:
+                        media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
+                        resp = await client.get(
+                            f"https://graph.facebook.com/v21.0/{media_id}/insights",
+                            params={
+                                "access_token": access_token,
+                                "metric": "views,plays,likes,comments,saved,shares,reach",
+                            },
+                        )
+                        if resp.status_code in (401, 190):
+                            continue
+                        if resp.status_code == 200:
+                            data = resp.json().get("data", []) or []
+                            if not data:
+                                continue
+                            s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                            ig_views = ig_plays = 0
+                            for m in data:
+                                name = m.get("name", "")
+                                vals = m.get("values", [])
+                                val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
+                                if name == "views":      ig_views     = val
+                                elif name == "plays":    ig_plays     = val
+                                elif name == "likes":    s["likes"]   += val
+                                elif name == "comments": s["comments"] += val
+                                elif name == "shares":   s["shares"]  += val
+                            s["views"] = ig_views or ig_plays
+                            _accum_platform_stats(platform_stats, "instagram", s)
                             total_views    += s["views"];    total_likes    += s["likes"]
                             total_comments += s["comments"]; total_shares   += s["shares"]
-                    else:
-                        logger.debug(f"[analytics-sync] TikTok HTTP {resp.status_code} for {upload_id}")
+                            resolved = True
+                            break
 
-                elif plat == "youtube" and video_id:
-                    resp = await client.get(
-                        "https://www.googleapis.com/youtube/v3/videos",
-                        params={"part": "statistics,snippet", "id": str(video_id)},
-                        headers={"Authorization": f"Bearer {access_token}"},
-                    )
-                    if resp.status_code == 200:
-                        items = resp.json().get("items", []) or []
-                        if items:
-                            st = items[0].get("statistics", {}) or {}
-                            s = {
-                                "views":    int(st.get("viewCount")    or 0),
-                                "likes":    int(st.get("likeCount")    or 0),
-                                "comments": int(st.get("commentCount") or 0),
-                                "shares":   0,
-                            }
-                            _accum_platform_stats(platform_stats, "youtube", s)
-                            total_views    += s["views"]; total_likes    += s["likes"]
-                            total_comments += s["comments"]
-                    else:
-                        logger.debug(f"[analytics-sync] YouTube HTTP {resp.status_code} for {upload_id}")
-
-                elif plat == "instagram" and video_id:
-                    media_id = pr.get("platform_video_id") or pr.get("media_id") or video_id
-                    resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{media_id}/insights",
-                        params={
-                            "access_token": access_token,
-                            "metric": "views,plays,likes,comments,saved,shares,reach",
-                        },
-                    )
-                    if resp.status_code == 200:
-                        s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
-                        ig_views = ig_plays = 0
-                        for m in resp.json().get("data", []) or []:
-                            name = m.get("name", "")
-                            vals = m.get("values", [])
-                            val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
-                            if name == "views":      ig_views     = val
-                            elif name == "plays":    ig_plays     = val
-                            elif name == "likes":    s["likes"]   += val
-                            elif name == "comments": s["comments"] += val
-                            elif name == "shares":   s["shares"]  += val
-                        s["views"] = ig_views or ig_plays
-                        _accum_platform_stats(platform_stats, "instagram", s)
-                        total_views    += s["views"];    total_likes    += s["likes"]
-                        total_comments += s["comments"]; total_shares   += s["shares"]
-                    else:
-                        logger.debug(f"[analytics-sync] Instagram HTTP {resp.status_code} for {upload_id}")
-
-                elif plat == "facebook" and video_id:
-                    resp = await client.get(
-                        f"https://graph.facebook.com/v21.0/{video_id}",
-                        params={
-                            "access_token": access_token,
-                            "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)",
-                        },
-                    )
-                    if resp.status_code == 200:
-                        s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
-                        for m in (resp.json().get("insights", {}) or {}).get("data", []) or []:
-                            name = m.get("name", "")
-                            vals = m.get("values", [{}])
-                            val  = vals[-1].get("value", 0) if vals else 0
-                            if isinstance(val, dict):
-                                val = sum(val.values())
-                            val = int(val or 0)
-                            if name == "total_video_views":                     s["views"]    += val
-                            elif name == "total_video_reactions_by_type_total": s["likes"]    += val
-                            elif name == "total_video_comments":                 s["comments"] += val
-                            elif name == "total_video_shares":                   s["shares"]   += val
-                        _accum_platform_stats(platform_stats, "facebook", s)
-                        total_views    += s["views"];    total_likes    += s["likes"]
-                        total_comments += s["comments"]; total_shares   += s["shares"]
-                    else:
-                        logger.debug(f"[analytics-sync] Facebook HTTP {resp.status_code} for {upload_id}")
+                    elif plat == "facebook" and video_id:
+                        resp = await client.get(
+                            f"https://graph.facebook.com/v21.0/{video_id}",
+                            params={
+                                "access_token": access_token,
+                                "fields": "insights.metric(total_video_views,total_video_reactions_by_type_total,total_video_comments,total_video_shares)",
+                            },
+                        )
+                        if resp.status_code in (401, 190):
+                            continue
+                        if resp.status_code == 200:
+                            data = (resp.json().get("insights", {}) or {}).get("data", []) or []
+                            if not data:
+                                continue
+                            s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                            for m in data:
+                                name = m.get("name", "")
+                                vals = m.get("values", [{}])
+                                val  = vals[-1].get("value", 0) if vals else 0
+                                if isinstance(val, dict):
+                                    val = sum(val.values())
+                                val = int(val or 0)
+                                if name == "total_video_views":                     s["views"]    += val
+                                elif name == "total_video_reactions_by_type_total": s["likes"]    += val
+                                elif name == "total_video_comments":                 s["comments"] += val
+                                elif name == "total_video_shares":                   s["shares"]   += val
+                            _accum_platform_stats(platform_stats, "facebook", s)
+                            total_views    += s["views"];    total_likes    += s["likes"]
+                            total_comments += s["comments"]; total_shares   += s["shares"]
+                            resolved = True
+                            break
 
             except Exception as e:
                 logger.warning(f"[analytics-sync] {plat}/{upload_id}: {e}")
@@ -1773,6 +1865,9 @@ async def run_analytics_sync_loop() -> None:
     await asyncio.sleep(60)
 
     while not shutdown_requested:
+        if not await _acquire_cron_lock("analytics_sync", ttl_seconds=max(ANALYTICS_SYNC_INTERVAL - 30, 120)):
+            await asyncio.sleep(ANALYTICS_SYNC_INTERVAL)
+            continue
         try:
             resync_cutoff = _now_utc() - timedelta(hours=ANALYTICS_RESYNC_HOURS)
             window_start  = _now_utc() - timedelta(days=90)
@@ -1876,10 +1971,10 @@ async def run_analytics_sync_loop() -> None:
                             )
                         continue
 
-                    # Refresh TikTok/YouTube OAuth at most once per user per cooldown (not once per upload row).
+                    # Refresh all platform tokens at most once per user per cooldown.
                     if _analytics_oauth_refresh_allowed(user_id):
                         try:
-                            from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token
+                            from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token, _refresh_meta_token
 
                             for tr in token_rows:
                                 if tr["platform"] != "tiktok":
@@ -1900,6 +1995,18 @@ async def run_analytics_sync_loop() -> None:
                                     if dec:
                                         await _refresh_youtube_token(
                                             dict(dec), db_pool=db_pool, user_id=str(user_id)
+                                        )
+                                except Exception:
+                                    pass
+                            for tr in token_rows:
+                                if tr["platform"] not in ("instagram", "facebook"):
+                                    continue
+                                try:
+                                    dec = _dec_blob_for_map(tr["token_blob"])
+                                    if dec:
+                                        await _refresh_meta_token(
+                                            dict(dec), platform=tr["platform"],
+                                            db_pool=db_pool, user_id=str(user_id)
                                         )
                                 except Exception:
                                     pass
@@ -1995,6 +2102,9 @@ async def run_platform_metrics_cache_loop() -> None:
     await asyncio.sleep(120)
 
     while not shutdown_requested:
+        if not await _acquire_cron_lock("platform_metrics_cache", ttl_seconds=max(PLATFORM_METRICS_CACHE_INTERVAL - 30, 120)):
+            await asyncio.sleep(PLATFORM_METRICS_CACHE_INTERVAL)
+            continue
         try:
             from services.platform_metrics_job import refresh_all_users_platform_metrics_cache
 
@@ -2033,6 +2143,9 @@ async def run_kpi_collector_loop() -> None:
     await asyncio.sleep(120)
 
     while not shutdown_requested:
+        if not await _acquire_cron_lock("kpi_collector", ttl_seconds=max(KPI_COLLECTOR_INTERVAL - 30, 120)):
+            await asyncio.sleep(KPI_COLLECTOR_INTERVAL)
+            continue
         try:
             summary = await run_kpi_collect(db_pool)
             if summary.get("rows_inserted", 0) > 0:
@@ -2056,6 +2169,40 @@ async def run_kpi_collector_loop() -> None:
     logger.info("[kpi-collector] loop stopped")
 
 
+async def run_ml_scoring_loop() -> None:
+    """
+    Periodically recompute strategy quality score rows used by the
+    generation engine for long-horizon learnings.
+    """
+    global shutdown_requested, shutdown_event
+    from services.ml_scoring_job import run_ml_scoring_cycle
+
+    logger.info(
+        f"[ml-scoring] loop started | interval={ML_SCORING_INTERVAL}s lookback_days={ML_SCORING_LOOKBACK_DAYS}"
+    )
+    await asyncio.sleep(120)
+
+    while not shutdown_requested:
+        if not await _acquire_cron_lock("ml_scoring", ttl_seconds=max(ML_SCORING_INTERVAL - 30, 120)):
+            await asyncio.sleep(ML_SCORING_INTERVAL)
+            continue
+        try:
+            await run_ml_scoring_cycle(db_pool, lookback_days=ML_SCORING_LOOKBACK_DAYS)
+        except Exception as e:
+            logger.warning(f"[ml-scoring] cycle error: {e}")
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=ML_SCORING_INTERVAL,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[ml-scoring] loop stopped")
+
+
 # ---------------------------------------------------------------------------
 # SCHEDULER LOOP
 # ---------------------------------------------------------------------------
@@ -2073,6 +2220,9 @@ async def run_scheduler_loop() -> None:
     )
 
     while not shutdown_requested:
+        if not await _acquire_cron_lock("scheduler", ttl_seconds=max(SCHEDULER_POLL_INTERVAL - 5, 10)):
+            await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
+            continue
         try:
             now = _now_utc()
             process_cutoff = now + timedelta(minutes=PROCESSING_WINDOW_MINUTES)
@@ -2199,7 +2349,21 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
 async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> None:
     async with _publish_semaphore:
         try:
-            await run_deferred_publish(upload_id, user_id)
+            await asyncio.wait_for(
+                run_deferred_publish(upload_id, user_id),
+                timeout=JOB_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[{upload_id}] Deferred publish timed out after {JOB_TIMEOUT}s")
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE uploads SET status='failed', error_code='PUBLISH_TIMEOUT', "
+                        "error_detail=$2, updated_at=NOW() WHERE id=$1",
+                        upload_id, f"Deferred publish exceeded {JOB_TIMEOUT}s timeout",
+                    )
+            except Exception:
+                pass
         except Exception as e:
             logger.exception(f"[{upload_id}] Unhandled deferred publish error: {e}")
 
@@ -2214,11 +2378,31 @@ async def _process_one_job(job_json: str) -> None:
     except json.JSONDecodeError as e:
         logger.error(f"Invalid job JSON: {e}")
         return
+    upload_id = job_data.get("upload_id", "?")
     async with _process_semaphore:
         try:
-            await run_processing_pipeline(job_data)
+            await asyncio.wait_for(
+                run_processing_pipeline(job_data),
+                timeout=JOB_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[{upload_id}] Job timed out after {JOB_TIMEOUT}s — releasing slot")
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE uploads SET status='failed', error_code='JOB_TIMEOUT', "
+                        "error_detail=$2, updated_at=NOW() WHERE id=$1 AND status='processing'",
+                        upload_id, f"Pipeline exceeded {JOB_TIMEOUT}s timeout",
+                    )
+            except Exception:
+                pass
+            await _send_to_dead_letter(
+                upload_id, job_data.get("user_id", ""), job_data,
+                "JOB_TIMEOUT", f"Pipeline timed out after {JOB_TIMEOUT}s",
+                retry_count=job_data.get("_retry_count", 0),
+            )
         except Exception as e:
-            logger.exception(f"Unhandled pipeline exception: {e}")
+            logger.exception(f"[{upload_id}] Unhandled pipeline exception: {e}")
 
 
 async def process_jobs() -> None:
@@ -2323,6 +2507,7 @@ async def main() -> None:
         min_size=db_min,
         max_size=db_max,
         command_timeout=60,
+        init=_init_asyncpg_codecs,
     )
     logger.info(f"Database connected | pool={db_min}-{db_max}")
 
@@ -2339,6 +2524,7 @@ async def main() -> None:
         asyncio.create_task(run_analytics_sync_loop()),
         asyncio.create_task(run_platform_metrics_cache_loop()),
         asyncio.create_task(run_kpi_collector_loop()),
+        asyncio.create_task(run_ml_scoring_loop()),
     ]
 
     try:

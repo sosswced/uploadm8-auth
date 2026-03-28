@@ -2176,8 +2176,9 @@ async def run_migrations():
 """),
 
 (811, """
-    -- platform_tokens.token_blob must be JSONB: encrypt_blob() passes a dict; TEXT columns make
-    -- asyncpg reject dict params ("expected str, got dict"). Normalize legacy TEXT/VARCHAR to JSONB.
+    -- platform_tokens.token_blob must be JSONB. Legacy TEXT rows may be invalid as a single JSON
+    -- value (e.g. two objects concatenated) - plain ::jsonb then fails. Parse first balanced {...}
+    -- or [...] or wrap as _legacy_parse for the rest.
     DO $m811$
     BEGIN
       IF EXISTS (
@@ -2188,8 +2189,76 @@ async def run_migrations():
            AND column_name = 'token_blob'
            AND data_type IN ('text', 'character varying')
       ) THEN
+        CREATE OR REPLACE FUNCTION uploadm8_token_blob_text_to_jsonb(t text)
+        RETURNS jsonb
+        LANGUAGE plpgsql
+        IMMUTABLE
+        AS $tokfn$
+        DECLARE
+          s text;
+          len int;
+          i int;
+          depth int;
+          start1 int;
+          c text;
+        BEGIN
+          IF t IS NULL THEN RETURN NULL; END IF;
+          s := trim(t);
+          IF s = '' THEN RETURN NULL; END IF;
+          BEGIN
+            RETURN s::jsonb;
+          EXCEPTION WHEN OTHERS THEN
+            PERFORM 1;
+          END;
+          -- First balanced {...}
+          depth := 0;
+          start1 := NULL;
+          len := length(s);
+          FOR i IN 1..len LOOP
+            c := substring(s FROM i FOR 1);
+            IF c = '{' THEN
+              IF depth = 0 THEN start1 := i; END IF;
+              depth := depth + 1;
+            ELSIF c = '}' THEN
+              depth := depth - 1;
+              IF depth = 0 AND start1 IS NOT NULL THEN
+                BEGIN
+                  RETURN substring(s FROM start1 FOR (i - start1 + 1))::jsonb;
+                EXCEPTION WHEN OTHERS THEN
+                  start1 := NULL;
+                  depth := 0;
+                  PERFORM 1;
+                END;
+              END IF;
+            END IF;
+          END LOOP;
+          -- First balanced [...]
+          depth := 0;
+          start1 := NULL;
+          FOR i IN 1..len LOOP
+            c := substring(s FROM i FOR 1);
+            IF c = '[' THEN
+              IF depth = 0 THEN start1 := i; END IF;
+              depth := depth + 1;
+            ELSIF c = ']' THEN
+              depth := depth - 1;
+              IF depth = 0 AND start1 IS NOT NULL THEN
+                BEGIN
+                  RETURN substring(s FROM start1 FOR (i - start1 + 1))::jsonb;
+                EXCEPTION WHEN OTHERS THEN
+                  PERFORM 1;
+                END;
+              END IF;
+            END IF;
+          END LOOP;
+          RETURN jsonb_build_object('_legacy_parse', to_jsonb(s));
+        END;
+        $tokfn$;
+
         ALTER TABLE platform_tokens
-          ALTER COLUMN token_blob TYPE jsonb USING (token_blob::text)::jsonb;
+          ALTER COLUMN token_blob TYPE jsonb USING uploadm8_token_blob_text_to_jsonb(token_blob::text);
+
+        DROP FUNCTION uploadm8_token_blob_text_to_jsonb(text);
       END IF;
     END
     $m811$;

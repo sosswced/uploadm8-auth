@@ -1502,6 +1502,8 @@ async def save_refreshed_token(
     refresh_token: Optional[str] = None,
     open_id: Optional[str] = None,
     extra_fields: Optional[Dict[str, Any]] = None,
+    token_row_id: Optional[str] = None,
+    token_data: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Persist a refreshed platform OAuth token back to the database.
@@ -1566,6 +1568,46 @@ async def save_refreshed_token(
             return json.dumps(blob)
 
         async with pool.acquire() as conn:
+            # Fast path: caller already knows the concrete platform_tokens row and
+            # has the decrypted token payload. This avoids an extra SELECT per
+            # refresh call in loops that already fetched all token rows.
+            if token_row_id and token_data is not None:
+                plain = dict(token_data or {})
+                plain["access_token"] = access_token
+                if refresh_token:
+                    plain["refresh_token"] = refresh_token
+                if open_id:
+                    plain["open_id"] = open_id
+                if extra_fields:
+                    for k, v in extra_fields.items():
+                        if v is not None:
+                            plain[k] = v
+
+                new_blob_str = _encrypt(plain)
+                cmd = await conn.execute(
+                    """
+                    UPDATE platform_tokens
+                       SET token_blob = $1,
+                           updated_at = NOW()
+                     WHERE id = $2
+                       AND user_id = $3
+                       AND revoked_at IS NULL
+                    """,
+                    new_blob_str,
+                    token_row_id,
+                    user_id,
+                )
+                if str(cmd).upper().startswith("UPDATE 1"):
+                    logger.info(
+                        f"save_refreshed_token: persisted {platform} token for user={user_id} "
+                        f"token_row_id={str(token_row_id)[:8]}"
+                    )
+                    return
+                logger.warning(
+                    f"save_refreshed_token: token_row_id not found for {platform} "
+                    f"user={user_id} token_row_id={token_row_id}"
+                )
+
             # ── Try platform_tokens ───────────────────────────────────────
             for table in ("platform_tokens", "connected_accounts"):
                 try:

@@ -358,11 +358,27 @@ async def refresh_platform_metrics_for_user(pool: asyncpg.Pool, user_id: Any) ->
         for plat, row_id, account_id, token in account_jobs:
             cur = dict(token)
             if plat == "tiktok":
-                cur = await _refresh_tiktok_token(cur, db_pool=pool, user_id=uid_str)
+                cur = await _refresh_tiktok_token(
+                    cur,
+                    db_pool=pool,
+                    user_id=uid_str,
+                    token_row_id=row_id,
+                )
             elif plat == "youtube":
-                cur = await _refresh_youtube_token(cur, db_pool=pool, user_id=uid_str)
+                cur = await _refresh_youtube_token(
+                    cur,
+                    db_pool=pool,
+                    user_id=uid_str,
+                    token_row_id=row_id,
+                )
             elif plat in ("instagram", "facebook"):
-                cur = await _refresh_meta_token(cur, platform=plat, db_pool=pool, user_id=uid_str)
+                cur = await _refresh_meta_token(
+                    cur,
+                    platform=plat,
+                    db_pool=pool,
+                    user_id=uid_str,
+                    token_row_id=row_id,
+                )
             refreshed_jobs.append((plat, row_id, account_id, cur))
         account_jobs = refreshed_jobs
     except Exception as e:

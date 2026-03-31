@@ -1983,7 +1983,10 @@ async def run_analytics_sync_loop() -> None:
                                     dec = _dec_blob_for_map(tr["token_blob"])
                                     if dec:
                                         await _refresh_tiktok_token(
-                                            dict(dec), db_pool=db_pool, user_id=str(user_id)
+                                            dict(dec),
+                                            db_pool=db_pool,
+                                            user_id=str(user_id),
+                                            token_row_id=str(tr["id"]),
                                         )
                                 except Exception:
                                     pass
@@ -1994,7 +1997,10 @@ async def run_analytics_sync_loop() -> None:
                                     dec = _dec_blob_for_map(tr["token_blob"])
                                     if dec:
                                         await _refresh_youtube_token(
-                                            dict(dec), db_pool=db_pool, user_id=str(user_id)
+                                            dict(dec),
+                                            db_pool=db_pool,
+                                            user_id=str(user_id),
+                                            token_row_id=str(tr["id"]),
                                         )
                                 except Exception:
                                     pass
@@ -2005,8 +2011,11 @@ async def run_analytics_sync_loop() -> None:
                                     dec = _dec_blob_for_map(tr["token_blob"])
                                     if dec:
                                         await _refresh_meta_token(
-                                            dict(dec), platform=tr["platform"],
-                                            db_pool=db_pool, user_id=str(user_id)
+                                            dict(dec),
+                                            platform=tr["platform"],
+                                            db_pool=db_pool,
+                                            user_id=str(user_id),
+                                            token_row_id=str(tr["id"]),
                                         )
                                 except Exception:
                                     pass

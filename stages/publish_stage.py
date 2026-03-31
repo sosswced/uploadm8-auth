@@ -545,7 +545,12 @@ def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
 # =====================================================================
 
 
-async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = None) -> dict:
+async def _refresh_tiktok_token(
+    token_data: dict,
+    db_pool=None,
+    user_id: str = None,
+    token_row_id: str = None,
+) -> dict:
     """Refresh a TikTok access token using the stored refresh_token.
     TikTok access tokens expire after 24 hours; refresh tokens after 365 days.
     Persists the new token blob to DB if db_pool and user_id are provided.
@@ -599,6 +604,8 @@ async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = N
                                 access_token=new_access,
                                 refresh_token=new_refresh,
                                 open_id=new_open_id,
+                                token_row_id=token_row_id,
+                                token_data=token_data,
                             )
                         except Exception as save_err:
                             logger.warning(f"TikTok: Failed to persist refreshed token: {save_err}")
@@ -612,7 +619,13 @@ async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = N
 
 
 
-async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, user_id: str = None) -> dict:
+async def _refresh_meta_token(
+    token_data: dict,
+    platform: str,
+    db_pool=None,
+    user_id: str = None,
+    token_row_id: str = None,
+) -> dict:
     """Refresh a Meta (Instagram/Facebook) Page access token.
     
     Meta Page tokens obtained via /me/accounts are long-lived (~60 days).
@@ -688,6 +701,8 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                                         platform=platform,
                                         access_token=new_page_token,
                                         extra_fields={"page_id": str(page_id)},
+                                        token_row_id=token_row_id,
+                                        token_data=token_data,
                                     )
                                 except Exception as save_err:
                                     logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
@@ -774,6 +789,8 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                             platform=platform,
                             access_token=updated["access_token"],
                             extra_fields=extra or None,
+                            token_row_id=token_row_id,
+                            token_data=token_data,
                         )
                     except Exception as save_err:
                         logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
@@ -1036,7 +1053,12 @@ async def publish_to_tiktok(
         )
 
 
-async def _refresh_youtube_token(token_data: dict, db_pool=None, user_id: str = None) -> dict:
+async def _refresh_youtube_token(
+    token_data: dict,
+    db_pool=None,
+    user_id: str = None,
+    token_row_id: str = None,
+) -> dict:
     """Attempt to refresh a YouTube access token using the stored refresh_token.
     Returns updated token_data dict with new access_token, or original if refresh fails.
     Persists updated token to DB if db_pool and user_id are provided.
@@ -1079,6 +1101,8 @@ async def _refresh_youtube_token(token_data: dict, db_pool=None, user_id: str = 
                             user_id=user_id,
                             platform="youtube",
                             access_token=new_access,
+                            token_row_id=token_row_id,
+                            token_data=token_data,
                         )
                     except Exception as save_err:
                         logger.warning(f"YouTube: Failed to persist refreshed token: {save_err}")

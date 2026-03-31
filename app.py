@@ -6395,7 +6395,12 @@ async def sync_upload_analytics(
                 try:
                     dec = decrypt_blob(tr["token_blob"])
                     if dec:
-                        await _refresh_tiktok_token(dict(dec), db_pool=db_pool, user_id=uid_str)
+                        await _refresh_tiktok_token(
+                            dict(dec),
+                            db_pool=db_pool,
+                            user_id=uid_str,
+                            token_row_id=str(tr["id"]),
+                        )
                 except Exception:
                     pass
         if "youtube" in plats_in_upload:
@@ -6405,7 +6410,12 @@ async def sync_upload_analytics(
                 try:
                     dec = decrypt_blob(tr["token_blob"])
                     if dec:
-                        await _refresh_youtube_token(dict(dec), db_pool=db_pool, user_id=uid_str)
+                        await _refresh_youtube_token(
+                            dict(dec),
+                            db_pool=db_pool,
+                            user_id=uid_str,
+                            token_row_id=str(tr["id"]),
+                        )
                 except Exception:
                     pass
         for meta_plat in ("instagram", "facebook"):
@@ -6416,7 +6426,13 @@ async def sync_upload_analytics(
                     try:
                         dec = decrypt_blob(tr["token_blob"])
                         if dec:
-                            await _refresh_meta_token(dict(dec), platform=meta_plat, db_pool=db_pool, user_id=uid_str)
+                            await _refresh_meta_token(
+                                dict(dec),
+                                platform=meta_plat,
+                                db_pool=db_pool,
+                                user_id=uid_str,
+                                token_row_id=str(tr["id"]),
+                            )
                     except Exception:
                         pass
         async with db_pool.acquire() as conn:
@@ -11542,7 +11558,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
 
     async with db_pool.acquire() as conn:
         token_rows = await conn.fetch(
-            "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            "SELECT id, platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
             user["id"],
         )
         upload_counts = await conn.fetch(
@@ -11571,7 +11587,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
                 decrypted["ig_user_id"] = str(row["account_id"])
             if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
                 decrypted["page_id"] = str(row["account_id"])
-            token_lists.setdefault(plat, []).append(decrypted)
+            token_lists.setdefault(plat, []).append((str(row["id"]), decrypted))
             token_map[plat] = decrypted
 
     # Refresh OAuth tokens before live API calls (YouTube ~1h; TikTok ~24h; Meta ~60 days).
@@ -11581,45 +11597,87 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
 
         if token_lists.get("tiktok"):
             refreshed = []
-            for tok in token_lists["tiktok"]:
+            for row_id, tok in token_lists["tiktok"]:
                 try:
-                    refreshed.append(await _refresh_tiktok_token(dict(tok), db_pool=db_pool, user_id=uid_str))
+                    refreshed.append(
+                        (
+                            row_id,
+                            await _refresh_tiktok_token(
+                                dict(tok),
+                                db_pool=db_pool,
+                                user_id=uid_str,
+                                token_row_id=row_id,
+                            ),
+                        )
+                    )
                 except Exception:
-                    refreshed.append(tok)
+                    refreshed.append((row_id, tok))
             token_lists["tiktok"] = refreshed
-            token_map["tiktok"] = refreshed[-1]
+            token_map["tiktok"] = refreshed[-1][1]
         if token_lists.get("youtube"):
             refreshed = []
-            for tok in token_lists["youtube"]:
+            for row_id, tok in token_lists["youtube"]:
                 try:
-                    refreshed.append(await _refresh_youtube_token(dict(tok), db_pool=db_pool, user_id=uid_str))
+                    refreshed.append(
+                        (
+                            row_id,
+                            await _refresh_youtube_token(
+                                dict(tok),
+                                db_pool=db_pool,
+                                user_id=uid_str,
+                                token_row_id=row_id,
+                            ),
+                        )
+                    )
                 except Exception:
-                    refreshed.append(tok)
+                    refreshed.append((row_id, tok))
             token_lists["youtube"] = refreshed
-            token_map["youtube"] = refreshed[-1]
+            token_map["youtube"] = refreshed[-1][1]
         if token_lists.get("instagram"):
             refreshed = []
-            for tok in token_lists["instagram"]:
+            for row_id, tok in token_lists["instagram"]:
                 try:
-                    refreshed.append(await _refresh_meta_token(dict(tok), platform="instagram", db_pool=db_pool, user_id=uid_str))
+                    refreshed.append(
+                        (
+                            row_id,
+                            await _refresh_meta_token(
+                                dict(tok),
+                                platform="instagram",
+                                db_pool=db_pool,
+                                user_id=uid_str,
+                                token_row_id=row_id,
+                            ),
+                        )
+                    )
                 except Exception:
-                    refreshed.append(tok)
+                    refreshed.append((row_id, tok))
             token_lists["instagram"] = refreshed
-            token_map["instagram"] = refreshed[-1]
+            token_map["instagram"] = refreshed[-1][1]
         if token_lists.get("facebook"):
             refreshed = []
-            for tok in token_lists["facebook"]:
+            for row_id, tok in token_lists["facebook"]:
                 try:
-                    refreshed.append(await _refresh_meta_token(dict(tok), platform="facebook", db_pool=db_pool, user_id=uid_str))
+                    refreshed.append(
+                        (
+                            row_id,
+                            await _refresh_meta_token(
+                                dict(tok),
+                                platform="facebook",
+                                db_pool=db_pool,
+                                user_id=uid_str,
+                                token_row_id=row_id,
+                            ),
+                        )
+                    )
                 except Exception:
-                    refreshed.append(tok)
+                    refreshed.append((row_id, tok))
             token_lists["facebook"] = refreshed
-            token_map["facebook"] = refreshed[-1]
+            token_map["facebook"] = refreshed[-1][1]
     except Exception as _tok_e:
         logger.warning(f"Platform metrics OAuth refresh skipped: {_tok_e}")
 
     async def run_tiktok():
-        tokens = token_lists.get("tiktok") or []
+        tokens = [t for _, t in (token_lists.get("tiktok") or [])]
         if not tokens:
             return {"status": "not_connected"}
         rs = await _asyncio.gather(*[_fetch_tiktok_metrics((t or {}).get("access_token", "")) for t in tokens], return_exceptions=True)
@@ -11627,7 +11685,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
         return _combine_platform_live_results("tiktok", norm)
 
     async def run_youtube():
-        tokens = token_lists.get("youtube") or []
+        tokens = [t for _, t in (token_lists.get("youtube") or [])]
         if not tokens:
             return {"status": "not_connected"}
         rs = await _asyncio.gather(*[_fetch_youtube_metrics((t or {}).get("access_token", "")) for t in tokens], return_exceptions=True)
@@ -11635,7 +11693,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
         return _combine_platform_live_results("youtube", norm)
 
     async def run_instagram():
-        tokens = token_lists.get("instagram") or []
+        tokens = [t for _, t in (token_lists.get("instagram") or [])]
         if not tokens:
             return {"status": "not_connected"}
         coros = []
@@ -11647,7 +11705,7 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
         return _combine_platform_live_results("instagram", norm)
 
     async def run_facebook():
-        tokens = token_lists.get("facebook") or []
+        tokens = [t for _, t in (token_lists.get("facebook") or [])]
         if not tokens:
             return {"status": "not_connected"}
         coros = []

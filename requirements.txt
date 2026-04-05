@@ -1,12 +1,18 @@
 # UploadM8 Backend Requirements
 # Using flexible versions with pre-built wheels (no Rust compilation needed)
+#
+# Python: use 3.11 locally and in CI (matches Dockerfile). On 3.14 + Windows, TensorFlow is missing
+# TensorFlow still has no 3.14 wheel on Windows. asyncpg: use <0.32 so pip can take 0.31+ (prebuilt cp314 wheels).
+# `py -m pip` often follows the newest Python — use an explicit
+# 3.11 venv: py -3.11 -m venv .venv
+# API-only: requirements-api.txt (still needs 3.11 on Windows unless you install C++ Build Tools).
 
 # Web Framework
 fastapi>=0.109.0,<0.116.0
 uvicorn[standard]>=0.27.0,<0.35.0
 
 # Database
-asyncpg>=0.29.0,<0.31.0
+asyncpg>=0.29.0,<0.32.0
 python-multipart==0.0.9
 
 

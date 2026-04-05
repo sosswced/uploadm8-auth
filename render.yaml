@@ -72,6 +72,9 @@ services:
         value: "60"
       - key: CACHE_TTL_MEDIUM
         value: "300"
+      # GET /api/me JSON cache (Redis); 0 disables. Shorter = fresher tier/accounts counts.
+      - key: ME_API_CACHE_TTL_SEC
+        value: "30"
       # Metrics key (set to secure random for production)
       - key: METRICS_API_KEY
         sync: false
@@ -187,10 +190,11 @@ services:
       - key: HUME_ENABLED
         value: "true"
 
-      # ── Google Cloud Vision ───────────────────────────────────────────────────
-      # Mount your GCP service account JSON as a secret file in Render:
-      #   Dashboard → uploadm8-worker → Environment → Secret Files
-      #   Filename: gcp-service-account.json  Path: /etc/secrets/gcp-sa.json
+      # ── Google Cloud Vision / Video Intelligence ──────────────────────────────
+      # Secret file: Dashboard → uploadm8-worker → Environment → Secret Files.
+      # Mount path is always /etc/secrets/<filename>. Any *.json that is a GCP service_account key is auto-detected
+      # (e.g. social-media-up-35c8d799dd54.json). Or set GOOGLE_APPLICATION_CREDENTIALS to the full path explicitly.
+      # Alternative: GCP_SERVICE_ACCOUNT_JSON = full JSON (when file path is awkward).
       - key: GOOGLE_APPLICATION_CREDENTIALS
         value: /etc/secrets/gcp-sa.json
       - key: VISION_STAGE_ENABLED
@@ -223,6 +227,12 @@ services:
         value: "120"
       - key: THUMBNAIL_MAX_SAMPLES
         value: "12"
+      - key: THUMB_RENDER_ENGINE
+        value: "studio"
+      - key: PIKZELS_API_URL
+        value: "https://app.pikzels.com/platform/api/thumbnail"
+      - key: PIKZELS_API_KEY
+        sync: false
 
       # ── Model cache paths (set in Dockerfile ENV, kept here for reference) ───
       - key: TFHUB_CACHE_DIR
@@ -233,8 +243,12 @@ services:
         value: /app/.playwright
 
       # ── Worker concurrency tuning ─────────────────────────────────────────────
+      # Standard 2GB: use 2 + heavy_pipeline_slots=1. Pro 4GB+: can try 3 and/or heavy_pipeline_slots=2.
       - key: WORKER_CONCURRENCY
-        value: "3"
+        value: "2"
+      # Caps parallel "audio+YAMNet+Vision+Twelve Labs+thumbnail" (peak RAM). Independent of WORKER_CONCURRENCY.
+      - key: WORKER_HEAVY_PIPELINE_SLOTS
+        value: "1"
       - key: PUBLISH_CONCURRENCY
         value: "5"
       - key: PUBLISH_PARALLEL

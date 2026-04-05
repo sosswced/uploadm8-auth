@@ -80,12 +80,17 @@ htmlcov/
 # --- Test artifacts ---
 tests/screenshots/*.png
 tests/.playwright-auth-state.json
+tests/artifacts/
+tools/internal-test-results/
 
 # --- Local tooling ---
 .mypy_cache/
 .pytype/
 .dmypy.json
 .cache/
+
+# Local agent / hypothesis debug dumps (never commit)
+debug-*.log
 
 # --- Node (if/when frontend is added into this repo) ---
 node_modules/

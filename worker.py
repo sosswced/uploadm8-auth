@@ -65,7 +65,10 @@ NEW IN v3: DEFERRED PROCESSING (Staged Upload Flow)
     fire at any given poll cycle.
 
 CONCURRENCY:
-  WORKER_CONCURRENCY=3 (default) — 3 jobs process simultaneously.
+  WORKER_CONCURRENCY (default 3) — simultaneous FFmpeg-heavy process jobs.
+  WORKER_HEAVY_PIPELINE_SLOTS (default 1) — jobs sharing the memory-heavy tail
+    (audio/YAMNet, Vision, Twelve Labs, thumbnails/ONNX/rembg). Keeps peak RAM
+    predictable on small Render instances even when WORKER_CONCURRENCY > 1.
   Scheduler loop runs as a separate asyncio task, not a job slot.
 """
 
@@ -77,6 +80,7 @@ import logging
 import tempfile
 import signal
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -84,25 +88,12 @@ from typing import Optional, Dict, List, Tuple
 import asyncpg
 import redis.asyncio as redis
 
+from stages.asyncpg_json_codecs import apply_asyncpg_json_codecs as _init_asyncpg_codecs
 
-def _json_encoder(v):
-    if isinstance(v, str):
-        return v
-    return json.dumps(v, separators=(',', ':'), ensure_ascii=False)
-
-async def _init_asyncpg_codecs(conn):
-    try:
-        await conn.set_type_codec('json', encoder=_json_encoder, decoder=json.loads, schema='pg_catalog')
-    except Exception:
-        pass
-    try:
-        await conn.set_type_codec('jsonb', encoder=_json_encoder, decoder=json.loads, schema='pg_catalog')
-    except Exception:
-        pass
-
-from stages.errors import StageError, SkipStage, CancelRequested
+from stages.errors import StageError, SkipStage, CancelRequested, log_stage_skip
 from stages.context import JobContext, create_context
-from stages.entitlements import get_entitlements_from_user
+from stages.entitlements import get_entitlements_from_user, get_entitlements_for_tier
+from services.wallet import partial_refund_upload_partial_success
 from stages import db as db_stage
 from stages import r2 as r2_stage
 from stages.telemetry_stage import run_telemetry_stage
@@ -192,7 +183,8 @@ async def _acquire_cron_lock(lock_name: str, ttl_seconds: int = 300) -> bool:
     try:
         acquired = await redis_client.set(f"cron_lock:{lock_name}", "1", nx=True, ex=ttl_seconds)
         return bool(acquired)
-    except Exception:
+    except Exception as e:
+        logger.debug("cron lock Redis error lock=%s (proceeding as leader): %s", lock_name, e)
         return True
 
 # ── 4-Lane Queue Names (must match app.py env vars) ──────────────
@@ -211,6 +203,8 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
 # PUBLISH_CONCURRENCY = API-light publish jobs   (I/O-bound, default 5)
 WORKER_CONCURRENCY  = int(os.environ.get("WORKER_CONCURRENCY",  "3"))
 PUBLISH_CONCURRENCY = int(os.environ.get("PUBLISH_CONCURRENCY", "5"))
+# Caps concurrent "ML + thumbnail" tails (TensorFlow YAMNet, ONNX, rembg, large API buffers).
+WORKER_HEAVY_PIPELINE_SLOTS = max(1, int(os.environ.get("WORKER_HEAVY_PIPELINE_SLOTS", "1")))
 
 # Scheduler: how far in advance to start processing a scheduled upload (minutes)
 PROCESSING_WINDOW_MINUTES = int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15"))
@@ -283,7 +277,8 @@ def _merge_upload_prefs_into_settings(user_settings: dict, upload_record: dict) 
         return out
     try:
         prefs = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.debug("_merge_upload_prefs_into_settings: skip invalid user_preferences: %s", e)
         return out
     if not isinstance(prefs, dict):
         return out
@@ -316,6 +311,24 @@ def _merge_upload_prefs_into_settings(user_settings: dict, upload_record: dict) 
             out[camel] = val
             out[snake] = val
 
+    # Thumbnail Studio / Pikzels scalar controls should follow per-upload snapshot.
+    for camel, snake in [
+        ("thumbnailStudioEnabled", "thumbnail_studio_enabled"),
+        ("thumbnailStudioEngineEnabled", "thumbnail_studio_engine_enabled"),
+        ("thumbnailPikzelsEnabled", "thumbnail_pikzels_enabled"),
+        ("thumbnailPersonaEnabled", "thumbnail_persona_enabled"),
+        ("thumbnailDefaultPersonaId", "thumbnail_default_persona_id"),
+        ("thumbnailPersonaStrength", "thumbnail_persona_strength"),
+        ("thumbnailUseStudioEngine", "thumbnail_use_studio_engine"),
+        ("thumbnailUsePikzels", "thumbnail_use_pikzels"),
+        ("thumbnailUsePersona", "thumbnail_use_persona"),
+        ("thumbnailPersonaId", "thumbnail_persona_id"),
+    ]:
+        val = prefs.get(camel) if prefs.get(camel) is not None else prefs.get(snake)
+        if val is not None:
+            out[camel] = val
+            out[snake] = val
+
     return out
 
 redis_client: Optional[redis.Redis] = None
@@ -329,6 +342,20 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
     if not db_pool:
         return
     async with db_pool.acquire() as conn:
+        urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1::uuid", user_id)
+        tier = (urow.get("subscription_tier") if urow else "free") or "free"
+        ent = get_entitlements_for_tier(str(tier))
+        if getattr(ent, "is_internal", False):
+            await conn.execute(
+                """
+                UPDATE wallet_holds SET status = 'captured', resolved_at = NOW()
+                WHERE upload_id = $1 AND status = 'held'
+                """,
+                upload_id,
+            )
+            await conn.execute("UPDATE uploads SET hold_status = 'captured' WHERE id = $1", upload_id)
+            return
+
         before_wallet = await conn.fetchrow(
             "SELECT put_balance, aic_balance FROM wallets WHERE user_id = $1",
             user_id,
@@ -336,48 +363,77 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
         before_put = int((before_wallet or {}).get("put_balance") or 0)
         before_aic = int((before_wallet or {}).get("aic_balance") or 0)
 
-        # Debit balance and clear reservation simultaneously
-        await conn.execute("""
+        # Debit balance and clear reservation simultaneously; only log ledger if update applied.
+        row = await conn.fetchrow(
+            """
             UPDATE wallets SET
                 put_balance  = put_balance  - $1,
                 aic_balance  = aic_balance  - $2,
                 put_reserved = put_reserved - $1,
                 aic_reserved = aic_reserved - $2,
                 updated_at   = NOW()
-            WHERE user_id = $3
+            WHERE user_id = $3::uuid
               AND put_reserved >= $1
               AND aic_reserved >= $2
-        """, put_cost, aic_cost, user_id)
+            RETURNING put_balance
+            """,
+            put_cost,
+            aic_cost,
+            user_id,
+        )
 
-        # Ledger entries
-        if put_cost > 0:
-            await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'put', $2, 'upload_debit', $3, 'upload')
-            """, user_id, -put_cost, upload_id)
-        if aic_cost > 0:
-            await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'aic', $2, 'upload_debit', $3, 'upload')
-            """, user_id, -aic_cost, upload_id)
+        if row:
+            if put_cost > 0:
+                await conn.execute(
+                    """
+                    INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                    VALUES ($1, 'put', $2, 'upload_debit', $3, 'upload')
+                    """,
+                    user_id,
+                    -put_cost,
+                    upload_id,
+                )
+            if aic_cost > 0:
+                await conn.execute(
+                    """
+                    INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                    VALUES ($1, 'aic', $2, 'upload_debit', $3, 'upload')
+                    """,
+                    user_id,
+                    -aic_cost,
+                    upload_id,
+                )
+        else:
+            logger.warning(
+                "capture_tokens: wallet update skipped (no hold?) upload_id=%s user=%s put=%s aic=%s",
+                upload_id,
+                user_id,
+                put_cost,
+                aic_cost,
+            )
 
-        # Update wallet_holds record
-        await conn.execute("""
-            UPDATE wallet_holds SET status = 'captured', resolved_at = NOW()
-            WHERE upload_id = $1 AND status = 'held'
-        """, upload_id)
+        if row:
+            await conn.execute(
+                """
+                UPDATE wallet_holds SET status = 'captured', resolved_at = NOW()
+                WHERE upload_id = $1 AND status = 'held'
+                """,
+                upload_id,
+            )
 
-        # Mark upload hold_status
-        await conn.execute("""
-            UPDATE uploads SET hold_status = 'captured' WHERE id = $1
-        """, upload_id)
+            await conn.execute(
+                """
+                UPDATE uploads SET hold_status = 'captured' WHERE id = $1
+                """,
+                upload_id,
+            )
 
         # Low token warning: if balance dropped to/below threshold, email user
         LOW_THRESHOLD = 5
         wallet = await conn.fetchrow(
             "SELECT put_balance, aic_balance FROM wallets WHERE user_id = $1", user_id
         )
-        if wallet:
+        if wallet and row:
             prefs = await conn.fetchrow(
                 "SELECT email_notifications FROM user_preferences WHERE user_id = $1",
                 user_id,
@@ -427,16 +483,7 @@ async def _release_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
             WHERE user_id = $3
         """, put_cost, aic_cost, user_id)
 
-        if put_cost > 0:
-            await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'put', $2, $3, $4, 'upload')
-            """, user_id, put_cost, reason, upload_id)  # positive delta = refund
-        if aic_cost > 0:
-            await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'aic', $2, $3, $4, 'upload')
-            """, user_id, aic_cost, reason, upload_id)
+        # No ledger: releasing a hold does not change balance (reserve had no ledger row).
 
         await conn.execute("""
             UPDATE wallet_holds SET status = 'released', resolved_at = NOW()
@@ -463,62 +510,6 @@ async def _get_upload_costs(upload_id: str):
         put = row["put_cost"] or row["put_reserved"] or 0
         aic = row["aic_cost"] or row["aic_reserved"] or 0
         return int(put), int(aic)
-
-
-async def partial_refund_tokens(
-    conn,
-    user_id: str,
-    upload_id: str,
-    succeeded_platforms: list,
-    failed_platforms: list,
-    original_put_cost: int,
-):
-    """
-    Pro-rate a PUT refund for platforms that failed in a partial upload.
-
-    PUT cost formula (mirrors entitlements.py compute_put_cost):
-      base = 10 (covers the first platform)
-      +2 per extra platform beyond the first
-
-    For partial failure we refund:
-      2 tokens × number_of_failed_platforms
-      (base-10 is always kept because work was done)
-
-    Note: In the worker flow we capture the full hold first (reserved → spent),
-    so this refund credits *put_balance* back (no reserved adjustment).
-    """
-    n_failed = len(failed_platforms or [])
-    if n_failed == 0 or not (succeeded_platforms or []):
-        return
-
-    put_refund = n_failed * 2
-    put_refund = min(int(put_refund), max(0, int(original_put_cost) - 10))  # never refund the base-10
-
-    if put_refund <= 0:
-        return
-
-    await conn.execute(
-        """
-        UPDATE wallets
-        SET
-            put_balance = put_balance + $1,
-            updated_at  = NOW()
-        WHERE user_id = $2
-        """,
-        put_refund,
-        user_id,
-    )
-
-    # Ledger entry — positive delta = credit back
-    await conn.execute(
-        """
-        INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-        VALUES ($1, 'put', $2, 'partial_platform_refund', $3, 'upload')
-        """,
-        user_id,
-        put_refund,
-        upload_id,
-    )
 
 
 shutdown_requested = False
@@ -552,6 +543,32 @@ async def _send_to_dead_letter(
     except Exception as e:
         logger.error(f"[{upload_id}] Failed to write to DLQ: {e}")
 
+
+async def _mark_pipeline_uncaught_failure(upload_id: str, user_id: str, job_data: dict, exc: Exception) -> None:
+    """Avoid leaving uploads stuck in processing when the worker escapes the inner pipeline try/except."""
+    detail = f"{type(exc).__name__}: {exc}"[:2000]
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE uploads SET status='failed', error_code=$2, error_detail=$3, updated_at=NOW() "
+                    "WHERE id=$1 AND status='processing'",
+                    upload_id,
+                    "PIPELINE_EXCEPTION",
+                    detail,
+                )
+        except Exception as e:
+            logger.warning("[%s] mark failed after PIPELINE_EXCEPTION: %s", upload_id, e)
+    await _send_to_dead_letter(
+        upload_id,
+        user_id,
+        job_data,
+        "PIPELINE_EXCEPTION",
+        detail,
+        retry_count=job_data.get("_retry_count", 0),
+    )
+
+
 # ── Separate semaphores for each lane ────────────────────────────
 # Process semaphore: guards FFmpeg transcode slots (CPU-bound)
 # Publish semaphore: guards platform API call slots (I/O-bound)
@@ -561,6 +578,19 @@ _process_semaphore: Optional[asyncio.Semaphore] = None
 _publish_semaphore: Optional[asyncio.Semaphore] = None
 # Legacy alias — some internal helpers still reference _job_semaphore
 _job_semaphore: Optional[asyncio.Semaphore] = None
+# Limits parallel memory-heavy stages (audio context → thumbnail), independent of transcode slots.
+_heavy_pipeline_sem: Optional[asyncio.Semaphore] = None
+
+
+@asynccontextmanager
+async def _heavy_pipeline_slot():
+    """Limit concurrent memory-heavy stages (audio/ML/thumbnail)."""
+    sem = _heavy_pipeline_sem
+    if sem is None:
+        yield
+        return
+    async with sem:
+        yield
 
 
 def _now_utc() -> datetime:
@@ -574,8 +604,8 @@ def handle_shutdown(signum, frame):
     try:
         if shutdown_event is not None:
             shutdown_event.set()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("handle_shutdown: could not set shutdown_event: %s", e)
 
 
 async def check_cancelled(ctx: JobContext) -> bool:
@@ -813,6 +843,15 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             or "gpt-4o"
         )
 
+        def _svc_enabled(camel_key: str, default: bool = True) -> bool:
+            """Read per-service toggles from ctx.user_settings (camel + snake aliases)."""
+            us = ctx.user_settings or {}
+            snake = camel_key[0].lower()
+            for ch in camel_key[1:]:
+                snake += ("_" + ch.lower()) if ch.isupper() else ch
+            raw = us.get(camel_key, us.get(snake, default))
+            return bool(raw)
+
         # ── Server-side entitlement cap enforcement ───────────────────────
         if ctx.user_record and ctx.entitlements:
             ent = ctx.entitlements
@@ -843,8 +882,8 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     "UPDATE uploads SET processing_started_at = NOW() WHERE id = $1",
                     upload_id,
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("[%s] processing_started_at timestamp update skipped: %s", upload_id, e)
 
         await maybe_cancel(ctx, "init")
 
@@ -883,7 +922,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 if trill_active:
                     _apply_trill_caption_settings(ctx)
             except SkipStage as e:
-                logger.info(f"[{upload_id}] Telemetry skipped: {e.reason}")
+                log_stage_skip(logger, "Telemetry", e.reason, upload_id=upload_id)
                 trill_active = False
                 hud_active = False
             except StageError as e:
@@ -904,7 +943,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             try:
                 ctx = await run_hud_stage(ctx)
             except SkipStage as e:
-                logger.info(f"[{upload_id}] HUD skipped: {e.reason}")
+                log_stage_skip(logger, "HUD", e.reason, upload_id=upload_id)
             except StageError as e:
                 logger.warning(f"[{upload_id}] HUD error: {e.message}")
         await maybe_cancel(ctx, "hud")
@@ -915,7 +954,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         try:
             ctx = await run_watermark_stage(ctx)
         except SkipStage as e:
-            logger.info(f"[{upload_id}] Watermark skipped: {e.reason}")
+            log_stage_skip(logger, "Watermark", e.reason, upload_id=upload_id)
         except StageError as e:
             logger.warning(f"[{upload_id}] Watermark error: {e.message}")
         await maybe_cancel(ctx, "watermark")
@@ -926,7 +965,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         try:
             ctx = await _run_deduplicated_transcode(ctx)
         except SkipStage as e:
-            logger.info(f"[{upload_id}] Transcode skipped: {e.reason}")
+            log_stage_skip(logger, "Transcode", e.reason, upload_id=upload_id)
         except StageError as e:
             logger.warning(f"[{upload_id}] Transcode error: {e.message}")
             source = ctx.processed_video_path or ctx.local_video_path
@@ -934,223 +973,243 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 ctx.platform_videos[p] = source
         await maybe_cancel(ctx, "transcode")
 
-        # ============================================================
-        # STAGE 5.5: Audio Context — Whisper + ACRCloud + YAMNet + Hume
-        # Runs AFTER transcode so ctx.video_info.audio_codec is populated.
-        # Runs BEFORE thumbnail so ctx.audio_context feeds thumbnail/caption.
-        # ============================================================
-        try:
-            ctx = await run_audio_context_stage(ctx)
-            logger.info(
-                f"[{upload_id}] Audio  — category={ctx.get_audio_category()} "
-                f"emotion={ctx.get_audio_emotion()} mood={ctx.get_thumbnail_mood()}"
-            )
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Audio context skipped: {e.reason}")
-            ctx.audio_context = {}
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Audio context error: {e.message}")
-            ctx.audio_context = {}
-        except Exception as e:
-            logger.warning(f"[{upload_id}] Audio error (non-fatal): {e}")
-            ctx.audio_context = {}
-        await maybe_cancel(ctx, "audio")
-
-        # ============================================================
-        # STAGE 5.6: Vision — Google Cloud Vision face/OCR on best frame
-        # Context feeds thumbnail (face-priority crop) + caption (OCR).
-        # ============================================================
-        try:
-            ctx = await run_vision_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Vision skipped: {e.reason}")
-            ctx.vision_context = {}
-        except Exception as e:
-            logger.warning(f"[{upload_id}] Vision error (non-fatal): {e}")
-            ctx.vision_context = {}
-        await maybe_cancel(ctx, "vision")
-
-        # ============================================================
-        # STAGE 5.7: Twelve Labs — deep video understanding (if enabled)
-        # Context feeds thumbnail/caption/hashtag design.
-        # ============================================================
-        try:
-            ctx = await run_twelvelabs_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Twelve Labs skipped: {e.reason}")
-            ctx.video_understanding = {}
-        except Exception as e:
-            logger.warning(f"[{upload_id}] Twelve Labs error (non-fatal): {e}")
-            ctx.video_understanding = {}
-        await maybe_cancel(ctx, "twelvelabs")
-
-        # ============================================================
-        # STAGE 5.8: Google Video Intelligence — full-clip labels + shots
-        # ============================================================
-        try:
-            ctx = await run_video_intelligence_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Video Intelligence skipped: {e.reason}")
-            ctx.video_intelligence_context = ctx.video_intelligence_context or {}
-        except Exception as e:
-            logger.warning(f"[{upload_id}] Video Intelligence error (non-fatal): {e}")
-            ctx.video_intelligence_context = ctx.video_intelligence_context or {}
-        await maybe_cancel(ctx, "video_intelligence")
-
-        # ============================================================
-        # STAGE 6: Thumbnail — extract frame then immediately upload to R2
-        # ============================================================
-        try:
-            recent_style_sigs: Dict[str, List[str]] = {}
-            recent_style_packs: Dict[str, List[str]] = {}
-            for pl in ("youtube", "instagram", "facebook"):
-                if pl not in [str(x).lower() for x in (ctx.platforms or [])]:
-                    continue
-                recent_style_sigs[pl] = await db_stage.fetch_recent_thumbnail_style_signatures(
-                    db_pool,
-                    str(ctx.user_id),
-                    pl,
-                    limit=30,
-                )
-                hist = await db_stage.fetch_recent_thumbnail_style_history(
-                    db_pool,
-                    str(ctx.user_id),
-                    pl,
-                    limit=30,
-                )
-                recent_style_packs[pl] = [
-                    str(x.get("style_pack") or "").lower()
-                    for x in (hist or [])
-                    if isinstance(x, dict) and x.get("style_pack")
-                ]
-            if recent_style_sigs:
-                ctx.output_artifacts["_recent_thumbnail_style_signatures"] = json.dumps(recent_style_sigs)
-            if recent_style_packs:
-                ctx.output_artifacts["_recent_thumbnail_style_packs"] = json.dumps(recent_style_packs)
-        except Exception as e:
-            logger.debug(f"[{upload_id}] Could not load recent thumbnail style signatures: {e}")
-
-        try:
-            ctx = await run_thumbnail_stage(ctx, db_pool=db_pool)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Thumbnail skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
-
-        # ── Upload the best thumbnail to R2 and record its key ─────────────
-        if ctx.thumbnail_path and Path(ctx.thumbnail_path).exists():
-            thumb_r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/thumbnail.jpg"
+        async with _heavy_pipeline_slot():
+            # ============================================================
+            # STAGE 5.5: Audio Context — Whisper + ACRCloud + YAMNet + Hume
+            # Runs AFTER transcode so ctx.video_info.audio_codec is populated.
+            # Runs BEFORE thumbnail so ctx.audio_context feeds thumbnail/caption.
+            # ============================================================
             try:
-                await r2_stage.upload_file(
-                    Path(ctx.thumbnail_path),
-                    thumb_r2_key,
-                    "image/jpeg",
+                ctx = await run_audio_context_stage(ctx)
+                logger.info(
+                    f"[{upload_id}] Audio  — category={ctx.get_audio_category()} "
+                    f"emotion={ctx.get_audio_emotion()} mood={ctx.get_thumbnail_mood()}"
                 )
-                ctx.thumbnail_r2_key = thumb_r2_key
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE uploads SET thumbnail_r2_key = $1, updated_at = NOW() WHERE id = $2",
-                        thumb_r2_key,
-                        upload_id,
-                    )
-                logger.info(f"[{upload_id}] Thumbnail uploaded to R2: {thumb_r2_key}")
+            except SkipStage as e:
+                log_stage_skip(logger, "Audio context", e.reason, upload_id=upload_id)
+                ctx.audio_context = {}
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Audio context error: {e.message}")
+                ctx.audio_context = {}
             except Exception as e:
-                logger.warning(f"[{upload_id}] Thumbnail R2 upload failed (non-fatal): {e}")
+                logger.warning(f"[{upload_id}] Audio error (non-fatal): {e}")
+                ctx.audio_context = {}
+            await maybe_cancel(ctx, "audio")
 
-        # ── Upload platform-specific styled thumbnails to R2 ──────────────
-        platform_thumb_r2: Dict[str, str] = {}
-        pm_json = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
-        try:
-            platform_map = json.loads(pm_json) if isinstance(pm_json, str) else (pm_json or {})
-        except Exception:
-            platform_map = {}
-        for platform, local_path in platform_map.items():
-            if not local_path or not Path(local_path).exists():
-                continue
-            r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/{platform}.jpg"
+            # ============================================================
+            # STAGE 5.6: Vision — Google Cloud Vision face/OCR on best frame
+            # Context feeds thumbnail (face-priority crop) + caption (OCR).
+            # ============================================================
             try:
-                await r2_stage.upload_file(Path(local_path), r2_key, "image/jpeg")
-                platform_thumb_r2[platform] = r2_key
-                logger.debug(f"[{upload_id}] Platform thumb {platform} → {r2_key}")
+                if _svc_enabled("aiServiceFrameInspector", True):
+                    ctx = await run_vision_stage(ctx)
+                else:
+                    raise SkipStage("Frame inspector disabled by user preference")
+            except SkipStage as e:
+                log_stage_skip(logger, "Vision", e.reason, upload_id=upload_id)
+                ctx.vision_context = {}
             except Exception as e:
-                logger.debug(f"[{upload_id}] Platform thumb {platform} upload failed: {e}")
-        if platform_thumb_r2:
-            ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2)
-            # Persist style signatures for anti-repeat memory.
+                logger.warning(f"[{upload_id}] Vision error (non-fatal): {e}")
+                ctx.vision_context = {}
+            await maybe_cancel(ctx, "vision")
+    
+            # ============================================================
+            # STAGE 5.7: Twelve Labs — deep video understanding (if enabled)
+            # Context feeds thumbnail/caption/hashtag design.
+            # ============================================================
             try:
-                raw_style = ctx.output_artifacts.get("thumbnail_style_signatures", "{}")
-                style_map = json.loads(raw_style) if isinstance(raw_style, str) else (raw_style or {})
-                for pl, md in (style_map or {}).items():
-                    if pl not in platform_thumb_r2:
+                if _svc_enabled("aiServiceSceneUnderstanding", True):
+                    ctx = await run_twelvelabs_stage(ctx)
+                else:
+                    raise SkipStage("Scene understanding disabled by user preference")
+            except SkipStage as e:
+                log_stage_skip(logger, "Twelve Labs", e.reason, upload_id=upload_id)
+                ctx.video_understanding = {}
+            except Exception as e:
+                logger.warning(f"[{upload_id}] Twelve Labs error (non-fatal): {e}")
+                ctx.video_understanding = {}
+            await maybe_cancel(ctx, "twelvelabs")
+    
+            # ============================================================
+            # STAGE 5.8: Google Video Intelligence — full-clip labels + shots
+            # ============================================================
+            try:
+                if _svc_enabled("aiServiceVideoAnalyzer", True):
+                    ctx = await run_video_intelligence_stage(ctx)
+                else:
+                    raise SkipStage("Video analyzer disabled by user preference")
+            except SkipStage as e:
+                log_stage_skip(logger, "Video Intelligence", e.reason, upload_id=upload_id)
+                ctx.video_intelligence_context = ctx.video_intelligence_context or {}
+            except Exception as e:
+                logger.warning(f"[{upload_id}] Video Intelligence error (non-fatal): {e}")
+                ctx.video_intelligence_context = ctx.video_intelligence_context or {}
+            await maybe_cancel(ctx, "video_intelligence")
+    
+            # ============================================================
+            # STAGE 6: Thumbnail — extract frame then immediately upload to R2
+            # ============================================================
+            try:
+                recent_style_sigs: Dict[str, List[str]] = {}
+                recent_style_packs: Dict[str, List[str]] = {}
+                for pl in ("youtube", "instagram", "facebook"):
+                    if pl not in [str(x).lower() for x in (ctx.platforms or [])]:
                         continue
-                    if not isinstance(md, dict):
-                        continue
-                    await db_stage.insert_thumbnail_style_signature(
+                    recent_style_sigs[pl] = await db_stage.fetch_recent_thumbnail_style_signatures(
                         db_pool,
-                        user_id=str(ctx.user_id),
-                        upload_id=str(upload_id),
-                        platform=str(pl).lower(),
-                        style_signature=str(md.get("signature") or ""),
-                        style_pack=str(md.get("style_pack") or ""),
-                        score=float(md.get("score") or 0.0),
+                        str(ctx.user_id),
+                        pl,
+                        limit=30,
                     )
+                    hist = await db_stage.fetch_recent_thumbnail_style_history(
+                        db_pool,
+                        str(ctx.user_id),
+                        pl,
+                        limit=30,
+                    )
+                    recent_style_packs[pl] = [
+                        str(x.get("style_pack") or "").lower()
+                        for x in (hist or [])
+                        if isinstance(x, dict) and x.get("style_pack")
+                    ]
+                if recent_style_sigs:
+                    ctx.output_artifacts["_recent_thumbnail_style_signatures"] = json.dumps(recent_style_sigs)
+                if recent_style_packs:
+                    ctx.output_artifacts["_recent_thumbnail_style_packs"] = json.dumps(recent_style_packs)
             except Exception as e:
-                logger.debug(f"[{upload_id}] Could not persist thumbnail style memory: {e}")
+                logger.debug(f"[{upload_id}] Could not load recent thumbnail style signatures: {e}")
+    
+            try:
+                if _svc_enabled("aiServiceThumbnailDesigner", True):
+                    ctx = await run_thumbnail_stage(ctx, db_pool=db_pool)
+                else:
+                    raise SkipStage("Thumbnail designer disabled by user preference")
+            except SkipStage as e:
+                log_stage_skip(logger, "Thumbnail", e.reason, upload_id=upload_id)
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
+            except Exception as e:
+                logger.warning(f"[{upload_id}] Thumbnail error (non-fatal): {e}")
 
-        if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
-            candidate_keys = []
-            for i, cpath in enumerate(ctx.thumbnail_paths):
-                if not cpath or not Path(cpath).exists():
-                    continue
-                if str(cpath) == str(ctx.thumbnail_path):
-                    candidate_keys.append(ctx.thumbnail_r2_key or "")
-                    continue
-                ckey = f"thumbnails/{ctx.user_id}/{upload_id}/candidate_{i:02d}.jpg"
+            # ── Upload the best thumbnail to R2 and record its key ─────────────
+            if ctx.thumbnail_path and Path(ctx.thumbnail_path).exists():
+                thumb_r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/thumbnail.jpg"
                 try:
-                    await r2_stage.upload_file(Path(cpath), ckey, "image/jpeg")
-                    candidate_keys.append(ckey)
-                    logger.debug(f"[{upload_id}] Candidate thumb {i} → {ckey}")
+                    await r2_stage.upload_file(
+                        Path(ctx.thumbnail_path),
+                        thumb_r2_key,
+                        "image/jpeg",
+                    )
+                    ctx.thumbnail_r2_key = thumb_r2_key
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE uploads SET thumbnail_r2_key = $1, updated_at = NOW() WHERE id = $2",
+                            thumb_r2_key,
+                            upload_id,
+                        )
+                    logger.info(f"[{upload_id}] Thumbnail uploaded to R2: {thumb_r2_key}")
                 except Exception as e:
-                    logger.debug(f"[{upload_id}] Candidate thumb {i} upload failed: {e}")
-            if candidate_keys:
-                ctx.output_artifacts["thumbnail_r2_candidates"] = json.dumps(candidate_keys)
-
-        # YouTube Test & Compare — extra JPEGs for Studio (public API has no experiment resource)
-        ab_raw = ctx.output_artifacts.get("youtube_thumbnail_ab_candidates", "")
-        try:
-            ab_list = json.loads(ab_raw) if isinstance(ab_raw, str) else (ab_raw or [])
-        except Exception:
-            ab_list = []
-        if ab_list:
-            ab_r2: Dict[str, str] = {}
-            for i, row in enumerate(ab_list):
-                if not isinstance(row, dict):
+                    logger.warning(f"[{upload_id}] Thumbnail R2 upload failed (non-fatal): {e}")
+    
+            # ── Upload platform-specific styled thumbnails to R2 ──────────────
+            platform_thumb_r2: Dict[str, str] = {}
+            pm_json = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
+            try:
+                platform_map = json.loads(pm_json) if isinstance(pm_json, str) else (pm_json or {})
+            except Exception:
+                platform_map = {}
+            for platform, local_path in platform_map.items():
+                if not local_path or not Path(local_path).exists():
                     continue
-                p = row.get("path")
-                if not p or not Path(p).exists():
-                    continue
-                ab_key = f"thumbnails/{ctx.user_id}/{upload_id}/youtube_ab_{i}.jpg"
+                r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/{platform}.jpg"
                 try:
-                    await r2_stage.upload_file(Path(p), ab_key, "image/jpeg")
-                    ab_r2[str(row.get("label") or f"B{i + 1}")] = ab_key
-                    logger.info(f"[{upload_id}] YouTube AB variant {i} → {ab_key}")
+                    await r2_stage.upload_file(Path(local_path), r2_key, "image/jpeg")
+                    platform_thumb_r2[platform] = r2_key
+                    logger.debug(f"[{upload_id}] Platform thumb {platform} → {r2_key}")
                 except Exception as e:
-                    logger.debug(f"[{upload_id}] YouTube AB variant {i} upload failed: {e}")
-            if ab_r2:
-                ctx.output_artifacts["youtube_thumbnail_ab_r2_keys"] = json.dumps(ab_r2)
-
-        await maybe_cancel(ctx, "thumbnail")
+                    logger.debug(f"[{upload_id}] Platform thumb {platform} upload failed: {e}")
+            if platform_thumb_r2:
+                ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2)
+                # Persist style signatures for anti-repeat memory.
+                try:
+                    raw_style = ctx.output_artifacts.get("thumbnail_style_signatures", "{}")
+                    style_map = json.loads(raw_style) if isinstance(raw_style, str) else (raw_style or {})
+                    for pl, md in (style_map or {}).items():
+                        if pl not in platform_thumb_r2:
+                            continue
+                        if not isinstance(md, dict):
+                            continue
+                        await db_stage.insert_thumbnail_style_signature(
+                            db_pool,
+                            user_id=str(ctx.user_id),
+                            upload_id=str(upload_id),
+                            platform=str(pl).lower(),
+                            style_signature=str(md.get("signature") or ""),
+                            style_pack=str(md.get("style_pack") or ""),
+                            score=float(md.get("score") or 0.0),
+                        )
+                except Exception as e:
+                    logger.debug(f"[{upload_id}] Could not persist thumbnail style memory: {e}")
+    
+            if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
+                candidate_keys = []
+                for i, cpath in enumerate(ctx.thumbnail_paths):
+                    if not cpath or not Path(cpath).exists():
+                        continue
+                    if str(cpath) == str(ctx.thumbnail_path):
+                        candidate_keys.append(ctx.thumbnail_r2_key or "")
+                        continue
+                    ckey = f"thumbnails/{ctx.user_id}/{upload_id}/candidate_{i:02d}.jpg"
+                    try:
+                        await r2_stage.upload_file(Path(cpath), ckey, "image/jpeg")
+                        candidate_keys.append(ckey)
+                        logger.debug(f"[{upload_id}] Candidate thumb {i} → {ckey}")
+                    except Exception as e:
+                        logger.debug(f"[{upload_id}] Candidate thumb {i} upload failed: {e}")
+                if candidate_keys:
+                    ctx.output_artifacts["thumbnail_r2_candidates"] = json.dumps(candidate_keys)
+    
+            # YouTube Test & Compare — extra JPEGs for Studio (public API has no experiment resource)
+            ab_raw = ctx.output_artifacts.get("youtube_thumbnail_ab_candidates", "")
+            try:
+                ab_list = json.loads(ab_raw) if isinstance(ab_raw, str) else (ab_raw or [])
+            except Exception:
+                ab_list = []
+            if ab_list:
+                ab_r2: Dict[str, str] = {}
+                for i, row in enumerate(ab_list):
+                    if not isinstance(row, dict):
+                        continue
+                    p = row.get("path")
+                    if not p or not Path(p).exists():
+                        continue
+                    ab_key = f"thumbnails/{ctx.user_id}/{upload_id}/youtube_ab_{i}.jpg"
+                    try:
+                        await r2_stage.upload_file(Path(p), ab_key, "image/jpeg")
+                        ab_r2[str(row.get("label") or f"B{i + 1}")] = ab_key
+                        logger.info(f"[{upload_id}] YouTube AB variant {i} → {ab_key}")
+                    except Exception as e:
+                        logger.debug(f"[{upload_id}] YouTube AB variant {i} upload failed: {e}")
+                if ab_r2:
+                    ctx.output_artifacts["youtube_thumbnail_ab_r2_keys"] = json.dumps(ab_r2)
+    
+            await maybe_cancel(ctx, "thumbnail")
 
         # ============================================================
         # STAGE 7: Caption
         # ============================================================
         try:
-            ctx = await run_caption_stage(ctx, db_pool)
-            await db_stage.save_generated_metadata(db_pool, ctx)
+            if _svc_enabled("aiServiceCaptionWriter", True):
+                ctx = await run_caption_stage(ctx, db_pool)
+                await db_stage.save_generated_metadata(db_pool, ctx)
+            else:
+                raise SkipStage("Caption writer disabled by user preference")
         except SkipStage as e:
-            logger.info(f"[{upload_id}] Caption skipped: {e.reason}")
+            log_stage_skip(logger, "Caption", e.reason, upload_id=upload_id)
         except StageError as e:
             logger.warning(f"[{upload_id}] Caption error: {e.message}")
+        except Exception as e:
+            logger.warning(f"[{upload_id}] Caption error (non-fatal): {e}")
         await maybe_cancel(ctx, "caption")
 
         # ============================================================
@@ -1280,8 +1339,8 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         if temp_dir:
             try:
                 temp_dir.cleanup()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[%s] temp_dir cleanup after pipeline: %s", upload_id, e)
 
 
 async def run_publish_and_notify(
@@ -1430,13 +1489,14 @@ async def run_publish_and_notify(
             elif ctx.is_partial_success():
                 await _capture_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost)
                 async with db_pool.acquire() as _wconn:
-                    await partial_refund_tokens(
+                    await partial_refund_upload_partial_success(
                         _wconn,
                         user_id=user_id_str,
                         upload_id=ctx.upload_id,
                         succeeded_platforms=ctx.get_success_platforms(),
                         failed_platforms=ctx.get_failed_platforms(),
                         original_put_cost=put_cost,
+                        original_aic_cost=aic_cost,
                     )
 
             else:
@@ -1569,8 +1629,8 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             try:
                 await r2_stage.download_file(default_key, default_local)
                 ctx.processed_video_path = default_local
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[%s] default processed video download skipped: %s", upload_id, e)
 
         platform_thumb_map: Dict[str, str] = {}
         platform_thumb_r2_keys: Dict[str, str] = {}
@@ -1598,8 +1658,8 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         finally:
             try:
                 temp_dir_obj.cleanup()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("[%s] deferred publish temp cleanup: %s", upload_id, e)
 
     except Exception as e:
         logger.exception(f"[{upload_id}] Deferred publish failed: {e}")
@@ -1647,6 +1707,10 @@ async def _sync_one_upload_analytics(
     import httpx as _httpx
     from stages.publish_stage import decrypt_token
     from services.sync_analytics_helpers import resolve_token_candidates_for_platform_result
+    from services.meta_graph_metrics import (
+        facebook_per_video_engagement_fallback,
+        instagram_per_media_engagement_fallback,
+    )
 
     total_views = total_likes = total_comments = total_shares = 0
     platform_stats = {}
@@ -1760,24 +1824,35 @@ async def _sync_one_upload_analytics(
                         if resp.status_code == 200:
                             data = resp.json().get("data", []) or []
                             if not data:
-                                continue
-                            s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
-                            ig_views = ig_plays = 0
-                            for m in data:
-                                name = m.get("name", "")
-                                vals = m.get("values", [])
-                                val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
-                                if name == "views":      ig_views     = val
-                                elif name == "plays":    ig_plays     = val
-                                elif name == "likes":    s["likes"]   += val
-                                elif name == "comments": s["comments"] += val
-                                elif name == "shares":   s["shares"]  += val
-                            s["views"] = ig_views or ig_plays
-                            _accum_platform_stats(platform_stats, "instagram", s)
-                            total_views    += s["views"];    total_likes    += s["likes"]
-                            total_comments += s["comments"]; total_shares   += s["shares"]
-                            resolved = True
-                            break
+                                pass
+                            else:
+                                s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                                ig_views = ig_plays = 0
+                                for m in data:
+                                    name = m.get("name", "")
+                                    vals = m.get("values", [])
+                                    val  = int(vals[-1].get("value", 0) if vals else m.get("value", 0) or 0)
+                                    if name == "views":      ig_views     = val
+                                    elif name == "plays":    ig_plays     = val
+                                    elif name == "likes":    s["likes"]   += val
+                                    elif name == "comments": s["comments"] += val
+                                    elif name == "shares":   s["shares"]  += val
+                                s["views"] = ig_views or ig_plays
+                                _accum_platform_stats(platform_stats, "instagram", s)
+                                total_views    += s["views"];    total_likes    += s["likes"]
+                                total_comments += s["comments"]; total_shares   += s["shares"]
+                                resolved = True
+                                break
+                        if not resolved:
+                            fb_ig = await instagram_per_media_engagement_fallback(client, access_token, str(media_id))
+                            if fb_ig:
+                                _accum_platform_stats(platform_stats, "instagram", fb_ig)
+                                total_views    += fb_ig["views"]
+                                total_likes    += fb_ig["likes"]
+                                total_comments += fb_ig["comments"]
+                                total_shares   += fb_ig["shares"]
+                                resolved = True
+                                break
 
                     elif plat == "facebook" and video_id:
                         resp = await client.get(
@@ -1792,24 +1867,41 @@ async def _sync_one_upload_analytics(
                         if resp.status_code == 200:
                             data = (resp.json().get("insights", {}) or {}).get("data", []) or []
                             if not data:
-                                continue
-                            s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
-                            for m in data:
-                                name = m.get("name", "")
-                                vals = m.get("values", [{}])
-                                val  = vals[-1].get("value", 0) if vals else 0
-                                if isinstance(val, dict):
-                                    val = sum(val.values())
-                                val = int(val or 0)
-                                if name == "total_video_views":                     s["views"]    += val
-                                elif name == "total_video_reactions_by_type_total": s["likes"]    += val
-                                elif name == "total_video_comments":                 s["comments"] += val
-                                elif name == "total_video_shares":                   s["shares"]   += val
-                            _accum_platform_stats(platform_stats, "facebook", s)
-                            total_views    += s["views"];    total_likes    += s["likes"]
-                            total_comments += s["comments"]; total_shares   += s["shares"]
-                            resolved = True
-                            break
+                                pass
+                            else:
+                                s = {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+                                for m in data:
+                                    name = m.get("name", "")
+                                    vals = m.get("values", [{}])
+                                    val  = vals[-1].get("value", 0) if vals else 0
+                                    if isinstance(val, dict):
+                                        val = sum(val.values())
+                                    val = int(val or 0)
+                                    if name == "total_video_views":                     s["views"]    += val
+                                    elif name == "total_video_reactions_by_type_total": s["likes"]    += val
+                                    elif name == "total_video_comments":                 s["comments"] += val
+                                    elif name == "total_video_shares":                   s["shares"]   += val
+                                _accum_platform_stats(platform_stats, "facebook", s)
+                                total_views    += s["views"];    total_likes    += s["likes"]
+                                total_comments += s["comments"]; total_shares   += s["shares"]
+                                resolved = True
+                                break
+                        if not resolved:
+                            fb_fb = await facebook_per_video_engagement_fallback(client, access_token, str(video_id))
+                            if fb_fb:
+                                s = {
+                                    "views": fb_fb["views"],
+                                    "likes": fb_fb["likes"],
+                                    "comments": fb_fb["comments"],
+                                    "shares": fb_fb["shares"],
+                                }
+                                _accum_platform_stats(platform_stats, "facebook", s)
+                                total_views    += s["views"]
+                                total_likes    += s["likes"]
+                                total_comments += s["comments"]
+                                total_shares   += s["shares"]
+                                resolved = True
+                                break
 
             except Exception as e:
                 logger.warning(f"[analytics-sync] {plat}/{upload_id}: {e}")
@@ -1956,8 +2048,10 @@ async def run_analytics_sync_loop() -> None:
                                 token_id = str(tr["id"])
                                 token_map[token_id] = dec
                                 token_map_by_platform.setdefault(tr["platform"], []).append(dec)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(
+                                "[analytics-sync] token row skip id=%s: %s", tr.get("id"), e
+                            )
 
                     from services.sync_analytics_helpers import build_plat_account_token_map
 
@@ -1985,8 +2079,12 @@ async def run_analytics_sync_loop() -> None:
                                         await _refresh_tiktok_token(
                                             dict(dec), db_pool=db_pool, user_id=str(user_id)
                                         )
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(
+                                        "[analytics-sync] TikTok refresh skip id=%s: %s",
+                                        tr.get("id"),
+                                        e,
+                                    )
                             for tr in token_rows:
                                 if tr["platform"] != "youtube":
                                     continue
@@ -1996,8 +2094,12 @@ async def run_analytics_sync_loop() -> None:
                                         await _refresh_youtube_token(
                                             dict(dec), db_pool=db_pool, user_id=str(user_id)
                                         )
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(
+                                        "[analytics-sync] YouTube refresh skip id=%s: %s",
+                                        tr.get("id"),
+                                        e,
+                                    )
                             for tr in token_rows:
                                 if tr["platform"] not in ("instagram", "facebook"):
                                     continue
@@ -2008,8 +2110,12 @@ async def run_analytics_sync_loop() -> None:
                                             dict(dec), platform=tr["platform"],
                                             db_pool=db_pool, user_id=str(user_id)
                                         )
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(
+                                        "[analytics-sync] Meta refresh skip id=%s: %s",
+                                        tr.get("id"),
+                                        e,
+                                    )
                             async with db_pool.acquire() as conn:
                                 trs = await conn.fetch(
                                     """SELECT id, platform, token_blob, account_id
@@ -2030,8 +2136,12 @@ async def run_analytics_sync_loop() -> None:
                                             dec["page_id"] = str(tr["account_id"])
                                         token_map[str(tr["id"])] = dec
                                         token_map_by_platform.setdefault(tr["platform"], []).append(dec)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(
+                                        "[analytics-sync] token remap skip id=%s: %s",
+                                        tr.get("id"),
+                                        e,
+                                    )
                             token_map_by_plat_account = build_plat_account_token_map(trs, _dec_blob_for_map)
                             _analytics_oauth_mark_refreshed(user_id)
                         except Exception as _wr:
@@ -2123,6 +2233,51 @@ async def run_platform_metrics_cache_loop() -> None:
             pass
 
     logger.info("[platform-metrics-cache] loop stopped")
+
+
+# ---------------------------------------------------------------------------
+# CATALOG SYNC LOOP  — discover external videos + link to uploads
+# ---------------------------------------------------------------------------
+
+CATALOG_SYNC_INTERVAL = int(os.environ.get("CATALOG_SYNC_INTERVAL_SECONDS", str(6 * 3600)))
+
+
+async def run_catalog_sync_loop() -> None:
+    """
+    Periodically syncs the video catalog for every user with connected accounts.
+
+    Schedule: every CATALOG_SYNC_INTERVAL_SECONDS (default 6 h).
+    Each run is incremental — pagination cursors are stored in
+    `platform_content_sync_state` so we only fetch new videos from each platform.
+    After catalog fetch, the linker matches platform_results from uploads and
+    sets upload_id on any external row that maps to an UploadM8 upload.
+    """
+    global shutdown_requested, shutdown_event
+
+    logger.info(f"[catalog-sync] loop started | interval={CATALOG_SYNC_INTERVAL}s")
+    await asyncio.sleep(180)  # stagger startup behind other loops
+
+    while not shutdown_requested:
+        if not await _acquire_cron_lock("catalog_sync", ttl_seconds=max(CATALOG_SYNC_INTERVAL - 60, 300)):
+            await asyncio.sleep(CATALOG_SYNC_INTERVAL)
+            continue
+        try:
+            from services.catalog_sync import refresh_catalog_for_all_users
+            n = await refresh_catalog_for_all_users(db_pool)
+            logger.info(f"[catalog-sync] cycle complete | users_synced={n}")
+        except Exception as e:
+            logger.exception(f"[catalog-sync] cycle error: {e}")
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=CATALOG_SYNC_INTERVAL,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[catalog-sync] loop stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -2339,11 +2494,33 @@ async def run_scheduler_loop() -> None:
 
 
 async def _run_job_with_semaphore(job_data: dict) -> None:
+    upload_id = str(job_data.get("upload_id", "?"))
+    user_id = str(job_data.get("user_id", ""))
     async with _process_semaphore:
         try:
-            await run_processing_pipeline(job_data)
+            await asyncio.wait_for(
+                run_processing_pipeline(job_data),
+                timeout=JOB_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[{upload_id}] Scheduled pipeline timed out after {JOB_TIMEOUT}s")
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE uploads SET status='failed', error_code='JOB_TIMEOUT', "
+                        "error_detail=$2, updated_at=NOW() WHERE id=$1 AND status='processing'",
+                        upload_id, f"Pipeline exceeded {JOB_TIMEOUT}s timeout",
+                    )
+            except Exception as e:
+                logger.warning("[%s] timeout: failed to mark upload failed in DB: %s", upload_id, e)
+            await _send_to_dead_letter(
+                upload_id, user_id, job_data,
+                "JOB_TIMEOUT", f"Pipeline timed out after {JOB_TIMEOUT}s",
+                retry_count=job_data.get("_retry_count", 0),
+            )
         except Exception as e:
-            logger.exception(f"[{job_data.get('upload_id')}] Unhandled pipeline error: {e}")
+            logger.exception(f"[{upload_id}] Unhandled pipeline error: {e}")
+            await _mark_pipeline_uncaught_failure(upload_id, user_id, job_data, e)
 
 
 async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> None:
@@ -2362,8 +2539,8 @@ async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> 
                         "error_detail=$2, updated_at=NOW() WHERE id=$1",
                         upload_id, f"Deferred publish exceeded {JOB_TIMEOUT}s timeout",
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[%s] deferred publish timeout: DB update failed: %s", upload_id, e)
         except Exception as e:
             logger.exception(f"[{upload_id}] Unhandled deferred publish error: {e}")
 
@@ -2394,8 +2571,8 @@ async def _process_one_job(job_json: str) -> None:
                         "error_detail=$2, updated_at=NOW() WHERE id=$1 AND status='processing'",
                         upload_id, f"Pipeline exceeded {JOB_TIMEOUT}s timeout",
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[%s] job timeout: failed to mark upload failed: %s", upload_id, e)
             await _send_to_dead_letter(
                 upload_id, job_data.get("user_id", ""), job_data,
                 "JOB_TIMEOUT", f"Pipeline timed out after {JOB_TIMEOUT}s",
@@ -2403,6 +2580,9 @@ async def _process_one_job(job_json: str) -> None:
             )
         except Exception as e:
             logger.exception(f"[{upload_id}] Unhandled pipeline exception: {e}")
+            await _mark_pipeline_uncaught_failure(
+                upload_id, str(job_data.get("user_id", "")), job_data, e
+            )
 
 
 async def process_jobs() -> None:
@@ -2425,6 +2605,7 @@ async def process_jobs() -> None:
     logger.info(
         f"Job consumer started | "
         f"process_concurrency={WORKER_CONCURRENCY} | "
+        f"heavy_pipeline_slots={WORKER_HEAVY_PIPELINE_SLOTS} | "
         f"publish_concurrency={PUBLISH_CONCURRENCY} | "
         f"process_queues={PROCESS_PRIORITY_QUEUE}, {PROCESS_NORMAL_QUEUE}"
     )
@@ -2487,7 +2668,7 @@ async def process_jobs() -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global db_pool, redis_client, shutdown_event
+    global db_pool, redis_client, shutdown_event, _heavy_pipeline_sem
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -2515,6 +2696,12 @@ async def main() -> None:
     await redis_client.ping()
     logger.info("Redis connected")
 
+    _heavy_pipeline_sem = asyncio.Semaphore(WORKER_HEAVY_PIPELINE_SLOTS)
+    logger.info(
+        f"Heavy pipeline slots={WORKER_HEAVY_PIPELINE_SLOTS} "
+        f"(parallel audio/ML/thumbnail tails capped; process concurrency={WORKER_CONCURRENCY})"
+    )
+
     shutdown_event = asyncio.Event()
 
     tasks = [
@@ -2523,6 +2710,7 @@ async def main() -> None:
         asyncio.create_task(run_verification_loop(db_pool, shutdown_event)),
         asyncio.create_task(run_analytics_sync_loop()),
         asyncio.create_task(run_platform_metrics_cache_loop()),
+        asyncio.create_task(run_catalog_sync_loop()),
         asyncio.create_task(run_kpi_collector_loop()),
         asyncio.create_task(run_ml_scoring_loop()),
     ]
@@ -2535,18 +2723,18 @@ async def main() -> None:
     finally:
         try:
             shutdown_event.set()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("main shutdown: shutdown_event.set failed: %s", e)
         try:
             await notify_admin_worker_stop(db_pool)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("main shutdown: notify_admin_worker_stop failed: %s", e)
         # Close Playwright browser on shutdown
         try:
             from stages.playwright_stage import close_browser
             await close_browser()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("main shutdown: close_browser failed: %s", e)
         if db_pool:
             await db_pool.close()
         if redis_client:

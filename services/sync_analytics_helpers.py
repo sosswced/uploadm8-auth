@@ -23,23 +23,6 @@ def _as_token_list(v: Any) -> List[dict]:
     return []
 
 
-def resolve_token_for_platform_result(
-    pr: Dict[str, Any],
-    token_map_by_id: Dict[str, dict],
-    token_map_by_plat_account: Dict[Tuple[str, str], dict],
-    token_map_by_platform: Dict[str, dict],
-) -> dict:
-    """Pick the correct decrypted token dict for one platform_results entry."""
-    # Backwards-compatible wrapper around the new candidate-based resolver.
-    candidates = resolve_token_candidates_for_platform_result(
-        pr=pr,
-        token_map_by_id=token_map_by_id,
-        token_map_by_plat_account=token_map_by_plat_account,
-        token_map_by_platform=token_map_by_platform,
-    )
-    return candidates[0] if candidates else {}
-
-
 def resolve_token_candidates_for_platform_result(
     pr: Dict[str, Any],
     token_map_by_id: Dict[str, dict],

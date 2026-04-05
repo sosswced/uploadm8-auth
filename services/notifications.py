@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import httpx
+
+logger = logging.getLogger("uploadm8-api")
 
 
 async def discord_notify(webhook_url: str, content: str = None, embeds: list = None):
@@ -15,9 +18,11 @@ async def discord_notify(webhook_url: str, content: str = None, embeds: list = N
         payload["embeds"] = embeds
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(webhook_url, json=payload)
-    except Exception:
-        pass
+            r = await c.post(webhook_url, json=payload)
+            if r.status_code not in (200, 204):
+                logger.warning("Discord notify failed: status=%s", r.status_code)
+    except Exception as e:
+        logger.warning("Discord notify error: %s", e)
 
 
 async def notify_signup(email: str, name: str, signup_webhook: Optional[str], admin_webhook: Optional[str]):

@@ -36,10 +36,14 @@ PLAYWRIGHT_ENABLED = os.environ.get("PLAYWRIGHT_ENABLED", "true").lower() == "tr
 
 # Playwright availability
 try:
+    from playwright.async_api import Error as PlaywrightError
     from playwright.async_api import async_playwright
+
     PLAYWRIGHT_AVAILABLE = True
     logger.info("[playwright] Playwright available")
 except ImportError:
+    PlaywrightError = Exception  # type: ignore[misc, assignment]
+    async_playwright = None  # type: ignore[misc, assignment]
     PLAYWRIGHT_AVAILABLE = False
 
 # Singleton browser instance (shared across all renders in worker process)
@@ -56,7 +60,8 @@ async def get_browser():
             # Quick health check
             await _browser_instance.contexts()
             return _browser_instance
-        except Exception:
+        except PlaywrightError as e:
+            logger.debug("[playwright] browser health check failed, recreating: %s", e)
             _browser_instance    = None
             _playwright_instance = None
 
@@ -116,8 +121,10 @@ async def render_html_thumbnail(
                 await page.close()
                 await context.close()
 
-    except Exception as e:
-        logger.warning(f"[playwright] Render error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (PlaywrightError, asyncio.TimeoutError, OSError, TypeError, ValueError) as e:
+        logger.warning("[playwright] Render error: %s", e)
         return None
 
 
@@ -129,8 +136,10 @@ async def close_browser():
             await _browser_instance.close()
         if _playwright_instance:
             await _playwright_instance.stop()
-    except Exception:
-        pass
+    except asyncio.CancelledError:
+        raise
+    except (PlaywrightError, OSError, RuntimeError) as e:
+        logger.debug("[playwright] close_browser cleanup: %s", e)
     _browser_instance    = None
     _playwright_instance = None
     # Yield so subprocess transports finish on Windows (reduces closed-pipe noise in __del__)

@@ -26,6 +26,7 @@ logger = logging.getLogger("uploadm8.platform_metrics_job")
 
 _PLATFORM_CACHE_TTL = 3 * 60 * 60
 _POLL_CONCURRENCY = max(2, int(os.environ.get("PLATFORM_POLL_CONCURRENCY", "8") or 8))
+_OAUTH_REFRESH_CONCURRENCY = max(1, int(os.environ.get("PLATFORM_OAUTH_REFRESH_CONCURRENCY", "4") or 4))
 _POLL_RETRIES = max(1, int(os.environ.get("PLATFORM_POLL_RETRIES", "3") or 3))
 _POLL_BACKOFF_BASE_SEC = float(os.environ.get("PLATFORM_POLL_BACKOFF_BASE_SEC", "0.6") or 0.6)
 _INTER_USER_DELAY_SEC = float(os.environ.get("PLATFORM_METRICS_INTER_USER_DELAY_SEC", "0.2") or 0.2)
@@ -46,9 +47,14 @@ def _aggregate_platform_metrics_live(platforms_result: dict) -> dict:
     for plat, d in platforms_result.items():
         if not isinstance(d, dict) or d.get("status") != "live":
             continue
-        views = _n(d.get("views"))
-        likes = _n(d.get("reactions")) if plat == "facebook" else _n(d.get("likes"))
-        comments = _n(d.get("comments"))
+        if plat == "youtube":
+            views = _n(d.get("shorts_views")) or _n(d.get("views"))
+            likes = _n(d.get("shorts_likes")) or _n(d.get("likes"))
+            comments = _n(d.get("shorts_comments")) or _n(d.get("comments"))
+        else:
+            views = _n(d.get("views"))
+            likes = _n(d.get("reactions")) if plat == "facebook" else _n(d.get("likes"))
+            comments = _n(d.get("comments"))
         shares = _n(d.get("shares"))
         if views or likes or comments or shares:
             agg["views"] += views
@@ -111,105 +117,6 @@ def _merge_metric_totals(rows: List[Dict[str, Any]], platform: str) -> Dict[str,
         totals["comments"] += _metric_int(row.get("comments"))
         totals["shares"] += _metric_int(row.get("shares"))
     return totals
-
-
-def _platform_summary_from_account_rows(plat: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Build one platform block (live/error/not_connected) from cached account row payloads."""
-    live_rows = [r.get("metrics", {}) for r in rows if (r.get("metrics") or {}).get("status") == "live"]
-    if live_rows:
-        totals = _merge_metric_totals(live_rows, plat)
-        exemplar = dict(live_rows[-1]) if live_rows else {}
-        exemplar.update(
-            {
-                "status": "live",
-                "views": totals["views"],
-                "likes": totals["likes"],
-                "comments": totals["comments"],
-                "shares": totals["shares"],
-                "accounts_polled": len(rows),
-                "accounts_live": len(live_rows),
-                "accounts": rows,
-            }
-        )
-        return exemplar
-    if rows:
-        err = next((r.get("metrics", {}) for r in rows if (r.get("metrics", {}) or {}).get("status") == "error"), {})
-        return {
-            "status": "error",
-            "error": err.get("error", "all_accounts_failed"),
-            "accounts_polled": len(rows),
-            "accounts_live": 0,
-            "accounts": rows,
-        }
-    return {"status": "not_connected", "accounts_polled": 0, "accounts_live": 0, "accounts": []}
-
-
-async def prune_platform_metrics_cache_for_disconnected_token(
-    pool: asyncpg.Pool, user_id: Any, disconnected_token_row_id: Any
-) -> bool:
-    """
-    Remove one disconnected platform_tokens row from platform_metrics_cache and
-    recompute per-platform and aggregate live metrics from remaining cached accounts.
-
-    Upload counts are refreshed from the uploads table (still reflects all user uploads).
-    """
-    uid = str(user_id)
-    tid = str(disconnected_token_row_id)
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT data FROM platform_metrics_cache WHERE user_id = $1",
-            uid,
-        )
-        if not row or row["data"] is None:
-            return False
-        try:
-            existing = dict(row["data"]) if isinstance(row["data"], dict) else json.loads(row["data"])
-        except Exception:
-            return False
-        platforms_in = existing.get("platforms") or {}
-        if not isinstance(platforms_in, dict):
-            return False
-
-        upload_counts = await conn.fetch(
-            """SELECT unnest(platforms) AS platform, COUNT(*)::int AS cnt
-               FROM uploads
-               WHERE user_id = $1 AND status IN ('succeeded', 'completed', 'partial')
-               GROUP BY platform""",
-            uid,
-        )
-        upload_map = {r["platform"]: r["cnt"] for r in upload_counts}
-
-        platforms_result: Dict[str, Dict[str, Any]] = {}
-        for plat in ("tiktok", "youtube", "instagram", "facebook"):
-            old = platforms_in.get(plat) or {}
-            if not isinstance(old, dict):
-                old = {}
-            accs = old.get("accounts")
-            if not isinstance(accs, list):
-                accs = []
-            filtered = [r for r in accs if isinstance(r, dict) and str(r.get("token_row_id", "")) != tid]
-            summary = _platform_summary_from_account_rows(plat, filtered)
-            summary["uploads"] = upload_map.get(plat, 0)
-            platforms_result[plat] = summary
-
-        ttl_min = int(_PLATFORM_CACHE_TTL / 60)
-        output = {
-            "platforms": platforms_result,
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "cached": bool(existing.get("cached", True)),
-            "cache_age_minutes": 0,
-            "next_refresh_minutes": int(existing.get("next_refresh_minutes") or ttl_min),
-            "aggregate": _aggregate_platform_metrics_live(platforms_result),
-            "cache_source": str(existing.get("cache_source") or "worker"),
-        }
-        await _store_platform_metrics_cache(conn, uid, output)
-        await _upsert_user_rollup_daily(
-            conn,
-            user_id=uid,
-            aggregate=output.get("aggregate") or {},
-            platforms_result=platforms_result,
-        )
-    return True
 
 
 async def _with_retry(coro_factory, *, retries: int = _POLL_RETRIES):
@@ -312,23 +219,29 @@ async def refresh_platform_metrics_for_user(pool: asyncpg.Pool, user_id: Any) ->
         logger.error(f"[platform-metrics-job] cannot import fetchers: {e}")
         return False
 
-    async with pool.acquire() as conn:
-        token_rows = await conn.fetch(
-            """
-            SELECT id, platform, token_blob, account_id
-              FROM platform_tokens
-             WHERE user_id = $1
-               AND revoked_at IS NULL
-            """,
-            uid,
-        )
-        upload_counts = await conn.fetch(
-            """SELECT unnest(platforms) AS platform, COUNT(*)::int AS cnt
-               FROM uploads
-               WHERE user_id = $1 AND status IN ('succeeded', 'completed', 'partial')
-               GROUP BY platform""",
-            uid,
-        )
+    async def _load_tokens():
+        async with pool.acquire() as c:
+            return await c.fetch(
+                """
+                SELECT id, platform, token_blob, account_id
+                  FROM platform_tokens
+                 WHERE user_id = $1
+                   AND revoked_at IS NULL
+                """,
+                uid,
+            )
+
+    async def _load_upload_counts():
+        async with pool.acquire() as c:
+            return await c.fetch(
+                """SELECT unnest(platforms) AS platform, COUNT(*)::int AS cnt
+                   FROM uploads
+                   WHERE user_id = $1 AND status IN ('succeeded', 'completed', 'partial')
+                   GROUP BY platform""",
+                uid,
+            )
+
+    token_rows, upload_counts = await asyncio.gather(_load_tokens(), _load_upload_counts())
 
     upload_map = {r["platform"]: r["cnt"] for r in upload_counts}
     account_jobs: List[Tuple[str, str, str, Dict[str, Any]]] = []
@@ -354,17 +267,32 @@ async def refresh_platform_metrics_for_user(pool: asyncpg.Pool, user_id: Any) ->
     try:
         from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token, _refresh_meta_token
 
-        refreshed_jobs: List[Tuple[str, str, str, Dict[str, Any]]] = []
-        for plat, row_id, account_id, token in account_jobs:
-            cur = dict(token)
-            if plat == "tiktok":
-                cur = await _refresh_tiktok_token(cur, db_pool=pool, user_id=uid_str)
-            elif plat == "youtube":
-                cur = await _refresh_youtube_token(cur, db_pool=pool, user_id=uid_str)
-            elif plat in ("instagram", "facebook"):
-                cur = await _refresh_meta_token(cur, platform=plat, db_pool=pool, user_id=uid_str)
-            refreshed_jobs.append((plat, row_id, account_id, cur))
-        account_jobs = refreshed_jobs
+        sem_oauth = asyncio.Semaphore(_OAUTH_REFRESH_CONCURRENCY)
+
+        async def _refresh_one(
+            job: Tuple[str, str, str, Dict[str, Any]],
+        ) -> Tuple[str, str, str, Dict[str, Any]]:
+            plat, row_id, account_id, token = job
+            async with sem_oauth:
+                cur = dict(token)
+                try:
+                    if plat == "tiktok":
+                        cur = await _refresh_tiktok_token(
+                            cur, db_pool=pool, user_id=uid_str, token_row_id=row_id
+                        )
+                    elif plat == "youtube":
+                        cur = await _refresh_youtube_token(
+                            cur, db_pool=pool, user_id=uid_str, token_row_id=row_id
+                        )
+                    elif plat in ("instagram", "facebook"):
+                        cur = await _refresh_meta_token(
+                            cur, platform=plat, db_pool=pool, user_id=uid_str, token_row_id=row_id
+                        )
+                except Exception as ex:
+                    logger.debug("[platform-metrics-job] oauth refresh skip %s: %s", plat, ex)
+                return plat, row_id, account_id, cur
+
+        account_jobs = list(await asyncio.gather(*[_refresh_one(j) for j in account_jobs]))
     except Exception as e:
         logger.warning(f"[platform-metrics-job] oauth refresh: {e}")
 
@@ -416,7 +344,34 @@ async def refresh_platform_metrics_for_user(pool: asyncpg.Pool, user_id: Any) ->
     platforms_result: Dict[str, Dict[str, Any]] = {}
     for plat in ("tiktok", "youtube", "instagram", "facebook"):
         rows = per_platform_rows.get(plat) or []
-        platforms_result[plat] = _platform_summary_from_account_rows(plat, rows)
+        live_rows = [r.get("metrics", {}) for r in rows if (r.get("metrics") or {}).get("status") == "live"]
+        if live_rows:
+            totals = _merge_metric_totals(live_rows, plat)
+            exemplar = dict(live_rows[-1]) if live_rows else {}
+            exemplar.update(
+                {
+                    "status": "live",
+                    "views": totals["views"],
+                    "likes": totals["likes"],
+                    "comments": totals["comments"],
+                    "shares": totals["shares"],
+                    "accounts_polled": len(rows),
+                    "accounts_live": len(live_rows),
+                    "accounts": rows,
+                }
+            )
+            platforms_result[plat] = exemplar
+        elif rows:
+            err = next((r.get("metrics", {}) for r in rows if (r.get("metrics", {}) or {}).get("status") == "error"), {})
+            platforms_result[plat] = {
+                "status": "error",
+                "error": err.get("error", "all_accounts_failed"),
+                "accounts_polled": len(rows),
+                "accounts_live": 0,
+                "accounts": rows,
+            }
+        else:
+            platforms_result[plat] = {"status": "not_connected", "accounts_polled": 0, "accounts_live": 0, "accounts": []}
 
     for plat in ["tiktok", "youtube", "instagram", "facebook"]:
         platforms_result[plat]["uploads"] = upload_map.get(plat, 0)

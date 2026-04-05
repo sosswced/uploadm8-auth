@@ -12,6 +12,7 @@ Uses env keys to authenticate and call:
 Posts incremental costs to cost_tracking. Tracks last_sync per provider to avoid duplicates.
 """
 
+import json
 import os
 import logging
 from datetime import datetime, timezone, timedelta
@@ -49,14 +50,21 @@ async def _fetch_stripe_fees(since: datetime) -> float:
         return 0.0
     try:
         import stripe
+    except ImportError:
+        logger.debug("_fetch_stripe_fees: stripe package not installed")
+        return 0.0
+    try:
         stripe.api_key = key
         since_ts = int(since.timestamp())
         total_fees = 0.0
         for t in stripe.BalanceTransaction.list(created={"gte": since_ts}, limit=100).auto_paging_iter():
             total_fees += (t.fee or 0) / 100.0  # cents to dollars
         return round(total_fees, 4)
-    except Exception as e:
-        logger.warning(f"Stripe fees fetch failed: {e}")
+    except stripe.error.StripeError as e:
+        logger.warning("Stripe fees fetch failed: %s", e)
+        return 0.0
+    except (TypeError, ValueError, AttributeError) as e:
+        logger.debug("_fetch_stripe_fees: unexpected data from Stripe API: %s", e)
         return 0.0
 
 
@@ -87,8 +95,14 @@ async def _fetch_mailgun_stats(since: datetime) -> tuple[int, float]:
                     total += item.get("delivered", {}).get("total", 0) if isinstance(item.get("delivered"), dict) else item.get("total", 0)
             cost = (total / 1000.0) * MAILGUN_COST_PER_1000
             return int(total), round(cost, 4)
-    except Exception as e:
-        logger.debug(f"Mailgun stats: {e}")
+    except (
+        httpx.RequestError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as e:
+        logger.debug("Mailgun stats: %s", e)
         return 0, 0.0
 
 
@@ -126,8 +140,14 @@ async def _fetch_openai_usage(since: datetime) -> float:
                 if isinstance(bucket, dict):
                     total += float(bucket.get("cost_usd", bucket.get("cost", 0)) or 0)
             return round(total, 6)
-    except Exception as e:
-        logger.debug(f"OpenAI usage fetch: {e}")
+    except (
+        httpx.RequestError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as e:
+        logger.debug("OpenAI usage fetch: %s", e)
         return 0.0
 
 
@@ -154,7 +174,14 @@ async def _fetch_cloudflare_r2_usage(since: datetime) -> tuple[float, float]:
             storage_bytes = data.get("totals", {}).get("bytes", 0) or 0
             egress_bytes = data.get("totals", {}).get("bandwidth", 0) or 0
             return storage_bytes / (1024**3), egress_bytes / (1024**4)
-    except Exception:
+    except (
+        httpx.RequestError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as e:
+        logger.debug("_fetch_cf_r2_usage: %s", e)
         return 0.0, 0.0
 
 
@@ -179,7 +206,14 @@ async def _fetch_upstash_usage() -> float:
                 mb = float(data.get("memory_usage_mb", 0) or 0)
             gb = mb / 1024.0
             return round(gb * UPSTASH_COST_PER_GB, 4)
-    except Exception:
+    except (
+        httpx.RequestError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as e:
+        logger.debug("_fetch_upstash_usage: %s", e)
         return 0.0
 
 
@@ -469,8 +503,14 @@ async def fetch_provider_costs_for_dashboard(window_minutes: int = 30 * 24 * 60)
                             redis_memory_mb += float(db.get("memory_usage_mb", 0) or 0)
                     elif isinstance(data, dict):
                         redis_memory_mb = float(data.get("memory_usage_mb", 0) or 0)
-    except Exception:
-        pass
+    except (
+        httpx.RequestError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as e:
+        logger.debug("kpi_collector: Upstash stats fetch skipped: %s", e)
     return {
         "render_cost": render_cost,
         "storage_gb": round(storage_gb, 4),

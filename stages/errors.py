@@ -121,6 +121,24 @@ class SkipStage(Exception):
         self.meta = meta or {}
 
 
+def log_stage_skip(
+    logger: Any,
+    stage_name: str,
+    reason: str,
+    *,
+    upload_id: Optional[str] = None,
+) -> None:
+    """
+    Uniform log line when an optional stage does not run (disabled, missing key,
+    no credits, quota, etc.). The pipeline keeps going — informational, not an error.
+    """
+    msg = f"{stage_name} SKIPPED (processing continues): {reason}"
+    if upload_id:
+        logger.info("[%s] %s", upload_id, msg)
+    else:
+        logger.info("%s", msg)
+
+
 class CancelRequested(Exception):
     """Raise to stop processing due to explicit cancellation."""
 
@@ -196,6 +214,7 @@ __all__ = [
     "ErrorCode",
     "StageError",
     "SkipStage",
+    "log_stage_skip",
     "CancelRequested",
     "PublishError",
     "StorageError",

@@ -17,8 +17,10 @@ Free: 1,000 units/month per feature.
 
 import asyncio
 import base64
+import json
 import logging
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -29,8 +31,125 @@ from .errors import SkipStage
 
 logger = logging.getLogger("uploadm8-worker")
 
+try:
+    from google.auth.exceptions import GoogleAuthError as _GoogleAuthError
+
+    _GOOGLE_AUTH_ERRS = (_GoogleAuthError,)
+except ImportError:  # pragma: no cover
+    _GOOGLE_AUTH_ERRS = ()
+
+try:
+    from google.api_core import exceptions as _google_api_core_exc
+
+    _GOOGLE_API_CORE_ERRS = (_google_api_core_exc.GoogleAPIError,)
+except ImportError:  # pragma: no cover
+    _GOOGLE_API_CORE_ERRS = ()
+
+_VISION_RUN_NONFATAL = (
+    OSError,
+    asyncio.TimeoutError,
+    ValueError,
+    TypeError,
+    RuntimeError,
+) + _GOOGLE_AUTH_ERRS + _GOOGLE_API_CORE_ERRS
+
 VISION_STAGE_ENABLED = os.environ.get("VISION_STAGE_ENABLED", "true").lower() == "true"
-GCP_CREDENTIALS      = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+
+# Inline JSON (Render: paste service account JSON as a secret env var if file mount path mismatches)
+_GCP_JSON_ENVS = ("GCP_SERVICE_ACCOUNT_JSON", "GOOGLE_CREDENTIALS_JSON")
+
+_RENDER_SECRET_NAMES = (
+    "gcp-sa.json",
+    "gcp-service-account.json",
+    "google-credentials.json",
+    "service-account.json",
+    "credentials.json",
+)
+
+
+def _path_looks_like_gcp_service_account(path: Path) -> bool:
+    """True if JSON file is a Google service account key (any filename, e.g. social-media-up-….json)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return (
+            isinstance(data, dict)
+            and data.get("type") == "service_account"
+            and bool(data.get("client_email"))
+            and bool(data.get("private_key"))
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
+def _pick_repo_root_gcp_json() -> Optional[Path]:
+    """
+    Local dev: if GOOGLE_APPLICATION_CREDENTIALS is unset, use a single
+    social-media-up-*.json service-account file in the repo root (e.g. checked-in key name).
+    """
+    root = Path(__file__).resolve().parents[1]
+    matches = sorted(root.glob("social-media-up-*.json"))
+    sa = [p for p in matches if _path_looks_like_gcp_service_account(p)]
+    if len(sa) == 1:
+        return sa[0].resolve()
+    if len(sa) > 1:
+        logger.warning(
+            "[vision] Multiple social-media-up-*.json files in repo root; "
+            "set GOOGLE_APPLICATION_CREDENTIALS to pick one"
+        )
+    return None
+
+
+def _pick_gcp_json_under_secrets(secrets_dir: Path) -> Optional[Path]:
+    """
+    Prefer explicit GOOGLE_APPLICATION_CREDENTIALS basename if it exists;
+    else the only *.json that parses as a GCP service account;
+    else sole *.json file (legacy).
+    """
+    raw = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
+    if raw:
+        hint = Path(raw).name
+        hinted = secrets_dir / hint
+        if hinted.is_file() and _path_looks_like_gcp_service_account(hinted):
+            logger.info("[vision] Using GCP credentials from /etc/secrets (env basename): %s", hint)
+            return hinted.resolve()
+
+    json_files = sorted(secrets_dir.glob("*.json"))
+    sa_candidates = [p for p in json_files if _path_looks_like_gcp_service_account(p)]
+    if len(sa_candidates) == 1:
+        logger.info("[vision] Using GCP service account JSON under /etc/secrets: %s", sa_candidates[0].name)
+        return sa_candidates[0].resolve()
+    if len(sa_candidates) > 1:
+        # Deterministic: prefer env basename match among SA files, else shortest name (often the GCP key)
+        if raw:
+            bn = Path(raw).name
+            for p in sa_candidates:
+                if p.name == bn:
+                    logger.info("[vision] Using GCP credentials (matched env name): %s", p.name)
+                    return p.resolve()
+        chosen = sorted(sa_candidates, key=lambda x: (len(x.name), x.name))[0]
+        logger.warning(
+            "[vision] Multiple service-account JSON files under /etc/secrets; using %s "
+            "(set GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/<file> to pick another)",
+            chosen.name,
+        )
+        return chosen.resolve()
+
+    if len(json_files) == 1:
+        if _path_looks_like_gcp_service_account(json_files[0]):
+            logger.info("[vision] Using sole JSON secret under /etc/secrets: %s", json_files[0].name)
+            return json_files[0].resolve()
+        logger.warning(
+            "[vision] One JSON file under /etc/secrets but it is not a GCP service_account key: %s",
+            json_files[0].name,
+        )
+        return None
+    if len(json_files) > 1:
+        logger.warning(
+            "[vision] Multiple JSON files under /etc/secrets; none look like a GCP service_account key. "
+            "Set GOOGLE_APPLICATION_CREDENTIALS to the full path (e.g. /etc/secrets/social-media-up-….json)."
+        )
+    return None
 
 _gcv_client      = None
 _vision_module   = None
@@ -48,26 +167,108 @@ LIKELIHOOD_MAP = {
 POSITIVE_EMOTIONS = {"LIKELY", "VERY_LIKELY"}
 
 
+def _raw_inline_gcp_json() -> str:
+    for key in _GCP_JSON_ENVS:
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            return raw
+    return ""
+
+
 def _resolve_gcp_credentials_path() -> Optional[Path]:
     """
     Resolve GOOGLE_APPLICATION_CREDENTIALS robustly:
     - absolute path as-is
     - relative to current working directory
     - relative to repo root (one level above stages/)
+    - Render secret files: /etc/secrets/<name> when the env path is missing or wrong
     """
     raw = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
-    if not raw:
+    checked: List[Path] = []
+
+    def _try_candidates(paths: List[Path]) -> Optional[Path]:
+        for p in paths:
+            if p.exists():
+                return p.resolve()
+            checked.append(p)
         return None
-    p = Path(raw)
-    candidates = [p]
-    if not p.is_absolute():
-        candidates.append(Path.cwd() / p)
-        repo_root = Path(__file__).resolve().parents[1]
-        candidates.append(repo_root / p)
-    for c in candidates:
-        if c.exists():
-            return c.resolve()
+
+    if raw:
+        p = Path(raw)
+        candidates = [p]
+        if not p.is_absolute():
+            candidates.append(Path.cwd() / p)
+            repo_root = Path(__file__).resolve().parents[1]
+            candidates.append(repo_root / p)
+        hit = _try_candidates(candidates)
+        if hit:
+            return hit
+
+    if not raw:
+        repo_json = _pick_repo_root_gcp_json()
+        if repo_json:
+            logger.info(
+                "[vision] Using GCP credentials from repo root (optional: set "
+                "GOOGLE_APPLICATION_CREDENTIALS=%s)",
+                repo_json,
+            )
+            return repo_json
+
+    secrets_dir = Path("/etc/secrets")
+    if secrets_dir.is_dir():
+        for name in _RENDER_SECRET_NAMES:
+            p = secrets_dir / name
+            if p.is_file():
+                logger.info("[vision] Using GCP credentials file from /etc/secrets: %s", name)
+                return p.resolve()
+        picked = _pick_gcp_json_under_secrets(secrets_dir)
+        if picked:
+            return picked
+
+    if raw and checked:
+        logger.warning(
+            "[vision] GOOGLE_APPLICATION_CREDENTIALS path not found: %s (tried %s)",
+            raw,
+            ", ".join(str(x) for x in checked[:5]),
+        )
     return None
+
+
+def load_gcp_service_account_credentials() -> Optional[Any]:
+    """
+    Service account credentials for Vision / Video Intelligence.
+    Prefers inline JSON env (GCP_SERVICE_ACCOUNT_JSON or GOOGLE_CREDENTIALS_JSON), else JSON file path.
+    """
+    raw = _raw_inline_gcp_json()
+    if raw:
+        try:
+            info = json.loads(raw)
+            if not isinstance(info, dict) or not info.get("client_email"):
+                logger.warning("[vision] Inline GCP JSON missing client_email")
+                return None
+            from google.oauth2 import service_account
+
+            return service_account.Credentials.from_service_account_info(info)
+        except json.JSONDecodeError as e:
+            logger.warning("[vision] Inline GCP JSON is not valid JSON: %s", e)
+            return None
+        except (ImportError, ValueError, TypeError, KeyError, OSError) + _GOOGLE_AUTH_ERRS as e:
+            logger.warning("[vision] Inline GCP credentials failed: %s", e)
+            return None
+    path = _resolve_gcp_credentials_path()
+    if not path:
+        return None
+    try:
+        from google.oauth2 import service_account
+
+        return service_account.Credentials.from_service_account_file(str(path))
+    except (ImportError, OSError, ValueError, TypeError) + _GOOGLE_AUTH_ERRS as e:
+        logger.warning("[vision] GCP credentials file failed: %s", e)
+        return None
+
+
+def gcp_vision_credentials_configured() -> bool:
+    return bool(_raw_inline_gcp_json()) or _resolve_gcp_credentials_path() is not None
 
 
 def _get_gcv_client():
@@ -77,20 +278,25 @@ def _get_gcv_client():
         return _gcv_client
 
     try:
-        creds = _resolve_gcp_credentials_path()
-        if not creds:
-            logger.warning("[vision] GOOGLE_APPLICATION_CREDENTIALS path not found on disk")
+        creds_obj = load_gcp_service_account_credentials()
+        if not creds_obj:
+            logger.warning(
+                "[vision] No GCP credentials (set GOOGLE_APPLICATION_CREDENTIALS to a mounted file, "
+                "or GCP_SERVICE_ACCOUNT_JSON, or place gcp-sa.json under /etc/secrets)"
+            )
             return None
-        # Ensure downstream google client can always locate credentials.
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds)
+        path = _resolve_gcp_credentials_path()
+        if path and not _raw_inline_gcp_json():
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
 
         from google.cloud import vision as v
+
         _vision_module = v
-        _gcv_client    = v.ImageAnnotatorClient()
+        _gcv_client = v.ImageAnnotatorClient(credentials=creds_obj)
         logger.info("[vision] Google Cloud Vision client initialized")
         return _gcv_client
-    except Exception as e:
-        logger.warning(f"[vision] GCV client init failed: {e}")
+    except (ImportError, OSError, ValueError, TypeError, AttributeError, RuntimeError) + _GOOGLE_AUTH_ERRS as e:
+        logger.warning("[vision] GCV client init failed: %s", e)
         return None
 
 
@@ -180,11 +386,11 @@ async def run_vision_stage(ctx: JobContext) -> JobContext:
     if not VISION_STAGE_ENABLED:
         raise SkipStage("Vision stage disabled via env")
 
-    if not GCP_CREDENTIALS:
-        raise SkipStage("GOOGLE_APPLICATION_CREDENTIALS not set")
-    creds = _resolve_gcp_credentials_path()
-    if not creds:
-        raise SkipStage("GOOGLE_APPLICATION_CREDENTIALS path not found")
+    if not gcp_vision_credentials_configured():
+        raise SkipStage(
+            "GCP credentials not configured (set GOOGLE_APPLICATION_CREDENTIALS, "
+            "GCP_SERVICE_ACCOUNT_JSON, a file under /etc/secrets, or one social-media-up-*.json in repo root)"
+        )
 
     # Find best frame to analyze
     frame_to_analyze = _find_best_frame(ctx)
@@ -215,10 +421,12 @@ async def run_vision_stage(ctx: JobContext) -> JobContext:
 
         return ctx
 
+    except asyncio.CancelledError:
+        raise
     except SkipStage:
         raise
-    except Exception as e:
-        logger.warning(f"[vision] Non-fatal error: {e}")
+    except _VISION_RUN_NONFATAL as e:
+        logger.warning("[vision] Non-fatal error: %s", e)
         ctx.vision_context = {}
         return ctx
 
@@ -266,7 +474,7 @@ async def _extract_frame_for_vision(ctx: JobContext) -> Optional[Path]:
         duration = 1.0
         if proc.returncode == 0 and stdout:
             try:
-                data = json.loads(stdout.decode())
+                data = json.loads(stdout.decode("utf-8", errors="replace"))
                 d = data.get("format", {}).get("duration", 1)
                 duration = float(d) if d else 1.0
             except (json.JSONDecodeError, TypeError, ValueError):
@@ -278,63 +486,10 @@ async def _extract_frame_for_vision(ctx: JobContext) -> Optional[Path]:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await proc.communicate()
         return out_path if out_path.exists() and out_path.stat().st_size > 1000 else None
-    except Exception as e:
-        logger.warning(f"[vision] Frame extraction failed: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning("[vision] Frame extraction failed: %s", e)
         return None
 
 
-def get_vision_ocr_for_caption(vision_ctx: Dict) -> str:
-    """
-    Extract OCR text relevant for caption generation.
-    Filters out noise, returns clean string.
-    """
-    if not vision_ctx:
-        return ""
-
-    text = vision_ctx.get("ocr_text", "")
-    if not text:
-        return ""
-
-    # Basic cleaning — remove single chars, very short tokens
-    lines = [line.strip() for line in text.split("\n") if len(line.strip()) > 2]
-    clean = " | ".join(lines[:5])  # Max 5 lines
-
-    return clean[:300]  # Cap at 300 chars for prompt injection
-
-
-def get_face_crop_region(vision_ctx: Dict, frame_width: int, frame_height: int) -> Optional[Dict]:
-    """
-    Return a crop region centered on the most expressive face.
-    Used by thumbnail_stage to focus composition.
-    Returns dict: {x, y, w, h} normalized 0–1 or None.
-    """
-    if not vision_ctx or not vision_ctx.get("best_face"):
-        return None
-
-    face = vision_ctx["best_face"]
-    poly = face.get("bounding_poly", [])
-
-    if len(poly) < 4:
-        return None
-
-    xs = [p[0] for p in poly]
-    ys = [p[1] for p in poly]
-
-    face_x = min(xs)
-    face_y = min(ys)
-    face_w = max(xs) - face_x
-    face_h = max(ys) - face_y
-
-    # Expand crop region by 60% to include shoulders/context
-    pad_x = face_w * 0.6
-    pad_y = face_h * 0.6
-
-    crop_x = max(0, face_x - pad_x)
-    crop_y = max(0, face_y - pad_y)
-    crop_w = min(frame_width,  face_w + pad_x * 2)
-    crop_h = min(frame_height, face_h + pad_y * 2)
-
-    return {
-        "x": int(crop_x), "y": int(crop_y),
-        "w": int(crop_w), "h": int(crop_h),
-    }

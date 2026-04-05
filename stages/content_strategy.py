@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
 from .context import JobContext
+from .safe_parse import json_dict
+
+logger = logging.getLogger("uploadm8-worker.content_strategy")
 
 _POLICY_PATH = Path(__file__).with_name("content_style_policy.json")
 
@@ -12,12 +15,13 @@ _POLICY_PATH = Path(__file__).with_name("content_style_policy.json")
 def _load_policy() -> Dict[str, Any]:
     try:
         raw = _POLICY_PATH.read_text(encoding="utf-8")
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    return {"defaults": {}, "rules": []}
+    except (OSError, UnicodeDecodeError) as e:
+        logger.debug("content_strategy: could not read %s: %s", _POLICY_PATH.name, e)
+        return {"defaults": {}, "rules": []}
+    obj = json_dict(raw, default={"defaults": {}, "rules": []}, context="content_style_policy.json")
+    obj.setdefault("defaults", {})
+    obj.setdefault("rules", [])
+    return obj
 
 
 def _safe_slug(s: Any) -> str:

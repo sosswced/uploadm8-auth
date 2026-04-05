@@ -245,7 +245,7 @@ async def run_hud_stage(ctx: JobContext) -> JobContext:
         # Clean up SRT file
         try:
             srt_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except (OSError, PermissionError) as e:
+            logger.debug("hud_stage: could not remove temp SRT %s: %s", srt_path, e)
     
     return ctx

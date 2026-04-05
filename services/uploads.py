@@ -47,6 +47,12 @@ PLATFORM_OPTIMAL_DAYS = {
     "facebook": [0, 1, 2, 3],
 }
 
+# Minutes added/subtracted around the weighted "peak" anchor (UTC). Wider = more spread;
+# applied via timedelta so hours/days roll correctly (unlike clamping minute to 0–59).
+SMART_SCHEDULE_JITTER_MINUTES = 90
+# Extra entropy so scheduled times are not all on the minute.
+SMART_SCHEDULE_JITTER_SECONDS_MAX = 59
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -90,14 +96,19 @@ def calculate_smart_schedule(platforms: List[str], num_days: int = 7, user_timez
                 selected_time = t
                 break
 
-        minute_offset = random.randint(-30, 30)
         target_date = now + timedelta(days=day_offset)
-        scheduled_dt = target_date.replace(
+        base_dt = target_date.replace(
             hour=selected_time["hour"],
-            minute=max(0, min(59, selected_time["minute"] + minute_offset)),
+            minute=selected_time["minute"],
             second=0,
             microsecond=0,
         )
+        jm = SMART_SCHEDULE_JITTER_MINUTES
+        delta = timedelta(
+            minutes=random.randint(-jm, jm),
+            seconds=random.randint(0, SMART_SCHEDULE_JITTER_SECONDS_MAX),
+        )
+        scheduled_dt = base_dt + delta
         if scheduled_dt <= now:
             scheduled_dt += timedelta(days=1)
         schedule[platform] = scheduled_dt

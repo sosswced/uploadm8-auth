@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import asyncpg
 import httpx
 
 from .context import (
@@ -212,8 +213,8 @@ def _build_m8_prompt(
     fusion = ""
     try:
         fusion = build_fusion_caption_rules(ctx) or ""
-    except Exception:
-        pass
+    except (AttributeError, TypeError, KeyError, ValueError) as e:
+        logger.debug("m8_engine: build_fusion_caption_rules skipped: %s", e)
 
     platforms = [p for p in scene_graph.get("platforms") or [] if p]
     if not platforms:
@@ -760,8 +761,8 @@ async def _call_openai_m8_json(
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": detail},
                 }
             )
-        except Exception as e:
-            logger.warning(f"M8: could not attach frame {frame}: {e}")
+        except (OSError, PermissionError, TypeError, ValueError) as e:
+            logger.warning("M8: could not attach frame %s: %s", frame, e)
 
     tokens = {"prompt": 0, "completion": 0}
     payload = {
@@ -772,48 +773,54 @@ async def _call_openai_m8_json(
         "response_format": {"type": "json_object"},
     }
     resp: Optional[httpx.Response] = None
-    for attempt in range(2):
-        async with outbound_slot("openai"):
-            async with httpx.AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-        if resp.status_code == 200:
-            break
-        # Rare intermittent upstream parse failures: retry once with same sanitized payload.
-        body = (resp.text or "")[:500]
-        bad_json_body = resp.status_code == 400 and "parse the JSON body" in body.lower()
-        if bad_json_body and attempt == 0:
-            logger.warning("M8 Engine got transient OpenAI 400 parse-body error, retrying once")
-            await asyncio.sleep(0.8)
-            continue
-        break
-    if resp is None:
-        return {}, tokens
-    if resp.status_code != 200:
-        logger.error(f"M8 Engine HTTP {resp.status_code}: {resp.text[:400]}")
-        return {}, tokens
-
-    data = resp.json()
-    usage = data.get("usage") or {}
-    tokens = {
-        "prompt": int(usage.get("prompt_tokens") or 0),
-        "completion": int(usage.get("completion_tokens") or 0),
-    }
-    raw = data["choices"][0]["message"]["content"]
-    if "```" in raw:
-        raw = raw.split("```", 1)[-1].split("```", 1)[0]
     try:
-        parsed = json.loads(raw.strip())
-    except json.JSONDecodeError as e:
-        logger.warning(f"M8 Engine JSON parse failed: {e}")
+        for attempt in range(2):
+            async with outbound_slot("openai"):
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {OPENAI_API_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    )
+            if resp.status_code == 200:
+                break
+            # Rare intermittent upstream parse failures: retry once with same sanitized payload.
+            body = (resp.text or "")[:500]
+            bad_json_body = resp.status_code == 400 and "parse the JSON body" in body.lower()
+            if bad_json_body and attempt == 0:
+                logger.warning("M8 Engine got transient OpenAI 400 parse-body error, retrying once")
+                await asyncio.sleep(0.8)
+                continue
+            break
+        if resp is None:
+            return {}, tokens
+        if resp.status_code != 200:
+            logger.error(f"M8 Engine HTTP {resp.status_code}: {resp.text[:400]}")
+            return {}, tokens
+
+        data = resp.json()
+        usage = data.get("usage") or {}
+        tokens = {
+            "prompt": int(usage.get("prompt_tokens") or 0),
+            "completion": int(usage.get("completion_tokens") or 0),
+        }
+        raw = data["choices"][0]["message"]["content"]
+        if "```" in raw:
+            raw = raw.split("```", 1)[-1].split("```", 1)[0]
+        try:
+            parsed = json.loads(raw.strip())
+        except json.JSONDecodeError as e:
+            logger.warning("M8 Engine JSON parse failed: %s", e)
+            return {}, tokens
+        return parsed, tokens
+    except asyncio.CancelledError:
+        raise
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as e:
+        logger.warning("M8 Engine OpenAI request failed: %s", e)
         return {}, tokens
-    return parsed, tokens
 
 
 def apply_selection_to_context(
@@ -963,8 +970,8 @@ async def run_m8_caption_engine(
                 category,
                 [str(p).lower() for p in (ctx.platforms or [])],
             )
-        except Exception as e:
-            logger.debug(f"M8 historical signals skipped: {e}")
+        except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError, TypeError, ValueError) as e:
+            logger.debug("M8 historical signals skipped: %s", e)
 
     prompt = _build_m8_prompt(
         ctx,
@@ -1013,8 +1020,8 @@ async def run_m8_caption_engine(
 
     try:
         ctx.output_artifacts["m8_engine_json"] = json.dumps(ranked)[:490_000]
-    except Exception:
-        pass
+    except (TypeError, ValueError, OverflowError) as e:
+        logger.debug("m8_engine: could not serialize m8_engine_json to artifacts: %s", e)
 
     if generate_caption and not (ctx.m8_platform_captions or {}).keys():
         return {"ok": False, "tokens": tokens, "error": "m8_no_captions", "selection": ranked}
@@ -1036,6 +1043,6 @@ async def fetch_historical_signals(
         from .db import fetch_m8_historical_signals
 
         return await fetch_m8_historical_signals(db_pool, user_id, category, platforms)
-    except Exception as e:
-        logger.debug(f"fetch_historical_signals: {e}")
+    except (ImportError, asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError, TypeError, ValueError) as e:
+        logger.debug("fetch_historical_signals: %s", e)
         return {"__pattern_corpus__": [], "__meta__": {"ok": False}}

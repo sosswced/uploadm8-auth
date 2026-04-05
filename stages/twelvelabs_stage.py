@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -35,8 +36,23 @@ TWELVE_LABS_API_KEY  = os.environ.get("TWELVE_LABS_API_KEY", "")
 TWELVELABS_ENABLED   = os.environ.get("TWELVELABS_ENABLED", "false").lower() == "true"
 TWELVELABS_INDEX_ID  = os.environ.get("TWELVELABS_INDEX_ID", "")  # Pre-created index
 TL_BASE_URL          = "https://api.twelvelabs.io/v1.3"
-INDEX_POLL_INTERVAL  = 10.0   # seconds
-INDEX_MAX_POLLS      = 30     # 30 × 10s = 5 min max
+INDEX_POLL_INTERVAL  = float(os.environ.get("TWELVELABS_POLL_INTERVAL_SEC", "10"))  # seconds
+INDEX_MAX_POLLS      = int(os.environ.get("TWELVELABS_MAX_POLLS", "30"))            # legacy floor
+INDEX_MAX_WAIT_SEC   = int(os.environ.get("TWELVELABS_MAX_WAIT_SEC", "1800"))       # 30m cap
+
+
+def _effective_poll_budget(file_size_mb: float) -> int:
+    """
+    Adaptive task polling budget.
+    The fixed 5m window was too tight for larger clips and busy API windows.
+    """
+    interval = max(1.0, float(INDEX_POLL_INTERVAL))
+    # Baseline 5m + 90s per ~25MB, capped by TWELVELABS_MAX_WAIT_SEC (default 30m)
+    dynamic_wait = 300 + int(max(0.0, file_size_mb) / 25.0) * 90
+    wait_cap = max(300, int(INDEX_MAX_WAIT_SEC))
+    wait_sec = min(wait_cap, dynamic_wait)
+    polls = max(int(INDEX_MAX_POLLS), int(math.ceil(wait_sec / interval)))
+    return max(1, polls)
 
 
 async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
@@ -87,10 +103,20 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
         )
         return ctx
 
+    except asyncio.CancelledError:
+        raise
     except SkipStage:
         raise
-    except Exception as e:
-        logger.warning(f"[twelvelabs] Non-fatal error: {e}")
+    except (
+        httpx.RequestError,
+        httpx.HTTPError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+    ) as e:
+        logger.warning("[twelvelabs] Non-fatal error: %s", e)
         ctx.video_understanding = {}
         return ctx
 
@@ -138,6 +164,15 @@ async def _upload_and_index(video_path: Path, index_id: str, upload_id: str) -> 
     file_size_mb = video_path.stat().st_size / 1024 / 1024
     logger.info(f"[twelvelabs] Uploading {file_size_mb:.1f}MB video for indexing...")
 
+    poll_budget = _effective_poll_budget(file_size_mb)
+    max_wait_min = (poll_budget * INDEX_POLL_INTERVAL) / 60.0
+    logger.info(
+        "[twelvelabs] Poll budget: up to %d checks every %.1fs (~%.1f min max wait)",
+        poll_budget,
+        INDEX_POLL_INTERVAL,
+        max_wait_min,
+    )
+
     async with httpx.AsyncClient(timeout=300.0) as client:
         with open(video_path, "rb") as f:
             resp = await client.post(
@@ -163,7 +198,8 @@ async def _upload_and_index(video_path: Path, index_id: str, upload_id: str) -> 
         logger.info(f"[twelvelabs] Task created: {task_id} — polling for completion...")
 
         # Poll task status
-        for attempt in range(INDEX_MAX_POLLS):
+        last_status = ""
+        for attempt in range(poll_budget):
             await asyncio.sleep(INDEX_POLL_INTERVAL)
 
             status_resp = await client.get(
@@ -172,10 +208,26 @@ async def _upload_and_index(video_path: Path, index_id: str, upload_id: str) -> 
             )
 
             if status_resp.status_code != 200:
+                if (attempt + 1) % 6 == 0:
+                    logger.warning(
+                        "[twelvelabs] Task poll non-200 (%s) on attempt %d/%d",
+                        status_resp.status_code,
+                        attempt + 1,
+                        poll_budget,
+                    )
                 continue
 
             data   = status_resp.json()
             status = data.get("status", "")
+            if status != last_status:
+                logger.info(
+                    "[twelvelabs] Task %s status=%s (%d/%d)",
+                    task_id,
+                    status or "unknown",
+                    attempt + 1,
+                    poll_budget,
+                )
+                last_status = status
 
             if status == "ready":
                 video_id = data.get("video_id")
@@ -186,9 +238,13 @@ async def _upload_and_index(video_path: Path, index_id: str, upload_id: str) -> 
                 logger.warning(f"[twelvelabs] Indexing failed: {data}")
                 return None
 
-            logger.debug(f"[twelvelabs] Polling attempt {attempt + 1}/{INDEX_MAX_POLLS}: status={status}")
+            logger.debug(f"[twelvelabs] Polling attempt {attempt + 1}/{poll_budget}: status={status}")
 
-        logger.warning("[twelvelabs] Indexing timed out")
+        logger.warning(
+            "[twelvelabs] Indexing timed out after %d checks (~%.1f min)",
+            poll_budget,
+            (poll_budget * INDEX_POLL_INTERVAL) / 60.0,
+        )
         return None
 
 

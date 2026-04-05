@@ -5,7 +5,7 @@ Rules align with product spec (PUT/AIC spend vs period capacity, AI upsell, flex
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -146,6 +146,7 @@ def _append_opportunity(
     body: str,
     cta_label: str,
     cta_link: str,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     opps.append({
         "type": type_,
@@ -154,7 +155,131 @@ def _append_opportunity(
         "body": body,
         "cta_label": cta_label,
         "cta_link": cta_link,
+        "metadata": metadata or {},
     })
+
+
+def _range_to_minutes(range_key: Optional[str]) -> int:
+    r = str(range_key or "30d").strip().lower()
+    table = {
+        "24h": 24 * 60,
+        "7d": 7 * 24 * 60,
+        "30d": 30 * 24 * 60,
+        "90d": 90 * 24 * 60,
+        "6m": 180 * 24 * 60,
+        "1y": 365 * 24 * 60,
+    }
+    return int(table.get(r, 30 * 24 * 60))
+
+
+async def _user_campaign_features(conn, user_id: str, range_key: str) -> Dict[str, Any]:
+    minutes = max(60, _range_to_minutes(range_key))
+    since = _now_utc().replace(microsecond=0) - timedelta(minutes=minutes)
+    row = await conn.fetchrow(
+        """
+        WITH up AS (
+          SELECT user_id, COUNT(*)::int AS uploads_window
+          FROM uploads
+          WHERE user_id = $1::uuid AND created_at >= $2
+          GROUP BY user_id
+        ),
+        rv AS (
+          SELECT user_id, COALESCE(SUM(amount), 0)::decimal AS revenue_7d
+          FROM revenue_tracking
+          WHERE user_id = $1::uuid AND created_at >= NOW() - INTERVAL '7 days'
+          GROUP BY user_id
+        ),
+        me AS (
+          SELECT user_id,
+                 COALESCE(SUM(CASE WHEN event_type='shown' THEN 1 ELSE 0 END),0)::int AS shown,
+                 COALESCE(SUM(CASE WHEN event_type='clicked' THEN 1 ELSE 0 END),0)::int AS clicked
+          FROM marketing_events
+          WHERE user_id = $1::uuid AND created_at >= $2
+          GROUP BY user_id
+        ),
+        pf AS (
+          SELECT user_id, COUNT(*)::int AS connected_accounts
+          FROM platform_tokens
+          WHERE user_id = $1::uuid
+          GROUP BY user_id
+        )
+        SELECT
+          COALESCE(up.uploads_window, 0)::int AS uploads_window,
+          COALESCE(rv.revenue_7d, 0)::decimal AS revenue_7d,
+          COALESCE(me.shown, 0)::int AS shown,
+          COALESCE(me.clicked, 0)::int AS clicked,
+          COALESCE(pf.connected_accounts, 0)::int AS connected_accounts
+        FROM (SELECT 1) seed
+        LEFT JOIN up ON TRUE
+        LEFT JOIN rv ON TRUE
+        LEFT JOIN me ON TRUE
+        LEFT JOIN pf ON TRUE
+        """,
+        user_id,
+        since,
+    )
+    uploads = _i((row or {}).get("uploads_window"))
+    shown = _i((row or {}).get("shown"))
+    clicked = _i((row or {}).get("clicked"))
+    connected = _i((row or {}).get("connected_accounts"))
+    ctr = (float(clicked) / float(max(shown, 1))) * 100.0
+    score = 0.0
+    score += min(40.0, uploads * 2.2)
+    score += min(25.0, connected * 4.5)
+    score += min(20.0, ctr * 0.6)
+    return {
+        "uploads_window": uploads,
+        "revenue_7d": float((row or {}).get("revenue_7d") or 0),
+        "shown": shown,
+        "clicked": clicked,
+        "nudge_ctr_pct": ctr,
+        "connected_accounts": connected,
+        "enterprise_fit_score": max(0.0, min(score, 100.0)),
+    }
+
+
+async def _live_campaign_for_user(conn, user_id: str, tier: str) -> Optional[Dict[str, Any]]:
+    rows = await conn.fetch(
+        """
+        SELECT id, name, objective, channel, status, range_key, targeting, schedule_at, created_at
+        FROM marketing_campaigns
+        WHERE status IN ('active', 'scheduled')
+          AND channel IN ('in_app', 'mixed', 'discount')
+          AND (schedule_at IS NULL OR schedule_at <= NOW())
+        ORDER BY
+          CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+          COALESCE(schedule_at, created_at) DESC
+        LIMIT 60
+        """
+    )
+    if not rows:
+        return None
+    tier_norm = normalize_tier(tier or "free")
+    features_cache: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        c = dict(r)
+        targeting = c.get("targeting") or {}
+        if not isinstance(targeting, dict):
+            continue
+        tiers = [normalize_tier(t) for t in (targeting.get("tiers") or []) if normalize_tier(t)]
+        if tiers and tier_norm not in tiers:
+            continue
+        range_key = str(c.get("range_key") or "30d")
+        if range_key not in features_cache:
+            features_cache[range_key] = await _user_campaign_features(conn, user_id, range_key)
+        feats = features_cache[range_key]
+        if feats["uploads_window"] < _i(targeting.get("min_uploads_30d")):
+            continue
+        if float(feats["nudge_ctr_pct"]) < float(targeting.get("min_nudge_ctr_pct") or 0):
+            continue
+        if float(feats["enterprise_fit_score"]) < float(targeting.get("min_enterprise_fit_score") or 0):
+            continue
+        if bool(targeting.get("require_no_revenue_7d")) and float(feats["revenue_7d"]) > 0:
+            continue
+        c["targeting"] = targeting
+        c["audience_eval"] = feats
+        return c
+    return None
 
 
 async def build_wallet_marketing_payload(
@@ -208,6 +333,7 @@ async def build_wallet_marketing_payload(
         "pricing": "/index.html#pricing",
         "platforms": "/platforms.html",
         "analytics": "/analytics.html",
+        "dashboard": "/dashboard.html",
     }
     experiments = {
         "cta_variant": _stable_ab_variant(user_id, "cta_text"),
@@ -357,7 +483,7 @@ async def build_wallet_marketing_payload(
         )
 
     ref_on = bool(admin_settings.get("promo_referral_enabled"))
-    if ref_on and tier in ("free", "launch", "creator_lite", "creator_pro"):
+    if ref_on and tier in ("free", "creator_lite", "creator_pro"):
         _append_opportunity(
             opps,
             type_="referral",
@@ -453,6 +579,36 @@ async def build_wallet_marketing_payload(
             body="White-label, maximum queue depth, and Flex are built for agencies managing many client accounts.",
             cta_label="View Agency",
             cta_link=links["pricing"],
+        )
+
+    # Runtime activation: when a campaign is active/scheduled and this user matches
+    # targeting filters, surface it as an in-app nudge opportunity.
+    live_campaign = await _live_campaign_for_user(conn, user_id, tier)
+    if live_campaign:
+        ch = str(live_campaign.get("channel") or "in_app")
+        cta_link = links["dashboard"]
+        cta_label = "Open campaign"
+        if ch == "discount":
+            cta_link = links["upgrade"]
+            cta_label = "Claim offer"
+        elif ch == "mixed":
+            cta_link = links["upgrade"]
+            cta_label = "View campaign"
+        _append_opportunity(
+            opps,
+            type_=f"campaign_{live_campaign.get('id')}",
+            severity="promo",
+            title=str(live_campaign.get("name") or "Recommended offer"),
+            body=str(live_campaign.get("objective") or "A campaign matched your recent activity and plan usage."),
+            cta_label=cta_label,
+            cta_link=cta_link,
+            metadata={
+                "campaign_id": str(live_campaign.get("id") or ""),
+                "campaign_channel": ch,
+                "campaign_status": str(live_campaign.get("status") or ""),
+                "campaign_range": str(live_campaign.get("range_key") or "30d"),
+                "audience_eval": live_campaign.get("audience_eval") or {},
+            },
         )
 
     order = {"blocking": 0, "urgent": 1, "warning": 2, "info": 3, "promo": 4}

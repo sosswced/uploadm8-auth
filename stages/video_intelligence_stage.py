@@ -47,6 +47,12 @@ def _resolve_gcp_credentials_path() -> Optional[Path]:
     return _rv()
 
 
+def _gcp_creds_for_vi():
+    from .vision_stage import load_gcp_service_account_credentials
+
+    return load_gcp_service_account_credentials()
+
+
 def _offset_to_seconds(ts: Any) -> float:
     if ts is None:
         return 0.0
@@ -54,7 +60,7 @@ def _offset_to_seconds(ts: Any) -> float:
         sec = float(getattr(ts, "seconds", 0) or 0)
         nanos = float(getattr(ts, "nanos", 0) or 0)
         return sec + nanos / 1e9
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         return 0.0
 
 
@@ -100,7 +106,7 @@ def _parse_annotation_result(result: Any) -> Dict[str, Any]:
                     "start_s": round(_offset_to_seconds(st), 3),
                     "end_s": round(_offset_to_seconds(en), 3),
                 })
-    except Exception as e:
+    except (TypeError, ValueError, AttributeError) as e:
         logger.warning("[video_intelligence] parse failed: %s", e)
         out["parse_error"] = str(e)
 
@@ -121,15 +127,19 @@ def _parse_annotation_result(result: Any) -> Dict[str, Any]:
     return out
 
 
-def _analyze_sync_inline(video_bytes: bytes) -> Dict[str, Any]:
+def _analyze_sync_inline(video_bytes: bytes, creds: Any = None) -> Dict[str, Any]:
     from google.cloud import videointelligence_v1 as vi
 
-    client = vi.VideoIntelligenceServiceClient()
+    client = (
+        vi.VideoIntelligenceServiceClient(credentials=creds)
+        if creds is not None
+        else vi.VideoIntelligenceServiceClient()
+    )
     features = [vi.Feature.LABEL_DETECTION]
     try:
         features.append(vi.Feature.SHOT_CHANGE_DETECTION)
-    except Exception:
-        pass
+    except AttributeError as e:
+        logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable, labels only: %s", e)
     request = vi.AnnotateVideoRequest(
         input_content=video_bytes,
         features=features,
@@ -139,15 +149,19 @@ def _analyze_sync_inline(video_bytes: bytes) -> Dict[str, Any]:
     return _parse_annotation_result(result)
 
 
-def _analyze_sync_gcs(uri: str) -> Dict[str, Any]:
+def _analyze_sync_gcs(uri: str, creds: Any = None) -> Dict[str, Any]:
     from google.cloud import videointelligence_v1 as vi
 
-    client = vi.VideoIntelligenceServiceClient()
+    client = (
+        vi.VideoIntelligenceServiceClient(credentials=creds)
+        if creds is not None
+        else vi.VideoIntelligenceServiceClient()
+    )
     features = [vi.Feature.LABEL_DETECTION]
     try:
         features.append(vi.Feature.SHOT_CHANGE_DETECTION)
-    except Exception:
-        pass
+    except AttributeError as e:
+        logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable (GCS path), labels only: %s", e)
     request = vi.AnnotateVideoRequest(
         input_uri=uri,
         features=features,
@@ -166,11 +180,16 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
     if not VIDEO_INTELLIGENCE_ENABLED:
         raise SkipStage("Video Intelligence disabled (VIDEO_INTELLIGENCE_ENABLED=false)")
 
-    creds = _resolve_gcp_credentials_path()
-    if not creds:
-        raise SkipStage("GOOGLE_APPLICATION_CREDENTIALS not set or path not found")
+    creds_obj = _gcp_creds_for_vi()
+    creds_path = _resolve_gcp_credentials_path()
+    if not creds_obj and not creds_path:
+        raise SkipStage(
+            "GCP credentials not configured for Video Intelligence (same as Vision: "
+            "GOOGLE_APPLICATION_CREDENTIALS or social-media-up-*.json in repo root)"
+        )
 
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds)
+    if creds_path and not (os.environ.get("GCP_SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_CREDENTIALS_JSON")):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
 
     loop = asyncio.get_event_loop()
 
@@ -178,7 +197,7 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
         try:
             data = await loop.run_in_executor(
                 _executor,
-                lambda: _analyze_sync_gcs(VIDEO_INTELLIGENCE_INPUT_URI),
+                lambda: _analyze_sync_gcs(VIDEO_INTELLIGENCE_INPUT_URI, creds_obj),
             )
             ctx.video_intelligence_context = data
             logger.info(
@@ -187,6 +206,8 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
                 len(data.get("shots") or []),
             )
             return ctx
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("[video_intelligence] GCS analyze failed: %s", e)
             ctx.video_intelligence_context = {"error": str(e)}
@@ -209,13 +230,13 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
 
     try:
         video_bytes = video_path.read_bytes()
-    except Exception as e:
+    except (OSError, PermissionError) as e:
         raise SkipStage(f"Cannot read video file: {e}") from e
 
     try:
         data = await loop.run_in_executor(
             _executor,
-            lambda: _analyze_sync_inline(video_bytes),
+            lambda: _analyze_sync_inline(video_bytes, creds_obj),
         )
         ctx.video_intelligence_context = data
         logger.info(
@@ -223,6 +244,8 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
             len(data.get("segment_labels") or []),
             len(data.get("shots") or []),
         )
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning("[video_intelligence] Non-fatal error: %s", e)
         ctx.video_intelligence_context = {"error": str(e)}

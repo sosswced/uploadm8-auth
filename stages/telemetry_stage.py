@@ -6,9 +6,9 @@ and performs reverse geocoding to extract location name
 for use in AI caption/title/hashtag generation.
 """
 
+import json
 import logging
 import asyncio
-import math
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timezone
@@ -148,7 +148,7 @@ def parse_map_file(map_path: Path) -> TelemetryData:
             f"Telemetry file not found: {map_path}",
             code=ErrorCode.TELEMETRY_PARSE_FAILED
         )
-    except Exception as e:
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
         raise TelemetryError(
             f"Failed to parse telemetry file: {e}",
             code=ErrorCode.TELEMETRY_PARSE_FAILED,
@@ -192,17 +192,6 @@ def parse_map_file(map_path: Path) -> TelemetryData:
         f"distance={telemetry.total_distance_miles:.2f} mi"
     )
     return telemetry
-
-
-def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate distance in miles between two GPS points."""
-    R = 3958.8  # Earth radius in miles
-    d_lat = math.radians(lat2 - lat1)
-    d_lon = math.radians(lon2 - lon1)
-    a = (math.sin(d_lat / 2) ** 2 +
-         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-         math.sin(d_lon / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def get_representative_coords(data_points: List[Dict]) -> Optional[Tuple[float, float]]:
@@ -277,11 +266,13 @@ async def reverse_geocode(lat: float, lon: float) -> Optional[str]:
             logger.info(f"Geocoded ({lat:.4f}, {lon:.4f}) → {location}")
             return location or None
 
+    except asyncio.CancelledError:
+        raise
     except asyncio.TimeoutError:
-        logger.warning(f"Geocode timeout for ({lat}, {lon})")
+        logger.warning("Geocode timeout for (%s, %s)", lat, lon)
         return None
-    except Exception as e:
-        logger.warning(f"Geocode error for ({lat}, {lon}): {e}")
+    except (httpx.HTTPError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        logger.warning("Geocode error for (%s, %s): %s", lat, lon, e)
         return None
 
 
@@ -355,22 +346,6 @@ def calculate_trill_score(
         consistency_score=round(consistency_score, 2),
         excessive_speed=telemetry.max_speed_mph >= float(euphoria_mph),
     )
-
-
-def get_trill_modifiers(score: int, max_speed: float, bucket: str) -> tuple:
-    """Get title modifier and hashtags based on Trill score."""
-    if bucket == "gloryBoy":
-        return " - GLORY BOY ", ["GloryBoyTour", "TrillScore100", "SendIt", "DashCam", "CarLife"]
-    elif bucket == "euphoric":
-        return " - Euphoric Run ", ["Euphoric", "TrillScore", "SpeedDemon", "DashCam"]
-    elif bucket == "sendIt":
-        return " - Send It ", ["SendIt", "TrillScore", "Spirited", "DashCam"]
-    elif bucket == "spirited":
-        return " - Spirited Drive ", ["SpiritedDrive", "TrillScore", "DashCam"]
-    elif max_speed >= 100:
-        return " ️", ["TrillScore", "RoadTrip", "DashCam"]
-    else:
-        return " ", ["TrillScore", "CruiseControl", "DashCam"]
 
 
 async def run_telemetry_stage(ctx: JobContext) -> JobContext:

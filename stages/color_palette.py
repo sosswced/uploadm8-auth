@@ -33,7 +33,7 @@ def extract_palette_from_image(image_path: Path, n: int = 5) -> Dict[str, Any]:
 
     try:
         img = Image.open(image_path).convert("RGB")
-    except Exception as e:
+    except (OSError, ValueError, TypeError) as e:
         logger.debug("[color_palette] open failed: %s", e)
         return {}
 

@@ -52,16 +52,73 @@ from typing import List, Optional, Dict, Any
 
 import httpx
 
+try:
+    import asyncpg
+except ImportError:  # pragma: no cover
+    asyncpg = None  # type: ignore[misc, assignment]
+
 from .errors import SkipStage, StageError, ErrorCode
 from .context import JobContext, build_multimodal_scene_digest, resolve_fused_thumbnail_category
 from .content_strategy import build_content_strategy
 from .outbound_rl import outbound_slot
+from .safe_parse import json_list
 
 logger = logging.getLogger("uploadm8-worker.caption")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL_DEFAULT = os.environ.get("OPENAI_CAPTION_MODEL", "gpt-4o-mini")
 M8_ENGINE_ENABLED = os.environ.get("M8_ENGINE_ENABLED", "true").lower() == "true"
+
+_CAPTION_OPENAI_ERRS = (
+    httpx.HTTPError,
+    json.JSONDecodeError,
+    KeyError,
+    TypeError,
+    ValueError,
+    IndexError,
+    OSError,
+    MemoryError,
+    UnicodeError,
+)
+
+_CAPTION_DIGEST_ERRS = (
+    AttributeError,
+    TypeError,
+    KeyError,
+    ValueError,
+    OSError,
+)
+
+_CAPTION_DB_ERRS = (OSError, TypeError, RuntimeError)
+_CAPTION_M8_FALLBACK_ERRS = (
+    *_CAPTION_OPENAI_ERRS,
+    AttributeError,
+)
+_CAPTION_STAGE_NONFATAL = (
+    OSError,
+    PermissionError,
+    *_CAPTION_OPENAI_ERRS,
+    RuntimeError,
+    asyncio.TimeoutError,
+)
+if asyncpg is not None:
+    _CAPTION_DB_ERRS = (
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+        OSError,
+        TypeError,
+        RuntimeError,
+    )
+    _CAPTION_M8_FALLBACK_ERRS = (
+        *_CAPTION_M8_FALLBACK_ERRS,
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+    )
+    _CAPTION_STAGE_NONFATAL = (
+        *_CAPTION_STAGE_NONFATAL,
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+    )
 
 # Meta / filler tags that read as “AI slop” — never emit unless user seeded them explicitly.
 _META_HASHTAG_SLUGS = frozenset({
@@ -721,7 +778,7 @@ async def _live_extract_frames(video_path: Path, temp_dir: Path, n: int) -> List
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await proc.communicate()
-        data = json.loads(stdout.decode())
+        data = json.loads(stdout.decode("utf-8", errors="replace"))
         duration = float(next(
             (s["duration"] for s in data.get("streams", [])
              if s.get("codec_type") == "video"),
@@ -747,8 +804,10 @@ async def _live_extract_frames(video_path: Path, temp_dir: Path, n: int) -> List
             await proc2.wait()
             if frame_path.exists() and frame_path.stat().st_size > 1024:
                 frames.append(frame_path)
-    except Exception as e:
-        logger.warning(f"Live frame extraction failed: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as e:
+        logger.warning("Live frame extraction failed: %s", e)
     return frames
 
 
@@ -973,16 +1032,16 @@ def _build_narrative_prompt(
                 "\n\n━━ MULTIMODAL EVIDENCE (background noise/music, YAMNet, GPS/lat-lon, route, "
                 "landmarks, full vision, people/faces, OCR, telemetry) ━━\n" + md
             )
-    except Exception:
-        pass
+    except _CAPTION_DIGEST_ERRS as e:
+        logger.debug("caption_stage: build_multimodal_scene_digest skipped: %s", e)
 
     fusion_block = ""
     try:
         fr = ctx.get_fusion_caption_rules()
         if fr:
             fusion_block = "\n\n" + fr + "\n"
-    except Exception:
-        pass
+    except (AttributeError, TypeError, KeyError, ValueError) as e:
+        logger.debug("caption_stage: get_fusion_caption_rules skipped: %s", e)
 
     # ── Memory examples (few-shot from past uploads) ─────────────────────────
     memory_block = ""
@@ -994,10 +1053,7 @@ def _build_narrative_prompt(
             c = (ex.get("ai_caption") or "")[:320]
             tags = ex.get("ai_hashtags")
             if isinstance(tags, str):
-                try:
-                    tags = json.loads(tags)
-                except Exception:
-                    tags = []
+                tags = json_list(tags, default=[], context="caption.memory.ai_hashtags")
             if isinstance(tags, list):
                 tag_str = ", ".join(str(x).lstrip("#") for x in tags[:15])
             else:
@@ -1114,8 +1170,8 @@ async def _call_openai(
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": detail}
             })
-        except Exception as e:
-            logger.warning(f"Could not attach frame {frame.name}: {e}")
+        except (OSError, MemoryError, PermissionError) as e:
+            logger.warning("Could not attach frame %s: %s", frame.name, e)
 
     try:
         payload = {
@@ -1205,8 +1261,10 @@ async def _call_openai(
                 result["hashtags"] = refined
                 logger.info(f"AI hashtags raw ({len(result['hashtags'])}): {result['hashtags']}")
 
-    except Exception as e:
-        logger.error(f"OpenAI API call failed: {e}")
+    except asyncio.CancelledError:
+        raise
+    except _CAPTION_OPENAI_ERRS as e:
+        logger.error("OpenAI API call failed: %s", e)
 
     return result
 
@@ -1400,8 +1458,8 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
             ctx.caption_memory_examples = await _db_stage.fetch_caption_memory_examples(
                 db_pool, str(ctx.user_id), category, limit=3
             )
-        except Exception as _mem_err:
-            logger.debug(f"Caption memory fetch skipped: {_mem_err}")
+        except _CAPTION_DB_ERRS as _mem_err:
+            logger.debug("Caption memory fetch skipped: %s", _mem_err)
 
     has_audio = bool(getattr(ctx, "ai_transcript", None))
     logger.info(
@@ -1464,8 +1522,17 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                         logger.info(f"M8 title (legacy default): {ctx.ai_title[:80]}")
                     if ctx.ai_caption:
                         logger.info(f"M8 caption (legacy default): {ctx.ai_caption[:80]}")
-            except Exception as m8_err:
-                logger.warning(f"M8 Engine failed — falling back to legacy caption: {m8_err}")
+            except asyncio.CancelledError:
+                raise
+            except SkipStage:
+                raise
+            except StageError:
+                raise
+            except _CAPTION_M8_FALLBACK_ERRS as m8_err:
+                logger.warning(
+                    "M8 Engine failed — falling back to legacy caption: %s",
+                    m8_err,
+                )
 
         if not m8_used:
             # ── Build prompt (category-aware) ─────────────────────────────────────
@@ -1549,8 +1616,8 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                     strategy_json=ctx.content_strategy if isinstance(ctx.content_strategy, dict) else {},
                     platform_winners=quality_meta.get("platform_winners") or {},
                 )
-            except Exception as _ins_err:
-                logger.debug(f"Caption memory insert skipped: {_ins_err}")
+            except _CAPTION_DB_ERRS as _ins_err:
+                logger.debug("Caption memory insert skipped: %s", _ins_err)
 
         return ctx
 
@@ -1558,8 +1625,10 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         raise
     except StageError:
         raise
-    except Exception as e:
-        logger.error(f"Caption generation failed (non-fatal): {e}")
+    except asyncio.CancelledError:
+        raise
+    except _CAPTION_STAGE_NONFATAL as e:
+        logger.error("Caption generation failed (non-fatal): %s", e)
         err_code = (
             ErrorCode.AI_CAPTION_FAILED.value
             if hasattr(ErrorCode, "AI_CAPTION_FAILED")

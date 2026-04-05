@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import subprocess
 import hmac
 import json
 import logging
@@ -161,8 +162,10 @@ async def _extract_audio_clip(video_path: Path, temp_dir: Path) -> Optional[Path
             return output_path
         logger.warning(f"[audio] FFmpeg extract failed: {stderr.decode()[:200]}")
         return None
-    except Exception as e:
-        logger.warning(f"[audio] Extraction error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (asyncio.TimeoutError, OSError, subprocess.SubprocessError, ValueError) as e:
+        logger.warning("[audio] Extraction error: %s", e)
         return None
 
 
@@ -231,8 +234,10 @@ async def _extract_audio_wav(video_path: Path, output_path: Path) -> bool:
         # ffmpeg not on PATH
         logger.warning("FFmpeg not found on PATH — audio context stage cannot run")
         return False
-    except Exception as e:
-        logger.warning(f"FFmpeg audio extraction exception: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (OSError, subprocess.SubprocessError, asyncio.TimeoutError, ValueError) as e:
+        logger.warning("FFmpeg audio extraction exception: %s", e)
         return False
 
 
@@ -272,8 +277,8 @@ def _classify_audio_yamnet(wav_path: Path) -> Optional[list]:
             for row in reader:
                 class_names.append(row["display_name"])
         return [class_names[i] for i in top5_idx if i < len(class_names)]
-    except Exception as e:
-        logger.debug(f"YAMNet audio classification failed: {e}")
+    except (OSError, ValueError, TypeError, RuntimeError, MemoryError) as e:
+        logger.debug("YAMNet audio classification failed: %s", e)
         return None
 
 
@@ -296,8 +301,8 @@ async def _call_whisper(wav_path: Path) -> Optional[str]:
 
     try:
         wav_bytes = wav_path.read_bytes()
-    except Exception as e:
-        logger.warning(f"Could not read WAV file: {e}")
+    except (OSError, PermissionError) as e:
+        logger.warning("Could not read WAV file: %s", e)
         return None
 
     try:
@@ -329,11 +334,13 @@ async def _call_whisper(wav_path: Path) -> Optional[str]:
             text = data.get("text", "").strip()
             return text
 
+    except asyncio.CancelledError:
+        raise
     except httpx.TimeoutException:
         logger.warning("Whisper API request timed out")
         return None
-    except Exception as e:
-        logger.warning(f"Whisper API call failed: {e}")
+    except (httpx.HTTPError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        logger.warning("Whisper API call failed: %s", e)
         return None
 
 
@@ -367,8 +374,10 @@ async def _transcribe_audio(audio_path: Path) -> Optional[Dict[str, Any]]:
                 "segments": data.get("segments", [])[:15],
             }
         return None
-    except Exception as e:
-        logger.warning(f"[audio] Whisper error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (OSError, httpx.HTTPError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        logger.warning("[audio] Whisper error: %s", e)
         return None
 
 
@@ -420,8 +429,10 @@ async def _recognize_music(audio_path: Path) -> Optional[Dict[str, Any]]:
                     "copyright_warning": True,
                 }
         return {"detected": False, "copyright_warning": False}
-    except Exception as e:
-        logger.warning(f"[audio] ACRCloud error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (OSError, httpx.HTTPError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        logger.warning("[audio] ACRCloud error: %s", e)
         return None
 
 
@@ -497,8 +508,10 @@ Return ONLY valid JSON, no markdown:
             if response.status_code == 200:
                 analysis = json.loads(response.json()["choices"][0]["message"]["content"])
                 logger.info(f"[audio] GPT: {analysis.get('category')}/{analysis.get('subcategory')}")
-        except Exception as e:
-            logger.warning(f"[audio] GPT error: {e}")
+        except asyncio.CancelledError:
+            raise
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning("[audio] GPT error: %s", e)
 
     tr_role = (analysis.get("transcript_role") or "").strip()
     if not tr_role and transcript_text and music_detected and (music_title or music_artist):
@@ -599,10 +612,22 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
         raise SkipStage("Audio context disabled by user preference")
 
     us = ctx.user_settings or {}
+
+    def _pref_enabled(camel_key: str, default: bool = True) -> bool:
+        snake = camel_key[0].lower()
+        for ch in camel_key[1:]:
+            snake += ("_" + ch.lower()) if ch.isupper() else ch
+        return bool(us.get(camel_key, us.get(snake, default)))
+
     use_whisper = us.get("audio_transcription")
     if use_whisper is None:
         use_whisper = us.get("audioTranscription", True)
     use_whisper = bool(use_whisper)
+    use_whisper = use_whisper and _pref_enabled("aiServiceSpeechToText", True)
+    use_audio_signals = _pref_enabled("aiServiceAudioSignals", True)
+    use_music_detection = _pref_enabled("aiServiceMusicDetection", True)
+    use_audio_summary = _pref_enabled("aiServiceAudioSummary", True)
+    use_emotion_signals = _pref_enabled("aiServiceEmotionSignals", True)
 
     audio_codec = _video_info_get(ctx, "audio_codec")
     if not audio_codec:
@@ -656,7 +681,7 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
         transcript_task = asyncio.create_task(_whisper_or_skip())
         acrcloud_task = asyncio.create_task(
             _recognize_music(audio_path)
-            if (ACRCLOUD_HOST and ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET)
+            if (use_music_detection and ACRCLOUD_HOST and ACRCLOUD_ACCESS_KEY and ACRCLOUD_ACCESS_SECRET)
             else _noop()
         )
 
@@ -672,7 +697,7 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
 
         # YAMNet sound classification
         yamnet_context: Dict[str, Any] = {}
-        if YAMNET_ENABLED:
+        if YAMNET_ENABLED and use_audio_signals:
             try:
                 from .yamnet_stage import run_yamnet_classification, yamnet_to_context
                 yamnet_events = await run_yamnet_classification(audio_path)
@@ -682,27 +707,38 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
                 loop = asyncio.get_event_loop()
                 labels = await loop.run_in_executor(None, _classify_audio_yamnet, audio_path)
                 yamnet_context = _yamnet_to_context(labels)
-            except Exception as e:
-                logger.warning(f"[audio] YAMNet error (non-fatal): {e}")
+            except asyncio.CancelledError:
+                raise
+            except (OSError, ValueError, TypeError, RuntimeError) as e:
+                logger.warning("[audio] YAMNet error (non-fatal): %s", e)
 
         # GPT content classification
-        audio_context = await _analyze_audio_context(
-            transcript=transcript_result,
-            music_info=music_result,
-            filename=ctx.filename,
-            platforms=ctx.platforms or [],
-            yamnet_context=yamnet_context,
-        )
+        if use_audio_summary:
+            audio_context = await _analyze_audio_context(
+                transcript=transcript_result,
+                music_info=music_result,
+                filename=ctx.filename,
+                platforms=ctx.platforms or [],
+                yamnet_context=yamnet_context,
+            )
+        else:
+            audio_context = _empty_context()
+            audio_context["transcript"] = (transcript_result or {}).get("text") if isinstance(transcript_result, dict) else ""
+            audio_context["music"] = music_result or {}
         audio_context.update(yamnet_context)
 
         # Hume AI voice emotion
-        if HUME_ENABLED_FLAG:
+        if HUME_ENABLED_FLAG and use_emotion_signals:
             try:
                 from .hume_stage import analyze_voice_emotion, merge_hume_into_audio_context
                 hume_result = await analyze_voice_emotion(audio_path)
                 audio_context = merge_hume_into_audio_context(audio_context, hume_result)
-            except Exception as e:
-                logger.warning(f"[audio] Hume error (non-fatal): {e}")
+            except ImportError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except (httpx.HTTPError, TypeError, ValueError, KeyError, OSError, AttributeError) as e:
+                logger.warning("[audio] Hume error (non-fatal): %s", e)
 
         ctx.audio_context = audio_context
 
@@ -722,9 +758,19 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
         )
         return ctx
 
+    except asyncio.CancelledError:
+        raise
     except SkipStage:
         raise
-    except Exception as e:
-        logger.warning(f"[audio] Non-fatal stage error: {e}")
+    except (
+        OSError,
+        asyncio.TimeoutError,
+        subprocess.SubprocessError,
+        httpx.HTTPError,
+        ValueError,
+        TypeError,
+        RuntimeError,
+    ) as e:
+        logger.warning("[audio] Non-fatal stage error: %s", e)
         ctx.audio_context = _empty_context()
         return ctx

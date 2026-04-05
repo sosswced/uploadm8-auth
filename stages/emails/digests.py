@@ -5,7 +5,10 @@ UploadM8 — Digest Emails
   send_admin_weekly_kpi_digest_email -> weekly admin KPI summary
 """
 
+import html as html_module
 import logging
+from typing import List, Optional, Tuple
+
 from .base import (
     send_email, mailgun_ready, tier_label, MAIL_FROM_SUPPORT, SUPPORT_EMAIL,
     email_shell, intro_row, cta_button, tinted_box, stat_grid, secondary_links,
@@ -30,6 +33,10 @@ async def send_monthly_user_kpi_digest_email(
     aic_used: int,
     put_balance: int,
     aic_balance: int,
+    *,
+    comments: int = 0,
+    shares: int = 0,
+    platform_breakdown: Optional[List[Tuple[str, str]]] = None,
 ) -> None:
     if not mailgun_ready():
         return
@@ -55,13 +62,34 @@ async def send_monthly_user_kpi_digest_email(
             + stat_grid(
                 ("Views", f"{views:,}"),
                 ("Likes", f"{likes:,}"),
+                ("Comments", f"{comments:,}"),
+                ("Shares", f"{shares:,}"),
+            )
+            + stat_grid(
                 ("PUT Used", f"{put_used:,}"),
                 ("AIC Used", f"{aic_used:,}"),
+            )
+            + (
+                divider_accent("linear-gradient(90deg,rgba(37,99,235,0) 0%,#2563eb 50%,rgba(37,99,235,0) 100%)")
+                + tinted_box(
+                    '<p style="margin:0 0 10px;color:#9ca3af;font-size:11px;text-transform:uppercase;'
+                    'letter-spacing:1px;font-weight:700;">By platform (targets)</p>'
+                    + "".join(
+                        f'<p style="margin:6px 0;color:#d1d5db;font-size:14px;line-height:1.55;">'
+                        f'<strong style="color:#ffffff;">{html_module.escape(lbl)}:</strong> '
+                        f'{html_module.escape(val)}</p>'
+                        for lbl, val in platform_breakdown
+                    ),
+                    hex_color="#1e3a5f",
+                )
+                if platform_breakdown
+                else ""
             )
             + divider_accent("linear-gradient(90deg,rgba(37,99,235,0) 0%,#2563eb 50%,rgba(37,99,235,0) 100%)")
             + tinted_box(
                 f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
                 f'<strong style="color:#ffffff;">Current wallet:</strong> {put_balance:,} PUT and {aic_balance:,} AIC available. '
+                f'PUT/AIC usage reflects ledger spend when recorded, otherwise upload totals. '
                 f'Need more capacity? Upgrade your tier or add a one-time top-up from Billing.</p>',
                 hex_color="#2563eb",
             )
@@ -94,6 +122,10 @@ async def send_admin_weekly_kpi_digest_email(
     revenue: float,
     cost: float,
     margin_pct: float,
+    *,
+    upload_success_pct: int = 0,
+    trialing_paid_users: int = 0,
+    platform_summary_lines: Optional[List[str]] = None,
 ) -> None:
     if not mailgun_ready():
         return
@@ -118,14 +150,35 @@ async def send_admin_weekly_kpi_digest_email(
             + stat_grid(
                 ("Total Users", f"{total_users:,}"),
                 ("New Users", f"{new_users:,}"),
-                ("Paid Users", f"{paid_users:,}"),
+                ("Paid (active/trial)", f"{paid_users:,}"),
                 ("Uploads", f"{uploads:,}"),
+            )
+            + stat_grid(
+                ("Upload success %", f"{upload_success_pct}%"),
+                ("Trialing (paid tier)", f"{trialing_paid_users:,}"),
+            )
+            + (
+                tinted_box(
+                    '<p style="margin:0 0 10px;color:#c4b5fd;font-size:11px;text-transform:uppercase;'
+                    'letter-spacing:1px;font-weight:700;">Platform rollups (UTC week, DB)</p>'
+                    + "".join(
+                        f'<p style="margin:8px 0;color:#e9d5ff;font-size:13px;line-height:1.55;font-family:system-ui,sans-serif;">'
+                        f'{html_module.escape(line)}</p>'
+                        for line in (platform_summary_lines or [])
+                    ),
+                    hex_color="#5b21b6",
+                    pb="24px",
+                )
+                if platform_summary_lines
+                else ""
             )
             + tinted_box(
                 f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
                 f'<strong style="color:#ffffff;">Cost estimate:</strong> ${cost:,.2f}. '
                 f'<strong style="color:#ffffff;">Revenue estimate:</strong> ${revenue:,.2f}. '
-                f'This digest is for operational awareness and should be validated against Stripe exports for accounting.</p>',
+                f'Paid users = active or trialing on creator_lite / creator_pro / studio / agency. '
+                f'Platform metrics use the platform_kpi_rollups_daily table (refreshed from uploads). '
+                f'Validate revenue against Stripe exports for accounting.</p>',
                 hex_color="#7c3aed",
                 pb="36px",
             )

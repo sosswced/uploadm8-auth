@@ -6,6 +6,7 @@ Database helpers used by the worker pipeline stages.
 
 from __future__ import annotations
 
+import binascii
 import json
 import logging
 import math
@@ -143,6 +144,16 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "trillOpenaiModel": "openai_model",
                         "useAudioContext":  "use_audio_context",
                         "audioTranscription": "audio_transcription",
+                        "thumbnailStudioEnabled": "thumbnail_studio_enabled",
+                        "thumbnailStudioEngineEnabled": "thumbnail_studio_engine_enabled",
+                        "thumbnailPikzelsEnabled": "thumbnail_pikzels_enabled",
+                        "thumbnailPersonaEnabled": "thumbnail_persona_enabled",
+                        "thumbnailDefaultPersonaId": "thumbnail_default_persona_id",
+                        "thumbnailPersonaStrength": "thumbnail_persona_strength",
+                        "thumbnailUseStudioEngine": "thumbnail_use_studio_engine",
+                        "thumbnailUsePikzels": "thumbnail_use_pikzels",
+                        "thumbnailUsePersona": "thumbnail_use_persona",
+                        "thumbnailPersonaId": "thumbnail_persona_id",
                     }
                     for camel, snake in FIELD_MAP.items():
                         val = prefs.get(camel)
@@ -228,6 +239,8 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                     "http_status": r.http_status,
                     "views": r.views,
                     "likes": r.likes,
+                    "comments": getattr(r, "comments", 0) or 0,
+                    "shares": getattr(r, "shares", 0) or 0,
                 }
                 for r in ctx.platform_results
             ]
@@ -348,7 +361,8 @@ async def check_cancel_requested(pool: asyncpg.Pool, upload_id: str) -> bool:
                 "SELECT cancel_requested FROM uploads WHERE id = $1", upload_id
             )
             return bool(val)
-    except Exception:
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as e:
+        logger.debug("check_cancel_requested failed upload_id=%s: %s", upload_id, e)
         return False
 
 
@@ -373,10 +387,15 @@ async def update_stage_progress(pool: asyncpg.Pool, upload_id: str, stage: str, 
                 stage,
                 progress,
             )
-    except Exception:
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as e:
         # Non-fatal — if columns don't exist yet neither screen will show progress,
         # but the pipeline won't crash
-        pass
+        logger.debug(
+            "update_stage_progress failed upload_id=%s stage=%s: %s",
+            upload_id,
+            stage,
+            e,
+        )
 
 
 # ============================================================
@@ -448,8 +467,14 @@ async def fetch_caption_memory_examples(
         return [dict(r) for r in rows] if rows else []
     except asyncpg.exceptions.UndefinedTableError:
         return []
-    except Exception as e:
-        logger.debug(f"fetch_caption_memory_examples: {e}")
+    except (
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as e:
+        logger.debug("fetch_caption_memory_examples: %s", e)
         return []
 
 
@@ -533,8 +558,14 @@ async def insert_caption_memory(
                 )
     except asyncpg.exceptions.UndefinedTableError:
         pass
-    except Exception as e:
-        logger.debug(f"insert_caption_memory: {e}")
+    except (
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as e:
+        logger.debug("insert_caption_memory: %s", e)
 
 
 async def fetch_recent_thumbnail_style_signatures(
@@ -935,8 +966,10 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                             if isinstance(parsed, str):
                                 try:
                                     parsed = json.loads(parsed)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(
+                                        "db.load_platform_token: double-encoded token JSON parse failed: %s", e
+                                    )
                         else:
                             parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
                         # Inject platform-specific IDs from the DB row's account_id column
@@ -974,7 +1007,7 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                         return parsed
                     return row_dict
             except asyncpg.exceptions.UndefinedTableError:
-                pass
+                logger.debug("db.load_platform_token: platform_tokens table missing, trying connected_accounts")
 
             # Fallback: connected_accounts table
             try:
@@ -999,8 +1032,10 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                             if isinstance(parsed, str):
                                 try:
                                     parsed = json.loads(parsed)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.debug(
+                                        "db.load_platform_token: double-encoded token JSON parse failed: %s", e
+                                    )
                         else:
                             parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
                         if account_id_col and isinstance(parsed, dict):
@@ -1066,15 +1101,21 @@ async def load_platform_token_with_identity(
                 "account_avatar":   row_dict.get("account_avatar") or "",
             }
 
-            token_data = row_dict.get("token_blob") or row_dict.get("token_data")
+            token_data = (
+                row_dict.get("token_blob")
+                or row_dict.get("token_data")
+                or row_dict.get("encrypted_token")
+            )
             if token_data:
                 if isinstance(token_data, str):
                     parsed = json.loads(token_data)
                     if isinstance(parsed, str):
                         try:
                             parsed = json.loads(parsed)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(
+                                "db.load_platform_token_with_identity: double-encoded token parse failed: %s", e
+                            )
                 else:
                     parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
 
@@ -1096,27 +1137,6 @@ async def load_platform_token_with_identity(
         return None, None
 
 
-async def load_all_platform_token_ids(pool: asyncpg.Pool, user_id: str, platform: str) -> list[str]:
-    """Return all platform_tokens.id for the user's connected accounts on this platform.
-    Used for multi-account publishing: when no target_accounts specified, publish to ALL.
-    """
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id FROM platform_tokens
-                WHERE user_id = $1 AND platform = $2 AND revoked_at IS NULL
-                ORDER BY updated_at DESC
-                """,
-                user_id,
-                platform,
-            )
-            return [str(r["id"]) for r in rows]
-    except Exception as e:
-        logger.error(f"Failed to load platform token ids for {user_id}/{platform}: {e}")
-        return []
-
-
 async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Optional[dict]:
     """Load a stored platform OAuth token by its platform_tokens.id (UUID).
 
@@ -1133,7 +1153,11 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
             if not row:
                 return None
             row_dict = dict(row)
-            token_data = row_dict.get("token_blob") or row_dict.get("token_data")
+            token_data = (
+                row_dict.get("token_blob")
+                or row_dict.get("token_data")
+                or row_dict.get("encrypted_token")
+            )
             if not token_data:
                 return None
             if isinstance(token_data, str):
@@ -1141,8 +1165,10 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
                 if isinstance(parsed, str):
                     try:
                         parsed = json.loads(parsed)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(
+                            "db.load_platform_token_by_id: double-encoded token parse failed: %s", e
+                        )
             else:
                 parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
             if isinstance(parsed, dict):
@@ -1339,7 +1365,16 @@ async def load_pending_verifications(pool: asyncpg.Pool, limit: int = 50) -> Lis
                     JOIN uploads u ON u.id = pa.upload_id
                     WHERE pa.status = 'accepted'
                       AND (pa.verify_status IS NULL OR pa.verify_status = 'pending')
-                      AND pa.created_at > NOW() - INTERVAL '24 hours'
+                      AND (
+                        -- Still-pending attempts get a 7-day window (TikTok processes async
+                        -- and the verify_stage often runs before TikTok finishes).
+                        pa.verify_status = 'pending'
+                          AND pa.created_at > NOW() - INTERVAL '7 days'
+                        OR
+                        -- First-time (never verified) attempts use 24 hours.
+                        pa.verify_status IS NULL
+                          AND pa.created_at > NOW() - INTERVAL '24 hours'
+                      )
                     ORDER BY pa.created_at ASC
                     LIMIT $1
                     """,
@@ -1365,7 +1400,11 @@ async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
                 "SELECT settings_json->'notifications'->>'admin_webhook_url' FROM admin_settings WHERE id = 1"
             )
             return str(val).strip() if val else None
-    except Exception:
+    except asyncpg.exceptions.UndefinedTableError:
+        logger.debug("load_admin_notification_webhook: admin_settings missing")
+        return None
+    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as e:
+        logger.debug("load_admin_notification_webhook: %s", e)
         return None
 
 
@@ -1418,82 +1457,6 @@ async def save_processed_assets(pool: asyncpg.Pool, upload_id: str, assets: Dict
             logger.warning(f"Could not save processed_assets: {e}")
 
 
-async def load_processed_assets(pool: asyncpg.Pool, upload_id: str) -> Dict[str, str]:
-    """Load per-platform R2 keys for an upload.
-
-    Returns dict like {"tiktok": "processed/.../tiktok.mp4", ...}
-    """
-    async with pool.acquire() as conn:
-        # Try dedicated column
-        try:
-            val = await conn.fetchval(
-                "SELECT processed_assets FROM uploads WHERE id = $1",
-                upload_id,
-            )
-            if val:
-                return json.loads(val) if isinstance(val, str) else dict(val)
-        except asyncpg.exceptions.UndefinedColumnError:
-            pass
-
-        # Fallback: check output_artifacts
-        try:
-            val = await conn.fetchval(
-                "SELECT output_artifacts->'processed_assets' FROM uploads WHERE id = $1",
-                upload_id,
-            )
-            if val:
-                return json.loads(val) if isinstance(val, str) else dict(val)
-        except Exception:
-            pass
-
-    return {}
-
-
-async def update_platform_token_identity_from_upload(
-    pool: asyncpg.Pool,
-    token_row_id: str,
-    user_id: str,
-    account_username: Optional[str] = None,
-    account_name: Optional[str] = None,
-    account_id: Optional[str] = None,
-) -> None:
-    """
-    Backfill platform_tokens with account identity when we get it from post-upload
-    response (e.g. YouTube channelTitle). Only updates fields that are currently empty.
-    """
-    if not pool or not token_row_id or not user_id:
-        return
-    updates = []
-    params: list = [user_id, token_row_id]
-    idx = 3
-    if account_username and (account_username or "").strip():
-        updates.append(f"account_username = COALESCE(NULLIF(TRIM(account_username), ''), ${idx})")
-        params.append((account_username or "").strip())
-        idx += 1
-    if account_name and (account_name or "").strip():
-        updates.append(f"account_name = COALESCE(NULLIF(TRIM(account_name), ''), ${idx})")
-        params.append((account_name or "").strip())
-        idx += 1
-    if account_id and (account_id or "").strip():
-        updates.append(f"account_id = COALESCE(NULLIF(TRIM(account_id), ''), ${idx})")
-        params.append((account_id or "").strip())
-        idx += 1
-    if not updates:
-        return
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                f"""UPDATE platform_tokens SET {', '.join(updates)}, updated_at = NOW()
-                    WHERE id = $2 AND user_id = $1 AND revoked_at IS NULL""",
-                params[0],
-                params[1],
-                *params[2:],
-            )
-            logger.debug(f"Updated platform_tokens identity for token_row_id={token_row_id[:8]}")
-    except Exception as e:
-        logger.warning(f"update_platform_token_identity_from_upload failed: {e}")
-
-
 async def save_refreshed_token(
     pool: asyncpg.Pool,
     user_id: str,
@@ -1502,9 +1465,14 @@ async def save_refreshed_token(
     refresh_token: Optional[str] = None,
     open_id: Optional[str] = None,
     extra_fields: Optional[Dict[str, Any]] = None,
+    token_row_id: Optional[str] = None,
 ) -> None:
     """
     Persist a refreshed platform OAuth token back to the database.
+
+    When ``token_row_id`` is set (``platform_tokens.id``), load/update that row directly
+    instead of ``WHERE user_id AND platform LIMIT 1`` — avoids N+1 and wrong-row updates
+    when a user has multiple accounts on the same platform.
 
     CRITICAL FIX: token_blob is stored as TEXT (json.dumps of encrypted blob).
     Previous version used JSONB || operator which does STRING CONCATENATION on
@@ -1547,8 +1515,8 @@ async def save_refreshed_token(
                     if len(raw) == 32:
                         _enc_keys[kid.strip()] = raw
                         _current_kid = kid.strip()
-                except Exception:
-                    pass
+                except (binascii.Error, TypeError, ValueError) as e:
+                    logger.debug("db.migrate_tokens: skip invalid TOKEN_ENC_KEYS segment kid=%s: %s", kid.strip(), e)
 
         def _encrypt(data: dict) -> str:
             """Re-encrypt a token dict and return json.dumps of the encrypted blob."""
@@ -1565,8 +1533,84 @@ async def save_refreshed_token(
             }
             return json.dumps(blob)
 
+        async def _persist_row(conn, table: str, row) -> bool:
+            if not row:
+                return False
+            row_id = row["id"]
+            raw_blob = row["token_blob"]
+
+            current_encrypted: Optional[dict] = None
+            try:
+                if isinstance(raw_blob, str):
+                    current_encrypted = json.loads(raw_blob)
+                    if isinstance(current_encrypted, str):
+                        current_encrypted = json.loads(current_encrypted)
+                elif isinstance(raw_blob, dict):
+                    current_encrypted = dict(raw_blob)
+                else:
+                    current_encrypted = dict(raw_blob) if raw_blob else None
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                logger.debug("save_refreshed_token: token_blob parse failed: %s", e)
+                current_encrypted = None
+
+            current_plain: dict = {}
+            if current_encrypted:
+                try:
+                    init_enc_keys()
+                    current_plain = decrypt_token_blob(current_encrypted) or {}
+                except Exception as e:
+                    logger.debug(
+                        "save_refreshed_token: decrypt failed, starting fresh token fields: %s",
+                        e,
+                    )
+                    current_plain = {}
+
+            current_plain["access_token"] = access_token
+            if refresh_token:
+                current_plain["refresh_token"] = refresh_token
+            if open_id:
+                current_plain["open_id"] = open_id
+            if extra_fields:
+                for k, v in extra_fields.items():
+                    if v is not None:
+                        current_plain[k] = v
+
+            new_blob_str = _encrypt(current_plain)
+
+            try:
+                await conn.execute(
+                    f"UPDATE {table} SET token_blob = $1, updated_at = NOW() "
+                    f"WHERE id = $2",
+                    new_blob_str,
+                    row_id,
+                )
+                logger.info(
+                    "save_refreshed_token: persisted %s token for user=%s table=%s row=%s",
+                    platform,
+                    user_id,
+                    table,
+                    row_id,
+                )
+                return True
+            except Exception as write_err:
+                logger.warning("save_refreshed_token: write failed on %s: %s", table, write_err)
+                return False
+
         async with pool.acquire() as conn:
-            # ── Try platform_tokens ───────────────────────────────────────
+            if token_row_id:
+                try:
+                    by_id = await conn.fetchrow(
+                        "SELECT id, token_blob FROM platform_tokens WHERE id = $1::uuid",
+                        token_row_id,
+                    )
+                except asyncpg.exceptions.UndefinedTableError:
+                    by_id = None
+                except asyncpg.PostgresError as e:
+                    logger.debug("save_refreshed_token by id: %s", e)
+                    by_id = None
+                if by_id and await _persist_row(conn, "platform_tokens", by_id):
+                    return
+
             for table in ("platform_tokens", "connected_accounts"):
                 try:
                     row = await conn.fetchrow(
@@ -1577,66 +1621,14 @@ async def save_refreshed_token(
                     )
                 except asyncpg.exceptions.UndefinedTableError:
                     continue
-                except Exception:
+                except asyncpg.PostgresError as e:
+                    logger.debug("save_refreshed_token fetchrow %s: %s", table, e)
                     continue
 
                 if not row:
                     continue
-
-                row_id = row["id"]
-                raw_blob = row["token_blob"]
-
-                # Parse the current stored blob (TEXT or JSONB both handled)
-                current_encrypted: Optional[dict] = None
-                try:
-                    if isinstance(raw_blob, str):
-                        current_encrypted = json.loads(raw_blob)
-                        # Handle double-encoded
-                        if isinstance(current_encrypted, str):
-                            current_encrypted = json.loads(current_encrypted)
-                    elif isinstance(raw_blob, dict):
-                        current_encrypted = dict(raw_blob)
-                    else:
-                        current_encrypted = dict(raw_blob) if raw_blob else None
-                except Exception:
-                    current_encrypted = None
-
-                # Decrypt to get plaintext token fields
-                current_plain: dict = {}
-                if current_encrypted:
-                    try:
-                        init_enc_keys()
-                        current_plain = decrypt_token_blob(current_encrypted) or {}
-                    except Exception:
-                        # If decrypt fails, start fresh with just the new token
-                        current_plain = {}
-
-                # Merge new values into plaintext
-                current_plain["access_token"] = access_token
-                if refresh_token:
-                    current_plain["refresh_token"] = refresh_token
-                if open_id:
-                    current_plain["open_id"] = open_id
-                if extra_fields:
-                    for k, v in extra_fields.items():
-                        if v is not None:
-                            current_plain[k] = v
-
-                # Re-encrypt and write back as clean TEXT
-                new_blob_str = _encrypt(current_plain)
-
-                try:
-                    await conn.execute(
-                        f"UPDATE {table} SET token_blob = $1, updated_at = NOW() "
-                        f"WHERE id = $2",
-                        new_blob_str,
-                        row_id,
-                    )
-                    logger.info(f"save_refreshed_token: persisted {platform} token for user={user_id} table={table}")
+                if await _persist_row(conn, table, row):
                     return
-                except Exception as write_err:
-                    logger.warning(f"save_refreshed_token: write failed on {table}: {write_err}")
-                    continue
 
             logger.warning(f"save_refreshed_token: no row found for {platform} user={user_id}")
 

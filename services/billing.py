@@ -9,7 +9,6 @@ from stages.entitlements import STRIPE_LOOKUP_TO_TIER, entitlements_to_dict, get
 
 _TIER_RANK = {
     "free": 0,
-    "launch": 1,
     "creator_lite": 1,
     "creator_pro": 2,
     "studio": 3,

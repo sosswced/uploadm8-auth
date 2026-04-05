@@ -58,7 +58,7 @@ import logging
 import math
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -67,12 +67,14 @@ from .context import JobContext, resolve_fused_thumbnail_category
 from .entitlements import should_generate_thumbnails
 from .errors import SkipStage
 from services.ml_strategy_utils import prefer_ai_thumbnail_vs_sharpness
+from .pikzels_api import studio_renderer_enabled, render_thumbnail_with_studio_renderer
 from .trend_intel import fetch_trend_intel
 from .thumbnail_qa import (
     YOUTUBE_SEARCH_PREVIEW_QA,
     assess_youtube_search_preview_readability,
     pick_tiktok_cover_offset_seconds,
 )
+from .safe_parse import json_dict
 
 logger = logging.getLogger("uploadm8-worker.thumbnail")
 
@@ -95,6 +97,22 @@ OPENAI_THUMB_MODEL       = os.environ.get("OPENAI_THUMB_MODEL", "gpt-4o-mini")
 OPENAI_IMAGE_EDIT_MODEL  = os.environ.get("OPENAI_IMAGE_EDIT_MODEL", "gpt-image-1")
 # Optional bold font for template thumbnails (falls back to Arial / DejaVu).
 THUMBNAIL_FONT_BOLD = os.environ.get("THUMBNAIL_FONT_BOLD", "").strip()
+
+
+def _thumbnail_render_engine_mode() -> str:
+    """
+    Select styled-thumbnail renderer:
+    - internal: use UploadM8 native renderer stack
+    - studio: try external studio renderer first, then fallback to internal
+    - auto: same as studio when configured; otherwise internal
+    """
+    raw = str(os.environ.get("THUMB_RENDER_ENGINE", "studio")).strip().lower()
+    # Legacy engine token support.
+    if raw == "pikzels":
+        return "studio"
+    if raw in ("internal", "studio", "auto"):
+        return raw
+    return "internal"
 
 
 # ============================================================
@@ -493,8 +511,8 @@ async def _ai_select_best_frame(
                 "text": f"[Frame {i}]"
             })
             attached += 1
-        except Exception as e:
-            logger.debug(f"Could not attach frame {path.name}: {e}")
+        except (OSError, PermissionError, TypeError, ValueError) as e:
+            logger.debug("Could not attach frame %s: %s", path.name, e)
 
     if attached == 0:
         logger.warning("AI thumbnail selection: no frames could be attached")
@@ -532,8 +550,11 @@ async def _ai_select_best_frame(
         elif "```" in answer:
             answer = answer.split("```")[1].split("```")[0]
 
-        parsed = json.loads(answer)
-        selected_idx = int(parsed.get("selected_frame", 0))
+        parsed = json_dict(answer, default={}, context="ai_thumbnail_selection")
+        try:
+            selected_idx = int(parsed.get("selected_frame", 0))
+        except (TypeError, ValueError):
+            selected_idx = 0
         reason = str(parsed.get("reason", ""))
 
         if 1 <= selected_idx <= len(frames_to_send):
@@ -550,11 +571,10 @@ async def _ai_select_best_frame(
         )
         return None
 
-    except json.JSONDecodeError as e:
-        logger.warning(f"AI thumbnail response not valid JSON: {e}")
-        return None
-    except Exception as e:
-        logger.warning(f"AI thumbnail selection failed (non-fatal, using sharpness): {e}")
+    except asyncio.CancelledError:
+        raise
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError, httpx.HTTPError) as e:
+        logger.warning("AI thumbnail selection failed (non-fatal, using sharpness): %s", e)
         return None
 
 
@@ -603,11 +623,10 @@ async def _generate_thumbnail_brief(ctx: JobContext, category: str) -> Optional[
         brief["platform_plan"].setdefault("facebook", {"enabled": True, "canvas": "9:16", "safe_center_pct": 60})
         brief["platform_plan"].setdefault("tiktok", {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5})
         return brief
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.warning(f"Thumbnail brief parse failed: {e}")
-        return None
-    except Exception as e:
-        logger.warning(f"Thumbnail brief generation failed: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError, httpx.HTTPError) as e:
+        logger.warning("Thumbnail brief generation failed: %s", e)
         return None
 
 
@@ -876,7 +895,7 @@ def _clamp_focal_for_safe_center(nx: float, safe_center_pct: float) -> float:
     """
     try:
         pct = float(safe_center_pct)
-    except Exception:
+    except (TypeError, ValueError):
         pct = 60.0
     pct = max(35.0, min(90.0, pct))
     half = (pct / 100.0) * 0.5
@@ -924,7 +943,8 @@ def _score_frame_visual_quality(image_path: Path) -> float:
         sat_norm = max(0.0, min(1.0, sat_mean / 150.0))
         center_norm = max(0.0, min(1.0, (center_ratio - 0.75) / 0.9))
         return 0.45 * contrast_norm + 0.30 * sat_norm + 0.25 * center_norm
-    except Exception:
+    except (OSError, ValueError, TypeError, ZeroDivisionError) as e:
+        logger.debug("thumbnail_stage._score_frame_visual_quality: %s", e)
         return 0.0
 
 
@@ -1242,10 +1262,7 @@ def _render_template_thumbnail(
                     except Exception:
                         continue
                 qa_rejections.append(rec)
-            try:
-                logger.debug(f"thumb-template qa-reject platform={platform} meta={qa_meta}")
-            except Exception:
-                pass
+            logger.debug("thumb-template qa-reject platform=%s meta=%s", platform, qa_meta)
             continue
 
         score, meta = _composition_pop_score(img.convert("RGB"), focal_strength, len(headline.split()))
@@ -1261,10 +1278,12 @@ def _render_template_thumbnail(
             }
             if qa_rejections:
                 brief.setdefault("_qa_rejections", {})[platform] = qa_rejections[:]
-            try:
-                logger.debug(f"thumb-template pop-score={score:.2f} meta={meta} style={style.get('pack_name')}")
-            except Exception:
-                pass
+            logger.debug(
+                "thumb-template pop-score=%.2f meta=%s style=%s",
+                score,
+                meta,
+                style.get("pack_name"),
+            )
 
         # Hard quality gate: pass early if strong composition.
         if score >= 56.0 and focal_strength >= 1.10:
@@ -1865,7 +1884,10 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
         try:
             use_ai, ml_decision = await _ml_pick_thumbnail_ai_vs_sharpness()
             ml_bias = ml_decision
-        except Exception:
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("thumbnail_stage: ml thumbnail decision failed: %s", e)
             use_ai = False
 
         ctx.output_artifacts["_ml_thumbnail_selection_bias"] = ml_bias or {"reason": "ml_decide_skipped"}
@@ -1912,8 +1934,8 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
         ctx.output_artifacts["thumbnail_frame_offsets_json"] = json.dumps(
             {Path(k).name: round(v, 3) for k, v in path_to_offset.items()}
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("thumbnail_stage: could not write tiktok cover / frame offset artifacts: %s", e)
 
     # ── Populate ctx ────────────────────────────────────────────────────────
     # Chronological candidate list (caption_stage uses these for multi-frame story)
@@ -1936,8 +1958,8 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
         ctx.frame_color_palette = extract_palette_from_image(best_path)
         if ctx.frame_color_palette:
             ctx.output_artifacts["thumbnail_color_palette_json"] = json.dumps(ctx.frame_color_palette)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("thumbnail_stage: extract_palette_from_image skipped: %s", e)
 
     # Artifacts — picked up by worker.py for R2 upload and DB save
     ctx.output_artifacts["thumbnail"]                   = str(best_path)
@@ -2010,21 +2032,20 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
                 )
             ctx.output_artifacts["thumbnail_brief_json"] = json.dumps(brief)
             ctx.thumbnail_brief = brief
-            try:
-                prior_raw = ctx.output_artifacts.get("_recent_thumbnail_style_signatures", "{}")
-                prior_map = json.loads(prior_raw) if isinstance(prior_raw, str) else (prior_raw or {})
-            except Exception:
-                prior_map = {}
-            try:
-                prior_pack_raw = ctx.output_artifacts.get("_recent_thumbnail_style_packs", "{}")
-                prior_pack_map = json.loads(prior_pack_raw) if isinstance(prior_pack_raw, str) else (prior_pack_raw or {})
-            except Exception:
-                prior_pack_map = {}
+            prior_raw = ctx.output_artifacts.get("_recent_thumbnail_style_signatures", "{}")
+            prior_map = json_dict(
+                prior_raw, default={}, context="thumbnail._recent_thumbnail_style_signatures"
+            )
+            prior_pack_raw = ctx.output_artifacts.get("_recent_thumbnail_style_packs", "{}")
+            prior_pack_map = json_dict(
+                prior_pack_raw, default={}, context="thumbnail._recent_thumbnail_style_packs"
+            )
             brief["_avoid_style_signatures"] = prior_map
             brief["_recent_style_packs"] = prior_pack_map
 
             # TikTok: no custom thumbnail via API — store thumb_offset for worker
             platform_map: Dict[str, str] = {}
+            platform_engine_map: Dict[str, str] = {}
             tiktok_plan = brief.get("platform_plan", {}).get("tiktok", {})
             ctx.output_artifacts["tiktok_thumb_offset_seconds"] = str(
                 tiktok_plan.get("thumb_offset_seconds", 1.5)
@@ -2039,12 +2060,77 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
             # AI image edits can be flashy/inconsistent, so keep them as fallback unless explicitly preferred.
             ai_style_mode = str(os.environ.get("THUMB_AI_STYLE_MODE", "fallback")).strip().lower()
             prefer_ai_edit = ai_style_mode in ("prefer_ai", "ai_first")
+            render_engine_mode = _thumbnail_render_engine_mode()
+            studio_enabled = bool(us.get("thumbnail_studio_enabled", us.get("thumbnailStudioEnabled", False)))
+            engine_pref_enabled = bool(
+                us.get(
+                    "thumbnail_studio_engine_enabled",
+                    us.get("thumbnailStudioEngineEnabled", us.get("thumbnail_pikzels_enabled", us.get("thumbnailPikzelsEnabled", False))),
+                )
+            )
+            use_engine_this_upload = bool(
+                us.get(
+                    "thumbnail_use_studio_engine",
+                    us.get("thumbnailUseStudioEngine", us.get("thumbnail_use_pikzels", us.get("thumbnailUsePikzels", False))),
+                )
+            )
+            allow_persona = bool(us.get("thumbnail_persona_enabled", us.get("thumbnailPersonaEnabled", False)))
+            use_persona_this_upload = bool(us.get("thumbnail_use_persona", us.get("thumbnailUsePersona", False)))
+            persona_id = str(us.get("thumbnail_persona_id", us.get("thumbnailPersonaId", "")) or "").strip()
+            try:
+                persona_strength = int(us.get("thumbnail_persona_strength", us.get("thumbnailPersonaStrength", 70)) or 70)
+            except (TypeError, ValueError):
+                persona_strength = 70
+            persona_strength = max(0, min(100, persona_strength))
+            persona_payload: Optional[Dict[str, Any]] = None
+            if studio_enabled and allow_persona and use_persona_this_upload and persona_id and db_pool:
+                try:
+                    async with db_pool.acquire() as conn:
+                        prow = await conn.fetchrow(
+                            """
+                            SELECT id, name, profile_json
+                            FROM creator_personas
+                            WHERE id = $1::uuid AND user_id = $2::uuid
+                            """,
+                            persona_id,
+                            str(ctx.user_id),
+                        )
+                        if prow:
+                            irows = await conn.fetch(
+                                """
+                                SELECT image_url
+                                FROM creator_persona_images
+                                WHERE persona_id = $1::uuid
+                                ORDER BY created_at ASC
+                                LIMIT 5
+                                """,
+                                persona_id,
+                            )
+                            persona_payload = {
+                                "id": str(prow.get("id") or ""),
+                                "name": str(prow.get("name") or ""),
+                                "profile": dict(prow.get("profile_json") or {}),
+                                "strength": persona_strength,
+                                "reference_images": [str(r.get("image_url") or "") for r in (irows or []) if str(r.get("image_url") or "").strip()],
+                            }
+                except Exception as e:
+                    logger.debug("[thumbnail] persona fetch failed: %s", e)
+
+            allow_studio_renderer = (
+                studio_enabled
+                and engine_pref_enabled
+                and use_engine_this_upload
+                and render_engine_mode in ("studio", "auto")
+                and studio_renderer_enabled()
+            )
+            ctx.output_artifacts["thumbnail_persona_applied"] = "true" if persona_payload else "false"
             primary_styled: Optional[Path] = None  # Prefer YouTube for primary
             youtube_frame_src: Optional[Path] = None
             for platform in platforms_to_render:
                 out_name = f"thumb_styled_{platform}_{ctx.upload_id}.jpg"
                 out_path = ctx.temp_dir / out_name
                 ok = False
+                engine_used = "internal"
                 frame_src = best_path
                 if can_ai_style:
                     try:
@@ -2055,6 +2141,31 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
                             frame_src = comp_path
                     except Exception as e:
                         logger.debug("[thumbnail] bg composite not used: %s", e)
+
+                if not ok and allow_studio_renderer:
+                    ok = await render_thumbnail_with_studio_renderer(
+                        frame_src,
+                        brief,
+                        platform,
+                        out_path,
+                        upload_id=str(ctx.upload_id or ""),
+                        category=str(category or ""),
+                        persona=persona_payload,
+                        options={
+                            "thumbnail_studio_enabled": studio_enabled,
+                            "persona_enabled": bool(persona_payload),
+                            "persona_strength": persona_strength,
+                        },
+                    )
+                    if ok:
+                        engine_used = "studio_renderer"
+                        render_method = "studio_renderer"
+                    elif render_engine_mode == "studio":
+                        logger.info(
+                            "[thumbnail] studio render unavailable for %s; fallback to internal engine",
+                            platform,
+                        )
+
                 if prefer_ai_edit and can_ai_style and OPENAI_API_KEY:
                     ok = await _ai_edit_thumbnail(frame_src, brief, out_path, retry_reduce=False)
                     if not ok:
@@ -2077,6 +2188,7 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
                         render_method = "ai_edit"
                 if ok:
                     platform_map[platform] = str(out_path)
+                    platform_engine_map[platform] = engine_used
                     if primary_styled is None or platform == "youtube":
                         primary_styled = out_path
                     if platform == "youtube":
@@ -2086,6 +2198,12 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
                 ctx.output_artifacts["thumbnail"] = str(primary_styled)
 
             ctx.output_artifacts["thumbnail_render_method"] = render_method
+            ctx.output_artifacts["thumbnail_render_engine"] = (
+                "studio_renderer"
+                if ("studio_renderer" in platform_engine_map.values() or "pikzels" in platform_engine_map.values())
+                else "internal"
+            )
+            ctx.output_artifacts["platform_thumbnail_engine_map"] = json.dumps(platform_engine_map)
             ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_map)
             # YouTube search-result size legibility (168×94 proxy)
             try:
@@ -2153,8 +2271,8 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
                 if isinstance(qa_rejections, dict) and qa_rejections:
                     try:
                         ctx.output_artifacts["thumbnail_qa_rejections"] = json.dumps(qa_rejections)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("thumbnail_stage: could not serialize thumbnail_qa_rejections: %s", e)
                 # Emit audit block for enterprise governance / dashboards.
                 try:
                     policy = {}
@@ -2170,8 +2288,8 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
                             "entropy_floor": float(os.environ.get("THUMB_STYLE_ENTROPY_FLOOR", "0.72") or 0.72),
                         }
                     ctx.output_artifacts["thumbnail_style_policy"] = json.dumps(policy)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("thumbnail_stage: could not build thumbnail_style_policy artifact: %s", e)
         except Exception as e:
             logger.warning(f"[thumbnail] Styled thumbnail pipeline failed (non-fatal): {e}")
 

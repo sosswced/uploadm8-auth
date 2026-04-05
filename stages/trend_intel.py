@@ -13,6 +13,7 @@ Env:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -71,7 +72,13 @@ async def _serp_youtube_titles(query: str) -> List[Dict[str, Any]]:
                 }
             )
         return out
-    except Exception as e:
+    except (
+        httpx.RequestError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as e:
         logger.warning("[trend_intel] SerpAPI error: %s", e)
         return []
 
@@ -109,7 +116,13 @@ async def _yt_search_titles(query: str) -> List[Dict[str, Any]]:
                 }
             )
         return out
-    except Exception as e:
+    except (
+        httpx.RequestError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as e:
         logger.warning("[trend_intel] YouTube Data API error: %s", e)
         return []
 

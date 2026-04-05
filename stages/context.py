@@ -6,13 +6,18 @@ Carries all state through the processing pipeline.
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-import re
 
 from .entitlements import Entitlements
+from .safe_parse import json_dict
+
+logger = logging.getLogger("uploadm8-worker.context")
 
 
 def expand_hashtag_items(items: Any) -> List[str]:
@@ -20,8 +25,6 @@ def expand_hashtag_items(items: Any) -> List[str]:
     Flatten hashtag inputs from DB/UI. Handles nested lists and JSON-looking strings
     (e.g. '["tag1","tag2"]' stored as a single element) so publish never emits '#"[\"a\"]"' artifacts.
     """
-    import json as _json
-
     def _clean_token(raw: Any) -> str:
         token = re.sub(r"[^a-z0-9_]", "", str(raw or "").strip().lower().lstrip("#"))
         return token[:50]
@@ -35,10 +38,10 @@ def expand_hashtag_items(items: Any) -> List[str]:
             return out
         if s.startswith("[") and "]" in s:
             try:
-                parsed = _json.loads(s)
+                parsed = json.loads(s)
                 return expand_hashtag_items(parsed)
-            except Exception:
-                pass
+            except json.JSONDecodeError as e:
+                logger.debug("expand_hashtag_items: JSON parse failed for bracket string: %s", e)
         cleaned = []
         for t in s.replace(",", " ").split():
             token = _clean_token(t)
@@ -56,20 +59,20 @@ def expand_hashtag_items(items: Any) -> List[str]:
         if (s.startswith("[") and s.endswith("]")) or (s.startswith('"[') and "]" in s):
             try:
                 cleaned = s.strip('"').strip("'")
-                parsed = _json.loads(cleaned)
+                parsed = json.loads(cleaned)
                 if isinstance(parsed, list):
                     out.extend(expand_hashtag_items(parsed))
                     continue
-            except Exception:
-                pass
+            except json.JSONDecodeError as e:
+                logger.debug("expand_hashtag_items: nested list JSON parse failed: %s", e)
         if s.startswith("#") and "[" in s:
             try:
-                parsed = _json.loads(s[1:])
+                parsed = json.loads(s[1:])
                 if isinstance(parsed, list):
                     out.extend(expand_hashtag_items(parsed))
                     continue
-            except Exception:
-                pass
+            except json.JSONDecodeError as e:
+                logger.debug("expand_hashtag_items: #prefix JSON parse failed: %s", e)
         token = _clean_token(s)
         if token:
             out.append(token)
@@ -516,6 +519,8 @@ class PlatformResult:
     # Optional engagement
     views: int = 0
     likes: int = 0
+    comments: int = 0
+    shares: int = 0
 
     # Step B (confirmed)
     verify_status: str = "pending"  # pending/confirmed/rejected/unknown
@@ -726,9 +731,9 @@ class JobContext:
         """
         Build the final hashtag list for publishing.
 
-        Merge order: always_hashtags (FIRST) → platform_hashtags for this platform →
-        base upload hashtags → AI additions.
-        blocked_hashtags are filtered out at every level.
+        Merge order: base upload hashtags (manual; kept even if blocked) → always_hashtags →
+        platform_hashtags for this platform → AI additions.
+        blocked_hashtags apply to saved settings and AI tags, not to manual upload tags.
 
         Uses the same pipeline for always_hashtags and platform_hashtags so both
         are applied consistently. platform_hashtags keys: tiktok, youtube, instagram, facebook.
@@ -751,11 +756,7 @@ class JobContext:
         if platform:
             ph = us.get("platformHashtags") or us.get("platform_hashtags") or {}
             if isinstance(ph, str):
-                try:
-                    import json as _j
-                    ph = _j.loads(ph)
-                except Exception:
-                    ph = {}
+                ph = json_dict(ph, default={}, context="user_settings.platform_hashtags")
             if isinstance(ph, dict):
                 raw = ph.get(platform) or ph.get((platform or "").lower()) or ph.get((platform or "").title()) or []
                 if not raw:

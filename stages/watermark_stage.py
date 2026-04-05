@@ -12,6 +12,7 @@ Exports: run_watermark_stage(ctx)
 import asyncio
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -110,11 +111,13 @@ async def run_watermark_stage(ctx: JobContext) -> JobContext:
         ctx.output_artifacts["watermarked_video"] = str(output_path)
         logger.info(f"Watermark applied: {output_path} ({output_path.stat().st_size} bytes)")
 
+    except asyncio.CancelledError:
+        raise
     except SkipStage:
         raise
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as e:
         # Watermark failure should never crash the pipeline
-        logger.warning(f"Watermark stage error (non-fatal): {e}")
+        logger.warning("Watermark stage error (non-fatal): %s", e)
         raise SkipStage(f"Watermark failed: {e}")
 
     return ctx

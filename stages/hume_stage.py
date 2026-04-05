@@ -147,7 +147,27 @@ async def analyze_voice_emotion(audio_path: Path) -> Optional[Dict[str, Any]]:
                     if status == "COMPLETED":
                         break
                     if status in ("FAILED", "CANCELLED"):
-                        logger.warning(f"[hume] Job {status}: {state}")
+                        detail = ""
+                        if isinstance(state, dict):
+                            detail = (
+                                str(state.get("message") or state.get("status") or "").strip()
+                            )
+                        low = detail.lower()
+                        if any(
+                            x in low
+                            for x in ("credit", "balance", "billing", "payment", "quota", "exhausted")
+                        ):
+                            logger.warning(
+                                "[hume] SKIPPED (processing continues): Hume voice emotion unavailable "
+                                "(credits/billing/quota) — %s",
+                                detail[:400] or str(state)[:400],
+                            )
+                        else:
+                            logger.warning(
+                                "[hume] SKIPPED (processing continues): Hume job %s — %s",
+                                status,
+                                detail[:400] or str(state)[:400],
+                            )
                         retryable_terminal = True
                         break
                 else:
@@ -174,8 +194,17 @@ async def analyze_voice_emotion(audio_path: Path) -> Optional[Dict[str, Any]]:
                     return None
 
                 return _parse_hume_predictions(pred_resp.json())
-        except Exception as e:
-            logger.warning(f"[hume] Analysis error: {e}")
+        except asyncio.CancelledError:
+            raise
+        except (
+            httpx.HTTPError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            OSError,
+        ) as e:
+            logger.warning("[hume] Analysis error: %s", e)
             if run == 0:
                 await asyncio.sleep(1.0)
                 continue
@@ -253,8 +282,8 @@ def _parse_hume_predictions(raw: Any) -> Optional[Dict[str, Any]]:
             "segment_count":      len(all_segments),
         }
 
-    except Exception as e:
-        logger.warning(f"[hume] Parse error: {e}")
+    except (TypeError, ValueError, KeyError, AttributeError) as e:
+        logger.warning("[hume] Parse error: %s", e)
         return None
 
 

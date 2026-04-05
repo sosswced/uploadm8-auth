@@ -23,6 +23,7 @@ DESIGN v2 UPGRADES:
   - NEW: progress_bar()    — visual % bar for tokens / days remaining
 """
 
+import asyncio
 import os
 import logging
 import httpx
@@ -42,7 +43,7 @@ DISCORD_INVITE_URL = os.environ.get("DISCORD_INVITE_URL", "https://discord.gg/TV
 
 # ── Brand constants ───────────────────────────────────────────────────────────
 SUPPORT_EMAIL = "support@uploadm8.com"
-LOGO_URL      = f"{FRONTEND_URL}/images/logo.png"
+LOGO_URL      = f"{FRONTEND_URL}/images/logo.svg"
 
 URL_DASHBOARD    = f"{FRONTEND_URL}/dashboard.html"
 URL_SETTINGS     = f"{FRONTEND_URL}/settings.html"
@@ -112,8 +113,10 @@ async def send_email(to: str, subject: str, html: str, from_addr: str = None, re
             logger.warning(f"Mailgun failed ({resp.status_code}): {to} | {subject}")
         else:
             logger.info(f"Email sent → {to}: {subject}")
-    except Exception as e:
-        logger.warning(f"Mailgun error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except httpx.HTTPError as e:
+        logger.warning("Mailgun error: %s", e)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

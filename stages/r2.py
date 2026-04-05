@@ -37,6 +37,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
+try:
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:  # pragma: no cover
+    BotoCoreError = OSError
+    ClientError = OSError
+
 logger = logging.getLogger("uploadm8-worker")
 
 # ── R2 credentials from environment ──────────────────────────────────────────
@@ -175,7 +181,9 @@ async def download_file(r2_key: str, local_path: Path) -> Path:
             logger.info(f"R2 download complete: {r2_key} ({size:,} bytes) attempt={attempt}")
             return local_path
 
-        except Exception as exc:
+        except asyncio.CancelledError:
+            raise
+        except (BotoCoreError, ClientError, OSError, FileNotFoundError) as exc:
             last_exc = exc
             if _is_connection_error(exc) and attempt < _MAX_RETRIES:
                 wait = _RETRY_DELAY * (2 ** (attempt - 1))  # 3s, 6s, 12s
@@ -241,7 +249,9 @@ async def upload_file(
             logger.info(f"R2 upload complete: {r2_key} attempt={attempt}")
             return r2_key
 
-        except Exception as exc:
+        except asyncio.CancelledError:
+            raise
+        except (BotoCoreError, ClientError, OSError) as exc:
             last_exc = exc
             if _is_connection_error(exc) and attempt < _MAX_RETRIES:
                 wait = _RETRY_DELAY * (2 ** (attempt - 1))
@@ -266,8 +276,8 @@ async def delete_file(r2_key: str) -> None:
     try:
         await asyncio.get_event_loop().run_in_executor(None, _do_delete)
         logger.info(f"R2 delete complete: {r2_key}")
-    except Exception as exc:
-        logger.warning(f"R2 delete failed (non-fatal): {r2_key} — {exc}")
+    except (BotoCoreError, ClientError, OSError) as exc:
+        logger.warning("R2 delete failed (non-fatal): %s — %s", r2_key, exc)
 
 
 def generate_presigned_url(r2_key: str, expires: int = 3600) -> str:

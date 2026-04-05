@@ -24,9 +24,19 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import httpx
+import json
 from PIL import Image
 
 logger = logging.getLogger("uploadm8-worker")
+
+_BG_NET_ERRS = (
+    httpx.HTTPError,
+    json.JSONDecodeError,
+    KeyError,
+    TypeError,
+    ValueError,
+    OSError,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 REPLICATE_API_TOKEN  = os.environ.get("REPLICATE_API_TOKEN", "")
@@ -93,8 +103,8 @@ async def _rembg_isolate(frame_path: Path, temp_dir: Path) -> Optional[Path]:
             logger.info("[bg] rembg subject isolation ")
             return out_path
 
-    except Exception as e:
-        logger.warning(f"[bg] rembg error: {e}")
+    except (OSError, PermissionError, ValueError, TypeError, RuntimeError, MemoryError) as e:
+        logger.warning("[bg] rembg error: %s", e)
 
     return None
 
@@ -124,8 +134,10 @@ async def _removebg_api_isolate(frame_path: Path, temp_dir: Path) -> Optional[Pa
         else:
             logger.warning(f"[bg] remove.bg error {resp.status_code}: {resp.text[:200]}")
 
-    except Exception as e:
-        logger.warning(f"[bg] remove.bg API error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except _BG_NET_ERRS as e:
+        logger.warning("[bg] remove.bg API error: %s", e)
 
     return None
 
@@ -188,8 +200,10 @@ async def _fal_generate(prompt: str, width: int, height: int, temp_dir: Path) ->
     except ImportError:
         logger.warning("[bg] fal-client not installed")
         return None
-    except Exception as e:
-        logger.warning(f"[bg] fal.ai error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (TypeError, ValueError, KeyError, OSError, RuntimeError) as e:
+        logger.warning("[bg] fal.ai error: %s", e)
         return None
 
 
@@ -221,8 +235,10 @@ async def _replicate_generate(prompt: str, width: int, height: int, temp_dir: Pa
     except ImportError:
         logger.warning("[bg] replicate not installed")
         return None
-    except Exception as e:
-        logger.warning(f"[bg] Replicate error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (TypeError, ValueError, KeyError, OSError, RuntimeError) as e:
+        logger.warning("[bg] Replicate error: %s", e)
         return None
 
 
@@ -235,8 +251,10 @@ async def _download_image(url: str, dest: Path) -> Optional[Path]:
             dest.write_bytes(resp.content)
             logger.info(f"[bg] AI background downloaded: {dest.stat().st_size // 1024}KB")
             return dest
-    except Exception as e:
-        logger.warning(f"[bg] Download error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except _BG_NET_ERRS as e:
+        logger.warning("[bg] Download error: %s", e)
     return None
 
 
@@ -385,8 +403,10 @@ async def generate_text_hero_image_replicate(
             return None
         image_url = out[0].url if hasattr(out[0], "url") else str(out[0])
         return await _download_image(image_url, temp_dir / "text_hero_replicate.jpg")
-    except Exception as e:
-        logger.warning(f"[bg] text hero replicate error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (TypeError, ValueError, KeyError, OSError, RuntimeError) as e:
+        logger.warning("[bg] text hero replicate error: %s", e)
         return None
 
 
@@ -422,8 +442,10 @@ async def generate_controlnet_background_replicate(
             return None
         image_url = out[0].url if hasattr(out[0], "url") else str(out[0])
         return await _download_image(image_url, temp_dir / "controlnet_bg_replicate.jpg")
-    except Exception as e:
-        logger.warning(f"[bg] controlnet replicate error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (TypeError, ValueError, KeyError, OSError, RuntimeError) as e:
+        logger.warning("[bg] controlnet replicate error: %s", e)
         return None
 
 
@@ -458,6 +480,8 @@ async def generate_kontext_background_replicate(
             return None
         image_url = out[0].url if hasattr(out[0], "url") else str(out[0])
         return await _download_image(image_url, temp_dir / "kontext_bg_replicate.jpg")
-    except Exception as e:
-        logger.warning(f"[bg] kontext replicate error: {e}")
+    except asyncio.CancelledError:
+        raise
+    except (TypeError, ValueError, KeyError, OSError, RuntimeError) as e:
+        logger.warning("[bg] kontext replicate error: %s", e)
         return None

@@ -61,7 +61,7 @@ def assess_youtube_search_preview_readability(image_path: Path) -> Dict[str, Any
                 "floor": YOUTUBE_PREVIEW_READABILITY_FLOOR,
             }
         )
-    except Exception as e:
+    except (OSError, ValueError, TypeError) as e:
         logger.debug("[thumbnail_qa] preview readability failed: %s", e)
         out["error"] = str(e)[:200]
     return out
@@ -81,7 +81,8 @@ def laplacian_variance(image_path: Path) -> float:
             + g[1:-1, 2:]
         )
         return float(np.var(lap))
-    except Exception:
+    except (OSError, ValueError, TypeError) as e:
+        logger.debug("thumbnail_qa.laplacian_variance: %s", e)
         return 0.0
 
 

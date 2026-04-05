@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import calendar
+import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -48,6 +50,12 @@ async def ledger_entry(
 
 async def reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str) -> bool:
     async with conn.transaction():
+        urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
+        tier = (urow.get("subscription_tier") if urow else "free") or "free"
+        ent = get_entitlements_for_tier(str(tier))
+        # Internal tiers (master_admin/friends_family/lifetime) are unlimited.
+        if getattr(ent, "is_internal", False):
+            return True
         wallet = await get_wallet(conn, user_id)
         available_put = wallet["put_balance"] - wallet["put_reserved"]
         available_aic = wallet["aic_balance"] - wallet["aic_reserved"]
@@ -59,15 +67,17 @@ async def reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upl
             aic_count,
             user_id,
         )
-        if put_count > 0:
-            await ledger_entry(conn, user_id, "put", -put_count, "reserve", upload_id)
-        if aic_count > 0:
-            await ledger_entry(conn, user_id, "aic", -aic_count, "reserve", upload_id)
+        # Ledger: single debit on capture (upload_debit), not here — avoids double lines for one spend.
         return True
 
 
 async def spend_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str, platforms: Optional[list] = None):
     async with conn.transaction():
+        urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
+        tier = (urow.get("subscription_tier") if urow else "free") or "free"
+        ent = get_entitlements_for_tier(str(tier))
+        if getattr(ent, "is_internal", False):
+            return
         await conn.execute(
             "UPDATE wallets SET put_balance = put_balance - $1, aic_balance = aic_balance - $2, put_reserved = put_reserved - $1, aic_reserved = aic_reserved - $2 WHERE user_id = $3",
             put_count,
@@ -82,16 +92,70 @@ async def spend_tokens(conn, user_id: str, put_count: int, aic_count: int, uploa
 
 async def refund_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str):
     async with conn.transaction():
+        urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
+        tier = (urow.get("subscription_tier") if urow else "free") or "free"
+        ent = get_entitlements_for_tier(str(tier))
+        if getattr(ent, "is_internal", False):
+            return
         await conn.execute(
             "UPDATE wallets SET put_reserved = put_reserved - $1, aic_reserved = aic_reserved - $2 WHERE user_id = $3",
             put_count,
             aic_count,
             user_id,
         )
-        if put_count > 0:
-            await ledger_entry(conn, user_id, "put", put_count, "refund", upload_id)
-        if aic_count > 0:
-            await ledger_entry(conn, user_id, "aic", aic_count, "refund", upload_id)
+        # No ledger row: balance was never debited; release only clears the hold.
+
+
+async def partial_refund_upload_partial_success(
+    conn,
+    user_id: str,
+    upload_id: str,
+    succeeded_platforms: list,
+    failed_platforms: list,
+    original_put_cost: int,
+    original_aic_cost: int,
+) -> None:
+    """
+    After capture, credit back PUT for failed publish slots (same rule as before)
+    and AIC in proportion to failed_targets / total_targets (AI work is mostly
+    per-job, but this aligns charges with partial delivery).
+    """
+    n_failed = len(failed_platforms or [])
+    n_ok = len(succeeded_platforms or [])
+    if n_failed == 0 or n_ok == 0:
+        return
+
+    put_refund = min(n_failed * 2, max(0, int(original_put_cost or 0) - 10))
+
+    n_total = n_ok + n_failed
+    aic_refund = int((int(original_aic_cost or 0) * n_failed) // max(1, n_total))
+    aic_refund = min(aic_refund, int(original_aic_cost or 0))
+
+    if put_refund <= 0 and aic_refund <= 0:
+        return
+
+    urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
+    tier = (urow.get("subscription_tier") if urow else "free") or "free"
+    ent = get_entitlements_for_tier(str(tier))
+    if getattr(ent, "is_internal", False):
+        return
+
+    await conn.execute(
+        """
+        UPDATE wallets SET
+            put_balance = put_balance + $1,
+            aic_balance = aic_balance + $2,
+            updated_at = NOW()
+        WHERE user_id = $3
+        """,
+        put_refund,
+        aic_refund,
+        user_id,
+    )
+    if put_refund > 0:
+        await ledger_entry(conn, user_id, "put", put_refund, "partial_platform_refund", upload_id)
+    if aic_refund > 0:
+        await ledger_entry(conn, user_id, "aic", aic_refund, "partial_platform_refund", upload_id)
 
 
 async def credit_wallet(conn, user_id: str, wallet_type: str, amount: int, reason: str, stripe_event_id: Optional[str] = None):
@@ -129,22 +193,76 @@ async def transfer_tokens(
 
 
 async def daily_refill(conn, user_id: str, tier: str):
+    # Avoid BEGIN/COMMIT for paid/internal tiers - hot path on every authenticated request.
+    ent = get_entitlements_for_tier(tier)
+    if getattr(ent, "is_internal", False) or str(getattr(ent, "tier", "")) != "free":
+        return
+
     async with conn.transaction():
-        ent = get_entitlements_for_tier(tier)
-        daily = ent.put_daily
         wallet = await get_wallet(conn, user_id)
         last_refill = wallet.get("last_refill_date")
         today = _now_utc().date()
         if last_refill and last_refill >= today:
             return
-        monthly_cap = ent.put_monthly
-        current = wallet["put_balance"]
-        if current < monthly_cap:
-            add = min(daily, monthly_cap - current)
+
+        # Split monthly entitlements over calendar days in current UTC month.
+        # Cap by subscription budget for the month (put_drip_granted), not by wallet
+        # balance — rollover/top-ups can push balance above the monthly allowance.
+        days_in_month = calendar.monthrange(today.year, today.month)[1]
+        put_daily = max(0, int(math.ceil((ent.put_monthly or 0) / max(1, days_in_month))))
+        aic_daily = max(0, int(math.ceil((ent.aic_monthly or 0) / max(1, days_in_month))))
+
+        put_cap = int(ent.put_monthly or 0)
+        aic_cap = int(ent.aic_monthly or 0)
+        month_key = f"{today.year}-{today.month:02d}"
+
+        drip_month = wallet.get("subscription_drip_month")
+        put_g = int(wallet.get("put_drip_granted") or 0)
+        aic_g = int(wallet.get("aic_drip_granted") or 0)
+        if (drip_month or "") != month_key:
+            put_g = 0
+            aic_g = 0
+
+        put_remaining = max(0, put_cap - put_g)
+        aic_remaining = max(0, aic_cap - aic_g)
+
+        put_add = min(put_daily, put_remaining)
+        aic_add = min(aic_daily, aic_remaining)
+        new_put_g = put_g + put_add
+        new_aic_g = aic_g + aic_add
+
+        if put_add <= 0 and aic_add <= 0:
             await conn.execute(
-                "UPDATE wallets SET put_balance = put_balance + $1, last_refill_date = $2 WHERE user_id = $3",
-                add,
+                "UPDATE wallets SET last_refill_date = $1, subscription_drip_month = $2, put_drip_granted = $3, aic_drip_granted = $4 WHERE user_id = $5",
                 today,
+                month_key,
+                new_put_g,
+                new_aic_g,
                 user_id,
             )
-            await ledger_entry(conn, user_id, "put", add, "daily_refill")
+            return
+
+        await conn.execute(
+            """
+            UPDATE wallets
+            SET
+                put_balance = put_balance + $1,
+                aic_balance = aic_balance + $2,
+                last_refill_date = $3,
+                subscription_drip_month = $4,
+                put_drip_granted = $5,
+                aic_drip_granted = $6
+            WHERE user_id = $7
+            """,
+            put_add,
+            aic_add,
+            today,
+            month_key,
+            new_put_g,
+            new_aic_g,
+            user_id,
+        )
+        if put_add > 0:
+            await ledger_entry(conn, user_id, "put", put_add, "daily_refill")
+        if aic_add > 0:
+            await ledger_entry(conn, user_id, "aic", aic_add, "daily_refill")

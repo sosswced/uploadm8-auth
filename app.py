@@ -4407,7 +4407,8 @@ async def get_entitlements():
 async def get_public_pricing():
     """
     Public pricing and entitlements for landing page and billing UI.
-    Returns tiers with PUT/AIC, perks, and top-up packs (with suggested prices).
+    Returns tiers with PUT/AIC, lookahead, queue_depth, max_thumbnails, max_caption_frames,
+    trial_days, Stripe lookup keys, plus top-up packs (with suggested prices).
     """
     STRIPE_LOOKUP = {
         "creator_lite": "uploadm8_creator_lite_monthly",
@@ -4429,7 +4430,11 @@ async def get_public_pricing():
             "max_accounts_per_platform": int(per_pf or 0),
             "lookahead_hours": cfg.get("lookahead_hours", 0),
             "queue_depth": cfg.get("queue_depth", 0),
-            "max_thumbnails": cfg.get("max_thumbnails", 0),
+            "max_thumbnails": int(cfg.get("max_thumbnails", 1) or 1),
+            "max_caption_frames": int(
+                cfg.get("max_caption_frames", cfg.get("caption_frames", 3)) or 3
+            ),
+            "trial_days": int(cfg.get("trial_days", 0) or 0),
             "stripe_lookup_key": STRIPE_LOOKUP.get(slug),
         })
     topups = []

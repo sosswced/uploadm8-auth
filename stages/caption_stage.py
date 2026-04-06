@@ -18,7 +18,7 @@ Key features:
     (ctx.ai_transcript, set by audio_stage), it is injected into the context
     block as factual evidence of what was actually said in the video.
   - Platform-aware content: TikTok/IG/FB get caption only; YouTube gets title+desc.
-  - Frame count pulled from user settings (captionFrameCount, default 6, clamped 2-12).
+  - Frame count pulled from user settings (captionFrameCount, default 6, clamped 2–20 vs plan max).
   - _finalise_hashtags() is NOW CALLED after AI generation — blocked hashtags
     are NEVER written to ctx.ai_hashtags.
   - always_hashtags from user settings are enforced at two layers:
@@ -817,6 +817,12 @@ async def _live_extract_frames(video_path: Path, temp_dir: Path, n: int) -> List
 
 def _build_trill_beat(ctx: JobContext) -> Optional[str]:
     """Construct the Trill story beat injection string (driving telemetry)."""
+    if getattr(ctx, "skip_trill_caption_injection", False):
+        return None
+    us = ctx.user_settings or {}
+    if not (us.get("trill_ai_enhance", us.get("trillAiEnhance", True))):
+        return None
+
     ts = ctx.trill_score
     td = ctx.telemetry_data or ctx.telemetry
 
@@ -1418,12 +1424,12 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
 
     model = str(us.get("trillOpenaiModel") or us.get("openai_model") or OPENAI_MODEL_DEFAULT)
 
-    # ── Frame count: entitlement ceiling × user setting, clamped 2–12 ────────
+    # ── Frame count: entitlement ceiling × user setting (cap 2–20) ───────────
     max_caption_frames = getattr(ctx.entitlements, "max_caption_frames", 6) or 6
     user_frame_count = int(
         us.get("captionFrameCount") or us.get("caption_frame_count") or max_caption_frames
     )
-    num_frames = max(2, min(min(user_frame_count, max_caption_frames), 12))
+    num_frames = max(2, min(user_frame_count, max_caption_frames, 20))
 
     # ── Detect content category (3-layer: hint → filename → general) ─────────
     category = _detect_content_category(ctx)

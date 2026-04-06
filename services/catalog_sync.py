@@ -130,6 +130,8 @@ async def _upsert_content_item(
     likes: int = 0,
     comments: int = 0,
     shares: int = 0,
+    visibility: Optional[str] = None,
+    presence: Optional[str] = None,
     extra: Optional[Dict] = None,
 ) -> str:
     """Upsert one video row; returns the row id."""
@@ -139,9 +141,10 @@ async def _upsert_content_item(
             (user_id, platform_token_id, platform, account_id, platform_video_id,
              source, content_kind, title, published_at, thumbnail_url, platform_url,
              duration_seconds, views, likes, comments, shares,
+             visibility, presence,
              metrics_synced_at, extra, updated_at)
         VALUES
-            ($1,$2,$3,$4,$5, $6,$7,$8,$9,$10,$11, $12,$13,$14,$15,$16, NOW(),$17,NOW())
+            ($1,$2,$3,$4,$5, $6,$7,$8,$9,$10,$11, $12,$13,$14,$15,$16, $17,$18, NOW(),$19,NOW())
         ON CONFLICT (user_id, platform, account_id, platform_video_id) DO UPDATE SET
             platform_token_id  = EXCLUDED.platform_token_id,
             content_kind       = COALESCE(EXCLUDED.content_kind, platform_content_items.content_kind),
@@ -154,6 +157,8 @@ async def _upsert_content_item(
             likes              = GREATEST(EXCLUDED.likes, platform_content_items.likes),
             comments           = GREATEST(EXCLUDED.comments, platform_content_items.comments),
             shares             = GREATEST(EXCLUDED.shares, platform_content_items.shares),
+            visibility         = COALESCE(EXCLUDED.visibility, platform_content_items.visibility),
+            presence           = COALESCE(EXCLUDED.presence, platform_content_items.presence),
             metrics_synced_at  = NOW(),
             extra              = platform_content_items.extra || EXCLUDED.extra,
             updated_at         = NOW()
@@ -162,6 +167,7 @@ async def _upsert_content_item(
         user_id, platform_token_id, platform, account_id, platform_video_id,
         source, content_kind, title, published_at, thumbnail_url, platform_url,
         duration_seconds, views, likes, comments, shares,
+        visibility, presence,
         json.dumps(extra or {}),
     )
     return str(row["id"]) if row else ""
@@ -367,10 +373,10 @@ async def _list_youtube_videos(
         if not video_ids:
             return [], next_pt, bool(next_pt)
 
-        # 3. Batch fetch statistics + snippet
+        # 3. Batch fetch statistics + snippet + status (privacy)
         vid_resp = await client.get(
             f"{BASE}/videos",
-            params={"part": "statistics,snippet,contentDetails", "id": ",".join(video_ids)},
+            params={"part": "statistics,snippet,contentDetails,status", "id": ",".join(video_ids)},
             headers=headers,
         )
         vid_items = vid_resp.json().get("items") or [] if vid_resp.status_code == 200 else []
@@ -386,6 +392,8 @@ async def _list_youtube_videos(
             stats = vdata.get("statistics") or {}
             vsnip = vdata.get("snippet") or {}
             cd = vdata.get("contentDetails") or {}
+            st = vdata.get("status") or {}
+            yt_vis = str(st.get("privacyStatus") or "").lower() or None
 
             # ISO8601 duration → seconds (basic)
             dur_str = cd.get("duration") or ""
@@ -425,6 +433,8 @@ async def _list_youtube_videos(
                 "duration_seconds": dur_sec,
                 "published_at": pub,
                 "content_kind": kind,
+                "visibility": yt_vis,
+                "presence": "ok",
                 "extra": extra,
             })
 
@@ -671,6 +681,41 @@ def _normalize_account_id(platform: str, row: Dict, token: Dict) -> str:
     return ""
 
 
+async def _mark_youtube_pci_not_in_catalog(
+    conn: asyncpg.Connection,
+    user_id: str,
+    platform_token_id: str,
+    account_id: str,
+    seen_ids: List[str],
+) -> int:
+    """
+    After a full YouTube uploads-playlist walk (natural end, not max_pages cutoff),
+    mark PCI rows for this token that are no longer returned by the channel API.
+    """
+    if not seen_ids:
+        return 0
+    r = await conn.execute(
+        """
+        UPDATE platform_content_items
+           SET presence = 'not_in_channel_catalog',
+               updated_at = NOW()
+         WHERE user_id = $1::uuid
+           AND platform = 'youtube'
+           AND platform_token_id = $2::uuid
+           AND account_id = $3
+           AND NOT (platform_video_id = ANY($4::text[]))
+        """,
+        user_id,
+        platform_token_id,
+        account_id,
+        seen_ids,
+    )
+    try:
+        return int(str(r).split()[-1])
+    except Exception:
+        return 0
+
+
 # ── Core per-token sync ─────────────────────────────────────────────────────
 async def sync_catalog_for_token(
     pool: asyncpg.Pool,
@@ -725,6 +770,9 @@ async def sync_catalog_for_token(
     if platform == "youtube":
         yt_ch = _youtube_channel_id_for_catalog(token, account_id)
 
+    seen_youtube_ids: set = set()
+    exhausted_playlist = False
+
     for _page in range(max_pages):
         try:
             if platform == "tiktok":
@@ -758,6 +806,12 @@ async def sync_catalog_for_token(
 
         discovered += len(videos)
 
+        if platform == "youtube":
+            for v in videos:
+                _pid = str(v.get("platform_video_id") or "").strip()
+                if _pid:
+                    seen_youtube_ids.add(_pid)
+
         async with pool.acquire() as conn:
             for v in videos:
                 try:
@@ -781,10 +835,21 @@ async def sync_catalog_for_token(
             current_cursor = str(next_cur) if next_cur is not None else None
         if not has_more or not current_cursor:
             current_cursor = None
+            exhausted_playlist = True
             break
 
     # Persist final state
     async with pool.acquire() as conn:
+        if platform == "youtube" and exhausted_playlist and seen_youtube_ids:
+            n_gone = await _mark_youtube_pci_not_in_catalog(
+                conn, user_id, token_row_id, account_id, list(seen_youtube_ids)
+            )
+            if n_gone:
+                logger.info(
+                    "[catalog-sync] YouTube PCI reconcile: %s rows marked not_in_channel_catalog (token=%s…)",
+                    n_gone,
+                    token_row_id[:8],
+                )
         # Run linker for newly synced items
         linked = await _link_uploads_for_user_token(conn, user_id, platform, account_id)
         # For TikTok: backfill platform_video_id on uploads that never got one.

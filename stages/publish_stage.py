@@ -54,6 +54,11 @@ from . import db as db_stage
 from . import r2 as r2_stage
 from .outbound_rl import outbound_slot
 from .platform_tokens import platform_tokens_db_key
+from .redis_publish_guard import (
+    publish_circuit_open,
+    publish_record_result,
+    publish_wait_slot,
+)
 
 
 logger = logging.getLogger("uploadm8-worker")
@@ -1745,13 +1750,27 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
         """Publish to a single platform/account with timeout. Returns result or None."""
         account_label = f"{platform}:{token_id[:8]}" if token_id else platform
         db_key = platform_tokens_db_key(platform)
+        rcli = getattr(ctx, "redis_client", None)
         try:
-            return await asyncio.wait_for(
+            if await publish_circuit_open(rcli, platform):
+                logger.warning("%s: circuit open — skipping publish attempt", account_label)
+                return PlatformResult(
+                    platform=platform,
+                    success=False,
+                    error_code="PUBLISH_CIRCUIT_OPEN",
+                    error_message="Platform APIs throttled after repeated failures — retry in a few minutes.",
+                    token_row_id=token_id,
+                )
+            await publish_wait_slot(rcli, platform)
+            res = await asyncio.wait_for(
                 _publish_single(ctx, db_pool, platform, token_id, db_key, account_label, default_video),
                 timeout=PUBLISH_TIMEOUT,
             )
+            await publish_record_result(rcli, platform, res.success, getattr(res, "http_status", None))
+            return res
         except asyncio.TimeoutError:
             logger.error(f"{account_label}: Publish timed out after {PUBLISH_TIMEOUT}s")
+            await publish_record_result(rcli, platform, False, None)
             return PlatformResult(
                 platform=platform,
                 success=False,
@@ -1759,6 +1778,9 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                 error_message=f"Publish timed out after {PUBLISH_TIMEOUT}s",
                 token_row_id=token_id,
             )
+        except Exception:
+            await publish_record_result(rcli, platform, False, None)
+            raise
 
     if parallel_mode and len(publish_targets) > 1:
         results = await asyncio.gather(

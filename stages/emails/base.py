@@ -46,6 +46,8 @@ SUPPORT_EMAIL = "support@uploadm8.com"
 LOGO_URL      = f"{FRONTEND_URL}/images/logo.svg"
 
 URL_DASHBOARD    = f"{FRONTEND_URL}/dashboard.html"
+URL_GUIDE        = f"{FRONTEND_URL}/guide.html"
+URL_GUIDE_PLAYBOOK = f"{FRONTEND_URL}/guide.html#feat-settings-playbook"
 URL_SETTINGS     = f"{FRONTEND_URL}/settings.html"
 URL_SETTINGS_TOKENS = f"{FRONTEND_URL}/settings.html#billing-panel"
 URL_BILLING      = f"{FRONTEND_URL}/billing.html"

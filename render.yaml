@@ -30,6 +30,9 @@ services:
         sync: false
       - key: REDIS_URL
         sync: false
+      # Must match worker: XADD vs LPUSH for process jobs
+      - key: REDIS_JOB_USE_STREAMS
+        value: "true"
       - key: R2_ACCOUNT_ID
         sync: false
       - key: R2_ACCESS_KEY_ID
@@ -242,8 +245,18 @@ services:
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /app/.playwright
 
-      # ── Worker concurrency tuning ─────────────────────────────────────────────
-      # Standard 2GB: use 2 + heavy_pipeline_slots=1. Pro 4GB+: can try 3 and/or heavy_pipeline_slots=2.
+      # ── Worker: ship ALL pipeline stages without OOM ───────────────────────────
+      # Stages already run sequentially per job; stress = *parallel* jobs × peak RAM (FFmpeg + ML + Playwright).
+      # 1) Set profile (defaults below only apply if you omit explicit WORKER_* / PUBLISH_*):
+      #    full_safe    — 2 FFmpeg jobs, 1 heavy tail (audio/Vision/VI/TL/thumb) at a time (default below)
+      #    minimal_ram  — 1 / 1 / publish 3 — smallest instances
+      #    throughput   — 3 / 2 / publish 6 — 4GB+ plans only
+      # 2) Scale horizontally: numInstances > 1 (same env); Redis distributes jobs — each box stays capped.
+      # 3) Optional caps: VIDEO_INTELLIGENCE_MAX_DURATION_SEC, TWELVELABS off if still tight.
+      - key: WORKER_PIPELINE_PROFILE
+        value: "full_safe"
+      # ── Worker concurrency tuning (explicit values override profile setdefaults) ─
+      # Standard 2GB: 2 process jobs + heavy_pipeline_slots=1. 512MB-1GB: profile minimal_ram or WORKER_CONCURRENCY=1.
       - key: WORKER_CONCURRENCY
         value: "2"
       # Caps parallel "audio+YAMNet+Vision+Twelve Labs+thumbnail" (peak RAM). Independent of WORKER_CONCURRENCY.
@@ -257,6 +270,15 @@ services:
         value: "600"
       - key: JOB_TIMEOUT_SECONDS
         value: "1800"
+      # After worker crash/deploy: mark stale `processing` rows failed (heartbeat via uploads.updated_at).
+      # Lower = queue shows failed sooner; very long single-stage ML (no DB updates) may need 60+ or heartbeat tuning.
+      - key: WORKER_ORPHAN_STALE_MINUTES
+        value: "25"
+      - key: WORKER_ORPHAN_MIN_JOB_MINUTES
+        value: "10"
+      # Throttle: API runs same reconcile when users load /api/uploads (fixes stuck rows if worker never restarted)
+      - key: API_STALE_PROCESSING_RECONCILE_INTERVAL_SEC
+        value: "30"
       # DB pool tuning
       - key: WORKER_DB_POOL_MIN
         value: "5"
@@ -270,6 +292,39 @@ services:
         value: "15"
       - key: SCHEDULER_POLL_INTERVAL
         value: "60"
+
+      # ── Redis Streams (at-least-once) + fairness + stage budgets ─────────────────
+      # REDIS_JOB_USE_STREAMS=false → legacy LPUSH/BRPOP only (rollback).
+      # USER_PROCESS_MAX_PARALLEL=0 → disable per-user cap (not recommended prod).
+      - key: REDIS_JOB_USE_STREAMS
+        value: "true"
+      - key: REDIS_JOB_STREAM_MAXLEN
+        value: "50000"
+      - key: USER_PROCESS_MAX_PARALLEL
+        value: "3"
+      - key: USER_PROCESS_MAX_PARALLEL_PRIORITY
+        value: "6"
+      - key: STREAM_RECLAIM_MIN_IDLE_MS
+        value: "120000"
+      - key: STREAM_RECLAIM_INTERVAL_SEC
+        value: "25"
+      - key: STAGE_TIMEOUT_AUDIO_SEC
+        value: "240"
+      - key: STAGE_TIMEOUT_VISION_SEC
+        value: "120"
+      - key: STAGE_TIMEOUT_TWELVELABS_SEC
+        value: "420"
+      - key: STAGE_TIMEOUT_VIDEO_INTELLIGENCE_SEC
+        value: "360"
+      - key: STAGE_TIMEOUT_THUMBNAIL_SEC
+        value: "600"
+      - key: STAGE_TIMEOUT_CAPTION_SEC
+        value: "360"
+      # STAGE_TIMEOUT_TRANSCODE_SEC=0 means unlimited (set e.g. 900 to cap FFmpeg wall time)
+      - key: PUBLISH_REDIS_RL_ENABLED
+        value: "true"
+      - key: PUBLISH_PLATFORM_MIN_INTERVAL_MS
+        value: "350"
 
       # ── Platform metrics & per-upload analytics sync (worker — no login required) ─
       # 10800s = 3h → ~8 runs per 24h. Users offline: still runs while uploadm8-worker is up.

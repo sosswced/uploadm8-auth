@@ -25,7 +25,7 @@ from .base import (
     check_list, alert_banner, numbered_steps, spacer, stat_grid, secondary_links,
     section_tag, metric_hero, divider_accent,
     GRAD_ORANGE, GRAD_RED, GRAD_DARK, GRAD_GREEN, GRAD_BLUE,
-    URL_DASHBOARD, URL_SETTINGS, URL_BILLING, URL_PRICING, DISCORD_INVITE_URL, SUPPORT_EMAIL, FRONTEND_URL,
+    URL_DASHBOARD, URL_GUIDE, URL_GUIDE_PLAYBOOK, URL_SETTINGS, URL_BILLING, URL_PRICING, DISCORD_INVITE_URL, SUPPORT_EMAIL, FRONTEND_URL,
 )
 
 logger = logging.getLogger("uploadm8-worker")
@@ -73,7 +73,7 @@ async def send_signup_confirmation_email(email: str, name: str, confirmation_lin
 # ─────────────────────────────────────────────────────────────────────────────
 async def send_welcome_email(email: str, name: str) -> None:
     """
-    Warm onboarding email fired immediately after a new user registers.
+    Warm onboarding email fired immediately after the user confirms their email (signup verification).
 
     BEFORE (app.py ~line 1902):
         background_tasks.add_task(send_email, data.email, "Welcome to UploadM8!", f"<h1>Welcome, {data.name}!</h1>...")
@@ -87,7 +87,7 @@ async def send_welcome_email(email: str, name: str) -> None:
     html = email_shell(
         gradient=GRAD_ORANGE,
         tagline="Upload once. Publish everywhere.",
-        preheader_text=f"Welcome, {name}! Your 30 free upload tokens are waiting — let's get your content live.",
+        preheader_text=f"Welcome, {name}! Open the Setup Handbook for captions, AI, thumbnails, and your first successful upload.",
         body_rows=(
             section_tag("Welcome to the Platform", "#f97316")
             + intro_row(
@@ -104,6 +104,8 @@ async def send_welcome_email(email: str, name: str) -> None:
             )
             + divider_accent()
             + numbered_steps(
+                ("Open the Setup Handbook",
+                 "One page explains every toggle — audio, AI services, captions, thumbnails, Drive Insights, and how to avoid wasted credits."),
                 ("Connect Your Platforms",
                  "Link TikTok, YouTube, Instagram, and Facebook from your Settings page."),
                 ("Upload Your First Video",
@@ -111,7 +113,8 @@ async def send_welcome_email(email: str, name: str) -> None:
                 ("Watch the Numbers Move",
                  "Track views, engagement, and performance from your Analytics dashboard."),
             )
-            + cta_button("Get Started Now", URL_DASHBOARD, pt="12px", pb="20px")
+            + cta_button("Setup Handbook (recommended)", URL_GUIDE_PLAYBOOK, pt="12px", pb="12px")
+            + cta_button("Open Dashboard", URL_DASHBOARD, pt="0", pb="20px")
             + tinted_box(
                 f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.65;">'
                 f'Questions? We\'re here. Reply to this email or reach out at '
@@ -144,7 +147,7 @@ async def send_fully_signed_up_guide_email(
     html = email_shell(
         gradient=GRAD_BLUE,
         tagline="You are fully signed up and ready to publish",
-        preheader_text=f"Your account is fully active. See your {plan_label} features and first steps to get your first successful upload live.",
+        preheader_text=f"Your account is fully active. Open the Setup Handbook to configure AI, audio, and uploads for success.",
         body_rows=(
             section_tag("Account Fully Activated", "#2563eb")
             + intro_row(
@@ -171,23 +174,25 @@ async def send_fully_signed_up_guide_email(
                 hex_color="#2563eb",
             )
             + numbered_steps(
+                ("Setup Handbook (do this first)", "Follow the Settings Playbook — dependencies, AI credits, captions, thumbnails, audio, and Drive Insights in one place."),
                 ("Connect platforms", "Open Settings and connect TikTok, YouTube, Instagram, and Facebook accounts."),
                 ("Upload your first video", "Go to Upload, add title/caption/hashtags, and select your platforms."),
                 ("Review results", "Use Queue and Dashboard to confirm publish status and retry any failed platforms."),
             )
+            + cta_button("Open Setup Handbook", URL_GUIDE_PLAYBOOK, pt="8px", pb="8px")
             + tinted_box(
                 f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
+                f'<strong style="color:#ffffff;">Full feature guide:</strong> '
+                f'<a href="{URL_GUIDE}" style="color:#60a5fa;text-decoration:none;">Browse the complete guide</a> '
+                f'(scheduling, queue, billing, Thumbnail Studio).<br><br>'
                 f'<strong style="color:#ffffff;">Upgrade option:</strong> Need more monthly quota? '
-                f'Open Billing to upgrade your plan or buy a one-time top-up. '
-                f'<a href="{URL_BILLING}" style="color:#60a5fa;text-decoration:none;">Go to Billing &#8594;</a><br><br>'
-                f'<strong style="color:#ffffff;">Community:</strong> Join our Discord for release updates, support, and roadmap feedback. '
-                f'<a href="{DISCORD_INVITE_URL}" style="color:#5865F2;text-decoration:none;">Join Discord &#8599;</a><br><br>'
-                f'<strong style="color:#ffffff;">Guide:</strong> '
-                f'<a href="{FRONTEND_URL}/guide.html" style="color:#60a5fa;text-decoration:none;">Open getting started guide</a>.'
+                f'<a href="{URL_BILLING}" style="color:#60a5fa;text-decoration:none;">Billing &amp; top-ups &#8594;</a><br><br>'
+                f'<strong style="color:#ffffff;">Community:</strong> '
+                f'<a href="{DISCORD_INVITE_URL}" style="color:#5865F2;text-decoration:none;">Join Discord &#8599;</a>'
                 f'</p>',
                 hex_color="#2563eb",
             )
-            + cta_button("Start First Upload", URL_DASHBOARD, pt="16px", pb="20px")
+            + cta_button("Go to Dashboard", URL_DASHBOARD, pt="16px", pb="20px")
             + secondary_links(
                 ("Billing", URL_BILLING),
                 ("Plans", URL_PRICING),

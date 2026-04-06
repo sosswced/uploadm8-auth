@@ -26,6 +26,9 @@ WATERMARK_TEXT = os.environ.get("WATERMARK_TEXT", "UploadM8")
 WATERMARK_FONT_SIZE = int(os.environ.get("WATERMARK_FONT_SIZE", "18"))
 WATERMARK_OPACITY = float(os.environ.get("WATERMARK_OPACITY", "0.5"))
 WATERMARK_POSITION = os.environ.get("WATERMARK_POSITION", "bottom-right")
+# Intermediate encode only — transcode stage re-encodes; favor speed here.
+WATERMARK_FFMPEG_PRESET = os.environ.get("WATERMARK_FFMPEG_PRESET", "veryfast")
+WATERMARK_FFMPEG_CRF = int(os.environ.get("WATERMARK_FFMPEG_CRF", "24"))
 
 
 def _get_position_filter(position: str, font_size: int) -> str:
@@ -87,8 +90,8 @@ async def run_watermark_stage(ctx: JobContext) -> JobContext:
         "-i", str(video_path),
         "-vf", drawtext_filter,
         "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
+        "-preset", WATERMARK_FFMPEG_PRESET,
+        "-crf", str(WATERMARK_FFMPEG_CRF),
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(output_path),

@@ -1140,6 +1140,7 @@ def _render_template_thumbnail(
 
     for nonce in range(10):
         style = _choose_style_variant(brief, platform, base_path, headline, nonce=nonce)
+        _apply_user_platform_colors_to_style(brief, platform, style)
         sig = _style_signature(style, headline)
         if sig in avoid_set:
             continue
@@ -1616,7 +1617,7 @@ async def _score_sharpness(image_path: Path) -> float:
 # Offset distribution
 # ============================================================
 
-def _distribute_offsets(
+def _distribute_offsets_spaced(
     duration: float,
     n: int,
     user_offset: Optional[float] = None,
@@ -1643,13 +1644,90 @@ def _distribute_offsets(
     if n == 2:
         return [clamp(duration * 0.05), clamp(duration * 0.90)]
 
-    start  = clamp(duration * 0.05)
-    end    = clamp(duration * 0.90)
+    start = clamp(duration * 0.05)
+    end = clamp(duration * 0.90)
     middle_count = n - 2
-    step   = (end - start) / (middle_count + 1)
+    step = (end - start) / (middle_count + 1)
     middle = [clamp(start + step * (i + 1)) for i in range(middle_count)]
 
     return [start] + middle + [end]
+
+
+def _distribute_offsets(
+    duration: float,
+    n: int,
+    user_offset: Optional[float] = None,
+    interval_sec: Optional[float] = None,
+) -> List[float]:
+    """
+    Frame timestamps for thumbnail extraction.
+
+    When ``interval_sec`` is set (>0) and n>1, offsets are placed at least
+    ``interval_sec`` apart starting near 5% of duration (matches settings
+    "Thumbnail Interval — seconds between frames"). Falls back to even-spaced
+    anchors if fewer than two timestamps fit.
+    """
+    if duration <= 0:
+        duration = 30.0
+
+    def clamp(v: float) -> float:
+        return max(0.5, min(v, duration - 0.5))
+
+    n = max(1, n)
+
+    if n == 1:
+        return _distribute_offsets_spaced(duration, 1, user_offset)
+
+    use_interval = interval_sec is not None and float(interval_sec) > 0
+    if not use_interval:
+        return _distribute_offsets_spaced(duration, n, user_offset)
+
+    step = max(1.0, min(float(interval_sec), 120.0))
+    usable_end = max(0.5, duration - 0.5)
+    start = clamp(duration * 0.05)
+    offsets: List[float] = [start]
+    cur = start
+    while len(offsets) < n:
+        cur += step
+        if cur > usable_end - 0.01:
+            break
+        offsets.append(clamp(cur))
+
+    if len(offsets) < 2:
+        return _distribute_offsets_spaced(duration, n, user_offset)
+
+    return offsets[:n]
+
+
+def _user_platform_colors_from_settings(us: dict) -> Dict[str, str]:
+    """Badge/accent hex colors from user_preferences / user_settings (Settings → Platform Colors)."""
+    out: Dict[str, str] = {}
+    _camel_color = {
+        "tiktok": "tiktokColor",
+        "youtube": "youtubeColor",
+        "instagram": "instagramColor",
+        "facebook": "facebookColor",
+    }
+    for plat in ("tiktok", "youtube", "instagram", "facebook"):
+        v = (us.get(f"{plat}_color") or us.get(_camel_color.get(plat, "")) or "").strip()
+        if v.startswith("#"):
+            out[plat] = v
+    acc = (us.get("accent_color") or us.get("accentColor") or "").strip()
+    if acc.startswith("#"):
+        out["accent"] = acc
+    return out
+
+
+def _apply_user_platform_colors_to_style(brief: Dict, platform: str, style: Dict) -> None:
+    """Override template badge (and optional accent) from saved platform colors."""
+    upc = (brief.get("user_platform_colors") or {}) if isinstance(brief, dict) else {}
+    key = (platform or "").lower()
+    hexv = (upc.get(key) or "").strip()
+    if hexv.startswith("#") and len(hexv) in (4, 5, 7, 9):
+        style["badge_bg"] = hexv
+    acc = (upc.get("accent") or "").strip()
+    if acc.startswith("#") and len(acc) in (4, 5, 7, 9):
+        style["accent"] = acc
 
 
 # ============================================================
@@ -1724,6 +1802,13 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
     except (TypeError, ValueError):
         user_offset = DEFAULT_THUMBNAIL_OFFSET
 
+    raw_iv = us0.get("thumbnail_interval", us0.get("thumbnailInterval", 5))
+    try:
+        thumb_interval_sec = float(raw_iv)
+    except (TypeError, ValueError):
+        thumb_interval_sec = 5.0
+    thumb_interval_sec = max(1.0, min(thumb_interval_sec, 120.0))
+
     # ── Category detection ──────────────────────────────────────────────────
     category = _detect_category(ctx)
 
@@ -1748,7 +1833,12 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
         duration=duration,
         n=extraction_count,
         user_offset=user_offset if extraction_count == 1 else None,
+        interval_sec=thumb_interval_sec if extraction_count > 1 else None,
     )
+    try:
+        ctx.output_artifacts["thumbnail_interval_seconds"] = str(int(thumb_interval_sec))
+    except Exception:
+        pass
     logger.debug(f"Thumbnail offsets: {[f'{o:.1f}s' for o in offsets]}")
 
     # ── Extract and score all frames ────────────────────────────────────────
@@ -2021,6 +2111,8 @@ async def run_thumbnail_stage(ctx: JobContext, db_pool=None) -> JobContext:
                     },
                     "notes": "No AI — minimal brief",
                 }
+            if isinstance(brief, dict):
+                brief["user_platform_colors"] = _user_platform_colors_from_settings(us)
             if brief is not None and "tiktok" in tiktok_plats:
                 brief.setdefault("platform_plan", {})
                 brief["platform_plan"].setdefault(

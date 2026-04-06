@@ -592,6 +592,11 @@ class JobContext:
 
     platform_results: List[PlatformResult] = field(default_factory=list)
     output_artifacts: Dict[str, str] = field(default_factory=dict)
+    # Built during pipeline; finalized to uploads.pipeline_manifest for diagnostics UI
+    pipeline_diag: Optional[Dict[str, Any]] = None
+
+    # Set by worker for distributed publish throttling / circuit breaker (optional)
+    redis_client: Any = None
 
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -601,6 +606,8 @@ class JobContext:
     # Explicit error tracking
     error_code: Optional[str] = None
     error_message: Optional[str] = None
+    # JSON-safe dict persisted on uploads.failure_diag for support / user diagnostics
+    failure_diag: Optional[Dict[str, Any]] = None
 
     put_cost: int = 0
     aic_cost: int = 0

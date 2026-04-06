@@ -96,7 +96,9 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                     for k in ("styled_thumbnails", "auto_thumbnails", "auto_captions", "thumbnail_interval",
                               "default_privacy", "ai_hashtags_enabled", "ai_hashtag_count", "always_hashtags",
                               "blocked_hashtags", "platform_hashtags", "email_notifications", "discord_webhook",
-                              "use_audio_context"):
+                              "use_audio_context",
+                              "tiktok_color", "youtube_color", "instagram_color", "facebook_color",
+                              "accent_color"):
                         if k in prefs_d and prefs_d[k] is not None:
                             result[k] = prefs_d[k]
                     # Ensure camelCase aliases for hashtag fields (context.get_effective_hashtags checks both)
@@ -216,6 +218,34 @@ async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
         )
 
 
+async def mark_processing_started_if_status_in(
+    pool: asyncpg.Pool,
+    ctx: JobContext,
+    statuses: tuple,
+) -> bool:
+    """
+    Transition to processing only from allowed statuses (Redis at-least-once dedupe).
+    Returns True if a row was updated.
+    """
+    if not statuses:
+        return False
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE uploads
+            SET status = 'processing',
+                processing_started_at = COALESCE(processing_started_at, $2::timestamptz),
+                updated_at = NOW()
+            WHERE id = $1 AND status = ANY($3::text[])
+            RETURNING id
+            """,
+            ctx.upload_id,
+            ctx.started_at or datetime.now(timezone.utc),
+            list(statuses),
+        )
+    return row is not None
+
+
 async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
     """Mark upload as completed."""
     platform_results_json = None
@@ -246,6 +276,14 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
             ]
         )
 
+    failure_diag_json = None
+    fd = getattr(ctx, "failure_diag", None)
+    if fd:
+        failure_diag_json = json.dumps(fd)
+
+    pm = getattr(ctx, "pipeline_manifest_final", None) or getattr(ctx, "pipeline_diag", None)
+    pipeline_manifest_json = json.dumps(pm) if pm else None
+
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -258,6 +296,8 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                 platform_results = $6::jsonb,
                 compute_seconds = $7,
                 thumbnail_r2_key = COALESCE($8, thumbnail_r2_key),
+                failure_diag = CASE WHEN $9::text IS NULL THEN failure_diag ELSE $9::jsonb END,
+                pipeline_manifest = CASE WHEN $10::text IS NULL THEN pipeline_manifest ELSE $10::jsonb END,
                 updated_at = NOW()
             WHERE id = $1
             """,
@@ -269,6 +309,8 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
             platform_results_json,
             ctx.compute_seconds,
             ctx.thumbnail_r2_key or None,
+            failure_diag_json,
+            pipeline_manifest_json,
         )
         # ML-ready feature persistence (non-fatal): keeps rich context per upload so
         # offline scorers can learn what creative strategies perform over time.
@@ -299,9 +341,24 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
 
 
 async def mark_processing_failed(
-    pool: asyncpg.Pool, ctx: JobContext, error_code: str, error_detail: str
+    pool: asyncpg.Pool,
+    ctx: JobContext,
+    error_code: str,
+    error_detail: str,
+    failure_diag: Optional[Dict[str, Any]] = None,
 ):
     """Mark upload as failed with error info."""
+    diag = failure_diag if failure_diag is not None else getattr(ctx, "failure_diag", None)
+    diag_json = json.dumps(diag) if diag else None
+    detail = (error_detail or "")[:8000]
+    try:
+        from .pipeline_manifest import finalize_pipeline_diag
+
+        ctx.pipeline_manifest_final = finalize_pipeline_diag(ctx, terminal_status="failed")
+    except Exception:
+        pass
+    pm = getattr(ctx, "pipeline_manifest_final", None) or getattr(ctx, "pipeline_diag", None)
+    pipeline_manifest_json = json.dumps(pm) if pm else None
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -309,14 +366,132 @@ async def mark_processing_failed(
             SET status = 'failed',
                 error_code = $2,
                 error_detail = $3,
+                failure_diag = CASE WHEN $4::text IS NULL THEN failure_diag ELSE $4::jsonb END,
+                pipeline_manifest = CASE WHEN $5::text IS NULL THEN pipeline_manifest ELSE $5::jsonb END,
                 processing_finished_at = NOW(),
                 updated_at = NOW()
             WHERE id = $1
             """,
             ctx.upload_id,
             error_code,
-            error_detail,
+            detail,
+            diag_json,
+            pipeline_manifest_json,
         )
+
+
+async def mark_upload_failed_diagnostic(
+    pool: asyncpg.Pool,
+    upload_id: str,
+    error_code: str,
+    error_detail: str,
+    failure_diag: Optional[Dict[str, Any]] = None,
+    only_if_status: Optional[str] = None,
+) -> bool:
+    """
+    Set uploads row to failed with structured diagnostics (worker timeouts, DLQ, etc.).
+    Returns True if at least one row matched.
+    """
+    detail = (error_detail or "")[:8000]
+    diag_json = json.dumps(failure_diag) if failure_diag is not None else None
+    async with pool.acquire() as conn:
+        if only_if_status:
+            n = await conn.fetchval(
+                """
+                WITH u AS (
+                  UPDATE uploads SET
+                    status = 'failed',
+                    error_code = $2,
+                    error_detail = $3,
+                    failure_diag = CASE WHEN $4::text IS NULL THEN failure_diag ELSE $4::jsonb END,
+                    processing_finished_at = NOW(),
+                    updated_at = NOW()
+                  WHERE id = $1::uuid AND status = $5::text
+                  RETURNING 1
+                )
+                SELECT COUNT(*)::int FROM u
+                """,
+                upload_id,
+                error_code,
+                detail,
+                diag_json,
+                only_if_status,
+            )
+        else:
+            n = await conn.fetchval(
+                """
+                WITH u AS (
+                  UPDATE uploads SET
+                    status = 'failed',
+                    error_code = $2,
+                    error_detail = $3,
+                    failure_diag = CASE WHEN $4::text IS NULL THEN failure_diag ELSE $4::jsonb END,
+                    processing_finished_at = NOW(),
+                    updated_at = NOW()
+                  WHERE id = $1::uuid
+                  RETURNING 1
+                )
+                SELECT COUNT(*)::int FROM u
+                """,
+                upload_id,
+                error_code,
+                detail,
+                diag_json,
+            )
+    return int(n or 0) > 0
+
+
+async def reconcile_stale_processing_uploads(
+    pool: asyncpg.Pool,
+    *,
+    stale_minutes: int,
+    min_job_age_minutes: int,
+    base_diag: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Mark uploads stuck in `processing` as failed when the row has not been updated
+    for `stale_minutes` (worker crash, OOM kill, host restart, deploy).
+    """
+    diag: Dict[str, Any] = dict(base_diag or {})
+    diag.setdefault("category", "WORKER_ORPHANED")
+    diag["stale_minutes"] = int(stale_minutes)
+    diag["min_job_age_minutes"] = int(min_job_age_minutes)
+    msg = (
+        f"Processing stopped unexpectedly (no worker heartbeat for ~{stale_minutes}m). "
+        "Common causes: worker restart, out-of-memory, or platform deploy. Retry the upload; "
+        "include upload id and failure_diag when contacting support."
+    )
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE uploads u SET
+                status = 'failed',
+                error_code = 'WORKER_ORPHANED',
+                error_detail = $1,
+                failure_diag = $2::jsonb,
+                processing_finished_at = NOW(),
+                updated_at = NOW()
+            WHERE u.status = 'processing'
+              AND u.processing_started_at IS NOT NULL
+              AND u.processing_started_at < NOW() - ($3::int * INTERVAL '1 minute')
+              AND u.updated_at < NOW() - ($4::int * INTERVAL '1 minute')
+            RETURNING u.id
+            """,
+            msg,
+            json.dumps(diag),
+            int(min_job_age_minutes),
+            int(stale_minutes),
+        )
+    n = len(rows or [])
+    if n:
+        logger.warning(
+            "reconcile_stale_processing_uploads: marked %s upload(s) WORKER_ORPHANED "
+            "(stale>=%sm, job_age>=%sm)",
+            n,
+            stale_minutes,
+            min_job_age_minutes,
+        )
+    return n
 
 
 async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):

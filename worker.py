@@ -65,10 +65,12 @@ NEW IN v3: DEFERRED PROCESSING (Staged Upload Flow)
     fire at any given poll cycle.
 
 CONCURRENCY:
-  WORKER_CONCURRENCY (default 3) — simultaneous FFmpeg-heavy process jobs.
+  WORKER_CONCURRENCY (default 2) — simultaneous FFmpeg-heavy process jobs.
   WORKER_HEAVY_PIPELINE_SLOTS (default 1) — jobs sharing the memory-heavy tail
     (audio/YAMNet, Vision, Twelve Labs, thumbnails/ONNX/rembg). Keeps peak RAM
     predictable on small Render instances even when WORKER_CONCURRENCY > 1.
+  WORKER_PIPELINE_PROFILE — optional preset: full_safe | minimal_ram | throughput
+    (applies setdefault for concurrency keys so explicit env still wins).
   Scheduler loop runs as a separate asyncio task, not a job slot.
 """
 
@@ -77,13 +79,15 @@ import sys
 import json
 import asyncio
 import logging
+import random
 import tempfile
 import signal
+import socket
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 
 import asyncpg
 import redis.asyncio as redis
@@ -117,6 +121,30 @@ from stages.notify_stage import (
     notify_admin_worker_start,
     notify_admin_worker_stop,
     notify_admin_error,
+)
+from stages.pipeline_manifest import init_pipeline_diag, diag_step, finalize_pipeline_diag
+from stages.pipeline_stage_budgets import (
+    stage_timeout_audio,
+    stage_timeout_vision,
+    stage_timeout_twelvelabs,
+    stage_timeout_video_intelligence,
+    stage_timeout_thumbnail,
+    stage_timeout_caption,
+    stage_timeout_transcode,
+)
+from stages.redis_job_queue import (
+    DEFAULT_GROUP,
+    enqueue_process_job,
+    ensure_stream_group,
+    list_key_from_stream,
+    make_worker_consumer_name,
+    process_stream_keys_ordered,
+    use_redis_streams,
+    user_process_release,
+    user_process_try_acquire,
+    xack_message,
+    xautoclaim_batch,
+    xreadgroup_one,
 )
 from stages.emails import (
     send_upload_completed_email,
@@ -198,13 +226,41 @@ PRIORITY_JOB_QUEUE = os.environ.get("PRIORITY_JOB_QUEUE", "uploadm8:priority")
 
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
 
+# ── Pipeline profile (optional) ─────────────────────────────────────
+# Ship all stages (FFmpeg + audio + Vision + VI + Twelve Labs + thumbnail + caption)
+# without blowing RAM: cap *parallel* jobs and *parallel* heavy tails.
+# Explicit WORKER_* / PUBLISH_* env vars in Render always win (setdefault).
+_PIPELINE_PROFILE = (os.environ.get("WORKER_PIPELINE_PROFILE") or "").strip().lower()
+if _PIPELINE_PROFILE == "full_safe":
+    os.environ.setdefault("WORKER_CONCURRENCY", "2")
+    os.environ.setdefault("WORKER_HEAVY_PIPELINE_SLOTS", "1")
+    os.environ.setdefault("PUBLISH_CONCURRENCY", "4")
+elif _PIPELINE_PROFILE == "minimal_ram":
+    os.environ.setdefault("WORKER_CONCURRENCY", "1")
+    os.environ.setdefault("WORKER_HEAVY_PIPELINE_SLOTS", "1")
+    os.environ.setdefault("PUBLISH_CONCURRENCY", "3")
+elif _PIPELINE_PROFILE == "throughput":
+    os.environ.setdefault("WORKER_CONCURRENCY", "3")
+    os.environ.setdefault("WORKER_HEAVY_PIPELINE_SLOTS", "2")
+    os.environ.setdefault("PUBLISH_CONCURRENCY", "6")
+elif _PIPELINE_PROFILE:
+    logger.warning("Unknown WORKER_PIPELINE_PROFILE=%r — ignoring", _PIPELINE_PROFILE)
+
 # ── Concurrency ───────────────────────────────────────────────────
-# WORKER_CONCURRENCY  = FFmpeg-heavy process jobs (CPU-bound, default 3)
+# WORKER_CONCURRENCY  = FFmpeg-heavy process jobs (CPU-bound; default 2 for small hosts)
 # PUBLISH_CONCURRENCY = API-light publish jobs   (I/O-bound, default 5)
-WORKER_CONCURRENCY  = int(os.environ.get("WORKER_CONCURRENCY",  "3"))
+WORKER_CONCURRENCY  = int(os.environ.get("WORKER_CONCURRENCY",  "2"))
 PUBLISH_CONCURRENCY = int(os.environ.get("PUBLISH_CONCURRENCY", "5"))
 # Caps concurrent "ML + thumbnail" tails (TensorFlow YAMNet, ONNX, rembg, large API buffers).
 WORKER_HEAVY_PIPELINE_SLOTS = max(1, int(os.environ.get("WORKER_HEAVY_PIPELINE_SLOTS", "1")))
+if _PIPELINE_PROFILE and _PIPELINE_PROFILE in ("full_safe", "minimal_ram", "throughput"):
+    logger.info(
+        "WORKER_PIPELINE_PROFILE=%s → concurrency=%s heavy_slots=%s publish=%s",
+        _PIPELINE_PROFILE,
+        WORKER_CONCURRENCY,
+        WORKER_HEAVY_PIPELINE_SLOTS,
+        PUBLISH_CONCURRENCY,
+    )
 
 # Scheduler: how far in advance to start processing a scheduled upload (minutes)
 PROCESSING_WINDOW_MINUTES = int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15"))
@@ -332,6 +388,8 @@ def _merge_upload_prefs_into_settings(user_settings: dict, upload_record: dict) 
     return out
 
 redis_client: Optional[redis.Redis] = None
+# Unique per worker process — Redis Streams consumer + reclaim identity
+WORKER_STREAM_CONSUMER: str = ""
 
 # ── Wallet helpers (worker-side) ─────────────────────────────────────────────
 async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost: int):
@@ -516,6 +574,31 @@ shutdown_requested = False
 shutdown_event: Optional[asyncio.Event] = None
 
 
+def _build_worker_failure_diag(
+    category: str,
+    *,
+    ctx: Optional[JobContext] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Structured JSON for uploads.failure_diag (support + user-visible copy)."""
+    out: Dict[str, Any] = {
+        "category": category,
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+        "host": socket.gethostname(),
+        "render_service_id": os.environ.get("RENDER_SERVICE_ID") or None,
+        "render_instance_id": os.environ.get("RENDER_INSTANCE_ID") or None,
+        "git_commit": os.environ.get("RENDER_GIT_COMMIT") or os.environ.get("GIT_COMMIT") or None,
+    }
+    if ctx is not None:
+        out["pipeline_stage"] = getattr(ctx, "stage", None) or None
+        out["platforms"] = list(getattr(ctx, "platforms", None) or [])
+        out["filename"] = getattr(ctx, "filename", None) or None
+        out["upload_id"] = str(getattr(ctx, "upload_id", "") or "")
+    if extra:
+        out.update(extra)
+    return {k: v for k, v in out.items() if v is not None}
+
+
 async def _send_to_dead_letter(
     upload_id: str,
     user_id: str,
@@ -547,16 +630,25 @@ async def _send_to_dead_letter(
 async def _mark_pipeline_uncaught_failure(upload_id: str, user_id: str, job_data: dict, exc: Exception) -> None:
     """Avoid leaving uploads stuck in processing when the worker escapes the inner pipeline try/except."""
     detail = f"{type(exc).__name__}: {exc}"[:2000]
+    diag = _build_worker_failure_diag(
+        "PIPELINE_EXCEPTION",
+        ctx=None,
+        extra={
+            "upload_id": str(upload_id),
+            "exception_type": type(exc).__name__,
+            "hint": "Uncaught error in worker job wrapper — often memory pressure or a bug. Retry or contact support with failure_diag.",
+        },
+    )
     if db_pool:
         try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE uploads SET status='failed', error_code=$2, error_detail=$3, updated_at=NOW() "
-                    "WHERE id=$1 AND status='processing'",
-                    upload_id,
-                    "PIPELINE_EXCEPTION",
-                    detail,
-                )
+            await db_stage.mark_upload_failed_diagnostic(
+                db_pool,
+                str(upload_id),
+                "PIPELINE_EXCEPTION",
+                detail,
+                failure_diag=diag,
+                only_if_status="processing",
+            )
         except Exception as e:
             logger.warning("[%s] mark failed after PIPELINE_EXCEPTION: %s", upload_id, e)
     await _send_to_dead_letter(
@@ -599,7 +691,12 @@ def _now_utc() -> datetime:
 
 def handle_shutdown(signum, frame):
     global shutdown_requested, shutdown_event
-    logger.info(f"Shutdown signal received ({signum})")
+    logger.warning(
+        "Shutdown signal received (%s) — draining in-flight work. "
+        "Uploads still in status=processing may be marked WORKER_ORPHANED after a heartbeat timeout "
+        "when a new worker starts (see WORKER_ORPHAN_STALE_MINUTES).",
+        signum,
+    )
     shutdown_requested = True
     try:
         if shutdown_event is not None:
@@ -625,12 +722,36 @@ STAGE_PROGRESS = {
     "watermark":  32,
     "transcode":  55,
     "audio":      62,
+    "vision":     64,
+    "twelvelabs": 65,
+    "video_intelligence": 66,
     "thumbnail":  68,
     "caption":    78,
     "upload":     87,
     "publish":    96,
     "notify":     99,
 }
+
+# Shown when a stage *starts* so the queue/upload UI is not stuck on the previous
+# milestone for the whole duration of FFmpeg-heavy work (watermark + transcode).
+STAGE_LIVE_PROGRESS = {
+    "watermark": 27,
+    "transcode": 33,
+    "audio":     56,
+    "vision":    63,
+    "twelvelabs": 64,
+    "video_intelligence": 65,
+    "thumbnail": 67,
+    "caption":   69,
+}
+
+
+async def report_stage_started(ctx: JobContext, stage: str):
+    """Write current stage to DB before long work; complements maybe_cancel at stage end."""
+    pct = STAGE_LIVE_PROGRESS.get(stage)
+    if pct is None:
+        return
+    await db_stage.update_stage_progress(db_pool, ctx.upload_id, stage, pct)
 
 
 async def maybe_cancel(ctx: JobContext, stage: str):
@@ -753,13 +874,29 @@ def _has_telemetry_file(ctx: JobContext) -> bool:
     )
 
 
+def _as_bool_pref(val, default: bool = True) -> bool:
+    """Coerce DB/UI string or missing values to bool."""
+    if val is None:
+        return default
+    if isinstance(val, str):
+        return val.lower() not in ("false", "0", "no", "off", "")
+    return bool(val)
+
+
 def _should_run_trill(ctx: JobContext) -> bool:
+    """
+    Drive / .map telemetry for captions: needs a map file plus user consent.
+    Aligns user_settings.telemetry_enabled (worker) with user_preferences.trill_enabled
+    (POST /api/settings/preferences); either may be set — both false disables.
+    """
     if not _has_telemetry_file(ctx):
         return False
-    setting = ctx.user_settings.get("telemetry_enabled", True)
-    if isinstance(setting, str):
-        setting = setting.lower() not in ("false", "0", "no", "off")
-    return bool(setting)
+    us = ctx.user_settings or {}
+    te = _as_bool_pref(us.get("telemetry_enabled", True), True)
+    tr = us.get("trill_enabled", us.get("trillEnabled"))
+    if tr is None:
+        return te
+    return te or _as_bool_pref(tr, False)
 
 
 def _should_run_hud(ctx: JobContext) -> bool:
@@ -875,7 +1012,23 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             if not ent.can_ai and hasattr(ctx, "use_ai"):
                 ctx.use_ai = False
 
-        await db_stage.mark_processing_started(db_pool, ctx)
+        ctx.redis_client = redis_client
+
+        transitioned = await db_stage.mark_processing_started_if_status_in(
+            db_pool, ctx, ("queued", "pending")
+        )
+        if not transitioned:
+            ur = await db_stage.load_upload_record(db_pool, upload_id)
+            st = ((ur or {}).get("status") or "").lower()
+            if st in ("completed", "succeeded", "partial", "failed", "cancelled", "ready_to_publish"):
+                logger.info("[%s] Skip job — already terminal (%s)", upload_id, st)
+                return True
+            if st == "processing":
+                logger.info("[%s] Skip job — already processing (at-least-once dedupe)", upload_id, st)
+                return True
+            logger.warning("[%s] Skip job — unexpected status %s (not queued/pending)", upload_id, st)
+            return True
+
         try:
             async with db_pool.acquire() as conn:
                 await conn.execute(
@@ -884,6 +1037,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 )
         except Exception as e:
             logger.debug("[%s] processing_started_at timestamp update skipped: %s", upload_id, e)
+
+        init_pipeline_diag(ctx, upload_record, is_deferred=is_deferred)
+        diag_step(ctx, stage="pipeline", status="started", provider="uploadm8_worker")
 
         await maybe_cancel(ctx, "init")
 
@@ -908,32 +1064,58 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 logger.warning(f"[{upload_id}] Telemetry download failed: {e}")
                 ctx.local_telemetry_path = None
 
-        trill_active = _should_run_trill(ctx)
+        trill_want = _should_run_trill(ctx)
         hud_active = _should_run_hud(ctx)
-        logger.info(f"[{upload_id}] Flags: trill={trill_active} hud={hud_active} platforms={ctx.platforms}")
+        svc_telemetry = _svc_enabled("aiServiceTelemetry", True)
+        # HUD still needs map parse; caption-side Trill only when drive + Telemetry Insights on.
+        run_telemetry_stage_flag = hud_active or (trill_want and svc_telemetry)
+        trill_for_captions = bool(trill_want and svc_telemetry)
+        setattr(ctx, "skip_trill_caption_injection", not trill_for_captions)
+
+        logger.info(
+            f"[{upload_id}] Flags: trill_for_captions={trill_for_captions} "
+            f"trill_want={trill_want} hud={hud_active} ai_svc_telemetry={svc_telemetry} "
+            f"platforms={ctx.platforms}"
+        )
+        diag_step(ctx, stage="download", status="ok", provider="cloudflare_r2", extra={"telemetry_map": bool(ctx.local_telemetry_path)})
         await maybe_cancel(ctx, "download")
 
         # ============================================================
         # STAGE 2: Telemetry
         # ============================================================
-        if trill_active or hud_active:
+        if run_telemetry_stage_flag:
             try:
                 ctx = await run_telemetry_stage(ctx)
-                if trill_active:
+                if trill_for_captions:
                     _apply_trill_caption_settings(ctx)
             except SkipStage as e:
                 log_stage_skip(logger, "Telemetry", e.reason, upload_id=upload_id)
-                trill_active = False
+                diag_step(ctx, stage="telemetry", status="skipped", provider="internal", reason=str(e.reason or e))
                 hud_active = False
             except StageError as e:
                 logger.warning(f"[{upload_id}] Telemetry error: {e.message}")
-                trill_active = False
+                diag_step(ctx, stage="telemetry", status="failed", provider="internal", reason=str(e.message)[:200])
                 hud_active = False
+            else:
+                diag_step(
+                    ctx,
+                    stage="telemetry",
+                    status="ok",
+                    provider="internal",
+                    extra={"trill_captions": trill_for_captions, "hud": hud_active},
+                )
         else:
             ctx.telemetry = None
             ctx.telemetry_data = None
             ctx.trill = None
             ctx.trill_score = None
+            diag_step(
+                ctx,
+                stage="telemetry",
+                status="skipped",
+                provider="internal",
+                reason="no_telemetry_or_disabled",
+            )
         await maybe_cancel(ctx, "telemetry")
 
         # ============================================================
@@ -944,33 +1126,83 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 ctx = await run_hud_stage(ctx)
             except SkipStage as e:
                 log_stage_skip(logger, "HUD", e.reason, upload_id=upload_id)
+                diag_step(ctx, stage="hud", status="skipped", provider="ffmpeg", reason=str(e.reason or e))
             except StageError as e:
                 logger.warning(f"[{upload_id}] HUD error: {e.message}")
+                diag_step(ctx, stage="hud", status="failed", provider="ffmpeg", reason=str(e.message)[:200])
+            else:
+                diag_step(ctx, stage="hud", status="ok", provider="ffmpeg")
+        else:
+            diag_step(ctx, stage="hud", status="skipped", provider="ffmpeg", reason="no_telemetry_or_disabled")
         await maybe_cancel(ctx, "hud")
 
         # ============================================================
         # STAGE 4: Watermark
         # ============================================================
+        if not (ctx.entitlements and not ctx.entitlements.can_watermark):
+            await report_stage_started(ctx, "watermark")
         try:
             ctx = await run_watermark_stage(ctx)
         except SkipStage as e:
             log_stage_skip(logger, "Watermark", e.reason, upload_id=upload_id)
+            diag_step(ctx, stage="watermark", status="skipped", provider="ffmpeg", reason=str(e.reason or e))
         except StageError as e:
             logger.warning(f"[{upload_id}] Watermark error: {e.message}")
+            diag_step(ctx, stage="watermark", status="failed", provider="ffmpeg", reason=str(e.message)[:200])
+        else:
+            if ctx.entitlements and not ctx.entitlements.can_watermark:
+                diag_step(ctx, stage="watermark", status="skipped", provider="ffmpeg", reason="tier_no_watermark")
+            else:
+                diag_step(ctx, stage="watermark", status="ok", provider="ffmpeg")
         await maybe_cancel(ctx, "watermark")
 
         # ============================================================
         # STAGE 5: Transcode (deduplicated)
         # ============================================================
+        await report_stage_started(ctx, "transcode")
+        _tt_budget = int(stage_timeout_transcode())
         try:
-            ctx = await _run_deduplicated_transcode(ctx)
+            if _tt_budget > 0:
+                ctx = await asyncio.wait_for(
+                    _run_deduplicated_transcode(ctx),
+                    timeout=float(_tt_budget),
+                )
+            else:
+                ctx = await _run_deduplicated_transcode(ctx)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Transcode exceeded %ss — using source video for platforms",
+                upload_id,
+                _tt_budget,
+            )
+            source = ctx.processed_video_path or ctx.local_video_path
+            for p in (ctx.platforms or []):
+                ctx.platform_videos[p] = source
+            diag_step(
+                ctx,
+                stage="transcode",
+                status="skipped",
+                provider="ffmpeg",
+                reason=f"stage_timeout_{_tt_budget}s",
+            )
         except SkipStage as e:
             log_stage_skip(logger, "Transcode", e.reason, upload_id=upload_id)
+            diag_step(ctx, stage="transcode", status="skipped", provider="ffmpeg", reason=str(e.reason or e))
         except StageError as e:
             logger.warning(f"[{upload_id}] Transcode error: {e.message}")
             source = ctx.processed_video_path or ctx.local_video_path
             for p in (ctx.platforms or []):
                 ctx.platform_videos[p] = source
+            diag_step(ctx, stage="transcode", status="failed", provider="ffmpeg", reason=str(e.message)[:200])
+        else:
+            nv = len(getattr(ctx, "platform_videos", None) or {})
+            diag_step(
+                ctx,
+                stage="transcode",
+                status="ok" if nv else "partial",
+                provider="ffmpeg",
+                extra={"platform_outputs": nv},
+            )
         await maybe_cancel(ctx, "transcode")
 
         async with _heavy_pipeline_slot():
@@ -979,71 +1211,211 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             # Runs AFTER transcode so ctx.video_info.audio_codec is populated.
             # Runs BEFORE thumbnail so ctx.audio_context feeds thumbnail/caption.
             # ============================================================
+            await report_stage_started(ctx, "audio")
+            _aud_b = stage_timeout_audio()
             try:
-                ctx = await run_audio_context_stage(ctx)
+                if _aud_b > 0:
+                    ctx = await asyncio.wait_for(run_audio_context_stage(ctx), timeout=_aud_b)
+                else:
+                    ctx = await run_audio_context_stage(ctx)
                 logger.info(
                     f"[{upload_id}] Audio  — category={ctx.get_audio_category()} "
                     f"emotion={ctx.get_audio_emotion()} mood={ctx.get_thumbnail_mood()}"
                 )
+            except asyncio.TimeoutError:
+                ctx.audio_context = {}
+                diag_step(
+                    ctx,
+                    stage="audio",
+                    status="skipped",
+                    provider="audio_context",
+                    reason=f"stage_timeout_{int(_aud_b)}s",
+                )
+                logger.warning("[%s] Audio context timed out after %ss — continuing", upload_id, int(_aud_b))
             except SkipStage as e:
                 log_stage_skip(logger, "Audio context", e.reason, upload_id=upload_id)
                 ctx.audio_context = {}
+                diag_step(ctx, stage="audio", status="skipped", provider="audio_context", reason=str(e.reason or e))
             except StageError as e:
                 logger.warning(f"[{upload_id}] Audio context error: {e.message}")
                 ctx.audio_context = {}
+                diag_step(ctx, stage="audio", status="failed", provider="audio_context", reason=str(e.message)[:200])
             except Exception as e:
                 logger.warning(f"[{upload_id}] Audio error (non-fatal): {e}")
                 ctx.audio_context = {}
+                diag_step(ctx, stage="audio", status="failed", provider="audio_context", reason=str(e)[:200])
+            else:
+                ac = getattr(ctx, "audio_context", None) or {}
+                keys = list(ac.keys())[:20] if isinstance(ac, dict) else []
+                diag_step(
+                    ctx,
+                    stage="audio",
+                    status="ok" if keys else "partial",
+                    provider="audio_context",
+                    extra={"context_keys": keys},
+                )
             await maybe_cancel(ctx, "audio")
 
             # ============================================================
             # STAGE 5.6: Vision — Google Cloud Vision face/OCR on best frame
             # Context feeds thumbnail (face-priority crop) + caption (OCR).
             # ============================================================
+            await report_stage_started(ctx, "vision")
+            _vis_b = stage_timeout_vision()
             try:
                 if _svc_enabled("aiServiceFrameInspector", True):
-                    ctx = await run_vision_stage(ctx)
+                    if _vis_b > 0:
+                        ctx = await asyncio.wait_for(run_vision_stage(ctx), timeout=_vis_b)
+                    else:
+                        ctx = await run_vision_stage(ctx)
                 else:
                     raise SkipStage("Frame inspector disabled by user preference")
+            except asyncio.TimeoutError:
+                ctx.vision_context = {}
+                diag_step(
+                    ctx,
+                    stage="vision",
+                    status="skipped",
+                    provider="google_cloud_vision",
+                    reason=f"stage_timeout_{int(_vis_b)}s",
+                )
+                logger.warning("[%s] Vision timed out after %ss — continuing", upload_id, int(_vis_b))
             except SkipStage as e:
                 log_stage_skip(logger, "Vision", e.reason, upload_id=upload_id)
                 ctx.vision_context = {}
+                diag_step(ctx, stage="vision", status="skipped", provider="google_cloud_vision", reason=str(e.reason or e))
             except Exception as e:
                 logger.warning(f"[{upload_id}] Vision error (non-fatal): {e}")
                 ctx.vision_context = {}
+                diag_step(ctx, stage="vision", status="failed", provider="google_cloud_vision", reason=str(e)[:200])
+            else:
+                vc = getattr(ctx, "vision_context", None) or {}
+                has_data = bool(vc) and not (isinstance(vc, dict) and vc.get("skipped"))
+                diag_step(
+                    ctx,
+                    stage="vision",
+                    status="ok" if has_data else "partial",
+                    provider="google_cloud_vision",
+                )
             await maybe_cancel(ctx, "vision")
-    
+
             # ============================================================
-            # STAGE 5.7: Twelve Labs — deep video understanding (if enabled)
-            # Context feeds thumbnail/caption/hashtag design.
+            # STAGE 5.7 + 5.8: Twelve Labs + Google Video Intelligence (parallel)
+            # Independent cloud jobs — running together cuts wall time when both run.
             # ============================================================
-            try:
-                if _svc_enabled("aiServiceSceneUnderstanding", True):
-                    ctx = await run_twelvelabs_stage(ctx)
-                else:
-                    raise SkipStage("Scene understanding disabled by user preference")
-            except SkipStage as e:
-                log_stage_skip(logger, "Twelve Labs", e.reason, upload_id=upload_id)
-                ctx.video_understanding = {}
-            except Exception as e:
-                logger.warning(f"[{upload_id}] Twelve Labs error (non-fatal): {e}")
-                ctx.video_understanding = {}
+            async def _twelvelabs_branch() -> None:
+                _tl_b = stage_timeout_twelvelabs()
+                try:
+                    if _svc_enabled("aiServiceSceneUnderstanding", True):
+                        if _tl_b > 0:
+                            await asyncio.wait_for(run_twelvelabs_stage(ctx), timeout=_tl_b)
+                        else:
+                            await run_twelvelabs_stage(ctx)
+                    else:
+                        raise SkipStage("Scene understanding disabled by user preference")
+                except asyncio.TimeoutError:
+                    ctx.video_understanding = {}
+                    diag_step(
+                        ctx,
+                        stage="twelvelabs",
+                        status="skipped",
+                        provider="twelve_labs_api",
+                        reason=f"stage_timeout_{int(_tl_b)}s",
+                    )
+                    logger.warning("[%s] Twelve Labs timed out after %ss", upload_id, int(_tl_b))
+                except SkipStage as e:
+                    log_stage_skip(logger, "Twelve Labs", e.reason, upload_id=upload_id)
+                    ctx.video_understanding = {}
+                except Exception as e:
+                    logger.warning(f"[{upload_id}] Twelve Labs error (non-fatal): {e}")
+                    ctx.video_understanding = {}
+
+            async def _video_intelligence_branch() -> None:
+                _vi_b = stage_timeout_video_intelligence()
+                try:
+                    if _svc_enabled("aiServiceVideoAnalyzer", True):
+                        if _vi_b > 0:
+                            await asyncio.wait_for(run_video_intelligence_stage(ctx), timeout=_vi_b)
+                        else:
+                            await run_video_intelligence_stage(ctx)
+                    else:
+                        raise SkipStage("Video analyzer disabled by user preference")
+                except asyncio.TimeoutError:
+                    ctx.video_intelligence_context = ctx.video_intelligence_context or {}
+                    diag_step(
+                        ctx,
+                        stage="video_intelligence",
+                        status="skipped",
+                        provider="google_video_intelligence",
+                        reason=f"stage_timeout_{int(_vi_b)}s",
+                    )
+                    logger.warning("[%s] Video Intelligence timed out after %ss", upload_id, int(_vi_b))
+                except SkipStage as e:
+                    log_stage_skip(logger, "Video Intelligence", e.reason, upload_id=upload_id)
+                    ctx.video_intelligence_context = ctx.video_intelligence_context or {}
+                except Exception as e:
+                    logger.warning(f"[{upload_id}] Video Intelligence error (non-fatal): {e}")
+                    ctx.video_intelligence_context = ctx.video_intelligence_context or {}
+
+            _tl_on = _svc_enabled("aiServiceSceneUnderstanding", True)
+            _vi_on = _svc_enabled("aiServiceVideoAnalyzer", True)
+            if _vi_on:
+                await report_stage_started(ctx, "video_intelligence")
+            elif _tl_on:
+                await report_stage_started(ctx, "twelvelabs")
+            await asyncio.gather(_twelvelabs_branch(), _video_intelligence_branch())
+
+            vu = getattr(ctx, "video_understanding", None) or {}
+            if not _tl_on:
+                diag_step(ctx, stage="twelvelabs", status="skipped", provider="twelve_labs_api", reason="user_pref_off")
+            elif isinstance(vu, dict) and vu.get("error"):
+                diag_step(
+                    ctx,
+                    stage="twelvelabs",
+                    status="failed",
+                    provider="twelve_labs_api",
+                    reason=str(vu.get("error"))[:200],
+                )
+            elif vu and (vu.get("scene_description") or vu.get("video_id") or vu.get("summary")):
+                diag_step(ctx, stage="twelvelabs", status="ok", provider="twelve_labs_api")
+            else:
+                diag_step(
+                    ctx,
+                    stage="twelvelabs",
+                    status="partial",
+                    provider="twelve_labs_api",
+                    reason="empty_or_unknown",
+                )
+
+            vi_ctx = getattr(ctx, "video_intelligence_context", None) or {}
+            if not _vi_on:
+                diag_step(
+                    ctx,
+                    stage="video_intelligence",
+                    status="skipped",
+                    provider="google_video_intelligence",
+                    reason="user_pref_off",
+                )
+            elif isinstance(vi_ctx, dict) and vi_ctx.get("error"):
+                diag_step(
+                    ctx,
+                    stage="video_intelligence",
+                    status="failed",
+                    provider="google_video_intelligence",
+                    reason=str(vi_ctx.get("error"))[:200],
+                )
+            elif vi_ctx and (vi_ctx.get("top_labels") or vi_ctx.get("segment_labels")):
+                diag_step(ctx, stage="video_intelligence", status="ok", provider="google_video_intelligence")
+            else:
+                diag_step(
+                    ctx,
+                    stage="video_intelligence",
+                    status="partial",
+                    provider="google_video_intelligence",
+                    reason="empty_or_unknown",
+                )
+
             await maybe_cancel(ctx, "twelvelabs")
-    
-            # ============================================================
-            # STAGE 5.8: Google Video Intelligence — full-clip labels + shots
-            # ============================================================
-            try:
-                if _svc_enabled("aiServiceVideoAnalyzer", True):
-                    ctx = await run_video_intelligence_stage(ctx)
-                else:
-                    raise SkipStage("Video analyzer disabled by user preference")
-            except SkipStage as e:
-                log_stage_skip(logger, "Video Intelligence", e.reason, upload_id=upload_id)
-                ctx.video_intelligence_context = ctx.video_intelligence_context or {}
-            except Exception as e:
-                logger.warning(f"[{upload_id}] Video Intelligence error (non-fatal): {e}")
-                ctx.video_intelligence_context = ctx.video_intelligence_context or {}
             await maybe_cancel(ctx, "video_intelligence")
     
             # ============================================================
@@ -1079,11 +1451,28 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except Exception as e:
                 logger.debug(f"[{upload_id}] Could not load recent thumbnail style signatures: {e}")
     
+            await report_stage_started(ctx, "thumbnail")
+            _th_b = stage_timeout_thumbnail()
             try:
                 if _svc_enabled("aiServiceThumbnailDesigner", True):
-                    ctx = await run_thumbnail_stage(ctx, db_pool=db_pool)
+                    if _th_b > 0:
+                        ctx = await asyncio.wait_for(
+                            run_thumbnail_stage(ctx, db_pool=db_pool),
+                            timeout=_th_b,
+                        )
+                    else:
+                        ctx = await run_thumbnail_stage(ctx, db_pool=db_pool)
                 else:
                     raise SkipStage("Thumbnail designer disabled by user preference")
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Thumbnail stage timed out after %ss — continuing", upload_id, int(_th_b))
+                diag_step(
+                    ctx,
+                    stage="thumbnail",
+                    status="skipped",
+                    provider="thumbnail_pipeline",
+                    reason=f"stage_timeout_{int(_th_b)}s",
+                )
             except SkipStage as e:
                 log_stage_skip(logger, "Thumbnail", e.reason, upload_id=upload_id)
             except StageError as e:
@@ -1192,24 +1581,63 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                         logger.debug(f"[{upload_id}] YouTube AB variant {i} upload failed: {e}")
                 if ab_r2:
                     ctx.output_artifacts["youtube_thumbnail_ab_r2_keys"] = json.dumps(ab_r2)
-    
+
+            _thumb_svc = _svc_enabled("aiServiceThumbnailDesigner", True)
+            if not _thumb_svc:
+                diag_step(ctx, stage="thumbnail", status="skipped", provider="thumbnail_pipeline", reason="user_pref_off")
+            elif ctx.thumbnail_path and Path(ctx.thumbnail_path).exists():
+                diag_step(
+                    ctx,
+                    stage="thumbnail",
+                    status="ok",
+                    provider="thumbnail_pipeline",
+                    extra={"r2": bool(ctx.thumbnail_r2_key)},
+                )
+            else:
+                diag_step(
+                    ctx,
+                    stage="thumbnail",
+                    status="skipped",
+                    provider="thumbnail_pipeline",
+                    reason="no_thumbnail_generated",
+                )
+
             await maybe_cancel(ctx, "thumbnail")
 
         # ============================================================
         # STAGE 7: Caption
         # ============================================================
+        await report_stage_started(ctx, "caption")
+        _cap_b = stage_timeout_caption()
         try:
             if _svc_enabled("aiServiceCaptionWriter", True):
-                ctx = await run_caption_stage(ctx, db_pool)
+                if _cap_b > 0:
+                    ctx = await asyncio.wait_for(run_caption_stage(ctx, db_pool), timeout=_cap_b)
+                else:
+                    ctx = await run_caption_stage(ctx, db_pool)
                 await db_stage.save_generated_metadata(db_pool, ctx)
             else:
                 raise SkipStage("Caption writer disabled by user preference")
+        except asyncio.TimeoutError:
+            logger.warning("[%s] Caption stage timed out after %ss — continuing", upload_id, int(_cap_b))
+            diag_step(
+                ctx,
+                stage="caption",
+                status="skipped",
+                provider="openai",
+                reason=f"stage_timeout_{int(_cap_b)}s",
+            )
         except SkipStage as e:
             log_stage_skip(logger, "Caption", e.reason, upload_id=upload_id)
+            diag_step(ctx, stage="caption", status="skipped", provider="openai", reason=str(e.reason or e))
         except StageError as e:
             logger.warning(f"[{upload_id}] Caption error: {e.message}")
+            diag_step(ctx, stage="caption", status="failed", provider="openai", reason=str(e.message)[:200])
         except Exception as e:
             logger.warning(f"[{upload_id}] Caption error (non-fatal): {e}")
+            diag_step(ctx, stage="caption", status="failed", provider="openai", reason=str(e)[:200])
+        else:
+            diag_step(ctx, stage="caption", status="ok", provider="openai")
         await maybe_cancel(ctx, "caption")
 
         # ============================================================
@@ -1260,6 +1688,14 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         except Exception as e:
             logger.warning(f"[{upload_id}] Could not persist processed_assets: {e}")
 
+        diag_step(
+            ctx,
+            stage="processed_r2_upload",
+            status="ok" if processed_assets else "partial",
+            provider="cloudflare_r2",
+            extra={"keys": list(processed_assets.keys())[:24]},
+        )
+
         await maybe_cancel(ctx, "upload")
 
         # ============================================================
@@ -1267,6 +1703,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # ============================================================
         if is_deferred:
             try:
+                pm = finalize_pipeline_diag(ctx, terminal_status="ready_to_publish")
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         """
@@ -1274,11 +1711,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                         SET status = 'ready_to_publish',
                             ready_to_publish_at = NOW(),
                             processed_assets = $2,
+                            pipeline_manifest = $3::jsonb,
                             updated_at = NOW()
                         WHERE id = $1
                         """,
                         upload_id,
                         json.dumps(processed_assets),
+                        json.dumps(pm),
                     )
                 logger.info(f"[{upload_id}] Processing complete → ready_to_publish (waiting for scheduled_time)")
             except Exception as e:
@@ -1320,6 +1759,14 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         logger.exception(f"[{upload_id}] Processing failed: {e}")
         if ctx:
             ctx.mark_error("INTERNAL", str(e))
+            ctx.failure_diag = _build_worker_failure_diag(
+                "PIPELINE_INTERNAL",
+                ctx=ctx,
+                extra={
+                    "exception_type": type(e).__name__,
+                    "hint": "Processing raised before publish — see error_detail. Retry the upload or share failure_diag with support.",
+                },
+            )
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
         _uid_for_release = str(ctx.user_id) if ctx else user_id
         _upid_for_release = ctx.upload_id if ctx else upload_id
@@ -1354,9 +1801,26 @@ async def run_publish_and_notify(
     """
     try:
         ctx = await run_publish_stage(ctx, db_pool)
+        for pr in ctx.platform_results or []:
+            reason = (getattr(pr, "error_code", None) or getattr(pr, "error_message", None) or "")[:200]
+            diag_step(
+                ctx,
+                stage="publish",
+                status="ok" if pr.success else "failed",
+                provider=str(pr.platform or "unknown"),
+                reason=reason,
+                extra={"account": getattr(pr, "account_username", None)},
+            )
     except StageError as e:
         logger.error(f"[{upload_id}] Publish error: {e.message}")
         ctx.mark_error(e.code.value, e.message)
+        ec = e.code.value if hasattr(e.code, "value") else str(e.code)
+        ctx.failure_diag = _build_worker_failure_diag(
+            "PUBLISH_STAGE_ERROR",
+            ctx=ctx,
+            extra={"publish_error_code": ec, "publish_stage_detail": (e.detail or "")[:500] or None},
+        )
+        diag_step(ctx, stage="publish", status="failed", provider="platform_apis", reason=str(e.message)[:200])
 
     try:
         ctx = await run_notify_stage(ctx)
@@ -1371,6 +1835,24 @@ async def run_publish_and_notify(
     else:
         ctx.state = "failed"
 
+    if ctx.state == "failed" and not ctx.platform_results:
+        if not (ctx.error_message or "").strip():
+            ctx.error_message = (
+                "Publish did not produce any per-platform results (nothing was posted). "
+                "Confirm destinations and connected accounts, or retry if the worker restarted during processing."
+            )
+        base = _build_worker_failure_diag(
+            "PUBLISH_EMPTY_RESULTS",
+            ctx=ctx,
+            extra={
+                "target_accounts": list(ctx.target_accounts or []),
+                "hint": "No PlatformResult rows — often worker restart before publish, missing video file, or no valid OAuth targets.",
+            },
+        )
+        prev = ctx.failure_diag if isinstance(ctx.failure_diag, dict) else {}
+        ctx.failure_diag = {**base, **prev}
+
+    ctx.pipeline_manifest_final = finalize_pipeline_diag(ctx, terminal_status=ctx.state)
     await db_stage.mark_processing_completed(db_pool, ctx)
 
     # ── Upload email notification ──────────────────────────────────────────
@@ -1557,6 +2039,7 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
+        ctx.redis_client = redis_client
 
         if ctx.user_record and ctx.entitlements:
             ent = ctx.entitlements
@@ -1583,11 +2066,21 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
 
         if not processed_assets:
             logger.error(f"[{upload_id}] No processed_assets found — cannot publish")
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE uploads SET status='failed', error_code='NO_PROCESSED_ASSETS', updated_at=NOW() WHERE id=$1",
-                    upload_id,
-                )
+            await db_stage.mark_upload_failed_diagnostic(
+                db_pool,
+                str(upload_id),
+                "NO_PROCESSED_ASSETS",
+                "Scheduled publish could not find processed video assets — upstream processing may not have completed.",
+                failure_diag=_build_worker_failure_diag(
+                    "NO_PROCESSED_ASSETS",
+                    ctx=None,
+                    extra={
+                        "upload_id": str(upload_id),
+                        "hint": "Worker restart or failed processing before R2 processed_assets were saved. Retry from upload or re-queue.",
+                    },
+                ),
+                only_if_status="processing",
+            )
             return False
 
         ctx.output_artifacts["processed_assets"] = json.dumps(processed_assets)
@@ -1615,11 +2108,21 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
 
         if not ctx.platform_videos:
             logger.error(f"[{upload_id}] No platform videos available after download")
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE uploads SET status='failed', error_code='ASSET_DOWNLOAD_FAILED', updated_at=NOW() WHERE id=$1",
-                    upload_id,
-                )
+            await db_stage.mark_upload_failed_diagnostic(
+                db_pool,
+                str(upload_id),
+                "ASSET_DOWNLOAD_FAILED",
+                "Could not download processed MP4s from storage for publish.",
+                failure_diag=_build_worker_failure_diag(
+                    "ASSET_DOWNLOAD_FAILED",
+                    ctx=None,
+                    extra={
+                        "upload_id": str(upload_id),
+                        "hint": "R2 keys in processed_assets may be invalid or storage temporarily unavailable.",
+                    },
+                ),
+                only_if_status="processing",
+            )
             temp_dir_obj.cleanup()
             return False
 
@@ -1665,6 +2168,11 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         logger.exception(f"[{upload_id}] Deferred publish failed: {e}")
         if ctx:
             ctx.mark_error("INTERNAL", str(e))
+            ctx.failure_diag = _build_worker_failure_diag(
+                "DEFERRED_PUBLISH_INTERNAL",
+                ctx=ctx,
+                extra={"exception_type": type(e).__name__},
+            )
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
         await notify_admin_error("deferred_publish_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
         return False
@@ -1704,6 +2212,7 @@ async def _sync_one_upload_analytics(
 
     token_map: keyed by platform_tokens.id (UUID). token_map_by_plat_account: (platform, account_id) → token.
     """
+    import json as _json
     import httpx as _httpx
     from stages.publish_stage import decrypt_token
     from services.sync_analytics_helpers import resolve_token_candidates_for_platform_result
@@ -1789,24 +2298,32 @@ async def _sync_one_upload_analytics(
                     elif plat == "youtube" and video_id:
                         resp = await client.get(
                             "https://www.googleapis.com/youtube/v3/videos",
-                            params={"part": "statistics,snippet", "id": str(video_id)},
+                            params={"part": "statistics,snippet,status", "id": str(video_id)},
                             headers={"Authorization": f"Bearer {access_token}"},
                         )
                         if resp.status_code == 200:
                             items = resp.json().get("items", []) or []
-                            if items:
-                                st = items[0].get("statistics", {}) or {}
-                                s = {
-                                    "views":    int(st.get("viewCount")    or 0),
-                                    "likes":    int(st.get("likeCount")    or 0),
-                                    "comments": int(st.get("commentCount") or 0),
-                                    "shares":   0,
-                                }
-                                _accum_platform_stats(platform_stats, "youtube", s)
-                                total_views    += s["views"]; total_likes    += s["likes"]
-                                total_comments += s["comments"]
+                            if not items:
+                                pr["platform_presence"] = "not_found"
+                                pr["visibility"] = None
                                 resolved = True
                                 break
+                            st = items[0].get("statistics", {}) or {}
+                            status = items[0].get("status") or {}
+                            vis = str(status.get("privacyStatus") or "").lower() or None
+                            pr["visibility"] = vis
+                            pr["platform_presence"] = "ok"
+                            s = {
+                                "views":    int(st.get("viewCount")    or 0),
+                                "likes":    int(st.get("likeCount")    or 0),
+                                "comments": int(st.get("commentCount") or 0),
+                                "shares":   0,
+                            }
+                            _accum_platform_stats(platform_stats, "youtube", s)
+                            total_views    += s["views"]; total_likes    += s["likes"]
+                            total_comments += s["comments"]
+                            resolved = True
+                            break
                         elif resp.status_code == 401:
                             continue
 
@@ -1914,15 +2431,17 @@ async def _sync_one_upload_analytics(
                likes = $2,
                comments = $3,
                shares = $4,
+               platform_results = $5::jsonb,
                analytics_synced_at = NOW(),
                updated_at = NOW()
-         WHERE id = $5
-           AND user_id = $6
+         WHERE id = $6
+           AND user_id = $7
         """,
         total_views,
         total_likes,
         total_comments,
         total_shares,
+        _json.dumps(pr_list),
         upload_id,
         user_id,
     )
@@ -2380,6 +2899,19 @@ async def run_scheduler_loop() -> None:
             continue
         try:
             now = _now_utc()
+            try:
+                _orph_stale = int(os.environ.get("WORKER_ORPHAN_STALE_MINUTES", "25"))
+                _orph_min_age = int(os.environ.get("WORKER_ORPHAN_MIN_JOB_MINUTES", "10"))
+                if _orph_stale > 0:
+                    await db_stage.reconcile_stale_processing_uploads(
+                        db_pool,
+                        stale_minutes=_orph_stale,
+                        min_job_age_minutes=_orph_min_age,
+                        base_diag=_build_worker_failure_diag("WORKER_ORPHANED", ctx=None, extra={}),
+                    )
+            except Exception as _sched_recon_err:
+                logger.debug("scheduler stale reconcile: %s", _sched_recon_err)
+
             process_cutoff = now + timedelta(minutes=PROCESSING_WINDOW_MINUTES)
 
             async with db_pool.acquire() as conn:
@@ -2505,12 +3037,22 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
         except asyncio.TimeoutError:
             logger.error(f"[{upload_id}] Scheduled pipeline timed out after {JOB_TIMEOUT}s")
             try:
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE uploads SET status='failed', error_code='JOB_TIMEOUT', "
-                        "error_detail=$2, updated_at=NOW() WHERE id=$1 AND status='processing'",
-                        upload_id, f"Pipeline exceeded {JOB_TIMEOUT}s timeout",
-                    )
+                await db_stage.mark_upload_failed_diagnostic(
+                    db_pool,
+                    str(upload_id),
+                    "JOB_TIMEOUT",
+                    f"Pipeline exceeded {JOB_TIMEOUT}s timeout (host may be undersized or clip very long).",
+                    failure_diag=_build_worker_failure_diag(
+                        "JOB_TIMEOUT",
+                        ctx=None,
+                        extra={
+                            "upload_id": str(upload_id),
+                            "job_timeout_sec": int(JOB_TIMEOUT),
+                            "hint": "Increase JOB_TIMEOUT_SECONDS or reduce WORKER_CONCURRENCY / heavy AI stages on small instances.",
+                        },
+                    ),
+                    only_if_status="processing",
+                )
             except Exception as e:
                 logger.warning("[%s] timeout: failed to mark upload failed in DB: %s", upload_id, e)
             await _send_to_dead_letter(
@@ -2533,12 +3075,22 @@ async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> 
         except asyncio.TimeoutError:
             logger.error(f"[{upload_id}] Deferred publish timed out after {JOB_TIMEOUT}s")
             try:
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE uploads SET status='failed', error_code='PUBLISH_TIMEOUT', "
-                        "error_detail=$2, updated_at=NOW() WHERE id=$1",
-                        upload_id, f"Deferred publish exceeded {JOB_TIMEOUT}s timeout",
-                    )
+                await db_stage.mark_upload_failed_diagnostic(
+                    db_pool,
+                    str(upload_id),
+                    "PUBLISH_TIMEOUT",
+                    f"Deferred publish exceeded {JOB_TIMEOUT}s timeout.",
+                    failure_diag=_build_worker_failure_diag(
+                        "PUBLISH_TIMEOUT",
+                        ctx=None,
+                        extra={
+                            "upload_id": str(upload_id),
+                            "job_timeout_sec": int(JOB_TIMEOUT),
+                            "hint": "Platform APIs were too slow or blocked; retry scheduled publish or increase JOB_TIMEOUT_SECONDS.",
+                        },
+                    ),
+                    only_if_status="processing",
+                )
             except Exception as e:
                 logger.warning("[%s] deferred publish timeout: DB update failed: %s", upload_id, e)
         except Exception as e:
@@ -2549,7 +3101,7 @@ async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> 
 # Redis job consumer (immediate uploads only)
 # ---------------------------------------------------------------------------
 
-async def _process_one_job(job_json: str) -> None:
+async def _process_one_job_body(job_json: str) -> None:
     try:
         job_data = json.loads(job_json)
     except json.JSONDecodeError as e:
@@ -2565,12 +3117,22 @@ async def _process_one_job(job_json: str) -> None:
         except asyncio.TimeoutError:
             logger.error(f"[{upload_id}] Job timed out after {JOB_TIMEOUT}s — releasing slot")
             try:
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE uploads SET status='failed', error_code='JOB_TIMEOUT', "
-                        "error_detail=$2, updated_at=NOW() WHERE id=$1 AND status='processing'",
-                        upload_id, f"Pipeline exceeded {JOB_TIMEOUT}s timeout",
-                    )
+                await db_stage.mark_upload_failed_diagnostic(
+                    db_pool,
+                    str(upload_id),
+                    "JOB_TIMEOUT",
+                    f"Pipeline exceeded {JOB_TIMEOUT}s timeout.",
+                    failure_diag=_build_worker_failure_diag(
+                        "JOB_TIMEOUT",
+                        ctx=None,
+                        extra={
+                            "upload_id": str(upload_id),
+                            "job_timeout_sec": int(JOB_TIMEOUT),
+                            "hint": "Worker job slot limit or slow FFmpeg/ML — reduce concurrency or disable optional AI stages.",
+                        },
+                    ),
+                    only_if_status="processing",
+                )
             except Exception as e:
                 logger.warning("[%s] job timeout: failed to mark upload failed: %s", upload_id, e)
             await _send_to_dead_letter(
@@ -2585,9 +3147,114 @@ async def _process_one_job(job_json: str) -> None:
             )
 
 
+async def _process_one_job_tracked(
+    job_json: str,
+    stream_key: Optional[str] = None,
+    message_id: Optional[str] = None,
+    list_key: Optional[str] = None,
+) -> None:
+    """
+    Per-user cluster cap, then pipeline. XACK stream messages after work (at-least-once).
+    """
+    global redis_client
+    manual_xack = False
+    user_got = False
+    user_id = ""
+    should_final_ack = False
+    try:
+        try:
+            job_data = json.loads(job_json)
+        except json.JSONDecodeError as e:
+            logger.error("Invalid job JSON (will ACK stream entry): %s", e)
+            should_final_ack = True
+            return
+
+        user_id = str(job_data.get("user_id") or "")
+        pc = str(job_data.get("priority_class") or "p4")
+        upload_id = job_data.get("upload_id", "?")
+
+        if redis_client:
+            if not await user_process_try_acquire(redis_client, user_id, pc):
+                if stream_key and message_id:
+                    ok = await enqueue_process_job(
+                        redis_client, list_key_from_stream(stream_key), job_data
+                    )
+                    if ok:
+                        await xack_message(redis_client, stream_key, DEFAULT_GROUP, message_id)
+                        manual_xack = True
+                        logger.info("[%s] Re-queued (per-user process cap)", upload_id)
+                    else:
+                        should_final_ack = False
+                elif list_key:
+                    await asyncio.sleep(0.2 + random.random() * 0.5)
+                    try:
+                        await redis_client.rpush(list_key, job_json)
+                        logger.info("[%s] Re-pushed list queue (per-user cap)", upload_id)
+                    except Exception as ex:
+                        logger.error("[%s] requeue rpush failed: %s", upload_id, ex)
+                return
+            user_got = True
+
+        await _process_one_job_body(job_json)
+        should_final_ack = True
+    except Exception as e:
+        logger.exception("Job tracked wrapper error: %s", e)
+        should_final_ack = bool(stream_key and message_id)
+    finally:
+        if user_got and redis_client and user_id:
+            await user_process_release(redis_client, user_id)
+        if (
+            stream_key
+            and message_id
+            and redis_client
+            and should_final_ack
+            and not manual_xack
+        ):
+            await xack_message(redis_client, stream_key, DEFAULT_GROUP, message_id)
+
+
+async def stream_reclaim_loop() -> None:
+    """XAUTOCLAIM stale pending stream messages (worker crash before XACK)."""
+    global redis_client, shutdown_requested
+    reclaim_as = f"{WORKER_STREAM_CONSUMER}:reclaim"
+    min_idle = int(os.environ.get("STREAM_RECLAIM_MIN_IDLE_MS", "120000"))
+    interval = max(5, int(os.environ.get("STREAM_RECLAIM_INTERVAL_SEC", "25")))
+    batch = max(1, int(os.environ.get("STREAM_RECLAIM_COUNT", "8")))
+    stream_keys = process_stream_keys_ordered(
+        PROCESS_PRIORITY_QUEUE,
+        PROCESS_NORMAL_QUEUE,
+        PRIORITY_JOB_QUEUE,
+        UPLOAD_JOB_QUEUE,
+    )
+    logger.info(
+        "Stream reclaim loop | min_idle_ms=%s interval=%s batch=%s consumer=%s",
+        min_idle,
+        interval,
+        batch,
+        reclaim_as,
+    )
+    while not shutdown_requested:
+        await asyncio.sleep(interval)
+        if shutdown_requested or not use_redis_streams() or not redis_client:
+            continue
+        for sk in stream_keys:
+            try:
+                claimed = await xautoclaim_batch(
+                    redis_client, sk, DEFAULT_GROUP, reclaim_as, min_idle, batch
+                )
+            except Exception as e:
+                logger.debug("xautoclaim %s: %s", sk, e)
+                continue
+            for mid, payload in claimed:
+                asyncio.create_task(
+                    _process_one_job_tracked(payload, stream_key=sk, message_id=mid, list_key=None)
+                )
+
+
 async def process_jobs() -> None:
     """
     Consume process-lane jobs from Redis (FFmpeg-heavy).
+    Streams (at-least-once) + legacy list drain (BRPOP).
     """
     global shutdown_requested, redis_client, _process_semaphore, _publish_semaphore, _job_semaphore
 
@@ -2601,9 +3268,17 @@ async def process_jobs() -> None:
         PRIORITY_JOB_QUEUE,
         UPLOAD_JOB_QUEUE,
     ]
+    stream_keys = process_stream_keys_ordered(
+        PROCESS_PRIORITY_QUEUE,
+        PROCESS_NORMAL_QUEUE,
+        PRIORITY_JOB_QUEUE,
+        UPLOAD_JOB_QUEUE,
+    )
 
     logger.info(
         f"Job consumer started | "
+        f"streams={use_redis_streams()} | "
+        f"consumer={WORKER_STREAM_CONSUMER} | "
         f"process_concurrency={WORKER_CONCURRENCY} | "
         f"heavy_pipeline_slots={WORKER_HEAVY_PIPELINE_SLOTS} | "
         f"publish_concurrency={PUBLISH_CONCURRENCY} | "
@@ -2617,18 +3292,37 @@ async def process_jobs() -> None:
         active_tasks = [t for t in active_tasks if not t.done()]
 
         try:
-            job_raw = await redis_client.brpop(
-                all_process_queues,
-                timeout=int(POLL_INTERVAL),
-            )
+            job_json = None
+            sk: Optional[str] = None
+            mid: Optional[str] = None
+            lk: Optional[str] = None
+
+            if use_redis_streams():
+                got = await xreadgroup_one(
+                    redis_client,
+                    stream_keys,
+                    DEFAULT_GROUP,
+                    WORKER_STREAM_CONSUMER,
+                    block_ms=max(500, int(float(POLL_INTERVAL) * 1000)),
+                )
+                if got:
+                    sk, mid, job_json = got
+
+            if not job_json:
+                job_raw = await redis_client.brpop(
+                    all_process_queues,
+                    timeout=int(max(1, float(POLL_INTERVAL))),
+                )
+                if job_raw:
+                    lk, job_json = job_raw
+
             consecutive_redis_errors = 0
 
-            if not job_raw:
-                continue
-
-            _, job_json = job_raw
-            task = asyncio.create_task(_process_one_job(job_json))
-            active_tasks.append(task)
+            if job_json:
+                task = asyncio.create_task(
+                    _process_one_job_tracked(job_json, stream_key=sk, message_id=mid, list_key=lk)
+                )
+                active_tasks.append(task)
 
         except redis.ReadOnlyError:
             consecutive_redis_errors += 1
@@ -2650,8 +3344,6 @@ async def process_jobs() -> None:
                 except Exception as re_err:
                     logger.error(f"Redis reconnect failed: {re_err}")
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid job JSON: {e}")
         except Exception as e:
             logger.exception(f"Job consumer error: {e}")
             await asyncio.sleep(1)
@@ -2668,7 +3360,7 @@ async def process_jobs() -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global db_pool, redis_client, shutdown_event, _heavy_pipeline_sem
+    global db_pool, redis_client, shutdown_event, _heavy_pipeline_sem, WORKER_STREAM_CONSUMER
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
@@ -2692,9 +3384,41 @@ async def main() -> None:
     )
     logger.info(f"Database connected | pool={db_min}-{db_max}")
 
+    try:
+        _orph_stale = int(os.environ.get("WORKER_ORPHAN_STALE_MINUTES", "25"))
+        _orph_min_age = int(os.environ.get("WORKER_ORPHAN_MIN_JOB_MINUTES", "10"))
+        if _orph_stale > 0 and _orph_min_age >= 0:
+            _n = await db_stage.reconcile_stale_processing_uploads(
+                db_pool,
+                stale_minutes=_orph_stale,
+                min_job_age_minutes=_orph_min_age,
+                base_diag=_build_worker_failure_diag("WORKER_ORPHANED", ctx=None, extra={}),
+            )
+            if _n:
+                logger.info("Reconciled %s stale processing upload(s) as WORKER_ORPHANED", _n)
+    except Exception as _recon_err:
+        logger.warning("Stale processing reconciliation skipped: %s", _recon_err)
+
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     await redis_client.ping()
     logger.info("Redis connected")
+
+    WORKER_STREAM_CONSUMER = make_worker_consumer_name()
+    if use_redis_streams():
+        _skeys = process_stream_keys_ordered(
+            PROCESS_PRIORITY_QUEUE,
+            PROCESS_NORMAL_QUEUE,
+            PRIORITY_JOB_QUEUE,
+            UPLOAD_JOB_QUEUE,
+        )
+        for _sk in _skeys:
+            await ensure_stream_group(redis_client, _sk, DEFAULT_GROUP)
+        logger.info(
+            "Redis Streams ready | group=%s consumer=%s (%s streams)",
+            DEFAULT_GROUP,
+            WORKER_STREAM_CONSUMER,
+            len(_skeys),
+        )
 
     _heavy_pipeline_sem = asyncio.Semaphore(WORKER_HEAVY_PIPELINE_SLOTS)
     logger.info(
@@ -2706,6 +3430,11 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(process_jobs()),
+    ]
+    if use_redis_streams():
+        tasks.append(asyncio.create_task(stream_reclaim_loop()))
+    tasks.extend(
+        [
         asyncio.create_task(run_scheduler_loop()),
         asyncio.create_task(run_verification_loop(db_pool, shutdown_event)),
         asyncio.create_task(run_analytics_sync_loop()),
@@ -2713,7 +3442,8 @@ async def main() -> None:
         asyncio.create_task(run_catalog_sync_loop()),
         asyncio.create_task(run_kpi_collector_loop()),
         asyncio.create_task(run_ml_scoring_loop()),
-    ]
+        ]
+    )
 
     try:
         await notify_admin_worker_start(db_pool)

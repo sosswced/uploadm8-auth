@@ -17,6 +17,9 @@ Env:
   VIDEO_INTELLIGENCE_MAX_BYTES (default 10485760)
   VIDEO_INTELLIGENCE_TIMEOUT_SEC (default 600)
   VIDEO_INTELLIGENCE_INPUT_URI  Optional gs://... (skips local read)
+  VIDEO_INTELLIGENCE_MAX_DURATION_SEC  If >0, skip when video duration (from ffprobe) exceeds this
+                                       (long clips make the Google API wait very long).
+  VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE  If false, label detection only (often faster than +shots).
 """
 
 from __future__ import annotations
@@ -37,8 +40,25 @@ VIDEO_INTELLIGENCE_ENABLED = os.environ.get("VIDEO_INTELLIGENCE_ENABLED", "false
 VIDEO_INTELLIGENCE_MAX_BYTES = int(os.environ.get("VIDEO_INTELLIGENCE_MAX_BYTES", str(10 * 1024 * 1024)))
 VIDEO_INTELLIGENCE_TIMEOUT_SEC = int(os.environ.get("VIDEO_INTELLIGENCE_TIMEOUT_SEC", "600"))
 VIDEO_INTELLIGENCE_INPUT_URI = (os.environ.get("VIDEO_INTELLIGENCE_INPUT_URI") or "").strip()
+VIDEO_INTELLIGENCE_MAX_DURATION_SEC = float(os.environ.get("VIDEO_INTELLIGENCE_MAX_DURATION_SEC", "0") or 0)
+VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE = (
+    os.environ.get("VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE", "true").lower() == "true"
+)
 
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gvi")
+
+
+def _ctx_duration_sec(ctx: JobContext) -> Optional[float]:
+    vi = getattr(ctx, "video_info", None)
+    if not isinstance(vi, dict):
+        return None
+    d = vi.get("duration")
+    if d is None:
+        return None
+    try:
+        return float(d)
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_gcp_credentials_path() -> Optional[Path]:
@@ -136,10 +156,11 @@ def _analyze_sync_inline(video_bytes: bytes, creds: Any = None) -> Dict[str, Any
         else vi.VideoIntelligenceServiceClient()
     )
     features = [vi.Feature.LABEL_DETECTION]
-    try:
-        features.append(vi.Feature.SHOT_CHANGE_DETECTION)
-    except AttributeError as e:
-        logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable, labels only: %s", e)
+    if VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE:
+        try:
+            features.append(vi.Feature.SHOT_CHANGE_DETECTION)
+        except AttributeError as e:
+            logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable, labels only: %s", e)
     request = vi.AnnotateVideoRequest(
         input_content=video_bytes,
         features=features,
@@ -158,10 +179,11 @@ def _analyze_sync_gcs(uri: str, creds: Any = None) -> Dict[str, Any]:
         else vi.VideoIntelligenceServiceClient()
     )
     features = [vi.Feature.LABEL_DETECTION]
-    try:
-        features.append(vi.Feature.SHOT_CHANGE_DETECTION)
-    except AttributeError as e:
-        logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable (GCS path), labels only: %s", e)
+    if VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE:
+        try:
+            features.append(vi.Feature.SHOT_CHANGE_DETECTION)
+        except AttributeError as e:
+            logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable (GCS path), labels only: %s", e)
     request = vi.AnnotateVideoRequest(
         input_uri=uri,
         features=features,
@@ -179,6 +201,14 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
 
     if not VIDEO_INTELLIGENCE_ENABLED:
         raise SkipStage("Video Intelligence disabled (VIDEO_INTELLIGENCE_ENABLED=false)")
+
+    if VIDEO_INTELLIGENCE_MAX_DURATION_SEC > 0:
+        dur = _ctx_duration_sec(ctx)
+        if dur is not None and dur > VIDEO_INTELLIGENCE_MAX_DURATION_SEC:
+            raise SkipStage(
+                f"Video Intelligence skipped (duration {dur:.0f}s > "
+                f"{VIDEO_INTELLIGENCE_MAX_DURATION_SEC:.0f}s VIDEO_INTELLIGENCE_MAX_DURATION_SEC)"
+            )
 
     creds_obj = _gcp_creds_for_vi()
     creds_path = _resolve_gcp_credentials_path()

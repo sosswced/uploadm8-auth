@@ -123,4 +123,4 @@ async def send_announcement_email(
         footer_note="You received this announcement because you are an UploadM8 user.",
     )
 
-    await send_email(to, f"UploadM8 update: {title}", html, from_addr=MAIL_FROM_HELLO)
+    await send_email(to, f"📢 {title}", html, from_addr=MAIL_FROM_HELLO)

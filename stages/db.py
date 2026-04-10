@@ -6,10 +6,8 @@ Database helpers used by the worker pipeline stages.
 
 from __future__ import annotations
 
-import binascii
 import json
 import logging
-import math
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -56,21 +54,6 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
     """
     result: dict = {}
 
-    def _has_content(v, is_platform_map: bool = False) -> bool:
-        if v is None:
-            return False
-        if is_platform_map and isinstance(v, dict):
-            return any(
-                (isinstance(x, list) and len(x) > 0)
-                or (isinstance(x, str) and x.strip())
-                for x in (v.values() or [])
-            )
-        if isinstance(v, (list, tuple)):
-            return len(v) > 0
-        if isinstance(v, dict):
-            return len(v) > 0
-        return bool(v)
-
     async with pool.acquire() as conn:
         # ── 1. user_settings table ────────────────────────────────────────
         try:
@@ -95,16 +78,9 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                     # Merge preference columns so POST /api/settings/preferences is respected
                     for k in ("styled_thumbnails", "auto_thumbnails", "auto_captions", "thumbnail_interval",
                               "default_privacy", "ai_hashtags_enabled", "ai_hashtag_count", "always_hashtags",
-                              "blocked_hashtags", "platform_hashtags", "email_notifications", "discord_webhook",
-                              "use_audio_context",
-                              "tiktok_color", "youtube_color", "instagram_color", "facebook_color",
-                              "accent_color"):
+                              "blocked_hashtags", "platform_hashtags", "email_notifications", "discord_webhook"):
                         if k in prefs_d and prefs_d[k] is not None:
                             result[k] = prefs_d[k]
-                    # Ensure camelCase aliases for hashtag fields (context.get_effective_hashtags checks both)
-                    for snake, camel in [("platform_hashtags", "platformHashtags"), ("always_hashtags", "alwaysHashtags"), ("blocked_hashtags", "blockedHashtags")]:
-                        if result.get(snake) is not None and result.get(camel) is None:
-                            result[camel] = result[snake]
                     result.setdefault("styled_thumbnails", True)
                     result.setdefault("styledThumbnails", result.get("styled_thumbnails", True))
         except asyncpg.exceptions.UndefinedTableError:
@@ -144,30 +120,12 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "captionFrameCount":"caption_frame_count",
                         "maxHashtags":      "max_hashtags",
                         "trillOpenaiModel": "openai_model",
-                        "useAudioContext":  "use_audio_context",
-                        "audioTranscription": "audio_transcription",
-                        "thumbnailStudioEnabled": "thumbnail_studio_enabled",
-                        "thumbnailStudioEngineEnabled": "thumbnail_studio_engine_enabled",
-                        "thumbnailPikzelsEnabled": "thumbnail_pikzels_enabled",
-                        "thumbnailPersonaEnabled": "thumbnail_persona_enabled",
-                        "thumbnailDefaultPersonaId": "thumbnail_default_persona_id",
-                        "thumbnailPersonaStrength": "thumbnail_persona_strength",
-                        "thumbnailUseStudioEngine": "thumbnail_use_studio_engine",
-                        "thumbnailUsePikzels": "thumbnail_use_pikzels",
-                        "thumbnailUsePersona": "thumbnail_use_persona",
-                        "thumbnailPersonaId": "thumbnail_persona_id",
                     }
                     for camel, snake in FIELD_MAP.items():
                         val = prefs.get(camel)
                         if val is None:
                             val = prefs.get(snake)
                         if val is not None:
-                            # Do not let empty hashtag prefs from users.preferences
-                            # wipe non-empty platform/always/blocked tags from user_preferences.
-                            if snake in ("always_hashtags", "blocked_hashtags") and not _has_content(val):
-                                continue
-                            if snake == "platform_hashtags" and not _has_content(val, is_platform_map=True):
-                                continue
                             # Frontend values override worker-side settings rows
                             result[camel] = val
                             result[snake] = val
@@ -218,34 +176,6 @@ async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
         )
 
 
-async def mark_processing_started_if_status_in(
-    pool: asyncpg.Pool,
-    ctx: JobContext,
-    statuses: tuple,
-) -> bool:
-    """
-    Transition to processing only from allowed statuses (Redis at-least-once dedupe).
-    Returns True if a row was updated.
-    """
-    if not statuses:
-        return False
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE uploads
-            SET status = 'processing',
-                processing_started_at = COALESCE(processing_started_at, $2::timestamptz),
-                updated_at = NOW()
-            WHERE id = $1 AND status = ANY($3::text[])
-            RETURNING id
-            """,
-            ctx.upload_id,
-            ctx.started_at or datetime.now(timezone.utc),
-            list(statuses),
-        )
-    return row is not None
-
-
 async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
     """Mark upload as completed."""
     platform_results_json = None
@@ -269,20 +199,10 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                     "http_status": r.http_status,
                     "views": r.views,
                     "likes": r.likes,
-                    "comments": getattr(r, "comments", 0) or 0,
-                    "shares": getattr(r, "shares", 0) or 0,
                 }
                 for r in ctx.platform_results
             ]
         )
-
-    failure_diag_json = None
-    fd = getattr(ctx, "failure_diag", None)
-    if fd:
-        failure_diag_json = json.dumps(fd)
-
-    pm = getattr(ctx, "pipeline_manifest_final", None) or getattr(ctx, "pipeline_diag", None)
-    pipeline_manifest_json = json.dumps(pm) if pm else None
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -296,8 +216,6 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
                 platform_results = $6::jsonb,
                 compute_seconds = $7,
                 thumbnail_r2_key = COALESCE($8, thumbnail_r2_key),
-                failure_diag = CASE WHEN $9::text IS NULL THEN failure_diag ELSE $9::jsonb END,
-                pipeline_manifest = CASE WHEN $10::text IS NULL THEN pipeline_manifest ELSE $10::jsonb END,
                 updated_at = NOW()
             WHERE id = $1
             """,
@@ -309,56 +227,13 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
             platform_results_json,
             ctx.compute_seconds,
             ctx.thumbnail_r2_key or None,
-            failure_diag_json,
-            pipeline_manifest_json,
         )
-        # ML-ready feature persistence (non-fatal): keeps rich context per upload so
-        # offline scorers can learn what creative strategies perform over time.
-        try:
-            await conn.execute(
-                """
-                INSERT INTO upload_feature_events
-                    (user_id, upload_id, category, audio_context, vision_context,
-                     video_understanding, thumbnail_brief, output_artifacts,
-                     ai_title, ai_caption, ai_hashtags)
-                VALUES
-                    ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9, $10, $11::jsonb)
-                """,
-                str(ctx.user_id),
-                str(ctx.upload_id),
-                str(ctx.get_canonical_category() or ""),
-                json.dumps(getattr(ctx, "audio_context", None) or {}),
-                json.dumps(getattr(ctx, "vision_context", None) or {}),
-                json.dumps(getattr(ctx, "video_understanding", None) or {}),
-                json.dumps(getattr(ctx, "thumbnail_brief", None) or {}),
-                json.dumps(getattr(ctx, "output_artifacts", None) or {}),
-                getattr(ctx, "ai_title", None),
-                getattr(ctx, "ai_caption", None),
-                json.dumps(getattr(ctx, "ai_hashtags", None) or []),
-            )
-        except Exception as e:
-            logger.debug(f"upload_feature_events insert skipped: {e}")
 
 
 async def mark_processing_failed(
-    pool: asyncpg.Pool,
-    ctx: JobContext,
-    error_code: str,
-    error_detail: str,
-    failure_diag: Optional[Dict[str, Any]] = None,
+    pool: asyncpg.Pool, ctx: JobContext, error_code: str, error_detail: str
 ):
     """Mark upload as failed with error info."""
-    diag = failure_diag if failure_diag is not None else getattr(ctx, "failure_diag", None)
-    diag_json = json.dumps(diag) if diag else None
-    detail = (error_detail or "")[:8000]
-    try:
-        from .pipeline_manifest import finalize_pipeline_diag
-
-        ctx.pipeline_manifest_final = finalize_pipeline_diag(ctx, terminal_status="failed")
-    except Exception:
-        pass
-    pm = getattr(ctx, "pipeline_manifest_final", None) or getattr(ctx, "pipeline_diag", None)
-    pipeline_manifest_json = json.dumps(pm) if pm else None
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -366,132 +241,14 @@ async def mark_processing_failed(
             SET status = 'failed',
                 error_code = $2,
                 error_detail = $3,
-                failure_diag = CASE WHEN $4::text IS NULL THEN failure_diag ELSE $4::jsonb END,
-                pipeline_manifest = CASE WHEN $5::text IS NULL THEN pipeline_manifest ELSE $5::jsonb END,
                 processing_finished_at = NOW(),
                 updated_at = NOW()
             WHERE id = $1
             """,
             ctx.upload_id,
             error_code,
-            detail,
-            diag_json,
-            pipeline_manifest_json,
+            error_detail,
         )
-
-
-async def mark_upload_failed_diagnostic(
-    pool: asyncpg.Pool,
-    upload_id: str,
-    error_code: str,
-    error_detail: str,
-    failure_diag: Optional[Dict[str, Any]] = None,
-    only_if_status: Optional[str] = None,
-) -> bool:
-    """
-    Set uploads row to failed with structured diagnostics (worker timeouts, DLQ, etc.).
-    Returns True if at least one row matched.
-    """
-    detail = (error_detail or "")[:8000]
-    diag_json = json.dumps(failure_diag) if failure_diag is not None else None
-    async with pool.acquire() as conn:
-        if only_if_status:
-            n = await conn.fetchval(
-                """
-                WITH u AS (
-                  UPDATE uploads SET
-                    status = 'failed',
-                    error_code = $2,
-                    error_detail = $3,
-                    failure_diag = CASE WHEN $4::text IS NULL THEN failure_diag ELSE $4::jsonb END,
-                    processing_finished_at = NOW(),
-                    updated_at = NOW()
-                  WHERE id = $1::uuid AND status = $5::text
-                  RETURNING 1
-                )
-                SELECT COUNT(*)::int FROM u
-                """,
-                upload_id,
-                error_code,
-                detail,
-                diag_json,
-                only_if_status,
-            )
-        else:
-            n = await conn.fetchval(
-                """
-                WITH u AS (
-                  UPDATE uploads SET
-                    status = 'failed',
-                    error_code = $2,
-                    error_detail = $3,
-                    failure_diag = CASE WHEN $4::text IS NULL THEN failure_diag ELSE $4::jsonb END,
-                    processing_finished_at = NOW(),
-                    updated_at = NOW()
-                  WHERE id = $1::uuid
-                  RETURNING 1
-                )
-                SELECT COUNT(*)::int FROM u
-                """,
-                upload_id,
-                error_code,
-                detail,
-                diag_json,
-            )
-    return int(n or 0) > 0
-
-
-async def reconcile_stale_processing_uploads(
-    pool: asyncpg.Pool,
-    *,
-    stale_minutes: int,
-    min_job_age_minutes: int,
-    base_diag: Optional[Dict[str, Any]] = None,
-) -> int:
-    """
-    Mark uploads stuck in `processing` as failed when the row has not been updated
-    for `stale_minutes` (worker crash, OOM kill, host restart, deploy).
-    """
-    diag: Dict[str, Any] = dict(base_diag or {})
-    diag.setdefault("category", "WORKER_ORPHANED")
-    diag["stale_minutes"] = int(stale_minutes)
-    diag["min_job_age_minutes"] = int(min_job_age_minutes)
-    msg = (
-        f"Processing stopped unexpectedly (no worker heartbeat for ~{stale_minutes}m). "
-        "Common causes: worker restart, out-of-memory, or platform deploy. Retry the upload; "
-        "include upload id and failure_diag when contacting support."
-    )
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            UPDATE uploads u SET
-                status = 'failed',
-                error_code = 'WORKER_ORPHANED',
-                error_detail = $1,
-                failure_diag = $2::jsonb,
-                processing_finished_at = NOW(),
-                updated_at = NOW()
-            WHERE u.status = 'processing'
-              AND u.processing_started_at IS NOT NULL
-              AND u.processing_started_at < NOW() - ($3::int * INTERVAL '1 minute')
-              AND u.updated_at < NOW() - ($4::int * INTERVAL '1 minute')
-            RETURNING u.id
-            """,
-            msg,
-            json.dumps(diag),
-            int(min_job_age_minutes),
-            int(stale_minutes),
-        )
-    n = len(rows or [])
-    if n:
-        logger.warning(
-            "reconcile_stale_processing_uploads: marked %s upload(s) WORKER_ORPHANED "
-            "(stale>=%sm, job_age>=%sm)",
-            n,
-            stale_minutes,
-            min_job_age_minutes,
-        )
-    return n
 
 
 async def mark_cancelled(pool: asyncpg.Pool, upload_id: str):
@@ -536,8 +293,7 @@ async def check_cancel_requested(pool: asyncpg.Pool, upload_id: str) -> bool:
                 "SELECT cancel_requested FROM uploads WHERE id = $1", upload_id
             )
             return bool(val)
-    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as e:
-        logger.debug("check_cancel_requested failed upload_id=%s: %s", upload_id, e)
+    except Exception:
         return False
 
 
@@ -562,15 +318,10 @@ async def update_stage_progress(pool: asyncpg.Pool, upload_id: str, stage: str, 
                 stage,
                 progress,
             )
-    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as e:
+    except Exception:
         # Non-fatal — if columns don't exist yet neither screen will show progress,
         # but the pipeline won't crash
-        logger.debug(
-            "update_stage_progress failed upload_id=%s stage=%s: %s",
-            upload_id,
-            stage,
-            e,
-        )
+        pass
 
 
 # ============================================================
@@ -642,14 +393,8 @@ async def fetch_caption_memory_examples(
         return [dict(r) for r in rows] if rows else []
     except asyncpg.exceptions.UndefinedTableError:
         return []
-    except (
-        asyncpg.PostgresError,
-        asyncpg.InterfaceError,
-        OSError,
-        TypeError,
-        ValueError,
-    ) as e:
-        logger.debug("fetch_caption_memory_examples: %s", e)
+    except Exception as e:
+        logger.debug(f"fetch_caption_memory_examples: {e}")
         return []
 
 
@@ -666,9 +411,6 @@ async def insert_caption_memory(
     caption_tone: str = "",
     caption_style: str = "",
     source: str = "auto",
-    predicted_quality_score: Optional[float] = None,
-    strategy_json: Optional[Dict[str, Any]] = None,
-    platform_winners: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Persist one row for future few-shot retrieval. Non-fatal on missing table."""
     if not (ai_title or ai_caption or ai_hashtags):
@@ -676,428 +418,34 @@ async def insert_caption_memory(
     try:
         import json as _json
         async with pool.acquire() as conn:
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO upload_caption_memory (
-                        user_id, upload_id, category, platforms,
-                        ai_title, ai_caption, ai_hashtags,
-                        caption_voice, caption_tone, caption_style, source,
-                        predicted_quality_score, strategy_json, platform_winners
-                    ) VALUES (
-                        $1, $2::uuid, $3, $4::jsonb,
-                        $5, $6, $7::jsonb,
-                        $8, $9, $10, $11,
-                        $12, $13::jsonb, $14::jsonb
-                    )
-                    """,
-                    user_id,
-                    upload_id,
-                    (category or "general").lower(),
-                    _json.dumps(platforms or []),
-                    ai_title,
-                    ai_caption,
-                    _json.dumps(ai_hashtags or []),
-                    caption_voice or None,
-                    caption_tone or None,
-                    caption_style or None,
-                    source,
-                    float(predicted_quality_score) if predicted_quality_score is not None else None,
-                    _json.dumps(strategy_json or {}),
-                    _json.dumps(platform_winners or {}),
-                )
-            except asyncpg.exceptions.UndefinedColumnError:
-                await conn.execute(
-                    """
-                    INSERT INTO upload_caption_memory (
-                        user_id, upload_id, category, platforms,
-                        ai_title, ai_caption, ai_hashtags,
-                        caption_voice, caption_tone, caption_style, source
-                    ) VALUES (
-                        $1, $2::uuid, $3, $4::jsonb,
-                        $5, $6, $7::jsonb,
-                        $8, $9, $10, $11
-                    )
-                    """,
-                    user_id,
-                    upload_id,
-                    (category or "general").lower(),
-                    _json.dumps(platforms or []),
-                    ai_title,
-                    ai_caption,
-                    _json.dumps(ai_hashtags or []),
-                    caption_voice or None,
-                    caption_tone or None,
-                    caption_style or None,
-                    source,
-                )
-    except asyncpg.exceptions.UndefinedTableError:
-        pass
-    except (
-        asyncpg.PostgresError,
-        asyncpg.InterfaceError,
-        OSError,
-        TypeError,
-        ValueError,
-    ) as e:
-        logger.debug("insert_caption_memory: %s", e)
-
-
-async def fetch_recent_thumbnail_style_signatures(
-    pool: asyncpg.Pool,
-    user_id: str,
-    platform: str,
-    limit: int = 24,
-) -> List[str]:
-    """
-    Return recent style signatures for anti-repeat rendering memory.
-    Non-fatal if table is absent.
-    """
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT style_signature
-                  FROM upload_thumbnail_style_memory
-                 WHERE user_id = $1
-                   AND platform = $2
-                 ORDER BY created_at DESC
-                 LIMIT $3
-                """,
-                str(user_id),
-                str(platform or "").lower(),
-                max(1, min(limit, 100)),
-            )
-        out: List[str] = []
-        for r in rows or []:
-            s = str(r.get("style_signature") or "").strip()
-            if s:
-                out.append(s)
-        return out
-    except asyncpg.exceptions.UndefinedTableError:
-        return []
-    except Exception as e:
-        logger.debug(f"fetch_recent_thumbnail_style_signatures: {e}")
-        return []
-
-
-async def fetch_recent_thumbnail_style_history(
-    pool: asyncpg.Pool,
-    user_id: str,
-    platform: str,
-    limit: int = 30,
-) -> List[Dict[str, Any]]:
-    """
-    Return recent style history rows for diversity policy (signature + pack + score).
-    Non-fatal when table is missing.
-    """
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT style_signature, style_pack, score, created_at
-                  FROM upload_thumbnail_style_memory
-                 WHERE user_id = $1
-                   AND platform = $2
-                 ORDER BY created_at DESC
-                 LIMIT $3
-                """,
-                str(user_id),
-                str(platform or "").lower(),
-                max(1, min(limit, 120)),
-            )
-        out: List[Dict[str, Any]] = []
-        for r in rows or []:
-            out.append(
-                {
-                    "signature": str(r.get("style_signature") or "").strip(),
-                    "style_pack": str(r.get("style_pack") or "").strip().lower(),
-                    "score": float(r.get("score") or 0.0),
-                    "created_at": str(r.get("created_at") or ""),
-                }
-            )
-        return out
-    except asyncpg.exceptions.UndefinedTableError:
-        return []
-    except Exception as e:
-        logger.debug(f"fetch_recent_thumbnail_style_history: {e}")
-        return []
-
-
-async def insert_thumbnail_style_signature(
-    pool: asyncpg.Pool,
-    *,
-    user_id: str,
-    upload_id: str,
-    platform: str,
-    style_signature: str,
-    style_pack: str = "",
-    score: float = 0.0,
-) -> None:
-    """
-    Persist a style signature for anti-repeat memory.
-    Ignores duplicates per (upload_id, platform, style_signature).
-    """
-    sig = (style_signature or "").strip()
-    if not sig:
-        return
-    try:
-        async with pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO upload_thumbnail_style_memory (
-                    user_id, upload_id, platform, style_signature, style_pack, score
+                INSERT INTO upload_caption_memory (
+                    user_id, upload_id, category, platforms,
+                    ai_title, ai_caption, ai_hashtags,
+                    caption_voice, caption_tone, caption_style, source
                 ) VALUES (
-                    $1, $2::uuid, $3, $4, $5, $6
+                    $1, $2::uuid, $3, $4::jsonb,
+                    $5, $6, $7::jsonb,
+                    $8, $9, $10, $11
                 )
-                ON CONFLICT (upload_id, platform, style_signature) DO NOTHING
                 """,
-                str(user_id),
-                str(upload_id),
-                str(platform or "").lower(),
-                sig,
-                (style_pack or None),
-                float(score or 0.0),
+                user_id,
+                upload_id,
+                (category or "general").lower(),
+                _json.dumps(platforms or []),
+                ai_title,
+                ai_caption,
+                _json.dumps(ai_hashtags or []),
+                caption_voice or None,
+                caption_tone or None,
+                caption_style or None,
+                source,
             )
     except asyncpg.exceptions.UndefinedTableError:
         pass
     except Exception as e:
-        logger.debug(f"insert_thumbnail_style_signature: {e}")
-
-
-def _m8_engagement_raw(views: int, likes: int, comments: int, shares: int) -> float:
-    """Weighted engagement for ranking priors (same spirit as KPI dashboards)."""
-    return float(
-        max(0, views)
-        + 2 * max(0, likes)
-        + 3 * max(0, comments)
-        + 2 * max(0, shares)
-    )
-
-
-def _m8_normalize_prior(avg_raw: float) -> float:
-    """Map rolling average raw engagement to a soft prior in [-5, 10] for M8 ranking."""
-    if avg_raw <= 0:
-        return 0.0
-    # Log-scaled: small accounts get small nudge; viral history gets a larger (capped) bump
-    x = math.log10(avg_raw + 1.0)
-    prior = (x - 1.5) * 4.0
-    return max(-5.0, min(10.0, prior))
-
-
-async def fetch_m8_historical_signals(
-    pool: asyncpg.Pool,
-    user_id: str,
-    category: str,
-    platforms: List[str],
-    *,
-    prior_row_limit: int = 40,
-    pattern_limit: int = 6,
-) -> Dict[str, Any]:
-    """
-    Analytics-backed priors + caption pattern memory for M8 v2.
-
-    Reads from `upload_caption_memory` JOIN `uploads` (views/likes/comments/shares
-    filled by the analytics sync loop). Per-platform rolling engagement and top
-    caption snippets for prompt injection.
-
-    Returns a dict suitable for m8_engine.rank_and_select (platform keys) plus
-    __pattern_corpus__ / __strategy_priors__ / __meta__ for prompts.
-    """
-    out: Dict[str, Any] = {
-        "__pattern_corpus__": [],
-        "__strategy_priors__": {"top": [], "lookback_days": 180},
-        "__meta__": {"source": "db", "ok": False},
-    }
-    plats = [str(p).lower() for p in (platforms or []) if p]
-    if not plats or not user_id:
-        return out
-
-    cat = (category or "general").lower()
-
-    try:
-        async with pool.acquire() as conn:
-            for plat in plats:
-                plat_json = json.dumps([plat])
-                try:
-                    rows = await conn.fetch(
-                        """
-                        SELECT COALESCE(u.views, 0)::bigint AS views,
-                               COALESCE(u.likes, 0)::bigint AS likes,
-                               COALESCE(u.comments, 0)::bigint AS comments,
-                               COALESCE(u.shares, 0)::bigint AS shares
-                          FROM upload_caption_memory ucm
-                          INNER JOIN uploads u ON u.id = ucm.upload_id
-                         WHERE ucm.user_id = $1
-                           AND ucm.category = $2
-                           AND ucm.platforms @> $3::jsonb
-                           AND u.created_at > NOW() - INTERVAL '180 days'
-                         ORDER BY u.created_at DESC
-                         LIMIT $4
-                        """,
-                        user_id,
-                        cat,
-                        plat_json,
-                        max(5, min(prior_row_limit, 80)),
-                    )
-                except asyncpg.exceptions.UndefinedColumnError:
-                    rows = await conn.fetch(
-                        """
-                        SELECT COALESCE(u.views, 0)::bigint AS views,
-                               COALESCE(u.likes, 0)::bigint AS likes,
-                               COALESCE(u.comments, 0)::bigint AS comments,
-                               COALESCE(u.shares, 0)::bigint AS shares
-                          FROM upload_caption_memory ucm
-                          INNER JOIN uploads u ON u.id = ucm.upload_id
-                         WHERE ucm.user_id = $1
-                           AND ucm.category = $2
-                           AND ucm.platforms @> $3::jsonb
-                         ORDER BY u.created_at DESC
-                         LIMIT $4
-                        """,
-                        user_id,
-                        cat,
-                        plat_json,
-                        max(5, min(prior_row_limit, 80)),
-                    )
-
-                if not rows:
-                    continue
-                raws = [_m8_engagement_raw(int(r["views"]), int(r["likes"]), int(r["comments"]), int(r["shares"])) for r in rows]
-                avg_raw = sum(raws) / len(raws)
-                out[plat] = {
-                    "engagement_prior": round(_m8_normalize_prior(avg_raw), 4),
-                    "sample_n": len(rows),
-                    "avg_engagement_raw": round(avg_raw, 2),
-                }
-
-            # Pattern memory: best past captions for this category + platform (rolling pool)
-            patterns: List[Dict[str, Any]] = []
-            for plat in plats:
-                plat_json = json.dumps([plat])
-                try:
-                    prow = await conn.fetch(
-                        """
-                        SELECT ucm.ai_caption,
-                               COALESCE(ucm.caption_style, '') AS caption_style,
-                               COALESCE(ucm.caption_tone, '') AS caption_tone,
-                               (COALESCE(u.views, 0) + 2 * COALESCE(u.likes, 0)
-                                + 3 * COALESCE(u.comments, 0) + 2 * COALESCE(u.shares, 0))::double precision AS eng_raw
-                          FROM upload_caption_memory ucm
-                          INNER JOIN uploads u ON u.id = ucm.upload_id
-                         WHERE ucm.user_id = $1
-                           AND ucm.category = $2
-                           AND ucm.platforms @> $3::jsonb
-                           AND LENGTH(TRIM(COALESCE(ucm.ai_caption, ''))) > 24
-                           AND u.created_at > NOW() - INTERVAL '180 days'
-                         ORDER BY eng_raw DESC, u.created_at DESC
-                         LIMIT $4
-                        """,
-                        user_id,
-                        cat,
-                        plat_json,
-                        max(1, min(pattern_limit, 12)),
-                    )
-                except asyncpg.exceptions.UndefinedColumnError:
-                    prow = await conn.fetch(
-                        """
-                        SELECT ucm.ai_caption,
-                               COALESCE(ucm.caption_style, '') AS caption_style,
-                               COALESCE(ucm.caption_tone, '') AS caption_tone,
-                               (COALESCE(u.views, 0) + 2 * COALESCE(u.likes, 0)
-                                + 3 * COALESCE(u.comments, 0) + 2 * COALESCE(u.shares, 0))::double precision AS eng_raw
-                          FROM upload_caption_memory ucm
-                          INNER JOIN uploads u ON u.id = ucm.upload_id
-                         WHERE ucm.user_id = $1
-                           AND ucm.category = $2
-                           AND ucm.platforms @> $3::jsonb
-                           AND LENGTH(TRIM(COALESCE(ucm.ai_caption, ''))) > 24
-                         ORDER BY eng_raw DESC, u.created_at DESC
-                         LIMIT $4
-                        """,
-                        user_id,
-                        cat,
-                        plat_json,
-                        max(1, min(pattern_limit, 12)),
-                    )
-                for r in prow or []:
-                    cap = (r.get("ai_caption") or "").strip()
-                    if len(cap) < 24:
-                        continue
-                    patterns.append(
-                        {
-                            "platform": plat,
-                            "snippet": cap[:420],
-                            "caption_style": (r.get("caption_style") or "").strip(),
-                            "caption_tone": (r.get("caption_tone") or "").strip(),
-                            "engagement_raw": float(r.get("eng_raw") or 0),
-                        }
-                    )
-
-            # De-dup near-identical snippets while preserving order
-            seen: set = set()
-            uniq: List[Dict[str, Any]] = []
-            for p in patterns:
-                key = (p["platform"], p["snippet"][:80])
-                if key in seen:
-                    continue
-                seen.add(key)
-                uniq.append(p)
-            out["__pattern_corpus__"] = uniq[: max(3, pattern_limit)]
-
-            # First-class ML priors from upload_quality_scores_daily.
-            # We pull a user-level top strategy table for prompt biasing.
-            try:
-                strat_rows = await conn.fetch(
-                    """
-                    SELECT
-                        strategy_key,
-                        SUM(samples)::bigint AS samples,
-                        CASE
-                          WHEN SUM(samples) > 0
-                          THEN SUM(mean_engagement * samples)::double precision / NULLIF(SUM(samples)::double precision, 0)
-                          ELSE 0.0
-                        END AS weighted_mean_engagement,
-                        MAX(ci95_high)::double precision AS max_ci95_high,
-                        COUNT(DISTINCT day)::int AS days_with_data
-                    FROM upload_quality_scores_daily
-                    WHERE user_id = $1::uuid
-                      AND day >= (CURRENT_DATE - (180::int || ' days')::interval)::date
-                      AND (
-                            platform = 'all'
-                            OR platform = ANY($2::text[])
-                      )
-                    GROUP BY strategy_key
-                    ORDER BY weighted_mean_engagement DESC, samples DESC
-                    LIMIT 10
-                    """,
-                    user_id,
-                    ["all"] + plats,
-                )
-                out["__strategy_priors__"] = {
-                    "lookback_days": 180,
-                    "top": [
-                        {
-                            "strategy_key": str(r.get("strategy_key") or "default"),
-                            "samples": int(r.get("samples") or 0),
-                            "weighted_mean_engagement": float(r.get("weighted_mean_engagement") or 0),
-                            "max_ci95_high": float(r.get("max_ci95_high") or 0),
-                            "days_with_data": int(r.get("days_with_data") or 0),
-                        }
-                        for r in (strat_rows or [])
-                    ],
-                }
-            except Exception as strat_err:
-                logger.debug(f"fetch_m8_historical_signals strategy priors skipped: {strat_err}")
-
-            out["__meta__"] = {"source": "upload_caption_memory+uploads", "ok": True}
-    except asyncpg.exceptions.UndefinedTableError:
-        return {"__pattern_corpus__": [], "__meta__": {"source": "missing_table", "ok": False}}
-    except Exception as e:
-        logger.debug(f"fetch_m8_historical_signals: {e}")
-        return {"__pattern_corpus__": [], "__meta__": {"source": "error", "ok": False, "err": str(e)[:120]}}
-
-    return out
+        logger.debug(f"insert_caption_memory: {e}")
 
 
 async def increment_upload_count(pool: asyncpg.Pool, user_id: str):
@@ -1141,10 +489,8 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                             if isinstance(parsed, str):
                                 try:
                                     parsed = json.loads(parsed)
-                                except Exception as e:
-                                    logger.debug(
-                                        "db.load_platform_token: double-encoded token JSON parse failed: %s", e
-                                    )
+                                except Exception:
+                                    pass
                         else:
                             parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
                         # Inject platform-specific IDs from the DB row's account_id column
@@ -1182,7 +528,7 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                         return parsed
                     return row_dict
             except asyncpg.exceptions.UndefinedTableError:
-                logger.debug("db.load_platform_token: platform_tokens table missing, trying connected_accounts")
+                pass
 
             # Fallback: connected_accounts table
             try:
@@ -1207,10 +553,8 @@ async def load_platform_token(pool: asyncpg.Pool, user_id: str, platform: str) -
                             if isinstance(parsed, str):
                                 try:
                                     parsed = json.loads(parsed)
-                                except Exception as e:
-                                    logger.debug(
-                                        "db.load_platform_token: double-encoded token JSON parse failed: %s", e
-                                    )
+                                except Exception:
+                                    pass
                         else:
                             parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
                         if account_id_col and isinstance(parsed, dict):
@@ -1276,21 +620,15 @@ async def load_platform_token_with_identity(
                 "account_avatar":   row_dict.get("account_avatar") or "",
             }
 
-            token_data = (
-                row_dict.get("token_blob")
-                or row_dict.get("token_data")
-                or row_dict.get("encrypted_token")
-            )
+            token_data = row_dict.get("token_blob") or row_dict.get("token_data")
             if token_data:
                 if isinstance(token_data, str):
                     parsed = json.loads(token_data)
                     if isinstance(parsed, str):
                         try:
                             parsed = json.loads(parsed)
-                        except Exception as e:
-                            logger.debug(
-                                "db.load_platform_token_with_identity: double-encoded token parse failed: %s", e
-                            )
+                        except Exception:
+                            pass
                 else:
                     parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
 
@@ -1312,6 +650,27 @@ async def load_platform_token_with_identity(
         return None, None
 
 
+async def load_all_platform_token_ids(pool: asyncpg.Pool, user_id: str, platform: str) -> list[str]:
+    """Return all platform_tokens.id for the user's connected accounts on this platform.
+    Used for multi-account publishing: when no target_accounts specified, publish to ALL.
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id FROM platform_tokens
+                WHERE user_id = $1 AND platform = $2 AND revoked_at IS NULL
+                ORDER BY updated_at DESC
+                """,
+                user_id,
+                platform,
+            )
+            return [str(r["id"]) for r in rows]
+    except Exception as e:
+        logger.error(f"Failed to load platform token ids for {user_id}/{platform}: {e}")
+        return []
+
+
 async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Optional[dict]:
     """Load a stored platform OAuth token by its platform_tokens.id (UUID).
 
@@ -1328,11 +687,7 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
             if not row:
                 return None
             row_dict = dict(row)
-            token_data = (
-                row_dict.get("token_blob")
-                or row_dict.get("token_data")
-                or row_dict.get("encrypted_token")
-            )
+            token_data = row_dict.get("token_blob") or row_dict.get("token_data")
             if not token_data:
                 return None
             if isinstance(token_data, str):
@@ -1340,10 +695,8 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
                 if isinstance(parsed, str):
                     try:
                         parsed = json.loads(parsed)
-                    except Exception as e:
-                        logger.debug(
-                            "db.load_platform_token_by_id: double-encoded token parse failed: %s", e
-                        )
+                    except Exception:
+                        pass
             else:
                 parsed = dict(token_data) if hasattr(token_data, "keys") else token_data
             if isinstance(parsed, dict):
@@ -1365,45 +718,6 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
 # ============================================================
 # Publish Attempts / Ledger (used by publish_stage + verify_stage)
 # ============================================================
-
-async def write_system_event_log(
-    pool: asyncpg.Pool,
-    *,
-    user_id: str,
-    event_category: str,
-    action: str,
-    resource_type: Optional[str] = None,
-    resource_id: Optional[str] = None,
-    details: Optional[dict] = None,
-    severity: str = "INFO",
-    outcome: str = "SUCCESS",
-):
-    """Write a user-facing audit event to system_event_log (non-fatal best effort)."""
-    try:
-        async with pool.acquire() as conn:
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO system_event_log
-                        (user_id, event_category, action, resource_type, resource_id,
-                         details, severity, outcome, created_at)
-                    VALUES ($1::uuid, $2, $3, $4, $5, $6::jsonb, $7, $8, NOW())
-                    """,
-                    user_id,
-                    event_category,
-                    action,
-                    resource_type,
-                    resource_id,
-                    json.dumps(details or {}),
-                    severity,
-                    outcome,
-                )
-            except asyncpg.exceptions.UndefinedTableError:
-                # Older DBs may not have migration 700 yet.
-                return
-    except Exception as e:
-        logger.debug(f"write_system_event_log failed (non-fatal): {e}")
-
 
 async def insert_publish_attempt(
     pool: asyncpg.Pool,
@@ -1540,16 +854,7 @@ async def load_pending_verifications(pool: asyncpg.Pool, limit: int = 50) -> Lis
                     JOIN uploads u ON u.id = pa.upload_id
                     WHERE pa.status = 'accepted'
                       AND (pa.verify_status IS NULL OR pa.verify_status = 'pending')
-                      AND (
-                        -- Still-pending attempts get a 7-day window (TikTok processes async
-                        -- and the verify_stage often runs before TikTok finishes).
-                        pa.verify_status = 'pending'
-                          AND pa.created_at > NOW() - INTERVAL '7 days'
-                        OR
-                        -- First-time (never verified) attempts use 24 hours.
-                        pa.verify_status IS NULL
-                          AND pa.created_at > NOW() - INTERVAL '24 hours'
-                      )
+                      AND pa.created_at > NOW() - INTERVAL '24 hours'
                     ORDER BY pa.created_at ASC
                     LIMIT $1
                     """,
@@ -1575,11 +880,7 @@ async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
                 "SELECT settings_json->'notifications'->>'admin_webhook_url' FROM admin_settings WHERE id = 1"
             )
             return str(val).strip() if val else None
-    except asyncpg.exceptions.UndefinedTableError:
-        logger.debug("load_admin_notification_webhook: admin_settings missing")
-        return None
-    except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError) as e:
-        logger.debug("load_admin_notification_webhook: %s", e)
+    except Exception:
         return None
 
 
@@ -1632,6 +933,37 @@ async def save_processed_assets(pool: asyncpg.Pool, upload_id: str, assets: Dict
             logger.warning(f"Could not save processed_assets: {e}")
 
 
+async def load_processed_assets(pool: asyncpg.Pool, upload_id: str) -> Dict[str, str]:
+    """Load per-platform R2 keys for an upload.
+
+    Returns dict like {"tiktok": "processed/.../tiktok.mp4", ...}
+    """
+    async with pool.acquire() as conn:
+        # Try dedicated column
+        try:
+            val = await conn.fetchval(
+                "SELECT processed_assets FROM uploads WHERE id = $1",
+                upload_id,
+            )
+            if val:
+                return json.loads(val) if isinstance(val, str) else dict(val)
+        except asyncpg.exceptions.UndefinedColumnError:
+            pass
+
+        # Fallback: check output_artifacts
+        try:
+            val = await conn.fetchval(
+                "SELECT output_artifacts->'processed_assets' FROM uploads WHERE id = $1",
+                upload_id,
+            )
+            if val:
+                return json.loads(val) if isinstance(val, str) else dict(val)
+        except Exception:
+            pass
+
+    return {}
+
+
 async def save_refreshed_token(
     pool: asyncpg.Pool,
     user_id: str,
@@ -1639,15 +971,9 @@ async def save_refreshed_token(
     access_token: str,
     refresh_token: Optional[str] = None,
     open_id: Optional[str] = None,
-    extra_fields: Optional[Dict[str, Any]] = None,
-    token_row_id: Optional[str] = None,
 ) -> None:
     """
     Persist a refreshed platform OAuth token back to the database.
-
-    When ``token_row_id`` is set (``platform_tokens.id``), load/update that row directly
-    instead of ``WHERE user_id AND platform LIMIT 1`` — avoids N+1 and wrong-row updates
-    when a user has multiple accounts on the same platform.
 
     CRITICAL FIX: token_blob is stored as TEXT (json.dumps of encrypted blob).
     Previous version used JSONB || operator which does STRING CONCATENATION on
@@ -1690,8 +1016,8 @@ async def save_refreshed_token(
                     if len(raw) == 32:
                         _enc_keys[kid.strip()] = raw
                         _current_kid = kid.strip()
-                except (binascii.Error, TypeError, ValueError) as e:
-                    logger.debug("db.migrate_tokens: skip invalid TOKEN_ENC_KEYS segment kid=%s: %s", kid.strip(), e)
+                except Exception:
+                    pass
 
         def _encrypt(data: dict) -> str:
             """Re-encrypt a token dict and return json.dumps of the encrypted blob."""
@@ -1708,84 +1034,8 @@ async def save_refreshed_token(
             }
             return json.dumps(blob)
 
-        async def _persist_row(conn, table: str, row) -> bool:
-            if not row:
-                return False
-            row_id = row["id"]
-            raw_blob = row["token_blob"]
-
-            current_encrypted: Optional[dict] = None
-            try:
-                if isinstance(raw_blob, str):
-                    current_encrypted = json.loads(raw_blob)
-                    if isinstance(current_encrypted, str):
-                        current_encrypted = json.loads(current_encrypted)
-                elif isinstance(raw_blob, dict):
-                    current_encrypted = dict(raw_blob)
-                else:
-                    current_encrypted = dict(raw_blob) if raw_blob else None
-            except (json.JSONDecodeError, TypeError, ValueError) as e:
-                logger.debug("save_refreshed_token: token_blob parse failed: %s", e)
-                current_encrypted = None
-
-            current_plain: dict = {}
-            if current_encrypted:
-                try:
-                    init_enc_keys()
-                    current_plain = decrypt_token_blob(current_encrypted) or {}
-                except Exception as e:
-                    logger.debug(
-                        "save_refreshed_token: decrypt failed, starting fresh token fields: %s",
-                        e,
-                    )
-                    current_plain = {}
-
-            current_plain["access_token"] = access_token
-            if refresh_token:
-                current_plain["refresh_token"] = refresh_token
-            if open_id:
-                current_plain["open_id"] = open_id
-            if extra_fields:
-                for k, v in extra_fields.items():
-                    if v is not None:
-                        current_plain[k] = v
-
-            new_blob_str = _encrypt(current_plain)
-
-            try:
-                await conn.execute(
-                    f"UPDATE {table} SET token_blob = $1, updated_at = NOW() "
-                    f"WHERE id = $2",
-                    new_blob_str,
-                    row_id,
-                )
-                logger.info(
-                    "save_refreshed_token: persisted %s token for user=%s table=%s row=%s",
-                    platform,
-                    user_id,
-                    table,
-                    row_id,
-                )
-                return True
-            except Exception as write_err:
-                logger.warning("save_refreshed_token: write failed on %s: %s", table, write_err)
-                return False
-
         async with pool.acquire() as conn:
-            if token_row_id:
-                try:
-                    by_id = await conn.fetchrow(
-                        "SELECT id, token_blob FROM platform_tokens WHERE id = $1::uuid",
-                        token_row_id,
-                    )
-                except asyncpg.exceptions.UndefinedTableError:
-                    by_id = None
-                except asyncpg.PostgresError as e:
-                    logger.debug("save_refreshed_token by id: %s", e)
-                    by_id = None
-                if by_id and await _persist_row(conn, "platform_tokens", by_id):
-                    return
-
+            # ── Try platform_tokens ───────────────────────────────────────
             for table in ("platform_tokens", "connected_accounts"):
                 try:
                     row = await conn.fetchrow(
@@ -1796,14 +1046,62 @@ async def save_refreshed_token(
                     )
                 except asyncpg.exceptions.UndefinedTableError:
                     continue
-                except asyncpg.PostgresError as e:
-                    logger.debug("save_refreshed_token fetchrow %s: %s", table, e)
+                except Exception:
                     continue
 
                 if not row:
                     continue
-                if await _persist_row(conn, table, row):
+
+                row_id = row["id"]
+                raw_blob = row["token_blob"]
+
+                # Parse the current stored blob (TEXT or JSONB both handled)
+                current_encrypted: Optional[dict] = None
+                try:
+                    if isinstance(raw_blob, str):
+                        current_encrypted = json.loads(raw_blob)
+                        # Handle double-encoded
+                        if isinstance(current_encrypted, str):
+                            current_encrypted = json.loads(current_encrypted)
+                    elif isinstance(raw_blob, dict):
+                        current_encrypted = dict(raw_blob)
+                    else:
+                        current_encrypted = dict(raw_blob) if raw_blob else None
+                except Exception:
+                    current_encrypted = None
+
+                # Decrypt to get plaintext token fields
+                current_plain: dict = {}
+                if current_encrypted:
+                    try:
+                        init_enc_keys()
+                        current_plain = decrypt_token_blob(current_encrypted) or {}
+                    except Exception:
+                        # If decrypt fails, start fresh with just the new token
+                        current_plain = {}
+
+                # Merge new values into plaintext
+                current_plain["access_token"] = access_token
+                if refresh_token:
+                    current_plain["refresh_token"] = refresh_token
+                if open_id:
+                    current_plain["open_id"] = open_id
+
+                # Re-encrypt and write back as clean TEXT
+                new_blob_str = _encrypt(current_plain)
+
+                try:
+                    await conn.execute(
+                        f"UPDATE {table} SET token_blob = $1, updated_at = NOW() "
+                        f"WHERE id = $2",
+                        new_blob_str,
+                        row_id,
+                    )
+                    logger.info(f"save_refreshed_token: persisted {platform} token for user={user_id} table={table}")
                     return
+                except Exception as write_err:
+                    logger.warning(f"save_refreshed_token: write failed on {table}: {write_err}")
+                    continue
 
             logger.warning(f"save_refreshed_token: no row found for {platform} user={user_id}")
 

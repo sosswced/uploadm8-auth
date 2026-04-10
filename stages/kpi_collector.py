@@ -12,7 +12,6 @@ Uses env keys to authenticate and call:
 Posts incremental costs to cost_tracking. Tracks last_sync per provider to avoid duplicates.
 """
 
-import json
 import os
 import logging
 from datetime import datetime, timezone, timedelta
@@ -28,20 +27,6 @@ R2_STORAGE_COST_PER_GB_MONTH = float(os.environ.get("KPI_R2_STORAGE_COST_PER_GB"
 R2_BANDWIDTH_COST_PER_TB = float(os.environ.get("KPI_R2_BANDWIDTH_COST_PER_TB", "0.00"))  # R2 egress free to CF
 UPSTASH_COST_PER_GB = float(os.environ.get("KPI_UPSTASH_COST_PER_GB", "0.20"))
 
-# Per-upload estimates for tools without reliable direct billing APIs.
-# Values are intentionally explicit so admin cost cards stay deterministic.
-TOOL_COST_ESTIMATES_USD_PER_UPLOAD = {
-    "openai_whisper": 0.0030,
-    "openai_gpt4o_mini": 0.0020,
-    "acrcloud": 0.0010,
-    "google_vision": 0.0045,
-    "hume_ai": 0.0020,
-    "fal_flux": 0.0030,
-    "rembg": 0.0,
-    "yamnet": 0.0,
-    "playwright": 0.0,
-}
-
 
 async def _fetch_stripe_fees(since: datetime) -> float:
     """Sum Stripe fees from balance transactions since given time."""
@@ -50,21 +35,14 @@ async def _fetch_stripe_fees(since: datetime) -> float:
         return 0.0
     try:
         import stripe
-    except ImportError:
-        logger.debug("_fetch_stripe_fees: stripe package not installed")
-        return 0.0
-    try:
         stripe.api_key = key
         since_ts = int(since.timestamp())
         total_fees = 0.0
         for t in stripe.BalanceTransaction.list(created={"gte": since_ts}, limit=100).auto_paging_iter():
             total_fees += (t.fee or 0) / 100.0  # cents to dollars
         return round(total_fees, 4)
-    except stripe.error.StripeError as e:
-        logger.warning("Stripe fees fetch failed: %s", e)
-        return 0.0
-    except (TypeError, ValueError, AttributeError) as e:
-        logger.debug("_fetch_stripe_fees: unexpected data from Stripe API: %s", e)
+    except Exception as e:
+        logger.warning(f"Stripe fees fetch failed: {e}")
         return 0.0
 
 
@@ -95,14 +73,8 @@ async def _fetch_mailgun_stats(since: datetime) -> tuple[int, float]:
                     total += item.get("delivered", {}).get("total", 0) if isinstance(item.get("delivered"), dict) else item.get("total", 0)
             cost = (total / 1000.0) * MAILGUN_COST_PER_1000
             return int(total), round(cost, 4)
-    except (
-        httpx.RequestError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as e:
-        logger.debug("Mailgun stats: %s", e)
+    except Exception as e:
+        logger.debug(f"Mailgun stats: {e}")
         return 0, 0.0
 
 
@@ -140,14 +112,8 @@ async def _fetch_openai_usage(since: datetime) -> float:
                 if isinstance(bucket, dict):
                     total += float(bucket.get("cost_usd", bucket.get("cost", 0)) or 0)
             return round(total, 6)
-    except (
-        httpx.RequestError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as e:
-        logger.debug("OpenAI usage fetch: %s", e)
+    except Exception as e:
+        logger.debug(f"OpenAI usage fetch: {e}")
         return 0.0
 
 
@@ -174,14 +140,7 @@ async def _fetch_cloudflare_r2_usage(since: datetime) -> tuple[float, float]:
             storage_bytes = data.get("totals", {}).get("bytes", 0) or 0
             egress_bytes = data.get("totals", {}).get("bandwidth", 0) or 0
             return storage_bytes / (1024**3), egress_bytes / (1024**4)
-    except (
-        httpx.RequestError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as e:
-        logger.debug("_fetch_cf_r2_usage: %s", e)
+    except Exception:
         return 0.0, 0.0
 
 
@@ -206,14 +165,7 @@ async def _fetch_upstash_usage() -> float:
                 mb = float(data.get("memory_usage_mb", 0) or 0)
             gb = mb / 1024.0
             return round(gb * UPSTASH_COST_PER_GB, 4)
-    except (
-        httpx.RequestError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as e:
-        logger.debug("_fetch_upstash_usage: %s", e)
+    except Exception:
         return 0.0
 
 
@@ -225,37 +177,6 @@ def _prorate_monthly_cost(monthly: float, since: datetime, until: datetime) -> f
     # ~30 days in seconds
     month_sec = 30 * 24 * 3600
     return round(monthly * (delta / month_sec), 4)
-
-
-def estimate_tool_costs(successful_uploads: int) -> dict:
-    """
-    Convert per-upload tool assumptions into totals for a window.
-    Returns payload safe for API responses and DB writes.
-    """
-    uploads = int(max(successful_uploads or 0, 0))
-    per_tool = []
-    total_per_upload = 0.0
-    total_window = 0.0
-    for tool_key, usd_per_upload in TOOL_COST_ESTIMATES_USD_PER_UPLOAD.items():
-        unit = float(max(usd_per_upload, 0.0))
-        window_cost = round(unit * uploads, 6)
-        total_per_upload += unit
-        total_window += window_cost
-        per_tool.append(
-            {
-                "tool": tool_key,
-                "usd_per_upload": round(unit, 6),
-                "uploads": uploads,
-                "window_cost_usd": window_cost,
-                "source": "estimated",
-            }
-        )
-    return {
-        "uploads": uploads,
-        "total_usd_per_upload": round(total_per_upload, 6),
-        "total_window_cost_usd": round(total_window, 6),
-        "tools": per_tool,
-    }
 
 
 async def run_kpi_collect(db_pool) -> dict:
@@ -294,9 +215,6 @@ async def run_kpi_collect(db_pool) -> dict:
             )
         """)
         await conn.execute(
-            "ALTER TABLE kpi_sync_state ADD COLUMN IF NOT EXISTS last_tool_est_sync_at TIMESTAMPTZ"
-        )
-        await conn.execute(
             "INSERT INTO kpi_sync_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING"
         )
 
@@ -307,7 +225,6 @@ async def run_kpi_collect(db_pool) -> dict:
         last_openai = row.get("last_openai_sync_at") if row else None
         last_cf = row.get("last_cf_sync_at") if row else None
         last_upstash = row.get("last_upstash_sync_at") if row else None
-        last_tool_est = row.get("last_tool_est_sync_at") if row else None
 
         # Use last sync or window start
         stripe_since = last_stripe or since
@@ -430,100 +347,4 @@ async def run_kpi_collect(db_pool) -> dict:
             now,
         )
 
-        # 7. Per-upload tool estimates (for tools without direct cost APIs)
-        tool_since = last_tool_est or since
-        successful_uploads = await conn.fetchval(
-            """
-            SELECT COUNT(*)::int
-            FROM uploads
-            WHERE status IN ('completed', 'succeeded', 'partial')
-              AND created_at >= $1
-            """,
-            tool_since,
-        )
-        tool_costs = estimate_tool_costs(int(successful_uploads or 0))
-        for t in tool_costs["tools"]:
-            if t["window_cost_usd"] <= 0:
-                continue
-            await conn.execute(
-                """
-                INSERT INTO cost_tracking (user_id, category, operation, tokens, cost_usd, created_at)
-                VALUES (NULL, 'tool_estimate', $1, $2, $3, NOW())
-                """,
-                t["tool"],
-                int(t["uploads"]),
-                float(t["window_cost_usd"]),
-            )
-            summary["rows_inserted"] += 1
-        summary["tool_estimated_total"] = float(tool_costs["total_window_cost_usd"])
-        summary["tool_estimated_uploads"] = int(tool_costs["uploads"])
-        await conn.execute(
-            "UPDATE kpi_sync_state SET last_tool_est_sync_at = $1, updated_at = NOW() WHERE id = 1",
-            now,
-        )
-
     return summary
-
-
-async def fetch_provider_costs_for_dashboard(window_minutes: int = 30 * 24 * 60) -> dict:
-    """
-    Read-only snapshot for GET /api/admin/kpi/provider-costs (admin KPI UI).
-    Uses the same env + external helpers as run_kpi_collect without writing to cost_tracking.
-    """
-    now = datetime.now(timezone.utc)
-    safe_minutes = int(max(window_minutes or 0, 1))
-    since = now - timedelta(minutes=safe_minutes)
-    storage_gb, bandwidth_tb = await _fetch_cloudflare_r2_usage(since)
-    window = timedelta(minutes=safe_minutes)
-    storage_cost = 0.0
-    if storage_gb > 0:
-        storage_cost = round(
-            storage_gb * R2_STORAGE_COST_PER_GB_MONTH * (window.total_seconds() / (30 * 24 * 3600)),
-            6,
-        )
-    bandwidth_cost = round(bandwidth_tb * R2_BANDWIDTH_COST_PER_TB, 6)
-    render_monthly = float(os.environ.get("RENDER_MONTHLY_COST", "0") or 0)
-    render_cost = _prorate_monthly_cost(render_monthly, since, now)
-    redis_cost = await _fetch_upstash_usage()
-    stripe_fees = await _fetch_stripe_fees(since)
-    emails, mailgun_cost = await _fetch_mailgun_stats(since)
-    openai_delta = await _fetch_openai_usage(since)
-    redis_memory_mb = 0.0
-    try:
-        api_key = os.environ.get("UPSTASH_API_KEY", "")
-        db_id = os.environ.get("UPSTASH_DB_ID", "")
-        if api_key:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                url = f"https://api.upstash.com/v2/database/{db_id}/stats" if db_id else "https://api.upstash.com/v2/databases"
-                r = await client.get(url, headers={"Authorization": f"Bearer {api_key}"})
-                if r.status_code == 200:
-                    data = r.json()
-                    if isinstance(data, list):
-                        for db in data:
-                            redis_memory_mb += float(db.get("memory_usage_mb", 0) or 0)
-                    elif isinstance(data, dict):
-                        redis_memory_mb = float(data.get("memory_usage_mb", 0) or 0)
-    except (
-        httpx.RequestError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as e:
-        logger.debug("kpi_collector: Upstash stats fetch skipped: %s", e)
-    return {
-        "render_cost": render_cost,
-        "storage_gb": round(storage_gb, 4),
-        "storage_cost": storage_cost,
-        "bandwidth_cost": bandwidth_cost,
-        "bandwidth_tb": round(bandwidth_tb, 6),
-        "redis_cost": redis_cost,
-        "redis_memory_mb": round(redis_memory_mb, 4),
-        "postgres_cost": 0.0,
-        "postgres_size_gb": 0.0,
-        "mailgun_cost": mailgun_cost,
-        "mailgun_emails_sent": int(emails),
-        "stripe_fees": stripe_fees,
-        "stripe_fee_txns": 0,
-        "openai_usage_api": openai_delta,
-    }

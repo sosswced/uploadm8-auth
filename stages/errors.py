@@ -10,8 +10,7 @@ Canonical exports:
   - SkipStage
   - CancelRequested
   - PublishError, StorageError, TelemetryError, TranscodeError,
-    ThumbnailError, CaptionError, WatermarkError, VerifyError, HUDError,
-    AudioError
+    ThumbnailError, CaptionError, WatermarkError, VerifyError, HUDError
 """
 
 from __future__ import annotations
@@ -52,7 +51,6 @@ class ErrorCode(str, Enum):
     VERIFY = "VERIFY"
     HUD = "HUD"
     HUD_GENERATION_FAILED = "HUD_GENERATION_FAILED"
-    AUDIO = "AUDIO_ERROR"
 
     # FFmpeg
     FFMPEG_FAILED = "FFMPEG_FAILED"
@@ -121,24 +119,6 @@ class SkipStage(Exception):
         self.meta = meta or {}
 
 
-def log_stage_skip(
-    logger: Any,
-    stage_name: str,
-    reason: str,
-    *,
-    upload_id: Optional[str] = None,
-) -> None:
-    """
-    Uniform log line when an optional stage does not run (disabled, missing key,
-    no credits, quota, etc.). The pipeline keeps going — informational, not an error.
-    """
-    msg = f"{stage_name} SKIPPED (processing continues): {reason}"
-    if upload_id:
-        logger.info("[%s] %s", upload_id, msg)
-    else:
-        logger.info("%s", msg)
-
-
 class CancelRequested(Exception):
     """Raise to stop processing due to explicit cancellation."""
 
@@ -204,17 +184,10 @@ class HUDError(StageError):
         super().__init__(code=code, message=message, stage="hud", meta=meta, retryable=retryable, detail=detail)
 
 
-class AudioError(StageError):
-    def __init__(self, message: str = "Audio context stage failed", *, code=ErrorCode.AUDIO,
-                 meta: Optional[Dict[str, Any]] = None, retryable: bool = False, detail: str = None):
-        super().__init__(code=code, message=message, stage="audio", meta=meta, retryable=retryable, detail=detail)
-
-
 __all__ = [
     "ErrorCode",
     "StageError",
     "SkipStage",
-    "log_stage_skip",
     "CancelRequested",
     "PublishError",
     "StorageError",
@@ -225,5 +198,4 @@ __all__ = [
     "WatermarkError",
     "VerifyError",
     "HUDError",
-    "AudioError",
 ]

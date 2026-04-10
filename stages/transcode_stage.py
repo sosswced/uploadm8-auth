@@ -29,8 +29,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
-import asyncpg
-
 from .context import JobContext
 from .errors import StageError, SkipStage, ErrorCode
 
@@ -172,7 +170,7 @@ async def get_video_info(video_path: Path) -> VideoInfo:
         if proc.returncode != 0:
             raise StageError(ErrorCode.TRANSCODE_FAILED, f"ffprobe failed: {stderr.decode()}")
 
-        data = json.loads(stdout.decode("utf-8", errors="replace"))
+        data = json.loads(stdout.decode())
 
         # Find video and audio streams
         video_stream = None
@@ -226,8 +224,8 @@ async def get_video_info(video_path: Path) -> VideoInfo:
         if file_size == 0:
             try:
                 file_size = video_path.stat().st_size
-            except (OSError, PermissionError) as e:
-                logger.debug("transcode.get_video_info: could not stat file size: %s", e)
+            except Exception:
+                pass
 
         return VideoInfo(
             width=width,
@@ -244,11 +242,9 @@ async def get_video_info(video_path: Path) -> VideoInfo:
             file_size=file_size,
         )
 
-    except asyncio.CancelledError:
-        raise
     except json.JSONDecodeError as e:
         raise StageError(ErrorCode.TRANSCODE_FAILED, f"Failed to parse ffprobe output: {e}")
-    except (OSError, ValueError, TypeError, KeyError, ZeroDivisionError) as e:
+    except Exception as e:
         if isinstance(e, StageError):
             raise
         raise StageError(ErrorCode.TRANSCODE_FAILED, f"Failed to get video info: {e}")
@@ -533,13 +529,8 @@ async def transcode_video(
                                     db_pool, upload_id, pct,
                                     stage=f"transcoding:{platform}"
                                 )
-                            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError, TimeoutError, AttributeError) as e:
-                                logger.debug(
-                                    "transcode: update_upload_progress failed upload=%s platform=%s: %s",
-                                    upload_id,
-                                    platform,
-                                    e,
-                                )
+                            except Exception:
+                                pass
 
             await asyncio.gather(proc.wait(), _stream_stderr())
             stderr_output = "".join(stderr_lines)
@@ -569,11 +560,9 @@ async def transcode_video(
 
         return output_path
 
-    except asyncio.CancelledError:
-        raise
-    except StageError:
-        raise
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError, RuntimeError) as e:
+    except Exception as e:
+        if isinstance(e, StageError):
+            raise
         raise StageError(ErrorCode.TRANSCODE_FAILED, f"Transcode failed for {platform}: {e}")
 
 
@@ -703,8 +692,7 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
             try:
                 sz = vpath.stat().st_size / 1024 / 1024
                 summary_parts.append(f"{p}={sz:.1f}MB")
-            except (OSError, PermissionError) as e:
-                logger.debug("transcode: could not stat output for summary %s: %s", p, e)
+            except Exception:
                 summary_parts.append(f"{p}=transcoded")
         else:
             summary_parts.append(f"{p}=original")
@@ -714,3 +702,18 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
     return ctx
 
 
+# -------------------------------------------------------------------------
+# Utility
+# -------------------------------------------------------------------------
+async def check_ffmpeg_available() -> bool:
+    """Check if FFmpeg is installed and accessible"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+        return proc.returncode == 0
+    except Exception:
+        return False

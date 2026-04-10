@@ -84,7 +84,7 @@ async def send_friends_family_welcome_email(email: str, name: str) -> None:
         footer_note="You received this because you were granted Friends & Family access to UploadM8.",
     )
 
-    await send_email(email, f"Welcome to UploadM8, {name}", html)
+    await send_email(email, f"Welcome to UploadM8, {name} — you're one of us ❤️", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,7 +168,7 @@ async def send_agency_welcome_email(
         footer_note="You received this because you activated an UploadM8 Agency plan.",
     )
 
-    await send_email(email, f"Welcome to UploadM8 Agency, {name}", html)
+    await send_email(email, f"Welcome to UploadM8 Agency — let's build something great, {name} 🌟", html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

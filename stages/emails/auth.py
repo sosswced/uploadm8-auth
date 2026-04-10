@@ -22,58 +22,21 @@ import logging
 from .base import (
     send_email, mailgun_ready, MAIL_FROM_SUPPORT,
     email_shell, intro_row, body_row, cta_button, tinted_box,
-    check_list, alert_banner, numbered_steps, spacer, stat_grid, secondary_links,
+    check_list, alert_banner, numbered_steps, spacer,
     section_tag, metric_hero, divider_accent,
     GRAD_ORANGE, GRAD_RED, GRAD_DARK, GRAD_GREEN, GRAD_BLUE,
-    URL_DASHBOARD, URL_GUIDE, URL_GUIDE_PLAYBOOK, URL_SETTINGS, URL_BILLING, URL_PRICING, DISCORD_INVITE_URL, SUPPORT_EMAIL, FRONTEND_URL,
+    URL_DASHBOARD, URL_SETTINGS, SUPPORT_EMAIL, FRONTEND_URL,
 )
 
 logger = logging.getLogger("uploadm8-worker")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 0. Signup confirmation (must verify email before full access)
-# ─────────────────────────────────────────────────────────────────────────────
-async def send_signup_confirmation_email(email: str, name: str, confirmation_link: str) -> None:
-    """
-    Sent immediately after signup. User must click the link to verify their email.
-    confirmation_link points to {FRONTEND_URL}/confirm-email.html?token=xxx
-    """
-    if not mailgun_ready():
-        return
-
-    html = email_shell(
-        gradient=GRAD_ORANGE,
-        tagline="One more step to get started",
-        preheader_text=f"Click the link to confirm your UploadM8 account and start publishing.",
-        body_rows=(
-            section_tag("Confirm Your Email", "#f97316")
-            + intro_row(
-                f"Almost there, {name}! &#128640;",
-                "Thanks for signing up for UploadM8. Click the button below to confirm your "
-                "email address and activate your account. This link expires in "
-                "<strong style='color:#f97316;'>24 hours</strong>.",
-            )
-            + cta_button("Confirm My Email", confirmation_link, pt="24px", pb="20px")
-            + alert_banner(
-                "&#9888;&#65039;&nbsp; If you did <strong>not</strong> create an UploadM8 account, "
-                "you can safely ignore this email.",
-                hex_color="#374151",
-                pb="36px",
-            )
-        ),
-        footer_note="You received this because you signed up for an UploadM8 account.",
-    )
-
-    await send_email(email, "Confirm your UploadM8 email address", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. New user welcome (sent AFTER email confirmation)
+# 1. New user welcome
 # ─────────────────────────────────────────────────────────────────────────────
 async def send_welcome_email(email: str, name: str) -> None:
     """
-    Warm onboarding email fired immediately after the user confirms their email (signup verification).
+    Warm onboarding email fired immediately after a new user registers.
 
     BEFORE (app.py ~line 1902):
         background_tasks.add_task(send_email, data.email, "Welcome to UploadM8!", f"<h1>Welcome, {data.name}!</h1>...")
@@ -87,7 +50,7 @@ async def send_welcome_email(email: str, name: str) -> None:
     html = email_shell(
         gradient=GRAD_ORANGE,
         tagline="Upload once. Publish everywhere.",
-        preheader_text=f"Welcome, {name}! Open the Setup Handbook for captions, AI, thumbnails, and your first successful upload.",
+        preheader_text=f"Welcome, {name}! Your 30 free upload tokens are waiting — let's get your content live.",
         body_rows=(
             section_tag("Welcome to the Platform", "#f97316")
             + intro_row(
@@ -104,8 +67,6 @@ async def send_welcome_email(email: str, name: str) -> None:
             )
             + divider_accent()
             + numbered_steps(
-                ("Open the Setup Handbook",
-                 "One page explains every toggle — audio, AI services, captions, thumbnails, Drive Insights, and how to avoid wasted credits."),
                 ("Connect Your Platforms",
                  "Link TikTok, YouTube, Instagram, and Facebook from your Settings page."),
                 ("Upload Your First Video",
@@ -113,8 +74,7 @@ async def send_welcome_email(email: str, name: str) -> None:
                 ("Watch the Numbers Move",
                  "Track views, engagement, and performance from your Analytics dashboard."),
             )
-            + cta_button("Setup Handbook (recommended)", URL_GUIDE_PLAYBOOK, pt="12px", pb="12px")
-            + cta_button("Open Dashboard", URL_DASHBOARD, pt="0", pb="20px")
+            + cta_button("Get Started Now", URL_DASHBOARD, pt="12px", pb="20px")
             + tinted_box(
                 f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.65;">'
                 f'Questions? We\'re here. Reply to this email or reach out at '
@@ -127,87 +87,7 @@ async def send_welcome_email(email: str, name: str) -> None:
         footer_note="You received this because you created an UploadM8 account.",
     )
 
-    await send_email(email, f"Welcome to UploadM8, {name} — your 30 free tokens are ready", html, from_addr=MAIL_FROM_SUPPORT)
-
-
-async def send_fully_signed_up_guide_email(
-    email: str,
-    name: str,
-    tier: str,
-    put_monthly: int,
-    aic_monthly: int,
-    max_accounts: int,
-    max_accounts_per_platform: int,
-) -> None:
-    """Brochure-style onboarding email sent after email verification completes."""
-    if not mailgun_ready():
-        return
-
-    plan_label = tier.replace("_", " ").title()
-    html = email_shell(
-        gradient=GRAD_BLUE,
-        tagline="You are fully signed up and ready to publish",
-        preheader_text=f"Your account is fully active. Open the Setup Handbook to configure AI, audio, and uploads for success.",
-        body_rows=(
-            section_tag("Account Fully Activated", "#2563eb")
-            + intro_row(
-                f"Welcome aboard, {name}",
-                "Your account is now fully verified. This quick guide shows what you have access to and the fastest path to your first successful upload.",
-            )
-            + metric_hero(
-                plan_label,
-                "Current Plan",
-                f"{put_monthly:,} PUT monthly • {aic_monthly:,} AIC monthly",
-                "#2563eb",
-            )
-            + stat_grid(
-                ("Plan", plan_label),
-                ("Monthly PUT", f"{put_monthly:,}"),
-                ("Monthly AIC", f"{aic_monthly:,}"),
-                ("Account Slots", f"{max_accounts:,}"),
-            )
-            + check_list(
-                f"Up to {max_accounts_per_platform:,} accounts per platform",
-                "AI caption tools are available from Upload",
-                "Scheduling and queue management are available in Dashboard",
-                "Billing supports one-time top-ups and plan upgrades",
-                hex_color="#2563eb",
-            )
-            + numbered_steps(
-                ("Setup Handbook (do this first)", "Follow the Settings Playbook — dependencies, AI credits, captions, thumbnails, audio, and Drive Insights in one place."),
-                ("Connect platforms", "Open Settings and connect TikTok, YouTube, Instagram, and Facebook accounts."),
-                ("Upload your first video", "Go to Upload, add title/caption/hashtags, and select your platforms."),
-                ("Review results", "Use Queue and Dashboard to confirm publish status and retry any failed platforms."),
-            )
-            + cta_button("Open Setup Handbook", URL_GUIDE_PLAYBOOK, pt="8px", pb="8px")
-            + tinted_box(
-                f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
-                f'<strong style="color:#ffffff;">Full feature guide:</strong> '
-                f'<a href="{URL_GUIDE}" style="color:#60a5fa;text-decoration:none;">Browse the complete guide</a> '
-                f'(scheduling, queue, billing, Thumbnail Studio).<br><br>'
-                f'<strong style="color:#ffffff;">Upgrade option:</strong> Need more monthly quota? '
-                f'<a href="{URL_BILLING}" style="color:#60a5fa;text-decoration:none;">Billing &amp; top-ups &#8594;</a><br><br>'
-                f'<strong style="color:#ffffff;">Community:</strong> '
-                f'<a href="{DISCORD_INVITE_URL}" style="color:#5865F2;text-decoration:none;">Join Discord &#8599;</a>'
-                f'</p>',
-                hex_color="#2563eb",
-            )
-            + cta_button("Go to Dashboard", URL_DASHBOARD, pt="16px", pb="20px")
-            + secondary_links(
-                ("Billing", URL_BILLING),
-                ("Plans", URL_PRICING),
-                ("Settings", URL_SETTINGS),
-            )
-        ),
-        footer_note="You received this because your email was verified and your account is fully active.",
-    )
-    await send_email(
-        email,
-        f"UploadM8 getting started guide — {plan_label} plan",
-        html,
-        from_addr=MAIL_FROM_SUPPORT,
-        reply_to=SUPPORT_EMAIL,
-    )
+    await send_email(email, f"Welcome to UploadM8, {name}! 🎉 Your 30 free tokens are ready", html, from_addr=MAIL_FROM_SUPPORT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,7 +96,7 @@ async def send_fully_signed_up_guide_email(
 async def send_password_reset_email(email: str, reset_link: str) -> None:
     """
     Fired from /api/auth/forgot-password.
-    reset_link points to {FRONTEND_URL}/reset-password.html?token=xxx
+    reset_link points to {FRONTEND_URL}/reset-password?token=xxx
     """
     if not mailgun_ready():
         return
@@ -247,7 +127,7 @@ async def send_password_reset_email(email: str, reset_link: str) -> None:
         footer_note="You received this because a password reset was requested for your account.",
     )
 
-    await send_email(email, "Reset your UploadM8 password", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, "Reset your UploadM8 password 🔑", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +170,7 @@ async def send_password_changed_email(email: str, name: str) -> None:
         footer_note="You received this security alert because your password was changed.",
     )
 
-    await send_email(email, "Your UploadM8 password was changed", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, "Your UploadM8 password was changed ⚠️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -361,10 +241,10 @@ async def send_email_change_email(
 ) -> None:
     """
     Sent to the NEW email address when a user (or admin) requests an email change.
-    verification_link points to {FRONTEND_URL}/verify-email.html?token=xxx
+    verification_link points to {FRONTEND_URL}/verify-email?token=xxx
 
     Hook into /api/admin/users/{id}/email after inserting into email_changes:
-        verification_link = f"{FRONTEND_URL}/verify-email.html?token={verification_token}"
+        verification_link = f"{FRONTEND_URL}/verify-email?token={verification_token}"
         background_tasks.add_task(
             send_email_change_email,
             new_email, old["email"], target_user["name"], verification_link
@@ -381,11 +261,10 @@ async def send_email_change_email(
             section_tag("Verify Email", "#2563eb")
             + intro_row(
                 f"Verify your new email, {name} &#9993;&#65039;",
-                f"Your UploadM8 sign-in email was updated from "
+                f"A request was made to change your UploadM8 account email from "
                 f"<strong style='color:#9ca3af;'>{old_email}</strong> to "
                 f"<strong style='color:#60a5fa;'>{new_email}</strong>. "
-                "Click the button below to confirm you can receive mail at this address. "
-                "Until you verify, some account notices may still go to your previous email.",
+                "Click the button below to confirm this change.",
             )
             + cta_button("Verify New Email", verification_link, pt="24px", pb="20px")
             + alert_banner(
@@ -400,113 +279,7 @@ async def send_email_change_email(
         footer_note="You received this because an email change was requested for your UploadM8 account.",
     )
 
-    await send_email(new_email, "Verify your new UploadM8 email address", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5b. Security notice to the OLD inbox (admin-initiated change)
-# ─────────────────────────────────────────────────────────────────────────────
-async def send_admin_email_change_notice_to_old_email(
-    email: str,
-    new_email: str,
-    name: str,
-) -> None:
-    """
-    Sent to the OLD email address when an UploadM8 administrator changes the
-    user's sign-in email via:
-      PUT /api/admin/users/{id}/email
-
-    The NEW email receives the verification link email (send_email_change_email).
-    """
-    if not mailgun_ready():
-        return
-
-    html = email_shell(
-        gradient=GRAD_RED,
-        tagline="Security notice — email updated",
-        preheader_text=f"An admin updated your UploadM8 email to: {new_email}",
-        body_rows=(
-            section_tag("Security Notice", "#ef4444")
-            + intro_row(
-                f"Your UploadM8 email was updated, {name} &#128274;",
-                f"An <strong>UploadM8 administrator</strong> updated your sign-in email to "
-                f"<strong style='color:#60a5fa;'>{new_email}</strong>. "
-                "A verification link was sent to that new address. "
-                f"If you did <strong>not</strong> request this change, sign in and review your account settings immediately: "
-                f'<a href="{URL_SETTINGS}" style="color:#f97316;text-decoration:none;">Settings</a>.',
-            )
-            + tinted_box(
-                f'<p style="margin:0 0 6px;color:#6b7280;font-size:10px;text-transform:uppercase;'
-                f'letter-spacing:1.5px;font-weight:600;">New Email Address</p>'
-                f'<p style="margin:0;color:#60a5fa;font-size:18px;font-weight:800;">{new_email}</p>',
-                hex_color="#ef4444",
-                pb="28px",
-            )
-            + cta_button("Sign In to Review", f"{FRONTEND_URL}/login.html", pt="24px", pb="20px")
-            + alert_banner(
-                "&#9888;&#65039;&nbsp; If you did <strong>not</strong> request this change, contact us immediately at "
-                f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#ffffff;text-decoration:underline;">'
-                f"{SUPPORT_EMAIL}</a>.",
-                hex_color="#ef4444",
-                pb="36px",
-            )
-        ),
-        footer_note="You received this because an administrator changed the email on your UploadM8 account.",
-    )
-
-    await send_email(
-        email,
-        "Security notice: your UploadM8 email was updated",
-        html,
-        from_addr=MAIL_FROM_SUPPORT,
-        reply_to=SUPPORT_EMAIL,
-    )
-
-
-async def send_user_email_change_notice_to_old_email(
-    email: str,
-    new_email: str,
-    name: str,
-) -> None:
-    """
-    Sent to the old email address when the user changes their own sign-in email.
-    """
-    if not mailgun_ready():
-        return
-
-    html = email_shell(
-        gradient=GRAD_RED,
-        tagline="Security notice — email updated",
-        preheader_text=f"Your UploadM8 sign-in email was changed to: {new_email}",
-        body_rows=(
-            section_tag("Security Notice", "#ef4444")
-            + intro_row(
-                f"Your UploadM8 email was updated, {name} &#128274;",
-                f"You changed your sign-in email to "
-                f"<strong style='color:#60a5fa;'>{new_email}</strong>. "
-                "A verification link was sent to that address. "
-                f"If this wasn't you, sign in and secure your account immediately: "
-                f'<a href="{URL_SETTINGS}" style="color:#f97316;text-decoration:none;">Settings</a>.',
-            )
-            + cta_button("Review Account Security", f"{FRONTEND_URL}/settings.html#security", pt="24px", pb="20px")
-            + alert_banner(
-                "&#9888;&#65039;&nbsp; If you did <strong>not</strong> request this change, contact us immediately at "
-                f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#ffffff;text-decoration:underline;">'
-                f"{SUPPORT_EMAIL}</a>.",
-                hex_color="#ef4444",
-                pb="36px",
-            )
-        ),
-        footer_note="You received this because your UploadM8 account email was changed.",
-    )
-
-    await send_email(
-        email,
-        "Security notice: your UploadM8 email was changed",
-        html,
-        from_addr=MAIL_FROM_SUPPORT,
-        reply_to=SUPPORT_EMAIL,
-    )
+    await send_email(new_email, "Verify your new UploadM8 email address ✉️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,10 +311,9 @@ async def send_admin_reset_password_email(
             section_tag("Action Required", "#ef4444")
             + intro_row(
                 f"Your password has been reset, {name} &#128272;",
-                "An <strong>UploadM8 administrator</strong> set a new temporary password on your account "
-                "for security or support reasons. Use the temporary password below to sign in at "
-                f'<a href="{FRONTEND_URL}/login.html" style="color:#f97316;text-decoration:none;">login</a>. '
-                "After you sign in, you will be asked to choose a new password before using the app.",
+                "An UploadM8 administrator has reset your account password. "
+                "Use the temporary password below to sign in, then you'll be "
+                "prompted to set a new one immediately.",
             )
             + tinted_box(
                 f'<p style="margin:0 0 6px;color:#6b7280;font-size:10px;text-transform:uppercase;'
@@ -566,59 +338,4 @@ async def send_admin_reset_password_email(
         footer_note="You received this because an admin reset your UploadM8 account password.",
     )
 
-    await send_email(email, "Your UploadM8 password has been reset — action required", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
-
-
-async def send_login_anomaly_email(
-    email: str,
-    name: str,
-    ip_address: str,
-    country_code: str = "",
-    user_agent: str = "",
-    previous_ip: str = "",
-) -> None:
-    """Security alert for sign-ins from a new IP/country/device fingerprint."""
-    if not mailgun_ready():
-        return
-
-    ua_short = (user_agent or "Unknown device")[:180]
-    prev_html = (
-        f'<p style="margin:10px 0 0;color:#9ca3af;font-size:13px;line-height:1.6;">Previous sign-in IP: {previous_ip}</p>'
-        if previous_ip else ""
-    )
-    html = email_shell(
-        gradient=GRAD_RED,
-        tagline="Security sign-in alert",
-        preheader_text="We detected a sign-in to your account from a new device or location.",
-        body_rows=(
-            section_tag("Security Alert", "#ef4444")
-            + intro_row(
-                f"New sign-in detected, {name}",
-                "We noticed a sign-in from a new location or device fingerprint. "
-                "If this was you, no action is required.",
-            )
-            + tinted_box(
-                f'<p style="margin:0;color:#d1d5db;font-size:14px;line-height:1.7;">'
-                f'<strong style="color:#ffffff;">IP:</strong> {ip_address or "Unknown"}<br>'
-                f'<strong style="color:#ffffff;">Country:</strong> {country_code or "Unknown"}<br>'
-                f'<strong style="color:#ffffff;">Device:</strong> {ua_short}'
-                f'{prev_html}</p>',
-                hex_color="#ef4444",
-            )
-            + check_list(
-                "If this was you, you can ignore this message",
-                "If this was not you, change your password immediately",
-                "Review connected sessions and platform tokens in Settings",
-                hex_color="#22c55e",
-            )
-            + cta_button("Sign In and Review Security", f"{FRONTEND_URL}/login.html", pt="16px", pb="20px")
-        ),
-        footer_note="You received this security alert because a new sign-in was detected.",
-    )
-    await send_email(
-        email,
-        "UploadM8 security alert — new sign-in detected",
-        html,
-        from_addr=MAIL_FROM_SUPPORT,
-        reply_to=SUPPORT_EMAIL,
-    )
+    await send_email(email, "Your UploadM8 password has been reset — action required 🔐", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)

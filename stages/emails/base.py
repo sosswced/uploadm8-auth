@@ -23,7 +23,6 @@ DESIGN v2 UPGRADES:
   - NEW: progress_bar()    — visual % bar for tokens / days remaining
 """
 
-import asyncio
 import os
 import logging
 import httpx
@@ -36,33 +35,17 @@ MAILGUN_DOMAIN  = os.environ.get("MAILGUN_DOMAIN", "")
 MAIL_FROM       = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
 MAIL_FROM_SUPPORT = os.environ.get("MAIL_FROM_SUPPORT", "UploadM8 Support <support@uploadm8.com>")
 MAIL_FROM_HELLO   = os.environ.get("MAIL_FROM_HELLO", "UploadM8 <hello@uploadm8.com>")
-FRONTEND_URL    = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com").rstrip("/")
-
-# Public Discord (community) — override via env for staging if needed
-DISCORD_INVITE_URL = os.environ.get("DISCORD_INVITE_URL", "https://discord.gg/TVDAc8fnwu")
+FRONTEND_URL    = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
 
 # ── Brand constants ───────────────────────────────────────────────────────────
 SUPPORT_EMAIL = "support@uploadm8.com"
-LOGO_URL      = f"{FRONTEND_URL}/images/logo.svg"
+LOGO_URL      = "https://app.uploadm8.com/images/logo.png"
 
 URL_DASHBOARD    = f"{FRONTEND_URL}/dashboard.html"
-URL_GUIDE        = f"{FRONTEND_URL}/guide.html"
-URL_GUIDE_PLAYBOOK = f"{FRONTEND_URL}/guide.html#feat-settings-playbook"
 URL_SETTINGS     = f"{FRONTEND_URL}/settings.html"
-URL_SETTINGS_TOKENS = f"{FRONTEND_URL}/settings.html#billing-panel"
 URL_BILLING      = f"{FRONTEND_URL}/billing.html"
 URL_PRICING      = f"{FRONTEND_URL}/index.html#pricing"
 URL_UNSUBSCRIBE  = f"{FRONTEND_URL}/unsubscribe.html"
-URL_CONTACT      = f"{FRONTEND_URL}/contact.html"
-URL_SUPPORT      = f"{FRONTEND_URL}/support.html"
-URL_LOGIN        = f"{FRONTEND_URL}/login.html"
-URL_TERMS        = f"{FRONTEND_URL}/terms.html"
-URL_PRIVACY      = f"{FRONTEND_URL}/privacy.html"
-
-
-def asset_url(path: str) -> str:
-    """Absolute URL for static images in transactional email (logo, platform icons)."""
-    return f"{FRONTEND_URL}/{path.lstrip('/')}"
 
 # ── Tier display names ────────────────────────────────────────────────────────
 TIER_NAMES: dict = {
@@ -115,10 +98,8 @@ async def send_email(to: str, subject: str, html: str, from_addr: str = None, re
             logger.warning(f"Mailgun failed ({resp.status_code}): {to} | {subject}")
         else:
             logger.info(f"Email sent → {to}: {subject}")
-    except asyncio.CancelledError:
-        raise
-    except httpx.HTTPError as e:
-        logger.warning("Mailgun error: %s", e)
+    except Exception as e:
+        logger.warning(f"Mailgun error: {e}")
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -195,49 +176,11 @@ def email_shell(
         '</div></td></tr>'
     )
 
-    sign_in_row = (
-        '<tr><td style="padding:18px 40px 4px;text-align:center;">'
-        f'<a href="{URL_LOGIN}" '
-        'style="display:inline-block;'
-        'background:linear-gradient(135deg,#2563eb 0%,#1d4ed8 100%);'
-        'color:#ffffff;text-decoration:none;padding:10px 26px;'
-        'border-radius:8px;font-size:13px;font-weight:700;letter-spacing:0.3px;'
-        'border:1px solid rgba(255,255,255,0.15);'
-        'box-shadow:0 2px 10px rgba(37,99,235,0.35);">'
-        'Sign In to UploadM8 &#8594;</a>'
-        '</td></tr>'
-    )
-
-    quick_links = (
-        '<tr><td style="padding:22px 40px 0;text-align:center;">'
-        '<p style="margin:0 0 8px;color:#9ca3af;font-size:11px;font-weight:700;'
-        'text-transform:uppercase;letter-spacing:0.12em;">Quick links</p>'
-        '<p style="margin:0 0 10px;color:#6b7280;font-size:13px;line-height:1.85;">'
-        f'<a href="{URL_DASHBOARD}" style="color:#f97316;text-decoration:none;">Dashboard</a>'
-        f' &middot; '
-        f'<a href="{URL_SETTINGS_TOKENS}" style="color:#f97316;text-decoration:none;">Token balance</a>'
-        f' &middot; '
-        f'<a href="{URL_CONTACT}" style="color:#f97316;text-decoration:none;">Contact</a>'
-        f' &middot; '
-        f'<a href="{DISCORD_INVITE_URL}" style="color:#5865F2;text-decoration:none;">Discord community</a>'
-        '</p>'
-        '<p style="margin:0 0 14px;color:#6b7280;font-size:12px;line-height:1.75;">'
-        f'<a href="{URL_TERMS}" style="color:#6b7280;text-decoration:underline;">Terms of Service</a>'
-        f' &middot; '
-        f'<a href="{URL_PRIVACY}" style="color:#6b7280;text-decoration:underline;">Privacy Policy</a>'
-        f' &middot; '
-        f'<a href="{URL_SUPPORT}" style="color:#6b7280;text-decoration:underline;">Support</a>'
-        '</p>'
-        '</td></tr>'
-    )
-
     footer = (
-        sign_in_row
-        + quick_links
-        + '<tr><td style="padding:18px 40px 24px;text-align:center;'
+        '<tr><td style="padding:26px 40px 24px;text-align:center;'
         'border-top:1px solid rgba(255,255,255,0.06);">'
         '<p style="margin:0 0 6px;color:#4b5563;font-size:13px;">'
-        '&#169; 2026 UploadM8 &middot; All rights reserved</p>'
+        '&#169; 2025 UploadM8 &middot; All rights reserved</p>'
         f'<p style="margin:0 0 8px;color:#4b5563;font-size:12px;">Need help? '
         f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
         f'{SUPPORT_EMAIL}</a></p>'
@@ -409,7 +352,7 @@ def numbered_steps(*steps, pb: str = "32px") -> str:
 
 
 def plan_change_visual(old_tier: str, new_tier: str, hex_new: str = "#f97316") -> str:
-    """Old plan  New plan visual inside a tinted box. v2: bolder type, strikethrough old plan."""
+    """Old plan ➜ New plan visual inside a tinted box. v2: bolder type, strikethrough old plan."""
     inner = (
         f'<table cellpadding="0" cellspacing="0" align="center"><tr>'
         f'<td style="text-align:center;padding:0 22px;">'
@@ -431,22 +374,22 @@ def plan_change_visual(old_tier: str, new_tier: str, hex_new: str = "#f97316") -
 
 
 def platform_logos_row() -> str:
-    """TikTok / YouTube / Instagram / Facebook — hosted on FRONTEND_URL for reliable email loading."""
+    """TikTok / YouTube / Instagram / Facebook logo strip. v2: bordered badge squares."""
     logos = [
-        (asset_url("images/platforms/tiktok.png"), "TikTok"),
-        (asset_url("images/platforms/youtube.png"), "YouTube"),
-        (asset_url("images/platforms/instagram.png"), "Instagram"),
-        (asset_url("images/platforms/facebook.png"), "Facebook"),
+        ("#1a1a1a", "https://logo.clearbit.com/tiktok.com",    "TikTok"),
+        ("#ff0000", "https://logo.clearbit.com/youtube.com",   "YouTube"),
+        ("#c13584", "https://logo.clearbit.com/instagram.com", "Instagram"),
+        ("#1877f2", "https://logo.clearbit.com/facebook.com",  "Facebook"),
     ]
     cells = "".join(
         f'<td style="padding:0 8px;text-align:center;">'
-        f'<div style="width:52px;height:52px;border-radius:14px;'
-        f'display:inline-block;border:1px solid rgba(255,255,255,0.14);overflow:hidden;background:#0b0f1a;">'
-        f'<img src="{src}" alt="{name}" width="52" height="52" '
-        f'style="display:block;width:52px;height:52px;object-fit:cover;"></div>'
+        f'<div style="width:52px;height:52px;background:{bg};border-radius:14px;'
+        f'display:inline-block;border:1px solid rgba(255,255,255,0.14);">'
+        f'<img src="{src}" alt="{name}" width="30" height="30" '
+        f'style="display:block;margin:11px auto;border-radius:4px;"></div>'
         f'<p style="margin:7px 0 0;color:#9ca3af;font-size:11px;font-weight:600;">{name}</p>'
         f'</td>'
-        for src, name in logos
+        for bg, src, name in logos
     )
     inner = (
         '<p style="margin:0 0 16px;color:#f97316;font-size:10px;font-weight:700;'

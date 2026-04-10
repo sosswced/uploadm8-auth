@@ -88,7 +88,7 @@ async def send_admin_wallet_topup_email(
 
     await send_email(
         email,
-        f"You received +{tokens_added:,} {wt_short} tokens — compliments of UploadM8",
+        f"🎁 You received +{tokens_added:,} {wt_short} tokens — compliments of UploadM8",
         html,
     )
 
@@ -119,8 +119,8 @@ async def send_admin_tier_switch_email(
     hex_new   = "#22c55e"  if is_upgrade else "#d97706"
 
     action_word = "upgraded" if is_upgrade else "updated"
-    emoji_html  = "&#128640;" if is_upgrade else "&#128295;"
-    tag_text    = f"Plan {action_word.title()} {emoji_html}"
+    emoji       = "&#128640;" if is_upgrade else "&#128295;"
+    tag_text    = f"Plan {action_word.title()} {emoji}"
     tag_color   = "#22c55e" if is_upgrade else "#d97706"
 
     note_html = (
@@ -136,7 +136,7 @@ async def send_admin_tier_switch_email(
         body_rows=(
             section_tag(tag_text, tag_color)
             + intro_row(
-                f"Your plan has been {action_word}, {name}! {emoji_html}",
+                f"Your plan has been {action_word}, {name}! {emoji}",
                 f"The UploadM8 team has manually moved your account from "
                 f"<strong style='color:#9ca3af;'>{old_plan}</strong> to "
                 f"<strong style='color:{hex_new};'>{new_plan}</strong>. "
@@ -169,63 +169,6 @@ async def send_admin_tier_switch_email(
 
     await send_email(
         email,
-        f"Your UploadM8 plan has been {action_word} to {new_plan}",
-        html,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Admin account status change (ban / unban)
-# ─────────────────────────────────────────────────────────────────────────────
-async def send_admin_account_status_email(
-    email: str,
-    name: str,
-    status: str,          # "banned" | "active"
-    reason: str = "",
-) -> None:
-    """Sent when an admin bans or unbans a user account."""
-    if not mailgun_ready():
-        return
-
-    is_banned = (status or "").lower() == "banned"
-    gradient = GRAD_GOLD if is_banned else GRAD_GREEN
-    color = "#d97706" if is_banned else "#22c55e"
-    action = "restricted" if is_banned else "restored"
-    section = "Account Access Changed" if is_banned else "Account Access Restored"
-    headline = "Your account access has changed" if is_banned else "Your account access has been restored"
-    body_text = (
-        "An UploadM8 administrator has restricted access to your account. "
-        "You will not be able to sign in until this restriction is removed."
-        if is_banned else
-        "An UploadM8 administrator has restored access to your account. "
-        "You can now sign in and continue using your workspace."
-    )
-    reason_html = (
-        f'<p style="margin:12px 0 0;color:#d1d5db;font-size:14px;line-height:1.65;">'
-        f'<strong style="color:#ffffff;">Reason:</strong> {reason}</p>'
-        if reason else ""
-    )
-
-    html = email_shell(
-        gradient=gradient,
-        tagline="Official account status notification",
-        preheader_text=f"Your UploadM8 account access has been {action} by an administrator.",
-        body_rows=(
-            section_tag(section, color)
-            + intro_row(f"{headline}, {name}", body_text)
-            + tinted_box(
-                f'<p style="margin:0;color:#9ca3af;font-size:13px;text-transform:uppercase;letter-spacing:1px;">Current Status</p>'
-                f'<p style="margin:8px 0 0;color:{color};font-size:22px;font-weight:800;">{status.title()}</p>'
-                f'{reason_html}',
-                hex_color=color,
-            )
-            + cta_button("Open UploadM8", URL_DASHBOARD, pt="20px", pb="20px")
-            + secondary_links(("Support", f"mailto:{SUPPORT_EMAIL}"), ("Dashboard", URL_DASHBOARD))
-        ),
-        footer_note="You received this because an administrator changed your account status.",
-    )
-    await send_email(
-        email,
-        f"UploadM8 account status updated: {status.title()}",
+        f"{emoji} Your UploadM8 plan has been {action_word} to {new_plan}",
         html,
     )

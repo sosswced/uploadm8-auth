@@ -32,12 +32,8 @@ def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
     Returns:
         Path to generated SRT file
     """
-    telemetry = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
-    points = (
-        (getattr(telemetry, "data_points", None) or getattr(telemetry, "points", None) or [])
-        if telemetry
-        else []
-    )
+    telemetry = getattr(ctx, "telemetry", None)
+    points = getattr(telemetry, "data_points", None) or getattr(telemetry, "points", None) or []
     if not telemetry or not points:
         raise HUDError(
             "No telemetry data for HUD",
@@ -72,17 +68,6 @@ def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
             f.write(f"{int(speed)} {unit_label}\n\n")
     
     return output_path
-
-
-def _ffmpeg_subtitles_path_for_filter(p: Path) -> str:
-    """
-    Escape .srt path for FFmpeg subtitles filter.
-    On Windows, a drive letter colon (C:) is parsed as a filter option separator unless escaped.
-    """
-    s = p.resolve().as_posix()
-    if os.name == "nt" and len(s) >= 2 and s[1] == ":":
-        s = s[0] + "\\:" + s[2:]
-    return s.replace("'", r"\'")
 
 
 def build_ffmpeg_command(
@@ -132,11 +117,10 @@ def build_ffmpeg_command(
         f"Shadow=1"
     )
     
-    sub_in_filter = _ffmpeg_subtitles_path_for_filter(srt_path)
     return [
         'ffmpeg', '-y',
         '-i', str(input_path),
-        '-vf', f"subtitles='{sub_in_filter}':force_style='{force_style}'",
+        '-vf', f"subtitles={str(srt_path)}:force_style='{force_style}'",
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
@@ -168,7 +152,7 @@ async def run_hud_stage(ctx: JobContext) -> JobContext:
         raise SkipStage("HUD not available for this tier")
     
     # Check if we have telemetry data
-    telemetry = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
+    telemetry = getattr(ctx, "telemetry", None)
     points = getattr(telemetry, "data_points", None) or getattr(telemetry, "points", None) or []
     if not telemetry or not points:
         raise SkipStage("No telemetry data for HUD overlay")
@@ -245,7 +229,7 @@ async def run_hud_stage(ctx: JobContext) -> JobContext:
         # Clean up SRT file
         try:
             srt_path.unlink(missing_ok=True)
-        except (OSError, PermissionError) as e:
-            logger.debug("hud_stage: could not remove temp SRT %s: %s", srt_path, e)
+        except Exception:
+            pass
     
     return ctx

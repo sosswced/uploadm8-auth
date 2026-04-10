@@ -12,7 +12,6 @@ Exports: run_watermark_stage(ctx)
 import asyncio
 import logging
 import os
-import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -26,9 +25,6 @@ WATERMARK_TEXT = os.environ.get("WATERMARK_TEXT", "UploadM8")
 WATERMARK_FONT_SIZE = int(os.environ.get("WATERMARK_FONT_SIZE", "18"))
 WATERMARK_OPACITY = float(os.environ.get("WATERMARK_OPACITY", "0.5"))
 WATERMARK_POSITION = os.environ.get("WATERMARK_POSITION", "bottom-right")
-# Intermediate encode only — transcode stage re-encodes; favor speed here.
-WATERMARK_FFMPEG_PRESET = os.environ.get("WATERMARK_FFMPEG_PRESET", "veryfast")
-WATERMARK_FFMPEG_CRF = int(os.environ.get("WATERMARK_FFMPEG_CRF", "24"))
 
 
 def _get_position_filter(position: str, font_size: int) -> str:
@@ -90,8 +86,8 @@ async def run_watermark_stage(ctx: JobContext) -> JobContext:
         "-i", str(video_path),
         "-vf", drawtext_filter,
         "-c:v", "libx264",
-        "-preset", WATERMARK_FFMPEG_PRESET,
-        "-crf", str(WATERMARK_FFMPEG_CRF),
+        "-preset", "fast",
+        "-crf", "23",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(output_path),
@@ -114,13 +110,11 @@ async def run_watermark_stage(ctx: JobContext) -> JobContext:
         ctx.output_artifacts["watermarked_video"] = str(output_path)
         logger.info(f"Watermark applied: {output_path} ({output_path.stat().st_size} bytes)")
 
-    except asyncio.CancelledError:
-        raise
     except SkipStage:
         raise
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as e:
+    except Exception as e:
         # Watermark failure should never crash the pipeline
-        logger.warning("Watermark stage error (non-fatal): %s", e)
+        logger.warning(f"Watermark stage error (non-fatal): {e}")
         raise SkipStage(f"Watermark failed: {e}")
 
     return ctx

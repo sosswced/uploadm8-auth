@@ -1,18 +1,12 @@
 # UploadM8 Backend Requirements
 # Using flexible versions with pre-built wheels (no Rust compilation needed)
-#
-# Python: use 3.11 locally and in CI (matches Dockerfile). On 3.14 + Windows, TensorFlow is missing
-# TensorFlow still has no 3.14 wheel on Windows. asyncpg: use <0.32 so pip can take 0.31+ (prebuilt cp314 wheels).
-# `py -m pip` often follows the newest Python — use an explicit
-# 3.11 venv: py -3.11 -m venv .venv
-# API-only: requirements-api.txt (still needs 3.11 on Windows unless you install C++ Build Tools).
 
 # Web Framework
 fastapi>=0.109.0,<0.116.0
 uvicorn[standard]>=0.27.0,<0.35.0
 
 # Database
-asyncpg>=0.29.0,<0.32.0
+asyncpg>=0.29.0,<0.31.0
 python-multipart==0.0.9
 
 
@@ -40,9 +34,6 @@ email-validator>=2.1.0,<3.0.0
 # Excel Export
 openpyxl>=3.1.0,<4.0.0
 
-# Error Tracking (opt-in via SENTRY_DSN env var)
-sentry-sdk[fastapi]>=2.0.0,<3.0.0
-
 # Environment
 python-dotenv>=1.0.0,<2.0.0
 
@@ -62,36 +53,4 @@ pandas>=2.0.0,<3.0.0
 numpy>=1.24.0,<3.0.0
 
 # Image processing — used by thumbnail_stage for template rendering
-# Pillow 11+ required for Python 3.14+ (prebuilt wheels); 10.x still ok on 3.11–3.12
-Pillow>=10.0.0,<13.0.0
-
-# E2E testing
-playwright>=1.40.0,<2.0.0
-pytest>=7.0.0,<9.0.0
-
-# Load / stress testing
-locust>=2.20.0,<3.0.0
-
-# ── Supercharged Worker Tools ──────────────────────────────────────
-
-# rembg: local background removal (no API key). First run downloads ~176MB model.
-rembg[cpu,cli]>=2.0.0
-onnxruntime>=1.15.0,<2.0.0
-
-# YAMNet: audio classification via TensorFlow Hub. First run downloads ~20MB model.
-tensorflow>=2.15.0,<3.0.0
-tensorflow-hub>=0.15.0,<1.0.0
-soundfile>=0.12.0,<0.15.0
-resampy>=0.4.0,<0.5.0
-
-# Replicate — AI image generation (FLUX schnell/dev/pro, Kontext)
-replicate>=0.25.0,<2.0.0
-
-# fal.ai — fast FLUX inference (alternative image gen)
-fal-client>=0.4.0,<1.0.0
-
-# Google Cloud Vision — face detection, OCR, labels
-google-cloud-vision>=3.5.0,<4.0.0
-
-# Google Cloud Video Intelligence — full-video labels + shot detection
-google-cloud-videointelligence>=2.11.0,<3.0.0
+Pillow>=10.0.0,<11.0.0

@@ -5,9 +5,7 @@ Publish per-platform transcoded videos to social media platforms.
 
 Platform-specific publish flows:
   TikTok   - Content Posting API v2: init upload -> PUT binary -> publish_id
-  YouTube  - Resumable upload: init -> PUT binary -> video_id; thumbnails.set for one custom
-              thumbnail. Extra A/B JPEGs are uploaded to R2 by the worker for Studio
-              “Test & Compare” (no public thumbnailTests API on Data API v3 as of 2025).
+  YouTube  - Resumable upload: init -> PUT binary -> video_id
   Instagram - Graph API Reels: create container (video_url) -> poll status -> publish
   Facebook - Graph API: multipart upload or URL-based Reels
 
@@ -16,7 +14,7 @@ Key behaviors:
   - Meta platforms (IG/FB) use presigned R2 URLs when public URL needed
   - Per-platform error isolation: one failure does NOT kill others
   - Ledger row per attempt (publish_attempts table)
-  - verify_stage later confirms "accepted" -> live (TikTok, YouTube, Instagram, Facebook)
+  - verify_stage later confirms "accepted" -> "confirmed live"
 
 Exports used by verify_stage:
   - decrypt_token(token_row) -> dict or None
@@ -28,72 +26,20 @@ import json
 import asyncio
 import logging
 import base64
-import binascii
 import math
 from pathlib import Path
 from typing import Dict, Any, Optional
 
 import httpx
-import asyncpg
-
-try:
-    from botocore.exceptions import BotoCoreError as _R2BotoCoreError
-    from botocore.exceptions import ClientError as _R2ClientError
-except ImportError:  # pragma: no cover
-    _R2BotoCoreError = OSError
-    _R2ClientError = OSError
-
-from .safe_parse import json_dict
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .errors import PublishError, ErrorCode
-from .context import JobContext, PlatformResult, build_multimodal_scene_digest
-
-from services.meta_oauth import require_facebook_publish, require_instagram_publish
+from .context import JobContext, PlatformResult
 from . import db as db_stage
 from . import r2 as r2_stage
-from .outbound_rl import outbound_slot
-from .platform_tokens import platform_tokens_db_key
-from .redis_publish_guard import (
-    publish_circuit_open,
-    publish_record_result,
-    publish_wait_slot,
-)
 
 
 logger = logging.getLogger("uploadm8-worker")
-
-_TOKEN_PARSE_ERRORS = (
-    json.JSONDecodeError,
-    ValueError,
-    TypeError,
-    KeyError,
-    OSError,
-    binascii.Error,
-)
-try:
-    from cryptography.exceptions import InvalidTag as _TokenInvalidTag
-
-    _TOKEN_PARSE_ERRORS = _TOKEN_PARSE_ERRORS + (_TokenInvalidTag,)
-except ImportError:  # pragma: no cover
-    pass
-
-_PUBLISH_HTTP_JSON_ERRS = (
-    httpx.HTTPError,
-    json.JSONDecodeError,
-    KeyError,
-    TypeError,
-    ValueError,
-)
-_DB_PERSIST_ERRS = (
-    asyncpg.PostgresError,
-    asyncpg.InterfaceError,
-    OSError,
-    TimeoutError,
-    TypeError,
-    ValueError,
-)
-_PUBLISH_FILE_HTTP_ERRS = _PUBLISH_HTTP_JSON_ERRS + (OSError, PermissionError)
 
 # Graph API version for Meta platforms (Instagram + Facebook)
 META_API_VERSION = "v21.0"
@@ -116,7 +62,10 @@ def _get_platform_thumbnail_path(ctx, platform: str):
     Prefers platform-specific styled thumbnail (16:9 YouTube, 9:16 IG/FB) when available.
     """
     pm = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
-    plat_map = json_dict(pm, default={}, context="platform_thumbnail_map")
+    try:
+        plat_map = json.loads(pm) if isinstance(pm, str) else (pm or {})
+    except Exception:
+        plat_map = {}
     path_str = plat_map.get(platform)
     if path_str:
         p = Path(path_str)
@@ -188,48 +137,9 @@ async def _push_thumbnail_to_platform(
         # TikTok: cover API restricted — platform auto-selects from video
         # Instagram: cover_url injected into container creation payload
         return False
-    except asyncio.CancelledError:
-        raise
-    except (OSError, PermissionError, httpx.HTTPError, json.JSONDecodeError, TypeError, ValueError) as e:
-        logger.warning("Thumbnail push %s failed (non-fatal): %s", platform, e)
+    except Exception as e:
+        logger.warning(f"Thumbnail push {platform} failed (non-fatal): {e}")
         return False
-
-
-# TikTok Content Posting: public → PUBLIC_TO_EVERYONE when the app is approved.
-# Default is audited (public/live). Set TIKTOK_APP_AUDITED=false only for sandbox apps that
-# cannot post publicly yet (maps public → SELF_ONLY to avoid unaudited_client errors).
-_tiktok_aud_raw = os.environ.get("TIKTOK_APP_AUDITED", "true").strip().lower()
-TIKTOK_APP_AUDITED = _tiktok_aud_raw not in (
-    "0",
-    "false",
-    "no",
-    "off",
-    "unaudited",
-    "sandbox",
-)
-
-
-def _tiktok_error_suggests_creator_only_fallback(code: Any, message: str, raw_text: str) -> bool:
-    """True when TikTok init likely failed because PUBLIC_TO_EVERYONE is not allowed for this client/token."""
-    blob = " ".join(
-        [
-            str(code or "").lower(),
-            (message or "").lower(),
-            (raw_text or "").lower(),
-        ]
-    )
-    needles = (
-        "unaudited",
-        "not_audited",
-        "private_account",
-        "can_only_post",
-        "only_post_to_private",
-        "sandbox",
-        "content-sharing-guidelines",
-        "content sharing guidelines",
-        "integration guidelines",
-    )
-    return any(n in blob for n in needles)
 
 
 # =====================================================================
@@ -251,7 +161,7 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
     private   │ MUTUAL_FOLLOW_FRIENDS │ private   │ private   │ SELF
 
     TikTok notes:
-      - public   → PUBLIC_TO_EVERYONE when TIKTOK_APP_AUDITED (default); else SELF_ONLY for sandbox
+      - public   → PUBLIC_TO_EVERYONE (visible to everyone)
       - unlisted → SELF_ONLY ("Only You" — what we use for pre-approval uploads)
       - private  → MUTUAL_FOLLOW_FRIENDS (friends / mutual followers)
 
@@ -267,9 +177,6 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
         level = "public"
 
     if platform == "tiktok":
-        # Sandbox / unaudited apps cannot use PUBLIC_TO_EVERYONE (unaudited_client_can_only_post_to_private_accounts).
-        if not TIKTOK_APP_AUDITED and level == "public":
-            return "SELF_ONLY"
         return {
             "public":   "PUBLIC_TO_EVERYONE",
             "unlisted": "SELF_ONLY",              # "Only You" — safe for pre-approval testing
@@ -328,8 +235,8 @@ def init_enc_keys():
             raw = base64.b64decode(b64key.strip())
             if len(raw) == 32:
                 _ENC_KEYS[kid.strip()] = raw
-        except (binascii.Error, TypeError, ValueError) as e:
-            logger.debug("Skipping invalid TOKEN_ENC_KEYS entry for kid=%r: %s", kid, e)
+        except Exception:
+            pass
 
 
 def decrypt_token_blob(blob: Any) -> dict:
@@ -374,14 +281,12 @@ def decrypt_token(token_row: Any) -> Optional[dict]:
         if "ciphertext" in token_row and "nonce" in token_row:
             try:
                 return decrypt_token_blob(token_row)
-            except _TOKEN_PARSE_ERRORS as e:
-                logger.debug("Token decrypt failed: %s", e)
+            except Exception:
                 return None
 
         # Already plaintext token dict
         return token_row
-    except _TOKEN_PARSE_ERRORS as e:
-        logger.debug("Token parse failed: %s", e)
+    except Exception:
         return None
 
 
@@ -389,17 +294,9 @@ def decrypt_token(token_row: Any) -> Optional[dict]:
 # Content Derivation
 # =====================================================================
 
-def _get_title(ctx: JobContext, platform: str = "") -> str:
-    """Get the best available title for publishing (optional per-platform override)."""
-    if hasattr(ctx, "get_effective_title"):
-        return ctx.get_effective_title(platform) or (
-            getattr(ctx, "ai_title", None)
-            or getattr(ctx, "title", None)
-            or getattr(ctx, "video_title", None)
-            or getattr(ctx, "name", None)
-            or f"UploadM8 {getattr(ctx, 'upload_id', '')}".strip()
-        )
-    return (
+def _get_title(ctx: JobContext) -> str:
+    """Get the best available title for publishing."""
+    return ctx.get_effective_title() if hasattr(ctx, "get_effective_title") else (
         getattr(ctx, "ai_title", None)
         or getattr(ctx, "title", None)
         or getattr(ctx, "video_title", None)
@@ -408,34 +305,14 @@ def _get_title(ctx: JobContext, platform: str = "") -> str:
     )
 
 
-def _get_caption(ctx: JobContext, platform: str = "") -> str:
-    """Get the best available caption/description (optional per-platform override)."""
-    if hasattr(ctx, "get_effective_caption"):
-        return ctx.get_effective_caption(platform) or ""
-    return (
+def _get_caption(ctx: JobContext) -> str:
+    """Get the best available caption/description for publishing."""
+    return ctx.get_effective_caption() if hasattr(ctx, "get_effective_caption") else (
         getattr(ctx, "ai_caption", None)
         or getattr(ctx, "caption", None)
         or getattr(ctx, "description", None)
         or ""
     )
-
-
-def _tiktok_post_title(ctx: JobContext) -> str:
-    """Build TikTok Content Posting `post_info.title` (max 150 chars).
-
-    The API exposes a single title field. We must not use ``(hook_title or caption)``
-    because a non-empty upload title would skip ``_build_platform_caption`` entirely,
-    dropping platform-specific / always / merged hashtags.
-    """
-    body = _build_platform_caption(ctx, "tiktok").strip()
-    hook = (_get_title(ctx, "tiktok") or "").strip()
-    if body:
-        if hook and not body.lower().startswith(hook.lower()):
-            merged = f"{hook}\n\n{body}".strip()
-        else:
-            merged = body
-        return merged[:150]
-    return hook[:150]
 
 
 def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
@@ -464,9 +341,7 @@ def _build_platform_caption(ctx: JobContext, platform: str) -> str:
     Includes platform-specific hashtags from user_settings.
     Respects the user's hashtag_position preference (start / end).
     """
-    caption = _get_caption(ctx, platform)
-    if not caption:
-        caption = _fallback_caption_from_context(ctx, platform)
+    caption = _get_caption(ctx)
     hashtags = _get_hashtags(ctx, platform=platform)
 
     if not hashtags:
@@ -485,70 +360,17 @@ def _build_platform_caption(ctx: JobContext, platform: str) -> str:
         ).lower()
         if hashtag_position not in ("start", "end"):
             hashtag_position = "end"
-    except (AttributeError, TypeError, KeyError, ValueError) as e:
-        logger.debug("Could not resolve hashtag position from user settings: %s", e)
+    except Exception:
+        pass
 
     if hashtag_position == "start":
         return f"{hashtags}\n\n{caption}"
     return f"{caption}\n\n{hashtags}"
 
 
-def _fallback_caption_from_context(ctx: JobContext, platform: str) -> str:
-    """
-    Deterministic fallback when AI/manual caption is empty.
-    Keeps publish stage grounded in multimodal evidence (geo/audio/vision).
-    """
-    ac = getattr(ctx, "audio_context", None) or {}
-    vc = getattr(ctx, "vision_context", None) or {}
-    tel = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
-
-    parts: list[str] = []
-    if getattr(ctx, "location_name", None):
-        parts.append(f"Shot near {ctx.location_name}")
-    if tel and getattr(tel, "location_road", None):
-        parts.append(f"route: {tel.location_road}")
-    if tel and getattr(tel, "max_speed_mph", 0):
-        parts.append(f"peak {float(getattr(tel, 'max_speed_mph', 0)):.0f} mph")
-
-    labels = list(vc.get("label_names") or [])
-    if labels:
-        parts.append("scene: " + ", ".join(str(x) for x in labels[:4]))
-
-    if ac.get("music_detected") and (ac.get("music_title") or ac.get("music_artist")):
-        mt = ac.get("music_title") or ""
-        ma = ac.get("music_artist") or ""
-        parts.append(f"soundtrack: {mt} {('- ' + ma) if ma else ''}".strip())
-    elif ac.get("top_sound_class"):
-        parts.append(f"audio vibe: {ac.get('top_sound_class')}")
-
-    if parts:
-        base = " | ".join(p for p in parts if p).strip()
-        return _format_platform_fallback_caption(base[:600], platform)
-
-    # Last resort: compact multimodal digest line
-    digest = (build_multimodal_scene_digest(ctx, max_chars=600) or "").strip()
-    if digest:
-        return _format_platform_fallback_caption(digest.replace("\n", " | ")[:600], platform)
-    return ""
-
-
-def _format_platform_fallback_caption(base: str, platform: str) -> str:
-    """Platform-native stylistic wrapper for deterministic fallback text."""
-    txt = (base or "").strip().strip("|")
-    if not txt:
-        return ""
-
-    p = (platform or "").lower()
-    if p == "tiktok":
-        # Hook-first short style
-        return f"POV: {txt}"[:600]
-    if p == "youtube":
-        # Description-style sentence framing
-        return f"Scene breakdown: {txt}"[:1200]
-    if p in ("instagram", "facebook"):
-        # Slightly aesthetic/social phrasing
-        return f"{txt} | captured in the moment."[:700]
-    return txt[:600]
+def _build_full_caption(ctx: JobContext) -> str:
+    """Backward-compat alias — no platform-specific hashtags."""
+    return _build_platform_caption(ctx, platform="")
 
 
 def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
@@ -563,9 +385,12 @@ def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
     r2_key = None
 
     # Try from output_artifacts stored during upload stage
-    assets_json = ctx.output_artifacts.get("processed_assets", "{}")
-    assets = json_dict(assets_json, default={}, context="processed_assets")
-    r2_key = assets.get(platform)
+    try:
+        assets_json = ctx.output_artifacts.get("processed_assets", "{}")
+        assets = json.loads(assets_json) if isinstance(assets_json, str) else assets_json
+        r2_key = assets.get(platform)
+    except Exception:
+        pass
 
     # Fallback: construct expected key
     if not r2_key:
@@ -579,8 +404,8 @@ def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
     # Fall back to presigned URL (always works)
     try:
         return r2_stage.generate_presigned_url(r2_key, expires=PRESIGNED_URL_EXPIRY)
-    except (_R2BotoCoreError, _R2ClientError, OSError, TypeError, ValueError, RuntimeError) as e:
-        logger.warning("Could not generate presigned URL for %s: %s", platform, e)
+    except Exception as e:
+        logger.warning(f"Could not generate presigned URL for {platform}: {e}")
         return None
 
 
@@ -589,16 +414,14 @@ def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
 # =====================================================================
 
 
-async def _refresh_tiktok_token(
-    token_data: dict, db_pool=None, user_id: str = None, token_row_id: Optional[str] = None
-) -> dict:
+async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = None) -> dict:
     """Refresh a TikTok access token using the stored refresh_token.
     TikTok access tokens expire after 24 hours; refresh tokens after 365 days.
     Persists the new token blob to DB if db_pool and user_id are provided.
     """
     refresh_token = token_data.get("refresh_token")
     if not refresh_token:
-        logger.warning("TikTok: No refresh_token stored, cannot refresh - user must reconnect")
+        logger.warning("TikTok: No refresh_token stored, cannot refresh — user must reconnect")
         return token_data
 
     client_key = os.environ.get("TIKTOK_CLIENT_KEY", "")
@@ -609,65 +432,55 @@ async def _refresh_tiktok_token(
         return token_data
 
     try:
-        async with outbound_slot("tiktok"):
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    "https://open.tiktokapis.com/v2/oauth/token/",
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    data={
-                        "client_key": client_key,
-                        "client_secret": client_secret,
-                        "grant_type": "refresh_token",
-                        "refresh_token": refresh_token,
-                    },
-                )
-                if resp.status_code == 200:
-                    new_tokens = resp.json()
-                    logger.info("TikTok: Token refreshed successfully")
-                    new_access  = new_tokens.get("access_token", token_data["access_token"])
-                    new_refresh = new_tokens.get("refresh_token", refresh_token)
-                    new_open_id = new_tokens.get("open_id") or token_data.get("open_id")
-                    updated = {
-                        **token_data,
-                        "access_token":  new_access,
-                        "refresh_token": new_refresh,
-                        "expires_at":    new_tokens.get("expires_in"),
-                    }
-                    if new_open_id:
-                        updated["open_id"] = new_open_id
-                    # Persist back to DB so future jobs use the fresh token
-                    if db_pool and user_id:
-                        try:
-                            await db_stage.save_refreshed_token(
-                                db_pool,
-                                user_id=user_id,
-                                platform="tiktok",
-                                access_token=new_access,
-                                refresh_token=new_refresh,
-                                open_id=new_open_id,
-                                token_row_id=token_row_id,
-                            )
-                        except _DB_PERSIST_ERRS as save_err:
-                            logger.warning("TikTok: Failed to persist refreshed token: %s", save_err)
-                    return updated
-                else:
-                    logger.warning(f"TikTok: Token refresh failed: {resp.status_code} {resp.text[:200]}")
-                    return token_data
-    except asyncio.CancelledError:
-        raise
-    except _PUBLISH_HTTP_JSON_ERRS as e:
-        logger.warning("TikTok: Token refresh exception: %s", e)
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://open.tiktokapis.com/v2/oauth/token/",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "client_key": client_key,
+                    "client_secret": client_secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+            )
+            if resp.status_code == 200:
+                new_tokens = resp.json()
+                logger.info("TikTok: Token refreshed successfully")
+                new_access  = new_tokens.get("access_token", token_data["access_token"])
+                new_refresh = new_tokens.get("refresh_token", refresh_token)
+                new_open_id = new_tokens.get("open_id") or token_data.get("open_id")
+                updated = {
+                    **token_data,
+                    "access_token":  new_access,
+                    "refresh_token": new_refresh,
+                    "expires_at":    new_tokens.get("expires_in"),
+                }
+                if new_open_id:
+                    updated["open_id"] = new_open_id
+                # Persist back to DB so future jobs use the fresh token
+                if db_pool and user_id:
+                    try:
+                        await db_stage.save_refreshed_token(
+                            db_pool,
+                            user_id=user_id,
+                            platform="tiktok",
+                            access_token=new_access,
+                            refresh_token=new_refresh,
+                            open_id=new_open_id,
+                        )
+                    except Exception as save_err:
+                        logger.warning(f"TikTok: Failed to persist refreshed token: {save_err}")
+                return updated
+            else:
+                logger.warning(f"TikTok: Token refresh failed: {resp.status_code} {resp.text[:200]}")
+                return token_data
+    except Exception as e:
+        logger.warning(f"TikTok: Token refresh exception: {e}")
         return token_data
 
 
 
-async def _refresh_meta_token(
-    token_data: dict,
-    platform: str,
-    db_pool=None,
-    user_id: str = None,
-    token_row_id: Optional[str] = None,
-) -> dict:
+async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, user_id: str = None) -> dict:
     """Refresh a Meta (Instagram/Facebook) Page access token.
     
     Meta Page tokens obtained via /me/accounts are long-lived (~60 days).
@@ -689,159 +502,164 @@ async def _refresh_meta_token(
         return token_data
 
     try:
-        async with outbound_slot("meta"):
-            async with httpx.AsyncClient(timeout=30) as client:
-                # Step 1: Exchange current token for a fresh long-lived user token
-                exchange_resp = await client.get(
-                    "https://graph.facebook.com/v18.0/oauth/access_token",
-                    params={
-                        "grant_type": "fb_exchange_token",
-                        "client_id": app_id,
-                        "client_secret": app_secret,
-                        "fb_exchange_token": access_token,
-                    },
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Step 1: Exchange current token for a fresh long-lived user token
+            exchange_resp = await client.get(
+                "https://graph.facebook.com/v18.0/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": app_id,
+                    "client_secret": app_secret,
+                    "fb_exchange_token": access_token,
+                },
+            )
+            if exchange_resp.status_code != 200:
+                logger.warning(
+                    f"{platform}: Meta token exchange failed: "
+                    f"{exchange_resp.status_code} {exchange_resp.text[:200]}"
                 )
-                if exchange_resp.status_code != 200:
-                    logger.warning(
-                        f"{platform}: Meta token exchange failed: "
-                        f"{exchange_resp.status_code} {exchange_resp.text[:200]}"
-                    )
-                    return token_data
-    
-                new_user_token = exchange_resp.json().get("access_token")
-                if not new_user_token:
-                    logger.warning(f"{platform}: Meta exchange returned no access_token")
-                    return token_data
-    
-                logger.info(f"{platform}: Meta user token refreshed successfully")
-    
-                # Step 2: For Instagram/Facebook Page tokens, re-fetch the Page token
-                # Page tokens derived from a long-lived user token do not expire,
-                # so re-fetching gives us a stable non-expiring page token.
-                page_id = token_data.get("page_id") or token_data.get("ig_user_id")
-    
-                if platform == "facebook" and page_id:
-                    pages_resp = await client.get(
-                        "https://graph.facebook.com/v18.0/me/accounts",
-                        params={"access_token": new_user_token, "fields": "id,access_token"},
-                    )
-                    if pages_resp.status_code == 200:
-                        pages = pages_resp.json().get("data", [])
-                        matching = next((p for p in pages if p.get("id") == str(page_id)), None)
-                        if matching:
-                            new_page_token = matching.get("access_token", new_user_token)
-                            updated = {
-                                **token_data,
-                                "access_token": new_page_token,
-                                "expires_at": None,
-                            }
-                            if db_pool and user_id:
-                                try:
-                                    await db_stage.save_refreshed_token(
-                                        db_pool,
-                                        user_id=user_id,
-                                        platform=platform,
-                                        access_token=new_page_token,
-                                        extra_fields={"page_id": str(page_id)},
-                                        token_row_id=token_row_id,
-                                    )
-                                except _DB_PERSIST_ERRS as save_err:
-                                    logger.warning("%s: Failed to persist refreshed token: %s", platform, save_err)
-                            return updated
-    
-                # ── Refresh page token for Instagram and Facebook ───────────────
-                # Instagram Insights API requires a PAGE token (not user token).
-                # Always fetch /me/accounts to get fresh page tokens for both
-                # platforms — even when ig_user_id / page_id are already known.
+                return token_data
+
+            new_user_token = exchange_resp.json().get("access_token")
+            if not new_user_token:
+                logger.warning(f"{platform}: Meta exchange returned no access_token")
+                return token_data
+
+            logger.info(f"{platform}: Meta user token refreshed successfully")
+
+            # Step 2: For Instagram/Facebook Page tokens, re-fetch the Page token
+            # Page tokens derived from a long-lived user token do not expire,
+            # so re-fetching gives us a stable non-expiring page token.
+            page_id = token_data.get("page_id") or token_data.get("ig_user_id")
+
+            if platform == "facebook" and page_id:
                 pages_resp = await client.get(
                     "https://graph.facebook.com/v18.0/me/accounts",
-                    params={"access_token": new_user_token, "fields": "id,name,access_token"},
+                    params={"access_token": new_user_token, "fields": "id,access_token"},
                 )
-    
-                recovered_ig_user_id = token_data.get("ig_user_id") or token_data.get("instagram_user_id")
-                recovered_page_id    = token_data.get("page_id") or token_data.get("facebook_page_id")
-                recovered_page_token = new_user_token  # fallback
-
                 if pages_resp.status_code == 200:
                     pages = pages_resp.json().get("data", [])
+                    matching = next((p for p in pages if p.get("id") == page_id), None)
+                    if matching:
+                        new_page_token = matching.get("access_token", new_user_token)
+                        updated = {
+                            **token_data,
+                            "access_token": new_page_token,
+                            "expires_at": None,  # Page tokens from LLT don't expire
+                        }
+                        if db_pool and user_id:
+                            try:
+                                await db_stage.save_refreshed_token(
+                                    db_pool,
+                                    user_id=user_id,
+                                    platform=platform,
+                                    access_token=new_page_token,
+                                )
+                            except Exception as save_err:
+                                logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
+                        return updated
 
-                    if platform == "instagram":
-                        # Find the page whose instagram_business_account matches ig_user_id
-                        for page in pages:
-                            page_id_tmp    = page.get("id")
-                            page_token_tmp = page.get("access_token", new_user_token)
-                            if not page_id_tmp:
-                                continue
-                            ig_resp = await client.get(
-                                f"https://graph.facebook.com/v18.0/{page_id_tmp}",
-                                params={
-                                    "access_token": page_token_tmp,
-                                    "fields": "instagram_business_account",
-                                },
-                            )
-                            if ig_resp.status_code == 200:
-                                ig_biz = ig_resp.json().get("instagram_business_account")
-                                if ig_biz and ig_biz.get("id"):
-                                    found_ig_id = ig_biz["id"]
-                                    if not recovered_ig_user_id or found_ig_id == str(recovered_ig_user_id):
-                                        recovered_ig_user_id = found_ig_id
-                                        recovered_page_token = page_token_tmp
-                                        logger.info(
-                                            f"instagram: Refreshed page token for ig_user_id={recovered_ig_user_id} "
-                                            f"via Page '{page.get('name', '?')}'"
-                                        )
-                                        break
+            # ── Recover missing ig_user_id / page_id ────────────────────────
+            # Old tokens stored before the OAuth fix may lack these IDs.
+            # Now that we have a fresh user token we can fetch them on the fly
+            # so the publish succeeds without forcing the user to reconnect.
+            # Step 1: Fetch user's Pages — id, name, page access_token only.
+            # instagram_business_account is NOT a valid inline field on /me/accounts;
+            # it must be fetched per-page via /{page_id}?fields=instagram_business_account
+            pages_resp = await client.get(
+                "https://graph.facebook.com/v18.0/me/accounts",
+                params={"access_token": new_user_token, "fields": "id,name,access_token"},
+            )
 
-                    if platform == "facebook":
-                        if recovered_page_id:
-                            matching = next((p for p in pages if p.get("id") == str(recovered_page_id)), None)
-                            if matching:
-                                recovered_page_token = matching.get("access_token", new_user_token)
-                        elif pages:
-                            first = pages[0]
-                            recovered_page_id    = first["id"]
-                            recovered_page_token = first.get("access_token", new_user_token)
-                            logger.info(
-                                f"facebook: Recovered page_id={recovered_page_id} "
-                                f"from Page '{first.get('name', '?')}' during token refresh"
-                            )
+            recovered_ig_user_id = token_data.get("ig_user_id") or token_data.get("instagram_user_id")
+            recovered_page_id    = token_data.get("page_id") or token_data.get("facebook_page_id")
+            recovered_page_token = new_user_token  # fallback
 
-                # Both platforms always use the page token (not user token)
-                updated = {
-                    **token_data,
-                    "access_token": recovered_page_token,
-                    "expires_at":   None,
-                }
-                if platform == "instagram" and recovered_ig_user_id:
-                    updated["ig_user_id"] = recovered_ig_user_id
-                if platform == "facebook" and recovered_page_id:
-                    updated["page_id"] = recovered_page_id
+            if pages_resp.status_code == 200:
+                pages = pages_resp.json().get("data", [])
 
-                if db_pool and user_id:
-                    try:
-                        extra = {}
-                        if platform == "instagram" and recovered_ig_user_id:
-                            extra["ig_user_id"] = str(recovered_ig_user_id)
-                        if platform == "facebook" and recovered_page_id:
-                            extra["page_id"] = str(recovered_page_id)
-                        await db_stage.save_refreshed_token(
-                            db_pool,
-                            user_id=user_id,
-                            platform=platform,
-                            access_token=updated["access_token"],
-                            extra_fields=extra or None,
-                            token_row_id=token_row_id,
+                if platform == "instagram" and not recovered_ig_user_id:
+                    # instagram_business_account must be fetched per-page
+                    for page in pages:
+                        page_id_tmp    = page.get("id")
+                        page_token_tmp = page.get("access_token", new_user_token)
+                        if not page_id_tmp:
+                            continue
+                        ig_resp = await client.get(
+                            f"https://graph.facebook.com/v18.0/{page_id_tmp}",
+                            params={
+                                "access_token": page_token_tmp,
+                                "fields": "instagram_business_account",
+                            },
                         )
-                    except _DB_PERSIST_ERRS as save_err:
-                        logger.warning("%s: Failed to persist refreshed token: %s", platform, save_err)
-                return updated
-    
-    except asyncio.CancelledError:
-        raise
-    except _PUBLISH_HTTP_JSON_ERRS as e:
-        logger.warning("%s: Meta token refresh exception: %s", platform, e)
+                        if ig_resp.status_code == 200:
+                            ig_biz = ig_resp.json().get("instagram_business_account")
+                            if ig_biz and ig_biz.get("id"):
+                                recovered_ig_user_id = ig_biz["id"]
+                                recovered_page_token = page_token_tmp
+                                logger.info(
+                                    f"instagram: Recovered ig_user_id={recovered_ig_user_id} "
+                                    f"from Page '{page.get('name', '?')}' during token refresh"
+                                )
+                                break
+
+                if platform == "facebook" and not recovered_page_id and pages:
+                    first = pages[0]
+                    recovered_page_id    = first["id"]
+                    recovered_page_token = first.get("access_token", new_user_token)
+                    logger.info(
+                        f"facebook: Recovered page_id={recovered_page_id} "
+                        f"from Page '{first.get('name', '?')}' during token refresh"
+                    )
+
+            # Build updated blob — preserve any existing IDs, override with recovered ones
+            updated = {
+                **token_data,
+                "access_token":  recovered_page_token if platform == "instagram" else new_user_token,
+                "expires_at":    None,
+            }
+            if platform == "instagram" and recovered_ig_user_id:
+                updated["ig_user_id"] = recovered_ig_user_id
+            if platform == "facebook" and recovered_page_id:
+                updated["page_id"]    = recovered_page_id
+                updated["access_token"] = recovered_page_token
+
+            if db_pool and user_id:
+                try:
+                    await db_stage.save_refreshed_token(
+                        db_pool,
+                        user_id=user_id,
+                        platform=platform,
+                        access_token=updated["access_token"],
+                    )
+                except Exception as save_err:
+                    logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
+            return updated
+
+    except Exception as e:
+        logger.warning(f"{platform}: Meta token refresh exception: {e}")
         return token_data
 
+
+
+def _instagram_media_id_to_shortcode(media_id: str) -> Optional[str]:
+    """
+    Convert an Instagram numeric media_id to its public shortcode.
+    Instagram shortcodes are base62 encoded from the lower 64 bits of
+    the media_id (specifically the portion after stripping the shard ID).
+    Used to construct valid instagram.com/reel/{shortcode}/ URLs.
+    """
+    ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    try:
+        n = int(media_id.split("_")[0])  # strip user_id suffix if present
+        # Instagram shortcode = base62 encoding of media_id
+        result = []
+        while n > 0:
+            result.append(ALPHABET[n % 62])
+            n //= 62
+        return "".join(reversed(result)) if result else None
+    except Exception:
+        return None
 
 
 async def publish_to_tiktok(
@@ -866,8 +684,10 @@ async def publish_to_tiktok(
             error_message="No access token"
         )
 
-    # Single title field: include caption + hashtag merge (platform / always / AI)
-    tiktok_title = _tiktok_post_title(ctx)
+    title = _get_title(ctx)
+    caption = _build_platform_caption(ctx, "tiktok")
+    # TikTok uses title field (max 150 chars), caption goes in description
+    tiktok_title = (caption or title)[:150]
 
     try:
         file_size = video_path.stat().st_size
@@ -909,111 +729,38 @@ async def publish_to_tiktok(
             # Safety clamp — chunk_size must be in [5 MB, 64 MB]
             chunk_size = max(_5MB, min(_64MB, chunk_size))
 
-        requested_privacy = getattr(ctx, "privacy", None) or "public"
-        privacy_level = resolve_privacy_level(requested_privacy, "tiktok")
-        attempted_creator_only_retry = False
-
         async with httpx.AsyncClient(timeout=120) as client:
             # Step 1: Initialize upload
             init_resp = await client.post(
                 "https://open.tiktokapis.com/v2/post/publish/video/init/",
                 headers={
                     "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json; charset=UTF-8",
+                    "Content-Type": "application/json; charset=UTF-8"
                 },
                 json={
                     "post_info": {
                         "title": tiktok_title,
-                        "privacy_level": privacy_level,
+                        "privacy_level": resolve_privacy_level(
+                            getattr(ctx, "privacy", None) or "public",
+                            "tiktok",
+                        ),
                     },
                     "source_info": {
                         "source": "FILE_UPLOAD",
                         "video_size": file_size,
                         "chunk_size": chunk_size,
                         "total_chunk_count": total_chunk_count,
-                    },
-                },
+                    }
+                }
             )
 
             if init_resp.status_code != 200:
-                err_snippet = (init_resp.text or "")[:800]
-                code: Any = None
-                api_message = ""
-                log_id = None
-                try:
-                    ej = init_resp.json()
-                    err = ej.get("error") or {}
-                    if isinstance(err, dict):
-                        code = err.get("code")
-                        api_message = str(err.get("message") or "")
-                        log_id = err.get("log_id")
-                except (json.JSONDecodeError, TypeError, ValueError, KeyError) as e:
-                    logger.debug("publish_stage.tiktok: non-JSON error body (status=%s): %s", init_resp.status_code, e)
-
-                orig_detail = (api_message.strip() or err_snippet)[:500]
-                suggest_creator_only = _tiktok_error_suggests_creator_only_fallback(
-                    code, api_message, err_snippet
-                )
-                if suggest_creator_only:
-                    bits = [orig_detail]
-                    if log_id:
-                        bits.append(f"log_id={log_id}")
-                    err_txt = (
-                        "TikTok rejected public posting. Common causes even after portal approval: "
-                        "using Sandbox Client Key/Secret instead of production, stale OAuth tokens "
-                        "(disconnect and reconnect TikTok), or Content Posting not Live for this app. "
-                        "Verify production credentials match TIKTOK_CLIENT_KEY/SECRET, portal "
-                        "Products → Content Posting API shows Live, and TIKTOK_APP_AUDITED is not "
-                        "false in server env (default is true). Or set TIKTOK_APP_AUDITED=false to "
-                        "post creator-only until "
-                        "TikTok accepts PUBLIC_TO_EVERYONE. Details: "
-                        + " | ".join(bits)
-                    )
-                else:
-                    err_txt = orig_detail
-
-                # Retry init with SELF_ONLY when TikTok disallows public posting for this client.
-                if (
-                    (not attempted_creator_only_retry)
-                    and suggest_creator_only
-                    and str(privacy_level).upper() == "PUBLIC_TO_EVERYONE"
-                ):
-                    attempted_creator_only_retry = True
-                    creator_only_level = resolve_privacy_level("unlisted", "tiktok")  # SELF_ONLY
-                    logger.info(
-                        "TikTok unaudited public rejection detected; retrying init with SELF_ONLY "
-                        f"(requested_privacy={requested_privacy}, privacy_level={privacy_level}, retry_privacy={creator_only_level})"
-                    )
-                    init_resp2 = await client.post(
-                        "https://open.tiktokapis.com/v2/post/publish/video/init/",
-                        headers={
-                            "Authorization": f"Bearer {access_token}",
-                            "Content-Type": "application/json; charset=UTF-8",
-                        },
-                        json={
-                            "post_info": {
-                                "title": tiktok_title,
-                                "privacy_level": creator_only_level,
-                            },
-                            "source_info": {
-                                "source": "FILE_UPLOAD",
-                                "video_size": file_size,
-                                "chunk_size": chunk_size,
-                                "total_chunk_count": total_chunk_count,
-                            },
-                        },
-                    )
-                    if init_resp2.status_code == 200:
-                        init_resp = init_resp2
-                    else:
-                        err_txt = (init_resp2.text[:500] or err_txt)[:500]
-
                 return PlatformResult(
                     platform="tiktok",
                     success=False,
                     http_status=init_resp.status_code,
                     error_code="INIT_FAILED",
-                    error_message=f"Init failed: {err_txt}",
+                    error_message=f"Init failed: {init_resp.text[:200]}"
                 )
 
             init_data = init_resp.json().get("data", {})
@@ -1065,21 +812,17 @@ async def publish_to_tiktok(
                 verify_status="pending",
             )
 
-    except asyncio.CancelledError:
-        raise
-    except _PUBLISH_FILE_HTTP_ERRS as e:
-        logger.error("TikTok publish error: %s", e)
+    except Exception as e:
+        logger.error(f"TikTok publish error: {e}")
         return PlatformResult(
             platform="tiktok",
             success=False,
             error_code="PUBLISH_EXCEPTION",
-            error_message=str(e),
+            error_message=str(e)
         )
 
 
-async def _refresh_youtube_token(
-    token_data: dict, db_pool=None, user_id: str = None, token_row_id: Optional[str] = None
-) -> dict:
+async def _refresh_youtube_token(token_data: dict, db_pool=None, user_id: str = None) -> dict:
     """Attempt to refresh a YouTube access token using the stored refresh_token.
     Returns updated token_data dict with new access_token, or original if refresh fails.
     Persists updated token to DB if db_pool and user_id are provided.
@@ -1122,18 +865,15 @@ async def _refresh_youtube_token(
                             user_id=user_id,
                             platform="youtube",
                             access_token=new_access,
-                            token_row_id=token_row_id,
                         )
-                    except _DB_PERSIST_ERRS as save_err:
-                        logger.warning("YouTube: Failed to persist refreshed token: %s", save_err)
+                    except Exception as save_err:
+                        logger.warning(f"YouTube: Failed to persist refreshed token: {save_err}")
                 return updated
             else:
                 logger.warning(f"YouTube: Token refresh failed: {resp.status_code} {resp.text[:200]}")
                 return token_data
-    except asyncio.CancelledError:
-        raise
-    except _PUBLISH_HTTP_JSON_ERRS as e:
-        logger.warning("YouTube: Token refresh exception: %s", e)
+    except Exception as e:
+        logger.warning(f"YouTube: Token refresh exception: {e}")
         return token_data
 
 
@@ -1159,7 +899,7 @@ async def publish_to_youtube(
             error_message="No access token"
         )
 
-    title = _get_title(ctx, "youtube")[:100]
+    title = _get_title(ctx)[:100]
     caption = _build_platform_caption(ctx, "youtube")
     description = caption[:5000] if caption else ""
 
@@ -1248,15 +988,13 @@ async def publish_to_youtube(
                 verify_status="pending",
             )
 
-    except asyncio.CancelledError:
-        raise
-    except _PUBLISH_FILE_HTTP_ERRS as e:
-        logger.error("YouTube publish error: %s", e)
+    except Exception as e:
+        logger.error(f"YouTube publish error: {e}")
         return PlatformResult(
             platform="youtube",
             success=False,
             error_code="PUBLISH_EXCEPTION",
-            error_message=str(e),
+            error_message=str(e)
         )
 
 
@@ -1311,15 +1049,6 @@ async def publish_to_instagram(
             error_message="No Instagram user ID found in token data. Connect Instagram Business account."
         )
 
-    _scope_msg = require_instagram_publish(token_data)
-    if _scope_msg:
-        return PlatformResult(
-            platform="instagram",
-            success=False,
-            error_code="META_SCOPE_MISSING",
-            error_message=_scope_msg,
-        )
-
     # Instagram Graph API requires a public URL - cannot upload binary directly
     if not video_url:
         video_url = _get_video_public_url(ctx, "instagram")
@@ -1350,8 +1079,11 @@ async def publish_to_instagram(
             # Prefer platform-specific 9:16 thumbnail when available (styled thumbnails).
             thumb_r2_key = None
             pt_json = ctx.output_artifacts.get("platform_thumbnail_r2_keys", "{}")
-            pt_keys = json_dict(pt_json, default={}, context="platform_thumbnail_r2_keys")
-            thumb_r2_key = pt_keys.get("instagram")
+            try:
+                pt_keys = json.loads(pt_json) if isinstance(pt_json, str) else (pt_json or {})
+                thumb_r2_key = pt_keys.get("instagram")
+            except Exception:
+                pass
             thumb_r2_key = thumb_r2_key or getattr(ctx, "thumbnail_r2_key", None)
             if thumb_r2_key:
                 try:
@@ -1359,8 +1091,8 @@ async def publish_to_instagram(
                     thumb_cover_url = _r2.generate_presigned_url(thumb_r2_key, expires=3600)
                     ig_params["cover_url"] = thumb_cover_url
                     logger.info(f"Instagram: cover_url set from R2 thumbnail")
-                except (_R2BotoCoreError, _R2ClientError, OSError, TypeError, ValueError, RuntimeError) as _e:
-                    logger.warning("Instagram: could not set cover_url: %s", _e)
+                except Exception as _e:
+                    logger.warning(f"Instagram: could not set cover_url: {_e}")
             create_resp = await client.post(
                 f"https://graph.facebook.com/{META_API_VERSION}/{ig_user_id}/media",
                 params=ig_params
@@ -1462,38 +1194,10 @@ async def publish_to_instagram(
                 )
 
             media_id = publish_resp.json().get("id")
-            # Public shortcode URLs are NOT derivable from media_id locally — fetch permalink from Graph.
-            platform_url = None
-            perm_status = None
-            if media_id:
-                perm_resp = await client.get(
-                    f"https://graph.facebook.com/{META_API_VERSION}/{media_id}",
-                    params={
-                        "access_token": access_token,
-                        "fields": "permalink,shortcode",
-                    },
-                )
-                perm_status = perm_resp.status_code
-                if perm_resp.status_code == 200:
-                    md = perm_resp.json() or {}
-                    platform_url = md.get("permalink")
-                    sc = md.get("shortcode")
-                    if not platform_url and sc:
-                        platform_url = f"https://www.instagram.com/p/{sc}/"
-                else:
-                    logger.warning(
-                        "Instagram: permalink lookup failed media_id=%s status=%s body=%s",
-                        media_id,
-                        perm_resp.status_code,
-                        (perm_resp.text or "")[:400],
-                    )
-
-            if not platform_url and media_id:
-                logger.warning(
-                    "Instagram: no permalink after publish (media_id=%s perm_status=%s)",
-                    media_id,
-                    perm_status,
-                )
+            # Build Instagram URL using shortcode (base62 of media_id)
+            # instagram.com/reel/{numeric_id} doesn't work — must use shortcode
+            ig_shortcode = _instagram_media_id_to_shortcode(str(media_id)) if media_id else None
+            platform_url = f"https://www.instagram.com/reel/{ig_shortcode}/" if ig_shortcode else None
 
             logger.info(f"Instagram publish accepted: media_id={media_id}")
             return PlatformResult(
@@ -1505,22 +1209,20 @@ async def publish_to_instagram(
                 verify_status="pending",
             )
 
-    except asyncio.CancelledError:
-        raise
     except httpx.TimeoutException:
         return PlatformResult(
             platform="instagram",
             success=False,
             error_code="TIMEOUT",
-            error_message="Instagram API request timed out",
+            error_message="Instagram API request timed out"
         )
-    except _PUBLISH_FILE_HTTP_ERRS as e:
-        logger.error("Instagram publish error: %s", e)
+    except Exception as e:
+        logger.error(f"Instagram publish error: {e}")
         return PlatformResult(
             platform="instagram",
             success=False,
             error_code="PUBLISH_EXCEPTION",
-            error_message=str(e),
+            error_message=str(e)
         )
 
 
@@ -1565,15 +1267,6 @@ async def publish_to_facebook(
             success=False,
             error_code="NO_PAGE_ID",
             error_message="No Facebook page ID found in token data"
-        )
-
-    _fb_scope = require_facebook_publish(token_data)
-    if _fb_scope:
-        return PlatformResult(
-            platform="facebook",
-            success=False,
-            error_code="META_SCOPE_MISSING",
-            error_message=_fb_scope,
         )
 
     description = _build_platform_caption(ctx, "facebook")
@@ -1625,19 +1318,7 @@ async def publish_to_facebook(
                 )
 
             video_id = resp.json().get("id")
-            platform_url = None
-            if video_id:
-                perm_resp = await client.get(
-                    f"https://graph.facebook.com/{META_API_VERSION}/{video_id}",
-                    params={
-                        "access_token": access_token,
-                        "fields": "permalink_url",
-                    },
-                )
-                if perm_resp.status_code == 200:
-                    platform_url = (perm_resp.json() or {}).get("permalink_url")
-                if not platform_url:
-                    platform_url = f"https://www.facebook.com/watch/?v={video_id}"
+            platform_url = f"https://www.facebook.com/video/{video_id}" if video_id else None
             logger.info(f"Facebook publish accepted: video_id={video_id}, url={platform_url}")
             # Push thumbnail to Facebook (non-fatal)
             thumb_path = _get_platform_thumbnail_path(ctx, "facebook")
@@ -1653,22 +1334,20 @@ async def publish_to_facebook(
                 verify_status="pending",
             )
 
-    except asyncio.CancelledError:
-        raise
     except httpx.TimeoutException:
         return PlatformResult(
             platform="facebook",
             success=False,
             error_code="TIMEOUT",
-            error_message="Facebook API request timed out",
+            error_message="Facebook API request timed out"
         )
-    except _PUBLISH_FILE_HTTP_ERRS as e:
-        logger.error("Facebook publish error: %s", e)
+    except Exception as e:
+        logger.error(f"Facebook publish error: {e}")
         return PlatformResult(
             platform="facebook",
             success=False,
             error_code="PUBLISH_EXCEPTION",
-            error_message=str(e),
+            error_message=str(e)
         )
 
 
@@ -1714,6 +1393,14 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
 
     init_enc_keys()
 
+    # Token DB key mapping (platform -> token table platform key)
+    platform_to_db_key = {
+        "tiktok": "tiktok",
+        "youtube": "youtube",
+        "instagram": "instagram",
+        "facebook": "facebook",
+    }
+
     # Build publish targets: list of (platform, token_id_or_None)
     #
     # LOGIC: Users select platforms AND which accounts within each platform.
@@ -1737,324 +1424,166 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
     if not publish_targets:
         publish_targets = [(p, None) for p in ctx.platforms]
 
-    PUBLISH_TIMEOUT = int(os.environ.get("PUBLISH_PER_PLATFORM_TIMEOUT", "600"))
-    parallel_mode = os.environ.get("PUBLISH_PARALLEL", "true").lower() in ("1", "true", "yes")
+    logger.info(f"Publishing to {len(publish_targets)} target(s)")
 
-    logger.info(
-        f"Publishing to {len(publish_targets)} target(s) | "
-        f"mode={'parallel' if parallel_mode else 'sequential'} | "
-        f"timeout={PUBLISH_TIMEOUT}s"
-    )
-
-    async def _publish_one_target(platform: str, token_id: str | None) -> PlatformResult | None:
-        """Publish to a single platform/account with timeout. Returns result or None."""
+    for platform, token_id in publish_targets:
         account_label = f"{platform}:{token_id[:8]}" if token_id else platform
-        db_key = platform_tokens_db_key(platform)
-        rcli = getattr(ctx, "redis_client", None)
-        try:
-            if await publish_circuit_open(rcli, platform):
-                logger.warning("%s: circuit open — skipping publish attempt", account_label)
-                return PlatformResult(
-                    platform=platform,
-                    success=False,
-                    error_code="PUBLISH_CIRCUIT_OPEN",
-                    error_message="Platform APIs throttled after repeated failures — retry in a few minutes.",
-                    token_row_id=token_id,
+        db_key = platform_to_db_key.get(platform, platform)
+
+        # -- Select the correct video file for this platform --
+        video_file = ctx.get_video_for_platform(platform)
+        if not video_file or not video_file.exists():
+            video_file = default_video
+            if video_file:
+                logger.warning(
+                    f"{account_label}: Platform-specific video not found, "
+                    f"using fallback: {video_file.name}"
                 )
-            await publish_wait_slot(rcli, platform)
-            res = await asyncio.wait_for(
-                _publish_single(ctx, db_pool, platform, token_id, db_key, account_label, default_video),
-                timeout=PUBLISH_TIMEOUT,
+
+        # -- Create ledger row (before API call) --
+        attempt_id = None
+        try:
+            attempt_id = await db_stage.insert_publish_attempt(
+                db_pool,
+                upload_id=str(ctx.upload_id),
+                user_id=str(ctx.user_id),
+                platform=str(platform),
             )
-            await publish_record_result(rcli, platform, res.success, getattr(res, "http_status", None))
-            return res
-        except asyncio.TimeoutError:
-            logger.error(f"{account_label}: Publish timed out after {PUBLISH_TIMEOUT}s")
-            await publish_record_result(rcli, platform, False, None)
-            return PlatformResult(
+        except Exception as e:
+            logger.warning(f"{account_label}: Could not create publish_attempt row: {e}")
+            attempt_id = None
+
+        # -- Load platform token (use target_accounts token when specified) --
+        token_data = None
+        token_identity = {}
+        try:
+            token_data, token_identity = await db_stage.load_platform_token_with_identity(
+                db_pool, ctx.user_id, db_key, token_row_id=token_id
+            )
+            if token_data:
+                token_data = decrypt_token(token_data) if isinstance(token_data, dict) and token_data.get("kid") else token_data
+        except Exception as e:
+            logger.warning(f"{account_label}: Token load failed: {e}")
+            token_data = None
+            token_identity = {}
+
+        if not token_data:
+            msg = f"Not connected to {platform}" + (f" (account {token_id[:8]})" if token_id else "")
+            logger.warning(f"{account_label}: {msg}")
+            if attempt_id:
+                try:
+                    await db_stage.update_publish_attempt_failed(
+                        db_pool,
+                        attempt_id=attempt_id,
+                        error_code="NOT_CONNECTED",
+                        error_message=msg,
+                    )
+                except Exception:
+                    pass
+            pr = PlatformResult(
                 platform=platform,
                 success=False,
-                error_code="PUBLISH_TIMEOUT",
-                error_message=f"Publish timed out after {PUBLISH_TIMEOUT}s",
+                attempt_id=attempt_id,
+                error_code="NOT_CONNECTED",
+                error_message=msg,
                 token_row_id=token_id,
             )
-        except Exception:
-            await publish_record_result(rcli, platform, False, None)
-            raise
+            ctx.platform_results.append(pr)
+            continue
 
-    if parallel_mode and len(publish_targets) > 1:
-        results = await asyncio.gather(
-            *[_publish_one_target(p, tid) for p, tid in publish_targets],
-            return_exceptions=True,
-        )
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                plat, tid = publish_targets[i]
-                logger.exception(f"Parallel publish {plat} raised: {res}")
-                ctx.platform_results.append(PlatformResult(
-                    platform=plat, success=False,
-                    error_code="PUBLISH_EXCEPTION", error_message=str(res)[:500],
-                    token_row_id=tid,
-                ))
-            elif res:
-                ctx.platform_results.append(res)
-    else:
-        for platform, token_id in publish_targets:
-            res = await _publish_one_target(platform, token_id)
-            if res:
-                ctx.platform_results.append(res)
+        # -- Publish to platform --
+        result = None
+        try:
+            if platform == "tiktok":
+                result = await publish_to_tiktok(video_file, ctx, token_data, db_pool=db_pool)
+
+            elif platform == "youtube":
+                result = await publish_to_youtube(video_file, ctx, token_data, db_pool=db_pool)
+
+            elif platform == "instagram":
+                video_url = _get_video_public_url(ctx, "instagram")
+                result = await publish_to_instagram(
+                    video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
+                )
+
+            elif platform == "facebook":
+                video_url = _get_video_public_url(ctx, "facebook")
+                result = await publish_to_facebook(
+                    video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
+                )
+
+            else:
+                result = PlatformResult(
+                    platform=platform,
+                    success=False,
+                    error_code="UNSUPPORTED",
+                    error_message=f"Unsupported platform: {platform}",
+                    account_id=token_id,
+                    account_name=(token_data.get("_account_name") or "") if token_data else "",
+                )
+
+        except Exception as e:
+            logger.exception(f"Error publishing to {account_label}")
+            result = PlatformResult(
+                platform=platform,
+                success=False,
+                error_code="PUBLISH_EXCEPTION",
+                error_message=str(e),
+                account_id=token_id,
+                account_name=(token_data.get("_account_name") or "") if token_data else "",
+            )
+
+        # -- Record result (stamp account identity from token so it's saved to DB) --
+        result.attempt_id = attempt_id
+        if token_identity:
+            result.token_row_id     = token_identity.get("token_row_id")
+            result.account_id       = token_identity.get("account_id")
+            result.account_username = token_identity.get("account_username")
+            result.account_name     = token_identity.get("account_name")
+            result.account_avatar   = token_identity.get("account_avatar")
+        ctx.platform_results.append(result)
+
+        status_icon = "OK" if result.success else "FAIL"
+        extra = ""
+        if token_id:
+            extra += f" account={token_id[:8]}"
+        if result.publish_id:
+            extra += f" publish_id={result.publish_id}"
+        if result.platform_video_id:
+            extra += f" video_id={result.platform_video_id}"
+        if result.error_message and not result.success:
+            extra += f" error={result.error_message[:100]}"
+
+        logger.info(f"{account_label} [{status_icon}]: {result.error_code or 'accepted'}{extra}")
+
+        # -- Update ledger row --
+        if attempt_id:
+            try:
+                if result.success:
+                    await db_stage.update_publish_attempt_success(
+                        db_pool,
+                        attempt_id=attempt_id,
+                        platform_post_id=result.platform_video_id,
+                        platform_url=result.platform_url,
+                        http_status=result.http_status,
+                        response_payload=result.response_payload,
+                        publish_id=result.publish_id,
+                    )
+                else:
+                    await db_stage.update_publish_attempt_failed(
+                        db_pool,
+                        attempt_id=attempt_id,
+                        error_code=result.error_code or "PUBLISH_FAILED",
+                        error_message=result.error_message or "Publish failed",
+                        http_status=result.http_status,
+                        response_payload=result.response_payload,
+                    )
+            except Exception as e:
+                logger.warning(f"{account_label}: Could not update publish_attempt: {e}")
 
     # -- Summary --
     succeeded = [r.platform for r in ctx.platform_results if r.success]
     failed = [r.platform for r in ctx.platform_results if not r.success]
-    logger.info(
-        f"Publish complete for {ctx.upload_id}: "
-        f"succeeded={succeeded}, failed={failed}"
-    )
+    logger.info(f"Publish complete: succeeded={succeeded}, failed={failed}")
 
     return ctx
-
-
-async def _publish_single(
-    ctx: "JobContext",
-    db_pool,
-    platform: str,
-    token_id: str | None,
-    db_key: str,
-    account_label: str,
-    default_video,
-) -> PlatformResult:
-    """Publish to ONE platform/account. Isolated — exceptions caught internally."""
-    from stages import db as db_stage
-
-    def _clip(s: str, n: int) -> str:
-        return (s or "")[:n]
-
-    video_file = ctx.get_video_for_platform(platform)
-    if not video_file or not video_file.exists():
-        video_file = default_video
-        if video_file:
-            logger.warning(
-                f"{account_label}: Platform-specific video not found, "
-                f"using fallback: {video_file.name}"
-            )
-
-    attempt_id = None
-    try:
-        attempt_id = await db_stage.insert_publish_attempt(
-            db_pool,
-            upload_id=str(ctx.upload_id),
-            user_id=str(ctx.user_id),
-            platform=str(platform),
-        )
-    except _DB_PERSIST_ERRS as e:
-        logger.warning("%s: Could not create publish_attempt row: %s", account_label, e)
-        attempt_id = None
-
-    token_data = None
-    token_identity = {}
-    try:
-        token_data, token_identity = await db_stage.load_platform_token_with_identity(
-            db_pool, ctx.user_id, db_key, token_row_id=token_id
-        )
-        if token_data is not None:
-            token_data = decrypt_token(token_data)
-    except _DB_PERSIST_ERRS as e:
-        logger.warning("%s: Token load failed: %s", account_label, e)
-        token_data = None
-        token_identity = {}
-
-    # Hard guard: token payload must be a dict with an access token.
-    if not isinstance(token_data, dict) or not str(token_data.get("access_token", "")).strip():
-        msg = (
-            f"Invalid or missing token payload for {platform}"
-            + (f" (account {token_id[:8]})" if token_id else "")
-        )
-        logger.warning(f"{account_label}: {msg}")
-        if attempt_id:
-            try:
-                await db_stage.update_publish_attempt_failed(
-                    db_pool,
-                    attempt_id=attempt_id,
-                    error_code="TOKEN_INVALID",
-                    error_message=msg,
-                )
-            except _DB_PERSIST_ERRS as e:
-                logger.debug("%s: Failed to mark TOKEN_INVALID on publish_attempt: %s", account_label, e)
-        return PlatformResult(
-            platform=platform,
-            success=False,
-            attempt_id=attempt_id,
-            error_code="TOKEN_INVALID",
-            error_message=msg,
-            token_row_id=token_id,
-        )
-
-    # Audit trail: effective metadata that this publish attempt will use.
-    try:
-        eff_title = (
-            ctx.get_effective_title(platform)
-            if hasattr(ctx, "get_effective_title")
-            else (getattr(ctx, "title", None) or "")
-        )
-        eff_caption = (
-            ctx.get_effective_caption(platform)
-            if hasattr(ctx, "get_effective_caption")
-            else (getattr(ctx, "caption", None) or "")
-        )
-        eff_tags = (
-            ctx.get_effective_hashtags(platform)
-            if hasattr(ctx, "get_effective_hashtags")
-            else (getattr(ctx, "hashtags", None) or [])
-        )
-        requested_privacy = getattr(ctx, "privacy", None) or "public"
-        native_privacy = resolve_privacy_level(requested_privacy, platform)
-        await db_stage.write_system_event_log(
-            db_pool,
-            user_id=str(ctx.user_id),
-            event_category="UPLOAD",
-            action="PUBLISH_METADATA_RESOLVED",
-            resource_type="upload",
-            resource_id=str(ctx.upload_id),
-            details={
-                "attempt_id": attempt_id,
-                "platform": platform,
-                "token_row_id": token_id,
-                "account_id": token_identity.get("account_id"),
-                "account_username": token_identity.get("account_username"),
-                "requested_privacy": requested_privacy,
-                "native_privacy": native_privacy,
-                "effective_title": _clip(str(eff_title or ""), 300),
-                "effective_caption": _clip(str(eff_caption or ""), 1200),
-                "effective_hashtags": list(eff_tags or [])[:80],
-            },
-            severity="INFO",
-            outcome="SUCCESS",
-        )
-    except _DB_PERSIST_ERRS as e:
-        logger.debug("%s: Could not write publish metadata audit log: %s", account_label, e, exc_info=True)
-
-    if not token_data:
-        msg = f"Not connected to {platform}" + (f" (account {token_id[:8]})" if token_id else "")
-        logger.warning(f"{account_label}: {msg}")
-        if attempt_id:
-            try:
-                await db_stage.update_publish_attempt_failed(
-                    db_pool, attempt_id=attempt_id,
-                    error_code="NOT_CONNECTED", error_message=msg,
-                )
-            except _DB_PERSIST_ERRS as e:
-                logger.debug("%s: Failed to mark NOT_CONNECTED on publish_attempt: %s", account_label, e)
-        return PlatformResult(
-            platform=platform, success=False, attempt_id=attempt_id,
-            error_code="NOT_CONNECTED", error_message=msg, token_row_id=token_id,
-        )
-
-    result = None
-    try:
-        if platform == "tiktok":
-            result = await publish_to_tiktok(video_file, ctx, token_data, db_pool=db_pool)
-        elif platform == "youtube":
-            result = await publish_to_youtube(video_file, ctx, token_data, db_pool=db_pool)
-        elif platform == "instagram":
-            video_url = _get_video_public_url(ctx, "instagram")
-            result = await publish_to_instagram(
-                video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
-            )
-        elif platform == "facebook":
-            video_url = _get_video_public_url(ctx, "facebook")
-            result = await publish_to_facebook(
-                video_file, ctx, token_data, video_url=video_url, db_pool=db_pool
-            )
-        else:
-            result = PlatformResult(
-                platform=platform, success=False,
-                error_code="UNSUPPORTED", error_message=f"Unsupported platform: {platform}",
-                account_id=token_id,
-                account_name=(token_data.get("_account_name") or "") if token_data else "",
-            )
-    except asyncio.CancelledError:
-        raise
-    except _PUBLISH_FILE_HTTP_ERRS as e:
-        logger.exception("Error publishing to %s", account_label)
-        result = PlatformResult(
-            platform=platform,
-            success=False,
-            error_code="PUBLISH_EXCEPTION",
-            error_message=str(e),
-            account_id=token_id,
-            account_name=(token_data.get("_account_name") or "") if token_data else "",
-        )
-
-    result.attempt_id = attempt_id
-    if token_identity:
-        result.token_row_id     = token_identity.get("token_row_id")
-        result.account_id       = token_identity.get("account_id")
-        result.account_username = token_identity.get("account_username")
-        result.account_name     = token_identity.get("account_name")
-        result.account_avatar   = token_identity.get("account_avatar")
-
-    status_icon = "OK" if result.success else "FAIL"
-    extra = ""
-    if token_id:
-        extra += f" account={token_id[:8]}"
-    if result.publish_id:
-        extra += f" publish_id={result.publish_id}"
-    if result.platform_video_id:
-        extra += f" video_id={result.platform_video_id}"
-    if result.error_message and not result.success:
-        extra += f" error={result.error_message[:100]}"
-    logger.info(f"{account_label} [{status_icon}]: {result.error_code or 'accepted'}{extra}")
-
-    if attempt_id:
-        try:
-            if result.success:
-                await db_stage.update_publish_attempt_success(
-                    db_pool, attempt_id=attempt_id,
-                    platform_post_id=result.platform_video_id,
-                    platform_url=result.platform_url,
-                    http_status=result.http_status,
-                    response_payload=result.response_payload,
-                    publish_id=result.publish_id,
-                )
-            else:
-                await db_stage.update_publish_attempt_failed(
-                    db_pool, attempt_id=attempt_id,
-                    error_code=result.error_code or "PUBLISH_FAILED",
-                    error_message=result.error_message or "Publish failed",
-                    http_status=result.http_status,
-                    response_payload=result.response_payload,
-                )
-        except _DB_PERSIST_ERRS as e:
-            logger.warning("%s: Could not update publish_attempt: %s", account_label, e)
-
-    # Audit trail: final platform outcome for this attempt.
-    try:
-        await db_stage.write_system_event_log(
-            db_pool,
-            user_id=str(ctx.user_id),
-            event_category="UPLOAD",
-            action="PUBLISH_ATTEMPT_RESULT",
-            resource_type="upload",
-            resource_id=str(ctx.upload_id),
-            details={
-                "attempt_id": attempt_id,
-                "platform": platform,
-                "token_row_id": token_id,
-                "account_id": token_identity.get("account_id"),
-                "account_username": token_identity.get("account_username"),
-                "success": bool(result.success),
-                "error_code": result.error_code,
-                "error_message": _clip(str(result.error_message or ""), 500),
-                "http_status": result.http_status,
-                "publish_id": result.publish_id,
-                "platform_video_id": result.platform_video_id,
-                "platform_url": result.platform_url,
-            },
-            severity="INFO" if result.success else "WARN",
-            outcome="SUCCESS" if result.success else "FAIL",
-        )
-    except _DB_PERSIST_ERRS as e:
-        logger.warning("publish_stage: write_system_event_log PUBLISH_ATTEMPT_RESULT failed: %s", e)
-
-    return result

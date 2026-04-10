@@ -81,7 +81,7 @@ async def send_subscription_started_email(
         footer_note="You received this because you started an UploadM8 subscription.",
     )
 
-    await send_email(email, f"Welcome to UploadM8 {plan} — your subscription is active", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, f"Welcome to UploadM8 {plan}! Your subscription is active 🎉", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ async def send_trial_started_email(
         footer_note=f"Your trial ends on {trial_end_date}. We'll email you a reminder before any charge.",
     )
 
-    await send_email(email, f"Your UploadM8 {plan} trial starts now", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, f"Your UploadM8 {plan} trial starts now 🎉", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,4 +318,4 @@ async def send_renewal_receipt_email(
         footer_note="You received this because a payment was processed for your UploadM8 subscription.",
     )
 
-    await send_email(email, f"UploadM8 payment received — ${amount:.2f}", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(email, f"UploadM8 payment received — ${amount:.2f} 💰", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)

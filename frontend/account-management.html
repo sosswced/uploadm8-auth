@@ -13,12 +13,14 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://static.cloudflareinsights.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 https://cloudflareinsights.com;">
     <title>Account Management - UploadM8</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="styles.css" rel="stylesheet">
@@ -81,13 +83,16 @@
         .badge.admin { background: rgba(59, 130, 246, 0.2); color: #3b82f6; }
         .badge.master_admin { background: rgba(249, 115, 22, 0.2); color: #f97316; }
         .badge.free { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
-        .badge.launch { background: rgba(59, 130, 246, 0.2); color: #3b82f6; }
+        .badge.creator_lite { background: rgba(59, 130, 246, 0.2); color: #3b82f6; }
         .badge.creator_pro { background: rgba(249, 115, 22, 0.2); color: #f97316; }
         .badge.studio { background: rgba(139, 92, 246, 0.2); color: #8b5cf6; }
         .badge.agency { background: rgba(236, 72, 153, 0.2); color: #ec4899; }
         .badge.friends_family { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
+        .badge.master_admin { background: rgba(249, 115, 22, 0.2); color: #f97316; }
         .badge.active { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
         .badge.banned { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+        .badge.email_ok { background: rgba(34, 197, 94, 0.15); color: #22c55e; }
+        .badge.email_pending { background: rgba(251, 191, 36, 0.2); color: #f59e0b; }
 
         .action-btn { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 1px solid var(--border-color); border-radius: 6px; color: var(--text-secondary); cursor: pointer; transition: all 0.2s; font-size: 0.8rem; }
         .action-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
@@ -196,6 +201,28 @@
         .toast.removing { animation: slideOut 0.3s ease-in forwards; }
         @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
         @keyframes slideOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(100%); opacity: 0; } }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 768px) {
+            .table-card, .audit-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+            .users-table, .audit-table { min-width: 580px; }
+            .tabs-container { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+            .tabs-container::-webkit-scrollbar { display: none; }
+            .tab-btn { white-space: nowrap; flex-shrink: 0; }
+        }
+        @media (max-width: 640px) {
+            .toolbar { flex-direction: column; }
+            .search-wrapper { min-width: unset; width: 100%; }
+            .filter-select { width: 100%; }
+            .toolbar-btn { width: 100%; justify-content: center; }
+            .audit-pagination { flex-direction: column; align-items: flex-start; }
+            .stats-row { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 480px) {
+            .stats-row { grid-template-columns: 1fr; }
+            .admin-header { flex-direction: column; align-items: flex-start; }
+            .admin-badge { align-self: flex-start; }
+        }
     </style>
 </head>
 <body>
@@ -203,60 +230,16 @@
         <!-- ============================================================ -->
         <!-- SIDEBAR — standard layout matching dashboard.html            -->
         <!-- ============================================================ -->
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header">
-                <a href="dashboard.html" class="sidebar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></a>
-            </div>
-            <nav class="sidebar-nav">
-                <div class="nav-section">
-                    <div class="nav-section-title">Main</div>
-                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
-                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
-                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Platforms</div>
-                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-                    <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Insights</div>
-                    <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-                </div>
-                <!-- Admin nav — hidden by default, shown by app.js updateUserUI() -->
-                <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                    <div class="nav-section-title">Admin</div>
-                    <a href="admin.html" class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
-                    <a href="account-management.html" class="nav-link active"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
-                    <a href="admin-kpi.html" class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
-                    <a href="admin-calculator.html" class="nav-link"> <i class="fas fa-calculator"></i> <span>Biz Calculator</span> </a>
-                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Account</div>
-                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-                    <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-                </div>
-            </nav>
-            <div class="sidebar-footer">
-                <div class="user-info">
-                    <!-- Updated by app.js updateUserUI() -->
-                    <div class="user-avatar" id="userAvatar">U</div>
-                    <div class="user-details">
-                        <div class="user-name" id="userName">Loading...</div>
-                        <div class="user-tier" id="userTier">-</div>
-                    </div>
-                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out"><i class="fas fa-sign-out-alt"></i></button>
-                </div>
-            </div>
-        </aside>
+        <aside class="sidebar" id="sidebar"></aside>
 
-        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
         <header class="top-bar">
-            <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
-            <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
-            <div class="top-bar-actions"><button class="theme-toggle" onclick="toggleTheme()"><i class="fas fa-moon"></i></button></div>
+            <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+            <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+            <div class="top-bar-actions">
+                <div data-wt-pills></div>
+                <button class="theme-toggle" data-um8-fn="toggleTheme"><i class="fas fa-moon"></i></button>
+            </div>
         </header>
 
         <!-- ============================================================ -->
@@ -279,12 +262,15 @@
 
             <!-- STATE 3: Admin content — Step 8 -->
             <div id="adminContent" style="display: none;">
-                <div class="admin-header">
+                <div class="admin-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;">
                     <div>
                         <h1><i class="fas fa-users-cog"></i> Account Management</h1>
                         <p>Manage users, subscriptions, and platform settings</p>
                     </div>
-                    <div class="admin-badge"><i class="fas fa-crown"></i><span id="roleBadge">ADMIN</span></div>
+                    <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;">
+                        <div data-wt-pills class="desktop-pills"></div>
+                        <div class="admin-badge"><i class="fas fa-crown"></i><span id="roleBadge">ADMIN</span></div>
+                    </div>
                 </div>
 
                 <div class="tabs-container">
@@ -310,7 +296,7 @@
                         <select id="tierFilter" class="filter-select">
                             <option value="">All Tiers</option>
                             <option value="free">Free</option>
-                            <option value="launch">Launch</option>
+                            <option value="creator_lite">Creator Lite</option>
                             <option value="creator_pro">Creator Pro</option>
                             <option value="studio">Studio</option>
                             <option value="agency">Agency</option>
@@ -323,8 +309,8 @@
 
                     <div class="table-card">
                         <table class="users-table">
-                            <thead><tr><th>User</th><th>Role</th><th>Tier</th><th>Status</th><th>Joined</th><th style="text-align:right;">Actions</th></tr></thead>
-                            <tbody id="usersTableBody"><tr><td colspan="6" class="empty-state">Loading users...</td></tr></tbody>
+                            <thead><tr><th>User</th><th>Role</th><th>Tier</th><th>Status</th><th>Email</th><th>Joined</th><th style="text-align:right;">Actions</th></tr></thead>
+                            <tbody id="usersTableBody"><tr><td colspan="7" class="empty-state">Loading users...</td></tr></tbody>
                         </table>
                         <div class="table-footer" id="tableFooter">Showing 0 users</div>
                     </div>
@@ -442,7 +428,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h3 class="modal-title">Edit User</h3>
-                <button class="modal-close" onclick="AccountMgmt.closeModal()"><i class="fas fa-times"></i></button>
+                <button type="button" class="modal-close" data-um8-fn="um8AccountMgmtCloseModal"><i class="fas fa-times"></i></button>
             </div>
             <div class="modal-body">
                 <div class="user-info-header">
@@ -457,13 +443,13 @@
                     <label class="form-label">Tier</label>
                     <select id="modalTier" class="form-select">
                         <option value="free">Free</option>
-                        <option value="launch">Launch</option>
+                        <option value="creator_lite">Creator Lite</option>
                         <option value="creator_pro">Creator Pro</option>
                         <option value="studio">Studio</option>
                         <option value="agency">Agency</option>
                         <option value="friends_family">Friends & Family</option>
                     </select>
-                    <div class="form-hint">Friends & Family tier grants all paid features for free</div>
+                    <div class="form-hint">Master Admin is role permission only (not a tier). Legacy Launch/Lifetime tiers are retired.</div>
                 </div>
 
                 <div class="form-group" id="roleGroup" style="display:none;">
@@ -485,6 +471,17 @@
 
                 <div class="admin-controls" id="adminControls" style="display:none;">
                     <div class="admin-controls-title"><i class="fas fa-shield-alt"></i> Admin Controls</div>
+
+                    <div class="form-group" id="emailVerifyGroup">
+                        <label class="form-label">Email verification</label>
+                        <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
+                            <span id="modalEmailVerifiedBadge" class="badge email_ok">Verified</span>
+                            <button type="button" id="adminVerifyEmailBtn" class="btn btn-secondary" style="display:none;">
+                                Confirm email manually
+                            </button>
+                        </div>
+                        <div class="form-hint">Use when the user never received the signup link (spam, Mailgun, or typo). Lets them sign in without clicking the link. Audit logged.</div>
+                    </div>
 
                     <div class="form-group">
                         <label class="form-label">Change Email</label>
@@ -511,7 +508,7 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="AccountMgmt.closeModal()">Cancel</button>
+                <button type="button" class="btn btn-secondary" data-um8-fn="um8AccountMgmtCloseModal">Cancel</button>
                 <button class="btn btn-primary" id="saveUserBtn">Save Changes</button>
             </div>
         </div>
@@ -522,7 +519,7 @@
         <div class="modal-content" style="max-width:600px;">
             <div class="modal-header">
                 <h3 class="modal-title"><i class="fas fa-file-alt" style="color:#8b5cf6;margin-right:0.5rem;"></i>Event Details</h3>
-                <button class="modal-close" onclick="document.getElementById('auditDetailsModal').classList.remove('active')"><i class="fas fa-times"></i></button>
+                <button type="button" class="modal-close" data-um8-fn="um8AuditDetailsModalClose"><i class="fas fa-times"></i></button>
             </div>
             <div class="modal-body">
                 <div id="auditDetailsContent" class="details-popup">Loading...</div>
@@ -535,8 +532,16 @@
 
     <!-- app.js: sole auth system — provides checkAuth(), getAccessToken(),
          logout(), applyAvatarToUI(), updateUserUI(), API_BASE, window.currentUser -->
-    <script src="wallet-tokens.js"></script>
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
     <script src="app.js"></script>
+    <script src="wallet-tokens.js"></script>
 
     <!-- ============================================================ -->
     <!-- TOAST HELPER (in case app.js / styles.css don't provide it)  -->
@@ -581,6 +586,13 @@
                 .replace(/"/g, '&quot;')
                 .replace(/'/g, '&#39;');
         }
+        function normalizeTierForAdminUI(tier) {
+            var t = String(tier || 'free').toLowerCase();
+            if (t === 'launch') return 'creator_lite';
+            if (t === 'lifetime') return 'friends_family';
+            if (t === 'master_admin') return 'friends_family';
+            return t;
+        }
 
         console.log('[Account Mgmt] Starting initialization...');
         console.log('[Account Mgmt] Step 4: Calling window.checkAuth()...');
@@ -599,7 +611,7 @@
             document.getElementById('accessDenied').style.display = 'flex';
             return;
         }
-        user = await window.checkAuth({ redirectOnFail: true });
+        user = await window.checkAuth({ redirectOnFail: true, forceRefresh: false });
         console.log('[Account Mgmt] checkAuth returned:', user ? user.email : 'null');
 
         if (!user) {
@@ -620,50 +632,55 @@
         const displayName = user.name || user.email?.split('@')[0] || 'User';
         const initial = displayName.charAt(0).toUpperCase();
         const tierMap = {
-            'free': 'Free', 'launch': 'Launch', 'creator_lite': 'Creator Lite', 'creator_pro': 'Creator Pro',
-            'studio': 'Studio', 'agency': 'Agency', 'friends_family': 'Friends & Family',
-            'lifetime': 'Lifetime', 'master_admin': 'Master Admin'
+            'free': 'Free', 'creator_lite': 'Creator Lite', 'creator_pro': 'Creator Pro',
+            'studio': 'Studio', 'agency': 'Agency', 'friends_family': 'Friends & Family'
         };
         const displayTier = tierMap[user.subscription_tier] || user.subscription_tier || 'Free';
 
         // Update all possible sidebar element IDs
-        ['userName', 'sidebarUserName'].forEach(function(id) {
-            const el = document.getElementById(id);
-            if (el) el.textContent = displayName;
-        });
-        ['userTier', 'sidebarUserTier'].forEach(function(id) {
-            const el = document.getElementById(id);
-            if (el) el.textContent = displayTier;
-        });
-        ['userAvatar', 'sidebarAvatar'].forEach(function(id) {
-            const el = document.getElementById(id);
-            if (!el) return;
+        const nameEl = document.getElementById('userName');
+        if (nameEl) nameEl.textContent = displayName;
+        const tierEl = document.getElementById('userTier');
+        if (tierEl) tierEl.textContent = displayTier;
+        const avatarEl = document.getElementById('userAvatar');
+        if (avatarEl) {
             if (user.avatar_url) {
-                el.textContent = '';
+                avatarEl.textContent = '';
                 const img = document.createElement('img');
-                img.src = String(user.avatar_url).split('#')[0] + '#v=' + Date.now();
+                img.referrerPolicy = 'no-referrer';
+                img.loading = 'lazy';
+                img.decoding = 'async';
+                img.src = String(user.avatar_url).split('#')[0];
                 img.alt = displayName;
-                img.style.width = '100%';
-                img.style.height = '100%';
-                img.style.borderRadius = '50%';
-                img.style.objectFit = 'cover';
-                el.appendChild(img);
-            } else if (!el.querySelector('img')) {
-                el.textContent = initial;
+                img.style.cssText = 'width:100%;height:100%;border-radius:50%;object-fit:cover;';
+                avatarEl.appendChild(img);
+            } else if (!avatarEl.querySelector('img')) {
+                avatarEl.textContent = initial;
             }
-        });
+        }
 
-        // Show admin nav section for admin/master_admin roles
-        const isAdmin = user.role === 'admin' || user.role === 'master_admin';
-        const isMasterAdmin = user.role === 'master_admin';
+        // Show admin nav section for admin/master_admin roles (role OR tier signal).
+        const _role = String(user.role || '').toLowerCase();
+        const _tier = String(user.tier || user.subscription_tier || '').toLowerCase();
+        const isMasterAdmin = _role === 'master_admin' || _tier === 'master_admin';
+        const isAdmin = isMasterAdmin || _role === 'admin';
 
         const adminSection = document.getElementById('adminSection');
         if (adminSection) {
             adminSection.style.display = isAdmin ? 'block' : 'none';
         }
-        // Also try class-based admin sections
-        document.querySelectorAll('.admin-only').forEach(function(el) {
-            el.style.display = isAdmin ? 'block' : 'none';
+        // Class-gated chrome — keep in sync with app.js _applyUserToDOM (.admin-only, .admin-only-marketing)
+        document.querySelectorAll('.admin-only, .admin-only-marketing').forEach(function(el) {
+            if (!el.dataset.roleDisplay) {
+                el.dataset.roleDisplay = (el.style && typeof el.style.display === 'string') ? el.style.display : '';
+            }
+            if (isAdmin) {
+                el.classList.remove('hidden');
+                el.style.display = el.dataset.roleDisplay || '';
+            } else {
+                el.classList.add('hidden');
+                el.style.display = 'none';
+            }
         });
 
         console.log('[Account Mgmt] User:', user.email, '| Role:', user.role, '| isAdmin:', isAdmin);
@@ -691,34 +708,19 @@
             filteredUsers: [],
             selectedUserId: null,
             isMasterAdmin: isMasterAdmin,
+            summaryTotal: null,
+            summaryActive: null,
+            summaryBanned: null,
+            summaryStripePaying: null,
 
             async api(endpoint, options) {
                 options = options || {};
-                var token = window.getAccessToken ? window.getAccessToken() : null;
-                if (!token) throw new Error('No auth token — session may have expired');
-
-                var baseUrl = window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : '');
-                var resp = await fetch(baseUrl + endpoint, {
+                /* Cookie-only sessions have no JS access token; apiCall uses credentials:'include'. */
+                return window.apiCall(endpoint, {
                     method: options.method || 'GET',
-                    headers: {
-                        'Authorization': 'Bearer ' + token,
-                        'Content-Type': 'application/json',
-                        ...(options.headers || {})
-                    },
-                    body: options.body || undefined
+                    headers: options.headers || {},
+                    body: options.body || undefined,
                 });
-
-                if (resp.status === 401) {
-                    if (typeof window.logout === 'function') window.logout();
-                    throw new Error('Unauthorized');
-                }
-
-                if (!resp.ok) {
-                    var errData = await resp.json().catch(function() { return {}; });
-                    throw new Error(errData.detail || 'API error: ' + resp.status);
-                }
-
-                return resp.json();
             },
 
             async loadUsers() {
@@ -731,6 +733,11 @@
                 try {
                     var data = await this.api('/api/admin/users?limit=1000');
                     this.users = data.users || [];
+                    var s = data.summary || {};
+                    this.summaryTotal = typeof s.total_users === 'number' ? s.total_users : null;
+                    this.summaryActive = typeof s.active_users === 'number' ? s.active_users : null;
+                    this.summaryBanned = typeof s.banned_users === 'number' ? s.banned_users : null;
+                    this.summaryStripePaying = typeof s.stripe_paying_users === 'number' ? s.stripe_paying_users : null;
                     this.applyFilters();
                     this.updateStats();
                 } catch (err) {
@@ -740,7 +747,7 @@
                         tbody.textContent = '';
                         var tr = document.createElement('tr');
                         var td = document.createElement('td');
-                        td.colSpan = 6;
+                        td.colSpan = 7;
                         td.className = 'empty-state';
                         td.textContent = 'Error: ' + (err && err.message ? err.message : 'Unknown error');
                         tr.appendChild(td);
@@ -767,7 +774,8 @@
                     var matchesSearch = !search ||
                         (u.name || '').toLowerCase().includes(search) ||
                         (u.email || '').toLowerCase().includes(search);
-                    var matchesTier = !tier || u.subscription_tier === tier;
+                    var ut = normalizeTierForAdminUI(u.subscription_tier || 'free');
+                    var matchesTier = !tier || ut === tier;
                     var matchesStatus = !status || u.status === status;
                     return matchesSearch && matchesTier && matchesStatus;
                 });
@@ -786,7 +794,7 @@
                 if (!this.filteredUsers.length) {
                     var tr0 = document.createElement('tr');
                     var td0 = document.createElement('td');
-                    td0.colSpan = 6;
+                    td0.colSpan = 7;
                     td0.className = 'empty-state';
                     td0.textContent = 'No users found';
                     tr0.appendChild(td0);
@@ -796,10 +804,10 @@
                 }
 
                 var roleNames = { 'user': 'User', 'admin': 'Admin', 'master_admin': 'Master Admin' };
-                var tierNames = { 'free': 'Free', 'launch': 'Launch', 'creator_lite': 'Creator Lite', 'creator_pro': 'Creator Pro', 'studio': 'Studio', 'agency': 'Agency', 'friends_family': 'Friends & Family', 'lifetime': 'Lifetime' };
+                var tierNames = { 'free': 'Free', 'creator_lite': 'Creator Lite', 'creator_pro': 'Creator Pro', 'studio': 'Studio', 'agency': 'Agency', 'friends_family': 'Friends & Family' };
                 var allowedRoles = new Set(['user', 'admin', 'master_admin']);
                 var allowedStatuses = new Set(['active', 'banned', 'trialing', 'canceled', 'past_due']);
-                var allowedTiers = new Set(['free', 'launch', 'creator_pro', 'studio', 'agency', 'friends_family', 'lifetime']);
+                var allowedTiers = new Set(['free', 'creator_lite', 'creator_pro', 'studio', 'agency', 'friends_family']);
 
                 this.filteredUsers.forEach(function(u) {
                     var tr = document.createElement('tr');
@@ -835,7 +843,7 @@
 
                     var tierTd = document.createElement('td');
                     var tierSpan = document.createElement('span');
-                    var tier = allowedTiers.has(u.subscription_tier) ? u.subscription_tier : (u.subscription_tier || 'free');
+                    var tier = normalizeTierForAdminUI(u.subscription_tier || 'free');
                     tierSpan.className = 'badge ' + (allowedTiers.has(tier) ? tier : 'free');
                     tierSpan.textContent = tierNames[tier] || tier;
                     tierTd.appendChild(tierSpan);
@@ -848,6 +856,14 @@
                     statusSpan.textContent = status;
                     statusTd.appendChild(statusSpan);
                     tr.appendChild(statusTd);
+
+                    var emailTd = document.createElement('td');
+                    var emailVerified = u.email_verified !== false;
+                    var emailSpan = document.createElement('span');
+                    emailSpan.className = 'badge ' + (emailVerified ? 'email_ok' : 'email_pending');
+                    emailSpan.textContent = emailVerified ? 'Verified' : 'Pending';
+                    emailTd.appendChild(emailSpan);
+                    tr.appendChild(emailTd);
 
                     var createdTd = document.createElement('td');
                     createdTd.textContent = u.created_at ? new Date(u.created_at).toLocaleDateString() : '-';
@@ -903,12 +919,30 @@
                 var paidEl = document.getElementById('statPaid');
                 var bannedEl = document.getElementById('statBanned');
 
-                if (totalEl) totalEl.textContent = this.users.length;
-                if (activeEl) activeEl.textContent = this.users.filter(function(u) { return u.status === 'active'; }).length;
+                if (totalEl) totalEl.textContent = this.summaryTotal != null ? this.summaryTotal : this.users.length;
+                if (activeEl) {
+                    activeEl.textContent = this.summaryActive != null
+                        ? this.summaryActive
+                        : this.users.filter(function(u) { return u.status === 'active'; }).length;
+                }
 
-                var paidTiers = ['launch', 'creator_lite', 'creator_pro', 'studio', 'agency'];
-                if (paidEl) paidEl.textContent = this.users.filter(function(u) { return paidTiers.includes(u.subscription_tier); }).length;
-                if (bannedEl) bannedEl.textContent = this.users.filter(function(u) { return u.status === 'banned'; }).length;
+                // Paid = Stripe subscription active or past_due (successful billing path), not comped tier alone.
+                if (paidEl) {
+                    if (this.summaryStripePaying != null) {
+                        paidEl.textContent = this.summaryStripePaying;
+                    } else {
+                        paidEl.textContent = this.users.filter(function(u) {
+                            var sid = u.stripe_subscription_id;
+                            var st = (u.subscription_status || '').toLowerCase();
+                            return !!sid && (st === 'active' || st === 'past_due');
+                        }).length;
+                    }
+                }
+                if (bannedEl) {
+                    bannedEl.textContent = this.summaryBanned != null
+                        ? this.summaryBanned
+                        : this.users.filter(function(u) { return u.status === 'banned'; }).length;
+                }
             },
 
             editUser(userId) {
@@ -929,7 +963,11 @@
                 if (modalAvatar) modalAvatar.textContent = (u.name || u.email || 'U')[0].toUpperCase();
                 if (modalName) modalName.textContent = u.name || 'No name';
                 if (modalEmail) modalEmail.textContent = u.email;
-                if (modalTier) modalTier.value = u.subscription_tier || 'free';
+                if (modalTier) {
+                    var sel = normalizeTierForAdminUI(u.subscription_tier || 'free');
+                    if (!modalTier.querySelector('option[value="' + sel + '"]')) sel = 'free';
+                    modalTier.value = sel;
+                }
                 if (modalRole) modalRole.value = u.role;
                 if (modalStatus) modalStatus.value = u.status;
 
@@ -938,6 +976,19 @@
                 }
 
                 if (adminControls) adminControls.style.display = 'block';
+
+                var emailOk = u.email_verified !== false;
+                var evBadge = document.getElementById('modalEmailVerifiedBadge');
+                var evBtn = document.getElementById('adminVerifyEmailBtn');
+                if (evBadge) {
+                    evBadge.className = 'badge ' + (emailOk ? 'email_ok' : 'email_pending');
+                    evBadge.textContent = emailOk ? 'Verified' : 'Pending confirmation';
+                }
+                if (evBtn) {
+                    evBtn.style.display = emailOk ? 'none' : 'inline-flex';
+                    evBtn.disabled = false;
+                    evBtn.innerHTML = 'Confirm email manually';
+                }
 
                 var emailInput = document.getElementById('adminNewEmail');
                 var pwInput = document.getElementById('adminNewPassword');
@@ -1022,6 +1073,46 @@
                 }
             },
 
+            async verifyEmailManually() {
+                if (!this.selectedUserId) return;
+                if (!confirm('Mark this email as verified? The user can sign in without using the confirmation link. This is audit logged.')) return;
+
+                var evBtn = document.getElementById('adminVerifyEmailBtn');
+                if (evBtn) {
+                    evBtn.disabled = true;
+                    evBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Working...';
+                }
+
+                try {
+                    await this.api('/api/admin/users/' + encodeURIComponent(this.selectedUserId) + '/verify-email', {
+                        method: 'POST'
+                    });
+                    await this.loadUsers();
+                    var u = this.users.find(function(x) { return x.id === AccountMgmt.selectedUserId; });
+                    if (u) {
+                        var evBadge = document.getElementById('modalEmailVerifiedBadge');
+                        var emailOk = u.email_verified !== false;
+                        if (evBadge) {
+                            evBadge.className = 'badge ' + (emailOk ? 'email_ok' : 'email_pending');
+                            evBadge.textContent = emailOk ? 'Verified' : 'Pending confirmation';
+                        }
+                        if (evBtn) {
+                            evBtn.style.display = emailOk ? 'none' : 'inline-flex';
+                            evBtn.innerHTML = 'Confirm email manually';
+                        }
+                    }
+                    window.showToast('Email marked verified. User can sign in.', 'success');
+                    this.loadAuditLog(this.selectedUserId);
+                } catch (err) {
+                    window.showToast('Error: ' + err.message, 'error');
+                } finally {
+                    if (evBtn) {
+                        evBtn.disabled = false;
+                        if (evBtn.style.display !== 'none') evBtn.innerHTML = 'Confirm email manually';
+                    }
+                }
+            },
+
             async loadAuditLog(userId) {
                 var box = document.getElementById('auditLogList');
                 if (!box) return;
@@ -1046,20 +1137,22 @@
                         var sevColor = sevColors[ev.severity || 'INFO'] || '#3b82f6';
                         var ts = ev.created_at ? new Date(ev.created_at).toLocaleString() : '-';
                         var actor = ev.actor_email || ev.actor_name || 'system';
+                        var ip = ev.ip_address ? escapeHTML(ev.ip_address) : '';
+                        var rtype = ev.resource_type ? escapeHTML(ev.resource_type) : '';
                         return '<div class="audit-item">' +
                             '<div class="audit-action" style="display:flex;align-items:center;gap:0.4rem;">' +
-                                '<span style="font-size:0.6rem;font-weight:700;color:' + catColor + ';background:' + catColor + '1a;padding:0.1rem 0.35rem;border-radius:3px;">' + cat + '</span>' +
-                                '<span>' + (ev.action || 'ACTION') + '</span>' +
-                                '<span style="font-size:0.6rem;color:' + sevColor + ';margin-left:auto;">' + (ev.severity || 'INFO') + '</span>' +
+                                '<span style="font-size:0.6rem;font-weight:700;color:' + catColor + ';background:' + catColor + '1a;padding:0.1rem 0.35rem;border-radius:3px;">' + escapeHTML(cat) + '</span>' +
+                                '<span>' + escapeHTML(ev.action || 'ACTION') + '</span>' +
+                                '<span style="font-size:0.6rem;color:' + sevColor + ';margin-left:auto;">' + escapeHTML(ev.severity || 'INFO') + '</span>' +
                             '</div>' +
                             '<div class="audit-meta">' +
-                                ts + ' &bull; ' + actor + (ev.ip_address ? ' &bull; ' + ev.ip_address : '') +
-                                (ev.resource_type ? ' &bull; ' + ev.resource_type : '') +
+                                escapeHTML(ts) + ' &bull; ' + escapeHTML(actor) + (ip ? ' &bull; ' + ip : '') +
+                                (rtype ? ' &bull; ' + rtype : '') +
                             '</div>' +
                         '</div>';
                     }).join('');
                 } catch (err) {
-                    box.innerHTML = '<div style="text-align:center; color:var(--text-muted);">Audit log unavailable: ' + err.message + '</div>';
+                    box.innerHTML = '<div style="text-align:center; color:var(--text-muted);">Audit log unavailable: ' + escapeHTML(err.message || '') + '</div>';
                 }
             },
 
@@ -1101,7 +1194,7 @@
                     return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
                 };
 
-                var rows = [['Name', 'Email', 'Role', 'Tier', 'Status', 'Joined']];
+                var rows = [['Name', 'Email', 'Role', 'Tier', 'Status', 'Email verified', 'Joined']];
 
                 this.filteredUsers.forEach(function(u) {
                     rows.push([
@@ -1110,6 +1203,7 @@
                         u.role,
                         u.subscription_tier || 'free',
                         u.status,
+                        u.email_verified === false ? 'no' : 'yes',
                         u.created_at ? new Date(u.created_at).toLocaleDateString() : '-'
                     ].map(csvEscape));
                 });
@@ -1125,6 +1219,14 @@
                 a.remove();
                 URL.revokeObjectURL(url);
             }
+        };
+
+        window.um8AccountMgmtCloseModal = function () {
+            if (window.AccountMgmt) window.AccountMgmt.closeModal();
+        };
+        window.um8AuditDetailsModalClose = function () {
+            var m = document.getElementById('auditDetailsModal');
+            if (m) m.classList.remove('active');
         };
 
         // ──────────────────────────────────────────────────────────
@@ -1188,6 +1290,11 @@
                 }
                 if (label) label.textContent = level.text;
             });
+        }
+
+        var verifyEmailBtn = document.getElementById('adminVerifyEmailBtn');
+        if (verifyEmailBtn) {
+            verifyEmailBtn.addEventListener('click', function() { AccountMgmt.verifyEmailManually(); });
         }
 
         // Email change button
@@ -1312,6 +1419,7 @@
             isLoading: false,
             hasMore: false,
             searchTimer: null,
+            _detailSlots: [],
 
             async load(append) {
                 if (this.isLoading) return;
@@ -1351,7 +1459,7 @@
                 } catch (err) {
                     console.error('[AuditLog] Load error:', err);
                     if (tbody) {
-                        tbody.innerHTML = '<tr><td colspan="8" class="empty-state" style="color:#ef4444;"><i class="fas fa-exclamation-circle"></i> Error: ' + err.message + '</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="8" class="empty-state" style="color:#ef4444;"><i class="fas fa-exclamation-circle"></i> Error: ' + escapeHTML(err.message || '') + '</td></tr>';
                     }
                     window.showToast('Audit log error: ' + err.message, 'error');
                 } finally {
@@ -1408,36 +1516,53 @@
                     'SYSTEM':   'fas fa-server'
                 };
 
+                var detailSlots = [];
+                var self = this;
                 tbody.innerHTML = display.map(function(ev) {
                     var cat   = ev.event_category || 'SYSTEM';
-                    var icon  = catIcons[cat] || 'fas fa-circle';
+                    var catClass = /^[A-Za-z0-9_]+$/.test(cat) ? cat : 'SYSTEM';
+                    var icon  = catIcons[cat] || catIcons[catClass] || 'fas fa-circle';
                     var sev   = ev.severity || 'INFO';
+                    var sevClass = /^[A-Za-z0-9_]+$/.test(sev) ? sev : 'INFO';
                     var ts    = ev.created_at ? new Date(ev.created_at).toLocaleString() : '-';
                     var actor = ev.actor_email || ev.actor_name || '-';
-                    var actorName = ev.actor_name ? '<small>' + ev.actor_name + '</small>' : '';
+                    var actorName = ev.actor_name ? '<small>' + escapeHTML(ev.actor_name) + '</small>' : '';
                     var resource  = ev.resource_type ? (ev.resource_type + (ev.resource_id ? ': ' + String(ev.resource_id).slice(0, 24) : '')) : '-';
-                    var detailsJson = JSON.stringify(ev.details || {}, null, 2);
+                    var resourceEsc = escapeHTML(resource);
                     var hasDetails = ev.details && Object.keys(ev.details).length > 0;
                     var outcome = ev.outcome || 'SUCCESS';
                     var outcomeStyle = outcome === 'SUCCESS' ? 'color:#22c55e' : 'color:#ef4444';
 
                     return '<tr>' +
-                        '<td><span class="ev-cat ' + cat + '"><i class="' + icon + '" style="font-size:0.65rem;"></i> ' + cat + '</span></td>' +
-                        '<td><div class="ev-action">' + (ev.action || '-') + '</div>' +
-                            '<div style="font-size:0.65rem;' + outcomeStyle + ';">' + outcome + '</div>' +
+                        '<td><span class="ev-cat ' + catClass + '"><i class="' + icon + '" style="font-size:0.65rem;"></i> ' + escapeHTML(cat) + '</span></td>' +
+                        '<td><div class="ev-action">' + escapeHTML(ev.action || '-') + '</div>' +
+                            '<div style="font-size:0.65rem;' + outcomeStyle + ';">' + escapeHTML(outcome) + '</div>' +
                         '</td>' +
-                        '<td><div class="ev-actor">' + actor + actorName + '</div></td>' +
-                        '<td><div class="ev-resource" title="' + resource + '">' + resource + '</div></td>' +
-                        '<td><span class="ev-sev ' + sev + '">' + sev + '</span></td>' +
-                        '<td><span style="font-size:0.72rem;color:var(--text-muted);font-family:monospace;">' + (ev.ip_address || '-') + '</span></td>' +
-                        '<td><div class="ev-time">' + ts + '</div></td>' +
-                        '<td>' + (hasDetails ? '<button class="ev-details-btn" onclick="AuditLog.showDetails(' + JSON.stringify(JSON.stringify(ev)).slice(1,-1).replace(/'/g,'&#39;') + ')"><i class="fas fa-code"></i></button>' : '-') + '</td>' +
+                        '<td><div class="ev-actor">' + escapeHTML(actor) + actorName + '</div></td>' +
+                        '<td><div class="ev-resource" title="' + resourceEsc + '">' + resourceEsc + '</div></td>' +
+                        '<td><span class="ev-sev ' + sevClass + '">' + escapeHTML(sev) + '</span></td>' +
+                        '<td><span style="font-size:0.72rem;color:var(--text-muted);font-family:monospace;">' + escapeHTML(ev.ip_address || '-') + '</span></td>' +
+                        '<td><div class="ev-time">' + escapeHTML(ts) + '</div></td>' +
+                        '<td>' + (function () {
+                            if (!hasDetails) return '-';
+                            detailSlots.push(JSON.stringify(ev));
+                            var slot = detailSlots.length - 1;
+                            return '<button type="button" class="ev-details-btn" data-um8-fn="um8AuditOpenDetailSlot" data-um8-arg="' + slot + '"><i class="fas fa-code"></i></button>';
+                        })() + '</td>' +
                     '</tr>';
                 }).join('');
+                self._detailSlots = detailSlots;
 
                 if (pageInfo) pageInfo.textContent = 'Showing ' + display.length + ' events (offset ' + this.offset + ')';
                 if (prevBtn) prevBtn.disabled = this.offset === 0;
                 if (nextBtn) nextBtn.disabled = !this.hasMore;
+            },
+
+            openDetailsSlot(_ev, slotStr) {
+                var i = parseInt(String(slotStr), 10);
+                if (isNaN(i) || i < 0 || i >= (this._detailSlots || []).length) return;
+                var raw = this._detailSlots[i];
+                if (raw) this.showDetails(raw);
             },
 
             showDetails(evJson) {
@@ -1517,15 +1642,22 @@
 
             async trackUIAction(action, resourceType, resourceId) {
                 try {
-                    var token = window.getAccessToken ? window.getAccessToken() : null;
-                    if (!token) return;
-                    var baseUrl = window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : '');
-                    await fetch(baseUrl + '/api/activity/log', {
+                    await window.apiCall('/api/activity/log', {
                         method: 'POST',
-                        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ action: action, event_category: 'UI_ACTION', resource_type: resourceType, resource_id: String(resourceId || '') })
+                        body: JSON.stringify({
+                            action: action,
+                            event_category: 'UI_ACTION',
+                            resource_type: resourceType,
+                            resource_id: String(resourceId || ''),
+                        }),
                     });
                 } catch (e) { /* silent — never break UI for audit tracking */ }
+            }
+        };
+
+        window.um8AuditOpenDetailSlot = function (ev, slotStr) {
+            if (window.AuditLog && typeof AuditLog.openDetailsSlot === 'function') {
+                AuditLog.openDetailsSlot(ev, slotStr);
             }
         };
 
@@ -1578,11 +1710,16 @@
         });
 
         // ──────────────────────────────────────────────────────────
-        // LOAD INITIAL DATA
+        // LOAD INITIAL DATA (full user list is heavy — defer so shell + table paint first)
         // ──────────────────────────────────────────────────────────
-        await AccountMgmt.loadUsers();
+        const runInitialUsers = function() { AccountMgmt.loadUsers(); };
+        if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback(runInitialUsers, { timeout: 6000 });
+        } else {
+            setTimeout(runInitialUsers, 200);
+        }
 
-        console.log('[Account Mgmt] ✅ Initialization complete — all 8 steps executed');
+        console.log('[Account Mgmt]  Initialization complete — all 8 steps executed');
 
     })();
     </script>

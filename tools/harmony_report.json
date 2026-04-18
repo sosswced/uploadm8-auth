@@ -1,0 +1,41 @@
+{
+  "route_count": 171,
+  "api_refs": {
+    "checked_refs": 328,
+    "missing_endpoints": {}
+  },
+  "links": {
+    "checked_links": 611,
+    "checked_scripts": 428,
+    "missing_links": [
+      [
+        "frontend\\analytics.html",
+        "'+escapeHtml(href)+'"
+      ],
+      [
+        "frontend\\analytics.html",
+        "'+escapeHtml(href)+'"
+      ]
+    ],
+    "missing_scripts": [
+      [
+        "frontend\\analytics.html",
+        "'+escapeHtml(u.thumbnail_url)+'"
+      ]
+    ],
+    "missing_viewport": [],
+    "no_media_queries": [
+      "frontend\\admin-users.html",
+      "frontend\\billing.html",
+      "frontend\\success.html"
+    ]
+  },
+  "python": {
+    "python_files": 299,
+    "errors": []
+  },
+  "javascript": {
+    "js_files": 18,
+    "errors": []
+  }
+}

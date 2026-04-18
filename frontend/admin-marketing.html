@@ -1,0 +1,1030 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+    <script src="js/html-safe.js"></script>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Marketing Ops - Admin - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+    <style>
+        .ops-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1rem; }
+        .ops-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1rem; }
+        .ops-card .label { color: var(--text-muted); font-size: .74rem; text-transform: uppercase; letter-spacing: .04em; margin-bottom: .4rem; display: flex; gap: .45rem; align-items: center; }
+        .ops-card .value { font-size: 1.45rem; font-weight: 700; color: var(--text-primary); }
+        .ops-card .sub { margin-top: .3rem; color: var(--text-secondary); font-size: .78rem; }
+        .section-header { display:flex; align-items:center; gap:.65rem; margin:1.75rem 0 .85rem; padding-bottom:.45rem; border-bottom: 2px solid var(--border-color); }
+        .section-header i { color: #f97316; }
+        .pill { display:inline-flex; align-items:center; padding:.18rem .46rem; border-radius:999px; font-size:.68rem; font-weight:700; }
+        .pill.good { background: rgba(34,197,94,.17); color:#22c55e; }
+        .pill.warn { background: rgba(251,191,36,.17); color:#f59e0b; }
+        .pill.hot { background: rgba(239,68,68,.17); color:#ef4444; }
+        .table-wrap { overflow:auto; border: 1px solid var(--border-color); border-radius: 10px; }
+        .table { width:100%; border-collapse: collapse; min-width: 980px; }
+        .table th, .table td { padding:.62rem .66rem; border-bottom:1px solid var(--border-color); text-align:left; font-size:.82rem; }
+        .table th { color: var(--text-muted); text-transform: uppercase; letter-spacing: .03em; font-size: .7rem; }
+        .table tr:hover { background: rgba(249,115,22,.05); }
+        .controls { display:flex; gap:.65rem; flex-wrap: wrap; align-items: center; }
+        .controls .form-input, .controls .form-select { min-height: 38px; }
+        .schedule-item { padding:.55rem 0; border-bottom:1px solid var(--border-color); display:flex; justify-content:space-between; gap:.6rem; }
+        .muted { color: var(--text-secondary); }
+        .badge-tier { padding:.17rem .45rem; border-radius: 6px; font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+        .tier-free { background: rgba(107,114,128,.2); color:#9ca3af; }
+        .tier-creator_lite,.tier-launch { background: rgba(59,130,246,.2); color:#3b82f6; }
+        .tier-creator_pro { background: rgba(249,115,22,.2); color:#f97316; }
+        .tier-studio { background: rgba(139,92,246,.2); color:#8b5cf6; }
+        .tier-agency { background: rgba(236,72,153,.2); color:#ec4899; }
+        .campaign-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:.7rem; }
+        .campaign-grid .form-input,.campaign-grid .form-select { width:100%; }
+        .campaign-list-item { border:1px solid var(--border-color); border-radius:8px; padding:.65rem .75rem; margin-bottom:.55rem; background: var(--bg-card); }
+        .campaign-actions { display:flex; gap:.4rem; flex-wrap:wrap; margin-top:.45rem; }
+        .btn-mini { border:1px solid var(--border-color); background:var(--bg-input); color:var(--text-primary); border-radius:6px; padding:.28rem .5rem; font-size:.72rem; cursor:pointer; }
+        .ai-box { border:1px solid var(--border-color); border-radius:10px; padding:.75rem; background:var(--bg-card); }
+        .ai-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap:.6rem; }
+        .modal-overlay { position:fixed; inset:0; background:rgba(15,23,42,.55); z-index:1200; display:flex; align-items:center; justify-content:center; padding:1rem; }
+        .modal-panel { background:var(--bg-card); border:1px solid var(--border-color); border-radius:12px; max-width:520px; width:100%; max-height:85vh; overflow:auto; padding:1.15rem 1.25rem; box-shadow:0 20px 50px rgba(0,0,0,.35); }
+        .modal-panel h3 { margin:0 0 .5rem; font-size:1.05rem; }
+        .modal-panel .approval-item { border:1px solid var(--border-color); border-radius:8px; padding:.55rem .65rem; margin:.45rem 0; font-size:.82rem; }
+
+        /* ── Mobile overrides for Marketing Ops ── */
+        @media (max-width: 768px) {
+            .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+            .controls { flex-direction: column; align-items: flex-start; width: 100%; }
+            .controls .form-input, .controls .form-select { width: 100%; }
+        }
+        @media (max-width: 600px) {
+            .ops-grid { grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+            .campaign-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app-layout">
+        <aside class="sidebar" id="sidebar"></aside>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+        <header class="top-bar">
+            <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+            <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+            <div class="top-bar-actions">
+                <div data-wt-pills></div>
+                <button class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle Theme"><i class="fas fa-moon"></i></button>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <div id="loadingState" style="display:flex;align-items:center;justify-content:center;min-height:50vh;flex-direction:column;gap:1rem;">
+                <div style="width:40px;height:40px;border:3px solid var(--border-color);border-top-color:var(--accent-orange);border-radius:50%;animation:spin 1s linear infinite;"></div>
+                <div>Loading Marketing Ops...</div>
+            </div>
+            <div id="accessDenied" style="display:none;align-items:center;justify-content:center;min-height:50vh;flex-direction:column;gap:1rem;text-align:center;">
+                <h2>Access Denied</h2>
+                <p class="muted">Admin privileges required.</p>
+                <a href="dashboard.html" class="btn btn-primary">Return to Dashboard</a>
+            </div>
+
+            <div id="approvalModal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="approvalModalTitle">
+                <div class="modal-panel" style="position:relative;">
+                    <button type="button" class="btn btn-secondary" data-um8-fn="hideApprovalModal" style="position:absolute;top:0.75rem;right:0.75rem;min-width:auto;padding:0.35rem 0.55rem;font-size:1rem;line-height:1;" aria-label="Close">&times;</button>
+                    <h3 id="approvalModalTitle"><i class="fas fa-shield-halved" style="color:#f97316;"></i> Outbound approval required</h3>
+                    <p class="muted" style="font-size:.85rem;margin:0 0 .75rem;">Email / Discord / mixed campaigns stay in <strong>pending approval</strong> until a master admin approves. A reminder is also sent to the admin Discord webhook (deduped ~2h).</p>
+                    <div id="approvalModalList"></div>
+                    <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.85rem;">
+                        <button type="button" class="btn btn-secondary" id="approvalModalDismiss" data-um8-fn="hideApprovalModal">Dismiss</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="content" style="display:none;">
+                <div class="page-header" style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;flex-wrap:wrap;">
+                    <div>
+                        <h1 class="page-title">Marketing Ops Intelligence</h1>
+                        <p class="page-subtitle">Outreach, promo timing, and hints about who may need a bigger plan or more credits. Click-through rates here measure in-app tips and banners, not video watch metrics or Pikzels scores. Thumbnail Studio is powered by <a href="https://pikzels.com/" target="_blank" rel="noopener noreferrer">Pikzels</a> — open <a href="thumbnail-studio.html">Thumbnail Studio</a> or their <a href="https://docs.pikzels.com/" target="_blank" rel="noopener noreferrer">documentation</a> for product detail.</p>
+                        <p id="thumbProviderIntegration" class="muted" style="font-size:0.82rem;margin-top:0.35rem;"></p>
+                        <p id="marketingPikzelsV2Line" class="muted" style="font-size:0.8rem;margin-top:0.25rem;"></p>
+                    </div>
+                    <div class="controls">
+                        <select id="rangeSelect" class="form-select">
+                            <option value="7d">Last 7 Days</option>
+                            <option value="30d" selected>Last 30 Days</option>
+                            <option value="90d">Last 90 Days</option>
+                            <option value="6m">Last 6 Months</option>
+                            <option value="1y">Last Year</option>
+                        </select>
+                        <input id="searchInput" class="form-input" placeholder="Search customer by email or name..." />
+                        <button id="refreshBtn" class="btn btn-secondary"><i class="fas fa-sync-alt"></i> Refresh</button>
+                        <span id="marketingOpsHealth" class="muted" style="font-size:0.8rem;align-self:center;" title="Last data refresh">Updated: —</span>
+                    </div>
+                </div>
+
+                <div class="section-header"><i class="fas fa-chart-line"></i><h2>Marketing Funnel</h2></div>
+                <div class="ops-grid">
+                    <div class="ops-card"><div class="label"><i class="fas fa-eye"></i> Nudges Shown</div><div class="value" id="fShown">--</div><div class="sub">Contextual opportunities delivered</div></div>
+                    <div class="ops-card"><div class="label"><i class="fas fa-mouse-pointer"></i> CTR</div><div class="value" id="fCtr">--%</div><div class="sub" id="fClicks">-- clicks</div></div>
+                    <div class="ops-card"><div class="label"><i class="fas fa-times"></i> Dismiss Rate</div><div class="value" id="fDismiss">--%</div><div class="sub" id="fDismissCount">-- dismissed</div></div>
+                    <div class="ops-card"><div class="label"><i class="fas fa-money-bill-wave"></i> Session Attributed</div><div class="value" id="fSessionRev">$--</div><div class="sub">Same-session influenced revenue</div></div>
+                    <div class="ops-card"><div class="label"><i class="fas fa-calendar-check"></i> 7-Day View-Through</div><div class="value" id="f7dRev">$--</div><div class="sub">Post-view conversion revenue</div></div>
+                </div>
+
+                <div class="section-header"><i class="fas fa-bullseye"></i><h2>Business Need Signals</h2></div>
+                <div class="ops-grid">
+                    <div class="ops-card"><div class="label"><i class="fas fa-users"></i> Free Uploaders (7d)</div><div class="value" id="lFree">--</div><div class="sub">Upgrade-ready active cohort</div></div>
+                    <div class="ops-card"><div class="label"><i class="fas fa-battery-quarter"></i> Low PUT (0-29)</div><div class="value" id="lPut">--</div><div class="sub">Near-blocking monetization pressure</div></div>
+                    <div class="ops-card"><div class="label"><i class="fas fa-robot"></i> Low AIC (0-9)</div><div class="value" id="lAic">--</div><div class="sub">AI upsell opportunity</div></div>
+                    <div class="ops-card"><div class="label"><i class="fas fa-network-wired"></i> 3+ Platform Accounts</div><div class="value" id="lMulti">--</div><div class="sub">Flex/team/enterprise expansion fit</div></div>
+                </div>
+
+                <div class="section-header"><i class="fas fa-clock"></i><h2>Promo Timing + Comms Plan</h2></div>
+                <div class="card">
+                    <div class="card-body">
+                        <div id="scheduleList" class="muted">Loading schedule intelligence...</div>
+                        <div id="commsList" style="margin-top:.75rem;"></div>
+                    </div>
+                </div>
+
+                <div class="section-header"><i class="fas fa-wand-magic-sparkles"></i><h2>AI Strategist</h2></div>
+                <div class="card" style="margin-bottom:1rem;">
+                    <div class="card-body">
+                        <div class="ai-grid">
+                            <div><label class="form-label">Objective</label><select id="aiObjective" class="form-select"><option value="revenue_growth">Revenue Growth</option><option value="upsell_conversion">Upsell Conversion</option><option value="retention_save">Retention Save</option><option value="enterprise_expansion">Enterprise Expansion</option></select></div>
+                            <div><label class="form-label">Tone</label><select id="aiTone" class="form-select"><option value="executive_clear">Executive Clear</option><option value="premium_confident">Premium Confident</option><option value="creator_friendly">Creator Friendly</option></select></div>
+                            <div><label class="form-label">Offer Style</label><select id="aiOfferStyle" class="form-select"><option value="value_first">Value First</option><option value="discount_forward">Discount Forward</option><option value="roi_anchored">ROI Anchored</option></select></div>
+                            <div><label class="form-label">Channel Mix</label><select id="aiChannelMix" class="form-select"><option value="mixed">Mixed</option><option value="in_app">In-App</option><option value="email">Email</option><option value="discount">Discount</option></select></div>
+                            <div><label class="form-label">Force Deploy (override guardrails)</label><select id="aiForceDeploy" class="form-select"><option value="false" selected>No</option><option value="true">Yes</option></select></div>
+                            <div><label class="form-label">Allow PII in LLM prompt</label><select id="aiAllowPii" class="form-select"><option value="false" selected>No (sanitized)</option><option value="true">Yes</option></select></div>
+                        </div>
+                        <div style="margin-top:.65rem; display:flex; gap:.55rem; flex-wrap:wrap;">
+                            <button id="aiGenerateBtn" class="btn btn-primary"><i class="fas fa-brain"></i> Generate AI Plan</button>
+                            <button id="aiDeployBtn" class="btn btn-secondary"><i class="fas fa-rocket"></i> Deploy AI Campaign</button>
+                            <button id="aiApplyBtn" class="btn btn-secondary"><i class="fas fa-arrow-down"></i> Apply to Campaign Builder</button>
+                            <span id="aiStatus" class="muted" style="align-self:center;">Ready</span>
+                        </div>
+                        <div id="aiOutput" class="ai-box muted" style="margin-top:.75rem;">Generate to see newsletter subjects, offer strategy, and execution plan.</div>
+                    </div>
+                </div>
+
+                <div class="section-header"><i class="fas fa-shield-check"></i><h2>Truth Dashboard (AI Decision Inputs)</h2></div>
+                <div class="card" style="margin-bottom:1rem;">
+                    <div class="card-body">
+                        <div id="truthSummary" class="muted">Loading last AI decision...</div>
+                        <div style="margin-top:.55rem;display:flex;gap:.5rem;flex-wrap:wrap;">
+                            <button id="truthToggleRawBtn" class="btn-mini"><i class="fas fa-code"></i> Toggle Raw Snapshot</button>
+                        </div>
+                        <div id="truthMetrics" class="ai-box" style="margin-top:.7rem;">No metrics yet.</div>
+                        <pre id="truthRaw" class="ai-box" style="display:none;margin-top:.7rem;white-space:pre-wrap;max-height:280px;overflow:auto;"></pre>
+                    </div>
+                </div>
+                <div class="card" style="margin-bottom:1rem;">
+                    <div class="card-header"><h3 class="card-title"><i class="fas fa-history"></i> AI Decision Audit Trail</h3></div>
+                    <div class="card-body">
+                        <div style="margin-bottom:.55rem;">
+                            <button id="exportDecisionCsvBtn" class="btn-mini"><i class="fas fa-file-csv"></i> Export Audit CSV</button>
+                        </div>
+                        <div id="decisionLog" class="muted">Loading decision log...</div>
+                    </div>
+                </div>
+                <div class="card" style="margin-bottom:1rem;">
+                    <div class="card-header"><h3 class="card-title"><i class="fas fa-microscope"></i> ML Priors Debug (live applied bias)</h3></div>
+                    <div class="card-body">
+                        <div style="display:flex;gap:.55rem;flex-wrap:wrap;align-items:center;margin-bottom:.55rem;">
+                            <label class="form-label" for="mlSinceHours" style="margin:0;">Window</label>
+                            <select id="mlSinceHours" class="form-select" style="max-width:120px;">
+                                <option value="24">24h</option>
+                                <option value="72" selected>72h</option>
+                                <option value="168">7d</option>
+                                <option value="720">30d</option>
+                            </select>
+                            <label class="form-label" for="mlLimit" style="margin:0;">Rows</label>
+                            <select id="mlLimit" class="form-select" style="max-width:100px;">
+                                <option value="25">25</option>
+                                <option value="50" selected>50</option>
+                                <option value="100">100</option>
+                                <option value="200">200</option>
+                            </select>
+                            <button id="mlPriorsRefreshBtn" class="btn-mini"><i class="fas fa-sync-alt"></i> Refresh ML Debug</button>
+                        </div>
+                        <div id="mlPriorsSummary" class="muted">Loading ML prior signals...</div>
+                        <div id="mlPriorsLog" class="ai-box" style="margin-top:.7rem;max-height:320px;overflow:auto;">No ML debug rows yet.</div>
+                    </div>
+                </div>
+                <div class="card" style="margin-bottom:1rem;">
+                    <div class="card-header"><h3 class="card-title"><i class="fas fa-trophy"></i> Thumbnail variant leaderboard (ML loop)</h3></div>
+                    <div class="card-body">
+                        <p class="muted" style="font-size:.82rem;margin:0 0 .55rem;">Selections and linked upload views from <code>ml_outcome_labels</code> + studio feedback.</p>
+                        <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.55rem;">
+                            <button type="button" id="mlLeaderboardBtn" class="btn-mini"><i class="fas fa-sync-alt"></i> Refresh leaderboard</button>
+                            <button type="button" id="mlPromoEvalBtn" class="btn-mini"><i class="fas fa-scale-balanced"></i> Run promotion eval</button>
+                        </div>
+                        <div id="mlLeaderboardOut" class="ai-box muted" style="max-height:220px;overflow:auto;">Load to see ranked variants.</div>
+                        <div id="mlPromoEvalOut" class="muted" style="margin-top:.5rem;font-size:.8rem;"></div>
+                    </div>
+                </div>
+
+                <div class="section-header"><i class="fas fa-building"></i><h2>Enterprise & Account Intelligence</h2></div>
+                <div class="card">
+                    <div class="card-body">
+                        <div class="table-wrap">
+                            <table class="table">
+                                <thead>
+                                    <tr>
+                                        <th>Account</th>
+                                        <th>Tier</th>
+                                        <th>Enterprise Fit</th>
+                                        <th>Uploads (window)</th>
+                                        <th>Revenue (window)</th>
+                                        <th>Nudge CTR</th>
+                                        <th>Connected Accounts</th>
+                                        <th>Recommended Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="accountsBody">
+                                    <tr><td colspan="8" class="muted">Loading account intelligence...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section-header"><i class="fas fa-bullhorn"></i><h2>Campaign Execution</h2></div>
+                <div class="card" style="margin-bottom:1rem;">
+                    <div class="card-body">
+                        <div class="campaign-grid">
+                            <div><label class="form-label">Campaign Name</label><input id="cmpName" class="form-input" placeholder="Q2 Enterprise Expansion Push"></div>
+                            <div><label class="form-label">Channel</label><select id="cmpChannel" class="form-select"><option value="in_app">In-App</option><option value="email">Email</option><option value="discord">Discord (in-app prompt)</option><option value="discount">Discount</option><option value="mixed">Mixed</option></select></div>
+                            <div><label class="form-label">Range</label><select id="cmpRange" class="form-select"><option value="7d">7d</option><option value="30d" selected>30d</option><option value="90d">90d</option><option value="6m">6m</option></select></div>
+                            <div><label class="form-label">Schedule At (UTC)</label><input id="cmpScheduleAt" type="datetime-local" class="form-input"></div>
+                            <div><label class="form-label">Min Uploads</label><input id="cmpMinUploads" type="number" min="0" value="3" class="form-input"></div>
+                            <div><label class="form-label">Min Enterprise Fit Score</label><input id="cmpMinScore" type="number" min="0" max="100" value="45" class="form-input"></div>
+                            <div><label class="form-label">Min Nudge CTR %</label><input id="cmpMinCtr" type="number" min="0" max="100" value="8" class="form-input"></div>
+                            <div><label class="form-label">Tier Filter (csv)</label><input id="cmpTiers" class="form-input" placeholder="free,creator_lite,creator_pro"></div>
+                        </div>
+                        <div style="margin-top:.7rem;">
+                            <label class="form-label">Objective</label>
+                            <textarea id="cmpObjective" class="form-input" style="min-height:74px;" placeholder="Goal, offer, and outcome"></textarea>
+                        </div>
+                        <div style="margin-top:.55rem;">
+                            <label class="form-label">Notes</label>
+                            <textarea id="cmpNotes" class="form-input" style="min-height:62px;" placeholder="Discount terms, copy draft, owner"></textarea>
+                        </div>
+                        <div style="margin-top:.65rem;">
+                            <label class="form-label">Email subject (use {{name}})</label>
+                            <input id="cmpTplSubject" class="form-input" placeholder="Hi {{name}} — quick UploadM8 tip" />
+                        </div>
+                        <div style="margin-top:.5rem;">
+                            <label class="form-label">Email HTML body</label>
+                            <textarea id="cmpTplHtml" class="form-input" style="min-height:100px;" placeholder="<p>Hi {{name}},</p><p>...</p>"></textarea>
+                        </div>
+                        <div style="margin-top:.5rem;">
+                            <label class="form-label">Discord / in-app message (use {{name}})</label>
+                            <textarea id="cmpTplDiscord" class="form-input" style="min-height:72px;" placeholder="Short line for in-app Discord-style prompt"></textarea>
+                        </div>
+                        <div style="display:flex; gap:.55rem; margin-top:.75rem; flex-wrap:wrap;">
+                            <label style="display:flex;align-items:center;gap:.4rem;"><input id="cmpNoRev7d" type="checkbox"> Require no revenue in last 7d</label>
+                            <button id="cmpPreviewBtn" class="btn btn-secondary"><i class="fas fa-users"></i> Preview Audience</button>
+                            <button id="cmpSaveBtn" class="btn btn-primary"><i class="fas fa-save"></i> Save Campaign</button>
+                            <button id="cmpExecTickBtn" type="button" class="btn btn-secondary" title="Run approved outbound sends (rate-limited)"><i class="fas fa-paper-plane"></i> Run execution tick</button>
+                            <span id="cmpPreviewOut" class="muted" style="align-self:center;">Audience: --</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-header"><h3 class="card-title"><i class="fas fa-list"></i> Saved Campaigns</h3></div>
+                    <div class="card-body"><div id="campaignList" class="muted">Loading campaigns...</div></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
+    <script src="app.js"></script>
+    <script src="wallet-tokens.js"></script>
+    <script>
+    (function () {
+        'use strict';
+
+        function fmtNum(v) { const n = Number(v || 0); return isFinite(n) ? n.toLocaleString() : '--'; }
+        function fmtPct(v) { const n = Number(v || 0); return isFinite(n) ? n.toFixed(2) + '%' : '--%'; }
+        function fmtMoney(v) { const n = Number(v || 0); return isFinite(n) ? ('$' + Math.round(n).toLocaleString()) : '$--'; }
+        function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
+        function tierCls(t) { return 'tier-' + String(t || 'free').toLowerCase(); }
+        let _lastAI = null;
+        let _approvalModalSeen = false;
+
+        function isMasterAdmin() {
+            const u = window.currentUser;
+            if (!u) return false;
+            return String(u.role || '').toLowerCase() === 'master_admin';
+        }
+
+        function showApprovalModal(pendingRows) {
+            const modal = document.getElementById('approvalModal');
+            const list = document.getElementById('approvalModalList');
+            if (!modal || !list || !isMasterAdmin()) return;
+            if (!pendingRows || !pendingRows.length) return;
+            list.innerHTML = pendingRows.map(function (p) {
+                return '<div class="approval-item"><strong>' + (p.name || 'Campaign') + '</strong> · ' + (p.channel || '') + ''
+                    + '<div class="muted" style="margin-top:.25rem;">' + (p.objective || '').slice(0, 160) + '</div>'
+                    + '<div style="margin-top:.4rem;"><button type="button" class="btn-mini" data-approve-id="' + p.id + '"><i class="fas fa-check"></i> Approve & activate</button></div></div>';
+            }).join('');
+            modal.style.display = 'flex';
+            _approvalModalSeen = true;
+        }
+
+        function hideApprovalModal() {
+            const modal = document.getElementById('approvalModal');
+            if (modal) modal.style.display = 'none';
+        }
+        window.hideApprovalModal = hideApprovalModal;
+
+        function renderMarketingHealth() {
+            const el = document.getElementById('marketingOpsHealth');
+            if (!el) return;
+            const s = window._marketingOpsHealthState || { status: 'idle', message: 'Updated: —' };
+            let color = 'var(--text-muted)';
+            if (s.status === 'ok') color = '#22c55e';
+            else if (s.status === 'loading') color = '#f59e0b';
+            else if (s.status === 'error') color = '#ef4444';
+            el.style.color = color;
+            el.textContent = s.message;
+        }
+
+        async function loadData() {
+            window._marketingOpsHealthState = { status: 'loading', message: 'Refreshing…' };
+            renderMarketingHealth();
+            try {
+                const range = document.getElementById('rangeSelect').value || '30d';
+                const q = encodeURIComponent((document.getElementById('searchInput').value || '').trim());
+                const mlHours = Number((document.getElementById('mlSinceHours') || {}).value || 72);
+                const mlLimit = Number((document.getElementById('mlLimit') || {}).value || 50);
+                const [intel, accountsRes, campaignsRes, truthRes, decisionRes, mlRes] = await Promise.all([
+                    window.apiCall('/api/admin/marketing/intel?range=' + encodeURIComponent(range)).catch(() => null),
+                    window.apiCall('/api/admin/marketing/accounts?range=' + encodeURIComponent(range) + '&q=' + q + '&limit=150').catch(() => null),
+                    window.apiCall('/api/admin/marketing/campaigns?limit=100').catch(() => null),
+                    window.apiCall('/api/admin/marketing/ai/truth').catch(() => null),
+                    window.apiCall('/api/admin/marketing/ai/decisions?limit=40').catch(() => null),
+                    window.apiCall('/api/admin/ml/priors/latest?since_hours=' + encodeURIComponent(mlHours) + '&limit=' + encodeURIComponent(mlLimit)).catch(() => null),
+                ]);
+                if (intel) renderIntel(intel);
+                renderAccounts((accountsRes && accountsRes.accounts) ? accountsRes.accounts : []);
+                renderCampaigns((campaignsRes && campaignsRes.campaigns) ? campaignsRes.campaigns : []);
+                renderTruth(truthRes || {});
+                renderDecisionLog((decisionRes && decisionRes.decisions) ? decisionRes.decisions : []);
+                renderMlPriors(mlRes || {});
+                await loadMarketingPikzelsV2();
+                const hb = await window.apiCall('/api/admin/marketing/execution/heartbeat').catch(function () { return null; });
+                if (hb && hb.pending_count > 0 && isMasterAdmin() && !_approvalModalSeen) {
+                    showApprovalModal(hb.pending || []);
+                }
+                window._marketingOpsHealthState = { status: 'ok', message: 'Updated ' + new Date().toLocaleTimeString() };
+                renderMarketingHealth();
+            } catch (e) {
+                window._marketingOpsHealthState = { status: 'error', message: 'Could not load · ' + ((e && e.message) ? e.message : String(e)) };
+                renderMarketingHealth();
+                if (window.showToast) window.showToast('Marketing data load failed', 'error');
+            }
+        }
+
+        async function generateAIPlan() {
+            const range = document.getElementById('rangeSelect').value || '30d';
+            const payload = {
+                range: range,
+                objective: document.getElementById('aiObjective').value || 'revenue_growth',
+                tone: document.getElementById('aiTone').value || 'executive_clear',
+                offer_style: document.getElementById('aiOfferStyle').value || 'value_first',
+                channel_mix: document.getElementById('aiChannelMix').value || 'mixed',
+                force_deploy: (document.getElementById('aiForceDeploy').value === 'true'),
+                allow_pii_in_llm: (document.getElementById('aiAllowPii') || {}).value === 'true',
+            };
+            const statusEl = document.getElementById('aiStatus');
+            const outEl = document.getElementById('aiOutput');
+            statusEl.textContent = 'Generating...';
+            outEl.textContent = 'Running AI strategist...';
+            const res = await window.apiCall('/api/admin/marketing/ai/generate', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+            }).catch(() => null);
+            if (!res || !res.plan) {
+                statusEl.textContent = 'Generation failed';
+                outEl.textContent = 'AI generation failed. Try again.';
+                return;
+            }
+            _lastAI = res;
+            statusEl.textContent = res.used_openai ? 'Generated with AI model' : 'Generated with deterministic strategist';
+            const p = res.plan || {};
+            const gp = p.game_plan || {};
+            const dq = gp.data_quality || {};
+            const ns = gp.north_star || {};
+            const subs = ((p.newsletter && p.newsletter.subject_lines) || []).slice(0, 5);
+            const offers = Array.isArray(p.offers) ? p.offers.slice(0, 5) : [];
+            const exec = Array.isArray(p.execution_plan) ? p.execution_plan.slice(0, 8) : [];
+            const conf = Number(gp.confidence_score || 0);
+            const confColor = conf >= 75 ? '#22c55e' : (conf >= 55 ? '#f59e0b' : '#ef4444');
+            const cov = Number(dq.platform_coverage_pct || 0);
+            const views = Number(ns.platform_views || 0);
+            const er = Number(ns.platform_engagement_rate_pct || 0);
+            outEl.innerHTML =
+                '<div style="margin-bottom:.7rem;padding:.55rem .65rem;background:rgba(249,115,22,.08);border:1px solid rgba(249,115,22,.25);border-radius:8px;">'
+                + '<div><strong>Plan Confidence</strong>: <span style="color:' + confColor + ';font-weight:700;">' + (isFinite(conf) ? conf.toFixed(1) : '0.0') + '/100</span></div>'
+                + '<div class="muted" style="margin-top:.2rem;">'
+                + 'Platform coverage: ' + (isFinite(cov) ? cov.toFixed(2) : '0.00') + '%'
+                + ' · Platform views: ' + fmtNum(views)
+                + ' · Platform engagement rate: ' + (isFinite(er) ? er.toFixed(2) : '0.00') + '%'
+                + '</div></div>'
+                + '<div><strong>Newsletter Subjects</strong><div class="muted" style="margin-top:.3rem;">'
+                + (subs.map(s => '• ' + s).join('<br>') || '—') + '</div></div>'
+                + '<div style="margin-top:.7rem;"><strong>Offers</strong><div class="muted" style="margin-top:.3rem;">'
+                + (offers.map(o => '• ' + (o.name || 'Offer') + ' — ' + (o.value_prop || '')).join('<br>') || '—') + '</div></div>'
+                + '<div style="margin-top:.7rem;"><strong>Execution Plan</strong><div class="muted" style="margin-top:.3rem;">'
+                + (exec.map(s => '• ' + s).join('<br>') || '—') + '</div></div>';
+        }
+
+        function applyAIToCampaignBuilder() {
+            if (!_lastAI || !_lastAI.plan || !_lastAI.plan.suggested_campaign) {
+                if (window.showToast) window.showToast('Generate AI plan first.', 'error');
+                return;
+            }
+            const s = _lastAI.plan.suggested_campaign;
+            const set = (id, val) => { const el = document.getElementById(id); if (el != null && val != null) el.value = String(val); };
+            set('cmpName', s.name || '');
+            set('cmpObjective', s.objective || '');
+            set('cmpChannel', s.channel || 'mixed');
+            set('cmpRange', s.range || (document.getElementById('rangeSelect').value || '30d'));
+            set('cmpMinUploads', s.min_uploads_30d || 0);
+            set('cmpMinScore', s.min_enterprise_fit_score || 0);
+            set('cmpMinCtr', s.min_nudge_ctr_pct || 0);
+            set('cmpTiers', Array.isArray(s.tiers) ? s.tiers.join(',') : '');
+            set('cmpNotes', s.notes || '');
+            const noRev = document.getElementById('cmpNoRev7d');
+            if (noRev) noRev.checked = !!s.require_no_revenue_7d;
+            if (window.showToast) window.showToast('AI plan applied to Campaign Builder.', 'success');
+        }
+
+        async function deployAICampaign() {
+            const range = document.getElementById('rangeSelect').value || '30d';
+            const payload = {
+                range: range,
+                objective: document.getElementById('aiObjective').value || 'revenue_growth',
+                tone: document.getElementById('aiTone').value || 'executive_clear',
+                offer_style: document.getElementById('aiOfferStyle').value || 'value_first',
+                channel_mix: document.getElementById('aiChannelMix').value || 'mixed',
+                allow_pii_in_llm: (document.getElementById('aiAllowPii') || {}).value === 'true',
+            };
+            const statusEl = document.getElementById('aiStatus');
+            statusEl.textContent = 'Deploying AI campaign...';
+            const res = await window.apiCall('/api/admin/marketing/ai/deploy', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+            }).catch(() => null);
+            if (!res) {
+                statusEl.textContent = 'Deploy failed';
+                if (window.showToast) window.showToast('AI deploy failed', 'error');
+                return;
+            }
+            if (res.status === 'blocked') {
+                const why = ((res.decision && res.decision.blocked_reasons) || []).join(' ');
+                statusEl.textContent = 'Blocked by factual guardrails';
+                if (window.showToast) window.showToast('AI deploy blocked: ' + (why || 'insufficient confidence signals'), 'warning');
+                return;
+            }
+            if (!res.deployed_campaign) {
+                statusEl.textContent = 'Deploy failed';
+                if (window.showToast) window.showToast('AI deploy failed', 'error');
+                return;
+            }
+            _lastAI = { plan: res.plan, snapshot: res.snapshot, used_openai: !!res.used_openai };
+            const confidence = (res.decision && res.decision.confidence_score != null) ? (' (confidence ' + res.decision.confidence_score + '/100)') : '';
+            statusEl.textContent = 'AI campaign deployed' + confidence;
+            if (window.showToast) window.showToast('AI campaign deployed to saved campaigns.' + confidence, 'success');
+            await loadData();
+        }
+
+        function renderIntel(data) {
+            const f = data.marketing_funnel || {};
+            const l = data.sales_opportunity_levers || {};
+            setText('fShown', fmtNum(f.shown));
+            setText('fCtr', fmtPct(f.ctr_pct));
+            setText('fClicks', fmtNum(f.clicked) + ' clicks');
+            setText('fDismiss', fmtPct(f.dismiss_rate_pct));
+            setText('fDismissCount', fmtNum(f.dismissed) + ' dismissed');
+            setText('fSessionRev', fmtMoney(f.same_session_attributed_revenue));
+            setText('f7dRev', fmtMoney(f.view_through_7d_attributed_revenue));
+
+            setText('lFree', fmtNum(l.free_users_uploading_last_7d));
+            setText('lPut', fmtNum(l.users_low_put_available_0_29));
+            setText('lAic', fmtNum(l.users_low_aic_available_0_9));
+            setText('lMulti', fmtNum(l.users_3plus_platform_connections));
+
+            const sched = Array.isArray(data.promo_schedule_recommendations) ? data.promo_schedule_recommendations : [];
+            const scheduleEl = document.getElementById('scheduleList');
+            if (scheduleEl) {
+                if (!sched.length) {
+                    scheduleEl.innerHTML = '<div class="muted">Not enough click→conversion signals yet. Keep collecting events.</div>';
+                } else {
+                    scheduleEl.innerHTML = sched.slice(0, 8).map((r, i) => {
+                        const hh = String(Number(r.hour_utc || 0)).padStart(2, '0') + ':00 UTC';
+                        return '<div class="schedule-item">'
+                            + '<div><strong>#' + (i + 1) + ' ' + (r.day || '—') + ' ' + hh + '</strong><div class="muted" style="font-size:.78rem;">'
+                            + fmtNum(r.clicks) + ' clicks · ' + fmtNum(r.conversions_7d) + ' conv (7d)</div></div>'
+                            + '<div class="pill ' + ((Number(r.conv_rate_7d || 0) >= 20) ? 'good' : (Number(r.conv_rate_7d || 0) >= 10) ? 'warn' : 'hot') + '">'
+                            + fmtPct(r.conv_rate_7d) + '</div></div>';
+                    }).join('');
+                }
+            }
+            const comms = Array.isArray(data.recommended_comms_plan) ? data.recommended_comms_plan : [];
+            const commsEl = document.getElementById('commsList');
+            if (commsEl) {
+                commsEl.innerHTML = comms.length
+                    ? '<div class="muted" style="font-size:.82rem;">' + comms.map(c =>
+                        '• <strong>' + (c.channel || 'channel') + '</strong> — '
+                        + (c.cadence || 'cadence') + ' · ' + (c.trigger || c.when || '')
+                    ).join('<br>') + '</div>'
+                    : '';
+            }
+        }
+
+        function actionFor(a) {
+            const tier = String(a.subscription_tier || 'free');
+            if ((a.enterprise_fit_score || 0) >= 75) return 'High-touch enterprise outreach';
+            if (tier === 'free' && (a.uploads_30d || 0) >= 8) return 'Upgrade sequence: Creator Lite';
+            if ((a.connected_accounts || 0) >= 3 && tier !== 'agency') return 'Flex / Studio / Agency consult';
+            if ((a.nudge_ctr_pct || 0) >= 15 && (a.revenue_30d || 0) <= 0) return 'Offer optimized discount test';
+            return 'Always-on nurture';
+        }
+
+        function renderAccounts(rows) {
+            const body = document.getElementById('accountsBody');
+            if (!body) return;
+            if (!rows.length) {
+                body.innerHTML = '<tr><td colspan="8" class="muted">No accounts found for this filter.</td></tr>';
+                return;
+            }
+            body.innerHTML = rows.map(a => {
+                const score = Number(a.enterprise_fit_score || 0);
+                const pill = score >= 75 ? 'good' : score >= 45 ? 'warn' : 'hot';
+                const nm = a.name || (a.email ? a.email.split('@')[0] : 'Unknown');
+                return '<tr>'
+                    + '<td><div style="font-weight:600;">' + nm + '</div><div class="muted" style="font-size:.75rem;">' + (a.email || '') + '</div></td>'
+                    + '<td><span class="badge-tier ' + tierCls(a.subscription_tier) + '">' + (a.subscription_tier || 'free') + '</span></td>'
+                    + '<td><span class="pill ' + pill + '">' + fmtPct(score) + '</span></td>'
+                    + '<td>' + fmtNum(a.uploads_30d) + '</td>'
+                    + '<td>' + fmtMoney(a.revenue_30d) + '</td>'
+                    + '<td>' + fmtPct(a.nudge_ctr_pct) + '</td>'
+                    + '<td>' + fmtNum(a.connected_accounts) + '</td>'
+                    + '<td class="muted">' + actionFor(a) + '</td>'
+                    + '</tr>';
+            }).join('');
+        }
+
+        function getCampaignPayload() {
+            const tierRaw = (document.getElementById('cmpTiers').value || '').trim();
+            const tiers = tierRaw ? tierRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+            const dtLocal = document.getElementById('cmpScheduleAt').value || '';
+            return {
+                name: (document.getElementById('cmpName').value || '').trim(),
+                objective: (document.getElementById('cmpObjective').value || '').trim(),
+                channel: document.getElementById('cmpChannel').value || 'in_app',
+                range: document.getElementById('cmpRange').value || '30d',
+                tiers,
+                min_uploads_30d: Number(document.getElementById('cmpMinUploads').value || 0),
+                min_enterprise_fit_score: Number(document.getElementById('cmpMinScore').value || 0),
+                min_nudge_ctr_pct: Number(document.getElementById('cmpMinCtr').value || 0),
+                require_no_revenue_7d: !!document.getElementById('cmpNoRev7d').checked,
+                schedule_at: dtLocal ? new Date(dtLocal).toISOString() : null,
+                notes: (document.getElementById('cmpNotes').value || '').trim(),
+                template_subject: (document.getElementById('cmpTplSubject').value || '').trim(),
+                template_body_html: (document.getElementById('cmpTplHtml').value || '').trim(),
+                discord_message_text: (document.getElementById('cmpTplDiscord').value || '').trim(),
+            };
+        }
+
+        function renderCampaigns(rows) {
+            const el = document.getElementById('campaignList');
+            if (!el) return;
+            if (!rows.length) {
+                el.innerHTML = '<div class="muted">No campaigns yet.</div>';
+                return;
+            }
+            el.innerHTML = rows.map(c => {
+                const t = c.targeting || {};
+                const tiers = Array.isArray(t.tiers) ? t.tiers.join(', ') : '';
+                return '<div class="campaign-list-item">'
+                    + '<div style="display:flex;justify-content:space-between;gap:.6rem;align-items:center;">'
+                    + '<div><strong>' + (c.name || 'Campaign') + '</strong><div class="muted" style="font-size:.78rem;">' + (c.objective || '') + '</div></div>'
+                    + '<span class="pill ' + ((c.status === 'scheduled') ? 'warn' : 'good') + '">' + (c.status || 'draft') + '</span>'
+                    + '</div>'
+                    + '<div class="muted" style="margin-top:.3rem;font-size:.78rem;">Channel: ' + (c.channel || 'in_app')
+                    + ' · Audience est: ' + fmtNum(c.estimated_audience || 0)
+                    + (c.schedule_at ? (' · Schedule: ' + new Date(c.schedule_at).toLocaleString()) : '')
+                    + '</div>'
+                    + '<div class="muted" style="margin-top:.22rem;font-size:.76rem;">Filters: uploads≥' + fmtNum(t.min_uploads_30d || 0)
+                    + ' · score≥' + fmtNum(t.min_enterprise_fit_score || 0)
+                    + ' · ctr≥' + fmtNum(t.min_nudge_ctr_pct || 0)
+                    + (tiers ? (' · tiers: ' + tiers) : '')
+                    + (t.require_no_revenue_7d ? ' · no revenue 7d' : '')
+                    + '</div>'
+                    + '<div class="muted" style="margin-top:.22rem;font-size:.72rem;">Approval: '
+                    + (c.approved_at ? ('approved ' + new Date(c.approved_at).toLocaleString()) : (c.needs_approval ? 'master admin required' : 'n/a'))
+                    + '</div>'
+                    + '<div class="campaign-actions">'
+                    + '<button class="btn-mini" data-c-action="status" data-c-id="' + c.id + '" data-c-status="active">Set Active</button>'
+                    + (isMasterAdmin() ? ('<button class="btn-mini" data-c-action="approve" data-c-id="' + c.id + '" style="border-color:#22c55e;"><i class="fas fa-check"></i> Master approve</button>') : '')
+                    + '<button class="btn-mini" data-c-action="status" data-c-id="' + c.id + '" data-c-status="paused">Pause</button>'
+                    + '<button class="btn-mini" data-c-action="status" data-c-id="' + c.id + '" data-c-status="completed">Complete</button>'
+                    + '<button class="btn-mini" data-c-action="csv" data-c-id="' + c.id + '">Export CSV</button>'
+                    + '<button class="btn-mini" data-c-action="handoff" data-c-id="' + c.id + '">Handoff to Announcements</button>'
+                    + '</div></div>';
+            }).join('');
+        }
+
+        function renderTruth(data) {
+            const s = document.getElementById('truthSummary');
+            const m = document.getElementById('truthMetrics');
+            const rawEl = document.getElementById('truthRaw');
+            const ld = data && data.last_decision ? data.last_decision : null;
+            if (!ld) {
+                if (s) s.textContent = 'No AI decision recorded yet.';
+                if (m) m.textContent = 'Run AI Generate or Deploy first.';
+                if (rawEl) rawEl.textContent = '';
+                return;
+            }
+            const created = ld.created_at ? new Date(ld.created_at).toLocaleString() : 'unknown time';
+            const blocked = Array.isArray(ld.blocked_reasons) ? ld.blocked_reasons : [];
+            if (s) {
+                s.innerHTML = '<strong>Last decision:</strong> ' + (ld.action || 'action') + ' / ' + (ld.status || 'status')
+                    + ' · confidence ' + (ld.confidence_score == null ? '--' : ld.confidence_score)
+                    + ' · ' + created + (ld.used_openai ? ' · model-assisted' : ' · deterministic');
+            }
+            const mu = (data && data.metrics_used) ? data.metrics_used : {};
+            const sources = (data && Array.isArray(data.metric_sources)) ? data.metric_sources : [];
+            const k = mu.kpis || {};
+            const seg = mu.segment_signals || {};
+            const pf = Array.isArray(mu.platform_kpis) ? mu.platform_kpis : [];
+            const win = Array.isArray(mu.best_promo_windows_utc) ? mu.best_promo_windows_utc : [];
+            const ml = mu.ml_truth || {};
+            const mlTop = Array.isArray(ml.top_strategies) ? ml.top_strategies : [];
+            if (m) {
+                m.innerHTML =
+                    '<div><strong>KPI Inputs</strong><div class="muted" style="margin-top:.3rem;">'
+                    + 'active_users=' + fmtNum(k.active_users) + ', paid_users=' + fmtNum(k.paid_users)
+                    + ', uploads=' + fmtNum(k.total_uploads) + ', revenue=' + fmtMoney(k.total_revenue)
+                    + ', mrr=' + fmtMoney(k.mrr_estimate) + ', nudge_ctr=' + fmtPct(k.nudge_ctr_pct)
+                    + ', gross_margin=' + fmtPct(k.gross_margin_pct) + '</div></div>'
+                    + '<div style="margin-top:.55rem;"><strong>Segment Inputs</strong><div class="muted" style="margin-top:.3rem;">'
+                    + 'free_high_intent=' + fmtNum(seg.free_high_intent_uploaders)
+                    + ', token_pressure=' + fmtNum(seg.token_pressure_accounts)
+                    + ', expansion_ready=' + fmtNum(seg.expansion_ready_accounts)
+                    + ', engaged_no_purchase=' + fmtNum(seg.engaged_no_purchase_accounts)
+                    + '</div></div>'
+                    + '<div style="margin-top:.55rem;"><strong>Platform Inputs</strong><div class="muted" style="margin-top:.3rem;">'
+                    + (pf.slice(0, 4).map(x => (x.platform + ': ' + fmtNum(x.uploads) + ' uploads @ ' + fmtPct(x.success_rate_pct))).join(' | ') || 'none')
+                    + '</div></div>'
+                    + '<div style="margin-top:.55rem;"><strong>Best Promo Windows (UTC)</strong><div class="muted" style="margin-top:.3rem;">'
+                    + (win.slice(0, 4).map(x => ((x.day || '?') + ' ' + String(x.hour_utc).padStart(2, '0') + ':00 @ ' + fmtPct(x.conv_rate_7d))).join(' | ') || 'none')
+                    + '</div></div>'
+                    + (mlTop.length ? (
+                        '<div style="margin-top:.55rem;"><strong>ML Truth Top Strategies</strong><div class="muted" style="margin-top:.3rem;">'
+                        + mlTop.slice(0, 5).map(x => (
+                            (x.strategy_key || 'default') + ': eng~' + fmtPct(x.weighted_mean_engagement) +
+                            ' (ci95_hi=' + fmtPct(x.max_ci95_high) + ', n=' + fmtNum(x.samples) + ')'
+                        )).join('<br>')
+                        + '</div></div>'
+                    ) : '')
+                    + '<div style="margin-top:.55rem;"><strong>SQL Source Map</strong><div class="muted" style="margin-top:.3rem;">'
+                    + (sources.map(x => '• ' + (x.metric_group || 'metric') + ' ← ' + (x.sql_source || 'source')).join('<br>') || 'none')
+                    + '</div></div>'
+                    + (blocked.length ? ('<div style="margin-top:.55rem;"><strong>Blocked Reasons</strong><div class="muted" style="margin-top:.3rem;">' + blocked.map(x => '• ' + x).join('<br>') + '</div></div>') : '');
+            }
+            if (rawEl) {
+                rawEl.textContent = JSON.stringify(mu, null, 2);
+            }
+        }
+
+        function renderDecisionLog(rows) {
+            const el = document.getElementById('decisionLog');
+            if (!el) return;
+            if (!rows.length) {
+                el.innerHTML = '<div class="muted">No decision records yet.</div>';
+                return;
+            }
+            el.innerHTML = rows.map(r => {
+                const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '';
+                return '<div class="campaign-list-item">'
+                    + '<div style="display:flex;justify-content:space-between;gap:.7rem;">'
+                    + '<div><strong>' + (r.action || 'action') + ' · ' + (r.status || 'status') + '</strong><div class="muted" style="font-size:.78rem;">'
+                    + 'objective=' + (r.objective || 'n/a') + ', range=' + (r.range_key || 'n/a') + ', confidence=' + (r.confidence_score == null ? '--' : r.confidence_score)
+                    + (r.used_openai ? ', model-assisted' : ', deterministic')
+                    + '</div></div><div class="muted" style="font-size:.76rem;">' + ts + '</div></div>'
+                    + '</div>';
+            }).join('');
+        }
+
+        function renderMlPriors(data) {
+            const sumEl = document.getElementById('mlPriorsSummary');
+            const logEl = document.getElementById('mlPriorsLog');
+            if (!sumEl || !logEl) return;
+            const s = (data && data.summary) ? data.summary : {};
+            const rows = (data && Array.isArray(data.items)) ? data.items : [];
+            sumEl.textContent =
+                'Rows: ' + fmtNum(s.total || rows.length || 0)
+                + ' · thumbnail bias present: ' + fmtNum(s.thumbnail_bias_present || 0)
+                + ' · m8 strategy priors present: ' + fmtNum(s.m8_strategy_priors_present || 0);
+            if (!rows.length) {
+                logEl.textContent = 'No ML debug rows yet.';
+                return;
+            }
+            logEl.innerHTML = rows.map(function (r) {
+                const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '';
+                const uid = r.user_email || r.user_id || 'unknown-user';
+                const up = r.upload_id || 'unknown-upload';
+                const cat = r.category || 'general';
+                const thumbMethod = r.thumbnail_selection_method || 'n/a';
+                const thumbReason = (r.thumbnail_bias && r.thumbnail_bias.reason) ? r.thumbnail_bias.reason : 'n/a';
+                const priTop = (r.m8_strategy_priors && Array.isArray(r.m8_strategy_priors.top)) ? r.m8_strategy_priors.top : [];
+                const topTxt = priTop.slice(0, 3).map(function (x) {
+                    return (x.strategy_key || 'default') + ' n=' + fmtNum(x.samples || 0) + ' eng=' + fmtPct(x.weighted_mean_engagement || 0);
+                }).join(' | ');
+                return '<div style="padding:.55rem .45rem;border-bottom:1px solid rgba(255,255,255,.08);">'
+                    + '<div><strong>' + uid + '</strong> · <span class="muted">' + ts + '</span></div>'
+                    + '<div class="muted" style="font-size:.78rem;">upload=' + up + ' · category=' + cat + '</div>'
+                    + '<div class="muted" style="font-size:.78rem;">thumbnail=' + thumbMethod + ' · bias=' + thumbReason + '</div>'
+                    + '<div class="muted" style="font-size:.78rem;">m8 top priors: ' + (topTxt || 'none') + '</div>'
+                    + '</div>';
+            }).join('');
+        }
+
+        async function updateCampaignStatus(id, status) {
+            const res = await window.apiCall('/api/admin/marketing/campaigns/' + encodeURIComponent(id) + '/status', {
+                method: 'POST',
+                body: JSON.stringify({ status: status }),
+            }).catch(() => null);
+            if (res && res.campaign) {
+                if (res.notice && window.showToast) window.showToast(res.notice, 'warning');
+                else if (window.showToast) window.showToast('Campaign updated to ' + (res.campaign.status || status), 'success');
+                await loadData();
+            } else if (window.showToast) {
+                window.showToast('Failed to update campaign status', 'error');
+            }
+        }
+
+        async function masterApproveCampaign(id) {
+            const res = await window.apiCall('/api/admin/marketing/campaigns/' + encodeURIComponent(id) + '/approve', {
+                method: 'POST',
+                body: '{}',
+            }).catch(() => null);
+            if (res && res.ok) {
+                if (window.showToast) window.showToast('Campaign approved and activated.', 'success');
+                hideApprovalModal();
+                await loadData();
+            } else if (window.showToast) {
+                window.showToast('Approve failed (master admin only).', 'error');
+            }
+        }
+
+        async function runExecutionTick() {
+            const res = await window.apiCall('/api/admin/marketing/execution/tick', {
+                method: 'POST',
+                body: JSON.stringify({ max_per_campaign: 30, max_total_sends: 120 }),
+            }).catch(() => null);
+            if (res && res.run_id) {
+                if (window.showToast) window.showToast('Tick complete · emails ' + (res.email_sent || 0) + ' · discord legs ' + (res.discord_sent || 0), 'success');
+                await loadData();
+            } else if (window.showToast) {
+                window.showToast('Execution tick failed', 'error');
+            }
+        }
+
+        async function loadVariantLeaderboard() {
+            const el = document.getElementById('mlLeaderboardOut');
+            if (!el) return;
+            el.textContent = 'Loading…';
+            const res = await window.apiCall('/api/admin/ml/variant-leaderboard?limit=40').catch(() => null);
+            const rows = (res && res.variants) ? res.variants : [];
+            if (!rows.length) {
+                el.textContent = 'No variant labels yet. Use Thumbnail Studio with variant/upload ids and feedback.';
+                return;
+            }
+            el.innerHTML = rows.map(function (r) {
+                return '<div style="padding:.35rem 0;border-bottom:1px solid var(--border-color);">'
+                    + '<strong>' + (r.variant_key || '—') + '</strong> · selections ' + (r.selections || 0)
+                    + ' · mean views ' + (r.mean_views != null ? Number(r.mean_views).toFixed(0) : '—')
+                    + ' · samples ' + (r.samples || 0) + '</div>';
+            }).join('');
+        }
+
+        async function runMlPromoEval() {
+            const el = document.getElementById('mlPromoEvalOut');
+            if (el) el.textContent = 'Running…';
+            const res = await window.apiCall('/api/admin/ml/promotion-eval', {
+                method: 'POST',
+                body: JSON.stringify({ model_key: 'propensity_v1', min_samples: 40 }),
+            }).catch(() => null);
+            if (el) {
+                if (!res) el.textContent = 'Eval failed.';
+                else el.textContent = 'Promoted: ' + (res.promoted ? 'yes' : 'no') + ' · lift '
+                    + ((res.lift != null && isFinite(res.lift)) ? res.lift.toFixed(4) : '—')
+                    + ' · n=' + (res.sample_n || 0) + ' · reason ' + (res.reason || 'ok');
+            }
+        }
+
+        async function exportCampaignCsv(id) {
+            try {
+                const r = await window.apiFetch(
+                    '/api/admin/marketing/campaigns/' + encodeURIComponent(id) + '/audience.csv',
+                    { method: 'GET' }
+                );
+                if (!r.ok) throw new Error('csv');
+                const blob = await r.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'marketing_campaign_' + id + '_audience.csv';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            } catch (_) {
+                if (window.showToast) window.showToast('CSV export failed', 'error');
+            }
+        }
+
+        async function handoffCampaign(id) {
+            const res = await window.apiCall('/api/admin/marketing/campaigns/' + encodeURIComponent(id) + '/handoff').catch(() => null);
+            if (!res) {
+                if (window.showToast) window.showToast('Handoff failed', 'error');
+                return;
+            }
+            try {
+                sessionStorage.setItem('uploadm8_campaign_handoff', JSON.stringify(res));
+            } catch (_) {}
+            window.location.href = 'admin.html?campaign_handoff=1';
+        }
+
+        async function previewCampaign() {
+            const out = document.getElementById('cmpPreviewOut');
+            const payload = getCampaignPayload();
+            if (!payload.name || !payload.objective) {
+                out.textContent = 'Audience: enter campaign name + objective first';
+                return;
+            }
+            out.textContent = 'Audience: estimating...';
+            const res = await window.apiCall('/api/admin/marketing/campaigns/preview', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+            }).catch(() => null);
+            out.textContent = 'Audience: ' + fmtNum((res && res.estimated_audience) || 0);
+        }
+
+        async function saveCampaign() {
+            const payload = getCampaignPayload();
+            if (!payload.name || !payload.objective) {
+                if (window.showToast) window.showToast('Campaign name and objective are required.', 'error');
+                return;
+            }
+            const res = await window.apiCall('/api/admin/marketing/campaigns', {
+                method: 'POST',
+                body: JSON.stringify(payload),
+            }).catch(() => null);
+            if (!res || !res.campaign) {
+                if (window.showToast) window.showToast('Failed to save campaign.', 'error');
+                return;
+            }
+            if (window.showToast) window.showToast('Campaign saved.', 'success');
+            await loadData();
+        }
+
+        function toggleTruthRaw() {
+            const el = document.getElementById('truthRaw');
+            if (!el) return;
+            el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
+        }
+
+        async function exportDecisionCsv() {
+            try {
+                const r = await window.apiFetch('/api/admin/marketing/ai/decisions.csv?limit=1000', {
+                    method: 'GET',
+                });
+                if (!r.ok) throw new Error('csv');
+                const blob = await r.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'ai_marketing_decisions.csv';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            } catch (_) {
+                if (window.showToast) window.showToast('Decision CSV export failed', 'error');
+            }
+        }
+
+        async function loadMarketingPikzelsV2() {
+            const el = document.getElementById('marketingPikzelsV2Line');
+            if (!el || typeof window.apiCall !== 'function') return;
+            const rs = document.getElementById('rangeSelect');
+            const range = (rs && rs.value) ? rs.value : '30d';
+            try {
+                const d = await window.apiCall('/api/admin/kpi/pikzels-v2-usage?range=' + encodeURIComponent(range));
+                const parts = (d.by_operation || []).map(function (r) { return (r.op || '?') + ': ' + (r.count || 0); });
+                el.textContent = 'All customers — Thumbnail Studio (Pikzels) actions this period: ' + (d.total_calls || 0) + (parts.length ? ' · ' + parts.join(' · ') : ' · none yet');
+            } catch (e) {
+                el.textContent = '';
+            }
+        }
+
+        async function loadThumbProviderIntegration() {
+            const el = document.getElementById('thumbProviderIntegration');
+            if (!el || typeof window.apiCall !== 'function') return;
+            try {
+                const d = await window.apiCall('/api/admin/integrations/thumbnail-provider');
+                const mode = (d.upload_pipeline_mode || '—').replace(/_/g, ' ');
+                const v2 = d.v2_api_key_configured ? 'Pikzels connected' : 'Pikzels not configured';
+                el.innerHTML = '<i class="fas fa-plug" style="color:#f97316;"></i> Thumbnail partner: ' + v2 + ' · upload flow <span style="font-size:0.72rem;">' + mode + '</span> · requests go through UploadM8 so keys stay on the server';
+            } catch (e) {
+                el.textContent = '';
+            }
+        }
+
+        async function boot() {
+            try {
+                if (typeof window.initApp === 'function') await window.initApp('admin-marketing', { forceAuthRefresh: false, skipWalletRefresh: true });
+                const u = window.currentUser;
+                const role = String((u && u.role) || '').toLowerCase();
+                const tier = String((u && (u.tier || u.subscription_tier)) || '').toLowerCase();
+                const isAdmin = !!u && (role === 'admin' || role === 'master_admin' || tier === 'master_admin');
+                document.getElementById('loadingState').style.display = 'none';
+                if (!isAdmin) {
+                    document.getElementById('accessDenied').style.display = 'flex';
+                    return;
+                }
+                const sec = document.getElementById('adminSection');
+                if (sec) sec.style.display = 'block';
+                document.getElementById('content').style.display = 'block';
+
+                document.getElementById('refreshBtn').addEventListener('click', loadData);
+                document.getElementById('rangeSelect').addEventListener('change', loadData);
+                document.getElementById('aiGenerateBtn').addEventListener('click', generateAIPlan);
+                document.getElementById('aiDeployBtn').addEventListener('click', deployAICampaign);
+                document.getElementById('aiApplyBtn').addEventListener('click', applyAIToCampaignBuilder);
+                document.getElementById('cmpPreviewBtn').addEventListener('click', previewCampaign);
+                document.getElementById('cmpSaveBtn').addEventListener('click', saveCampaign);
+                document.getElementById('truthToggleRawBtn').addEventListener('click', toggleTruthRaw);
+                document.getElementById('exportDecisionCsvBtn').addEventListener('click', exportDecisionCsv);
+                document.getElementById('mlPriorsRefreshBtn').addEventListener('click', loadData);
+                document.getElementById('mlSinceHours').addEventListener('change', loadData);
+                document.getElementById('mlLimit').addEventListener('change', loadData);
+                document.getElementById('campaignList').addEventListener('click', function (e) {
+                    const btn = e.target.closest('[data-c-action]');
+                    if (!btn) return;
+                    const action = btn.getAttribute('data-c-action');
+                    const id = btn.getAttribute('data-c-id');
+                    if (!id) return;
+                    if (action === 'status') {
+                        const status = btn.getAttribute('data-c-status') || 'draft';
+                        updateCampaignStatus(id, status);
+                    } else if (action === 'approve') {
+                        masterApproveCampaign(id);
+                    } else if (action === 'csv') {
+                        exportCampaignCsv(id);
+                    } else if (action === 'handoff') {
+                        handoffCampaign(id);
+                    }
+                });
+                document.getElementById('approvalModal').addEventListener('click', function (e) {
+                    var root = document.getElementById('approvalModal');
+                    if (e.target === root) hideApprovalModal();
+                    if (e.target.id === 'approvalModalDismiss' || (e.target.closest && e.target.closest('#approvalModalDismiss'))) hideApprovalModal();
+                    const ap = e.target.closest('[data-approve-id]');
+                    if (ap) masterApproveCampaign(ap.getAttribute('data-approve-id'));
+                });
+                var _execBtn = document.getElementById('cmpExecTickBtn');
+                if (_execBtn) _execBtn.addEventListener('click', runExecutionTick);
+                var _lbBtn = document.getElementById('mlLeaderboardBtn');
+                if (_lbBtn) _lbBtn.addEventListener('click', loadVariantLeaderboard);
+                var _peBtn = document.getElementById('mlPromoEvalBtn');
+                if (_peBtn) _peBtn.addEventListener('click', runMlPromoEval);
+                document.getElementById('searchInput').addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter') loadData();
+                });
+                await loadData();
+                await loadThumbProviderIntegration();
+            } catch (_) {
+                document.getElementById('loadingState').style.display = 'none';
+                document.getElementById('accessDenied').style.display = 'flex';
+            }
+        }
+
+        boot();
+    })();
+    </script>
+</body>
+</html>

@@ -9,40 +9,45 @@
  *   - Real-time cost estimator
  *   - Trial countdown banner
  *
- * Requires: auth-core.js (apiCall, toast helpers)
- * Include AFTER auth-core.js on any page that has billing UI.
+ * Requires: app.js (apiCall, showToast), js/tier-catalog.js (before this file)
+ * Include AFTER app.js on any page that has billing UI.
  */
 
 (function () {
     'use strict';
 
-    // ── Constants ────────────────────────────────────────────────────────────
-    const TIER_META = {
-        free:         { name: 'Free',         price: 0,      put: 60,    aic: 10,    color: '#6b7280' },
-        creator_lite: { name: 'Creator Lite', price: 9.99,   put: 300,   aic: 80,    color: '#f97316' },
-        creator_pro:  { name: 'Creator Pro',  price: 19.99,  put: 700,   aic: 200,   color: '#f97316' },
-        studio:       { name: 'Studio',       price: 49.99,  put: 2000,  aic: 600,   color: '#a855f7' },
-        agency:       { name: 'Agency',       price: 99.99,  put: 4500,  aic: 1500,  color: '#ec4899' },
-        launch:       { name: 'Launch',       price: 9.99,   put: 300,   aic: 80,    color: '#f97316' },
-        master_admin: { name: 'Admin',        price: 0,      put: 999999, aic: 999999, color: '#ef4444' },
-        friends_family:{ name: 'F&F',         price: 0,      put: 999999, aic: 999999, color: '#10b981' },
-        lifetime:     { name: 'Lifetime',     price: 0,      put: 999999, aic: 999999, color: '#10b981' },
-    };
+    function canonicalTier(user) {
+        if (!user || typeof user !== 'object') return 'free';
+        if (typeof window.getTier === 'function') return window.getTier(user);
+        return user.tier || user.subscription_tier || (user.plan && user.plan.tier) || 'free';
+    }
+
+    function canonicalEntitlements(user) {
+        if (!user || typeof user !== 'object') return {};
+        if (typeof window.getEntitlements === 'function') return window.getEntitlements(user);
+        return user.entitlements || user.plan || {};
+    }
+
+    function tierMeta(slug) {
+        var TC = window.UploadM8TierCatalog;
+        if (!TC || typeof TC.settingsTierMeta !== 'function') return null;
+        return TC.settingsTierMeta(slug) || TC.settingsTierMeta('free');
+    }
 
     const TOPUP_PACKS = {
         put: [
-            { key: 'uploadm8_put_50',   amount: 50,   price: '$2.99',  label: '50 PUT' },
-            { key: 'uploadm8_put_100',  amount: 100,  price: '$4.99',  label: '100 PUT' },
-            { key: 'uploadm8_put_250',  amount: 250,  price: '$9.99',  label: '250 PUT',  badge: 'Best Value' },
-            { key: 'uploadm8_put_500',  amount: 500,  price: '$17.99', label: '500 PUT' },
-            { key: 'uploadm8_put_1000', amount: 1000, price: '$29.99', label: '1000 PUT', badge: 'Best Deal' },
+            { key: 'uploadm8_put_250',  amount: 250,  price: '$4.99',  label: '250 PUT' },
+            { key: 'uploadm8_put_500',  amount: 500,  price: '$8.99',  label: '500 PUT' },
+            { key: 'uploadm8_put_1000', amount: 1000, price: '$14.99', label: '1,000 PUT' },
+            { key: 'uploadm8_put_2500', amount: 2500, price: '$29.99', label: '2,500 PUT', badge: 'Best Value' },
+            { key: 'uploadm8_put_5000', amount: 5000, price: '$49.99', label: '5,000 PUT', badge: 'Best Deal' },
         ],
         aic: [
-            { key: 'uploadm8_aic_100',  amount: 100,  price: '$3.99',  label: '100 AIC' },
-            { key: 'uploadm8_aic_250',  amount: 250,  price: '$7.99',  label: '250 AIC',  badge: 'Best Value' },
-            { key: 'uploadm8_aic_500',  amount: 500,  price: '$14.99', label: '500 AIC' },
-            { key: 'uploadm8_aic_1000', amount: 1000, price: '$24.99', label: '1000 AIC', badge: 'Best Deal' },
-            { key: 'uploadm8_aic_2500', amount: 2500, price: '$49.99', label: '2500 AIC', badge: 'Agency Pick' },
+            { key: 'uploadm8_aic_500',   amount: 500,   price: '$4.99',  label: '500 AIC' },
+            { key: 'uploadm8_aic_1000',  amount: 1000,  price: '$8.99',  label: '1,000 AIC' },
+            { key: 'uploadm8_aic_2500',  amount: 2500,  price: '$18.99', label: '2,500 AIC' },
+            { key: 'uploadm8_aic_5000',  amount: 5000,  price: '$34.99', label: '5,000 AIC', badge: 'Best Value' },
+            { key: 'uploadm8_aic_10000', amount: 10000, price: '$59.99', label: '10,000 AIC', badge: 'Best Deal' },
         ],
     };
 
@@ -54,6 +59,15 @@
     // ── Init ─────────────────────────────────────────────────────────────────
     async function initBilling(userData) {
         _user = userData;
+        if (_user && typeof window._normalizeUserPayload === 'function') {
+            try {
+                _user = window._normalizeUserPayload(Object.assign({}, _user));
+            } catch (e) { /* keep raw */ }
+        }
+
+        if (window.UploadM8TierCatalog && typeof window.UploadM8TierCatalog.load === 'function') {
+            try { await window.UploadM8TierCatalog.load(); } catch (e) { console.warn('[Billing] tier catalog', e); }
+        }
 
         // Load wallet data
         try {
@@ -75,8 +89,8 @@
 
     // ── Current Plan Card ────────────────────────────────────────────────────
     function renderCurrentPlan() {
-        const tier = _user?.subscription_tier || 'free';
-        const meta = TIER_META[tier] || TIER_META.free;
+        const tier = canonicalTier(_user);
+        const meta = tierMeta(tier) || { name: tier, price: 0, put: 0, aic: 0, color: '#6b7280', trial_days: 0 };
         const status = _user?.subscription_status || 'inactive';
 
         const planNameEl = document.getElementById('billingPlanName');
@@ -115,8 +129,8 @@
 
     // ── Wallet Bars ──────────────────────────────────────────────────────────
     function renderWalletBars() {
-        const tier = _user?.subscription_tier || 'free';
-        const meta = TIER_META[tier] || TIER_META.free;
+        const tier = canonicalTier(_user);
+        const meta = tierMeta(tier) || { name: tier, price: 0, put: 0, aic: 0, color: '#6b7280', trial_days: 0 };
 
         const putBalance = parseFloat(_wallet?.put_balance || 0);
         const aicBalance = parseFloat(_wallet?.aic_balance || 0);
@@ -183,7 +197,7 @@
 
     // ── Plan Cards ───────────────────────────────────────────────────────────
     function renderPlanCards() {
-        const currentTier = _user?.subscription_tier || 'free';
+        const currentTier = canonicalTier(_user);
         const tierOrder = ['free', 'creator_lite', 'creator_pro', 'studio', 'agency'];
         const currentIdx = tierOrder.indexOf(currentTier);
 
@@ -191,19 +205,20 @@
             const tier = card.dataset.tier;
             const btn = card.querySelector('button[data-plan]');
             const idx = tierOrder.indexOf(tier);
-            const meta = TIER_META[tier];
+            const meta = tierMeta(tier);
 
             // Mark current plan
             if (tier === currentTier) {
                 card.classList.add('current');
-                if (btn) { btn.textContent = '✓ Current Plan'; btn.disabled = true; btn.classList.add('btn-current'); }
+                if (btn) { btn.textContent = ' Current Plan'; btn.disabled = true; btn.classList.add('btn-current'); }
             } else {
                 card.classList.remove('current');
                 if (btn) {
                     btn.disabled = false;
                     btn.classList.remove('btn-current');
+                    const td = meta && meta.trial_days > 0;
                     btn.textContent = idx > currentIdx
-                        ? (meta?.trial_days > 0 ? 'Start Free Trial' : 'Upgrade →')
+                        ? (td ? 'Start Free Trial' : 'Upgrade →')
                         : 'Switch Plan';
                 }
             }
@@ -266,29 +281,70 @@
     }
 
     // ── Cost Estimator ───────────────────────────────────────────────────────
-    // numPublishTargets: backend uses this for cost (len(target_accounts) or len(platforms) when empty).
-    function updateCostEstimate(numPublishTargets, useAi, useHud) {
-        const tier = _user?.subscription_tier || 'free';
-        const isInternal = ['master_admin','friends_family','lifetime'].includes(tier);
+    // Canonical numbers: POST /api/billing/upload-estimate (same as presign / compute_upload_cost).
+    async function updateCostEstimate(numPublishTargets, useAi, useHud) {
+        const tier = canonicalTier(_user);
+        let isInternal = ['master_admin', 'friends_family', 'lifetime'].includes(tier);
+        const adm = typeof window._resolveAdminFlags === 'function' ? window._resolveAdminFlags(_user) : null;
+        if (adm && adm.isAdminRole) isInternal = true;
 
-        // PUT formula (matches backend: 10 + (n-1)*2 + HUD + priority + thumbnails)
-        const PRIORITY_TIERS = ['creator_pro', 'studio', 'agency'];
-        const HUD_TIERS = ['creator_pro', 'studio', 'agency'];
-        const AI_DEPTH = { none: 0, basic: 2, enhanced: 3, advanced: 4, max: 6 };
-        const AI_DEPTH_BY_TIER = {
-            free: 'basic', creator_lite: 'enhanced', creator_pro: 'advanced',
-            studio: 'max', agency: 'max', launch: 'enhanced',
-        };
+        const n = Math.max(1, parseInt(String(numPublishTargets != null ? numPublishTargets : 1), 10) || 1);
+        const useAiF = !!useAi;
+        const useHudF = !!useHud;
 
-        const isPriority = PRIORITY_TIERS.includes(tier);
-        const canHud = HUD_TIERS.includes(tier);
-        let put = 10;
-        if (useHud && canHud) put += 5;
-        if (isPriority) put += 5;
-        put += Math.max(0, numPublishTargets - 1) * 2;
+        function fallbackPutAic() {
+            const PRIORITY_TIERS = ['creator_pro', 'studio', 'agency'];
+            const HUD_TIERS = ['creator_pro', 'studio', 'agency'];
+            const AI_DEPTH = { none: 0, basic: 2, enhanced: 3, advanced: 4, max: 6 };
+            const AI_DEPTH_BY_TIER = {
+                free: 'basic', creator_lite: 'enhanced', creator_pro: 'advanced',
+                studio: 'max', agency: 'max',
+            };
+            const isPriority = PRIORITY_TIERS.includes(tier);
+            const canHud = HUD_TIERS.includes(tier);
+            let p = 10;
+            if (useHudF && canHud) p += 5;
+            if (isPriority) p += 5;
+            p += Math.max(0, n - 1) * 2;
+            const depth = AI_DEPTH_BY_TIER[tier] || 'none';
+            const a = useAiF ? (AI_DEPTH[depth] || 0) : 0;
+            return { put: p, aic: a };
+        }
 
-        const depth = AI_DEPTH_BY_TIER[tier] || 'none';
-        const aic = useAi ? AI_DEPTH[depth] || 0 : 0;
+        let put;
+        let aic;
+        if (typeof apiCall === 'function' && _user && !isInternal) {
+            try {
+                const est = await apiCall('/api/billing/upload-estimate', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        num_publish_targets: n,
+                        use_ai: useAiF,
+                        use_hud: useHudF,
+                        num_thumbnails: 1,
+                    }),
+                });
+                put = Number(est && est.put_cost != null ? est.put_cost : NaN);
+                aic = Number(est && est.aic_cost != null ? est.aic_cost : NaN);
+                if (!Number.isFinite(put) || !Number.isFinite(aic)) {
+                    const fb = fallbackPutAic();
+                    put = fb.put;
+                    aic = fb.aic;
+                }
+            } catch (e) {
+                console.warn('[Billing] upload-estimate fallback', e);
+                const fb = fallbackPutAic();
+                put = fb.put;
+                aic = fb.aic;
+            }
+        } else if (!isInternal) {
+            const fb = fallbackPutAic();
+            put = fb.put;
+            aic = fb.aic;
+        } else {
+            put = 0;
+            aic = 0;
+        }
 
         const putEl = document.getElementById('estimatedPutCost');
         const aicEl = document.getElementById('estimatedAicCost');
@@ -299,13 +355,13 @@
         if (totalEl) {
             const putAvail = (_wallet?.put_balance || 0) - (_wallet?.put_reserved || 0);
             const aicAvail = (_wallet?.aic_balance || 0) - (_wallet?.aic_reserved || 0);
-            const canAfford = putAvail >= put && (aic === 0 || aicAvail >= aic);
+            const canAfford = isInternal || (putAvail >= put && (aic === 0 || aicAvail >= aic));
             totalEl.className = 'cost-summary ' + (canAfford ? 'cost-ok' : 'cost-low');
             totalEl.innerHTML = canAfford
                 ? `<i class="fas fa-check-circle"></i> You have enough balance`
                 : `<i class="fas fa-exclamation-circle"></i> Insufficient balance — <a href="/settings.html#billing">top up</a>`;
         }
-        return { put, aic };
+        return { put: put, aic: aic };
     }
 
     // ── API Calls ────────────────────────────────────────────────────────────

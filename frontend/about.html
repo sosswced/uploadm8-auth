@@ -1,11 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>About - UploadM8</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="/images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="/images/logo.svg">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -47,21 +49,24 @@
     .foot a{color:var(--gray-600);text-decoration:none;font-weight:700;}
     .foot a:hover{color:var(--gray-900);}
     @media (max-width:900px){.grid{grid-template-columns:1fr;}.nav-links{display:none;}}
+    @media (max-width:480px){.hero{padding:3rem 1.25rem;}.hero h1{font-size:2rem;}.nav{padding:.75rem 1rem;}}
 </style>
 </head>
 <body>
   <nav>
     <div class="nav-container">
-      <a class="logo" href="/index.html"><img src="/images/logo.png" alt="UploadM8"></a>
+      <a class="logo" href="index.html"><img src="images/logo.svg" alt="UploadM8"></a>
       
         <div class="nav-links">
-            <a href="/index.html">Home</a>
-            <a href="/contact.html">Contact</a>
+            <a href="index.html">Home</a>
+            <a href="how-it-works.html">How it works</a>
+            <a href="contact.html">Contact</a>
+            <a href="support.html">Support</a>
         </div>
     
       <div class="nav-buttons">
-        <a class="btn btn-ghost" href="/login.html">Log in</a>
-        <a class="btn btn-primary" href="/signup.html">Get started free</a>
+        <a class="btn btn-ghost" href="login.html">Log in</a>
+        <a class="btn btn-primary" href="signup.html">Get started free</a>
       </div>
     </div>
   </nav>
@@ -109,7 +114,7 @@
   <li>Team accounts, roles, audit trails.</li>
 </ul>
 
-<p>Contact: <a href="mailto:sosswced@gmail.com">sosswced@gmail.com</a></p>
+<p>Contact: <a href="mailto:partners@uploadm8.com">partners@uploadm8.com</a> · Help: <a href="support.html">Support center</a> · Community: <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a></p>
 
     </div>
   </div>
@@ -118,14 +123,24 @@
     <div class="foot">
       <div>© 2026 UploadM8</div>
       <div style="display:flex;gap:14px;flex-wrap:wrap;">
-        <a href="/about.html">About</a>
-        <a href="/blog.html">Blog</a>
-        <a href="/contact.html">Contact</a>
-        <a href="/privacy.html">Privacy</a>
-        <a href="/terms.html">Terms</a>
-        <a href="/data-deletion.html">Data deletion</a>
+        <a href="about.html">About</a>
+        <a href="blog.html">Blog</a>
+        <a href="how-it-works.html">How it works</a>
+        <a href="contact.html">Contact</a>
+        <a href="support.html">Support</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="terms.html">Terms</a>
+        <a href="data-deletion.html">Data deletion</a>
+        <a href="dashboard.html">Dashboard</a>
+        <a href="settings.html#billing-panel">Tokens</a>
+        <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
       </div>
     </div>
   </footer>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
 </body>
 </html>

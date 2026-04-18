@@ -1,130 +1,224 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>How It Works - UploadM8</title>
-  <link rel="icon" type="image/x-icon" href="/favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="/images/logo.png">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="images/logo.svg">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
     :root {
-        --blue-50:#eff6ff; --blue-100:#dbeafe; --blue-500:#3b82f6; --blue-600:#2563eb;
-        --orange-500:#f97316;
-        --gray-50:#f9fafb; --gray-100:#f3f4f6; --gray-200:#e5e7eb; --gray-300:#d1d5db;
-        --gray-400:#9ca3af; --gray-500:#6b7280; --gray-600:#4b5563; --gray-700:#374151;
-        --gray-800:#1f2937; --gray-900:#111827;
-        --green-500:#22c55e; --red-500:#ef4444; --yellow-500:#eab308;
+      --bg-primary: #0a0a0f; --bg-secondary: #12121a; --bg-card: #1a1a24; --bg-hover: #22222e;
+      --bg-input: rgba(255,255,255,0.05); --text-primary: #ffffff; --text-secondary: #9ca3af;
+      --text-muted: #6b7280; --border-color: rgba(255,255,255,0.08); --border-hover: rgba(255,255,255,0.15);
+      --accent-orange: #f97316; --accent-orange-hover: #ea580c; --accent-blue: #3b82f6;
+      --accent-green: #22c55e; --radius-sm: 6px; --radius-md: 10px; --radius-lg: 16px;
     }
-    *{margin:0;padding:0;box-sizing:border-box;}
-    body{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--gray-50);color:var(--gray-800);line-height:1.65;}
-    nav{position:sticky;top:0;background:rgba(255,255,255,0.95);backdrop-filter:blur(20px);border-bottom:1px solid var(--gray-200);z-index:10;padding:0 24px;}
-    .nav-container{max-width:1100px;margin:0 auto;height:72px;display:flex;align-items:center;justify-content:space-between;}
-    .logo{display:flex;align-items:center;gap:10px;text-decoration:none;}
-    .logo img{height:34px;}
-    .nav-links{display:flex;align-items:center;gap:18px;}
-    .nav-links a{color:var(--gray-600);text-decoration:none;font-weight:600;font-size:0.95rem;}
-    .nav-links a:hover{color:var(--gray-900);}
-    .nav-buttons{display:flex;gap:12px;align-items:center;}
-    .btn{padding:10px 18px;border-radius:10px;font-weight:700;font-size:0.95rem;text-decoration:none;display:inline-flex;align-items:center;gap:8px;border:1px solid transparent;cursor:pointer;}
-    .btn-ghost{background:transparent;border-color:var(--gray-300);color:var(--gray-700);}
-    .btn-ghost:hover{background:var(--gray-100);}
-    .btn-primary{background:linear-gradient(135deg,var(--blue-500),var(--blue-600));color:#fff;box-shadow:0 6px 18px rgba(59,130,246,0.35);}
-    .btn-primary:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(59,130,246,0.45);}
-    .wrap{max-width:1100px;margin:0 auto;padding:56px 24px;}
-    .card{background:#fff;border:1px solid var(--gray-200);border-radius:18px;padding:28px;}
-    h1{font-size:2.2rem;line-height:1.15;color:var(--gray-900);margin-bottom:10px;}
-    .meta{color:var(--gray-500);font-weight:600;margin-bottom:22px;}
-    h2{font-size:1.25rem;color:var(--gray-900);margin-top:26px;margin-bottom:10px;}
-    p{color:var(--gray-700);margin:10px 0;}
-    ul{padding-left:20px;margin:10px 0;color:var(--gray-700);}
-    li{margin:6px 0;}
-    .callout{border-left:4px solid var(--blue-500);background:var(--blue-50);padding:14px 16px;border-radius:12px;margin:16px 0;color:var(--gray-700);}
-    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:14px;}
-    .pill{display:inline-flex;gap:8px;align-items:center;padding:6px 12px;border-radius:999px;background:var(--gray-100);border:1px solid var(--gray-200);font-weight:700;color:var(--gray-700);font-size:0.85rem;}
-    footer{border-top:1px solid var(--gray-200);background:#fff;}
-    .foot{max-width:1100px;margin:0 auto;padding:26px 24px;color:var(--gray-500);display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;}
-    .foot a{color:var(--gray-600);text-decoration:none;font-weight:700;}
-    .foot a:hover{color:var(--gray-900);}
-    @media (max-width:900px){.grid{grid-template-columns:1fr;}.nav-links{display:none;}}
-</style>
+    html { scroll-behavior: smooth; }
+    body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg-primary); color: var(--text-primary); line-height: 1.65; min-height: 100vh; }
+    a { color: var(--accent-orange); text-decoration: none; transition: color 0.2s; }
+    a:hover { color: var(--accent-orange-hover); }
+    .nav { position: sticky; top: 0; z-index: 100; padding: 1rem 2rem; background: rgba(10,10,15,0.97); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); }
+    .nav-container { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+    .nav-logo { display: flex; align-items: center; gap: 0.75rem; font-size: 1.25rem; font-weight: 700; color: white; text-decoration: none; }
+    .back-btn { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; font-weight: 500; padding: 0.5rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-md); transition: all 0.2s; }
+    .back-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--bg-hover); }
+    .hero { padding: 4rem 2rem 3rem; background: linear-gradient(180deg, rgba(59,130,246,0.06) 0%, transparent 100%); border-bottom: 1px solid var(--border-color); }
+    .hero-inner { max-width: 900px; margin: 0 auto; }
+    .hero-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.875rem; background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.25); border-radius: 50px; font-size: 0.8rem; font-weight: 600; color: var(--accent-blue); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 1.25rem; }
+    .hero h1 { font-size: 2.75rem; font-weight: 800; margin-bottom: 0.75rem; }
+    .hero p { color: var(--text-secondary); font-size: 1.1rem; max-width: 600px; }
+    .hero p strong { color: var(--text-primary); font-weight: 600; }
+    .legal-nav { background: var(--bg-secondary); border-bottom: 1px solid var(--border-color); padding: 0 2rem; overflow-x: auto; }
+    .legal-nav-inner { max-width: 1280px; margin: 0 auto; display: flex; }
+    .legal-nav a { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
+    .legal-nav a:hover { color: var(--text-primary); }
+    .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+    .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem 4rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
+    @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
+    .article { min-width: 0; }
+    .sidebar-toc { position: sticky; top: 5.5rem; z-index: 1; }
+    .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
+    .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
+    .toc-list { list-style: none; }
+    .toc-list li { margin-bottom: 0.125rem; }
+    .toc-list a { display: block; padding: 0.4rem 0.75rem; color: var(--text-secondary); font-size: 0.85rem; border-radius: var(--radius-sm); border-left: 2px solid transparent; transition: all 0.2s; text-decoration: none; }
+    .toc-list a:hover, .toc-list a.active { color: var(--accent-orange); border-left-color: var(--accent-orange); background: rgba(249,115,22,0.07); }
+    .intro { font-size: 1.05rem; color: var(--text-secondary); margin-bottom: 1.5rem; }
+    .card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.75rem; margin-bottom: 1.25rem; }
+    h2 { font-size: 1.2rem; font-weight: 700; margin-bottom: 0.75rem; color: var(--text-primary); }
+    p, li { color: var(--text-secondary); margin: 0.5rem 0; }
+    ol, ul { padding-left: 1.25rem; color: var(--text-secondary); }
+    li { margin: 0.35rem 0; }
+    .callout { border-left: 3px solid var(--accent-orange); background: rgba(249, 115, 22, 0.08); padding: 1rem 1.25rem; border-radius: 0 var(--radius-md) var(--radius-md) 0; margin: 1.25rem 0; color: var(--text-secondary); font-size: 0.95rem; }
+    .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1rem; }
+    .pill { display: inline-block; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent-orange); margin-bottom: 0.5rem; }
+    .footer { background: var(--bg-secondary); border-top: 1px solid var(--border-color); padding: 2rem; margin-top: 4rem; }
+    .footer-inner { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+    .footer-copy { color: var(--text-muted); font-size: 0.85rem; }
+    .footer-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+    .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
+    .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
+    @media (max-width: 768px) { .grid3 { grid-template-columns: 1fr; } }
+    @media (max-width: 480px) {
+        .hero { padding: 2.5rem 1.25rem 2rem; }
+        .hero h1 { font-size: 2rem; }
+        .nav { padding: 0.75rem 1rem; }
+        .content-wrapper { padding: 2rem 1.25rem 3rem; }
+    }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: var(--bg-secondary); } ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+  </style>
 </head>
 <body>
-  <nav>
-    <div class="nav-container">
-      <a class="logo" href="/index.html"><img src="/images/logo.png" alt="UploadM8"></a>
-      
-        <div class="nav-links">
-            <a href="/index.html">Home</a>
-            <a href="/contact.html">Contact</a>
-        </div>
-    
-      <div class="nav-buttons">
-        <a class="btn btn-ghost" href="/login.html">Log in</a>
-        <a class="btn btn-primary" href="/signup.html">Get started free</a>
-      </div>
-    </div>
-  </nav>
 
-  <div class="wrap">
-    <div class="card">
-      <h1>How UploadM8 Works</h1>
-      <div class="meta">Last updated: January 26, 2026</div>
-      
-<p>UploadM8 is designed for creators and teams who need repeatable distribution at scale without drowning in manual uploads.</p>
-
-<h2>Workflow</h2>
-<ol style="padding-left:20px;color:var(--gray-700);margin:10px 0;">
-  <li><strong>Connect:</strong> link TikTok, YouTube, Instagram, and Facebook accounts in one place.</li>
-  <li><strong>Upload:</strong> drop videos, set title/caption/hashtags once.</li>
-  <li><strong>Schedule:</strong> choose “smart” (recommended windows) or set a specific publish time.</li>
-  <li><strong>Queue:</strong> monitor countdowns, cancel pending jobs, and track platform results.</li>
-  <li><strong>Notify:</strong> get Discord webhooks on success/failure with links and metadata.</li>
-</ol>
-
-<h2>Smart Scheduling (what it means)</h2>
-<ul>
-  <li><strong>Inputs:</strong> your preferred windows (e.g., weekdays 6–9pm), spacing rules, and content volume.</li>
-  <li><strong>Output:</strong> a publish plan that avoids collisions and maximizes consistency.</li>
-  <li><strong>Overrides:</strong> manual time always wins.</li>
-</ul>
-
-<div class="callout"><strong>Reality check:</strong> “optimal times” can be improved, but the biggest lift comes from consistency and volume. UploadM8’s job is to make that operationally painless.</div>
-
-<h2>Core values</h2>
-<div class="grid">
-  <div class="card" style="padding:18px;border-radius:16px;">
-    <div class="pill">Single source of truth</div>
-    <p>One queue and one dashboard for all platform outcomes.</p>
+<nav class="nav">
+  <div class="nav-container">
+    <a href="index.html" class="nav-logo">
+      <img src="images/logo.svg" alt="UploadM8" style="height:32px;width:auto;">
+      UploadM8
+    </a>
+    <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
   </div>
-  <div class="card" style="padding:18px;border-radius:16px;">
-    <div class="pill">Automation, not autopilot</div>
-    <p>You set intent; the system executes and reports.</p>
-  </div>
-  <div class="card" style="padding:18px;border-radius:16px;">
-    <div class="pill">Enterprise readiness</div>
-    <p>Auditability, billing, roles, reliability, and scalability.</p>
+</nav>
+
+<div class="hero">
+  <div class="hero-inner">
+    <div class="hero-badge"><i class="fas fa-book-open"></i> Guide</div>
+    <h1>How UploadM8 works</h1>
+    <p>Last updated <strong>April 12, 2026</strong>. Built for creators and teams who need repeatable distribution without drowning in manual uploads — one presigned upload, resumable jobs, and a clear queue so publishing stays consistent while you focus on content. The dashboard adds <strong>AI + machine-learning signals</strong> (caption/thumbnail packaging vs engagement). Use <strong>On This Page</strong> to jump to a section, or open <a href="support.html">Support</a>, <a href="report-bug.html">Report a bug</a>, and <a href="contact.html">Contact</a>.</p>
   </div>
 </div>
 
-<h2>Need help?</h2>
-<p>Reach out at <a href="mailto:sosswced@gmail.com">sosswced@gmail.com</a>.</p>
+<nav class="legal-nav" aria-label="Legal and policies">
+  <div class="legal-nav-inner">
+    <a href="privacy.html"><i class="fas fa-shield-alt"></i> Privacy</a>
+    <a href="terms.html"><i class="fas fa-file-contract"></i> Terms</a>
+    <a href="security.html"><i class="fas fa-lock"></i> Security</a>
+    <a href="cookies.html"><i class="fas fa-cookie-bite"></i> Cookies</a>
+    <a href="subprocessors.html"><i class="fas fa-server"></i> Subprocessors</a>
+    <a href="refunds.html"><i class="fas fa-undo"></i> Refunds</a>
+    <a href="dmca.html"><i class="fas fa-gavel"></i> DMCA</a>
+    <a href="support.html" class="active"><i class="fas fa-headset"></i> Support</a>
+  </div>
+</nav>
 
-    </div>
+<div class="content-wrapper">
+
+  <article class="article">
+
+  <div class="section-block" id="workflow">
+  <div class="card">
+    <h2><i class="fas fa-stream" style="color:var(--accent-orange);margin-right:0.35rem;"></i> Workflow</h2>
+    <ol>
+      <li><strong style="color:var(--text-primary);">Connect</strong> — Link TikTok, YouTube, Instagram, and Facebook in one place.</li>
+      <li><strong style="color:var(--text-primary);">Upload</strong> — Drop videos; direct-to-cloud presigned upload; set title, captions, and hashtags once.</li>
+      <li><strong style="color:var(--text-primary);">Schedule</strong> — Use smart windows or pick an exact publish time.</li>
+      <li><strong style="color:var(--text-primary);">Process</strong> — Transcode, optional Whisper transcript, thumbnails, and AI captions.</li>
+      <li><strong style="color:var(--text-primary);">Queue</strong> — Track status, cancel pending jobs, see platform results.</li>
+      <li><strong style="color:var(--text-primary);">Notify</strong> — Discord webhooks on success or failure.</li>
+    </ol>
+  </div>
   </div>
 
-  <footer>
-    <div class="foot">
-      <div>© 2026 UploadM8</div>
-      <div style="display:flex;gap:14px;flex-wrap:wrap;">
-        <a href="/about.html">About</a>
-        <a href="/blog.html">Blog</a>
-        <a href="/contact.html">Contact</a>
-        <a href="/privacy.html">Privacy</a>
-        <a href="/terms.html">Terms</a>
-        <a href="/data-deletion.html">Data deletion</a>
-      </div>
+  <div class="section-block" id="scheduling">
+  <div class="card">
+    <h2>Smart scheduling</h2>
+    <ul>
+      <li><strong style="color:var(--text-primary);">Inputs:</strong> preferred windows, spacing, and volume.</li>
+      <li><strong style="color:var(--text-primary);">Output:</strong> a plan that avoids collisions and keeps you consistent.</li>
+      <li><strong style="color:var(--text-primary);">Overrides:</strong> manual time always wins.</li>
+    </ul>
+    <div class="callout"><strong style="color:var(--text-primary);">Reality check:</strong> consistency beats chasing “perfect” post times. UploadM8 makes the operational part painless.</div>
+  </div>
+  </div>
+
+  <div class="section-block" id="audio">
+  <div class="card">
+    <h2>Audio &amp; captions</h2>
+    <p>After transcode, optional <strong style="color:var(--text-primary);">Whisper</strong> transcription feeds the AI caption step so hooks and hashtags reflect what was <em>said</em>, not only what was on screen. Silent or short clips skip gracefully. Tune this in <a href="settings.html">Settings → AI</a>.</p>
+  </div>
+  </div>
+
+  <div class="section-block" id="pillars">
+  <div class="grid3">
+    <div class="card" style="margin:0;">
+      <div class="pill">One queue</div>
+      <p>Single dashboard for every platform outcome.</p>
     </div>
-  </footer>
+    <div class="card" style="margin:0;">
+      <div class="pill">You’re in control</div>
+      <p>You set intent; the system executes and reports.</p>
+    </div>
+    <div class="card" style="margin:0;">
+      <div class="pill">Built to scale</div>
+      <p>Billing, roles, reliability, and auditability.</p>
+    </div>
+  </div>
+  </div>
+
+  <div class="section-block" id="help">
+  <div class="card" style="margin-top:0;">
+    <h2>Need help?</h2>
+    <p>Visit <a href="support.html">Support</a> or <a href="contact.html">contact us</a> — we’ll get back to you by email.</p>
+  </div>
+  </div>
+
+  </article>
+
+  <aside class="sidebar-toc" aria-label="On this page">
+    <div class="toc-card">
+      <div class="toc-title">On This Page</div>
+      <ul class="toc-list">
+        <li><a href="#workflow">Workflow</a></li>
+        <li><a href="#scheduling">Smart scheduling</a></li>
+        <li><a href="#audio">Audio &amp; captions</a></li>
+        <li><a href="#pillars">At a glance</a></li>
+        <li><a href="#help">Need help?</a></li>
+      </ul>
+    </div>
+  </aside>
+
+</div>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
+    <div class="footer-links">
+      <a href="how-it-works.html" class="active">How it works</a>
+      <a href="contact.html">Contact</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="terms.html">Terms</a>
+      <a href="security.html">Security</a>
+      <a href="cookies.html">Cookies</a>
+      <a href="subprocessors.html">Subprocessors</a>
+      <a href="refunds.html">Refunds</a>
+      <a href="dmca.html">DMCA</a>
+      <a href="support.html">Support</a>
+      <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
+    </div>
+  </div>
+</footer>
+
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script>
+  const sections = document.querySelectorAll('.section-block[id]');
+  const tocLinks = document.querySelectorAll('.toc-list a');
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        tocLinks.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+      }
+    });
+  }, { rootMargin: '-20% 0% -60% 0%' });
+  sections.forEach(s => observer.observe(s));
+</script>
 </body>
 </html>

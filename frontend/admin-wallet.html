@@ -1,7 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-      <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+
+    <script src="js/html-safe.js"></script>
+      <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
     <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Wallet Manager — UploadM8 Admin</title>
@@ -178,6 +180,17 @@
     }
     .adjust-result.ok  { background: rgba(34,197,94,0.1);  border: 1px solid rgba(34,197,94,0.3);  color: #22c55e; }
     .adjust-result.err { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); color: #ef4444; }
+
+    /* ── Mobile overrides ── */
+    @media (max-width: 768px) {
+      .ledger-container { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      .ledger-table { min-width: 540px; }
+    }
+    @media (max-width: 600px) {
+      .wallet-stat-grid { grid-template-columns: 1fr 1fr; }
+      .adjust-tabs { grid-template-columns: repeat(3, 1fr); }
+      .search-result-item { flex-wrap: wrap; }
+    }
   </style>
 </head>
 
@@ -185,64 +198,16 @@
 <div class="app-layout">
 
   <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
-  <aside class="sidebar" id="sidebar">
-    <div class="sidebar-header">
-      <a href="dashboard.html" class="sidebar-logo">
-        <img src="images/logo.png" alt="UploadM8" /><span>UploadM8</span>
-      </a>
-    </div>
-    <nav class="sidebar-nav">
-      <div class="nav-section">
-        <div class="nav-section-title">Main</div>
-        <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
-        <a href="upload.html"    class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-        <a href="queue.html"     class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
-        <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-      </div>
-      <div class="nav-section">
-        <div class="nav-section-title">Platforms</div>
-        <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-        <a href="groups.html"    class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-      </div>
-      <div class="nav-section">
-        <div class="nav-section-title">Insights</div>
-        <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-      </div>
-      <div class="nav-section admin-only" id="adminSection">
-        <div class="nav-section-title">Admin</div>
-        <a href="admin.html"              class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
-        <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
-        <a href="admin-kpi.html"          class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
-        <a href="admin-calculator.html"   class="nav-link"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
-        <a href="admin-wallet.html"       class="nav-link active"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-      </div>
-      <div class="nav-section">
-        <div class="nav-section-title">Account</div>
-        <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-        <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-      </div>
-    </nav>
-    <div class="sidebar-footer">
-      <div class="user-info">
-        <div class="user-avatar" id="userAvatar">A</div>
-        <div class="user-details">
-          <div class="user-name" id="userName">Admin</div>
-          <div class="user-tier" id="userTier">MASTER ADMIN</div>
-        </div>
-        <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
-          <i class="fas fa-sign-out-alt"></i>
-        </button>
-      </div>
-    </div>
-  </aside>
+  <aside class="sidebar" id="sidebar"></aside>
 
-  <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+  <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
 
   <header class="top-bar">
-    <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
-    <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8" /><span>UploadM8</span></div>
+    <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+    <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8" /><span>UploadM8</span></div>
     <div class="top-bar-actions">
-      <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme">
+      <div data-wt-pills></div>
+      <button class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle Theme">
         <i class="fas fa-moon" id="themeToggleIconMobile"></i>
       </button>
     </div>
@@ -251,11 +216,12 @@
   <!-- ── Main Content ──────────────────────────────────────────────────── -->
   <main class="main-content">
 
-    <div class="page-header">
+    <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;">
       <div>
         <h1 class="page-title"><i class="fas fa-coins" style="color:var(--accent-orange); margin-right:0.5rem;"></i>Wallet Manager</h1>
-        <p class="page-subtitle">Adjust PUT / AIC balances for any user account • All changes logged to ledger + audit trail</p>
+        <p class="page-subtitle">Adjust upload credits (PUT) and AI credits (AIC) for any customer. Every change is saved to their wallet history and the admin audit log.</p>
       </div>
+      <div data-wt-pills class="desktop-pills"></div>
     </div>
 
     <!-- Admin guard banner -->
@@ -295,7 +261,7 @@
           <div id="selectedUserCard" class="card mb-4" style="display:none;">
             <div class="card-header" style="display:flex; align-items:center; justify-content:space-between;">
               <h3 class="card-title"><i class="fas fa-user-check"></i> Selected User</h3>
-              <button class="btn btn-ghost btn-sm" onclick="clearSelection()">
+              <button class="btn btn-ghost btn-sm" data-um8-fn="clearSelection">
                 <i class="fas fa-times"></i> Clear
               </button>
             </div>
@@ -337,7 +303,7 @@
                 </div>
               </div>
 
-              <button class="btn btn-secondary btn-sm" onclick="refreshWallet()" id="refreshBtn" style="width:100%;">
+              <button type="button" class="btn btn-secondary btn-sm" data-um8-fn="refreshWallet" id="refreshBtn" style="width:100%;">
                 <i class="fas fa-sync-alt"></i> Refresh Balance
               </button>
             </div>
@@ -357,10 +323,10 @@
               <!-- Wallet selector -->
               <label class="form-label">Wallet</label>
               <div class="wallet-select-btns" style="margin-bottom:1rem;">
-                <button class="wallet-select-btn active-put" id="walletBtnPut" onclick="selectWallet('put')">
+                <button type="button" class="wallet-select-btn active-put" id="walletBtnPut" data-um8-fn="selectWallet" data-um8-arg="put">
                   <i class="fas fa-upload"></i> PUT Tokens
                 </button>
-                <button class="wallet-select-btn" id="walletBtnAic" onclick="selectWallet('aic')">
+                <button type="button" class="wallet-select-btn" id="walletBtnAic" data-um8-fn="selectWallet" data-um8-arg="aic">
                   <i class="fas fa-robot"></i> AIC Tokens
                 </button>
               </div>
@@ -368,13 +334,13 @@
               <!-- Mode tabs -->
               <label class="form-label">Mode</label>
               <div class="adjust-tabs" style="margin-bottom:1rem;">
-                <button class="adjust-tab active" id="modeAdd"      onclick="selectMode('add')">
+                <button type="button" class="adjust-tab active" id="modeAdd"      data-um8-fn="selectMode" data-um8-arg="add">
                   <i class="fas fa-plus"></i> Add
                 </button>
-                <button class="adjust-tab"        id="modeSubtract" onclick="selectMode('subtract')">
+                <button type="button" class="adjust-tab"        id="modeSubtract" data-um8-fn="selectMode" data-um8-arg="subtract">
                   <i class="fas fa-minus"></i> Subtract
                 </button>
-                <button class="adjust-tab"        id="modeSet"      onclick="selectMode('set')">
+                <button type="button" class="adjust-tab"        id="modeSet"      data-um8-fn="selectMode" data-um8-arg="set">
                   <i class="fas fa-equals"></i> Set to
                 </button>
               </div>
@@ -432,10 +398,11 @@
               <div class="adjust-result" id="adjustResult"></div>
 
               <button
+                type="button"
                 class="btn btn-primary mt-3"
                 id="adjustSubmitBtn"
                 style="width:100%;"
-                onclick="submitAdjust()"
+                data-um8-fn="submitAdjust"
               >
                 <i class="fas fa-save"></i> Apply Adjustment
               </button>
@@ -468,10 +435,21 @@
 
 <div id="toastContainer"></div>
 
-<script src="wallet-tokens.js"></script>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script src="shared-sidebar.js"></script>
+<script src="js/helpers-formatting.js"></script>
+<script src="js/upload-utils.js"></script>
 <script src="app.js"></script>
+<script src="wallet-tokens.js"></script>
 
 <script>
+function escapeHtml(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 // ════════════════════════════════════════════════════════════
 // STATE
 // ════════════════════════════════════════════════════════════
@@ -485,10 +463,12 @@ let selectedMode   = 'add';
 // INIT
 // ════════════════════════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', async () => {
-  const user = await initApp('admin-wallet');
+  const user = await initApp('admin-wallet', { forceAuthRefresh: false, skipWalletRefresh: false });
   if (!user) return;
 
-  const isAdmin = user.role === 'admin' || user.role === 'master_admin' || !!user.is_admin;
+  const role = String(user.role || '').toLowerCase();
+  const tier = String(user.tier || user.subscription_tier || '').toLowerCase();
+  const isAdmin = role === 'admin' || role === 'master_admin' || tier === 'master_admin' || !!user.is_admin;
   if (!isAdmin) {
     document.getElementById('adminGuardBanner').style.display = '';
     return;
@@ -533,22 +513,31 @@ async function runSearch(query) {
     container.innerHTML = users.map((u, i) => `
       <div
         class="search-result-item ${selectedUser && selectedUser.id === String(u.id) ? 'active' : ''}"
-        onclick="selectUserByIndex(${i}, this)"
+        data-um8-fn="selectUserByIndex" data-um8-args="[${i}]"
       >
-        <div class="result-avatar">${(u.name || u.email || '?')[0].toUpperCase()}</div>
+        <div class="result-avatar">${escapeHtml((u.name || u.email || '?')[0].toUpperCase())}</div>
         <div class="result-info">
-          <div class="result-email">${u.email || '—'}</div>
-          <div class="result-meta">${u.name || 'No name'}</div>
+          <div class="result-email">${escapeHtml(u.email || '—')}</div>
+          <div class="result-meta">${escapeHtml(u.name || 'No name')}</div>
         </div>
-        <span class="tier-badge">${(u.subscription_tier || 'free').replace('_',' ')}</span>
+        <span class="tier-badge">${escapeHtml((u.subscription_tier || 'free').replace(/_/g,' '))}</span>
       </div>
     `).join('');
   } catch (e) {
-    container.innerHTML = `<div class="text-sm" style="color:#ef4444; padding:0.5rem 0;">Search failed: ${e.message}</div>`;
+    container.innerHTML = `<div class="text-sm" style="color:#ef4444; padding:0.5rem 0;">Search failed: ${escapeHtml(e && e.message)}</div>`;
   }
 }
 
-async function selectUserByIndex(index, el) {
+async function selectUserByIndex(first, second) {
+    let index, el;
+    if (first && typeof first === 'object' && typeof first.preventDefault === 'function') {
+        el = this && this.nodeType === 1 ? this : null;
+        index = Number(second);
+    } else {
+        index = Number(first);
+        el = second;
+    }
+    if (!Number.isFinite(index) || !el) return;
   const u = (window._searchUsers || [])[index];
   if (!u) return;
 
@@ -695,14 +684,22 @@ function renderWalletStats() {
 // ════════════════════════════════════════════════════════════
 // ADJUST FORM
 // ════════════════════════════════════════════════════════════
-function selectWallet(w) {
+function selectWallet(first, second) {
+    const w =
+        second !== undefined && second !== null && second !== ''
+            ? String(second)
+            : String(first);
   selectedWallet = w;
   document.getElementById('walletBtnPut').className = 'wallet-select-btn' + (w === 'put' ? ' active-put' : '');
   document.getElementById('walletBtnAic').className = 'wallet-select-btn' + (w === 'aic' ? ' active-aic' : '');
   renderPreview();
 }
 
-function selectMode(m) {
+function selectMode(first, second) {
+    const m =
+        second !== undefined && second !== null && second !== ''
+            ? String(second)
+            : String(first);
   selectedMode = m;
   // IDs: modeAdd, modeSubtract, modeSet
   const modeIds = { add: 'modeAdd', subtract: 'modeSubtract', set: 'modeSet' };
@@ -821,9 +818,9 @@ async function submitAdjust() {
 
   } catch (e) {
     resultEl.className = 'adjust-result err';
-    resultEl.innerHTML = `<i class="fas fa-exclamation-triangle"></i> ${e.message || 'Adjustment failed'}`;
+    resultEl.innerHTML = `<i class="fas fa-exclamation-triangle"></i> ${escapeHtml(e && e.message ? e.message : 'Adjustment failed')}`;
     resultEl.style.display = '';
-    showToast(`Failed: ${e.message}`, 'error');
+    showToast(`Failed: ${escapeHtml(e && e.message ? e.message : 'Error')}`, 'error');
   } finally {
     btn.disabled = false;
     btn.innerHTML = '<i class="fas fa-save"></i> Apply Adjustment';

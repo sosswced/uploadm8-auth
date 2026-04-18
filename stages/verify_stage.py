@@ -7,25 +7,45 @@ published videos actually went live (Step B confirmation).
 The publish stage records "accepted" status (Step A). This stage
 asynchronously verifies that videos actually appear on platforms.
 
-Exports: run_verification_loop(db_pool, shutdown_event)
+Exports: run_verification_loop(db_pool, shutdown_event, redis_client=None)
 """
 
 import asyncio
 import json
 import logging
 import os
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
 import asyncpg
 import httpx
+
+from services.worker_leader_lock import acquire_leader_lock, release_leader_lock
 
 from . import db as db_stage
 from .publish_stage import decrypt_token, init_enc_keys
 
 logger = logging.getLogger("uploadm8-worker")
 
+
+def _tiktok_web_video_url(video_id: str, username: Optional[str]) -> str:
+    """TikTok often 404s for www.tiktok.com/video/{id} without the creator handle."""
+    v = str(video_id or "").strip()
+    if not v:
+        return ""
+    u = (username or "").strip().lstrip("@")
+    if u:
+        return f"https://www.tiktok.com/@{u}/video/{v}"
+    return f"https://www.tiktok.com/video/{v}"
+
+
 VERIFY_INTERVAL_SECONDS = int(os.environ.get("VERIFY_INTERVAL_SECONDS", "60"))
 VERIFY_MAX_AGE_HOURS = int(os.environ.get("VERIFY_MAX_AGE_HOURS", "24"))
+VERIFY_LOCK_TTL_SECONDS = int(
+    os.environ.get(
+        "WORKER_LEADER_LOCK_TTL_VERIFY_SEC",
+        str(max(120, VERIFY_INTERVAL_SECONDS * 4)),
+    )
+)
 
 
 async def verify_tiktok(publish_id: str, token_data: dict):
@@ -200,9 +220,16 @@ async def verify_single_attempt(
                                 if isinstance(item, dict) and item.get("platform") == "tiktok":
                                     item["platform_video_id"] = tiktok_video_id
                                     item["video_id"] = tiktok_video_id
-                                    # Build the TikTok video URL
-                                    item["platform_url"] = f"https://www.tiktok.com/video/{tiktok_video_id}"
-                                    item["url"] = item["platform_url"]
+                                    uname = (item.get("account_username") or "").strip().lstrip("@")
+                                    if not uname and isinstance(token_data, dict):
+                                        uname = (
+                                            str(token_data.get("_account_username") or "")
+                                            .strip()
+                                            .lstrip("@")
+                                        )
+                                    tt_url = _tiktok_web_video_url(tiktok_video_id, uname)
+                                    item["platform_url"] = tt_url
+                                    item["url"] = tt_url
                                     updated = True
                             if updated:
                                 await conn.execute(
@@ -220,43 +247,60 @@ async def verify_single_attempt(
 async def run_verification_loop(
     db_pool: asyncpg.Pool,
     shutdown_event: asyncio.Event,
+    redis_client: Optional[Any] = None,
 ):
     """
     Background loop that polls pending publish attempts and verifies them.
 
     Runs alongside the main job processing loop. Exits when shutdown_event is set.
+    With redis_client and leader locks enabled, only one worker replica runs each tick.
     """
     logger.info("Verification loop started")
     init_enc_keys()
 
     while not shutdown_event.is_set():
+        lock_token = await acquire_leader_lock(
+            redis_client,
+            "verification",
+            VERIFY_LOCK_TTL_SECONDS,
+        )
+        if lock_token is None:
+            logger.debug("Verification skipping cycle (peer holds leader lock)")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(shutdown_event.wait()),
+                    timeout=VERIFY_INTERVAL_SECONDS,
+                )
+                break
+            except asyncio.TimeoutError:
+                continue
         try:
-            # Load pending verifications
-            pending = await db_stage.load_pending_verifications(db_pool, limit=50)
+            try:
+                pending = await db_stage.load_pending_verifications(db_pool, limit=50)
 
-            if pending:
-                logger.info(f"Verifying {len(pending)} publish attempts")
-                for attempt in pending:
-                    if shutdown_event.is_set():
-                        break
-                    try:
-                        await verify_single_attempt(db_pool, attempt)
-                    except Exception as e:
-                        logger.warning(f"Verify attempt failed: {e}")
-                    # Small delay between API calls to avoid rate limits
-                    await asyncio.sleep(0.5)
+                if pending:
+                    logger.info(f"Verifying {len(pending)} publish attempts")
+                    for attempt in pending:
+                        if shutdown_event.is_set():
+                            break
+                        try:
+                            await verify_single_attempt(db_pool, attempt)
+                        except Exception as e:
+                            logger.warning(f"Verify attempt failed: {e}")
+                        await asyncio.sleep(0.5)
 
-        except Exception as e:
-            logger.warning(f"Verification loop error: {e}")
+            except Exception as e:
+                logger.warning(f"Verification loop error: {e}")
+        finally:
+            await release_leader_lock(redis_client, "verification", lock_token)
 
-        # Wait for next cycle or shutdown
         try:
             await asyncio.wait_for(
-                shutdown_event.wait(),
+                asyncio.shield(shutdown_event.wait()),
                 timeout=VERIFY_INTERVAL_SECONDS,
             )
-            break  # shutdown_event was set
+            break
         except asyncio.TimeoutError:
-            pass  # Normal timeout — loop again
+            pass
 
     logger.info("Verification loop stopped")

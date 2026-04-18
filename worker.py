@@ -7,8 +7,14 @@ Pipeline order (critical — DO NOT REORDER):
   3.  HUD             — Burn speed overlay onto raw video (before transcode!)
   4.  Watermark       — Burn text watermark (before transcode!)
   5.  Transcode       — Deduplicated per-platform MP4s
-  6.  Thumbnail       — Extract frame from FINAL processed video
-  7.  Caption         — AI title/caption/hashtags (vision + telemetry)
+  5b. Audio context   — Whisper / GPT summary / hooks (per aiService* + audio prefs)
+  5c. Vision (GCP)    — Frame Inspector (aiServiceFrameInspector)
+  5d. Twelve Labs     — Scene Understanding (aiServiceSceneUnderstanding + env)
+  5e. Video Intel     — Full-clip analyzer (aiServiceVideoAnalyzer + env)
+  6.  Thumbnail       — Extract frame from FINAL processed video (auto_thumbnails + designer toggles)
+  7.  Caption         — M8_ENGINE (scene graph + user-seeded content_strategy) by default; legacy narrative
+                        prompt if UPLOADM8_M8_CAPTION_ENGINE=false or M8 fails. Respects aiServiceCaptionWriter,
+                        Frame Inspector (frames), and other upstream context when those stages run.
   8.  Upload          — Per-platform R2 keys
   9.  Publish         — Send to each platform API
   10. Verify          — Delivery verification loop (background)
@@ -63,6 +69,15 @@ NEW IN v3: DEFERRED PROCESSING (Staged Upload Flow)
 CONCURRENCY:
   WORKER_CONCURRENCY=3 (default) — 3 jobs process simultaneously.
   Scheduler loop runs as a separate asyncio task, not a job slot.
+
+CHECKPOINT RESUME (retry):
+  When POST /api/uploads/{id}/retry runs, the job includes action="retry".
+  Priority:
+    1) processed_assets complete → publish-only / ready_to_publish (final MP4s).
+    2) output_artifacts.pipeline_resume.stage == post_caption → resume at
+       "upload processed to R2" (transcoded MP4s + thumbnail on R2; caption in DB).
+    3) pipeline_resume.stage == post_transcode → resume at audio/vision/thumbnail/caption.
+  Checkpoints are written after transcode and after caption; cleared when stage 8 succeeds.
 """
 
 import os
@@ -79,10 +94,17 @@ from typing import Optional, Dict, List, Tuple
 import asyncpg
 import redis.asyncio as redis
 
+from services.worker_leader_lock import (
+    acquire_leader_lock,
+    leader_lock_enabled,
+    leader_lock_prefix,
+    release_leader_lock,
+)
 from stages.errors import StageError, SkipStage, CancelRequested
 from stages.context import JobContext, create_context
-from stages.entitlements import get_entitlements_from_user
+from stages.entitlements import get_entitlements_from_user, wallet_bypass_for_user_record
 from stages import db as db_stage
+from stages import pipeline_checkpoint as pipeline_ck
 from stages import r2 as r2_stage
 from stages.telemetry_stage import run_telemetry_stage
 from stages.transcode_stage import (
@@ -91,7 +113,13 @@ from stages.transcode_stage import (
     resolve_reframe_action,
 )
 from stages.thumbnail_stage import run_thumbnail_stage
+from stages.audio_stage import run_audio_context_stage
+from stages.vision_stage import run_vision_stage
+from stages.twelvelabs_stage import run_twelvelabs_stage
+from stages.video_intelligence_stage import run_video_intelligence_stage
 from stages.caption_stage import run_caption_stage
+from stages.pipeline_manifest import init_pipeline_diag
+from stages.ai_service_costs import user_pref_ai_service_enabled
 from stages.hud_stage import run_hud_stage
 from stages.watermark_stage import run_watermark_stage
 from stages.publish_stage import run_publish_stage
@@ -114,6 +142,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [worker] %(message)s",
 )
 logger = logging.getLogger("uploadm8-worker")
+# httpx logs full request URLs at INFO (OAuth tokens in query strings). Match core/config.py.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+from core.sentry_init import init_sentry_for_worker
+
+init_sentry_for_worker()
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 REDIS_URL = os.environ.get("REDIS_URL", "")
@@ -148,10 +183,58 @@ ANALYTICS_SYNC_INTERVAL = int(os.environ.get("ANALYTICS_SYNC_INTERVAL_SECONDS", 
 # ── KPI collector ─────────────────────────────────────────────────
 # How often to collect cost/revenue from Stripe, OpenAI, Mailgun, etc. (seconds). Default: 30 min.
 KPI_COLLECTOR_INTERVAL = int(os.environ.get("KPI_COLLECTOR_INTERVAL_SECONDS", str(30 * 60)))
+
+# ── ML scoring (upload_quality_scores_daily rollups) ────────────────────────
+ML_SCORING_INTERVAL = int(os.environ.get("ML_SCORING_INTERVAL_SECONDS", str(3600)))
+
+# Optional: AI-driven multi-channel touchpoints (email / Discord / in-app). See services/marketing_touchpoint_runner.py
+MARKETING_AUTOMATION_INTERVAL_SEC = int(
+    os.environ.get("MARKETING_AUTOMATION_INTERVAL_SEC", str(4 * 3600))
+)
 # How many uploads to sync per cycle (avoids platform API rate-limit hammering)
 ANALYTICS_SYNC_BATCH    = int(os.environ.get("ANALYTICS_SYNC_BATCH_SIZE", "20"))
 # Only re-sync uploads whose analytics_synced_at is older than this many hours
 ANALYTICS_RESYNC_HOURS  = int(os.environ.get("ANALYTICS_RESYNC_HOURS", "6"))
+
+# ── Multi-instance leader locks (Redis) — see services/worker_leader_lock.py ──
+WORKER_ENABLE_ANALYTICS_SYNC = os.environ.get("WORKER_ENABLE_ANALYTICS_SYNC", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+WORKER_ENABLE_KPI_COLLECTOR = os.environ.get("WORKER_ENABLE_KPI_COLLECTOR", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+WORKER_ENABLE_ML_SCORING = os.environ.get("WORKER_ENABLE_ML_SCORING", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+WORKER_ENABLE_SCHEDULER = os.environ.get("WORKER_ENABLE_SCHEDULER", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+_ANALYTICS_LOCK_TTL = max(600, min(ANALYTICS_SYNC_INTERVAL - 120, 7200))
+WORKER_LEADER_LOCK_TTL_ANALYTICS = int(
+    os.environ.get("WORKER_LEADER_LOCK_TTL_ANALYTICS_SEC", str(_ANALYTICS_LOCK_TTL))
+)
+WORKER_LEADER_LOCK_TTL_KPI = int(
+    os.environ.get("WORKER_LEADER_LOCK_TTL_KPI_SEC", str(max(120, min(KPI_COLLECTOR_INTERVAL, 900))))
+)
+_ML_LOCK_TTL = max(300, min(ML_SCORING_INTERVAL - 60, 3600))
+WORKER_LEADER_LOCK_TTL_ML_SCORING = int(
+    os.environ.get("WORKER_LEADER_LOCK_TTL_ML_SCORING_SEC", str(_ML_LOCK_TTL))
+)
+WORKER_LEADER_LOCK_TTL_SCHEDULER = int(
+    os.environ.get(
+        "WORKER_LEADER_LOCK_TTL_SCHEDULER_SEC",
+        str(max(120, SCHEDULER_POLL_INTERVAL * 4)),
+    )
+)
+WORKER_LEADER_LOCK_TTL_MARKETING = int(
+    os.environ.get(
+        "WORKER_LEADER_LOCK_TTL_MARKETING_SEC",
+        str(max(300, min(MARKETING_AUTOMATION_INTERVAL_SEC, 3600))),
+    )
+)
+
+# Cap asyncpg max pool size (e.g. small Postgres plan). Approx connections ≈ instances × db_max.
+WORKER_DB_POOL_MAX = os.environ.get("WORKER_DB_POOL_MAX", "").strip()
 
 # Redis resilience
 REDIS_RETRY_DELAY = 5.0
@@ -169,30 +252,37 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
     if not db_pool:
         return
     async with db_pool.acquire() as conn:
-        # Debit balance and clear reservation simultaneously
-        await conn.execute("""
-            UPDATE wallets SET
-                put_balance  = put_balance  - $1,
-                aic_balance  = aic_balance  - $2,
-                put_reserved = put_reserved - $1,
-                aic_reserved = aic_reserved - $2,
-                updated_at   = NOW()
-            WHERE user_id = $3
-              AND put_reserved >= $1
-              AND aic_reserved >= $2
-        """, put_cost, aic_cost, user_id)
+        urow = await conn.fetchrow(
+            "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+            user_id,
+        )
+        wallet_exempt = bool(urow) and wallet_bypass_for_user_record(dict(urow))
 
-        # Ledger entries
-        if put_cost > 0:
+        if not wallet_exempt:
+            # Debit balance and clear reservation simultaneously
             await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'put', $2, 'upload_debit', $3, 'upload')
-            """, user_id, -put_cost, upload_id)
-        if aic_cost > 0:
-            await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'aic', $2, 'upload_debit', $3, 'upload')
-            """, user_id, -aic_cost, upload_id)
+                UPDATE wallets SET
+                    put_balance  = put_balance  - $1,
+                    aic_balance  = aic_balance  - $2,
+                    put_reserved = put_reserved - $1,
+                    aic_reserved = aic_reserved - $2,
+                    updated_at   = NOW()
+                WHERE user_id = $3
+                  AND put_reserved >= $1
+                  AND aic_reserved >= $2
+            """, put_cost, aic_cost, user_id)
+
+            # Ledger entries
+            if put_cost > 0:
+                await conn.execute("""
+                    INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                    VALUES ($1, 'put', $2, 'upload_debit', $3, 'upload')
+                """, user_id, -put_cost, upload_id)
+            if aic_cost > 0:
+                await conn.execute("""
+                    INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                    VALUES ($1, 'aic', $2, 'upload_debit', $3, 'upload')
+                """, user_id, -aic_cost, upload_id)
 
         # Update wallet_holds record
         await conn.execute("""
@@ -204,6 +294,9 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
         await conn.execute("""
             UPDATE uploads SET hold_status = 'captured' WHERE id = $1
         """, upload_id)
+
+        if wallet_exempt:
+            return
 
         # Low token warning: if balance dropped to/below threshold, email user
         LOW_THRESHOLD = 5
@@ -250,24 +343,31 @@ async def _release_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
     if not db_pool:
         return
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE wallets SET
-                put_reserved = GREATEST(0, put_reserved - $1),
-                aic_reserved = GREATEST(0, aic_reserved - $2),
-                updated_at   = NOW()
-            WHERE user_id = $3
-        """, put_cost, aic_cost, user_id)
+        urow = await conn.fetchrow(
+            "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+            user_id,
+        )
+        wallet_exempt = bool(urow) and wallet_bypass_for_user_record(dict(urow))
 
-        if put_cost > 0:
+        if not wallet_exempt:
             await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'put', $2, $3, $4, 'upload')
-            """, user_id, put_cost, reason, upload_id)  # positive delta = refund
-        if aic_cost > 0:
-            await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'aic', $2, $3, $4, 'upload')
-            """, user_id, aic_cost, reason, upload_id)
+                UPDATE wallets SET
+                    put_reserved = GREATEST(0, put_reserved - $1),
+                    aic_reserved = GREATEST(0, aic_reserved - $2),
+                    updated_at   = NOW()
+                WHERE user_id = $3
+            """, put_cost, aic_cost, user_id)
+
+            if put_cost > 0:
+                await conn.execute("""
+                    INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                    VALUES ($1, 'put', $2, $3, $4, 'upload')
+                """, user_id, put_cost, reason, upload_id)  # positive delta = refund
+            if aic_cost > 0:
+                await conn.execute("""
+                    INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
+                    VALUES ($1, 'aic', $2, $3, $4, 'upload')
+                """, user_id, aic_cost, reason, upload_id)
 
         await conn.execute("""
             UPDATE wallet_holds SET status = 'released', resolved_at = NOW()
@@ -318,6 +418,13 @@ async def partial_refund_tokens(
     Note: In the worker flow we capture the full hold first (reserved → spent),
     so this refund credits *put_balance* back (no reserved adjustment).
     """
+    urow = await conn.fetchrow(
+        "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+        user_id,
+    )
+    if urow and wallet_bypass_for_user_record(dict(urow)):
+        return
+
     n_failed = len(failed_platforms or [])
     if n_failed == 0 or not (succeeded_platforms or []):
         return
@@ -518,6 +625,42 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
 # Settings helpers
 # ---------------------------------------------------------------------------
 
+def _merge_job_preferences(ctx: JobContext, job_data: dict) -> None:
+    """Apply preferences snapshot from enqueue (if any) on top of DB-loaded settings."""
+    jp = job_data.get("preferences")
+    if not isinstance(jp, dict) or not jp:
+        return
+
+    merged = dict(ctx.user_settings or {})
+
+    # platformHashtags: deep-merge. Enqueue payloads often send `{}` or partial dicts;
+    # a flat dict.update() was wiping DB-loaded per-platform lists (never applied on publish).
+    inc_ph = jp.get("platformHashtags")
+    if inc_ph is None:
+        inc_ph = jp.get("platform_hashtags")
+
+    filtered = {k: v for k, v in jp.items() if k not in ("platformHashtags", "platform_hashtags")}
+    merged.update(filtered)
+
+    if isinstance(inc_ph, dict):
+        cur = merged.get("platformHashtags") or merged.get("platform_hashtags") or {}
+        cur = cur if isinstance(cur, dict) else {}
+        if len(inc_ph) == 0 and cur:
+            pass
+        else:
+            out = dict(cur)
+            for pk, pv in inc_ph.items():
+                if isinstance(pv, (list, tuple)) and len(pv) == 0:
+                    continue
+                if isinstance(pv, str) and not pv.strip():
+                    continue
+                out[pk] = pv
+            merged["platformHashtags"] = out
+            merged["platform_hashtags"] = out
+
+    ctx.user_settings = merged
+
+
 def _should_run_trill(ctx: JobContext) -> bool:
     has_file = (
         ctx.local_telemetry_path is not None
@@ -525,10 +668,18 @@ def _should_run_trill(ctx: JobContext) -> bool:
     )
     if not has_file:
         return False
-    setting = ctx.user_settings.get("telemetry_enabled", True)
+    setting = ctx.user_settings.get("telemetry_enabled")
+    if setting is None:
+        setting = ctx.user_settings.get("trill_enabled", True)
+    if setting is None:
+        setting = True
     if isinstance(setting, str):
         setting = setting.lower() not in ("false", "0", "no", "off")
-    return bool(setting)
+    if not bool(setting):
+        return False
+    if not user_pref_ai_service_enabled(ctx.user_settings or {}, "telemetry_trill", default=True):
+        return False
+    return True
 
 
 def _should_run_hud(ctx: JobContext) -> bool:
@@ -563,6 +714,133 @@ def _apply_trill_caption_settings(ctx: JobContext) -> None:
         ctx.trill = None
 
 
+def _normalized_processed_assets(upload_record: dict) -> Dict[str, str]:
+    """Return processed_assets from the upload row as a flat str->str map (R2 keys)."""
+    raw = upload_record.get("processed_assets")
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items() if v}
+    if isinstance(raw, str):
+        try:
+            d = json.loads(raw)
+        except Exception:
+            return {}
+        if isinstance(d, dict):
+            return {str(k): str(v) for k, v in d.items() if v}
+        return {}
+    return {}
+
+
+def _platforms_covered_by_assets(assets: Dict[str, str], platforms: List[str]) -> bool:
+    """True if every target platform has a non-empty R2 key in processed_assets."""
+    if not platforms or not assets:
+        return False
+
+    def _norm_key(k: str) -> str:
+        k = str(k).strip()
+        if not k or k == "default" or k.startswith("thumb_"):
+            return ""
+        return k.lower()
+
+    by_lower = {_norm_key(k): v for k, v in assets.items() if _norm_key(k)}
+
+    for p in platforms:
+        pl = str(p).strip().lower()
+        if not pl:
+            continue
+        key = by_lower.get(pl)
+        if not key or not str(key).strip():
+            return False
+    return True
+
+
+def _hydrate_ctx_ai_from_upload_record(ctx: JobContext, upload_record: dict) -> None:
+    """Restore AI caption fields from DB for publish-only paths (no caption_stage run)."""
+    if not upload_record:
+        return
+    title = upload_record.get("ai_generated_title") or upload_record.get("ai_title")
+    if title and not ctx.ai_title:
+        ctx.ai_title = str(title).strip() or ctx.ai_title
+    cap = upload_record.get("ai_generated_caption") or upload_record.get("ai_caption")
+    if cap and not ctx.ai_caption:
+        ctx.ai_caption = str(cap).strip() or ctx.ai_caption
+    tags = upload_record.get("ai_generated_hashtags") or upload_record.get("ai_hashtags")
+    if tags is not None and not ctx.ai_hashtags:
+        from core.helpers import coerce_hashtag_list
+
+        ctx.ai_hashtags = [str(t) for t in coerce_hashtag_list(tags) if str(t).strip()]
+
+
+async def _prepare_ctx_for_publish_from_r2_assets(
+    ctx: JobContext,
+    upload_id: str,
+    processed_assets: Dict[str, str],
+    temp_dir: Path,
+) -> bool:
+    """
+    Download processed MP4s (and platform thumbnails) from R2 into temp_dir for publish_stage.
+    Mutates ctx.platform_videos, output_artifacts, processed_r2_key, temp_dir.
+    """
+    ctx.output_artifacts["processed_assets"] = json.dumps(processed_assets)
+    ctx.processed_r2_key = processed_assets.get("default") or next(
+        (v for k, v in processed_assets.items() if not str(k).startswith("thumb_") and k != "default"),
+        "",
+    )
+    ctx.temp_dir = temp_dir
+
+    downloaded: Dict[str, Path] = {}
+    for platform, r2_key in processed_assets.items():
+        if platform == "default" or str(platform).startswith("thumb_"):
+            continue
+        if r2_key in downloaded:
+            ctx.platform_videos[platform] = downloaded[r2_key]
+            continue
+        local_path = temp_dir / f"{platform}.mp4"
+        try:
+            await r2_stage.download_file(r2_key, local_path)
+            ctx.platform_videos[platform] = local_path
+            downloaded[r2_key] = local_path
+            logger.info(f"[{upload_id}] Downloaded {platform} for publish: {r2_key}")
+        except Exception as e:
+            logger.error(f"[{upload_id}] Failed to download {platform} asset: {e}")
+
+    if not ctx.platform_videos:
+        logger.error(f"[{upload_id}] No platform videos available after download")
+        return False
+
+    default_key = processed_assets.get("default")
+    if default_key:
+        default_local = temp_dir / "default.mp4"
+        try:
+            await r2_stage.download_file(default_key, default_local)
+            ctx.processed_video_path = default_local
+        except Exception:
+            pass
+
+    platform_thumb_map: Dict[str, str] = {}
+    platform_thumb_r2_keys: Dict[str, str] = {}
+    for key, r2_key in processed_assets.items():
+        if not str(key).startswith("thumb_") or not r2_key:
+            continue
+        plat = str(key).replace("thumb_", "")
+        platform_thumb_r2_keys[plat] = r2_key
+        local_thumb = temp_dir / f"thumb_{plat}.jpg"
+        try:
+            await r2_stage.download_file(r2_key, local_thumb)
+            if local_thumb.exists():
+                platform_thumb_map[plat] = str(local_thumb)
+                logger.debug(f"[{upload_id}] Downloaded thumb_{plat} for publish")
+        except Exception as e:
+            logger.debug(f"[{upload_id}] Thumb {plat} download failed: {e}")
+    if platform_thumb_map:
+        ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_thumb_map)
+    if platform_thumb_r2_keys:
+        ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2_keys)
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # PROCESSING PIPELINE (all stages except publish)
 # ---------------------------------------------------------------------------
@@ -578,9 +856,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
     upload_id = job_data.get("upload_id")
     user_id = job_data.get("user_id")
     job_id = job_data.get("job_id", "unknown")
-    is_deferred = job_data.get("deferred", False)  # True = staged, publish later
 
-    logger.info(f"[{upload_id}] Processing start | job={job_id} | deferred={is_deferred}")
     ctx = None
     temp_dir = None
 
@@ -594,6 +870,14 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             logger.info(f"[{upload_id}] Skipping — already cancelled")
             return False
 
+        if "deferred" in job_data:
+            is_deferred = bool(job_data.get("deferred"))
+        else:
+            sm = (upload_record.get("schedule_mode") or "immediate").strip().lower()
+            is_deferred = sm in ("scheduled", "smart")
+
+        logger.info(f"[{upload_id}] Processing start | job={job_id} | deferred={is_deferred}")
+
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
         entitlements = get_entitlements_from_user(user_record, overrides)
@@ -602,6 +886,14 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
+        _merge_job_preferences(ctx, job_data)
+        try:
+            await db_stage.merge_pikzels_thumbnail_persona_id(
+                db_pool, str(user_id), ctx.user_settings
+            )
+        except Exception as e:
+            logger.debug("[%s] merge_pikzels_thumbnail_persona_id: %s", upload_id, e)
+        init_pipeline_diag(ctx, upload_record, is_deferred=is_deferred)
         ctx.user_settings["_openai_model_override"] = (
             ctx.user_settings.get("trillOpenaiModel")
             or ctx.user_settings.get("trill_openai_model")
@@ -638,6 +930,81 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             if not ent.can_ai and hasattr(ctx, "use_ai"):
                 ctx.use_ai = False
 
+        processed_snapshot = _normalized_processed_assets(upload_record)
+        resume_from_assets = (
+            job_data.get("action") == "retry"
+            and processed_snapshot
+            and _platforms_covered_by_assets(processed_snapshot, ctx.platforms or [])
+        )
+
+        if resume_from_assets:
+            await db_stage.mark_processing_started(db_pool, ctx)
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE uploads SET processing_started_at = NOW() WHERE id = $1",
+                        upload_id,
+                    )
+            except Exception:
+                pass
+
+            if is_deferred:
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE uploads
+                            SET status = 'ready_to_publish',
+                                ready_to_publish_at = NOW(),
+                                processed_assets = $2::jsonb,
+                                updated_at = NOW()
+                            WHERE id = $1
+                            """,
+                            upload_id,
+                            json.dumps(processed_snapshot),
+                        )
+                    logger.info(
+                        f"[{upload_id}] Retry resume: using saved processed_assets → ready_to_publish "
+                        f"(skipped download/transcode/caption)"
+                    )
+                    return True
+                except Exception as e:
+                    logger.warning(
+                        f"[{upload_id}] Deferred resume update failed ({e}); running full pipeline"
+                    )
+            else:
+                _hydrate_ctx_ai_from_upload_record(ctx, upload_record)
+                temp_resume = tempfile.TemporaryDirectory()
+                try:
+                    if await _prepare_ctx_for_publish_from_r2_assets(
+                        ctx,
+                        upload_id,
+                        processed_snapshot,
+                        Path(temp_resume.name),
+                    ):
+                        logger.info(
+                            f"[{upload_id}] Retry resume: publish-only from saved processed_assets "
+                            f"(skipped download/transcode/caption)"
+                        )
+                        return await run_publish_and_notify(ctx, upload_id, user_id)
+                    logger.warning(
+                        f"[{upload_id}] Publish-only resume could not load R2 assets; running full pipeline"
+                    )
+                finally:
+                    try:
+                        temp_resume.cleanup()
+                    except Exception:
+                        pass
+
+        ckpt_mode, ckpt_holder = await pipeline_ck.try_resume_from_checkpoint(
+            db_pool, job_data, upload_record, ctx
+        )
+        skip_early = ckpt_mode in ("post_transcode", "post_caption")
+        skip_mid = ckpt_mode == "post_caption"
+
+        if ckpt_mode == "post_caption":
+            _hydrate_ctx_ai_from_upload_record(ctx, upload_record)
+
         await db_stage.mark_processing_started(db_pool, ctx)
         # Record processing_started_at for staged jobs
         try:
@@ -651,180 +1018,243 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
         await maybe_cancel(ctx, "init")
 
-        # ============================================================
-        # STAGE 1: Download
-        # ============================================================
-        ctx.mark_stage("download")
-        temp_dir = tempfile.TemporaryDirectory()
-        ctx.temp_dir = Path(temp_dir.name)
+        temp_dir = None
+        if not skip_early:
+            # ============================================================
+            # STAGE 1: Download
+            # ============================================================
+            ctx.mark_stage("download")
+            temp_dir = tempfile.TemporaryDirectory()
+            ctx.temp_dir = Path(temp_dir.name)
 
-        video_local = ctx.temp_dir / ctx.filename
-        await r2_stage.download_file(ctx.source_r2_key, video_local)
-        ctx.local_video_path = video_local
+            video_local = ctx.temp_dir / ctx.filename
+            await r2_stage.download_file(ctx.source_r2_key, video_local)
+            ctx.local_video_path = video_local
 
-        if ctx.telemetry_r2_key:
-            try:
-                telem_local = ctx.temp_dir / "telemetry.map"
-                await r2_stage.download_file(ctx.telemetry_r2_key, telem_local)
-                ctx.local_telemetry_path = telem_local
-                logger.info(f"[{upload_id}] Telemetry downloaded")
-            except Exception as e:
-                logger.warning(f"[{upload_id}] Telemetry download failed: {e}")
-                ctx.local_telemetry_path = None
-
-        trill_active = _should_run_trill(ctx)
-        hud_active = _should_run_hud(ctx)
-        logger.info(f"[{upload_id}] Flags: trill={trill_active} hud={hud_active} platforms={ctx.platforms}")
-        await maybe_cancel(ctx, "download")
-
-        # ============================================================
-        # STAGE 2: Telemetry
-        # ============================================================
-        if trill_active:
-            try:
-                ctx = await run_telemetry_stage(ctx)
-                _apply_trill_caption_settings(ctx)
-            except SkipStage as e:
-                logger.info(f"[{upload_id}] Telemetry skipped: {e.reason}")
-                trill_active = False
-                hud_active = False
-            except StageError as e:
-                logger.warning(f"[{upload_id}] Telemetry error: {e.message}")
-                trill_active = False
-                hud_active = False
-        else:
-            ctx.telemetry = None
-            ctx.telemetry_data = None
-            ctx.trill = None
-            ctx.trill_score = None
-        await maybe_cancel(ctx, "telemetry")
-
-        # ============================================================
-        # STAGE 3: HUD
-        # ============================================================
-        if hud_active:
-            try:
-                ctx = await run_hud_stage(ctx)
-            except SkipStage as e:
-                logger.info(f"[{upload_id}] HUD skipped: {e.reason}")
-            except StageError as e:
-                logger.warning(f"[{upload_id}] HUD error: {e.message}")
-        await maybe_cancel(ctx, "hud")
-
-        # ============================================================
-        # STAGE 4: Watermark
-        # ============================================================
-        try:
-            ctx = await run_watermark_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Watermark skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Watermark error: {e.message}")
-        await maybe_cancel(ctx, "watermark")
-
-        # ============================================================
-        # STAGE 5: Transcode (deduplicated)
-        # ============================================================
-        try:
-            ctx = await _run_deduplicated_transcode(ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Transcode skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Transcode error: {e.message}")
-            source = ctx.processed_video_path or ctx.local_video_path
-            for p in (ctx.platforms or []):
-                ctx.platform_videos[p] = source
-        await maybe_cancel(ctx, "transcode")
-
-        # ============================================================
-        # STAGE 6: Thumbnail — extract frame then immediately upload to R2
-        # ============================================================
-        try:
-            ctx = await run_thumbnail_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Thumbnail skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
-
-        # ── Upload the best thumbnail to R2 and record its key ─────────────
-        # thumbnail_stage sets ctx.thumbnail_path but never uploads it.
-        # We do it here so thumbnail_r2_key is persisted to the DB and the
-        # API can return a presigned URL for the dashboard to display.
-        if ctx.thumbnail_path and Path(ctx.thumbnail_path).exists():
-            thumb_r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/thumbnail.jpg"
-            try:
-                await r2_stage.upload_file(
-                    Path(ctx.thumbnail_path),
-                    thumb_r2_key,
-                    "image/jpeg",
-                )
-                ctx.thumbnail_r2_key = thumb_r2_key
-                # Persist immediately so the API can serve it even before the
-                # pipeline finishes (user sees the thumbnail as soon as it's ready).
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE uploads SET thumbnail_r2_key = $1, updated_at = NOW() WHERE id = $2",
-                        thumb_r2_key,
-                        upload_id,
-                    )
-                logger.info(f"[{upload_id}] Thumbnail uploaded to R2: {thumb_r2_key}")
-            except Exception as e:
-                logger.warning(f"[{upload_id}] Thumbnail R2 upload failed (non-fatal): {e}")
-
-        # ── Upload platform-specific styled thumbnails to R2 (for publish + deferred) ──
-        # platform_thumbnail_map has local paths per platform (youtube, instagram, facebook).
-        # Upload each so publish_stage can use platform-specific cover for IG/FB (9:16).
-        platform_thumb_r2: Dict[str, str] = {}
-        pm_json = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
-        try:
-            platform_map = json.loads(pm_json) if isinstance(pm_json, str) else (pm_json or {})
-        except Exception:
-            platform_map = {}
-        for platform, local_path in platform_map.items():
-            if not local_path or not Path(local_path).exists():
-                continue
-            r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/{platform}.jpg"
-            try:
-                await r2_stage.upload_file(Path(local_path), r2_key, "image/jpeg")
-                platform_thumb_r2[platform] = r2_key
-                logger.debug(f"[{upload_id}] Platform thumb {platform} → {r2_key}")
-            except Exception as e:
-                logger.debug(f"[{upload_id}] Platform thumb {platform} upload failed: {e}")
-        if platform_thumb_r2:
-            ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2)
-
-        # Also upload any additional candidate thumbnails (for tier users who can pick)
-        if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
-            candidate_keys = []
-            for i, cpath in enumerate(ctx.thumbnail_paths):
-                if not cpath or not Path(cpath).exists():
-                    continue
-                if str(cpath) == str(ctx.thumbnail_path):
-                    candidate_keys.append(ctx.thumbnail_r2_key or "")
-                    continue
-                ckey = f"thumbnails/{ctx.user_id}/{upload_id}/candidate_{i:02d}.jpg"
+            if ctx.telemetry_r2_key:
                 try:
-                    await r2_stage.upload_file(Path(cpath), ckey, "image/jpeg")
-                    candidate_keys.append(ckey)
-                    logger.debug(f"[{upload_id}] Candidate thumb {i} → {ckey}")
+                    telem_local = ctx.temp_dir / "telemetry.map"
+                    await r2_stage.download_file(ctx.telemetry_r2_key, telem_local)
+                    ctx.local_telemetry_path = telem_local
+                    logger.info(f"[{upload_id}] Telemetry downloaded")
                 except Exception as e:
-                    logger.debug(f"[{upload_id}] Candidate thumb {i} upload failed: {e}")
-            if candidate_keys:
-                ctx.output_artifacts["thumbnail_r2_candidates"] = json.dumps(candidate_keys)
+                    logger.warning(f"[{upload_id}] Telemetry download failed: {e}")
+                    ctx.local_telemetry_path = None
 
-        await maybe_cancel(ctx, "thumbnail")
+            trill_active = _should_run_trill(ctx)
+            hud_active = _should_run_hud(ctx)
+            logger.info(f"[{upload_id}] Flags: trill={trill_active} hud={hud_active} platforms={ctx.platforms}")
+            await maybe_cancel(ctx, "download")
 
-        # ============================================================
-        # STAGE 7: Caption
-        # ============================================================
-        try:
-            ctx = await run_caption_stage(ctx, db_pool)
-            await db_stage.save_generated_metadata(db_pool, ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Caption skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Caption error: {e.message}")
-        await maybe_cancel(ctx, "caption")
+            # ============================================================
+            # STAGE 2: Telemetry
+            # ============================================================
+            if trill_active:
+                try:
+                    ctx = await run_telemetry_stage(ctx)
+                    _apply_trill_caption_settings(ctx)
+                except SkipStage as e:
+                    logger.info(f"[{upload_id}] Telemetry skipped: {e.reason}")
+                    trill_active = False
+                    hud_active = False
+                except StageError as e:
+                    logger.warning(f"[{upload_id}] Telemetry error: {e.message}")
+                    trill_active = False
+                    hud_active = False
+            else:
+                ctx.telemetry = None
+                ctx.telemetry_data = None
+                ctx.trill = None
+                ctx.trill_score = None
+            await maybe_cancel(ctx, "telemetry")
+
+            # ============================================================
+            # STAGE 3: HUD
+            # ============================================================
+            if hud_active:
+                try:
+                    ctx = await run_hud_stage(ctx)
+                except SkipStage as e:
+                    logger.info(f"[{upload_id}] HUD skipped: {e.reason}")
+                except StageError as e:
+                    logger.warning(f"[{upload_id}] HUD error: {e.message}")
+            await maybe_cancel(ctx, "hud")
+
+            # ============================================================
+            # STAGE 4: Watermark
+            # ============================================================
+            try:
+                ctx = await run_watermark_stage(ctx)
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Watermark skipped: {e.reason}")
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Watermark error: {e.message}")
+            await maybe_cancel(ctx, "watermark")
+
+            # ============================================================
+            # STAGE 5: Transcode (deduplicated)
+            # ============================================================
+            try:
+                ctx = await _run_deduplicated_transcode(ctx)
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Transcode skipped: {e.reason}")
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Transcode error: {e.message}")
+                source = ctx.processed_video_path or ctx.local_video_path
+                for p in (ctx.platforms or []):
+                    ctx.platform_videos[p] = source
+            await maybe_cancel(ctx, "transcode")
+
+            try:
+                await pipeline_ck.save_post_transcode_checkpoint(db_pool, ctx)
+            except Exception as e:
+                logger.warning(f"[{upload_id}] post-transcode checkpoint save failed (non-fatal): {e}")
+        else:
+            temp_dir = ckpt_holder
+
+        platform_thumb_r2: Dict[str, str] = {}
+        if not skip_mid:
+            # ============================================================
+            # STAGE 5b: Audio context — Whisper transcript for caption prompts
+            # ============================================================
+            try:
+                ctx = await run_audio_context_stage(ctx)
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Audio context skipped: {e.reason}")
+            except Exception as e:
+                logger.warning(f"[{upload_id}] Audio context error: {e}")
+
+            # ============================================================
+            # STAGE 5c: Google Vision (Frame Inspector) — before thumbnail extraction
+            # ============================================================
+            try:
+                ctx = await run_vision_stage(ctx)
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Vision skipped: {e.reason}")
+            except Exception as e:
+                logger.warning(f"[{upload_id}] Vision error: {e}")
+
+            # ============================================================
+            # STAGE 5d: Twelve Labs (Scene Understanding)
+            # ============================================================
+            try:
+                ctx = await run_twelvelabs_stage(ctx)
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Twelve Labs skipped: {e.reason}")
+            except Exception as e:
+                logger.warning(f"[{upload_id}] Twelve Labs error: {e}")
+
+            # ============================================================
+            # STAGE 5e: Google Video Intelligence (Video Analyzer)
+            # ============================================================
+            try:
+                ctx = await run_video_intelligence_stage(ctx)
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Video Intelligence skipped: {e.reason}")
+            except Exception as e:
+                logger.warning(f"[{upload_id}] Video Intelligence error: {e}")
+
+            # ============================================================
+            # STAGE 6: Thumbnail — extract frame then immediately upload to R2
+            # ============================================================
+            try:
+                ctx = await run_thumbnail_stage(ctx)
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Thumbnail skipped: {e.reason}")
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
+
+            # ── Upload the best thumbnail to R2 and record its key ─────────────
+            # thumbnail_stage sets ctx.thumbnail_path but never uploads it.
+            # We do it here so thumbnail_r2_key is persisted to the DB and the
+            # API can return a presigned URL for the dashboard to display.
+            if ctx.thumbnail_path and Path(ctx.thumbnail_path).exists():
+                thumb_r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/thumbnail.jpg"
+                try:
+                    await r2_stage.upload_file(
+                        Path(ctx.thumbnail_path),
+                        thumb_r2_key,
+                        "image/jpeg",
+                    )
+                    ctx.thumbnail_r2_key = thumb_r2_key
+                    # Persist immediately so the API can serve it even before the
+                    # pipeline finishes (user sees the thumbnail as soon as it's ready).
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE uploads SET thumbnail_r2_key = $1, updated_at = NOW() WHERE id = $2",
+                            thumb_r2_key,
+                            upload_id,
+                        )
+                    logger.info(f"[{upload_id}] Thumbnail uploaded to R2: {thumb_r2_key}")
+                except Exception as e:
+                    logger.warning(f"[{upload_id}] Thumbnail R2 upload failed (non-fatal): {e}")
+
+            # ── Upload platform-specific styled thumbnails to R2 (for publish + deferred) ──
+            # platform_thumbnail_map has local paths per platform (youtube, instagram, facebook).
+            # Upload each so publish_stage can use platform-specific cover for IG/FB (9:16).
+            pm_json = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
+            try:
+                platform_map = json.loads(pm_json) if isinstance(pm_json, str) else (pm_json or {})
+            except Exception:
+                platform_map = {}
+            for platform, local_path in platform_map.items():
+                if not local_path or not Path(local_path).exists():
+                    continue
+                r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/{platform}.jpg"
+                try:
+                    await r2_stage.upload_file(Path(local_path), r2_key, "image/jpeg")
+                    platform_thumb_r2[platform] = r2_key
+                    logger.debug(f"[{upload_id}] Platform thumb {platform} → {r2_key}")
+                except Exception as e:
+                    logger.debug(f"[{upload_id}] Platform thumb {platform} upload failed: {e}")
+            if platform_thumb_r2:
+                ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2)
+
+            # Also upload any additional candidate thumbnails (for tier users who can pick)
+            if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
+                candidate_keys = []
+                for i, cpath in enumerate(ctx.thumbnail_paths):
+                    if not cpath or not Path(cpath).exists():
+                        continue
+                    if str(cpath) == str(ctx.thumbnail_path):
+                        candidate_keys.append(ctx.thumbnail_r2_key or "")
+                        continue
+                    ckey = f"thumbnails/{ctx.user_id}/{upload_id}/candidate_{i:02d}.jpg"
+                    try:
+                        await r2_stage.upload_file(Path(cpath), ckey, "image/jpeg")
+                        candidate_keys.append(ckey)
+                        logger.debug(f"[{upload_id}] Candidate thumb {i} → {ckey}")
+                    except Exception as e:
+                        logger.debug(f"[{upload_id}] Candidate thumb {i} upload failed: {e}")
+                if candidate_keys:
+                    ctx.output_artifacts["thumbnail_r2_candidates"] = json.dumps(candidate_keys)
+
+            await maybe_cancel(ctx, "thumbnail")
+
+            # ============================================================
+            # STAGE 7: Caption
+            # ============================================================
+            try:
+                ctx = await run_caption_stage(ctx, db_pool)
+                await db_stage.save_generated_metadata(db_pool, ctx)
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Caption skipped: {e.reason}")
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Caption error: {e.message}")
+            await maybe_cancel(ctx, "caption")
+
+            try:
+                await pipeline_ck.save_post_caption_checkpoint(db_pool, ctx)
+            except Exception as e:
+                logger.warning(f"[{upload_id}] post-caption checkpoint promote failed (non-fatal): {e}")
+        else:
+            pm_fallback = ctx.output_artifacts.get("platform_thumbnail_r2_keys", "{}")
+            try:
+                loaded = json.loads(pm_fallback) if isinstance(pm_fallback, str) else (pm_fallback or {})
+                if isinstance(loaded, dict):
+                    platform_thumb_r2 = {str(k): str(v) for k, v in loaded.items() if v}
+            except Exception:
+                platform_thumb_r2 = {}
 
         # ============================================================
         # STAGE 8: Upload processed files to R2
@@ -870,10 +1300,32 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         ctx.output_artifacts["processed_assets"] = json.dumps(processed_assets)
         ctx.output_artifacts["processed_video"] = ctx.processed_r2_key or ""
 
+        save_proc_ok = False
         try:
             await db_stage.save_processed_assets(db_pool, ctx.upload_id, processed_assets)
+            save_proc_ok = True
         except Exception as e:
             logger.warning(f"[{upload_id}] Could not persist processed_assets: {e}")
+        if save_proc_ok:
+            try:
+                ur_clr = await db_stage.load_upload_record(db_pool, upload_id)
+                prev_resume = pipeline_ck.load_resume(ur_clr or {})
+                tr_keys = (
+                    (prev_resume or {}).get("transcode_r2")
+                    if isinstance(prev_resume, dict)
+                    else None
+                )
+                await pipeline_ck.clear_checkpoint(db_pool, upload_id)
+                await pipeline_ck.delete_checkpoint_r2_objects(tr_keys)
+            except Exception:
+                pass
+
+        try:
+            await db_stage.merge_job_output_artifacts_strings(
+                db_pool, upload_id, dict(ctx.output_artifacts or {})
+            )
+        except Exception as art_err:
+            logger.warning(f"[{upload_id}] merge output_artifacts failed (non-fatal): {art_err}")
 
         await maybe_cancel(ctx, "upload")
 
@@ -1029,6 +1481,23 @@ async def run_publish_and_notify(
     except Exception as _email_err:
         logger.warning(f"[{upload_id}] Upload email notification failed (non-fatal): {_email_err}")
 
+    if ctx.state == "failed":
+        import asyncio as _aio
+
+        _aio.ensure_future(
+            notify_admin_error(
+                "upload_job_failed",
+                {
+                    "upload_id": str(upload_id),
+                    "user_id": str(ctx.user_id) if ctx.user_id else None,
+                    "error": getattr(ctx, "error_message", None) or "",
+                    "stage": getattr(ctx, "current_stage", None) or "",
+                    "filename": getattr(ctx, "filename", None),
+                },
+                db_pool,
+            )
+        )
+
     # ── Finalize wallet hold (capture on success/partial, release on failure) ──
     try:
         put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
@@ -1139,15 +1608,12 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             if not ent.can_ai and hasattr(ctx, "use_ai"):
                 ctx.use_ai = False
 
+        _hydrate_ctx_ai_from_upload_record(ctx, upload_record)
+
         # Mark processing started again (publish phase)
         await db_stage.mark_processing_started(db_pool, ctx)
 
-        # Restore platform_videos from processed_assets stored in DB
-        processed_assets_json = upload_record.get("processed_assets") or "{}"
-        try:
-            processed_assets: Dict[str, str] = json.loads(processed_assets_json)
-        except Exception:
-            processed_assets = {}
+        processed_assets = _normalized_processed_assets(upload_record)
 
         if not processed_assets:
             logger.error(f"[{upload_id}] No processed_assets found — cannot publish")
@@ -1158,74 +1624,23 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
                 )
             return False
 
-        # platform_videos aren't local paths anymore — they're R2 keys.
-        # publish_stage needs to download them temporarily.
-        # We store them in ctx.output_artifacts for publish_stage to read.
-        ctx.output_artifacts["processed_assets"] = json.dumps(processed_assets)
-        ctx.processed_r2_key = processed_assets.get("default") or next(iter(processed_assets.values()), "")
-
-        # For publish_stage to get the right file per platform, we need temp downloads.
-        # Create a minimal temp dir and download each unique asset.
         temp_dir_obj = tempfile.TemporaryDirectory()
         temp_dir = Path(temp_dir_obj.name)
-        ctx.temp_dir = temp_dir
 
-        downloaded: Dict[str, Path] = {}
-        for platform, r2_key in processed_assets.items():
-            if platform == "default" or platform.startswith("thumb_"):
-                continue
-            if r2_key in downloaded:
-                ctx.platform_videos[platform] = downloaded[r2_key]
-                continue
-            local_path = temp_dir / f"{platform}.mp4"
-            try:
-                await r2_stage.download_file(r2_key, local_path)
-                ctx.platform_videos[platform] = local_path
-                downloaded[r2_key] = local_path
-                logger.info(f"[{upload_id}] Downloaded {platform} for publish: {r2_key}")
-            except Exception as e:
-                logger.error(f"[{upload_id}] Failed to download {platform} asset: {e}")
-
-        if not ctx.platform_videos:
-            logger.error(f"[{upload_id}] No platform videos available after download")
+        prepared = await _prepare_ctx_for_publish_from_r2_assets(
+            ctx, upload_id, processed_assets, temp_dir
+        )
+        if not prepared:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE uploads SET status='failed', error_code='ASSET_DOWNLOAD_FAILED', updated_at=NOW() WHERE id=$1",
                     upload_id,
                 )
-            temp_dir_obj.cleanup()
-            return False
-
-        # Also set processed_video_path for fallback
-        default_key = processed_assets.get("default")
-        if default_key:
-            default_local = temp_dir / "default.mp4"
             try:
-                await r2_stage.download_file(default_key, default_local)
-                ctx.processed_video_path = default_local
+                temp_dir_obj.cleanup()
             except Exception:
                 pass
-
-        # Download platform-specific thumbnails for publish (thumb_youtube, thumb_instagram, thumb_facebook)
-        platform_thumb_map: Dict[str, str] = {}
-        platform_thumb_r2_keys: Dict[str, str] = {}
-        for key, r2_key in processed_assets.items():
-            if not key.startswith("thumb_") or not r2_key:
-                continue
-            plat = key.replace("thumb_", "")
-            platform_thumb_r2_keys[plat] = r2_key
-            local_thumb = temp_dir / f"thumb_{plat}.jpg"
-            try:
-                await r2_stage.download_file(r2_key, local_thumb)
-                if local_thumb.exists():
-                    platform_thumb_map[plat] = str(local_thumb)
-                    logger.debug(f"[{upload_id}] Downloaded thumb_{plat} for publish")
-            except Exception as e:
-                logger.debug(f"[{upload_id}] Thumb {plat} download failed: {e}")
-        if platform_thumb_map:
-            ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_thumb_map)
-        if platform_thumb_r2_keys:
-            ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2_keys)
+            return False
 
         try:
             result = await run_publish_and_notify(ctx, upload_id, user_id)
@@ -1452,10 +1867,16 @@ async def run_analytics_sync_loop() -> None:
 
     Intentionally sequential — no concurrency within the batch to stay well
     inside platform rate limits.
+
+    Env: WORKER_ENABLE_ANALYTICS_SYNC=0 to disable. Leader lock: WORKER_LEADER_LOCK (default on).
     """
     from stages.publish_stage import decrypt_token
 
     global shutdown_requested
+
+    if not WORKER_ENABLE_ANALYTICS_SYNC:
+        logger.info("[analytics-sync] disabled (WORKER_ENABLE_ANALYTICS_SYNC=0)")
+        return
 
     logger.info(
         f"[analytics-sync] loop started | "        f"interval={ANALYTICS_SYNC_INTERVAL}s | "        f"batch={ANALYTICS_SYNC_BATCH} | "        f"resync_every={ANALYTICS_RESYNC_HOURS}h"
@@ -1465,6 +1886,17 @@ async def run_analytics_sync_loop() -> None:
     await asyncio.sleep(60)
 
     while not shutdown_requested:
+        lock_token = await _acquire_leader_lock("analytics_sync", WORKER_LEADER_LOCK_TTL_ANALYTICS)
+        if lock_token is None:
+            logger.debug("[analytics-sync] skipping cycle (peer holds leader lock)")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(shutdown_event.wait()),
+                    timeout=ANALYTICS_SYNC_INTERVAL,
+                )
+                break
+            except asyncio.TimeoutError:
+                continue
         try:
             resync_cutoff = _now_utc() - timedelta(hours=ANALYTICS_RESYNC_HOURS)
             window_start  = _now_utc() - timedelta(days=90)
@@ -1538,8 +1970,11 @@ async def run_analytics_sync_loop() -> None:
                         )
 
                     # token_map: by token_id for multi-account; fallback by platform
+                    from services.platform_oauth_refresh import refresh_decrypted_token_for_row
+
                     token_map = {}
                     token_map_by_platform = {}
+                    uid_str = str(row["user_id"])
                     for tr in token_rows:
                         try:
                             blob = tr["token_blob"]
@@ -1552,6 +1987,13 @@ async def run_analytics_sync_loop() -> None:
                                 if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
                                     dec["page_id"] = str(tr["account_id"])
                                 token_id = str(tr["id"])
+                                dec = await refresh_decrypted_token_for_row(
+                                    tr["platform"],
+                                    dec,
+                                    db_pool=db_pool,
+                                    user_id=uid_str,
+                                    token_row_id=token_id,
+                                )
                                 token_map[token_id] = dec
                                 token_map_by_platform[tr["platform"]] = dec
                         except Exception:
@@ -1573,7 +2015,7 @@ async def run_analytics_sync_loop() -> None:
                             )
                         synced += 1
                         logger.debug(
-                            f"[analytics-sync] {upload_id}: "                            f"views={result['views']} likes={result['likes']} "                            f"comments={result['comments']} shares={result['shares']}"                        )
+                            f"[analytics-sync] {upload_id}: "                                f"views={result['views']} likes={result['likes']} "                                f"comments={result['comments']} shares={result['shares']}"                            )
                     except Exception as e:
                         errors += 1
                         logger.warning(f"[analytics-sync] {upload_id} failed: {e}")
@@ -1589,6 +2031,8 @@ async def run_analytics_sync_loop() -> None:
             logger.warning(f"[analytics-sync] DB error: {e}")
         except Exception as e:
             logger.exception(f"[analytics-sync] unexpected error: {e}")
+        finally:
+            await _release_leader_lock("analytics_sync", lock_token)
 
         # Sleep until next cycle, but wake early on shutdown
         try:
@@ -1612,16 +2056,33 @@ async def run_kpi_collector_loop() -> None:
     Every KPI_COLLECTOR_INTERVAL (default 30 min), fetch cost/revenue from
     Stripe, OpenAI, Mailgun, Cloudflare, etc. and post to cost_tracking.
     Uses env keys: STRIPE_SECRET_KEY, OPENAI_API_KEY, MAILGUN_API_KEY, etc.
+
+    Env: WORKER_ENABLE_KPI_COLLECTOR=0 to disable. Leader lock shares Redis with other periodic tasks.
     """
     global shutdown_requested, shutdown_event
 
     from stages.kpi_collector import run_kpi_collect
+
+    if not WORKER_ENABLE_KPI_COLLECTOR:
+        logger.info("[kpi-collector] disabled (WORKER_ENABLE_KPI_COLLECTOR=0)")
+        return
 
     logger.info(f"[kpi-collector] loop started | interval={KPI_COLLECTOR_INTERVAL}s")
 
     await asyncio.sleep(120)  # Stagger after analytics sync
 
     while not shutdown_requested:
+        lock_token = await _acquire_leader_lock("kpi_collector", WORKER_LEADER_LOCK_TTL_KPI)
+        if lock_token is None:
+            logger.debug("[kpi-collector] skipping cycle (peer holds leader lock)")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(shutdown_event.wait()),
+                    timeout=KPI_COLLECTOR_INTERVAL,
+                )
+                break
+            except asyncio.TimeoutError:
+                continue
         try:
             summary = await run_kpi_collect(db_pool)
             if summary.get("rows_inserted", 0) > 0:
@@ -1632,6 +2093,8 @@ async def run_kpi_collector_loop() -> None:
                 )
         except Exception as e:
             logger.warning(f"[kpi-collector] error: {e}")
+        finally:
+            await _release_leader_lock("kpi_collector", lock_token)
 
         try:
             await asyncio.wait_for(
@@ -1643,6 +2106,116 @@ async def run_kpi_collector_loop() -> None:
             pass
 
     logger.info("[kpi-collector] loop stopped")
+
+
+# ---------------------------------------------------------------------------
+# ML SCORING (content attribution × engagement rollups)
+# ---------------------------------------------------------------------------
+
+async def run_ml_scoring_loop() -> None:
+    """
+    Recompute ``upload_quality_scores_daily`` from uploads + output_artifacts
+    (content_attribution_key, thumbnail methods). Powers M8 priors + /api/me/content-insights.
+
+    Env: WORKER_ENABLE_ML_SCORING=0 to disable.
+         ML_SCORING_INTERVAL_SECONDS (default 3600).
+    """
+    global shutdown_requested, shutdown_event
+
+    from services.ml_scoring_job import run_ml_scoring_cycle
+
+    if not WORKER_ENABLE_ML_SCORING:
+        logger.info("[ml-scoring] disabled (WORKER_ENABLE_ML_SCORING=0)")
+        return
+
+    logger.info(f"[ml-scoring] loop started | interval={ML_SCORING_INTERVAL}s")
+
+    await asyncio.sleep(180)  # Stagger after worker startup
+
+    while not shutdown_requested:
+        lock_token = await _acquire_leader_lock(
+            "ml_scoring", WORKER_LEADER_LOCK_TTL_ML_SCORING
+        )
+        if lock_token is None:
+            logger.debug("[ml-scoring] skipping cycle (peer holds leader lock)")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(shutdown_event.wait()),
+                    timeout=ML_SCORING_INTERVAL,
+                )
+                break
+            except asyncio.TimeoutError:
+                continue
+        try:
+            n = await run_ml_scoring_cycle(db_pool)
+            if n is not None:
+                logger.info("[ml-scoring] cycle complete | rows_touched=%s", n)
+        except Exception as e:
+            logger.warning("[ml-scoring] cycle error: %s", e)
+        finally:
+            await _release_leader_lock("ml_scoring", lock_token)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=ML_SCORING_INTERVAL,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[ml-scoring] loop stopped")
+
+
+# ---------------------------------------------------------------------------
+# MARKETING AUTOMATION (opt-in)
+# ---------------------------------------------------------------------------
+
+async def run_marketing_automation_loop() -> None:
+    global shutdown_requested, shutdown_event
+
+    from services.marketing_touchpoint_runner import MARKETING_AUTOMATION_ENABLED, run_touchpoint_cycle
+
+    if not MARKETING_AUTOMATION_ENABLED:
+        logger.info("[marketing-automation] disabled (set MARKETING_AUTOMATION_ENABLED=1 to enable)")
+        return
+
+    logger.info(
+        f"[marketing-automation] loop started | interval={MARKETING_AUTOMATION_INTERVAL_SEC}s"
+    )
+    await asyncio.sleep(420)
+
+    while not shutdown_requested:
+        lock_token = await _acquire_leader_lock(
+            "marketing_automation", WORKER_LEADER_LOCK_TTL_MARKETING
+        )
+        if lock_token is None:
+            logger.debug("[marketing-automation] skipping cycle (peer holds leader lock)")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(shutdown_event.wait()),
+                    timeout=MARKETING_AUTOMATION_INTERVAL_SEC,
+                )
+                break
+            except asyncio.TimeoutError:
+                continue
+        try:
+            await run_touchpoint_cycle(db_pool)
+        except Exception as e:
+            logger.warning(f"[marketing-automation] cycle error: {e}")
+        finally:
+            await _release_leader_lock("marketing_automation", lock_token)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=MARKETING_AUTOMATION_INTERVAL_SEC,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[marketing-automation] loop stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -1671,8 +2244,14 @@ async def run_scheduler_loop() -> None:
        Fires deferred publish pipeline.
 
     Both dispatch as asyncio tasks governed by _job_semaphore.
+
+    Env: WORKER_ENABLE_SCHEDULER=0 disables this loop (only if another instance runs it).
     """
-    global shutdown_requested, _job_semaphore
+    global shutdown_requested, _job_semaphore, shutdown_event
+
+    if not WORKER_ENABLE_SCHEDULER:
+        logger.info("Scheduler loop disabled (WORKER_ENABLE_SCHEDULER=0)")
+        return
 
     logger.info(
         f"Scheduler loop started | "
@@ -1681,6 +2260,17 @@ async def run_scheduler_loop() -> None:
     )
 
     while not shutdown_requested:
+        lock_token = await _acquire_leader_lock("scheduler", WORKER_LEADER_LOCK_TTL_SCHEDULER)
+        if lock_token is None:
+            logger.debug("Scheduler skipping tick (peer holds leader lock)")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(shutdown_event.wait()),
+                    timeout=SCHEDULER_POLL_INTERVAL,
+                )
+                break
+            except asyncio.TimeoutError:
+                continue
         try:
             now = _now_utc()
             process_cutoff = now + timedelta(minutes=PROCESSING_WINDOW_MINUTES)
@@ -1795,6 +2385,8 @@ async def run_scheduler_loop() -> None:
             logger.warning(f"Scheduler DB error: {e}")
         except Exception as e:
             logger.exception(f"Scheduler loop error: {e}")
+        finally:
+            await _release_leader_lock("scheduler", lock_token)
 
         # Wait for next poll cycle
         try:
@@ -1948,27 +2540,49 @@ async def main() -> None:
     total_concurrency = WORKER_CONCURRENCY + PUBLISH_CONCURRENCY
     db_min = max(2, total_concurrency)
     db_max = max(15, total_concurrency * 3)
+    if WORKER_DB_POOL_MAX:
+        cap = int(WORKER_DB_POOL_MAX)
+        db_max = min(db_max, cap)
+        db_min = min(db_min, db_max)
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=db_min, max_size=db_max)
     logger.info(f"Database connected | pool={db_min}-{db_max}")
 
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     await redis_client.ping()
     logger.info("Redis connected")
+    if WORKER_LEADER_LOCK_ENABLED:
+        logger.info(
+            "Leader locks enabled | prefix=%s (one winner per tick: analytics, kpi, scheduler, marketing)",
+            WORKER_LEADER_LOCK_PREFIX,
+        )
+
+    from core.auth import init_enc_keys
+
+    try:
+        init_enc_keys()
+    except RuntimeError as e:
+        logger.error("%s", e)
+        sys.exit(1)
+    logger.info("TOKEN_ENC_KEYS loaded (platform token crypto aligned with API)")
 
     shutdown_event = asyncio.Event()
 
-    # Six concurrent loops:
+    # Seven concurrent loops:
     # 1. process_jobs          — Redis consumer for immediate uploads
     # 2. run_scheduler_loop    — polls DB for staged/ready_to_publish jobs
     # 3. run_verification_loop — delivery verification polling
     # 4. run_analytics_sync_loop — periodic engagement stats fetch from platform APIs
     # 5. run_kpi_collector_loop — every 30 min: Stripe/Mailgun/OpenAI costs → cost_tracking
+    # 6. run_ml_scoring_loop — hourly (default): upload_quality_scores_daily rollups
+    # 7. run_marketing_automation_loop — optional AI touchpoints (MARKETING_AUTOMATION_ENABLED=1)
     tasks = [
         asyncio.create_task(process_jobs()),
         asyncio.create_task(run_scheduler_loop()),
         asyncio.create_task(run_verification_loop(db_pool, shutdown_event)),
         asyncio.create_task(run_analytics_sync_loop()),
         asyncio.create_task(run_kpi_collector_loop()),
+        asyncio.create_task(run_ml_scoring_loop()),
+        asyncio.create_task(run_marketing_automation_loop()),
     ]
 
     try:

@@ -1,7 +1,9 @@
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
-        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+
+    <script src="js/html-safe.js"></script>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Business Calculator - UploadM8 Admin</title>
@@ -107,6 +109,15 @@
         .output-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
         @media (max-width: 900px) { .output-grid-2 { grid-template-columns: 1fr; } .kpi-strip { grid-template-columns: repeat(2,1fr); } }
         @media (max-width: 600px) { .kpi-strip { grid-template-columns: 1fr; } .input-grid { grid-template-columns: 1fr; } }
+        @media (max-width: 480px) {
+            .calc-run-bar { flex-direction: column; align-items: stretch; }
+            .btn-calculate { width: 100%; justify-content: center; }
+            .calc-tabs { flex-wrap: wrap; gap: 0.25rem; }
+            .calc-tab { min-width: 80px; padding: 0.6rem 0.5rem; font-size: 0.75rem; }
+            .score-breakdown { gap: 1rem; }
+            .gauge-ring { width: 140px; height: 140px; }
+            .gauge-score { font-size: 2rem; }
+        }
         .empty-outputs { text-align: center; padding: 3rem 1rem; color: var(--text-muted); }
         .empty-outputs i { font-size: 2.5rem; margin-bottom: 1rem; opacity: 0.3; }
         .empty-outputs h3 { color: var(--text-secondary); font-size: 1rem; margin-bottom: 0.5rem; }
@@ -135,70 +146,21 @@
 <body>
     <div class="app-layout">
 
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header">
-                <a href="dashboard.html" class="sidebar-logo">
-                    <img src="images/logo.png" alt="UploadM8">
-                    <span>UploadM8</span>
-                </a>
-            </div>
-            <nav class="sidebar-nav">
-                <div class="nav-section">
-                    <div class="nav-section-title">Main</div>
-                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
-                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
-                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Platforms</div>
-                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-                    <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Insights</div>
-                    <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-                </div>
-                <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                    <div class="nav-section-title">Admin</div>
-                    <a href="admin.html" class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
-                    <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
-                    <a href="admin-kpi.html" class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
-                    <a href="admin-calculator.html" class="nav-link active"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
-                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Account</div>
-                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-                    <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-                </div>
-            </nav>
-            <div class="sidebar-footer">
-                <div class="user-info">
-                    <div class="user-avatar" id="userAvatar">U</div>
-                    <div class="user-details">
-                        <div class="user-name" id="userName">User</div>
-                        <div class="user-tier" id="userTier">Free</div>
-                    </div>
-                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
-                        <i class="fas fa-sign-out-alt"></i>
-                    </button>
-                </div>
-            </div>
-        </aside>
+        <aside class="sidebar" id="sidebar"></aside>
 
-        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
 
         <header class="top-bar">
-            <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()">
+            <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu">
                 <i class="fas fa-bars"></i>
             </button>
             <div class="top-bar-logo">
-                <img src="images/logo.png" alt="UploadM8">
+                <img src="images/logo.svg" alt="UploadM8">
                 <span>UploadM8</span>
             </div>
             <div class="top-bar-actions">
-                <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme">
+                <div data-wt-pills></div>
+                <button class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle Theme">
                     <i class="fas fa-moon" id="themeToggleIconMobile"></i>
                 </button>
             </div>
@@ -226,38 +188,39 @@
                     <div class="page-header">
                         <div>
                             <h1 class="page-title"><i class="fas fa-calculator" style="color:var(--accent-orange);margin-right:0.5rem;"></i> Business Calculator</h1>
-                            <p class="page-subtitle">Unit Economics &bull; Capacity Planning &bull; Margin Analysis &bull; Scaling Alerts</p>
+                            <p class="page-subtitle">Work out per-customer costs, how much headroom you have, margins, and when to scale — from real usage and pricing.</p>
                         </div>
-                        <div style="display:flex;gap:0.5rem;">
-                            <button class="btn btn-primary btn-sm" onclick="window.fetchPricingAndRun()" title="Reload live pricing from DB"><i class="fas fa-database"></i> Load Live Data</button>
-                            <button class="btn btn-secondary btn-sm" onclick="exportJSON()" title="Export Assumptions"><i class="fas fa-download"></i> Export</button>
+                        <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                            <div data-wt-pills class="desktop-pills"></div>
+                            <button class="btn btn-primary btn-sm" data-um8-fn="fetchPricingAndRun" data-um8-args="[true]" title="Reload live pricing from DB"><i class="fas fa-database"></i> Load Live Data</button>
+                            <button class="btn btn-secondary btn-sm" data-um8-fn="exportJSON" title="Export Assumptions"><i class="fas fa-download"></i> Export</button>
                             <label class="btn btn-secondary btn-sm" style="cursor:pointer;" title="Import Assumptions"><i class="fas fa-upload"></i> Import<input type="file" accept=".json" onchange="importJSON(event)" style="display:none;"></label>
-                            <button class="btn btn-secondary btn-sm" onclick="window.print()" title="Print Report"><i class="fas fa-print"></i></button>
+                            <button class="btn btn-secondary btn-sm" data-um8-fn="um8WindowPrint" title="Print Report"><i class="fas fa-print"></i></button>
                         </div>
                     </div>
 
                     <div class="preset-bar">
                         <span style="font-size:0.78rem;font-weight:600;color:var(--text-muted);padding:0.5rem 0;margin-right:0.25rem;">PRESETS:</span>
-                        <button class="btn-preset active" onclick="loadPreset('bootstrap')" id="preset-bootstrap"><i class="fas fa-seedling"></i> Bootstrap (50 users)</button>
-                        <button class="btn-preset" onclick="loadPreset('growth')" id="preset-growth"><i class="fas fa-rocket"></i> Growth (500 users)</button>
-                        <button class="btn-preset" onclick="loadPreset('scale')" id="preset-scale"><i class="fas fa-building"></i> Scale (5K users)</button>
-                        <button class="btn-preset" onclick="loadPreset('enterprise')" id="preset-enterprise"><i class="fas fa-city"></i> Enterprise (25K users)</button>
-                        <button class="btn-preset" onclick="resetAll()" id="preset-reset"><i class="fas fa-eraser"></i> Clear All</button>
+                        <button class="btn-preset active" data-um8-fn="loadPreset" data-um8-arg="bootstrap" id="preset-bootstrap"><i class="fas fa-seedling"></i> Bootstrap (50 users)</button>
+                        <button class="btn-preset" data-um8-fn="loadPreset" data-um8-arg="growth" id="preset-growth"><i class="fas fa-rocket"></i> Growth (500 users)</button>
+                        <button class="btn-preset" data-um8-fn="loadPreset" data-um8-arg="scale" id="preset-scale"><i class="fas fa-building"></i> Scale (5K users)</button>
+                        <button class="btn-preset" data-um8-fn="loadPreset" data-um8-arg="enterprise" id="preset-enterprise"><i class="fas fa-city"></i> Enterprise (25K users)</button>
+                        <button class="btn-preset" data-um8-fn="resetAll" id="preset-reset"><i class="fas fa-eraser"></i> Clear All</button>
                     </div>
 
                     <div class="calc-tabs">
-                        <button class="calc-tab active" onclick="switchCalcTab('inputs',event)"><i class="fas fa-sliders-h"></i> Inputs</button>
-                        <button class="calc-tab" onclick="switchCalcTab('outputs',event)"><i class="fas fa-chart-bar"></i> Dashboard</button>
-                        <button class="calc-tab" onclick="switchCalcTab('scaling',event)"><i class="fas fa-server"></i> Capacity</button>
-                        <button class="calc-tab" onclick="switchCalcTab('health',event)"><i class="fas fa-heartbeat"></i> Health Score</button>
-                        <button class="calc-tab" onclick="switchCalcTab('enterprise',event)"><i class="fas fa-handshake"></i> Enterprise Quote</button>
+                        <button class="calc-tab active" data-um8-fn="switchCalcTab" data-um8-arg="inputs"><i class="fas fa-sliders-h"></i> Inputs</button>
+                        <button class="calc-tab" data-um8-fn="switchCalcTab" data-um8-arg="outputs"><i class="fas fa-chart-bar"></i> Dashboard</button>
+                        <button class="calc-tab" data-um8-fn="switchCalcTab" data-um8-arg="scaling"><i class="fas fa-server"></i> Capacity</button>
+                        <button class="calc-tab" data-um8-fn="switchCalcTab" data-um8-arg="health"><i class="fas fa-heartbeat"></i> Health Score</button>
+                        <button class="calc-tab" data-um8-fn="switchCalcTab" data-um8-arg="enterprise"><i class="fas fa-handshake"></i> Enterprise Quote</button>
                     </div>
 
                     <!-- TAB: INPUTS -->
                     <div class="tab-panel active" id="panel-inputs">
 
                         <div class="calc-section" id="section-demand">
-                            <div class="calc-section-header" onclick="toggleSection('section-demand')">
+                            <div class="calc-section-header" data-um8-fn="toggleSection" data-um8-arg="section-demand">
                                 <div class="calc-section-title"><i class="fas fa-users"></i> Demand &amp; Usage</div>
                                 <i class="fas fa-chevron-down calc-section-toggle"></i>
                             </div>
@@ -265,6 +228,7 @@
                                 <div class="section-label"><i class="fas fa-user-friends"></i> Active Customers by Tier</div>
                                 <div class="input-grid">
                                     <div class="input-group"><label><span class="tier-dot free"></span>Free Users</label><input type="number" id="n_free" value="30" min="0" step="1"></div>
+                                    <div class="input-group"><label><span class="tier-dot" style="background:#3b82f6;"></span>Creator Lite</label><input type="number" id="n_creatorlite" value="5" min="0" step="1"></div>
                                     <div class="input-group"><label><span class="tier-dot creator_pro"></span>Creator Pro</label><input type="number" id="n_creatorpro" value="10" min="0" step="1"></div>
                                     <div class="input-group"><label><span class="tier-dot studio"></span>Studio</label><input type="number" id="n_studio" value="5" min="0" step="1"></div>
                                     <div class="input-group"><label><span class="tier-dot agency"></span>Agency</label><input type="number" id="n_agency" value="3" min="0" step="1"></div>
@@ -281,6 +245,7 @@
                                 <div class="section-label"><i class="fas fa-video"></i> Avg Videos / Customer / Month</div>
                                 <div class="input-grid">
                                     <div class="input-group"><label>Free</label><input type="number" id="v_free" value="3" min="0" step="1"></div>
+                                    <div class="input-group"><label>Creator Lite</label><input type="number" id="v_cl" value="10" min="0" step="1"></div>
                                     <div class="input-group"><label>Creator Pro</label><input type="number" id="v_cp" value="20" min="0" step="1"></div>
                                     <div class="input-group"><label>Studio</label><input type="number" id="v_st" value="60" min="0" step="1"></div>
                                     <div class="input-group"><label>Agency</label><input type="number" id="v_ag" value="150" min="0" step="1"></div>
@@ -309,13 +274,14 @@
                         </div>
 
                         <div class="calc-section" id="section-revenue">
-                            <div class="calc-section-header" onclick="toggleSection('section-revenue')">
+                            <div class="calc-section-header" data-um8-fn="toggleSection" data-um8-arg="section-revenue">
                                 <div class="calc-section-title"><i class="fas fa-dollar-sign"></i> Plans &amp; Revenue</div>
                                 <i class="fas fa-chevron-down calc-section-toggle"></i>
                             </div>
                             <div class="calc-section-body">
                                 <div class="section-label"><i class="fas fa-tags"></i> Subscription Prices ($/mo)</div>
                                 <div class="input-grid">
+                                    <div class="input-group"><label>Creator Lite</label><div class="input-prefix"><span>$</span><input type="number" id="price_cl" value="9.99" min="0" step="0.01"></div></div>
                                     <div class="input-group"><label>Creator Pro</label><div class="input-prefix"><span>$</span><input type="number" id="price_cp" value="29" min="0" step="1"></div></div>
                                     <div class="input-group"><label>Studio</label><div class="input-prefix"><span>$</span><input type="number" id="price_st" value="79" min="0" step="1"></div></div>
                                     <div class="input-group"><label>Agency</label><div class="input-prefix"><span>$</span><input type="number" id="price_ag" value="199" min="0" step="1"></div></div>
@@ -324,6 +290,7 @@
                                 <hr class="section-divider">
                                 <div class="section-label"><i class="fas fa-box"></i> Included Monthly Allowances — PUT (Publish Upload Transactions)</div>
                                 <div class="input-grid">
+                                    <div class="input-group"><label>Creator Lite PUT</label><input type="number" id="put_cl" value="500" min="0" step="10"></div>
                                     <div class="input-group"><label>Creator Pro PUT</label><input type="number" id="put_cp" value="200" min="0" step="10"></div>
                                     <div class="input-group"><label>Studio PUT</label><input type="number" id="put_st" value="1000" min="0" step="50"></div>
                                     <div class="input-group"><label>Agency PUT</label><input type="number" id="put_ag" value="5000" min="0" step="100"></div>
@@ -339,6 +306,7 @@
                                 <hr class="section-divider">
                                 <div class="section-label"><i class="fas fa-robot"></i> Included Monthly Allowances — AIC (AI Credits)</div>
                                 <div class="input-grid">
+                                    <div class="input-group"><label>Creator Lite AIC</label><input type="number" id="aic_cl" value="4500" min="0" step="100"></div>
                                     <div class="input-group"><label>Creator Pro AIC</label><input type="number" id="aic_cp" value="100" min="0" step="10"></div>
                                     <div class="input-group"><label>Studio AIC</label><input type="number" id="aic_st" value="500" min="0" step="50"></div>
                                     <div class="input-group"><label>Agency AIC</label><input type="number" id="aic_ag" value="2500" min="0" step="100"></div>
@@ -377,7 +345,7 @@
                         </div>
 
                         <div class="calc-section" id="section-infra">
-                            <div class="calc-section-header" onclick="toggleSection('section-infra')">
+                            <div class="calc-section-header" data-um8-fn="toggleSection" data-um8-arg="section-infra">
                                 <div class="calc-section-title"><i class="fas fa-server"></i> Infrastructure &amp; Costs</div>
                                 <i class="fas fa-chevron-down calc-section-toggle"></i>
                             </div>
@@ -430,7 +398,7 @@
                         </div>
 
                         <div class="calc-section" id="section-policy">
-                            <div class="calc-section-header" onclick="toggleSection('section-policy')">
+                            <div class="calc-section-header" data-um8-fn="toggleSection" data-um8-arg="section-policy">
                                 <div class="calc-section-title"><i class="fas fa-sliders-h"></i> Policy &amp; SLA</div>
                                 <i class="fas fa-chevron-down calc-section-toggle"></i>
                             </div>
@@ -444,7 +412,7 @@
 
                         <div class="calc-run-bar">
                             <div class="status-text" id="calcStatus">Configure inputs and click Calculate</div>
-                            <button class="btn-calculate" onclick="runCalculator()">
+                            <button class="btn-calculate" data-um8-fn="runCalculator">
                                 <i class="fas fa-play"></i> Calculate
                             </button>
                         </div>
@@ -461,7 +429,7 @@
                             <div class="kpi-strip" id="kpiStrip"></div>
                             <div class="output-grid-2">
                                 <div class="calc-section">
-                                    <div class="calc-section-header" onclick="toggleSection('section-costbreak')">
+                                    <div class="calc-section-header" data-um8-fn="toggleSection" data-um8-arg="section-costbreak">
                                         <div class="calc-section-title"><i class="fas fa-receipt"></i> Cost Breakdown</div>
                                         <i class="fas fa-chevron-down calc-section-toggle"></i>
                                     </div>
@@ -470,7 +438,7 @@
                                     </div>
                                 </div>
                                 <div class="calc-section">
-                                    <div class="calc-section-header" onclick="toggleSection('section-revbreak')">
+                                    <div class="calc-section-header" data-um8-fn="toggleSection" data-um8-arg="section-revbreak">
                                         <div class="calc-section-title"><i class="fas fa-money-bill-wave"></i> Revenue Breakdown</div>
                                         <i class="fas fa-chevron-down calc-section-toggle"></i>
                                     </div>
@@ -568,7 +536,7 @@
                                     <div class="input-group"><label>Dedicated Worker?</label><select id="ent_dedicated_worker"><option value="no">No (Shared Pool)</option><option value="yes">Yes (Dedicated)</option></select></div>
                                 </div>
                                 <div style="margin-top:1.25rem;text-align:right;">
-                                    <button class="btn-calculate" onclick="runEnterpriseQuote()">
+                                    <button class="btn-calculate" data-um8-fn="runEnterpriseQuote">
                                         <i class="fas fa-calculator"></i> Generate Quote
                                     </button>
                                 </div>
@@ -586,27 +554,21 @@
         </main>
     </div>
 
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
     <script src="app.js"></script>
+    <script src="wallet-tokens.js"></script>
     <script>
     (function () {
         'use strict';
 
-        var API_BASE  = window.API_BASE  || 'https://auth.uploadm8.com';
-        var TOKEN_KEY = 'uploadm8_access_token';
-
-        /* ── helpers ─────────────────────────────────────────────── */
-        function getToken() {
-            return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY);
-        }
-
-        function clearTokensAndRedirect(msg) {
-            localStorage.removeItem(TOKEN_KEY);
-            localStorage.removeItem('uploadm8_refresh_token');
-            sessionStorage.removeItem(TOKEN_KEY);
-            if (msg) sessionStorage.setItem('uploadm8_auth_message', msg);
-            window.location.href = 'login.html';
-        }
-
+        /* ── helpers (auth via app.js: checkAuth, getAccessToken, API_BASE) ── */
         function setVal(id, v) {
             if (v === undefined || v === null) return;
             var el = document.getElementById(id);
@@ -625,40 +587,13 @@
         function fmtP(v)  { return v.toFixed(1) + '%'; }
         function fmtD(v)  { return '$' + v.toFixed(4); }
 
-        /* ── auth ────────────────────────────────────────────────── */
-        async function authenticateAdmin() {
-            var token = getToken();
-            if (!token) { clearTokensAndRedirect('Please log in to continue.'); return null; }
-            try {
-                var r = await fetch(API_BASE + '/api/me', {
-                    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }
-                });
-                if (r.status === 401) { clearTokensAndRedirect('Session expired.'); return null; }
-                if (!r.ok) throw new Error('Server error');
-                var user = await r.json();
-                if (!user || !user.email || !user.role) throw new Error('Invalid data');
-                window.currentUser = user;
-                return user;
-            } catch (e) {
-                console.error('Auth error:', e);
-                document.getElementById('loadingState').innerHTML = [
-                    '<div style="text-align:center;">',
-                    '<div style="color:#ef4444;font-size:2rem;margin-bottom:1rem;"><i class="fas fa-exclamation-triangle"></i></div>',
-                    '<h2>Connection Error</h2>',
-                    '<p style="color:var(--text-secondary);margin-bottom:1rem;">Could not connect to server</p>',
-                    '<button onclick="location.reload()" class="btn btn-secondary"><i class="fas fa-sync"></i> Retry</button>',
-                    '</div>'
-                ].join('');
-                return null;
-            }
-        }
-
+        /* ── auth: app.js is sole source — checkAuth(), getAccessToken(), API_BASE ── */
         function initPage(user) {
             document.getElementById('loadingState').style.display = 'none';
-            var role        = user.role || 'user';
-            var tier        = user.subscription_tier || 'free';
-            var isAdmin     = role === 'admin' || role === 'master_admin';
-            var isMaster    = role === 'master_admin';
+            var role        = String(user.role || 'user').toLowerCase();
+            var tier        = String(user.tier || user.subscription_tier || 'free').toLowerCase();
+            var isMaster    = role === 'master_admin' || tier === 'master_admin';
+            var isAdmin     = isMaster || role === 'admin';
 
             if (!isAdmin) { document.getElementById('accessDenied').style.display = 'flex'; return; }
 
@@ -666,33 +601,30 @@
             var name    = user.name || (user.email ? user.email.split('@')[0] : 'Admin');
             var initial = name.charAt(0).toUpperCase();
 
-            ['userName','sidebarUserName'].forEach(function(id) {
-                var el = document.getElementById(id);
-                if (el) el.textContent = name;
-            });
+            var nameEl = document.getElementById('userName');
+            if (nameEl) nameEl.textContent = name;
 
             var tierNames = { free:'Free', launch:'Launch', creator_pro:'Creator Pro', studio:'Studio',
                               agency:'Agency', master_admin:'Master Admin', friends_family:'Friends & Family', lifetime:'Lifetime' };
             var displayTier = isMaster ? 'Master Admin' : (role === 'admin' ? 'Admin' : (tierNames[tier] || tier || 'Free'));
 
-            ['userTier','sidebarUserTier'].forEach(function(id) {
-                var el = document.getElementById(id);
-                if (el) el.textContent = displayTier;
-            });
+            var tierEl = document.getElementById('userTier');
+            if (tierEl) tierEl.textContent = displayTier;
 
-            ['userAvatar','sidebarAvatar'].forEach(function(id) {
-                var el = document.getElementById(id);
-                if (!el) return;
+            var avatarEl = document.getElementById('userAvatar');
+            if (avatarEl) {
                 if (user.avatar_url) {
-                    el.innerHTML = '<img src="' + user.avatar_url + '" alt="" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">';
+                    var _av = typeof um8EscapeHtml === 'function' ? um8EscapeHtml(user.avatar_url) : String(user.avatar_url).replace(/"/g, '&quot;');
+                    avatarEl.innerHTML = '<img referrerpolicy="no-referrer" loading="lazy" decoding="async" src="' + _av + '" alt="" style="width:100%;height:100%;border-radius:50%;object-fit:cover;">';
                 } else {
-                    el.textContent = initial;
+                    avatarEl.textContent = initial;
                 }
-            });
+            }
 
             // show admin nav
-            document.getElementById('adminSection').style.display = 'block';
-            document.querySelectorAll('.admin-only').forEach(function(el) {
+            var _admSec = document.getElementById('adminSection');
+            if (_admSec) _admSec.style.display = 'block';
+            document.querySelectorAll('.admin-only, .admin-only-marketing').forEach(function(el) {
                 el.style.display = 'block'; el.classList.remove('hidden');
             });
             document.querySelectorAll('.master-admin-only').forEach(function(el) {
@@ -710,156 +642,218 @@
             window.dispatchEvent(new CustomEvent('userLoaded',   { detail: user }));
 
             document.getElementById('adminContent').style.display = 'block';
-            loadSavedInputs();
 
-            // FIX 1: call via window so the header button also works
+            // Load live data from DB on default; fallback to saved values only if fetch fails
             window.fetchPricingAndRun();
         }
 
-        /* ── LIVE DATA — FIX 1 (global) + FIX 2 (price_usd) + FIX 3 (enterprise) ── */
-        window.fetchPricingAndRun = async function () {
-            var token = getToken();
+        /* ── LIVE DATA — load from DB by default; cache for same-session navigation; Load Live Data forces refresh ── */
+        var CALC_CACHE_KEY = 'uploadm8_calc_live_data';
+        var CALC_CACHE_MAX_AGE = 5 * 60 * 1000; // 5 min
+
+        function applyPricingData(data) {
+            if (!data) return;
+            var rt = data.revenue_tiers || {};
+            setVal('price_cl', rt.creator_lite  && rt.creator_lite.price);
+            setVal('put_cl',   rt.creator_lite  && rt.creator_lite.put_monthly);
+            setVal('aic_cl',   rt.creator_lite  && rt.creator_lite.aic_monthly);
+            setVal('price_cp', rt.creator_pro  && rt.creator_pro.price);
+            setVal('put_cp',   rt.creator_pro  && rt.creator_pro.put_monthly);
+            setVal('aic_cp',   rt.creator_pro  && rt.creator_pro.aic_monthly);
+            setVal('price_st', rt.studio       && rt.studio.price);
+            setVal('put_st',   rt.studio       && rt.studio.put_monthly);
+            setVal('aic_st',   rt.studio       && rt.studio.aic_monthly);
+            setVal('price_ag', rt.agency       && rt.agency.price);
+            setVal('put_ag',   rt.agency       && rt.agency.put_monthly);
+            setVal('aic_ag',   rt.agency       && rt.agency.aic_monthly);
+            if (rt.enterprise) {
+                setVal('price_ent', rt.enterprise.price);
+                setVal('put_ent',   rt.enterprise.put_monthly);
+                setVal('aic_ent',   rt.enterprise.aic_monthly);
+            }
+            var it = data.internal_tiers || {};
+            setVal('put_ff',       it.friends_family && it.friends_family.put_monthly);
+            setVal('aic_ff',       it.friends_family && it.friends_family.aic_monthly);
+            setVal('put_internal', it.master_admin   && it.master_admin.put_monthly);
+            setVal('aic_internal', it.master_admin   && it.master_admin.aic_monthly);
+            setVal('put_lifetime', it.lifetime       && it.lifetime.put_monthly);
+            setVal('aic_lifetime', it.lifetime       && it.lifetime.aic_monthly);
+            var packs = data.topup_packs || [];
+            for (var i = 0; i < packs.length; i++) {
+                var p     = packs[i];
+                var w     = (p.wallet || '').toLowerCase();
+                var amt   = Number(p.amount);
+                var price = (p.price_usd !== undefined && p.price_usd !== null) ? p.price_usd : p.price;
+                if (typeof price !== 'number' || price < 0) continue;
+                if (w === 'put') {
+                    if      (amt === 100)  setVal('put_pack_100_price',  price);
+                    else if (amt === 500)  setVal('put_pack_500_price',  price);
+                    else if (amt === 2000) setVal('put_pack_2000_price', price);
+                } else if (w === 'aic' || w === 'ai_credits') {
+                    if      (amt === 50)   setVal('aic_pack_50_price',   price);
+                    else if (amt === 250)  setVal('aic_pack_250_price',  price);
+                    else if (amt === 1000) setVal('aic_pack_1000_price', price);
+                }
+            }
+        }
+
+        function applyKpisData(kpi) {
+            if (!kpi) return;
+            var tb = kpi.tier_breakdown || {};
+            setVal('n_free',           tb.free           || 0);
+            setVal('n_creatorlite',    tb.creator_lite   || tb.launch || 0);
+            setVal('n_creatorpro',     tb.creator_pro     || 0);
+            setVal('n_studio',         tb.studio          || 0);
+            setVal('n_agency',         tb.agency          || 0);
+            setVal('n_enterprise',     tb.enterprise      || 0);
+            setVal('n_friends_family', tb.friends_family  || 0);
+            setVal('n_internal',       tb.master_admin    || 0);
+            setVal('n_lifetime',       tb.lifetime        || 0);
+        }
+
+        window.fetchPricingAndRun = async function (first, second) {
+            var force = false;
+            if (first && typeof first === 'object' && 'preventDefault' in first) {
+                force = second === true || second === 'true';
+            } else {
+                force = !!first;
+            }
+            var token = window.getAccessToken && window.getAccessToken();
             if (!token) return;
 
             var statusEl = document.getElementById('calcStatus');
-            if (statusEl) statusEl.textContent = 'Loading live pricing from database…';
 
-            try {
-                var r = await fetch(API_BASE + '/api/admin/calculator/pricing', {
-                    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }
-                });
-                if (!r.ok) {
-                    console.warn('Calculator pricing endpoint returned', r.status);
-                    if (statusEl) statusEl.textContent = 'Live pricing unavailable — using saved/default values';
-                } else {
-                    var data = await r.json();
-                    if (data) {
-                        // Revenue tiers
-                        var rt = data.revenue_tiers || {};
-                        setVal('price_cp', rt.creator_pro  && rt.creator_pro.price);
-                        setVal('put_cp',   rt.creator_pro  && rt.creator_pro.put_monthly);
-                        setVal('aic_cp',   rt.creator_pro  && rt.creator_pro.aic_monthly);
-                        setVal('price_st', rt.studio       && rt.studio.price);
-                        setVal('put_st',   rt.studio       && rt.studio.put_monthly);
-                        setVal('aic_st',   rt.studio       && rt.studio.aic_monthly);
-                        setVal('price_ag', rt.agency       && rt.agency.price);
-                        setVal('put_ag',   rt.agency       && rt.agency.put_monthly);
-                        setVal('aic_ag',   rt.agency       && rt.agency.aic_monthly);
-                        // FIX 3: enterprise tier
-                        if (rt.enterprise) {
-                            setVal('price_ent', rt.enterprise.price);
-                            setVal('put_ent',   rt.enterprise.put_monthly);
-                            setVal('aic_ent',   rt.enterprise.aic_monthly);
-                        }
-
-                        // Internal tiers
-                        var it = data.internal_tiers || {};
-                        setVal('put_ff',       it.friends_family && it.friends_family.put_monthly);
-                        setVal('aic_ff',       it.friends_family && it.friends_family.aic_monthly);
-                        setVal('put_internal', it.master_admin   && it.master_admin.put_monthly);
-                        setVal('aic_internal', it.master_admin   && it.master_admin.aic_monthly);
-                        setVal('put_lifetime', it.lifetime       && it.lifetime.put_monthly);
-                        setVal('aic_lifetime', it.lifetime       && it.lifetime.aic_monthly);
-
-                        // Top-up packs — FIX 2: read price_usd (canonical) with price as fallback
-                        var packs = data.topup_packs || [];
-                        for (var i = 0; i < packs.length; i++) {
-                            var p     = packs[i];
-                            var w     = (p.wallet || '').toLowerCase();
-                            var amt   = Number(p.amount);
-                            var price = (p.price_usd !== undefined && p.price_usd !== null) ? p.price_usd : p.price;
-                            if (typeof price !== 'number' || price < 0) continue;
-                            if (w === 'put') {
-                                if      (amt === 100)  setVal('put_pack_100_price',  price);
-                                else if (amt === 500)  setVal('put_pack_500_price',  price);
-                                else if (amt === 2000) setVal('put_pack_2000_price', price);
-                            } else if (w === 'aic' || w === 'ai_credits') {
-                                if      (amt === 50)   setVal('aic_pack_50_price',   price);
-                                else if (amt === 250)  setVal('aic_pack_250_price',  price);
-                                else if (amt === 1000) setVal('aic_pack_1000_price', price);
-                            }
-                        }
-
-                        saveInputs();
-                        if (statusEl) statusEl.textContent = 'Live pricing loaded — click Calculate to run';
-                    }
-                }
-            } catch (e) {
-                console.warn('Calculator: could not load live pricing', e);
-                if (statusEl) statusEl.textContent = 'Pricing fetch failed — using saved values';
+            function finish() {
+                saveInputs();
+                if (typeof window.runCalculator === 'function') window.runCalculator();
             }
 
-            // Pull actual user counts from DB and populate demand inputs
+            // Use cached data when returning to calculator (same session) — instant display, no flicker
+            if (!force) {
+                try {
+                    var raw = sessionStorage.getItem(CALC_CACHE_KEY);
+                    if (raw) {
+                        var c = JSON.parse(raw);
+                        if (c && c.timestamp && (Date.now() - c.timestamp) < CALC_CACHE_MAX_AGE) {
+                            applyPricingData(c.pricing);
+                            applyKpisData(c.kpis);
+                            if (statusEl) statusEl.textContent = 'Live data (cached) — click Calculate';
+                            finish();
+                            // Refresh in background
+                            window.apiCall('/api/admin/calculator/pricing')
+                                .then(function (data) {
+                                    if (!data) return;
+                                    applyPricingData(data);
+                                    return window.apiCall('/api/admin/kpis?range=30d').then(function (kpi) {
+                                        if (kpi) {
+                                            applyKpisData(kpi);
+                                            sessionStorage.setItem(
+                                                CALC_CACHE_KEY,
+                                                JSON.stringify({ pricing: data, kpis: kpi, timestamp: Date.now() })
+                                            );
+                                        } else {
+                                            sessionStorage.setItem(
+                                                CALC_CACHE_KEY,
+                                                JSON.stringify({ pricing: data, kpis: null, timestamp: Date.now() })
+                                            );
+                                        }
+                                        saveInputs();
+                                        if (statusEl) statusEl.textContent = 'Live data refreshed — click Calculate';
+                                        if (typeof window.runCalculator === 'function') window.runCalculator();
+                                    });
+                                })
+                                .catch(function () {});
+                            return;
+                        }
+                    }
+                } catch (_) {}
+            }
+
+            if (statusEl) statusEl.textContent = 'Loading live pricing from database…';
+
+            var pricingData = null;
+            var kpisData = null;
+
             try {
-                var r2 = await fetch(API_BASE + '/api/admin/kpis?range=30d', {
-                    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }
-                });
-                if (r2.ok) {
-                    var kpi = await r2.json();
-                    var tb  = kpi.tier_breakdown || {};
-                    setVal('n_free',           tb.free           || 0);
-                    setVal('n_creatorpro',     tb.creator_pro     || 0);
-                    setVal('n_studio',         tb.studio          || 0);
-                    setVal('n_agency',         tb.agency          || 0);
-                    setVal('n_enterprise',     tb.enterprise      || 0);
-                    setVal('n_friends_family', tb.friends_family  || 0);
-                    setVal('n_internal',       tb.master_admin    || 0);
-                    setVal('n_lifetime',       tb.lifetime        || 0);
-                    saveInputs();
-                    if (statusEl) statusEl.textContent = 'Live pricing + user counts loaded — click Calculate';
-                }
+                pricingData = await window.apiCall('/api/admin/calculator/pricing');
+                applyPricingData(pricingData);
+                if (statusEl) statusEl.textContent = 'Live pricing loaded — loading user counts…';
+            } catch (e) {
+                if (e && e.status) console.warn('Calculator pricing endpoint returned', e.status);
+                console.warn('Calculator: could not load live pricing', e);
+                if (statusEl) statusEl.textContent = 'Live pricing unavailable — using saved/default values';
+                loadSavedInputs();
+                finish();
+                return;
+            }
+
+            try {
+                kpisData = await window.apiCall('/api/admin/kpis?range=30d');
+                applyKpisData(kpisData);
             } catch (e) {
                 console.warn('Calculator: could not load user counts', e);
             }
 
-            if (typeof window.runCalculator === 'function') window.runCalculator();
+            try {
+                sessionStorage.setItem(CALC_CACHE_KEY, JSON.stringify({ pricing: pricingData, kpis: kpisData, timestamp: Date.now() }));
+            } catch (_) {}
+            if (statusEl) statusEl.textContent = 'Live pricing + user counts loaded — click Calculate';
+            finish();
         };
 
         /* ── tab switching ───────────────────────────────────────── */
         window.switchCalcTab = function (tab, evt) {
-            var btn = (evt && evt.currentTarget) ? evt.currentTarget : null;
+            var realTab = tab;
+            var realEvt = evt;
+            if (tab && typeof tab === 'object' && tab.currentTarget && typeof evt === 'string') {
+                realEvt = tab;
+                realTab = evt;
+            }
+            var btn = (realEvt && realEvt.currentTarget) ? realEvt.currentTarget : null;
             document.querySelectorAll('.calc-tab').forEach(function(t)  { t.classList.remove('active'); });
             document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
             if (btn) btn.classList.add('active');
-            var panel = document.getElementById('panel-' + tab);
+            var panel = document.getElementById('panel-' + realTab);
             if (panel) panel.classList.add('active');
         };
 
         /* ── section collapse ────────────────────────────────────── */
-        window.toggleSection = function (id) {
+        window.toggleSection = function (first, second) {
+            var id = second !== undefined && second !== null && second !== '' ? String(second) : String(first);
             var el = document.getElementById(id);
             if (el) el.classList.toggle('collapsed');
         };
 
         /* ── presets ─────────────────────────────────────────────── */
         var PRESETS = {
-            bootstrap: { n_free:30, n_creatorpro:10, n_studio:5, n_agency:3, n_enterprise:0,
+            bootstrap: { n_free:30, n_creatorlite:5, n_creatorpro:10, n_studio:5, n_agency:3, n_enterprise:0,
                 n_friends_family:2, n_internal:1, n_lifetime:0,
-                v_free:3, v_cp:20, v_st:60, v_ag:150, v_ent:500,
+                v_free:3, v_cl:10, v_cp:20, v_st:60, v_ag:150, v_ent:500,
                 v_ff:30, v_internal:50, v_lifetime:40,
                 p_avg:2.5, size_mb_avg:25, ai_rate:0.6, workers_provisioned:1,
                 worker_cost_month:25, pg_cost_month:19, redis_cost_month:10 },
-            growth: { n_free:300, n_creatorpro:100, n_studio:50, n_agency:30, n_enterprise:2,
+            growth: { n_free:300, n_creatorlite:50, n_creatorpro:100, n_studio:50, n_agency:30, n_enterprise:2,
                 n_friends_family:5, n_internal:2, n_lifetime:3,
-                v_free:3, v_cp:25, v_st:70, v_ag:180, v_ent:500,
+                v_free:3, v_cl:12, v_cp:25, v_st:70, v_ag:180, v_ent:500,
                 v_ff:40, v_internal:60, v_lifetime:50,
                 p_avg:2.8, size_mb_avg:30, ai_rate:0.7, workers_provisioned:3,
                 worker_cost_month:25, pg_cost_month:49, redis_cost_month:20 },
-            scale: { n_free:3000, n_creatorpro:1000, n_studio:500, n_agency:300, n_enterprise:20,
+            scale: { n_free:3000, n_creatorlite:500, n_creatorpro:1000, n_studio:500, n_agency:300, n_enterprise:20,
                 n_friends_family:10, n_internal:3, n_lifetime:15,
-                v_free:3, v_cp:30, v_st:80, v_ag:200, v_ent:600,
+                v_free:3, v_cl:12, v_cp:30, v_st:80, v_ag:200, v_ent:600,
                 v_ff:50, v_internal:80, v_lifetime:60,
                 p_avg:3, size_mb_avg:35, ai_rate:0.75, workers_provisioned:10,
                 worker_cost_month:50, pg_cost_month:149, redis_cost_month:50 },
-            enterprise: { n_free:15000, n_creatorpro:5000, n_studio:2500, n_agency:1500, n_enterprise:100,
+            enterprise: { n_free:15000, n_creatorlite:2500, n_creatorpro:5000, n_studio:2500, n_agency:1500, n_enterprise:100,
                 n_friends_family:15, n_internal:5, n_lifetime:50,
-                v_free:2, v_cp:30, v_st:100, v_ag:250, v_ent:800,
+                v_free:2, v_cl:10, v_cp:30, v_st:100, v_ag:250, v_ent:800,
                 v_ff:60, v_internal:100, v_lifetime:70,
                 p_avg:3.2, size_mb_avg:40, ai_rate:0.8, workers_provisioned:40,
                 worker_cost_month:85, pg_cost_month:499, redis_cost_month:150 }
         };
 
-        window.loadPreset = function (name) {
+        window.loadPreset = function (first, second) {
+            var name = second !== undefined && second !== null && second !== '' ? String(second) : String(first);
             var p = PRESETS[name];
             if (!p) return;
             Object.keys(p).forEach(function(k) {
@@ -878,18 +872,18 @@
             if (btn) btn.classList.add('active');
         };
 
-        /* ── localStorage ────────────────────────────────────────── */
+        /* ── sessionStorage ────────────────────────────────────────── */
         function saveInputs() {
             var data = {};
             document.querySelectorAll('#panel-inputs input, #panel-inputs select').forEach(function(el) {
                 if (el.id) data[el.id] = el.value;
             });
-            try { localStorage.setItem('uploadm8_calc_inputs', JSON.stringify(data)); } catch(e) {}
+            try { sessionStorage.setItem('uploadm8_calc_inputs', JSON.stringify(data)); } catch(e) {}
         }
 
         function loadSavedInputs() {
             try {
-                var raw = localStorage.getItem('uploadm8_calc_inputs');
+                var raw = sessionStorage.getItem('uploadm8_calc_inputs');
                 if (!raw) return;
                 var data = JSON.parse(raw);
                 Object.keys(data).forEach(function(k) {
@@ -938,31 +932,31 @@
             saveInputs();
 
             // Volume
-            var n_free=val('n_free'), n_cp=val('n_creatorpro'), n_st=val('n_studio'), n_ag=val('n_agency'), n_ent=val('n_enterprise');
+            var n_free=val('n_free'), n_cl=val('n_creatorlite'), n_cp=val('n_creatorpro'), n_st=val('n_studio'), n_ag=val('n_agency'), n_ent=val('n_enterprise');
             var n_ff=val('n_friends_family'), n_internal=val('n_internal'), n_lifetime=val('n_lifetime');
-            var v_free=val('v_free'), v_cp_v=val('v_cp'), v_st_v=val('v_st'), v_ag_v=val('v_ag'), v_ent_v=val('v_ent');
+            var v_free=val('v_free'), v_cl_v=val('v_cl'), v_cp_v=val('v_cp'), v_st_v=val('v_st'), v_ag_v=val('v_ag'), v_ent_v=val('v_ent');
             var v_ff_v=val('v_ff'), v_internal_v=val('v_internal'), v_lifetime_v=val('v_lifetime');
             var p_avg=val('p_avg'), ai_rate=val('ai_rate'), ai_steps=val('ai_steps_per_upload');
             var retry_rate=val('publish_retry_rate'), retries=val('retries_avg'), size_mb=val('size_mb_avg');
 
-            var videos_paid     = n_cp*v_cp_v + n_st*v_st_v + n_ag*v_ag_v + n_ent*v_ent_v;
+            var videos_paid     = n_cl*v_cl_v + n_cp*v_cp_v + n_st*v_st_v + n_ag*v_ag_v + n_ent*v_ent_v;
             var videos_internal = n_ff*v_ff_v + n_internal*v_internal_v + n_lifetime*v_lifetime_v;
             var videos_free     = n_free * v_free;
             var videos_total    = videos_free + videos_paid + videos_internal;
             var put_demand      = videos_total * p_avg * (1 + retry_rate * retries);
             var aic_demand      = videos_total * ai_rate * ai_steps;
 
-            var total_customers    = n_free+n_cp+n_st+n_ag+n_ent+n_ff+n_internal+n_lifetime;
-            var paid_customers     = n_cp+n_st+n_ag+n_ent;
+            var total_customers    = n_free+n_cl+n_cp+n_st+n_ag+n_ent+n_ff+n_internal+n_lifetime;
+            var paid_customers     = n_cl+n_cp+n_st+n_ag+n_ent;
             var internal_customers = n_ff+n_internal+n_lifetime;
 
             // Revenue
             var price_cp=val('price_cp'), price_st=val('price_st'), price_ag=val('price_ag'), price_ent=val('price_ent');
-            var rev_sub = n_cp*price_cp + n_st*price_st + n_ag*price_ag + n_ent*price_ent;
+            var rev_sub = n_cl*val('price_cl') + n_cp*price_cp + n_st*price_st + n_ag*price_ag + n_ent*price_ent;
 
-            var put_included = n_cp*val('put_cp')+n_st*val('put_st')+n_ag*val('put_ag')+n_ent*val('put_ent')
+            var put_included = n_cl*val('put_cl')+n_cp*val('put_cp')+n_st*val('put_st')+n_ag*val('put_ag')+n_ent*val('put_ent')
                              + n_ff*val('put_ff')+n_internal*val('put_internal')+n_lifetime*val('put_lifetime');
-            var aic_included = n_cp*val('aic_cp')+n_st*val('aic_st')+n_ag*val('aic_ag')+n_ent*val('aic_ent')
+            var aic_included = n_cl*val('aic_cl')+n_cp*val('aic_cp')+n_st*val('aic_st')+n_ag*val('aic_ag')+n_ent*val('aic_ent')
                              + n_ff*val('aic_ff')+n_internal*val('aic_internal')+n_lifetime*val('aic_lifetime');
 
             var internal_put_demand = videos_internal * p_avg * (1 + retry_rate * retries);
@@ -1343,33 +1337,23 @@
                 }).join('') : '';
         };
 
-        /* ── sidebar / theme fallbacks ───────────────────────────── */
+        /* ── sidebar fallback only if app.js did not bind ───────── */
         window.toggleSidebar = window.toggleSidebar || function () {
             document.getElementById('sidebar').classList.toggle('open');
             document.getElementById('sidebarOverlay').classList.toggle('hidden');
         };
 
-        window.toggleTheme = window.toggleTheme || function () {
-            var html = document.documentElement;
-            var t = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-            html.setAttribute('data-theme', t);
-            localStorage.setItem('uploadm8_theme', t);
-        };
-
         window.logout = window.logout || function () {
-            localStorage.removeItem(TOKEN_KEY);
-            localStorage.removeItem('uploadm8_refresh_token');
+            sessionStorage.removeItem(TOKEN_KEY);
+            sessionStorage.removeItem('uploadm8_refresh_token');
+            try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem('uploadm8_refresh_token'); } catch (e) {}
             sessionStorage.removeItem(TOKEN_KEY);
             window.location.href = 'login.html';
         };
 
-        // apply saved theme
-        var savedTheme = localStorage.getItem('uploadm8_theme');
-        if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
-
-        /* ── boot ────────────────────────────────────────────────── */
+        /* ── boot: app.js checkAuth is sole auth ───────────────────── */
         document.addEventListener('DOMContentLoaded', async function () {
-            var user = await authenticateAdmin();
+            var user = await window.checkAuth({ redirectOnFail: true, forceRefresh: false });
             if (user) initPage(user);
         });
 

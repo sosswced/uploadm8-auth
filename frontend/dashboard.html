@@ -1,7 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+
+    <script src="js/html-safe.js"></script>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://static.cloudflareinsights.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 https://cloudflareinsights.com;">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard - UploadM8</title>
@@ -13,79 +15,34 @@
 <div class="app-layout">
 
     <!-- Sidebar -->
-    <aside class="sidebar" id="sidebar">
-        <div class="sidebar-header">
-            <a href="dashboard.html" class="sidebar-logo">
-                <img src="images/logo.png" alt="UploadM8">
-                <span>UploadM8</span>
-            </a>
-        </div>
-        <nav class="sidebar-nav">
-            <div class="nav-section">
-                <div class="nav-section-title">Main</div>
-                <a href="dashboard.html" class="nav-link active"><i class="fas fa-home"></i><span>Dashboard</span></a>
-                <a href="upload.html"    class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-                <a href="queue.html"     class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
-                <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Platforms</div>
-                <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-                <a href="groups.html"    class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Insights</div>
-                <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-            </div>
-            <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                <div class="nav-section-title">Admin</div>
-                <a href="admin.html"              class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
-                <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
-                <a href="admin-kpi.html"          class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
-                <a href="admin-calculator.html"   class="nav-link"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
-                <a href="admin-wallet.html"       class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Account</div>
-                <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-                <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-            </div>
-        </nav>
-        <div class="sidebar-footer">
-            <div class="user-info">
-                <div class="user-avatar" id="userAvatar">U</div>
-                <div class="user-details">
-                    <div class="user-name" id="userName">User</div>
-                    <div class="user-tier" id="userTier">Free</div>
-                </div>
-                <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
-                    <i class="fas fa-sign-out-alt"></i>
-                </button>
-            </div>
-        </div>
-    </aside>
+    <aside class="sidebar" id="sidebar"></aside>
 
-    <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
 
     <header class="top-bar">
-        <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
-        <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
+        <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
         <div class="top-bar-actions">
-            <button class="theme-toggle" onclick="toggleTheme()"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+            <div data-wt-pills></div>
+            <button class="theme-toggle" data-um8-fn="toggleTheme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
         </div>
     </header>
 
     <!-- Main Content -->
     <main class="main-content">
-        <div id="usageBannerContainer"></div>
+        <div id="usageBannerContainer" data-wt-banner></div>
         <div class="page-header">
             <div>
                 <h1 class="page-title">Welcome back, <span id="welcomeName">User</span>!</h1>
                 <p class="page-subtitle">Here's what's happening with your uploads</p>
             </div>
-            <div class="flex gap-2">
-                <button class="theme-toggle" id="themeToggleDesktop" onclick="toggleTheme()">
+            <div class="flex gap-2 items-center flex-wrap">
+                <div data-wt-pills class="desktop-pills"></div>
+                <button class="theme-toggle" id="themeToggleDesktop" data-um8-fn="toggleTheme">
                     <i class="fas fa-moon" id="themeToggleIconDesktop"></i>
+                </button>
+                <button type="button" class="btn btn-secondary" id="dashboardMasterRefreshBtn" title="Re-sync all video stats from platforms (views, likes, comments, shares) and refresh totals on this page">
+                    <i class="fas fa-arrows-rotate"></i> Refresh stats
                 </button>
                 <a href="upload.html" class="btn btn-primary"><i class="fas fa-plus"></i> New Upload</a>
             </div>
@@ -105,6 +62,9 @@
                         <div class="quota-bar bg-orange" id="quotaBar" style="width:0%;"></div>
                     </div>
                 </div>
+                <a href="settings.html#preferences" class="btn btn-secondary btn-sm" title="Captions, thumbnails, Trill, AI defaults">
+                    <i class="fas fa-sliders-h"></i> Upload prefs
+                </a>
                 <a href="settings.html#billing" class="btn btn-secondary btn-sm">
                     <i class="fas fa-arrow-up"></i> Upgrade Plan
                 </a>
@@ -134,6 +94,40 @@
                 <div class="card-title text-sm text-secondary"><i class="fas fa-calendar"></i> Scheduled</div>
                 <div class="stat-value" id="statScheduled">-</div>
                 <div class="stat-label">Pending uploads</div>
+            </div>
+        </div>
+        <div class="grid grid-4 mb-4" id="dashboardEngagementRow">
+            <div class="card stat-card" data-card-id="aggregate-views">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-eye"></i> Total Views</div>
+                <div class="stat-value" id="statEngagementViews">—</div>
+                <div class="stat-label">Merged across platforms (matches Analytics)</div>
+            </div>
+            <div class="card stat-card" data-card-id="aggregate-likes">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-heart"></i> Total Likes</div>
+                <div class="stat-value" id="statEngagementLikes">—</div>
+                <div class="stat-label">Merged across platforms (matches Analytics)</div>
+            </div>
+            <div class="card stat-card" data-card-id="aggregate-comments">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-comment"></i> Total Comments</div>
+                <div class="stat-value" id="statEngagementComments">—</div>
+                <div class="stat-label">Merged across platforms (matches Analytics)</div>
+            </div>
+            <div class="card stat-card" data-card-id="aggregate-shares">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-share"></i> Total Shares</div>
+                <div class="stat-value" id="statEngagementShares">—</div>
+                <div class="stat-label">Merged across platforms (matches Analytics)</div>
+            </div>
+        </div>
+
+        <!-- ── Unified catalog aggregate — shared CatalogAgg widget ── -->
+        <div id="dashAggWidget" data-catalog-agg="true" data-catalog-agg-period="30d" style="margin-bottom:1.25rem;"></div>
+
+        <div class="card mb-4" style="border-color:rgba(139,92,246,.35);background:rgba(139,92,246,.05);">
+            <div class="card-header" style="padding-bottom:6px;">
+                <h3 class="card-title" style="font-size:1rem;"><i class="fas fa-wand-magic-sparkles" style="color:#a78bfa;"></i> Personalized tips</h3>
+            </div>
+            <div class="card-body" style="padding-top:6px;">
+                <div data-ai-coach="1" class="text-secondary" style="font-size:.88rem;line-height:1.45;">Loading personalized tips…</div>
             </div>
         </div>
 
@@ -182,8 +176,13 @@
             .sync-btn i { font-size:.6rem; }
             /* Platform chips */
             .platform-chips { display:flex; flex-wrap:wrap; gap:5px; }
-            .platform-chip { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; border-radius:20px; font-size:.68rem; font-weight:500; text-decoration:none; border:1px solid transparent; transition:opacity .15s, transform .12s, box-shadow .12s; cursor:pointer; white-space:nowrap; }
+            .platform-chip { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; border-radius:20px; font-size:.68rem; font-weight:500; text-decoration:none; border:1px solid transparent; transition:opacity .15s, transform .12s, box-shadow .12s; cursor:pointer; white-space:normal; }
             .platform-chip:hover { opacity:.9; transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,.25); text-decoration:none; }
+            .vis-pill { font-size:0.58rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em; padding:1px 6px; border-radius:4px; margin-left:6px; flex-shrink:0; line-height:1.2; }
+            .vis-public { background:rgba(34,197,94,.18); color:#86efac; border:1px solid rgba(34,197,94,.35); }
+            .vis-private { background:rgba(107,114,128,.25); color:#d1d5db; border:1px solid rgba(107,114,128,.4); }
+            .vis-unlisted { background:rgba(234,179,8,.15); color:#fcd34d; border:1px solid rgba(234,179,8,.35); }
+            .vis-removed { background:rgba(239,68,68,.15); color:#fca5a5; border:1px solid rgba(239,68,68,.35); }
             .chip-youtube   { background:rgba(255,0,0,.12);    color:#ff4444; border-color:rgba(255,0,0,.3); }
             .chip-tiktok    { background:rgba(105,201,208,.12); color:#69C9D0; border-color:rgba(105,201,208,.3); }
             .chip-instagram { background:rgba(225,48,108,.12);  color:#E1306C; border-color:rgba(225,48,108,.3); }
@@ -203,12 +202,41 @@
                 border: 1px solid rgba(255,255,255,.2);
                 vertical-align: middle;
             }
+            .chip-avatar-slot { display:inline-flex; width:16px; height:16px; flex-shrink:0; align-items:center; justify-content:center; position:relative; }
+            .chip-avatar-slot .chip-avatar { position:absolute; inset:0; width:16px; height:16px; }
+            .chip-avatar-fallback {
+                display:inline-flex; align-items:center; justify-content:center;
+                width:16px; height:16px; border-radius:50%; flex-shrink:0;
+                font-size:7px; font-weight:800; color:#fff;
+                background:linear-gradient(135deg,rgba(249,115,22,.75),rgba(139,92,246,.75));
+                border:1px solid rgba(255,255,255,.25);
+            }
+            .chip-mid { display:flex; flex-direction:column; align-items:flex-start; gap:2px; min-width:0; white-space:normal; }
+            .chip-line { font-size:.68rem; font-weight:500; line-height:1.2; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+            .chip-tier-pill {
+                font-size:.55rem; font-weight:600; text-transform:uppercase; letter-spacing:.03em;
+                padding:1px 6px; border-radius:999px; background:rgba(0,0,0,.22); border:1px solid rgba(255,255,255,.12); opacity:.9;
+            }
+            a.platform-chip { color: inherit; }
+            a.platform-chip .chip-line { color: inherit; }
             /* Filter bar */
             .uploads-filter-bar { display:flex; align-items:center; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
             .filter-chip { padding:3px 11px; border-radius:16px; font-size:.72rem; font-weight:500; border:1px solid var(--border-color); background:transparent; color:var(--text-secondary); cursor:pointer; transition:all .15s; }
             .filter-chip:hover, .filter-chip.active { background:rgba(249,115,22,.15); border-color:rgba(249,115,22,.4); color:#f97316; }
             .filter-chip.active-smart { background:rgba(139,92,246,.15); border-color:rgba(139,92,246,.4); color:#a78bfa; }
             .uploads-count-badge { margin-left:auto; font-size:.72rem; color:var(--text-secondary); }
+
+            /* ── Mobile overrides ── */
+            @media (max-width: 640px) {
+                .upload-row { flex-wrap: wrap; gap: 8px; }
+                .upload-thumb { width: 80px; height: 50px; flex-shrink: 0; }
+                .uploads-filter-bar { gap: 4px; }
+                .filter-chip { font-size: .68rem; padding: 2px 9px; }
+            }
+            @media (max-width: 480px) {
+                .upload-thumb { width: 72px; height: 44px; }
+                .upload-title { font-size: .8rem; }
+            }
         </style>
 
         <div class="card mb-4">
@@ -223,20 +251,20 @@
             </div>
             <div class="card-body" style="padding-top:8px;">
                 <div class="uploads-filter-bar">
-                    <button class="filter-chip active" onclick="filterUploads('all',this)">All</button>
-                    <button class="filter-chip" onclick="filterUploads('succeeded',this)">
+                    <button class="filter-chip active" data-um8-fn="filterUploads" data-um8-arg="all">All</button>
+                    <button class="filter-chip" data-um8-fn="filterUploads" data-um8-arg="succeeded">
                         <i class="fas fa-check-circle" style="font-size:.6rem;"></i> Succeeded
                     </button>
-                    <button class="filter-chip" onclick="filterUploads('staged',this)">
+                    <button class="filter-chip" data-um8-fn="filterUploads" data-um8-arg="staged">
                         <i class="fas fa-clock" style="font-size:.6rem;"></i> Staged / Pending
                     </button>
-                    <button class="filter-chip" onclick="filterUploads('smart',this)">
+                    <button class="filter-chip" data-um8-fn="filterUploads" data-um8-arg="smart">
                         <i class="fas fa-magic" style="font-size:.6rem;"></i> Smart Schedule
                     </button>
-                    <button class="filter-chip" onclick="filterUploads('partial',this)">
+                    <button class="filter-chip" data-um8-fn="filterUploads" data-um8-arg="partial">
                         <i class="fas fa-exclamation-triangle" style="font-size:.6rem;"></i> Partial
                     </button>
-                    <button class="filter-chip" onclick="filterUploads('failed',this)">
+                    <button class="filter-chip" data-um8-fn="filterUploads" data-um8-arg="failed">
                         <i class="fas fa-times-circle" style="font-size:.6rem;"></i> Failed
                     </button>
                 </div>
@@ -260,6 +288,11 @@
                     <a href="groups.html"    class="btn btn-secondary"><i class="fas fa-layer-group" style="color:#a78bfa;"></i> Create Account Group</a>
                     <a href="scheduled.html" class="btn btn-secondary"><i class="fas fa-calendar-alt" style="color:#34d399;"></i> View Scheduled</a>
                     <a href="analytics.html" class="btn btn-secondary"><i class="fas fa-chart-line text-orange"></i> View Analytics</a>
+                    <a href="guide.html#feat-settings-playbook" class="btn btn-secondary"><i class="fas fa-book text-orange"></i> Setup Handbook</a>
+                    <a href="kpi.html" class="btn btn-secondary"><i class="fas fa-chart-bar text-orange"></i> Upload KPIs</a>
+                    <a href="report-bug.html" class="btn btn-secondary"><i class="fas fa-bug" style="color:#f97316;"></i> Report a bug</a>
+                    <a href="admin-kpi.html" class="btn btn-secondary admin-only" style="display:none"><i class="fas fa-chart-pie text-orange"></i> Admin KPIs</a>
+                    <a href="admin-marketing.html" id="marketingOpsQuickLink" class="btn btn-secondary hidden admin-only-marketing"><i class="fas fa-bullhorn" style="color:#f97316;"></i> Marketing Ops</a>
                 </div>
             </div>
         </div>
@@ -270,16 +303,43 @@
     </main>
 </div>
 
+<!-- First-visit Setup Handbook modal (after email verification / first dashboard visit) -->
+<div class="modal hidden" id="playbookWelcomeModal" role="dialog" aria-modal="true" aria-labelledby="playbookModalTitle" aria-hidden="true">
+    <div class="modal-content" style="max-width:560px;">
+        <div class="modal-header">
+            <h3 class="modal-title" id="playbookModalTitle"><i class="fas fa-book-open" style="color:#f97316;margin-right:.4rem;"></i> Set up for successful uploads</h3>
+            <button type="button" class="modal-close" id="playbookModalClose" aria-label="Close" data-um8-fn="um8DashboardPlaybookDismiss"><i class="fas fa-times"></i></button>
+        </div>
+        <div class="modal-body" style="font-size:.9rem;line-height:1.55;color:var(--text-secondary);">
+            <p style="margin:0 0 .75rem;color:var(--text-primary);">We also sent a link to the <strong>Setup Handbook</strong> in your welcome email (after you confirmed your address). It lives in the Feature Guide.</p>
+            <p style="margin:0 0 .75rem;">The handbook walks through <strong>every toggle</strong> — wallet and AI credits, captions and thumbnails, audio and speech-to-text, Drive Insights, Thumbnail Studio, and how to turn services on or off so you do not spend credits you do not need.</p>
+            <ul style="margin:.5rem 0 .75rem 1.1rem;padding:0;">
+                <li>Connect platforms, then review Settings and save your preferences.</li>
+                <li>On Upload, keep <strong>Use AI</strong> on unless you want a non-AI run for that batch.</li>
+                <li>Use <strong>Queue</strong> to confirm each job finished.</li>
+            </ul>
+            <p style="margin:0;font-size:.82rem;">Full reference: <a href="guide.html" style="color:#f97316;">Feature Guide</a> · <a href="guide.html#feat-settings-playbook" style="color:#f97316;">Settings Playbook</a></p>
+        </div>
+        <div class="modal-footer" style="flex-wrap:wrap;justify-content:space-between;">
+            <button type="button" class="btn btn-secondary" id="playbookModalDismiss" data-um8-fn="um8DashboardPlaybookDismiss">Don&apos;t show again</button>
+            <div style="display:flex;gap:.5rem;flex-wrap:wrap;">
+                <a href="guide.html#feat-settings-playbook" class="btn btn-secondary"><i class="fas fa-external-link-alt"></i> Open handbook</a>
+                <a href="settings.html" class="btn btn-primary"><i class="fas fa-sliders-h"></i> Settings</a>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Confirm Modal -->
 <div class="modal hidden" id="confirmModal">
     <div class="modal-content">
         <div class="modal-header">
             <h3 class="modal-title" id="confirmTitle">Confirm</h3>
-            <button class="modal-close" onclick="hideModal('confirmModal')"><i class="fas fa-times"></i></button>
+            <button class="modal-close" data-um8-fn="hideModal" data-um8-arg="confirmModal"><i class="fas fa-times"></i></button>
         </div>
         <div class="modal-body"><p id="confirmMessage">Are you sure?</p></div>
         <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="hideModal('confirmModal')">Cancel</button>
+            <button class="btn btn-secondary" data-um8-fn="hideModal" data-um8-arg="confirmModal">Cancel</button>
             <button class="btn btn-primary"   id="confirmAction">Confirm</button>
         </div>
     </div>
@@ -287,8 +347,21 @@
 
 <div id="toastContainer"></div>
 
-<script src="wallet-tokens.js"></script>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script src="shared-sidebar.js"></script>
+<script src="js/helpers-formatting.js"></script>
+<script src="js/upload-utils.js"></script>
 <script src="app.js"></script>
+<script src="js/ai-coach.js"></script>
+<script src="wallet-tokens.js"></script>
+<script src="js/tier-catalog.js"></script>
+<script src="success-modal.js"></script>
+<script src="js/catalog-aggregate.js"></script>
+<script src="js/m8-stats.js"></script>
 <script>
 /* ═══════════════════════════════════════════════════════
    CONSTANTS
@@ -297,6 +370,42 @@ const SUCCESSFUL_STATUSES = ['completed','complete','success','succeeded','publi
 const STAGED_STATUSES     = ['staged','scheduled','queued','pending','ready_to_publish','in_progress','uploading','waiting','preparing','encoding','transcoding','ready'];
 const SMART_STATUS_WORDS  = ['smart_scheduled','smart_schedule','smart','auto_scheduled','ai_scheduled','optimal','optimized'];
 const FAILED_STATUSES     = ['failed','error','cancelled','canceled','rejected','timeout'];
+let _dashboardAnalyticsRefreshTimer = null;
+let _dashboardDidBootRefresh = false;
+/** After unreachable-api errors, skip analytics refresh + auto-sync to avoid request storms. */
+let _dashboardApiOfflineUntil = 0;
+const DASHBOARD_API_OFFLINE_COOLDOWN_MS = 60_000;
+
+window.um8DashboardPlaybookDismiss = async function () {
+    var modal = document.getElementById('playbookWelcomeModal');
+    if (!modal) return;
+    modal.classList.add('hidden');
+    modal.setAttribute('aria-hidden', 'true');
+    try {
+        if (typeof apiCall === 'function') {
+            await apiCall('/api/me/preferences', {
+                method: 'PUT',
+                body: JSON.stringify({ playbookModalDismissed: true }),
+            });
+        }
+    } catch (e) {
+        console.warn('[Dashboard] playbook dismiss:', e);
+    }
+};
+
+function _dashboardApiOfflineUntilEffective() {
+    return Math.max(
+        _dashboardApiOfflineUntil,
+        typeof window.__uploadm8ApiOfflineUntil === 'number' ? window.__uploadm8ApiOfflineUntil : 0
+    );
+}
+function _isUnreachableApiError(e) {
+    if (!e) return false;
+    if (e.name === 'TypeError' && /fetch|network|load failed/i.test(String(e.message || ''))) return true;
+    if (e.message === 'Failed to fetch') return true;
+    return /ECONNREFUSED|connection refused|network error|Failed to fetch/i.test(String(e.message || ''));
+}
+const PLATFORM_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const PLATFORM_ALIASES = {
     youtube:'youtube',youtube_shorts:'youtube',youtubeshorts:'youtube',yt:'youtube',yt_shorts:'youtube',
@@ -316,6 +425,61 @@ function normalizePlatform(raw) {
     if (!raw) return null;
     return PLATFORM_ALIASES[String(raw).toLowerCase().trim()] || String(raw).toLowerCase().trim();
 }
+function normalizePlatformKey(raw) {
+    return normalizePlatform(raw) || String(raw || '').toLowerCase().trim();
+}
+function escapeHtmlDash(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+/** Match platform_results row to connected account (multi-account) for avatar/name. */
+function resolvePlatformAccountMatch(entry, platform, avatarMap) {
+    const p = normalizePlatform(platform) || platform;
+    const list = (window._platformAccountsByPlatform && window._platformAccountsByPlatform[p]) || [];
+    const tokenRow = entry.token_row_id || entry.token_id || entry.platform_token_id;
+    const accId = entry.account_id;
+    const uname = String(entry.account_username || entry.username || '').replace(/^@+/, '').trim().toLowerCase();
+    const aname = String(entry.account_name || entry.name || '').trim().toLowerCase();
+    let match = null;
+    if (tokenRow && list.length) match = list.find(a => String(a.id) === String(tokenRow));
+    if (!match && accId && list.length) match = list.find(a => String(a.account_id || '') === String(accId));
+    if (!match && uname && list.length) match = list.find(a => String(a.username || '').replace(/^@+/, '').trim().toLowerCase() === uname);
+    if (!match && aname && list.length) match = list.find(a => String(a.name || '').trim().toLowerCase() === aname);
+    const fb = avatarMap[p] || {};
+    return {
+        avatar: (match && match.avatar) || fb.avatar || '',
+        name: (match && match.name) || fb.name || '',
+        username: (match && match.username) || fb.username || '',
+    };
+}
+function chipAvatarHtml(displayAvatar, letterSource) {
+    const letter = String(letterSource || '?').trim().charAt(0).toUpperCase() || '?';
+    if (displayAvatar) {
+        return `<span class="chip-avatar-slot"><img referrerpolicy="no-referrer" loading="lazy" decoding="async" class="chip-avatar" src="${escapeHtmlDash(displayAvatar)}" alt="" onerror="this.style.display='none';var n=this.nextElementSibling;if(n)n.style.display='inline-flex';"><span class="chip-avatar chip-avatar-fallback" style="display:none" aria-hidden="true">${escapeHtmlDash(letter)}</span></span>`;
+    }
+    return `<span class="chip-avatar chip-avatar-fallback" aria-hidden="true">${escapeHtmlDash(letter)}</span>`;
+}
+function tierPillHtml() {
+    return '';
+}
+/** YouTube privacy + API presence from sync-analytics (platform_results[].visibility / platform_presence). */
+function visibilityPillHtml(entry) {
+    if (!entry || typeof entry !== 'object') return '';
+    const pres = String(entry.platform_presence || '').toLowerCase();
+    if (pres === 'not_found') {
+        return '<span class="vis-pill vis-removed" title="Video not returned by platform API (removed or inaccessible)">Removed</span>';
+    }
+    const v = String(entry.visibility || '').toLowerCase();
+    if (!v) return '';
+    if (v === 'public') return '<span class="vis-pill vis-public">Public</span>';
+    if (v === 'private') return '<span class="vis-pill vis-private">Private</span>';
+    if (v === 'unlisted') return '<span class="vis-pill vis-unlisted">Unlisted</span>';
+    return '';
+}
+function normalizeChipAvatarUrl(v) {
+    const s = String(v || '').trim();
+    return /^https?:\/\//i.test(s) ? s : '';
+}
 function extractArray(res, key='uploads') {
     if (!res) return [];
     if (Array.isArray(res)) return res;
@@ -330,12 +494,14 @@ function fmtNum(n) {
     return String(n);
 }
 function fmtDate(iso) {
-    if (!iso) return '';
+    if (!iso) return '—';
+    const t = new Date(iso).getTime();
+    if (Number.isNaN(t)) return '—';
     try {
-        const d = new Date(iso);
+        const d = new Date(t);
         return d.toLocaleDateString(undefined,{month:'short',day:'numeric'})
              + ' at ' + d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
-    } catch { return iso; }
+    } catch { return '—'; }
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -363,17 +529,31 @@ function normalizeUpload(u) {
 
     const platforms = (u.platforms || []).map(normalizePlatform).filter(Boolean);
 
-    const views    = u.views    || prList.reduce((s,r) => s+(r.view_count||r.views||0), 0) || 0;
-    const likes    = u.likes    || prList.reduce((s,r) => s+(r.like_count||r.likes||0), 0) || 0;
-    const comments = u.comments || prList.reduce((s,r) => s+(r.comment_count||r.comments||0), 0) || 0;
-    const shares   = u.shares   || prList.reduce((s,r) => s+(r.share_count||r.shares||0), 0) || 0;
+    const aggViews = prList.reduce((s, r) => s + Number(r.view_count ?? r.views ?? r.viewCount ?? r.plays ?? 0), 0);
+    const aggLikes = prList.reduce((s, r) => s + Number(r.like_count ?? r.likes ?? r.likeCount ?? 0), 0);
+    const aggComments = prList.reduce((s, r) => s + Number(r.comment_count ?? r.comments ?? r.commentCount ?? 0), 0);
+    const aggShares = prList.reduce((s, r) => s + Number(r.share_count ?? r.shares ?? r.shareCount ?? 0), 0);
+    const col = (v, agg) => {
+        const n = v != null && v !== '' ? Number(v) : NaN;
+        const base = Number.isFinite(n) ? n : agg;
+        return Math.max(Number(base) || 0, Number(agg) || 0);
+    };
+    let views = col(u.views, aggViews);
+    let likes = col(u.likes, aggLikes);
+    let comments = col(u.comments, aggComments);
+    let shares = col(u.shares, aggShares);
+    if (!Number.isFinite(views)) views = aggViews;
+    if (!Number.isFinite(likes)) likes = aggLikes;
+    if (!Number.isFinite(comments)) comments = aggComments;
+    if (!Number.isFinite(shares)) shares = aggShares;
 
+    const st0 = String(u.status || '').toLowerCase();
     const hasAnyVideoId = prList.some(r => {
-        const notFailed = r.success !== false;
         const hasId = !!(r.platform_video_id || r.video_id || r.media_id ||
                          r.post_id || r.share_id || r.publish_id ||
                          r.platform_url || r.url);
-        return notFailed && hasId;
+        if (st0 === 'partial' && hasId) return true;
+        return r.success !== false && hasId;
     });
 
     return {
@@ -390,27 +570,44 @@ function normalizeUpload(u) {
 }
 
 /* ═══════════════════════════════════════════════════════
-   URL BUILDER
+   URL BUILDER (core: js/upload-utils.js UploadM8Urls)
 ═══════════════════════════════════════════════════════ */
-function buildUrlFromEntry(entry) {
-    if (!entry) return null;
-    const direct = entry.platform_url||entry.url||entry.video_url||entry.post_url||entry.share_url||entry.permalink;
-    if (direct) return direct;
-    const p   = normalizePlatform(entry.platform)||'';
-    const vid = entry.platform_video_id||entry.video_id||entry.videoId||entry.id||entry.media_id||entry.post_id||entry.share_id||entry.item_id;
-    if (!vid) return null;
-    if (p==='youtube')   return `https://www.youtube.com/shorts/${vid}`;
-    if (p==='facebook')  return `https://www.facebook.com/reel/${vid}`;
-    if (p==='tiktok')    return `https://www.tiktok.com/@${entry.username||entry.author||'_'}/video/${vid}`;
-    if (p==='instagram') return (entry.shortcode||entry.ig_shortcode) ? `https://www.instagram.com/reel/${entry.shortcode||entry.ig_shortcode}/` : null;
-    return null;
+function normalizeOutboundUrl(candidate) {
+    return window.UploadM8Urls ? UploadM8Urls.normalizeOutboundUrl(candidate) : null;
 }
-function buildPlatformUrl(platform, upload) {
-    if (upload.video_url) return upload.video_url;
-    if (upload.platform_urls?.[platform]) return upload.platform_urls[platform];
+function isKnownSocialPostHost(urlStr) {
+    return window.UploadM8Urls ? UploadM8Urls.isKnownSocialPostHost(urlStr) : false;
+}
+function isLikelySourceOrCdnVideoUrl(urlStr) {
+    return window.UploadM8Urls ? UploadM8Urls.isLikelySourceOrCdnVideoUrl(urlStr) : false;
+}
+function buildUrlFromEntry(entry) {
+    return window.UploadM8Urls ? UploadM8Urls.buildUrlFromEntry(entry, normalizePlatform) : null;
+}
+function buildProfileUrl(platform, entry) {
+    return window.UploadM8Urls ? UploadM8Urls.buildProfileUrl(platform, entry, normalizePlatform) : null;
+}
+function buildPlatformUrl(platform, upload, hintEntry) {
     const pr = upload._prList || [];
-    const entry = pr.find(r=>normalizePlatform(r.platform)===platform)||{};
-    return buildUrlFromEntry(entry);
+    const pNorm = normalizePlatform(platform) || '';
+    let entry = null;
+    if (hintEntry && normalizePlatform(hintEntry.platform) === pNorm) {
+        entry = hintEntry;
+    } else if (hintEntry && typeof entryTokenRowId === 'function') {
+        const tid = entryTokenRowId(hintEntry);
+        if (tid) entry = pr.find(r => normalizePlatform(r.platform) === pNorm && entryTokenRowId(r) === tid) || null;
+    }
+    if (!entry) entry = pr.find(r => normalizePlatform(r.platform) === pNorm) || {};
+    const fromPr = buildUrlFromEntry(entry);
+    if (fromPr) return fromPr;
+    const mapped = upload.platform_urls?.[platform];
+    if (mapped && window.UploadM8Urls) {
+        const nu = normalizeOutboundUrl(mapped);
+        if (nu && !isLikelySourceOrCdnVideoUrl(nu) && UploadM8Urls.isPlausibleWatchUrl(nu, pNorm)) return nu;
+    }
+    const vu = normalizeOutboundUrl(upload.video_url);
+    if (vu && window.UploadM8Urls && isKnownSocialPostHost(vu) && !isLikelySourceOrCdnVideoUrl(vu) && UploadM8Urls.isPlausibleWatchUrl(vu, pNorm)) return vu;
+    return null;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -425,7 +622,13 @@ function startCountdown(elementId, targetIso, isSmart) {
     function tick() {
         const el = document.getElementById(elementId);
         if (!el) { clearInterval(_timers[elementId]); delete _timers[elementId]; return; }
-        const diff = new Date(targetIso)-Date.now();
+        const targetMs = new Date(targetIso).getTime();
+        if (Number.isNaN(targetMs)) {
+            el.innerHTML = `<i class="fas fa-calendar-times"></i> Invalid schedule time`;
+            clearInterval(_timers[elementId]); delete _timers[elementId];
+            return;
+        }
+        const diff = targetMs - Date.now();
         if (diff<=0) {
             el.innerHTML = `<i class="fas fa-spinner fa-spin"></i> Uploading now…`;
             clearInterval(_timers[elementId]); delete _timers[elementId];
@@ -434,7 +637,7 @@ function startCountdown(elementId, targetIso, isSmart) {
         }
         const s=Math.floor(diff/1000), d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60), sec=s%60;
         const parts = d>0 ? [`${d}d`,`${h}h`,`${m}m`] : h>0 ? [`${h}h`,`${m}m`,`${sec}s`] : [`${m}m`,`${sec}s`];
-        el.innerHTML = `<i class="fas fa-clock"></i> ${isSmart?'✦ Smart upload in':'Uploading in'} <strong>${parts.join(' ')}</strong>`;
+        el.innerHTML = `<i class="fas fa-clock"></i> ${isSmart?' Smart upload in':'Uploading in'} <strong>${parts.join(' ')}</strong>`;
     }
     tick();
     _timers[elementId] = setInterval(tick,1000);
@@ -458,23 +661,69 @@ async function fetchMissingThumbnails(uploads) {
     }
 }
 
-async function syncStats(uploadId, btnEl) {
+async function dismissFailedUpload(first, second) {
+    let uploadId, btnEl;
+    // delegated-ui.js: fn.call(triggerEl, ev, arg) — ev.currentTarget is document, not the button.
+    if (first && typeof first === 'object' && typeof first.preventDefault === 'function') {
+        btnEl = this && this.nodeType === 1 ? this : null;
+        uploadId = String(second || '');
+    } else {
+        uploadId = String(first || '');
+        btnEl = second;
+    }
+    if (!uploadId || !btnEl) return;
+    if (!confirm('Remove this failed upload from your list?')) return;
+    btnEl.disabled = true;
+    try {
+        await apiCall(`/api/uploads/${uploadId}`, { method: 'DELETE' });
+        showToast('Upload removed', 'success');
+        await loadDashboardData();
+    } catch (e) {
+        btnEl.disabled = false;
+        showToast(e?.message || 'Could not remove upload', 'error');
+    }
+}
+
+async function syncStats(first, second) {
+    let uploadId, btnEl;
+    if (first && typeof first === 'object' && typeof first.preventDefault === 'function') {
+        btnEl = this && this.nodeType === 1 ? this : null;
+        uploadId = String(second || '');
+    } else {
+        uploadId = String(first || '');
+        btnEl = second;
+    }
+    if (!uploadId || !btnEl) return;
     btnEl.disabled=true; btnEl.innerHTML='<i class="fas fa-spinner fa-spin"></i>';
     const reset=()=>{ btnEl.disabled=false; btnEl.innerHTML='<i class="fas fa-sync-alt"></i> Sync'; };
     try {
         const res = await Promise.race([
             apiCall(`/api/uploads/${uploadId}/sync-analytics`,{method:'POST',body:'{}'}),
-            new Promise((_,rej)=>setTimeout(()=>rej(new Error('Timed out')),15000))
+            new Promise((_,rej)=>setTimeout(()=>rej(new Error('Timed out')),30000))
         ]);
         if (res?.synced) {
             const row = btnEl.closest('.upload-row');
             if (row) {
-                const upd=(cls,val)=>{ const el=row.querySelector(cls); if(el&&val!=null) el.textContent=fmtNum(val)||'0'; };
+                const upd=(cls,val)=>{ const el=row.querySelector(cls); if(el&&val!=null) el.textContent=fmtNum(val)??'0'; };
                 upd('.stat-views',res.views); upd('.stat-likes',res.likes);
                 upd('.stat-comments',res.comments); upd('.stat-shares',res.shares);
             }
+            const u = (window._allUploadsData||[]).find(x=>String(x.id)===String(uploadId));
+            if (u) {
+                const rv = (v)=> (v===undefined||v===null||Number.isNaN(Number(v))?0:Number(v));
+                u._views=rv(res.views); u._likes=rv(res.likes); u._comments=rv(res.comments); u._shares=rv(res.shares);
+                u.views=u._views; u.likes=u._likes; u.comments=u._comments; u.shares=u._shares;
+            }
+            try {
+                const cur = window.currentUser && (window.currentUser.id || window.currentUser.user_id || window.currentUser.uid);
+                if (cur) {
+                    window.dispatchEvent(new CustomEvent('uploadm8:analytics-sync', {
+                        detail: { user_id: String(cur), skip_dashboard_reload: true },
+                    }));
+                }
+            } catch (_) {}
             btnEl.innerHTML = '<i class="fas fa-check"></i>'; setTimeout(reset,2000);
-        } else { reset(); showToast(res?.message||'Stats unavailable — try again later','warning'); }
+        } else { reset(); showToast(res?.message||res?.reason||'Stats unavailable — try again later','warning'); }
     } catch(e) { reset(); showToast(e?.message||'Failed to sync stats','error'); }
 }
 
@@ -484,30 +733,142 @@ async function syncStats(uploadId, btnEl) {
 document.addEventListener('DOMContentLoaded', async () => {
     const user = await initApp('dashboard');
     if (!user) return;
-    updateThemeIcons();
+    const masterBtn = document.getElementById('dashboardMasterRefreshBtn');
+    if (masterBtn && typeof window.uploadM8MasterRefreshStats === 'function') {
+        masterBtn.addEventListener('click', async function () {
+            masterBtn.disabled = true;
+            const prev = masterBtn.innerHTML;
+            masterBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Refreshing…';
+            try {
+                await window.uploadM8MasterRefreshStats();
+            } finally {
+                masterBtn.disabled = false;
+                masterBtn.innerHTML = prev;
+            }
+        });
+    }
     try {
-        if (window.WalletTokens?.renderUsageBanner) {
-            const c = document.getElementById('usageBannerContainer');
-            if (c) window.WalletTokens.renderUsageBanner(c, user);
+        const c = document.getElementById('usageBannerContainer');
+        if (c && window.WalletTokens?.renderUsageBanner) {
+            window.WalletTokens.renderUsageBanner(c, user);
         }
-    } catch(e) { console.warn('[Dashboard] banner failed:', e); }
+    } catch (e) { console.warn('[Dashboard] banner:', e); }
+
+    (function setupPlaybookWelcomeModal() {
+        var modal = document.getElementById('playbookWelcomeModal');
+        if (!modal) return;
+        modal.querySelectorAll('a[href]').forEach(function (a) {
+            a.addEventListener('click', function () { void window.um8DashboardPlaybookDismiss(); });
+        });
+        if (user && user.onboarding && user.onboarding.show_playbook_modal) {
+            modal.classList.remove('hidden');
+            modal.setAttribute('aria-hidden', 'false');
+        }
+    })();
+
     loadDashboardDataWithTimeout();
     const ad = document.getElementById('adBanner');
     if (ad && hasEntitlement('no_ads')) ad.classList.add('hidden');
+    const runCat = () => { try { loadDashboardCatalogAggregate(); } catch (_) {} };
+    if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(runCat, { timeout: 4500 });
+    } else {
+        setTimeout(runCat, 400);
+    }
 });
 
-function updateThemeIcons() {
-    const cls = getTheme()==='dark' ? 'fas fa-moon' : 'fas fa-sun';
-    document.querySelectorAll('#themeToggleIconMobile,#themeToggleIconDesktop').forEach(i=>i.className=cls);
+// ── Dashboard catalog aggregate — delegate to shared widget ─────────────────
+function loadDashboardCatalogAggregate() {
+    // widget auto-mounts via data-catalog-agg attribute; just trigger a load
+    if (window.CatalogAgg) window.CatalogAgg.load('dashAggWidget', '30d');
 }
-const _origToggle = window.toggleTheme;
-window.toggleTheme = function() { _origToggle(); updateThemeIcons(); };
+
+function applySharedEngagement(eng) {
+    if (!eng || typeof eng !== 'object') return;
+    // If M8Stats is available, delegate to the canonical module so the element
+    // mapping is defined in one place and uses the same format as Analytics/Queue.
+    if (window.M8Stats) {
+        window.M8Stats.applyToElements(eng, {
+            views:    'statEngagementViews',
+            likes:    'statEngagementLikes',
+            comments: 'statEngagementComments',
+            shares:   'statEngagementShares',
+        });
+        return;
+    }
+    const setKpi = (id, raw) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const n = raw != null ? Number(raw) : null;
+        el.textContent = (n != null && !Number.isNaN(n)) ? fmtNum(n) : '—';
+    };
+    setKpi('statEngagementViews',    eng.views);
+    setKpi('statEngagementLikes',    eng.likes);
+    setKpi('statEngagementComments', eng.comments);
+    setKpi('statEngagementShares',   eng.shares);
+}
+
+/** Headline KPI chips must match GET /api/dashboard/stats (canonical_engagement rollup), not a client sum of rows. */
+async function refreshDashboardEngagementFromServer() {
+    try {
+        const stats = await apiCall('/api/dashboard/stats');
+        if (stats && stats.engagement) applySharedEngagement(stats.engagement);
+        if (window.M8Stats) window.M8Stats.invalidate();
+    } catch (e) {
+        console.warn('[Dashboard] engagement refresh failed:', e);
+    }
+}
+
+function _currentUserId() {
+    const u = window.currentUser || null;
+    const id = u && (u.id || u.user_id || u.uid);
+    return id ? String(id) : null;
+}
+
+function _isAnalyticsPayloadForCurrentUser(payload) {
+    if (!payload || typeof payload !== 'object') return false;
+    const cur = _currentUserId();
+    const pid = payload.user_id ? String(payload.user_id) : null;
+    if (!pid || !cur) return false;
+    return pid === cur;
+}
+
+function _scheduleDashboardAnalyticsRefresh() {
+    if (Date.now() < _dashboardApiOfflineUntilEffective()) return;
+    if (_dashboardAnalyticsRefreshTimer) clearTimeout(_dashboardAnalyticsRefreshTimer);
+    _dashboardAnalyticsRefreshTimer = setTimeout(() => {
+        loadDashboardDataWithTimeout().catch(() => null);
+    }, 1200);
+}
+
+window.addEventListener('uploadm8:analytics-sync', function(e){
+    if (!_isAnalyticsPayloadForCurrentUser(e && e.detail)) return;
+    // Never apply client-computed engagement (e.g. sum of queue rows); it does not match
+    // canonical dedupe (platform_content_items + uploads.platform_results) and breaks multi-account KPIs.
+    if (e.detail && e.detail.skip_dashboard_reload) {
+        void refreshDashboardEngagementFromServer();
+        return;
+    }
+    _scheduleDashboardAnalyticsRefresh();
+});
+
+window.addEventListener('uploadm8:analytics-refresh-all', function(e){
+    const payload = e && e.detail;
+    if (!_isAnalyticsPayloadForCurrentUser(payload)) return;
+    if (payload && payload.master) {
+        void loadDashboardDataWithTimeout();
+        loadDashboardCatalogAggregate();
+        return;
+    }
+    _scheduleDashboardAnalyticsRefresh();
+});
 
 /* ═══════════════════════════════════════════════════════
-   DATA LOADER — always fetches full /api/uploads data
-   so every tab gets identical objects with platform_results
+   DATA LOADER — recent /api/uploads slice for tabs + charts.
+   MoM upload chip uses stats.uploads.successful_* from GET /api/dashboard/stats (not this list).
 ═══════════════════════════════════════════════════════ */
 const DASHBOARD_LOAD_TIMEOUT_MS = 30000;
+const DASHBOARD_UPLOADS_FETCH_LIMIT = 200;
 
 async function loadDashboardDataWithTimeout() {
     try {
@@ -526,17 +887,47 @@ async function loadDashboardData() {
     const user = window.currentUser;
     if (!user) return;
     try {
-        const [stats, rawUploads] = await Promise.all([
-            apiCall('/api/dashboard/stats'),
-            apiCall('/api/uploads?limit=500').catch(()=>null)
-        ]);
+        // Avoid heavy refresh-all on normal page load (keeps UI snappy).
+        if (!_dashboardDidBootRefresh) _dashboardDidBootRefresh = true;
+        let stats, rawUploads;
+        try {
+            const boot = await apiCall('/api/shell/bootstrap?context=dashboard&upload_limit=' + DASHBOARD_UPLOADS_FETCH_LIMIT);
+            if (boot && boot.dashboard_stats && boot.uploads != null) {
+                stats = boot.dashboard_stats;
+                rawUploads = boot.uploads;
+                if (boot.platforms && window.UploadM8Cache && typeof window.UploadM8Cache.setUserScoped === 'function') {
+                    const inner = boot.platforms.platforms || boot.platforms;
+                    try {
+                        window.UploadM8Cache.setUserScoped('platform_accounts', inner && typeof inner === 'object' ? inner : {}, { storage: 'session' });
+                    } catch (_) {}
+                }
+            } else {
+                throw new Error('bootstrap_incomplete');
+            }
+        } catch (_bootErr) {
+            const pair = await Promise.all([
+                apiCall('/api/dashboard/stats'),
+                apiCall('/api/uploads?limit=' + DASHBOARD_UPLOADS_FETCH_LIMIT).catch(()=>null)
+            ]);
+            stats = pair[0];
+            rawUploads = pair[1];
+        }
+        _dashboardApiOfflineUntil = 0;
+        try { window.__uploadm8ApiOfflineUntil = 0; } catch (_) {}
 
-        const quotaUsed  = stats?.quota?.put_used ?? 0;
-        const quotaLimit = stats?.quota?.put_limit ?? user.entitlements?.monthly_uploads ?? 10;
+        const ent = typeof getEntitlements === 'function' ? getEntitlements(user) : (user.entitlements || user.plan || {});
+        const quotaUsed = (stats?.quota?.uploads_used ?? stats?.quota?.put_used ?? Number(ent.uploads_used ?? ent.put_used ?? user.uploads_this_month ?? 0)) || 0;
+        let quotaLimit = stats?.quota?.uploads_limit ?? stats?.quota?.put_limit ?? ent.put_monthly ?? ent.uploads_limit ?? ent.monthly_uploads;
+        if (quotaLimit == null || quotaLimit === '') {
+            quotaLimit = typeof getUploadLimit === 'function' ? getUploadLimit(user) : 10;
+        }
         document.getElementById('quotaUsed').textContent  = quotaUsed;
-        document.getElementById('quotaTotal').textContent = (!quotaLimit||quotaLimit===-1) ? '∞' : quotaLimit;
-        const pct = (!quotaLimit||quotaLimit===-1) ? 5 : Math.min(100,Math.round((quotaUsed/quotaLimit)*100));
-        document.getElementById('quotaBar').style.width = pct+'%';
+        const quotaUnlimited = !!(user.unlimited_uploads || (typeof isAdmin === 'function' && isAdmin()) || quotaLimit === -1 || Number(quotaLimit) >= 999999);
+        document.getElementById('quotaTotal').textContent = quotaUnlimited ? '∞' : quotaLimit;
+        const pct = quotaUnlimited ? 5 : Math.min(100,Math.round((quotaUsed/Math.max(1, Number(quotaLimit) || 1))*100));
+        const qBar = document.getElementById('quotaBar');
+        qBar.style.width = pct+'%';
+        qBar.className = quotaUnlimited ? 'quota-bar bg-green' : `quota-bar ${pct > 80 ? 'bg-red' : pct > 50 ? 'bg-orange' : 'bg-green'}`;
 
         document.getElementById('statTotalUploads').textContent = stats?.uploads?.total ?? 0;
 
@@ -544,8 +935,12 @@ async function loadDashboardData() {
         document.getElementById('statSuccessRate').textContent = Math.round(successRate)+'%';
 
         const acctConnected = stats?.accounts?.connected ?? 0;
-        let acctLimit = stats?.accounts?.limit ?? user.entitlements?.max_accounts ?? 1;
-        if ((user.role||'').toLowerCase()==='master_admin') acctLimit='∞';
+        let acctLimit = stats?.accounts?.limit;
+        if (acctLimit == null || acctLimit === '') {
+            acctLimit = typeof getMaxAccounts === 'function' ? getMaxAccounts() : (ent.max_accounts ?? 1);
+        }
+        if (typeof isMasterAdmin === 'function' && isMasterAdmin()) acctLimit = '∞';
+        else if (Number(acctLimit) >= 999) acctLimit = '∞';
         document.getElementById('statAccounts').textContent    = acctConnected;
         document.getElementById('statAccountsMax').textContent = acctLimit;
         document.getElementById('statScheduled').textContent   = stats?.scheduled ?? 0;
@@ -554,38 +949,87 @@ async function loadDashboardData() {
         let allUploads = allRaw.length > 0 ? allRaw : extractArray(stats?.recent||[],'uploads');
 
         const successful = allUploads.filter(u=>SUCCESSFUL_STATUSES.includes((u.status||'').toLowerCase()));
-        const now=new Date(), mStart=new Date(now.getFullYear(),now.getMonth(),1), lStart=new Date(now.getFullYear(),now.getMonth()-1,1);
+        const today=new Date(), mStart=new Date(today.getFullYear(),today.getMonth(),1), lStart=new Date(today.getFullYear(),today.getMonth()-1,1);
         const thisM=successful.filter(u=>new Date(u.created_at||0)>=mStart).length;
         const lastM=successful.filter(u=>{ const d=new Date(u.created_at||0); return d>=lStart&&d<mStart; }).length;
-        const el=document.getElementById('statUploadsChange');
-        if (lastM===0) {
-            el.innerHTML=`<i class="fas fa-minus"></i> <span>No prior data</span>`; el.className='stat-change';
-        } else {
-            const pctM=Math.round(((thisM-lastM)/lastM)*100);
-            el.innerHTML=`<i class="fas fa-arrow-${pctM>=0?'up':'down'}"></i> <span>${Math.abs(pctM)}%</span> vs last month`;
-            el.className=`stat-change ${pctM>=0?'positive':'negative'}`;
+        const statChangeEl = document.getElementById('statUploadsChange');
+        if (statChangeEl) {
+            const apiCm = stats?.uploads?.successful_this_month;
+            const apiLm = stats?.uploads?.successful_last_month;
+            if (typeof apiCm === 'number' && typeof apiLm === 'number') {
+                if (apiLm === 0) {
+                    statChangeEl.innerHTML = `<i class="fas fa-minus"></i> <span>No prior data</span>`;
+                    statChangeEl.className = 'stat-change';
+                } else {
+                    const pctM = Math.round(((apiCm - apiLm) / apiLm) * 100);
+                    statChangeEl.innerHTML = `<i class="fas fa-arrow-${pctM>=0?'up':'down'}"></i> <span>${Math.abs(pctM)}%</span> vs last month`;
+                    statChangeEl.className = `stat-change ${pctM>=0?'positive':'negative'}`;
+                }
+            } else if (lastM === 0) {
+                statChangeEl.innerHTML=`<i class="fas fa-minus"></i> <span>No prior data</span>`; statChangeEl.className='stat-change';
+            } else {
+                const pctM=Math.round(((thisM-lastM)/lastM)*100);
+                statChangeEl.innerHTML=`<i class="fas fa-arrow-${pctM>=0?'up':'down'}"></i> <span>${Math.abs(pctM)}%</span> vs last month`;
+                statChangeEl.className=`stat-change ${pctM>=0?'positive':'negative'}`;
+            }
         }
 
         window._platformAvatars = {};
+        window._platformAccountsByPlatform = {};
         try {
-            const pd = await apiCall('/api/platforms');
-            const src = pd?.platforms || pd || {};
+            let src = null;
+            try {
+                src = window.UploadM8Cache && typeof window.UploadM8Cache.getUserScoped === 'function'
+                    ? window.UploadM8Cache.getUserScoped('platform_accounts', { storage: 'session', maxAgeMs: PLATFORM_CACHE_TTL_MS })
+                    : null;
+            } catch (_) {}
+            if (!src) {
+                const pd = await apiCall('/api/platforms');
+                src = pd?.platforms || pd || {};
+                try {
+                    if (window.UploadM8Cache && typeof window.UploadM8Cache.setUserScoped === 'function') {
+                        window.UploadM8Cache.setUserScoped('platform_accounts', src, { storage: 'session' });
+                    }
+                } catch (_) {}
+            }
             if (typeof src==='object') {
                 Object.entries(src).forEach(([p,accounts])=>{
                     const arr = Array.isArray(accounts)?accounts:[];
+                    const pNorm = normalizePlatformKey(p);
+                    window._platformAccountsByPlatform[p] = arr;
+                    window._platformAccountsByPlatform[pNorm] = arr;
                     const primary = arr.find(a=>a.is_primary)||arr[0];
-                    if (primary) window._platformAvatars[p] = {
-                        avatar:   primary.avatar||primary.account_avatar_url||null,
-                        name:     primary.name||primary.account_name||p,
-                        username: primary.username||primary.account_username||'',
-                    };
+                    if (primary) {
+                        const info = {
+                            avatar:   primary.avatar||primary.account_avatar_url||null,
+                            name:     primary.name||primary.account_name||pNorm||p,
+                            username: primary.username||primary.account_username||'',
+                        };
+                        window._platformAvatars[p] = info;
+                        window._platformAvatars[pNorm] = info;
+                    }
                 });
             }
         } catch(_) {}
 
+        const prevById = new Map((window._allUploadsData || []).map(u => [String(u.id || ''), u]));
         const normalized = allUploads
             .map(normalizeUpload)
+            .map(u => {
+                const prev = prevById.get(String(u.id || ''));
+                if (!prev) return u;
+                const prevThumb = prev.thumbnail_url || prev.thumbnail || prev.cover_url || null;
+                const nextThumb = u.thumbnail_url || u.thumbnail || u.cover_url || null;
+                if (prevThumb && (!nextThumb || prevThumb !== nextThumb)) {
+                    u.thumbnail_url = prev.thumbnail_url || prevThumb;
+                }
+                return u;
+            })
             .sort((a,b)=>new Date(b.created_at||b.uploaded_at||0)-new Date(a.created_at||a.uploaded_at||0));
+
+        const eng = stats?.engagement || {};
+        // Always use canonical engagement from server — no client-side inflation.
+        applySharedEngagement(eng);
 
         window._allUploadsData = normalized;
         document.getElementById('uploadsCountBadge').textContent =
@@ -593,18 +1037,99 @@ async function loadDashboardData() {
         renderRecentUploads(normalized);
         fetchMissingThumbnails(normalized);
 
+        // Auto-sync completed rows with stale stats (already-uploaded videos).
+        void autoSyncCompletedUploads(normalized);
+        // Backfill of older uploads is triggered by explicit account connect/manual refresh.
+
     } catch(e) {
-        console.error('[Dashboard] loadDashboardData error:',e);
-        showToast(e?.message||'Could not load dashboard — try refreshing','error');
+        if (_isUnreachableApiError(e)) {
+            const until = Date.now() + DASHBOARD_API_OFFLINE_COOLDOWN_MS;
+            _dashboardApiOfflineUntil = until;
+            try { window.__uploadm8ApiOfflineUntil = until; } catch (_) {}
+            console.warn('[Dashboard] API unreachable — pausing refresh/sync for 60s');
+        } else {
+            console.error('[Dashboard] loadDashboardData error:', e);
+        }
+        let msg = e?.message || 'Could not load dashboard — try refreshing';
+        if (_isUnreachableApiError(e)) {
+            const b = (typeof window.API_BASE === 'string' ? window.API_BASE : '') || '';
+            let portHint = '';
+            try {
+                const u = new URL(b, typeof location !== 'undefined' ? location.href : 'http://localhost/');
+                portHint = u.port || (u.protocol === 'https:' ? '443' : '80');
+            } catch (_) {}
+            msg = /127\.0\.0\.1|localhost/i.test(b)
+                ? ('Cannot reach the API (connection refused). Start the backend on port ' + (portHint || 'your API port') + ' (see API_BASE) and refresh.')
+                : 'Cannot reach the server. Check your connection and try again.';
+        }
+        showToast(msg, 'error');
         renderRecentUploads([]);
     }
 }
+
+let _dashboardAutoSyncInFlight = false;
+let _dashboardLastAutoSyncAt = 0;
+function _dashboardSyncAllThrottleKey() {
+    const uid = (window.currentUser && (window.currentUser.id || window.currentUser.user_id || window.currentUser.uid)) || 'anon';
+    return 'uploadm8_sync_all_analytics_at:' + String(uid);
+}
+async function triggerDashboardGlobalAnalyticsSync(reason) {
+    if (Date.now() < _dashboardApiOfflineUntilEffective()) return;
+    try {
+        const key = _dashboardSyncAllThrottleKey();
+        const now = Date.now();
+        const last = Number(sessionStorage.getItem(key) || 0);
+        const force = String(reason || '') === 'oauth_connect';
+        if (!force && (now - last) < (10 * 60 * 1000)) return;
+        sessionStorage.setItem(key, String(now));
+        await apiCall('/api/uploads/sync-analytics/all?max_uploads=800&async_mode=true', { method: 'POST', body: '{}' });
+        await apiCall('/api/analytics/refresh-all?async_mode=true', { method: 'POST', body: '{}' }).catch(function () {});
+        if (window.M8Stats) window.M8Stats.invalidate();
+    } catch (_) {}
+}
+async function autoSyncCompletedUploads(rows) {
+    if (Date.now() < _dashboardApiOfflineUntilEffective()) return;
+    const MIN_GAP_MS = 45000;
+    if (_dashboardAutoSyncInFlight) return;
+    if (Date.now() - _dashboardLastAutoSyncAt < MIN_GAP_MS) return;
+    const list = Array.isArray(rows) ? rows : (window._allUploadsData || []);
+    const hasEligible = list.some(u => {
+        const st = String(u.status || '').toLowerCase();
+        return (SUCCESSFUL_STATUSES.includes(st) && !!u._hasVideoId) || st === 'partial';
+    });
+    if (!hasEligible) return;
+    _dashboardAutoSyncInFlight = true;
+    _dashboardLastAutoSyncAt = Date.now();
+    try {
+        // Single async batch call prevents per-row timeout storms.
+        await apiCall('/api/uploads/sync-analytics/all?max_uploads=800&async_mode=true', { method: 'POST', body: '{}' }).catch(() => null);
+        await apiCall('/api/analytics/refresh-all?async_mode=true', { method: 'POST', body: '{}' }).catch(() => null);
+    } catch (_) {
+    } finally {
+        _dashboardAutoSyncInFlight = false;
+    }
+}
+window.addEventListener('uploadm8:aggregate-refreshed', function () {
+    void triggerDashboardGlobalAnalyticsSync('oauth_connect');
+});
+setInterval(function () {
+    void autoSyncCompletedUploads(window._allUploadsData || []);
+}, 60000);
 
 /* ═══════════════════════════════════════════════════════
    FILTER — all filters use the same normalized data
    only /staged and /smart hit the API for fresh data
 ═══════════════════════════════════════════════════════ */
-async function filterUploads(filter, btn) {
+async function filterUploads(first, second) {
+    let filter, btn;
+    if (first && typeof first === 'object' && typeof first.preventDefault === 'function') {
+        btn = this && this.nodeType === 1 ? this : null;
+        filter = second;
+    } else {
+        filter = first;
+        btn = second;
+    }
+    if (!btn) return;
     document.querySelectorAll('.filter-chip').forEach(c=>c.classList.remove('active','active-smart'));
     btn.classList.add(filter==='smart'?'active-smart':'active');
 
@@ -662,7 +1187,8 @@ function renderRecentUploads(uploads) {
         const thumb       = upload.thumbnail_url||upload.thumbnail||upload.cover_url||null;
         const timestamp   = upload.created_at||upload.uploaded_at||upload.timestamp||null;
         const scheduledAt = upload.scheduled_time||upload.scheduled_at||upload.publish_time||null;
-        const hasStats    = isSuccess && (views||likes||comments||shares);
+        // Partial = some platforms succeeded — show rollup + Sync like succeeded (not only when _hasVideoId).
+        const showEngagementRow = (isSuccess && hasVideoId) || isPartial;
 
         let pillCls, pillIco, pillLbl;
         if      (isSuccess) { pillCls='pill-success'; pillIco='fa-check-circle'; pillLbl=upload.status_label||'succeeded'; }
@@ -683,102 +1209,147 @@ function renderRecentUploads(uploads) {
                 </div>`;
             } else {
                 cdHtml = `<div class="countdown-block">
-                    <span class="${timerCls}"><i class="fas fa-hourglass-half"></i> ${isSmart?'✦ Awaiting optimal time':'Awaiting schedule time'}</span>
+                    <span class="${timerCls}"><i class="fas fa-hourglass-half"></i> ${isSmart?' Awaiting optimal time':'Awaiting schedule time'}</span>
                 </div>`;
             }
         }
 
+        const stat = (n) => {
+            const v = Number(n);
+            if (!Number.isFinite(v)) return '—';
+            const s = fmtNum(v);
+            return s != null ? s : '0';
+        };
         let statsHtml = '';
-        if (hasStats) {
+        if (showEngagementRow) {
             statsHtml = `<div class="stats-bar">
-                ${views    ? `<span class="stat-chip"><i class="fas fa-eye"></i><span class="stat-views">${fmtNum(views)}</span></span>` : ''}
-                ${likes    ? `<span class="stat-chip"><i class="fas fa-heart"></i><span class="stat-likes">${fmtNum(likes)}</span></span>` : ''}
-                ${comments ? `<span class="stat-chip"><i class="fas fa-comment"></i><span class="stat-comments">${fmtNum(comments)}</span></span>` : ''}
-                ${shares   ? `<span class="stat-chip"><i class="fas fa-share"></i><span class="stat-shares">${fmtNum(shares)}</span></span>` : ''}
-                <button class="sync-btn" onclick="syncStats('${upload.id}',this)" title="Refresh stats"><i class="fas fa-sync-alt"></i></button>
-            </div>`;
-        } else if (isSuccess && hasVideoId) {
-            statsHtml = `<div class="stats-bar">
-                <span class="stat-chip no-stats"><i class="fas fa-chart-bar" style="opacity:.4;"></i> Stats pending</span>
-                <button class="sync-btn" onclick="syncStats('${upload.id}',this)" title="Fetch stats"><i class="fas fa-sync-alt"></i> Sync</button>
+                <span class="stat-chip"><i class="fas fa-eye"></i><span class="stat-views">${stat(views)}</span></span>
+                <span class="stat-chip"><i class="fas fa-heart"></i><span class="stat-likes">${stat(likes)}</span></span>
+                <span class="stat-chip"><i class="fas fa-comment"></i><span class="stat-comments">${stat(comments)}</span></span>
+                <span class="stat-chip"><i class="fas fa-share"></i><span class="stat-shares">${stat(shares)}</span></span>
+                <button type="button" class="sync-btn" data-um8-fn="syncStats" data-um8-arg="${upload.id}" title="Refresh stats from platforms"><i class="fas fa-sync-alt"></i></button>
             </div>`;
         } else if (isSuccess && !hasVideoId) {
             statsHtml = `<div class="stats-bar">
                 <span class="stat-chip no-stats" title="Platform confirming video — check back shortly"><i class="fas fa-hourglass-half" style="opacity:.4;"></i> Awaiting confirmation</span>
             </div>`;
+        } else if (isFailed) {
+            statsHtml = `<div class="stats-bar">
+                <button type="button" class="btn btn-secondary btn-sm" style="font-size:.68rem;padding:2px 8px;" data-um8-fn="dismissFailedUpload" data-um8-arg="${upload.id}" title="Remove this failed upload from your list">
+                    <i class="fas fa-trash-alt"></i> Remove
+                </button>
+            </div>`;
         }
 
         const avatarMap = window._platformAvatars || {};
-        const chipEntries = prList.length > 0 ? prList : platforms.map(p => ({ platform: p }));
+        const chipEntries = buildChipEntries(prList, upload, normalizePlatform);
         const chipsHtml = chipEntries.length === 0 ? '' : `
             <div class="platform-chips">
                 ${chipEntries.map(entry => {
                     const p = normalizePlatform(entry.platform) || 'unknown';
 
+                    const matched = resolvePlatformAccountMatch(entry, p, avatarMap);
                     const entryUsername = entry.account_username || entry.username || '';
                     const entryName     = entry.account_name || entry.name || '';
-                    const entryAvatar   = entry.account_avatar || '';
-                    const fallback      = avatarMap[p] || {};
+                    const entryAvatar   = entry.account_avatar || entry.avatar || entry.account_avatar_url || '';
 
-                    const displayUsername = entryUsername || fallback.username || '';
-                    const displayName     = entryName     || fallback.name     || LABEL[p] || p;
-                    const displayAvatar   = entryAvatar   || fallback.avatar   || '';
+                    const displayUsername = (entryUsername || matched.username || '').replace(/^@+/, '').trim();
+                    const displayName     = (entryName || matched.name || '').trim();
+                    const displayAvatar   = normalizeChipAvatarUrl(entryAvatar || matched.avatar || '');
 
-                    const dispLabel = displayUsername
-                        ? `@${String(displayUsername).replace(/^@+/, '')}`
-                        : displayName;
+                    const platLabel = LABEL[p] || p;
+                    let lineMain, subBits = '';
+                    if (displayName) {
+                        lineMain = displayName;
+                        if (displayUsername && displayName.toLowerCase() !== displayUsername.toLowerCase()) subBits = ' · @' + displayUsername;
+                    } else if (displayUsername) lineMain = '@' + displayUsername;
+                    else lineMain = platLabel;
 
-                    const url     = buildUrlFromEntry(entry) || buildPlatformUrl(p, upload);
+                    const letterSrc = displayName || displayUsername || platLabel;
+                    const leftIcon = chipAvatarHtml(displayAvatar, letterSrc);
+                    const tierHtml = tierPillHtml();
+                    const visHtml = visibilityPillHtml(entry);
+                    const textBlock = `<span class="chip-mid"><span class="chip-line">${escapeHtmlDash(lineMain)}${escapeHtmlDash(subBits)}</span>${tierHtml}${visHtml}</span>`;
+
+                    const entryForUrl = { ...entry };
+                    if (matched.username && !entryForUrl.account_username) entryForUrl.account_username = matched.username;
+                    if (matched.username && !entryForUrl.username) entryForUrl.username = matched.username;
+                    const videoUrl   = buildUrlFromEntry(entryForUrl) || buildPlatformUrl(p, upload, entry);
+                    const profileUrl = buildProfileUrl(p, entryForUrl);
+                    const resolved = window.UploadM8Urls
+                        ? UploadM8Urls.resolveChipHref(entry, upload, videoUrl, profileUrl)
+                        : { href: videoUrl || profileUrl, kind: videoUrl ? 'video' : 'profile', tip: '' };
+                    const url = resolved.href;
                     const chipCls = ['youtube','tiktok','instagram','facebook'].includes(p) ? `chip-${p}` : 'chip-default';
 
-                    // FIX: removed fallbackIcon + insertAdjacentHTML from onerror.
-                    // Embedding icon HTML with single quotes inside a JS string inside an
-                    // HTML attribute caused "missing ) after argument list" SyntaxError.
-                    const leftIcon = displayAvatar
-                        ? `<img src="${displayAvatar}" class="chip-avatar" alt="${dispLabel}" onerror="this.style.display='none'">`
-                        : (ICON[p] || '<i class="fas fa-globe"></i>');
+                    const extIcon = resolved.kind === 'video'
+                        ? ' <i class="fas fa-external-link-alt chip-ext" title="Watch video"></i>'
+                        : resolved.kind === 'profile'
+                            ? ' <i class="fas fa-user chip-ext" title="View profile"></i>'
+                            : ' <i class="fas fa-link-slash chip-ext" title="No post URL yet"></i>';
 
-                    const extIcon = url ? ' <i class="fas fa-external-link-alt chip-ext"></i>' : '';
-                    const inner   = `${leftIcon} ${dispLabel}${extIcon}`;
+                    const inner   = `${leftIcon}${textBlock}${extIcon}`;
 
-                    const tipAcct = displayUsername ? ` (${dispLabel})` : '';
-                    const tip = url
-                        ? `Watch on ${LABEL[p] || p}${tipAcct}`
-                        : entry.error_message
-                            ? `Failed: ${entry.error_message}`
-                            : entry.success === false
-                                ? `Publish failed on ${LABEL[p] || p}`
-                                : 'Link not yet available';
+                    const tipAcct = displayUsername ? ` (@${displayUsername})` : (displayName ? ` (${displayName})` : '');
+                    let tip = '';
+                    if (resolved.kind === 'video') tip = `Watch on ${LABEL[p] || p}${tipAcct}`;
+                    else if (resolved.kind === 'profile') tip = `View profile on ${LABEL[p] || p}${tipAcct}`;
+                    else if (entry.error_message) tip = `Failed: ${entry.error_message}`;
+                    else if (entry.success === false) tip = `Publish failed on ${LABEL[p] || p}`;
+                    else tip = resolved.tip || 'Post link pending';
 
                     const entryFailed = entry.success === false;
                     const failedCls = entryFailed ? ' chip-no-link chip-failed' : '';
+                    const showLink = url && (!entryFailed || resolved.kind === 'profile');
 
-                    return url && !entryFailed
-                        ? `<a href="${url}" target="_blank" rel="noopener"
-                              class="platform-chip ${chipCls}${failedCls}" title="${tip}">${inner}</a>`
-                        : `<span class="platform-chip ${chipCls} chip-no-link${failedCls}" title="${tip}">${inner}</span>`;
+                    return showLink
+                        ? `<a href="${escapeHtmlDash(url)}" target="_blank" rel="noopener"
+                              class="platform-chip ${chipCls}${failedCls}" title="${escapeHtmlDash(tip)}">${inner}</a>`
+                        : `<span class="platform-chip ${chipCls} chip-no-link${failedCls}" title="${escapeHtmlDash(tip)}">${inner}</span>`;
                 }).join('')}
             </div>`;
 
-        const firstUrl = platforms.length ? buildPlatformUrl(platforms[0],upload) : null;
-        const firstAv  = platforms.length ? (avatarMap[platforms[0]]?.avatar||null) : null;
+        let firstUrl = null;
+        for (let ci = 0; ci < chipEntries.length; ci++) {
+            const ent = chipEntries[ci];
+            const p0 = normalizePlatform(ent.platform) || '';
+            const m0 = resolvePlatformAccountMatch(ent, p0, avatarMap);
+            const efu = { ...ent };
+            if (m0.username && !efu.account_username) efu.account_username = m0.username;
+            if (m0.username && !efu.username) efu.username = m0.username;
+            const cand = buildUrlFromEntry(efu) || buildPlatformUrl(p0, upload, ent);
+            if (cand && window.UploadM8Urls && UploadM8Urls.isPlausibleWatchUrl(cand, p0)) {
+                firstUrl = cand;
+                break;
+            }
+        }
+        let firstAv = null;
+        if (chipEntries.length > 0) {
+            const ent0 = chipEntries[0];
+            const pAv = normalizePlatform(ent0.platform) || '';
+            const mAv = resolvePlatformAccountMatch(ent0, pAv, avatarMap);
+            firstAv = normalizeChipAvatarUrl(ent0.account_avatar || ent0.avatar || ent0.account_avatar_url || mAv.avatar || '') || null;
+        }
+        const thumbPlatLabel = chipEntries.length
+            ? (LABEL[normalizePlatform(chipEntries[0].platform) || ''] || chipEntries[0].platform || 'video')
+            : (LABEL[platforms[0]] || platforms[0] || 'video');
         const thumbId  = `thumb-img-${upload.id}`;
         let imgInner;
         if (thumb) {
-            imgInner = `<img id="${thumbId}" src="${thumb}" alt="thumb" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+            imgInner = `<img id="${thumbId}" referrerpolicy="no-referrer" loading="lazy" decoding="async" src="${thumb}" alt="thumb" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
                         <i class="fas fa-film upload-thumb-placeholder" style="display:none;"></i>`;
-        } else if (isSuccess) {
+        } else if (isSuccess || isPartial) {
             imgInner = firstAv
-                ? `<img id="${thumbId}" src="${firstAv}" alt="avatar" style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;" onerror="this.style.display='none';">
+                ? `<img id="${thumbId}" referrerpolicy="no-referrer" loading="lazy" decoding="async" src="${firstAv}" alt="avatar" style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;" onerror="this.style.display='none';">
                    <i class="fas fa-spinner fa-spin" style="position:absolute;font-size:.8rem;color:var(--text-secondary);bottom:4px;right:4px;"></i>`
                 : `<i class="fas fa-spinner fa-spin upload-thumb-placeholder" style="font-size:1.2rem;opacity:.4;"></i>`;
         } else if (firstAv) {
-            imgInner = `<img src="${firstAv}" alt="avatar" style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;" onerror="this.style.display='none';">`;
+            imgInner = `<img referrerpolicy="no-referrer" loading="lazy" decoding="async" src="${firstAv}" alt="avatar" style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;" onerror="this.style.display='none';">`;
         } else {
             imgInner = `<i class="fas fa-film upload-thumb-placeholder"></i>`;
         }
-        const thumbHtml = (isSuccess&&firstUrl)
-            ? `<a href="${firstUrl}" target="_blank" rel="noopener" class="upload-thumb" title="Open ${LABEL[platforms[0]]||platforms[0]||'video'}">${imgInner}<i class="fas fa-external-link-alt play-icon"></i></a>`
+        const thumbHtml = ((isSuccess || isPartial) && firstUrl)
+            ? `<a href="${escapeHtmlDash(firstUrl)}" target="_blank" rel="noopener" class="upload-thumb" title="Open ${escapeHtmlDash(thumbPlatLabel)}">${imgInner}<i class="fas fa-external-link-alt play-icon"></i></a>`
             : `<div class="upload-thumb">${imgInner}</div>`;
 
         return `<div class="upload-row">
@@ -815,7 +1386,7 @@ function renderRecentUploads(uploads) {
 <div id="billingSuccessModal" style="position:relative;background:var(--bg-card,#1a1a24);border:1px solid rgba(249,115,22,.3);border-radius:20px;max-width:680px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 0 80px rgba(249,115,22,.15),0 30px 80px rgba(0,0,0,.5);">
 
   <!-- Close btn -->
-  <button onclick="closeBillingModal()" style="position:sticky;top:12px;float:right;margin:12px 12px 0 0;width:32px;height:32px;border-radius:50%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);color:var(--text-secondary,#9ca3af);cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;z-index:10;" title="Close"><i class="fas fa-times"></i></button>
+  <button data-um8-fn="closeBillingModal" style="position:sticky;top:12px;float:right;margin:12px 12px 0 0;width:32px;height:32px;border-radius:50%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.1);color:var(--text-secondary,#9ca3af);cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;z-index:10;" title="Close"><i class="fas fa-times"></i></button>
 
   <!-- Header glow bar -->
   <div style="height:3px;background:linear-gradient(90deg,#f97316,#a855f7,#3b82f6);border-radius:20px 20px 0 0;"></div>
@@ -839,13 +1410,13 @@ function renderRecentUploads(uploads) {
     <!-- Wallet credits -->
     <div id="bsWalletRow" style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.5rem;opacity:0;transform:translateY(8px);transition:all .4s ease .5s;">
       <div style="background:rgba(249,115,22,.07);border:1px solid rgba(249,115,22,.2);border-radius:12px;padding:1rem;text-align:center;">
-        <div style="font-size:1.4rem;margin-bottom:.2rem;">⚡</div>
+        <div style="font-size:1.4rem;margin-bottom:.2rem;"></div>
         <div id="bsPUT" style="font-size:1.8rem;font-weight:700;color:#fff;line-height:1;">—</div>
         <div style="font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:#f97316;margin-top:.25rem;">PUT Tokens</div>
         <div style="font-size:.72rem;color:var(--text-secondary,#9ca3af);margin-top:.2rem;">Upload credits / month</div>
       </div>
       <div style="background:rgba(139,92,246,.07);border:1px solid rgba(139,92,246,.2);border-radius:12px;padding:1rem;text-align:center;">
-        <div style="font-size:1.4rem;margin-bottom:.2rem;">🤖</div>
+        <div style="font-size:1.4rem;margin-bottom:.2rem;"></div>
         <div id="bsAIC" style="font-size:1.8rem;font-weight:700;color:#fff;line-height:1;">—</div>
         <div style="font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;color:#8b5cf6;margin-top:.25rem;">AI Credits</div>
         <div style="font-size:.72rem;color:var(--text-secondary,#9ca3af);margin-top:.2rem;">AI analysis / month</div>
@@ -925,63 +1496,7 @@ function renderRecentUploads(uploads) {
 ════════════════════════════════════════════════════════════════ */
 (function() {
 
-const TIER_META = {
-    free:           { name:'Free',           color:'#9ca3af', put:60,    aic:10    },
-    launch:         { name:'Creator Lite',   color:'#f97316', put:300,   aic:80    },
-    creator_lite:   { name:'Creator Lite',   color:'#f97316', put:300,   aic:80    },
-    creator_pro:    { name:'Creator Pro',    color:'#8b5cf6', put:700,   aic:200   },
-    studio:         { name:'Studio',         color:'#3b82f6', put:2000,  aic:600   },
-    agency:         { name:'Agency',         color:'#22c55e', put:4500,  aic:1500  },
-    friends_family: { name:'Friends & Family',color:'#fbbf24',put:999999,aic:999999},
-    lifetime:       { name:'Lifetime',       color:'#fbbf24', put:999999,aic:999999},
-    master_admin:   { name:'Admin',          color:'#ef4444', put:999999,aic:999999},
-};
-
-// Features per tier — what to show as "included"
-const TIER_FEATURES = {
-    free: [
-        { icon:'fa-cloud-upload-alt', label:'Upload to 4 platforms',      ok:true  },
-        { icon:'fa-robot',            label:'AI captions',                 ok:false },
-        { icon:'fa-calendar-alt',     label:'Scheduled posts',             ok:false },
-        { icon:'fa-bolt',             label:'Priority processing',         ok:false },
-        { icon:'fa-film',             label:'HUD overlay',                 ok:false },
-        { icon:'fa-chart-line',       label:'Basic analytics',             ok:true  },
-    ],
-    creator_lite: [
-        { icon:'fa-cloud-upload-alt', label:'Upload to 8 accounts',        ok:true  },
-        { icon:'fa-robot',            label:'AI captions (enhanced)',       ok:true  },
-        { icon:'fa-calendar-alt',     label:'Scheduled posts',              ok:true  },
-        { icon:'fa-image',            label:'Up to 3 thumbnails',           ok:true  },
-        { icon:'fa-paint-brush',      label:'Styled thumbnails',             ok:true  },
-        { icon:'fa-bell',             label:'Webhook notifications',        ok:true  },
-        { icon:'fa-chart-line',       label:'Standard analytics',           ok:true  },
-    ],
-    creator_pro: [
-        { icon:'fa-cloud-upload-alt', label:'20 accounts (5 per platform)', ok:true },
-        { icon:'fa-robot',            label:'Advanced AI (4 depth)',         ok:true },
-        { icon:'fa-film',             label:'HUD burn-in overlay',           ok:true },
-        { icon:'fa-bolt',             label:'Priority queue (p2)',           ok:true },
-        { icon:'fa-image',            label:'Up to 5 thumbnails',            ok:true },
-        { icon:'fa-magic',            label:'AI thumbnail styling',        ok:true },
-        { icon:'fa-users',            label:'3 team seats',                  ok:true },
-    ],
-    studio: [
-        { icon:'fa-cloud-upload-alt', label:'60 accounts (15 per platform)', ok:true },
-        { icon:'fa-robot',            label:'Max AI depth (15 frames)',       ok:true },
-        { icon:'fa-file-excel',       label:'Excel export reports',          ok:true },
-        { icon:'fa-bolt',             label:'Turbo priority queue (p1)',      ok:true },
-        { icon:'fa-film',             label:'HUD burn-in overlay',            ok:true },
-        { icon:'fa-users',            label:'10 team seats',                  ok:true },
-    ],
-    agency: [
-        { icon:'fa-cloud-upload-alt', label:'Unlimited accounts',            ok:true },
-        { icon:'fa-robot',            label:'Max AI + dense frame scan',      ok:true },
-        { icon:'fa-tag',              label:'White-label branding',           ok:true },
-        { icon:'fa-bolt',             label:'Top priority queue (p0)',        ok:true },
-        { icon:'fa-exchange-alt',     label:'Flex token transfers',           ok:true },
-        { icon:'fa-users',            label:'25 team seats',                  ok:true },
-    ],
-};
+var TC = window.UploadM8TierCatalog;
 
 function fmt(n) {
     if (n >= 999999) return '∞';
@@ -1050,24 +1565,27 @@ function animateIn() {
 }
 
 function showBillingModal(user) {
-    var tier    = (user && user.subscription_tier) || 'creator_lite';
+    if (!user) return;
+    var tier    = (typeof getTier === 'function' ? getTier(user) : (user.tier || user.subscription_tier)) || 'free';
     var status  = (user && user.subscription_status) || 'active';
-    var meta    = TIER_META[tier] || TIER_META.creator_lite;
-    var feats   = TIER_FEATURES[tier] || TIER_FEATURES.creator_lite;
+    var meta    = TC.getTierMeta(tier, 'free');
+    var feats   = TC.dashboardBillingFeats(tier) || TC.dashboardBillingFeats('free');
+    if (!meta) return;
     var wallet  = (user && user.wallet) || {};
     var put     = wallet.put_balance != null ? wallet.put_balance : meta.put;
     var aic     = wallet.aic_balance != null ? wallet.aic_balance : meta.aic;
     var isT     = status === 'trialing';
+    var trialDays = meta.trial_days || 7;
 
-    document.getElementById('bsEyebrow').textContent   = isT ? '7-Day Free Trial Active' : 'Subscription Active';
+    document.getElementById('bsEyebrow').textContent   = isT ? (trialDays + '-Day Free Trial Active') : 'Subscription Active';
     document.getElementById('bsHeadline').textContent  = meta.name + (isT ? ' trial started.' : ' activated.');
     document.getElementById('bsSub').textContent       = isT
-        ? 'Full ' + meta.name + ' access for 7 days — no charge until your trial ends. Cancel any time.'
+        ? ('Full ' + meta.name + ' access for ' + trialDays + ' days — no charge until your trial ends. Cancel any time.')
         : 'Your wallet has been loaded. Credits renew every billing period automatically.';
 
     if (isT) {
         var trialEl = document.getElementById('bsTrialBanner');
-        document.getElementById('bsTrialText').textContent = 'Trial ends in 7 days. Card on file will be charged ' + (user && user.current_period_end ? 'on ' + new Date(user.current_period_end).toLocaleDateString('en-US',{month:'long',day:'numeric'}) : 'after trial') + '.';
+        document.getElementById('bsTrialText').textContent = 'Trial ends in ' + trialDays + ' days. Card on file will be charged ' + (user && user.current_period_end ? 'on ' + new Date(user.current_period_end).toLocaleDateString('en-US',{month:'long',day:'numeric'}) : 'after trial') + '.';
         trialEl.style.display = 'flex';
     }
 
@@ -1091,12 +1609,14 @@ function showBillingModal(user) {
     setTimeout(burst, 200);
 }
 
-function maybeShowModal() {
+async function maybeShowModal() {
     var params  = new URLSearchParams(window.location.search);
     var trigger = params.get('billing_success') === '1';
     var sid     = sessionStorage.getItem('billing_session_id') || '';
 
     if (!trigger && !sid) return;
+
+    try { await TC.load(); } catch (err) { console.warn('[dashboard] tier catalog', err); }
 
     function tryShow() {
         if (window.currentUser) {
@@ -1114,15 +1634,19 @@ function maybeShowModal() {
 }
 
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() { setTimeout(maybeShowModal, 400); });
+    document.addEventListener('DOMContentLoaded', function() { setTimeout(function () { maybeShowModal(); }, 400); });
 } else {
-    setTimeout(maybeShowModal, 400);
+    setTimeout(function () { maybeShowModal(); }, 400);
 }
 window.addEventListener('userLoaded', function(e) {
     var p = new URLSearchParams(window.location.search);
     if (p.get('billing_success') === '1' || sessionStorage.getItem('billing_session_id')) {
         if (!document.getElementById('billingSuccessOverlay').classList.contains('active')) {
-            showBillingModal(e.detail || window.currentUser);
+            TC.load().then(function () {
+                showBillingModal(e.detail || window.currentUser);
+            }).catch(function () {
+                showBillingModal(e.detail || window.currentUser);
+            });
         }
     }
 });

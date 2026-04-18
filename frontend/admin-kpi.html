@@ -1,10 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+
+    <script src="js/html-safe.js"></script>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>KPI Dashboard - Admin - UploadM8</title>
+    <title>Admin KPIs - UploadM8</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="styles.css" rel="stylesheet">
@@ -85,62 +87,35 @@
         .badge.agency { background: rgba(236, 72, 153, 0.2); color: #ec4899; }
         .badge.active { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
         .badge.banned { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 768px) {
+            .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+            .grid-2 { grid-template-columns: 1fr; }
+            .grid-4 { grid-template-columns: repeat(2, 1fr); }
+            .kpi-header { flex-direction: column; align-items: flex-start; }
+            .kpi-header .time-select { width: 100%; }
+            .leaderboard { max-height: 250px; }
+        }
+        @media (max-width: 480px) {
+            .kpi-grid { grid-template-columns: 1fr; }
+            .grid-4 { grid-template-columns: 1fr; }
+            .kpi-card .value { font-size: 1.25rem; }
+        }
     </style>
 </head>
 <body>
     <div class="app-layout">
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header">
-                <a href="dashboard.html" class="sidebar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></a>
-            </div>
-            <nav class="sidebar-nav">
-                <div class="nav-section">
-                    <div class="nav-section-title">Main</div>
-                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
-                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
-                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Platforms</div>
-                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-                    <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Insights</div>
-                    <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-                </div>
-                <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                    <div class="nav-section-title">Admin</div>
-                    <a href="admin.html" class="nav-link"><i class="fas fa-cog"></i><span>Admin Panel</span></a>
-                    <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>User Management</span></a>
-                    <a href="admin-kpi.html" class="nav-link active"><i class="fas fa-chart-bar"></i><span>KPI Dashboard</span></a>
-                    <a href="admin-calculator.html" class="nav-link"> <i class="fas fa-calculator"></i> <span>Biz Calculator</span> </a>
-                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Account</div>
-                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-                    <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-                </div>
-            </nav>
-            <div class="sidebar-footer">
-                <div class="user-info">
-                    <div class="user-avatar" id="userAvatar">U</div>
-                    <div class="user-details">
-                        <div class="user-name" id="userName">User</div>
-                        <div class="user-tier" id="userTier">Admin</div>
-                    </div>
-                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out"><i class="fas fa-sign-out-alt"></i></button>
-                </div>
-            </div>
-        </aside>
+        <aside class="sidebar" id="sidebar"></aside>
 
-        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
         <header class="top-bar">
-            <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
-            <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
-            <div class="top-bar-actions"><button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme"><i class="fas fa-moon"></i></button></div>
+            <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+            <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+            <div class="top-bar-actions">
+                <div data-wt-pills></div>
+                <button class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle Theme"><i class="fas fa-moon"></i></button>
+            </div>
         </header>
 
         <main class="main-content">
@@ -159,20 +134,25 @@
             <div id="adminContent" style="display: none;">
                 <div class="page-header" style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem;">
                     <div>
-                        <h1 class="page-title">KPI Dashboard</h1>
-                        <p class="page-subtitle">Profit-First Analytics & Business Performance</p>
+                        <h1 class="page-title">Admin KPIs</h1>
+                        <p class="page-subtitle">Business snapshot for <strong>every customer</strong> in the date range you select. Views and likes here are straight sums from upload records. <a href="analytics.html">Analytics</a> in the product uses a richer merge across platforms (one total per video), so the two screens may differ slightly. Thumbnail tools: <a href="thumbnail-studio.html">Thumbnail Studio</a> &middot; <a href="https://pikzels.com/" target="_blank" rel="noopener noreferrer">Pikzels</a>.</p>
+                        <p id="adminDataProvenanceLine" class="text-secondary" style="font-size:0.78rem;margin-top:0.35rem;line-height:1.45;" title="Where these numbers come from"></p>
+                        <p id="thumbProviderIntegration" class="text-secondary" style="font-size:0.82rem;margin-top:0.35rem;" title="Thumbnail partner connection status"></p>
                     </div>
-                    <div style="display: flex; gap: 0.5rem;">
-                        <button class="btn btn-secondary btn-sm" id="editModeBtn" onclick="toggleEditMode()"><i class="fas fa-grip-vertical"></i> Customize</button>
-                        <button class="btn btn-secondary btn-sm" onclick="resetLayout()"><i class="fas fa-undo"></i> Reset</button>
-                        <button class="btn btn-secondary btn-sm" id="kpiRefreshBtn" onclick="refreshKPIsWithSync()"><i class="fas fa-sync-alt"></i> Refresh</button>
+                    <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                        <div data-wt-pills class="desktop-pills"></div>
+                        <a href="kpi.html" class="btn btn-secondary btn-sm" title="Your account upload KPIs &amp; ML strategies"><i class="fas fa-chart-bar"></i> Upload KPIs</a>
+                        <button class="btn btn-secondary btn-sm" id="editModeBtn" data-um8-fn="toggleEditMode"><i class="fas fa-grip-vertical"></i> Customize</button>
+                        <button class="btn btn-secondary btn-sm" data-um8-fn="resetLayout"><i class="fas fa-undo"></i> Reset</button>
+                        <button class="btn btn-secondary btn-sm" id="kpiRefreshBtn" data-um8-fn="refreshKPIsWithSync"><i class="fas fa-sync-alt"></i> Refresh</button>
+                        <span id="adminKpiHealth" class="text-secondary" style="font-size:0.8rem;align-self:center;" title="Last data refresh">Updated: —</span>
                     </div>
                 </div>
 
                 <div class="edit-mode-banner" id="editModeBanner">
                     <i class="fas fa-info-circle"></i>
                     <span>Drag and drop cards to customize your layout. In edit mode, card clicks are disabled.</span>
-                    <button class="btn btn-primary btn-sm" onclick="toggleEditMode()">Done</button>
+                    <button class="btn btn-primary btn-sm" data-um8-fn="toggleEditMode">Done</button>
                 </div>
 
                 <div class="card mb-4">
@@ -191,8 +171,19 @@
                             <input type="date" id="startDate" class="form-input" style="width: 140px;">
                             <span>to</span>
                             <input type="date" id="endDate" class="form-input" style="width: 140px;">
-                            <button class="btn btn-primary btn-sm" onclick="applyCustomRange()">Apply</button>
+                            <button class="btn btn-primary btn-sm" data-um8-fn="applyCustomRange">Apply</button>
                         </div>
+                        <span id="activeWindowLabel" class="text-secondary" style="font-size: 0.85rem;">Window: 30d</span>
+                    </div>
+                </div>
+
+                <div class="section-header usage"><i class="fas fa-wand-magic-sparkles"></i><h2>Pikzels API v2 (usage)</h2></div>
+                <div class="card mb-4">
+                    <div class="card-body">
+                        <p class="text-secondary" style="font-size:0.85rem;margin-bottom:0.75rem;">
+                            Billable Thumbnail Studio actions customers ran in this period (by tool type). Internal admin tests are excluded. Open <a href="thumbnail-studio.html">Thumbnail Studio</a> or see <a href="https://docs.pikzels.com/openapi.json" target="_blank" rel="noopener noreferrer">Pikzels API reference</a> for feature detail.
+                        </p>
+                        <div id="pikzelsV2UsageAdmin" class="text-secondary" style="font-size:0.88rem;">Loading…</div>
                     </div>
                 </div>
 
@@ -209,7 +200,7 @@
                 <div class="section-header revenue"><i class="fas fa-dollar-sign"></i><h2>Revenue</h2></div>
                 <div class="kpi-grid mb-4" id="revenueGrid" data-section="revenue">
                     <a class="kpi-card" draggable="true" data-card-id="mrr-total" data-href="https://dashboard.stripe.com/payments" target="_blank" rel="noopener"><div class="label"><i class="fas fa-chart-line"></i> Total MRR</div><div class="value money" id="kpiMRR">$--</div><div class="change up" id="kpiMRRChange"><i class="fas fa-arrow-up"></i> --% vs prev</div><i class="fas fa-external-link-alt external-link"></i></a>
-                    <a class="kpi-card" draggable="true" data-card-id="mrr-launch" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-rocket"></i> MRR - Launch</div><div class="value money" id="kpiMRRLaunch">$--</div><div class="subtext" id="kpiMRRLaunchUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <a class="kpi-card" draggable="true" data-card-id="mrr-launch" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-rocket"></i> MRR - Creator Lite</div><div class="value money" id="kpiMRRLaunch">$--</div><div class="subtext" id="kpiMRRLaunchUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
                     <a class="kpi-card" draggable="true" data-card-id="mrr-creator" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-star"></i> MRR - Creator Pro</div><div class="value money" id="kpiMRRCreator">$--</div><div class="subtext" id="kpiMRRCreatorUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
                     <a class="kpi-card" draggable="true" data-card-id="mrr-studio" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-building"></i> MRR - Studio</div><div class="value money" id="kpiMRRStudio">$--</div><div class="subtext" id="kpiMRRStudioUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
                     <a class="kpi-card" draggable="true" data-card-id="mrr-agency" data-href="https://dashboard.stripe.com/subscriptions" target="_blank" rel="noopener"><div class="label"><i class="fas fa-users"></i> MRR - Agency</div><div class="value money" id="kpiMRRAgency">$--</div><div class="subtext" id="kpiMRRAgencyUsers">-- users</div><i class="fas fa-external-link-alt external-link"></i></a>
@@ -223,6 +214,7 @@
                 <div class="section-header costs"><i class="fas fa-receipt"></i><h2>Costs</h2></div>
                 <div class="kpi-grid mb-4" id="costsGrid" data-section="costs">
                     <a class="kpi-card" draggable="true" data-card-id="openai-cost" data-href="https://platform.openai.com/usage" target="_blank" rel="noopener"><div class="label"><i class="fas fa-brain"></i> OpenAI Cost</div><div class="value cost" id="kpiOpenAI">$--</div><div class="subtext" id="kpiOpenAICalls">-- API calls</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <div class="kpi-card" draggable="true" data-card-id="whisper-estimate"><div class="label"><i class="fas fa-microphone"></i> Whisper (est.)</div><div class="value cost" id="kpiWhisperEst">$--</div><div class="subtext" id="kpiWhisperEstHint">Successful uploads × assumed min × $/min</div></div>
                     <a class="kpi-card" draggable="true" data-card-id="storage-cost" data-href="https://dash.cloudflare.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-database"></i> Storage Cost</div><div class="value cost" id="kpiStorage">$--</div><div class="subtext" id="kpiStorageGB">-- GB used</div><i class="fas fa-external-link-alt external-link"></i></a>
                     <a class="kpi-card" draggable="true" data-card-id="bandwidth-cost" data-href="https://dash.cloudflare.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-wifi"></i> Bandwidth Cost</div><div class="value cost" id="kpiBandwidth">$--</div><div class="subtext" id="kpiBandwidthTB">-- TB transferred</div><i class="fas fa-external-link-alt external-link"></i></a>
                     <a class="kpi-card" draggable="true" data-card-id="compute-cost" data-href="https://render.com/dashboard" target="_blank" rel="noopener"><div class="label"><i class="fas fa-server"></i> Compute Cost</div><div class="value cost" id="kpiCompute">$--</div><div class="subtext" id="kpiComputeHours">-- CPU hours</div><i class="fas fa-external-link-alt external-link"></i></a>
@@ -231,13 +223,14 @@
                     <a class="kpi-card" draggable="true" data-card-id="mailgun-cost" data-href="https://app.mailgun.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-envelope"></i> Mailgun Cost</div><div class="value cost" id="kpiMailgun">$--</div><div class="subtext" id="kpiMailgunEmails">-- emails sent</div><i class="fas fa-external-link-alt external-link"></i></a>
                     <a class="kpi-card" draggable="true" data-card-id="postgres-cost" data-href="https://dashboard.render.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-database"></i> Postgres Cost</div><div class="value cost" id="kpiPostgres">$--</div><div class="subtext" id="kpiPostgresSize">-- GB</div><i class="fas fa-external-link-alt external-link"></i></a>
                     <a class="kpi-card" draggable="true" data-card-id="redis-cost" data-href="https://dashboard.render.com" target="_blank" rel="noopener"><div class="label"><i class="fas fa-memory"></i> Redis Cost</div><div class="value cost" id="kpiRedis">$--</div><div class="subtext" id="kpiRedisMemory">-- MB used</div><i class="fas fa-external-link-alt external-link"></i></a>
+                    <div class="kpi-card" draggable="true" data-card-id="tool-estimates"><div class="label"><i class="fas fa-sitemap"></i> Tool Estimate (30d)</div><div class="value cost" id="kpiToolEstimate">$--</div><div class="subtext" id="kpiToolEstimateHint">-- uploads × $--/upload</div></div>
                 </div>
 
                 <!-- MARGINS -->
                 <div class="section-header margins"><i class="fas fa-percentage"></i><h2>Margins</h2></div>
                 <div class="kpi-grid mb-4" id="marginsGrid" data-section="margins">
                     <div class="kpi-card" draggable="true" data-card-id="gross-margin"><div class="label"><i class="fas fa-chart-pie"></i> Gross Margin</div><div class="value percent" id="kpiGrossMargin">--%</div><div class="change up" id="kpiGrossMarginChange"><i class="fas fa-arrow-up"></i> --% vs prev</div></div>
-                    <div class="kpi-card" draggable="true" data-card-id="margin-launch"><div class="label"><i class="fas fa-rocket"></i> Margin - Launch</div><div class="value percent" id="kpiMarginLaunch">--%</div><div class="subtext">Per tier</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="margin-launch"><div class="label"><i class="fas fa-rocket"></i> Margin - Creator Lite</div><div class="value percent" id="kpiMarginLaunch">--%</div><div class="subtext">Per tier</div></div>
                     <div class="kpi-card" draggable="true" data-card-id="margin-creator"><div class="label"><i class="fas fa-star"></i> Margin - Creator</div><div class="value percent" id="kpiMarginCreator">--%</div><div class="subtext">Per tier</div></div>
                     <div class="kpi-card" draggable="true" data-card-id="margin-studio"><div class="label"><i class="fas fa-building"></i> Margin - Studio</div><div class="value percent" id="kpiMarginStudio">--%</div><div class="subtext">Per tier</div></div>
                     <div class="kpi-card" draggable="true" data-card-id="margin-agency"><div class="label"><i class="fas fa-users"></i> Margin - Agency</div><div class="value percent" id="kpiMarginAgency">--%</div><div class="subtext">Per tier</div></div>
@@ -259,6 +252,26 @@
                     <div class="kpi-card" draggable="true" data-card-id="failed-payments"><div class="label"><i class="fas fa-credit-card"></i> Failed Payments</div><div class="value" id="kpiFailedPayments">--</div><div class="change down" id="kpiFailedPaymentsRate">--% failure rate</div></div>
                 </div>
 
+                <!-- MARKETING OPS -->
+                <div class="section-header funnels"><i class="fas fa-bullhorn"></i><h2>Marketing Ops</h2></div>
+                <div class="kpi-grid mb-4" id="marketingOpsGrid" data-section="marketing_ops">
+                    <div class="kpi-card" draggable="true" data-card-id="nudge-shown"><div class="label"><i class="fas fa-eye"></i> Nudges Shown</div><div class="value" id="kpiNudgeShown">--</div><div class="subtext">In selected window</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="nudge-ctr"><div class="label"><i class="fas fa-mouse-pointer"></i> Nudge CTR</div><div class="value percent" id="kpiNudgeCtr">--%</div><div class="subtext" id="kpiNudgeClicks">-- clicks</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="nudge-dismiss"><div class="label"><i class="fas fa-times"></i> Dismiss Rate</div><div class="value percent" id="kpiNudgeDismiss">--%</div><div class="subtext" id="kpiNudgeDismissCount">-- dismissed</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="rev-same-session"><div class="label"><i class="fas fa-dollar-sign"></i> Attrib Revenue (Session)</div><div class="value money" id="kpiAttribSession">$--</div><div class="subtext">Same-session influence</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="rev-view-through"><div class="label"><i class="fas fa-calendar-check"></i> Attrib Revenue (7D)</div><div class="value money" id="kpiAttrib7d">$--</div><div class="subtext">7-day view-through</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="low-put-lever"><div class="label"><i class="fas fa-battery-quarter"></i> Low PUT Users</div><div class="value" id="kpiLowPutUsers">--</div><div class="subtext">0-29 available</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="low-aic-lever"><div class="label"><i class="fas fa-robot"></i> Low AIC Users</div><div class="value" id="kpiLowAicUsers">--</div><div class="subtext">0-9 available</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="free-uploaders-lever"><div class="label"><i class="fas fa-users"></i> Free Uploaders (7d)</div><div class="value" id="kpiFreeUploaders7d">--</div><div class="subtext">Upgrade-ready cohort</div></div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header"><h3 class="card-title"><i class="fas fa-calendar-alt"></i> Promo Timing & Comms Plan</h3></div>
+                    <div class="card-body">
+                        <div id="promoScheduleList" class="text-secondary">Loading promo schedule...</div>
+                    </div>
+                </div>
+
                 <!-- RELIABILITY -->
                 <div class="section-header reliability"><i class="fas fa-heartbeat"></i><h2>Reliability</h2></div>
                 <div class="kpi-grid mb-4" id="reliabilityGrid" data-section="reliability">
@@ -275,11 +288,12 @@
                 <!-- USAGE METRICS -->
                 <div class="section-header usage"><i class="fas fa-chart-bar"></i><h2>Usage Metrics</h2></div>
                 <div class="kpi-grid mb-4" id="usageGrid" data-section="usage">
+                    <div class="kpi-card" draggable="true" data-card-id="creative-freshness"><div class="label"><i class="fas fa-palette"></i> Creative Freshness</div><div class="value percent" id="kpiCreativeFreshness">--%</div><div class="subtext" id="kpiCreativeFreshnessDetail">-- entities measured</div></div>
                     <div class="kpi-card" draggable="true" data-card-id="new-users"><div class="label"><i class="fas fa-user-plus"></i> New Users</div><div class="value" id="kpiNewUsers">--</div><div class="change up" id="kpiNewUsersChange"><i class="fas fa-arrow-up"></i> --% vs prev</div></div>
                     <div class="kpi-card" draggable="true" data-card-id="total-uploads"><div class="label"><i class="fas fa-cloud-upload-alt"></i> Total Uploads</div><div class="value" id="kpiUploads">--</div><div class="change up" id="kpiUploadsChange"><i class="fas fa-arrow-up"></i> --% vs prev</div></div>
                     <div class="kpi-card" draggable="true" data-card-id="active-users"><div class="label"><i class="fas fa-users"></i> Active Users</div><div class="value" id="kpiActiveUsers">--</div><div class="subtext">With uploads in period</div></div>
-                    <div class="kpi-card" draggable="true" data-card-id="total-views"><div class="label"><i class="fas fa-eye"></i> Total Views</div><div class="value" id="kpiViews">--</div><div class="subtext">Across all platforms</div></div>
-                    <div class="kpi-card" draggable="true" data-card-id="total-likes"><div class="label"><i class="fas fa-heart"></i> Total Likes</div><div class="value" id="kpiLikes">--</div><div class="subtext">Engagement metric</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="total-views"><div class="label"><i class="fas fa-eye"></i> Total Views</div><div class="value" id="kpiViews">--</div><div class="subtext">Admin global &mdash; sum of all users&rsquo; upload views</div></div>
+                    <div class="kpi-card" draggable="true" data-card-id="total-likes"><div class="label"><i class="fas fa-heart"></i> Total Likes</div><div class="value" id="kpiLikes">--</div><div class="subtext">Admin global &mdash; sum of all users&rsquo; upload likes</div></div>
                     <div class="kpi-card" draggable="true" data-card-id="avg-uploads"><div class="label"><i class="fas fa-calculator"></i> Avg Uploads/User</div><div class="value" id="kpiAvgUploads">--</div><div class="subtext">Per active user</div></div>
                 </div>
 
@@ -325,8 +339,16 @@
 
     <div id="toastContainer"></div>
     
-    <script src="wallet-tokens.js"></script>
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
     <script src="app.js"></script>
+    <script src="wallet-tokens.js"></script>
     
     <script>
     (function() {
@@ -340,6 +362,12 @@
         let draggedCard = null;
 
         // ---------- Helpers ----------
+        function um8Esc(s) {
+            if (typeof window.escapeHTML === 'function') return window.escapeHTML(s == null ? '' : s);
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
         function formatNumber(n) {
             if (n == null) return '--';
             if (typeof n !== 'number') n = Number(n);
@@ -433,18 +461,32 @@
                 // Revenue
                 mrr: k.mrr ?? k.total_mrr ?? 0,
                 mrr_change: k.mrr_change ?? 0,
-                mrr_by_tier: k.mrr_by_tier ?? {
-                    launch: k.mrr_launch,
-                    creator_pro: k.mrr_creator ?? k.mrr_creator_pro,
-                    studio: k.mrr_studio,
-                    agency: k.mrr_agency,
-                },
-                users_by_tier: k.users_by_tier ?? {
-                    launch: k.launch_users,
-                    creator_pro: k.creator_pro_users,
-                    studio: k.studio_users,
-                    agency: k.agency_users,
-                },
+                mrr_by_tier: (function() {
+                    const raw = k.mrr_by_tier || {};
+                    // Support both 'creator_lite' (DB key) and legacy 'launch' alias
+                    const cl = raw.creator_lite ?? raw.launch ?? k.mrr_creator_lite ?? k.mrr_launch ?? 0;
+                    return {
+                        ...raw,
+                        creator_lite: cl,
+                        launch: cl,
+                        creator_pro: raw.creator_pro ?? k.mrr_creator ?? k.mrr_creator_pro ?? 0,
+                        studio: raw.studio ?? k.mrr_studio ?? 0,
+                        agency: raw.agency ?? k.mrr_agency ?? 0,
+                    };
+                })(),
+                users_by_tier: (function() {
+                    const raw = k.users_by_tier || {};
+                    // creator_lite_users comes directly from /api/admin/kpis response
+                    const cl = raw.creator_lite ?? raw.launch ?? k.creator_lite_users ?? k.launch_users ?? 0;
+                    return {
+                        ...raw,
+                        creator_lite: cl,
+                        launch: cl,
+                        creator_pro: raw.creator_pro ?? k.creator_pro_users ?? 0,
+                        studio: raw.studio ?? k.studio_users ?? 0,
+                        agency: raw.agency ?? k.agency_users ?? 0,
+                    };
+                })(),
                 topup_revenue: k.topup_revenue ?? 0,
                 topup_count: k.topup_count ?? 0,
                 arpu: k.arpu ?? 0,
@@ -462,6 +504,8 @@
                 compute_cost: k.compute_cost ?? 0,
                 compute_hours: k.compute_hours ?? 0,
                 cost_per_upload: k.cost_per_upload ?? 0,
+                whisper_cost_estimate_usd: k.whisper_cost_estimate_usd ?? k.whisper_estimate_usd ?? 0,
+                whisper_estimate: k.whisper_estimate ?? null,
 
                 // Costs – additional providers
                 stripe_fees: k.stripe_fees ?? 0,
@@ -472,16 +516,25 @@
                 postgres_size_gb: k.postgres_size_gb ?? 0,
                 redis_cost: k.redis_cost ?? 0,
                 redis_memory_mb: k.redis_memory_mb ?? 0,
+                tool_estimate_cost: k.tool_estimate_cost ?? 0,
+                tool_estimate_per_upload_usd: k.tool_estimate_per_upload_usd ?? 0,
+                tool_estimate_uploads: k.tool_estimate_uploads ?? 0,
 
                 // Margins
                 gross_margin: k.gross_margin ?? 0,
                 gross_margin_change: k.gross_margin_change ?? k.margin_change ?? 0,
-                margin_by_tier: k.margin_by_tier ?? {
-                    launch: k.margin_launch,
-                    creator_pro: k.margin_creator ?? k.margin_creator_pro,
-                    studio: k.margin_studio,
-                    agency: k.margin_agency,
-                },
+                margin_by_tier: (function() {
+                    const raw = k.margin_by_tier || {};
+                    const cl = raw.creator_lite ?? raw.launch ?? k.margin_creator_lite ?? k.margin_launch ?? null;
+                    return {
+                        ...raw,
+                        creator_lite: cl,
+                        launch: cl,
+                        creator_pro: raw.creator_pro ?? k.margin_creator ?? k.margin_creator_pro ?? null,
+                        studio: raw.studio ?? k.margin_studio ?? null,
+                        agency: raw.agency ?? k.margin_agency ?? null,
+                    };
+                })(),
                 margin_by_platform: k.margin_by_platform ?? {
                     tiktok: k.margin_tiktok,
                     youtube: k.margin_youtube,
@@ -523,6 +576,14 @@
                 total_views: k.total_views ?? 0,
                 total_likes: k.total_likes ?? 0,
                 avg_uploads_per_user: k.avg_uploads_per_user ?? 0,
+                creative_freshness_score: k.creative_freshness_score ?? 0,
+                thumbnail_entropy_norm: k.thumbnail_entropy_norm ?? 0,
+                thumbnail_low_entropy_entities: k.thumbnail_low_entropy_entities ?? 0,
+                thumbnail_entities_measured: k.thumbnail_entities_measured ?? 0,
+                sales_opportunity_levers: k.sales_opportunity_levers ?? {},
+                marketing_funnel: k.marketing_funnel ?? {},
+                promo_schedule_recommendations: k.promo_schedule_recommendations ?? [],
+                recommended_comms_plan: k.recommended_comms_plan ?? [],
 
                 // Breakdowns
                 tier_breakdown: k.tier_breakdown ?? k.tier_breakdown ?? null,
@@ -552,6 +613,15 @@
 
             // Costs
             setText('kpiOpenAI', formatCurrency(k.openai_cost)); setText('kpiOpenAICalls', formatNumber(k.openai_calls) + ' API calls');
+            setText('kpiWhisperEst', formatCurrency(k.whisper_cost_estimate_usd));
+            (function () {
+                const w = k.whisper_estimate || {};
+                const su = k.successful_uploads ?? 0;
+                const eff = w.effective_minutes_per_upload != null ? Number(w.effective_minutes_per_upload).toFixed(2) : '—';
+                const usd = w.usd_per_minute != null ? Number(w.usd_per_minute).toFixed(4) : '—';
+                const hint = su + ' ok × ' + eff + ' min × $' + usd + '/min';
+                setText('kpiWhisperEstHint', hint);
+            })();
             setText('kpiStorage', formatCurrency(k.storage_cost)); setText('kpiStorageGB', formatNumber(k.storage_gb) + ' GB used');
             setText('kpiCompute', formatCurrency(k.compute_cost)); setText('kpiComputeHours', formatNumber(k.compute_hours) + ' CPU hours');
             setText('kpiCostPerUpload', '$' + Number(k.cost_per_upload || 0).toFixed(3));
@@ -560,6 +630,8 @@
             setText('kpiMailgun', formatCurrency(k.mailgun_cost)); setText('kpiMailgunEmails', formatNumber(k.mailgun_emails_sent) + ' emails sent');
             setText('kpiPostgres', formatCurrency(k.postgres_cost)); setText('kpiPostgresSize', Number(k.postgres_size_gb || 0).toFixed(2) + ' GB');
             setText('kpiRedis', formatCurrency(k.redis_cost)); setText('kpiRedisMemory', Number(k.redis_memory_mb || 0).toFixed(1) + ' MB used');
+            setText('kpiToolEstimate', formatCurrency(k.tool_estimate_cost));
+            setText('kpiToolEstimateHint', formatNumber(k.tool_estimate_uploads || 0) + ' uploads x $' + Number(k.tool_estimate_per_upload_usd || 0).toFixed(4) + '/upload');
 
             // Margins
             setText('kpiGrossMargin', formatPercent(k.gross_margin)); updateChange('kpiGrossMarginChange', k.gross_margin_change);
@@ -593,12 +665,63 @@
             setText('kpiQueueDepth', formatNumber(k.queue_depth));
 
             // Usage
+            setText('kpiCreativeFreshness', formatPercent(k.creative_freshness_score));
+            setText(
+                'kpiCreativeFreshnessDetail',
+                formatNumber(k.thumbnail_low_entropy_entities) + ' low-entropy / ' + formatNumber(k.thumbnail_entities_measured) + ' measured'
+            );
+            (function() {
+                const el = document.getElementById('kpiCreativeFreshness');
+                if (!el) return;
+                const v = Number(k.creative_freshness_score || 0);
+                el.classList.remove('money', 'cost', 'percent');
+                if (v >= 72) el.classList.add('money');
+                else if (v >= 55) el.classList.add('percent');
+                else el.classList.add('cost');
+            })();
             setText('kpiNewUsers', formatNumber(k.new_users)); updateChange('kpiNewUsersChange', k.new_users_change);
             setText('kpiUploads', formatNumber(k.total_uploads)); updateChange('kpiUploadsChange', k.uploads_change);
             setText('kpiActiveUsers', formatNumber(k.active_users));
             setText('kpiViews', formatNumber(k.total_views));
             setText('kpiLikes', formatNumber(k.total_likes));
             setText('kpiAvgUploads', Number(k.avg_uploads_per_user || k.avg_uploads_per_user || k.avg_uploads_per_user || 0).toFixed(1));
+
+            // Marketing ops
+            setText('kpiNudgeShown', formatNumber(k.marketing_funnel?.shown || 0));
+            setText('kpiNudgeCtr', formatPercent(k.marketing_funnel?.ctr_pct || 0));
+            setText('kpiNudgeClicks', formatNumber(k.marketing_funnel?.clicked || 0) + ' clicks');
+            setText('kpiNudgeDismiss', formatPercent(k.marketing_funnel?.dismiss_rate_pct || 0));
+            setText('kpiNudgeDismissCount', formatNumber(k.marketing_funnel?.dismissed || 0) + ' dismissed');
+            setText('kpiAttribSession', formatCurrency(k.marketing_funnel?.same_session_attributed_revenue || 0));
+            setText('kpiAttrib7d', formatCurrency(k.marketing_funnel?.view_through_7d_attributed_revenue || 0));
+            setText('kpiLowPutUsers', formatNumber(k.sales_opportunity_levers?.users_low_put_available_0_29 || 0));
+            setText('kpiLowAicUsers', formatNumber(k.sales_opportunity_levers?.users_low_aic_available_0_9 || 0));
+            setText('kpiFreeUploaders7d', formatNumber(k.sales_opportunity_levers?.free_users_uploading_last_7d || 0));
+            (function renderPromoSchedule() {
+                const el = document.getElementById('promoScheduleList');
+                if (!el) return;
+                const rows = Array.isArray(k.promo_schedule_recommendations) ? k.promo_schedule_recommendations : [];
+                if (!rows.length) {
+                    el.innerHTML = '<div class="text-secondary">No timing pattern yet (need more click/conversion data).</div>';
+                    return;
+                }
+                var schedHtml = rows.slice(0, 6).map(function (r, i) {
+                    const hh = String(Number(r.hour_utc || 0)).padStart(2, '0') + ':00 UTC';
+                    return '<div style="display:flex;justify-content:space-between;gap:.75rem;padding:.5rem 0;border-bottom:1px solid var(--border-color);">'
+                        + '<div><strong>#' + (i + 1) + ' ' + (r.day || '—') + ' ' + hh + '</strong><div class="text-secondary" style="font-size:.78rem;">'
+                        + formatNumber(r.clicks || 0) + ' clicks · ' + formatNumber(r.conversions_7d || 0) + ' conversions (7d)</div></div>'
+                        + '<div style="font-weight:700;color:#22c55e;">' + formatPercent(r.conv_rate_7d || 0) + '</div></div>';
+                }).join('');
+                var comms = Array.isArray(k.recommended_comms_plan) ? k.recommended_comms_plan : [];
+                var commsHtml = comms.length
+                    ? ('<div style="margin-top:.8rem;font-size:.82rem;"><strong>Recommended comms cadence</strong>'
+                        + comms.map(function (c) {
+                            return '<div style="margin-top:.35rem;color:var(--text-secondary);">• ' + (c.channel || 'channel') + ': '
+                                + (c.cadence || 'cadence') + ' — ' + (c.trigger || c.when || '') + '</div>';
+                        }).join('') + '</div>')
+                    : '<div style="margin-top:.75rem;font-size:.82rem;color:var(--text-secondary);">Run promo pushes 30-60m before top windows. Email cohorts with 3+ nudge clicks and no conversion in 7d.</div>';
+                el.innerHTML = schedHtml + commsHtml;
+            })();
 
             // Breakdowns
             loadTierBreakdown(k.tier_breakdown);
@@ -609,6 +732,7 @@
         function handleTimeRangeChange() {
             currentRange = document.getElementById('timeRange').value;
             document.getElementById('customRange').classList.toggle('show', currentRange === 'custom');
+            updateActiveWindowLabel();
             if (currentRange !== 'custom') refreshKPIs();
         }
 
@@ -616,6 +740,7 @@
             customStart = document.getElementById('startDate').value;
             customEnd = document.getElementById('endDate').value;
             if (!customStart || !customEnd) { alert('Please select both dates'); return; }
+            updateActiveWindowLabel();
             refreshKPIs();
         };
 
@@ -686,11 +811,11 @@
             document.querySelectorAll('[data-section]').forEach(grid => {
                 layout[grid.dataset.section] = Array.from(grid.querySelectorAll('[data-card-id]')).map(c => c.dataset.cardId);
             });
-            localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
+            sessionStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
         }
 
         function loadSavedLayout() {
-            const saved = localStorage.getItem(LAYOUT_KEY);
+            const saved = sessionStorage.getItem(LAYOUT_KEY);
             if (!saved) return;
             try {
                 const layout = JSON.parse(saved);
@@ -706,28 +831,72 @@
         }
 
         window.resetLayout = function() {
-            localStorage.removeItem(LAYOUT_KEY);
+            sessionStorage.removeItem(LAYOUT_KEY);
             location.reload();
         };
 
         // ---------- Query-param builder (shared by all KPI fetches) ----------
         function buildKpiParams() {
             if (currentRange === 'custom' && customStart && customEnd) {
-                // Backend only accepts range= param; map custom date span to closest supported value
-                const diffDays = Math.round((new Date(customEnd) - new Date(customStart)) / 86400000);
-                let r = '30d';
-                if (diffDays <= 7) r = '7d';
-                else if (diffDays <= 30) r = '30d';
-                else if (diffDays <= 90) r = '90d';
-                else r = '365d';
-                return 'range=' + r;
+                // Send true custom day windows as Nd (backend supports it).
+                const start = new Date(customStart + 'T00:00:00');
+                const end = new Date(customEnd + 'T00:00:00');
+                if (!isFinite(start.getTime()) || !isFinite(end.getTime())) return 'range=30d';
+                const diffMs = end.getTime() - start.getTime();
+                const diffDays = Math.floor(diffMs / 86400000) + 1; // inclusive window
+                const safeDays = Math.max(1, Math.min(diffDays, 3650));
+                return 'range=' + encodeURIComponent(String(safeDays) + 'd');
             }
-            // FIX 1: Removed the extra closing brace here!
             return 'range=' + encodeURIComponent(currentRange);
         }
 
+        function getResolvedRangeValue() {
+            const qp = buildKpiParams();
+            const m = qp.match(/(?:^|&)range=([^&]+)/);
+            if (!m) return '30d';
+            try { return decodeURIComponent(m[1] || '30d'); } catch (_) { return '30d'; }
+        }
+
+        function updateActiveWindowLabel() {
+            const el = document.getElementById('activeWindowLabel');
+            if (!el) return;
+            const resolved = getResolvedRangeValue();
+            if (currentRange === 'custom' && customStart && customEnd) {
+                el.textContent = 'Window: ' + resolved + ' (' + customStart + ' to ' + customEnd + ')';
+            } else {
+                el.textContent = 'Window: ' + resolved;
+            }
+        }
+
         // ---------- Data loaders ----------
+        function renderDataProvenance(raw) {
+            const el = document.getElementById('adminDataProvenanceLine');
+            if (!el) return;
+            const dp = raw && raw.data_provenance;
+            if (!dp) {
+                el.textContent = '';
+                return;
+            }
+            el.textContent =
+                'Analytics in the app shows engagement as one total per video so the same clip is not counted twice across accounts. '
+                + 'This page adds marketing signals, bills from hosting and partners, usage, and upload reliability for the same window.';
+        }
+
+        function renderAdminKpiHealth() {
+            const el = document.getElementById('adminKpiHealth');
+            if (!el) return;
+            const s = window._adminKpiHealthState || { status: 'idle', message: 'Updated: —' };
+            let color = 'var(--text-muted)';
+            if (s.status === 'ok') color = '#22c55e';
+            else if (s.status === 'loading') color = '#f59e0b';
+            else if (s.status === 'error') color = '#ef4444';
+            el.style.color = color;
+            el.textContent = s.message;
+        }
+
         window.refreshKPIsWithSync = async function() {
+            window._adminKpiHealthState = { status: 'loading', message: 'Syncing data…' };
+            renderAdminKpiHealth();
             const btn = document.getElementById('kpiRefreshBtn');
             if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Syncing...'; }
             try {
@@ -742,16 +911,17 @@
         };
 
         window.refreshKPIs = async function() {
+            window._adminKpiHealthState = { status: 'loading', message: 'Refreshing…' };
+            renderAdminKpiHealth();
             try {
                 const params = buildKpiParams();
 
-                const [raw, costsSummary, revenueSummary, usageSummary, reliabilitySummary, providerCosts] = await Promise.all([
+                const [raw, costsSummary, revenueSummary, usageSummary, reliabilitySummary] = await Promise.all([
                     window.apiCall('/api/admin/kpis?' + params).catch(() => ({})),
                     window.apiCall('/api/admin/kpi/costs?' + params).catch(() => null),
                     window.apiCall('/api/admin/kpi/revenue?' + params).catch(() => null),
                     window.apiCall('/api/admin/kpi/usage?' + params).catch(() => null),
                     window.apiCall('/api/admin/kpi/reliability?' + params).catch(() => null),
-                    window.apiCall('/api/admin/kpi/provider-costs').catch(() => null),
                 ]);
 
                 const merged = Object.assign({}, raw || {});
@@ -792,6 +962,15 @@
                     merged.platform_fail_rate  = merged.platform_fail_rate  || reliabilitySummary.failRates?.publish          || 0;
                 }
 
+                updateKPICards(merged);
+                renderDataProvenance(merged);
+
+                const [providerCosts, costTracker, marketingIntel] = await Promise.all([
+                    window.apiCall('/api/admin/kpi/provider-costs?' + params).catch(() => null),
+                    window.apiCall('/api/admin/kpi/cost-tracker?' + params).catch(() => null),
+                    window.apiCall('/api/admin/marketing/intel?' + params).catch(() => null),
+                ]);
+
                 // /api/admin/kpi/provider-costs (synced from external APIs + Render env var)
                 // These always win over DB-derived zeros — cost_tracking only has OpenAI rows.
                 if (providerCosts) {
@@ -809,16 +988,33 @@
                     if (providerCosts.stripe_fees     >= 0) merged.stripe_fees     = providerCosts.stripe_fees;
                     if (providerCosts.stripe_fee_txns  > 0) merged.stripe_fee_txns = providerCosts.stripe_fee_txns;
                 }
+                if (costTracker) {
+                    merged.tool_estimate_cost = costTracker.estimated_total_window_usd || 0;
+                    merged.tool_estimate_per_upload_usd = costTracker.estimated_total_per_upload_usd || 0;
+                    merged.tool_estimate_uploads = costTracker.successful_uploads || 0;
+                }
+                if (marketingIntel) {
+                    merged.sales_opportunity_levers = marketingIntel.sales_opportunity_levers || {};
+                    merged.marketing_funnel = marketingIntel.marketing_funnel || {};
+                    merged.promo_schedule_recommendations = marketingIntel.promo_schedule_recommendations || [];
+                    merged.recommended_comms_plan = marketingIntel.recommended_comms_plan || [];
+                }
 
                 updateKPICards(merged);
+                renderDataProvenance(merged);
 
                 await Promise.all([
                     loadLeaderboard(),
                     loadCountries(),
                     loadRecentUsers(),
+                    loadPikzelsV2UsageAdmin(),
                 ]);
+                window._adminKpiHealthState = { status: 'ok', message: 'Updated ' + new Date().toLocaleTimeString() };
+                renderAdminKpiHealth();
             } catch (e) {
                 console.error('KPI load error:', e);
+                window._adminKpiHealthState = { status: 'error', message: 'Could not load · ' + ((e && e.message) ? e.message : String(e)) };
+                renderAdminKpiHealth();
                 if (typeof window.showToast === 'function') window.showToast('Failed to load KPIs', 'error');
             }
         };
@@ -836,12 +1032,12 @@
                     '<div class="leaderboard-item">'
                     + '<div class="rank ' + (i < 3 ? 'rank-' + (i+1) : 'rank-default') + '">' + (i+1) + '</div>'
                     + '<div class="flex-1">'
-                    + '<div class="font-medium">' + (u.name || 'Unknown') + '</div>'
-                    + '<div class="text-xs text-secondary">' + (u.email || '') + '</div>'
+                    + '<div class="font-medium">' + um8Esc(u.name || 'Unknown') + '</div>'
+                    + '<div class="text-xs text-secondary">' + um8Esc(u.email || '') + '</div>'
                     + '</div>'
                     + '<div class="text-right">'
                     + '<div class="font-semibold">' + (sort === 'revenue' ? formatCurrency(u[sort]) : formatNumber(u[sort] || u.uploads)) + '</div>'
-                    + '<div class="text-xs text-secondary">' + sort + '</div>'
+                    + '<div class="text-xs text-secondary">' + um8Esc(sort) + '</div>'
                     + '</div>'
                     + '</div>'
                 )).join('');
@@ -861,7 +1057,7 @@
                 container.innerHTML = countries.slice(0, 10).map((c, i) => (
                     '<div class="leaderboard-item">'
                     + '<div class="rank ' + (i < 3 ? 'rank-' + (i+1) : 'rank-default') + '">' + (i+1) + '</div>'
-                    + '<div class="flex-1"><div class="font-medium">' + (c.name || c.code || 'Unknown') + '</div></div>'
+                    + '<div class="flex-1"><div class="font-medium">' + um8Esc(c.name || c.code || 'Unknown') + '</div></div>'
                     + '<div class="text-right"><div class="font-semibold">' + formatNumber(c.users || c.views || 0) + '</div><div class="text-xs text-secondary">users</div></div>'
                     + '</div>'
                 )).join('');
@@ -877,16 +1073,21 @@
                 container.innerHTML = '<div class="text-center py-4 text-secondary">No data</div>';
                 return;
             }
+            // Normalize: merge legacy 'launch' key into 'creator_lite'
+            const normalized = Object.assign({}, data);
+            if (!normalized.creator_lite && normalized.launch) {
+                normalized.creator_lite = normalized.launch;
+            }
             const tiers = [
                 {key:'free',label:'Free',color:'#6b7280'},
-                {key:'launch',label:'Launch',color:'#3b82f6'},
+                {key:'creator_lite',label:'Creator Lite',color:'#3b82f6'},
                 {key:'creator_pro',label:'Creator Pro',color:'#f97316'},
                 {key:'studio',label:'Studio',color:'#8b5cf6'},
                 {key:'agency',label:'Agency',color:'#ec4899'},
             ];
-            const total = Object.values(data).reduce((a,b) => a + (Number(b)||0), 0) || 1;
+            const total = Object.values(normalized).reduce((a,b) => a + (Number(b)||0), 0) || 1;
             container.innerHTML = tiers.map(t => {
-                const count = Number(data[t.key] || 0);
+                const count = Number(normalized[t.key] || 0);
                 const pct = ((count/total)*100).toFixed(1);
                 return (
                     '<div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem;">'
@@ -939,18 +1140,25 @@
                     tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-secondary">No recent signups</td></tr>';
                     return;
                 }
-                tbody.innerHTML = users.map(u => (
+                tbody.innerHTML = users.map(u => {
+                    const tier = u.subscription_tier || 'free';
+                    const st = u.status || 'active';
+                    const tierSlug = String(tier).replace(/[^a-z0-9_-]/gi, '') || 'free';
+                    const statusSlug = String(st).replace(/[^a-z0-9_-]/gi, '') || 'active';
+                    const initial = um8Esc((u.name || 'U').charAt(0).toUpperCase());
+                    return (
                     '<tr>'
                     + '<td><div style="display:flex;align-items:center;gap:0.5rem;">'
-                    + '<div class="user-avatar" style="width:30px;height:30px;font-size:0.75rem;">' + (u.name || 'U')[0].toUpperCase() + '</div>'
-                    + '<span>' + (u.name || 'Unknown') + '</span></div></td>'
-                    + '<td class="text-secondary">' + (u.email || '') + '</td>'
-                    + '<td><span class="badge ' + (u.subscription_tier || 'free') + '">' + (u.subscription_tier || 'free') + '</span></td>'
-                    + '<td><span class="badge ' + (u.status || 'active') + '">' + (u.status || 'active') + '</span></td>'
-                    + '<td class="text-secondary">' + formatRelativeTime(u.created_at) + '</td>'
+                    + '<div class="user-avatar" style="width:30px;height:30px;font-size:0.75rem;">' + initial + '</div>'
+                    + '<span>' + um8Esc(u.name || 'Unknown') + '</span></div></td>'
+                    + '<td class="text-secondary">' + um8Esc(u.email || '') + '</td>'
+                    + '<td><span class="badge ' + tierSlug + '">' + um8Esc(tier) + '</span></td>'
+                    + '<td><span class="badge ' + statusSlug + '">' + um8Esc(st) + '</span></td>'
+                    + '<td class="text-secondary">' + um8Esc(formatRelativeTime(u.created_at)) + '</td>'
                     + '<td class="text-center">' + (u.uploads_count || 0) + '</td>'
                     + '</tr>'
-                )).join('');
+                    );
+                }).join('');
             } catch (e) {
                 const tbody = document.getElementById('recentUsersBody');
                 if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-secondary">Failed to load</td></tr>';
@@ -961,7 +1169,7 @@
         async function authenticateUser() {
             // Single source of truth: app.js initApp() (calls /api/me)
             if (typeof window.initApp === 'function') {
-                await window.initApp('admin-kpi');
+                await window.initApp('admin-kpi', { forceAuthRefresh: false, skipWalletRefresh: true });
             }
 
             // Preferred: app.js exposes currentUser
@@ -996,14 +1204,47 @@
             const monthAgo = new Date(today); monthAgo.setDate(monthAgo.getDate() - 30);
             document.getElementById('endDate').value = today.toISOString().split('T')[0];
             document.getElementById('startDate').value = monthAgo.toISOString().split('T')[0];
+            customStart = document.getElementById('startDate').value;
+            customEnd = document.getElementById('endDate').value;
 
             document.getElementById('timeRange').onchange = handleTimeRangeChange;
             document.getElementById('leaderboardSort').onchange = loadLeaderboard;
+            updateActiveWindowLabel();
 
             initClickableCards();
             initDragAndDrop();
             loadSavedLayout();
             refreshKPIs();
+            loadThumbProviderIntegration();
+        }
+
+        async function loadPikzelsV2UsageAdmin() {
+            const node = document.getElementById('pikzelsV2UsageAdmin');
+            if (!node || typeof window.apiCall !== 'function') return;
+            try {
+                const d = await window.apiCall('/api/admin/kpi/pikzels-v2-usage?' + buildKpiParams());
+                const rows = (d && d.by_operation) || [];
+                const parts = rows.map(function (r) { return (r.op || '?') + ': ' + (r.count || 0); });
+                node.innerHTML = '<strong>' + (d.total_calls || 0) + '</strong> Studio actions this period · ' + (parts.length ? parts.join(' · ') : 'none yet');
+            } catch (e) {
+                node.textContent = 'Pikzels usage unavailable.';
+            }
+        }
+
+        async function loadThumbProviderIntegration() {
+            const el = document.getElementById('thumbProviderIntegration');
+            if (!el || typeof window.apiCall !== 'function') return;
+            try {
+                const d = await window.apiCall('/api/admin/integrations/thumbnail-provider');
+                const mode = (d.upload_pipeline_mode || '—').replace(/_/g, ' ');
+                const v2 = d.v2_api_key_configured ? 'Pikzels connection active' : 'Pikzels not configured (add the partner key on the server)';
+                const leg = d.legacy_one_shot_renderer_enabled ? 'classic single-image path on' : 'classic single-image path off';
+                el.innerHTML = '<i class="fas fa-plug text-orange"></i> '
+                    + v2 + ' · ' + leg + ' · upload flow: <span style="font-size:0.75rem;">' + mode + '</span>. '
+                    + 'Thumbnail Studio talks to Pikzels through UploadM8; usage is counted in the section below.';
+            } catch (e) {
+                el.textContent = '';
+            }
         }
 
         (async function bootstrap() {

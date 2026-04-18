@@ -43,15 +43,24 @@ import asyncio
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+from core.helpers import sanitize_hashtag_body
+
 import httpx
 
 from .errors import SkipStage, StageError, ErrorCode
 from .context import JobContext
+from .ai_service_costs import user_pref_ai_service_enabled
 
 logger = logging.getLogger("uploadm8-worker.caption")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL_DEFAULT = os.environ.get("OPENAI_CAPTION_MODEL", "gpt-4o-mini")
+
+# M8_ENGINE path: scene graph + user-seeded content_strategy → OpenAI JSON → rank → ctx.
+# Set UPLOADM8_M8_CAPTION_ENGINE=false to force the legacy single-prompt narrative path only.
+_USE_M8_CAPTION_ENGINE = os.environ.get("UPLOADM8_M8_CAPTION_ENGINE", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 
 # Pricing per 1K tokens (gpt-4o-mini defaults; gpt-4o is ~10x)
 COST_PER_1K_INPUT  = 0.000150
@@ -481,32 +490,74 @@ _CATEGORY_PRIORITY = [
 ]
 
 
-# High-level "voices" / personalities for caption delivery.
-# Users can pick these via captionVoice / caption_voice in their preferences.
+# Caption energy / register (user captionTone). Topic-agnostic: jargon and
+# examples must always come from visible content + transcript, not from a
+# assumed niche.
+TONE_DIRECTIVES: Dict[str, str] = {
+    "hype": (
+        "High momentum and conviction: strong verbs, tight clauses, forward pull. "
+        "You may use emphatic punctuation sparingly. "
+        "Scale intensity to the subject—finance, grief, or slow crafts get "
+        "'quiet hype' (urgent clarity) rather than party-bro shouting. "
+        "Never invent stakes or drama not supported by the video."
+    ),
+    "calm": (
+        "Measured, breathable pacing; let concrete details do the work. "
+        "Prefer understatement over exclamation. "
+        "Works for any subject: tutorials, newsy explainers, intimate vlogs, "
+        "technical demos—same cool, trustworthy register."
+    ),
+    "cinematic": (
+        "Scene-led, sensory language: light, shadow, motion, scale, texture—only "
+        "what the frames support. Present tense where it heightens immediacy. "
+        "Trailer-like rhythm without melodrama or clichés that could apply to "
+        "any video; every line should tether to something visible or said."
+    ),
+    "authentic": (
+        "Human, direct, first-person or close second-person; plain words over "
+        "marketing speak. "
+        "Sound like a real person in any niche—parenting, code, sports, "
+        "small business—without filler ('okay guys', 'here's the thing' spam). "
+        "One honest observation beats a generic hook."
+    ),
+}
+
+# High-level speaker persona (user captionVoice). Static prose instructions only.
+# Must adapt vocabulary to the actual topic; persona is delivery, not a fake niche.
 VOICE_PROFILES: Dict[str, str] = {
     "default": (
-        "Balanced, high-signal storytelling. Sounds like a creator who "
-        "knows their audience well — confident but not shouty."
+        "Balanced creator voice: clear hook, specific middle, satisfying close. "
+        "Confident but not performative; match slang and terminology to what "
+        "the content actually is (chef terms for food, dev terms for code, etc.)."
     ),
     "mentor": (
-        "Supportive, experienced mentor. Speaks directly to the viewer as "
-        "a guide, with clear takeaways and calm confidence."
+        "Experienced guide: 'you'-oriented, encouraging, zero condescension. "
+        "Implied expertise through specifics, not credentials flex. "
+        "End with a usable takeaway when the video teaches or demonstrates something."
     ),
     "hypebeast": (
-        "Max energy, hype, slang-forward where appropriate. Short punchy "
-        "sentences, built to spike excitement without sounding fake."
+        "Peak short-form energy: clipped sentences, rhythm, occasional bold word "
+        "choice—still believable. "
+        "Slang only if it fits the subject and platform; avoid empty viral filler. "
+        "Excitement must trace back to what is literally on screen or in audio."
     ),
     "best_friend": (
-        "Warm, honest, slightly chaotic best friend energy. First-person, "
-        "casual, occasionally self-deprecating, very relatable."
+        "Warm, unfiltered peer: conversational fragments OK, light humor if "
+        "the content allows. "
+        "Self-aware without derailing; relatable across any hobby or life slice. "
+        "Never mean-spirited or faux-chaos."
     ),
     "teacher": (
-        "Clear and structured educator. Breaks ideas into steps, avoids "
-        "fluff, and focuses on one key insight per caption."
+        "Educator clarity: one central idea, logical mini-arc, minimal jargon "
+        "unless the audience clearly expects it from the visuals. "
+        "If the clip is not instructional, still be precise—teach what "
+        "happened or what to notice, not a life lesson unrelated to the footage."
     ),
     "cinematic_narrator": (
-        "Film-trailer narrator voice. Descriptive, visual, and dramatic, "
-        "like a voiceover to a movie trailer."
+        "Third-person or omniscient trailer voice: declarative, image-stacking, "
+        "slightly elevated register. "
+        "Still anchored to real events in the clip—no epic narration of "
+        "nothing happening. Save flourish for genuine peaks in the footage."
     ),
 }
 
@@ -777,17 +828,9 @@ def _build_narrative_prompt(
         )
     tasks_block = "\n".join(tasks) if tasks else "(none requested)"
 
-    # ── Tone: user pref overrides category default ───────────────────────────
-    tone_instruction = {
-        "hype":      "Energy is HIGH. Power words, exclamation, urgency. Stop the scroll.",
-        "calm":      "Measured and confident. Let the footage speak. Understated cool.",
-        "cinematic": "Poetic, atmospheric. Paint a picture with words. Film trailer voiceover.",
-        "authentic": "Real talk, first-person, no fluff. Like texting a friend.",
-    }.get(caption_tone) or CONTENT_CATEGORIES.get(
-        category, CONTENT_CATEGORIES["general"]
-    ).get("tone", "Engaging and authentic.")
+    # ── Tone + voice (user prefs): composable layers on top of category context
+    tone_instruction = TONE_DIRECTIVES.get(caption_tone) or TONE_DIRECTIVES["authentic"]
 
-    # ── Voice profile: higher-level personality on top of tone ───────────────
     us = getattr(ctx, "user_settings", None) or {}
     voice_key = str(us.get("captionVoice") or us.get("caption_voice") or "default").lower()
     if voice_key not in VOICE_PROFILES:
@@ -805,11 +848,16 @@ def _build_narrative_prompt(
             f"energy level, branding, skill level. Use ALL of it. "
             f"Generic = buried. Specific = algorithmic lift."
         )
-    else:
+    elif num_frames == 1:
         frame_instruction = (
             "You are being shown 1 frame. "
             "Identify everything visible: environment, subject, activity, products, energy, "
             "branding, skill level. Use all visible signals for specific content."
+        )
+    else:
+        frame_instruction = (
+            "No video frames are attached. Rely on the spoken transcript (if any), filename, "
+            "user hints, and telemetry/context blocks only. Do not invent on-screen visuals."
         )
 
     # ── Context block ────────────────────────────────────────────────────────
@@ -854,6 +902,86 @@ def _build_narrative_prompt(
     # ── Category context block ────────────────────────────────────────────────
     category_block = _build_category_context_block(category, ctx.location_name)
 
+    raw_tx = getattr(ctx, "ai_transcript", None)
+    transcript_block = ""
+    if raw_tx and str(raw_tx).strip():
+        transcript_block = (
+            "\n━━ SPOKEN CONTENT (speech-to-text — factual; do not contradict) ━━\n"
+            f"{str(raw_tx).strip()[:6000]}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    vision_block = ""
+    vc = getattr(ctx, "vision_context", None) or {}
+    if isinstance(vc, dict) and vc and not vc.get("skipped"):
+        bits: List[str] = []
+        ocr = (vc.get("ocr_text") or "").strip()
+        if ocr:
+            bits.append(f"On-screen / OCR text: {ocr[:900]}")
+        labels = vc.get("label_names") or []
+        if labels:
+            bits.append("Scene labels: " + ", ".join(str(x) for x in labels[:22]))
+        fc = vc.get("face_count")
+        if fc:
+            bits.append(f"Approx. faces in sampled frame: {fc}")
+        lm = vc.get("landmark_names") or []
+        if isinstance(lm, list) and lm:
+            bits.append("Landmarks (Google Vision): " + ", ".join(str(x) for x in lm[:8]))
+        logos = vc.get("logo_names") or []
+        if isinstance(logos, list) and logos:
+            bits.append("Logos / brands (Google Vision): " + ", ".join(str(x) for x in logos[:8]))
+        if bits:
+            vision_block = (
+                "\n━━ FRAME INSPECTOR (Google Vision — sampled frame) ━━\n"
+                + "\n".join(bits)
+                + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+
+    scene_understanding_block = ""
+    vu = getattr(ctx, "video_understanding", None) or {}
+    if isinstance(vu, dict) and (vu.get("scene_description") or vu.get("title_suggestion")):
+        sd = str(vu.get("scene_description") or "").strip()
+        ts = str(vu.get("title_suggestion") or "").strip()
+        scene_understanding_block = (
+            "\n━━ SCENE UNDERSTANDING (full video) ━━\n"
+            f"{sd[:4000]}\n"
+            + (f"Suggested title angle: {ts}\n" if ts else "")
+            + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    video_intel_block = ""
+    vi_ctx = getattr(ctx, "video_intelligence_context", None) or {}
+    if isinstance(vi_ctx, dict) and not vi_ctx.get("error"):
+        summary = (vi_ctx.get("summary_text") or "").strip()
+        if summary:
+            video_intel_block = (
+                f"\n━━ VIDEO ANALYZER (full clip — labels) ━━\n{summary[:2200]}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+
+    audio_enrich_block = ""
+    ac = getattr(ctx, "audio_context", None) or {}
+    if isinstance(ac, dict):
+        gas = (ac.get("gpt_audio_summary") or "").strip()
+        if gas:
+            audio_enrich_block += (
+                f"\n━━ AUDIO CONTENT SUMMARY ━━\n{gas[:1200]}\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+        he = ac.get("hume_emotions")
+        if isinstance(he, dict) and he.get("dominant_emotion"):
+            audio_enrich_block += (
+                f"\n━━ VOCAL EMOTION SIGNALS ━━\nDominant: {he.get('dominant_emotion')} "
+                f"(score {he.get('dominant_score', '')}); intensity: {he.get('emotional_intensity', '')}\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+        yev = ac.get("yamnet_events")
+        if isinstance(yev, list) and yev:
+            audio_enrich_block += (
+                "\n━━ AUDIO EVENTS ━━\n"
+                + ", ".join(str(x) for x in yev[:16])
+                + "\n━━━━━━━━━━━━━━━━━\n"
+            )
+
     # ── Trill beat ───────────────────────────────────────────────────────────
     trill_beat = _build_trill_beat(ctx)
     trill_section = f"\n\n{trill_beat}" if trill_beat else ""
@@ -870,12 +998,18 @@ def _build_narrative_prompt(
 
 {frame_instruction}
 {memory_block}
-{category_block}{trill_section}
+{category_block}{transcript_block}{vision_block}{scene_understanding_block}{video_intel_block}{audio_enrich_block}{trill_section}
 
-TONE DIRECTIVE: {tone_instruction}
-VOICE PROFILE: {voice_key.upper()} — {voice_instruction}
+TONE DIRECTIVE ({caption_tone.upper()}): {tone_instruction}
+VOICE PROFILE ({voice_key.upper()}): {voice_instruction}
 CAPTION STYLE: {caption_style.upper()} — follow this style strictly.
 {f"PLATFORM NOTE: {platform_note}" if platform_note else ""}
+
+HOW TONE + VOICE + CATEGORY FIT TOGETHER:
+- Category block above = subject vocabulary, hook patterns, and hashtag seeds for the detected vertical (or general).
+- Tone = energy, pacing, and emotional register.
+- Voice = who is speaking (persona and sentence habits).
+- All three must agree with what is actually visible or said. If category tone and user tone differ, keep user tone and voice for delivery but pull facts and niche words only from evidence—never force a vertical that the footage does not support.
 
 Generate the following for this video:
 {tasks_block}
@@ -885,7 +1019,7 @@ Context:
 
 Rules:
 - Content must feel AUTHENTIC — not AI-generated
-- NEVER invent events, locations, or narratives not shown in the video. Base caption ONLY on what is visible in the frames.
+- NEVER invent events, locations, or narratives not supported by the frames, transcript, or telemetry provided. If no frames: do not claim specific visuals.
 - ACCURACY OVER ENGAGEMENT: Do NOT use clickbait patterns ("Nobody expected", "You need to see this", "The secret nobody tells you"). Describe what is actually shown. Hooks must reflect visible content — never overpromise or mislead.
 - Hook in the first 3 words for short-form platforms
 - Use emojis sparingly (1–3 max)
@@ -987,16 +1121,14 @@ async def _call_openai(
 
                 cleaned: List[str] = []
                 for tag in raw_tags:
-                    tag = str(tag).strip().lstrip("#").lower()
-                    if len(tag) < 2:
+                    tag = str(tag).strip()
+                    if not tag:
                         continue
-                    if " " in tag:
-                        for part in tag.split():
-                            p = part.lstrip("#").lower()
-                            if len(p) >= 2:
-                                cleaned.append(p)
-                    else:
-                        cleaned.append(tag)
+                    parts = tag.split() if " " in tag else [tag]
+                    for part in parts:
+                        body = sanitize_hashtag_body(part)
+                        if len(body) >= 2:
+                            cleaned.append(body)
 
                 result["hashtags"] = cleaned[:hashtag_count]
                 logger.info(f"AI hashtags raw ({len(result['hashtags'])}): {result['hashtags']}")
@@ -1027,16 +1159,20 @@ def _finalise_hashtags(
     Order: base_tags (always_hashtags + preset) FIRST, then AI additions.
     Blocked tags are filtered from every position in the merged list.
     """
-    blocked_set = {t.lower().lstrip("#") for t in (blocked or [])}
+    blocked_set: set = set()
+    for t in blocked or []:
+        b = sanitize_hashtag_body(str(t))
+        if b:
+            blocked_set.add(b)
     seen: set = set()
     merged: List[str] = []
 
     for tag in list(base_tags or []) + list(ai_tags or []):
-        t = str(tag).strip().lstrip("#").lower()
-        if not t or t in seen or t in blocked_set:
+        body = sanitize_hashtag_body(tag)
+        if not body or body in seen or body in blocked_set:
             continue
-        seen.add(t)
-        merged.append(f"#{t}" if not str(tag).startswith("#") else str(tag))
+        seen.add(body)
+        merged.append(f"#{body}")
 
     return merged[:max_total]
 
@@ -1083,6 +1219,9 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
 
     us = ctx.user_settings or {}
 
+    if not user_pref_ai_service_enabled(us, "caption_llm", default=True):
+        raise SkipStage("Caption writer disabled (aiServiceCaptionWriter=false)")
+
     # ── User preference toggles ──────────────────────────────────────────────
     generate_caption  = bool(us.get("autoCaptions") or us.get("auto_captions") or False)
     generate_title    = generate_caption
@@ -1093,6 +1232,12 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         generate_title   = generate_caption
     if us.get("auto_generate_hashtags") is not None:
         generate_hashtags = bool(us["auto_generate_hashtags"])
+
+    # Upload-page title/caption are authoritative: do not spend tokens replacing them.
+    if (ctx.title or "").strip():
+        generate_title = False
+    if (ctx.caption or "").strip():
+        generate_caption = False
 
     if not (generate_title or generate_caption or generate_hashtags):
         raise SkipStage("AI generation not enabled by user settings")
@@ -1106,14 +1251,33 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
     if caption_tone not in ("hype", "calm", "cinematic", "authentic"):
         caption_tone = "authentic"
 
+    caption_voice = str(us.get("captionVoice") or us.get("caption_voice") or "default").lower()
+    if caption_voice not in (
+        "default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator",
+    ):
+        caption_voice = "default"
+
     hashtag_style = str(us.get("aiHashtagStyle") or us.get("ai_hashtag_style") or "mixed").lower()
-    if hashtag_style not in ("trending", "niche", "mixed"):
+    if hashtag_style not in (
+        "lowercase",
+        "capitalized",
+        "camelcase",
+        "mixed",
+        "trending",
+        "niche",
+    ):
         hashtag_style = "mixed"
 
-    pref_max = int(
-        us.get("aiHashtagCount") or us.get("ai_hashtag_count") or
-        us.get("maxHashtags") or us.get("max_hashtags") or 15
-    )
+    # "Number of AI Hashtags" — prefer ai_hashtag_count; fall back to max_hashtags for legacy rows.
+    try:
+        raw_n = us.get("aiHashtagCount")
+        if raw_n is None:
+            raw_n = us.get("ai_hashtag_count")
+        if raw_n is None or (isinstance(raw_n, str) and not str(raw_n).strip()):
+            raw_n = us.get("maxHashtags") or us.get("max_hashtags")
+        pref_max = int(raw_n or 5)
+    except (TypeError, ValueError):
+        pref_max = 5
     pref_max = max(1, min(pref_max, 50))
     hashtag_count = pref_max if generate_hashtags else 0
 
@@ -1125,6 +1289,8 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         us.get("captionFrameCount") or us.get("caption_frame_count") or max_caption_frames
     )
     num_frames = max(2, min(min(user_frame_count, max_caption_frames), 12))
+    if not user_pref_ai_service_enabled(us, "vision_google", default=True):
+        num_frames = 0
 
     # ── Detect content category (3-layer: hint → filename → general) ─────────
     category = _detect_content_category(ctx)
@@ -1141,8 +1307,8 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
 
     logger.info(
         f"Caption stage: category={category}, style={caption_style}, tone={caption_tone}, "
-        f"hashtag_style={hashtag_style}, count={hashtag_count}, "
-        f"model={model}, frames={num_frames}"
+        f"voice={caption_voice}, hashtag_style={hashtag_style}, count={hashtag_count}, "
+        f"model={model}, frames={num_frames}, m8_engine={_USE_M8_CAPTION_ENGINE}"
     )
 
     # ── Read hashtag enforcement settings ────────────────────────────────────
@@ -1157,72 +1323,166 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
     blocked_tags: List[str] = list(raw_blocked) if isinstance(raw_blocked, list) else []
 
     try:
+        from .content_strategy import build_content_strategy
+
+        strategy = build_content_strategy(
+            ctx,
+            category=category,
+            user_caption_style=caption_style,
+            user_caption_tone=caption_tone,
+            user_caption_voice=caption_voice,
+        )
+
         # ── Collect story frames ─────────────────────────────────────────────
         frames = await _collect_story_frames(ctx, num_frames)
         if not frames:
             logger.warning("No frames available — generating captions without visual context")
 
-        # ── Build prompt (category-aware) ─────────────────────────────────────
-        prompt = _build_narrative_prompt(
-            ctx=ctx,
-            num_frames=len(frames),
-            generate_title=generate_title,
-            generate_caption=generate_caption,
-            generate_hashtags=generate_hashtags,
-            hashtag_count=hashtag_count,
-            caption_style=caption_style,
-            caption_tone=caption_tone,
-            hashtag_style=hashtag_style,
-            category=category,
-        )
+        used_m8 = False
+        if _USE_M8_CAPTION_ENGINE:
+            try:
+                from .m8_engine import run_m8_caption_engine
 
-        # ── Call OpenAI ──────────────────────────────────────────────────────
-        result = await _call_openai(
-            frames=frames,
-            prompt=prompt,
-            model=model,
-            hashtag_count=hashtag_count,
-        )
+                meta = await run_m8_caption_engine(
+                    ctx,
+                    frames=frames,
+                    category=category,
+                    caption_style=caption_style,
+                    caption_tone=caption_tone,
+                    hashtag_style=hashtag_style,
+                    hashtag_count=hashtag_count,
+                    generate_title=generate_title,
+                    generate_caption=generate_caption,
+                    generate_hashtags=generate_hashtags,
+                    model=model,
+                    blocked_tags=blocked_tags,
+                    always_tags=always_tags,
+                    base_tags=list(ctx.hashtags or []),
+                    db_pool=db_pool,
+                    strategy=strategy,
+                )
+                if meta.get("ok"):
+                    used_m8 = True
+                    tok = meta.get("tokens") or {}
+                    logger.info(
+                        "M8 caption engine: prompt=%s completion=%s category=%s",
+                        tok.get("prompt", 0),
+                        tok.get("completion", 0),
+                        category,
+                    )
+                    if generate_hashtags:
+                        logger.info(
+                            "AI hashtags finalised (%s): %s",
+                            len(ctx.ai_hashtags or []),
+                            ctx.ai_hashtags,
+                        )
+                else:
+                    logger.warning(
+                        "M8 caption engine failed (%s); falling back to legacy narrative prompt",
+                        meta.get("error"),
+                    )
+            except Exception as m8_err:
+                logger.warning(
+                    "M8 caption path error: %s; falling back to legacy narrative prompt",
+                    m8_err,
+                )
 
-        # ── Apply results ────────────────────────────────────────────────────
-        if result.get("title") and generate_title:
-            ctx.ai_title = result["title"]
-            logger.info(f"AI title: {ctx.ai_title[:80]}")
-
-        if result.get("caption") and generate_caption:
-            ctx.ai_caption = result["caption"]
-            logger.info(f"AI caption: {ctx.ai_caption[:80]}")
-
-        if generate_hashtags:
-            ai_raw = result.get("hashtags") or []
-
-            # ── FIX ISSUE 3: _finalise_hashtags() IS NOW CALLED ──────────────
-            # Previously this function existed but was never invoked, allowing
-            # blocked hashtags to appear in every published post.
-            # Now: blocked tags filtered out, always_hashtags merged in first.
-            ctx.ai_hashtags = _finalise_hashtags(
-                ai_tags=ai_raw,
-                base_tags=list(ctx.hashtags or []) + always_tags,
-                blocked=blocked_tags,
-                max_total=pref_max,
+        if not used_m8:
+            # ── Legacy: single category-aware narrative prompt ───────────────
+            prompt = _build_narrative_prompt(
+                ctx=ctx,
+                num_frames=len(frames),
+                generate_title=generate_title,
+                generate_caption=generate_caption,
+                generate_hashtags=generate_hashtags,
+                hashtag_count=hashtag_count,
+                caption_style=caption_style,
+                caption_tone=caption_tone,
+                hashtag_style=hashtag_style,
+                category=category,
             )
+
+            result = await _call_openai(
+                frames=frames,
+                prompt=prompt,
+                model=model,
+                hashtag_count=hashtag_count,
+            )
+
+            if result.get("title") and generate_title:
+                ctx.ai_title = result["title"]
+                logger.info(f"AI title: {ctx.ai_title[:80]}")
+
+            if result.get("caption") and generate_caption:
+                ctx.ai_caption = result["caption"]
+                logger.info(f"AI caption: {ctx.ai_caption[:80]}")
+
+            if generate_hashtags:
+                ai_raw = result.get("hashtags") or []
+                ctx.ai_hashtags = _finalise_hashtags(
+                    ai_tags=ai_raw,
+                    base_tags=list(ctx.hashtags or []) + always_tags,
+                    blocked=blocked_tags,
+                    max_total=pref_max,
+                )
+                logger.info(
+                    f"AI hashtags finalised ({len(ctx.ai_hashtags)}): {ctx.ai_hashtags}"
+                )
+
+            tokens_used = result.get("tokens", {})
+            cost = _estimate_cost(tokens_used, len(frames))
             logger.info(
-                f"AI hashtags finalised ({len(ctx.ai_hashtags)}): {ctx.ai_hashtags}"
+                f"OpenAI usage (legacy path): prompt={tokens_used.get('prompt', 0)}, "
+                f"completion={tokens_used.get('completion', 0)}, "
+                f"cost=${cost:.4f}, category={category}"
             )
 
-        tokens_used = result.get("tokens", {})
-        cost = _estimate_cost(tokens_used, len(frames))
-        logger.info(
-            f"OpenAI usage: prompt={tokens_used.get('prompt', 0)}, "
-            f"completion={tokens_used.get('completion', 0)}, "
-            f"cost=${cost:.4f}, category={category}"
+        # ── Content attribution (settings snapshot → output_artifacts + DB) ──
+        from core.content_attribution import (
+            build_content_attribution_snapshot,
+            collect_hashtag_slugs_for_attribution,
+            content_attribution_strategy_key,
         )
+
+        _ht_slugs = collect_hashtag_slugs_for_attribution(ctx)
+        if ctx.ai_title or ctx.ai_caption or ctx.ai_hashtags or _ht_slugs:
+            try:
+                snap = build_content_attribution_snapshot(
+                    user_settings=us,
+                    strategy=strategy,
+                    category=category,
+                    used_m8_engine=used_m8,
+                    caption_style_ui=caption_style,
+                    caption_tone_ui=caption_tone,
+                    caption_voice_ui=caption_voice,
+                    hashtag_style=hashtag_style,
+                    hashtag_count=hashtag_count if generate_hashtags else 0,
+                    caption_frame_count=num_frames,
+                    generate_hashtags=generate_hashtags,
+                    output_artifacts=dict(ctx.output_artifacts or {}),
+                    hashtag_slugs_used=_ht_slugs,
+                )
+                ctx.output_artifacts["content_attribution_v1"] = json.dumps(snap)
+                ctx.output_artifacts["content_attribution_key"] = content_attribution_strategy_key(snap)
+                if db_pool:
+                    from . import db as _db_stage
+
+                    await _db_stage.merge_job_output_artifacts_strings(
+                        db_pool,
+                        str(ctx.upload_id),
+                        {
+                            "content_attribution_v1": ctx.output_artifacts["content_attribution_v1"],
+                            "content_attribution_key": ctx.output_artifacts["content_attribution_key"],
+                        },
+                    )
+            except Exception as attr_err:
+                logger.debug("content attribution: %s", attr_err)
 
         # ── Persist into caption memory for future few-shot retrieval ────────
         if db_pool and (ctx.ai_title or ctx.ai_caption or ctx.ai_hashtags):
             try:
                 from . import db as _db_stage
-                _voice = str(us.get("captionVoice") or us.get("caption_voice") or "")
+                _voice = caption_voice
                 await _db_stage.insert_caption_memory(
                     db_pool,
                     str(ctx.user_id),

@@ -30,67 +30,42 @@
 (function () {
     'use strict';
 
-    /* ── Tier data ─────────────────────────────────────────────── */
-    var TIERS = [
-        {
-            slug: 'free', name: 'Free', price: '$0', color: '#9ca3af',
-            put: 60, aic: 10, accounts: 4,
-            feats: ['4 platform accounts','Basic analytics'],
-            missing: ['AI captions','Scheduling','HUD overlay','Priority queue','Webhooks'],
-        },
-        {
-            slug: 'creator_lite', name: 'Creator Lite', price: '$9.99/mo',
-            color: '#f97316', put: 300, aic: 80, accounts: 8,
-            lookupKey: 'uploadm8_creatorlite_monthly',
-            trial: '7-day free trial',
-            feats: ['8 accounts (2/platform)','AI captions','Scheduling','3 thumbnails','Styled thumbnails','Webhooks','Standard analytics'],
-            missing: ['HUD overlay','AI thumbnail styling','Priority queue','Excel export'],
-        },
-        {
-            slug: 'creator_pro', name: 'Creator Pro', price: '$19.99/mo',
-            color: '#8b5cf6', put: 700, aic: 200, accounts: 20,
-            lookupKey: 'uploadm8_creatorpro_monthly',
-            trial: '7-day free trial',
-            feats: ['20 accounts (5/platform)','Advanced AI','HUD overlay','Priority queue (p2)','5 thumbnails','Styled + AI thumbnails','3 team seats'],
-            missing: ['Excel export','White label','Flex transfers'],
-        },
-        {
-            slug: 'studio', name: 'Studio', price: '$49.99/mo',
-            color: '#3b82f6', put: 2000, aic: 600, accounts: 60,
-            lookupKey: 'uploadm8_studio_monthly',
-            trial: '7-day free trial',
-            feats: ['60 accounts','Max AI (15 frames)','Excel export','Turbo queue (p1)','10 team seats','Full analytics'],
-            missing: ['White label','Flex transfers'],
-        },
-        {
-            slug: 'agency', name: 'Agency', price: '$99.99/mo',
-            color: '#22c55e', put: 4500, aic: 1500, accounts: 9999,
-            lookupKey: 'uploadm8_agency_monthly',
-            trial: '7-day free trial',
-            feats: ['Unlimited accounts','Max AI','White label','Top priority (p0)','Flex transfers','25 team seats'],
-            missing: [],
-        },
-    ];
-
+    /* ── Tier data (filled from UploadM8TierCatalog after /api/entitlements/tiers) ─ */
+    var TIERS = [];
     var TIER_BY_SLUG = {};
-    TIERS.forEach(function (t) { TIER_BY_SLUG[t.slug] = t; });
-    TIER_BY_SLUG['launch'] = TIER_BY_SLUG['creator_lite'];
+
+    function rebuildUpgradeTiers() {
+        var TC = window.UploadM8TierCatalog;
+        if (!TC || typeof TC.upgradeModalTiers !== 'function') return;
+        TIERS = TC.upgradeModalTiers();
+        TIER_BY_SLUG = {};
+        TIERS.forEach(function (t) { TIER_BY_SLUG[t.slug] = t; });
+    }
+
+    function ensureUpgradeTiersLoaded() {
+        if (TIERS.length) return Promise.resolve();
+        var TC = window.UploadM8TierCatalog;
+        if (!TC || typeof TC.load !== 'function') return Promise.resolve();
+        return TC.load()
+            .then(function () { rebuildUpgradeTiers(); })
+            .catch(function (e) { console.warn('[upgrade-modal] tier catalog', e); });
+    }
 
     /* ── Reason → copy map ─────────────────────────────────────── */
     var REASON_COPY = {
-        insufficient_put:    { icon: '⚡', headline: 'Out of upload tokens (PUT)', sub: 'You\'ve used all your PUT tokens for this billing period. Upgrade for more, or buy a top-up pack.' },
-        insufficient_aic:    { icon: '🤖', headline: 'Out of AI credits (AIC)',    sub: 'You\'ve used all your AI credits. Upgrade your plan or buy an AIC top-up pack.' },
-        account_limit:       { icon: '🔌', headline: 'Account limit reached',       sub: 'You\'ve connected the maximum number of social accounts for your plan.' },
-        queue_limit:         { icon: '📋', headline: 'Queue limit reached',          sub: 'You have too many pending uploads. Upgrade for a larger queue depth.' },
-        feature_schedule:    { icon: '📅', headline: 'Scheduling is a paid feature', sub: 'Schedule uploads in advance with Creator Lite or higher.' },
-        feature_ai:          { icon: '🤖', headline: 'AI captions require a paid plan', sub: 'Get AI-powered captions, hashtags, and descriptions with Creator Lite+.' },
-        feature_hud:         { icon: '🎬', headline: 'HUD overlay requires Creator Pro', sub: 'Burn custom overlays and branding into your videos with Creator Pro+.' },
-        feature_analytics:   { icon: '📊', headline: 'Full analytics require a paid plan', sub: 'Unlock views, likes, and engagement tracking across all platforms.' },
-        feature_excel:       { icon: '📑', headline: 'Excel export requires Studio', sub: 'Download full analytics reports as formatted Excel files.' },
-        feature_webhooks:    { icon: '🔔', headline: 'Webhooks require Creator Lite', sub: 'Get notified via webhook when uploads complete.' },
-        feature_white_label: { icon: '🏷️', headline: 'White label requires Agency', sub: 'Remove all UploadM8 branding for your clients.' },
-        feature_styled_thumbnails: { icon: '🖼️', headline: 'Styled thumbnails require Creator Lite', sub: 'Add text, badges, and overlays to thumbnails (MrBeast-style) with Creator Lite+.' },
-        feature_ai_thumbnail:      { icon: '✨', headline: 'AI thumbnail styling requires Creator Pro', sub: 'Use AI to enhance thumbnails with props and styling. Creator Pro+ only.' },
+        insufficient_put:    { icon: '', headline: 'Out of upload tokens (PUT)', sub: 'You\'ve used all your PUT tokens for this billing period. Upgrade for more, or buy a top-up pack.' },
+        insufficient_aic:    { icon: '', headline: 'Out of AI credits (AIC)',    sub: 'You\'ve used all your AI credits. Upgrade your plan or buy an AIC top-up pack.' },
+        account_limit:       { icon: '', headline: 'Account limit reached',       sub: 'You\'ve connected the maximum number of social accounts for your plan.' },
+        queue_limit:         { icon: '', headline: 'Queue limit reached',          sub: 'You have too many pending uploads. Upgrade for a larger queue depth.' },
+        feature_schedule:    { icon: '', headline: 'Scheduling is a paid feature', sub: 'Schedule uploads in advance with Creator Lite or higher.' },
+        feature_ai:          { icon: '', headline: 'AI captions require a paid plan', sub: 'Get AI-powered captions, hashtags, and descriptions with Creator Lite+.' },
+        feature_hud:         { icon: '', headline: 'HUD overlay requires Creator Pro', sub: 'Burn custom overlays and branding into your videos with Creator Pro+.' },
+        feature_analytics:   { icon: '', headline: 'Full analytics require a paid plan', sub: 'Unlock views, likes, and engagement tracking across all platforms.' },
+        feature_excel:       { icon: '', headline: 'Excel export requires Studio', sub: 'Download full analytics reports as formatted Excel files.' },
+        feature_webhooks:    { icon: '', headline: 'Webhooks require Creator Lite', sub: 'Get notified via webhook when uploads complete.' },
+        feature_white_label: { icon: '️', headline: 'White label requires Agency', sub: 'Remove all UploadM8 branding for your clients.' },
+        feature_styled_thumbnails: { icon: '️', headline: 'Styled thumbnails require Creator Lite', sub: 'Add text, badges, and overlays to thumbnails (MrBeast-style) with Creator Lite+.' },
+        feature_ai_thumbnail:      { icon: '', headline: 'AI thumbnail styling requires Creator Pro', sub: 'Use AI to enhance thumbnails with props and styling. Creator Pro+ only.' },
     };
 
     /* ── Required tier per feature ─────────────────────────────── */
@@ -113,36 +88,67 @@
     /* ── Topup packs ───────────────────────────────────────────── */
     var TOPUP_PACKS = {
         put: [
-            { key: 'uploadm8_put_50',   label: '50 PUT',     price: '$2.99' },
-            { key: 'uploadm8_put_100',  label: '100 PUT',    price: '$4.99' },
-            { key: 'uploadm8_put_250',  label: '250 PUT',    price: '$9.99',  best: true },
-            { key: 'uploadm8_put_1000', label: '1,000 PUT',  price: '$29.99' },
+            { key: 'uploadm8_put_250',  label: '250 PUT',    price: '$4.99' },
+            { key: 'uploadm8_put_500',  label: '500 PUT',    price: '$8.99' },
+            { key: 'uploadm8_put_1000', label: '1,000 PUT',  price: '$14.99' },
+            { key: 'uploadm8_put_2500', label: '2,500 PUT',  price: '$29.99', best: true },
+            { key: 'uploadm8_put_5000', label: '5,000 PUT',  price: '$49.99' },
         ],
         aic: [
-            { key: 'uploadm8_aic_100',  label: '100 AIC',    price: '$3.99' },
-            { key: 'uploadm8_aic_250',  label: '250 AIC',    price: '$7.99',  best: true },
-            { key: 'uploadm8_aic_500',  label: '500 AIC',    price: '$14.99' },
-            { key: 'uploadm8_aic_2500', label: '2,500 AIC',  price: '$49.99' },
+            { key: 'uploadm8_aic_500',   label: '500 AIC',    price: '$4.99' },
+            { key: 'uploadm8_aic_1000',  label: '1,000 AIC',  price: '$8.99' },
+            { key: 'uploadm8_aic_2500',  label: '2,500 AIC',  price: '$18.99' },
+            { key: 'uploadm8_aic_5000',  label: '5,000 AIC',  price: '$34.99', best: true },
+            { key: 'uploadm8_aic_10000', label: '10,000 AIC', price: '$59.99' },
         ],
     };
 
     /* ── Helpers ───────────────────────────────────────────────── */
     function currentTierSlug() {
-        return (window.currentUser && window.currentUser.subscription_tier) || 'free';
+        var t = (window.currentUser && (window.currentUser.tier || window.currentUser.subscription_tier)) || 'free';
+        return t;
+    }
+
+    /** Same-session user if currentUser not set yet (e.g. race before app.js paint). */
+    function _sessionSnapshotUser() {
+        try {
+            if (typeof window._readSessionCache === 'function') {
+                var snap = window._readSessionCache();
+                if (snap && snap.user) return snap.user;
+            }
+        } catch (e) {}
+        try {
+            var raw = sessionStorage.getItem('uploadm8_cached_user');
+            if (!raw) return null;
+            var parsed = JSON.parse(raw);
+            return parsed && parsed.user ? parsed.user : null;
+        } catch (e2) {
+            return null;
+        }
+    }
+
+    /** Internal tiers + admin/master_admin role: no PUT/AIC wallet enforcement (matches API). */
+    function currentUserWalletExempt() {
+        var u = window.currentUser || _sessionSnapshotUser();
+        if (!u) return false;
+        if (window.isUserMasterAdmin === true) return true;
+        var ent = u.entitlements || {};
+        if (ent.is_internal === true) return true;
+        var role = String(u.role || '').trim().toLowerCase();
+        if (role === 'admin' || role === 'master_admin') return true;
+        var tier = String(u.subscription_tier || u.tier || 'free').trim().toLowerCase();
+        if (tier === 'master_admin' || tier === 'friends_family' || tier === 'lifetime') return true;
+        return false;
     }
     function apiBase() {
-        return window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : 'https://auth.uploadm8.com');
-    }
-    function getToken() {
-        return localStorage.getItem('uploadm8_access_token') || sessionStorage.getItem('uploadm8_access_token') || '';
+        if (typeof window.resolveUploadM8ApiOrigin === 'function') return window.resolveUploadM8ApiOrigin();
+        if (typeof window.getUploadM8ApiBase === 'function') return window.getUploadM8ApiBase();
+        if (typeof window.API_BASE === 'string' && window.API_BASE) return String(window.API_BASE).replace(/\/$/, '');
+        return 'https://auth.uploadm8.com';
     }
     async function callApi(path, opts) {
-        var token = getToken();
-        var res = await fetch(apiBase() + path, Object.assign({
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }
-        }, opts || {}));
-        if (!res.ok) { var e = await res.json().catch(function(){return{detail:'Error'}}); throw new Error(e.detail||res.status); }
-        return res.json();
+        if (typeof window.apiCall !== 'function') throw new Error('upgrade-modal: load js/auth-stack.js');
+        return window.apiCall(path, opts || {});
     }
 
     /* ── CSS (injected once) ───────────────────────────────────── */
@@ -225,6 +231,10 @@
 
     /* ── Checkout call ─────────────────────────────────────────── */
     async function goToCheckout(lookupKey, btnEl) {
+        if (currentUserWalletExempt()) {
+            alert('Your account does not use subscription checkout here. If uploads still fail, restart the API server and hard-refresh this page.');
+            return;
+        }
         var orig = btnEl.innerHTML;
         btnEl.disabled = true;
         btnEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading…';
@@ -243,6 +253,10 @@
     }
 
     async function goToTopup(lookupKey, btnEl) {
+        if (currentUserWalletExempt()) {
+            alert('Your plan does not require AIC or PUT top-ups. If uploads still fail, restart the API server and hard-refresh this page.');
+            return;
+        }
         var orig = btnEl.innerHTML;
         btnEl.disabled = true;
         btnEl.innerHTML = '…';
@@ -263,32 +277,37 @@
     /* ── Render modal content ──────────────────────────────────── */
     function renderContent(reason, opts) {
         opts = opts || {};
-        var copy         = REASON_COPY[reason] || { icon: '🔒', headline: reason, sub: 'This feature requires a higher plan.' };
+        var copy         = REASON_COPY[reason] || { icon: '', headline: reason, sub: 'This feature requires a higher plan.' };
         var curSlug      = opts.currentTier || currentTierSlug();
         var reqSlug      = opts.requiredTier || FEATURE_TIER[reason] || 'creator_lite';
-        var curIdx       = TIERS.findIndex(function (t) { return t.slug === curSlug; });
         var showTopupPut = reason === 'insufficient_put';
         var showTopupAic = reason === 'insufficient_aic';
         var showTopup    = showTopupPut || showTopupAic;
 
-        // Which plans to recommend (current+1 up to agency, min 2)
-        var eligible = TIERS.filter(function (t) { return t.lookupKey; });
-        var reqIdx   = eligible.findIndex(function (t) { return t.slug === reqSlug; });
-        var startIdx = Math.max(0, reqIdx);
-        var plans    = eligible.slice(startIdx, startIdx + 3);
-        if (plans.length === 0) plans = [eligible[0]];
-
-        // Recommended = smallest plan that unlocks the feature
-        var recSlug = plans[0] && plans[0].slug;
-
         var html = [
-            '<button class="um8-close" onclick="(function(){var o=document.getElementById(\'um8UgOverlay\');if(o){o.classList.remove(\'open\');setTimeout(function(){o.remove()},280)}})()">',
+            '<button type="button" class="um8-close" data-um8-fn="um8UpgradeModalClose">',
             '  <i class="fas fa-times"></i>',
             '</button>',
             '<div class="um8-icon">' + copy.icon + '</div>',
             '<div class="um8-hl" id="um8UgHeadline">' + copy.headline + '</div>',
             '<div class="um8-sub">' + copy.sub + '</div>',
         ];
+
+        if (!TIERS.length) {
+            html.push('<div class="um8-sub" style="color:#f97316;">Could not load plans. Open Settings → Billing or try again.</div>');
+            html.push('<a href="settings.html#billing" class="um8-btn-secondary"><i class="fas fa-credit-card"></i> Billing settings</a>');
+            return html.join('');
+        }
+
+        // Which plans to recommend (current+1 up to agency, min 2)
+        var eligible = TIERS.filter(function (t) { return t.lookupKey; });
+        var reqIdx   = eligible.findIndex(function (t) { return t.slug === reqSlug; });
+        var startIdx = Math.max(0, reqIdx);
+        var plans    = eligible.slice(startIdx, startIdx + 3);
+        if (plans.length === 0) plans = eligible.length ? [eligible[0]] : [];
+
+        // Recommended = smallest plan that unlocks the feature
+        var recSlug = plans[0] && plans[0].slug;
 
         // Low balance detail
         if ((showTopupPut || showTopupAic) && opts.available != null && opts.needed != null) {
@@ -302,7 +321,7 @@
         if (showTopup) {
             var packType = showTopupPut ? 'put' : 'aic';
             var packs    = TOPUP_PACKS[packType] || [];
-            html.push('<div class="um8-sec-label">' + (showTopupPut ? '⚡ Buy PUT tokens' : '🤖 Buy AI credits') + '</div>');
+            html.push('<div class="um8-sec-label">' + (showTopupPut ? ' Buy PUT tokens' : ' Buy AI credits') + '</div>');
             html.push('<div class="um8-topup-grid">');
             packs.forEach(function (p) {
                 html.push('<div class="um8-topup-item' + (p.best ? ' best' : '') + '">');
@@ -318,7 +337,11 @@
         // ── Plan cards ─────────────────────────────────────────────
         html.push('<div class="um8-sec-label"' + (showTopup ? ' style="display:none"' : '') + '>Choose a plan</div>');
         html.push('<div class="um8-plan-grid">');
+        if (!plans.length) {
+            html.push('<div class="um8-sub" style="grid-column:1/-1;">No paid plans available. Check Settings → Billing.</div>');
+        }
         plans.forEach(function (plan) {
+            if (!plan || !plan.lookupKey) return;
             var isRec = plan.slug === recSlug;
             var col   = plan.color || '#f97316';
             html.push('<div class="um8-plan-card' + (isRec ? ' recommended' : '') + '" style="' + (isRec ? 'border-color:' + col + ';' : '') + '">');
@@ -327,10 +350,10 @@
             html.push('<div class="um8-plan-price">' + plan.price + '</div>');
             html.push('<div class="um8-plan-feats">');
             plan.feats.slice(0, 4).forEach(function (f) {
-                html.push('<div style="margin-bottom:.2rem;"><span style="color:#22c55e;margin-right:.3rem;">✓</span>' + f + '</div>');
+                html.push('<div style="margin-bottom:.2rem;"><span style="color:#22c55e;margin-right:.3rem;"></span>' + f + '</div>');
             });
             html.push('</div>');
-            if (plan.trial) html.push('<div class="um8-plan-trial">🎁 ' + plan.trial + '</div>');
+            if (plan.trial) html.push('<div class="um8-plan-trial"> ' + plan.trial + '</div>');
             html.push('<button data-checkout-key="' + plan.lookupKey + '" style="margin-top:.75rem;width:100%;background:' + (isRec ? col : 'rgba(255,255,255,.07)') + ';color:#fff;border:none;border-radius:7px;padding:.5rem;font-size:.75rem;font-weight:600;cursor:pointer;transition:opacity .15s;" onmouseover="this.style.opacity=\'.8\'" onmouseout="this.style.opacity=\'1\'">' + (isRec ? 'Start Free Trial' : 'Select') + '</button>');
             html.push('</div>');
         });
@@ -341,7 +364,7 @@
 
         // Already on paid plan — open billing portal
         if (curSlug !== 'free' && (showTopupPut || showTopupAic)) {
-            html.push('<a href="' + apiBase() + '" class="um8-btn-secondary" id="um8PortalBtn" onclick="event.preventDefault();um8OpenPortal(this)"><i class="fas fa-external-link-alt"></i> Manage subscription</a>');
+            html.push('<a href="' + apiBase() + '" class="um8-btn-secondary" id="um8PortalBtn" data-um8-fn="um8OpenPortalFromClick"><i class="fas fa-external-link-alt"></i> Manage subscription</a>');
         }
 
         return html.join('');
@@ -362,13 +385,23 @@
 
     /* ── Public API ────────────────────────────────────────────── */
     function showUpgradeModal(reason, opts) {
-        buildModal();
-        var body = document.getElementById('um8UgBody');
-        body.innerHTML = renderContent(reason || 'account_limit', opts || {});
-        wireButtons();
+        if ((reason === 'insufficient_put' || reason === 'insufficient_aic') && currentUserWalletExempt()) {
+            console.warn('[upgrade-modal] skipped billing modal for wallet-exempt user:', reason);
+            return;
+        }
+        ensureUpgradeTiersLoaded().then(function () {
+            buildModal();
+            var body = document.getElementById('um8UgBody');
+            body.innerHTML = renderContent(reason || 'account_limit', opts || {});
+            wireButtons();
+        });
     }
 
     async function openPortal(btn) {
+        if (currentUserWalletExempt()) {
+            alert('Billing portal is not used for your account type. For uploads: restart the API with the latest code, then hard-refresh this page.');
+            return;
+        }
         var orig = btn && btn.innerHTML;
         if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Opening…'; }
         try {
@@ -391,12 +424,20 @@
     function handleEntitlementError(err) {
         if (!err || err.status !== 429) return false;
         var resp = err.response || {};
-        var code = resp.code || '';
+        var inner = (resp.detail && typeof resp.detail === 'object') ? resp.detail : resp;
+        var code = inner.code || resp.code || '';
+        var msg = String(err.message || inner.message || resp.message || '');
+        if (!code && /insufficient\s+aic/i.test(msg)) code = 'insufficient_aic';
+        if (!code && /insufficient\s+put/i.test(msg)) code = 'insufficient_put';
         var opts = {
-            available: resp.available,
-            needed:    resp.needed,
-            topup_url: resp.topup_url,
+            available: inner.available != null ? inner.available : resp.available,
+            needed:    inner.needed != null ? inner.needed : resp.needed,
+            topup_url: inner.topup_url || resp.topup_url,
         };
+        if ((code === 'insufficient_put' || code === 'insufficient_aic') && currentUserWalletExempt()) {
+            console.warn('[upgrade-modal] wallet-exempt user got token 429; not opening paywall', code, err.message || '');
+            return false;
+        }
         if (code === 'insufficient_put') { showUpgradeModal('insufficient_put', opts); return true; }
         if (code === 'insufficient_aic') { showUpgradeModal('insufficient_aic', opts); return true; }
         // Generic queue/rate 429
@@ -407,6 +448,18 @@
     // Exports
     window.showUpgradeModal     = showUpgradeModal;
     window.handleEntitlementError = handleEntitlementError;
+    window.currentUserWalletExempt = currentUserWalletExempt;
     window.um8OpenPortal        = openPortal;
+    window.um8UpgradeModalClose = function () {
+        var o = document.getElementById('um8UgOverlay');
+        if (o) {
+            o.classList.remove('open');
+            setTimeout(function () { o.remove(); }, 280);
+        }
+    };
+    window.um8OpenPortalFromClick = function (ev) {
+        if (ev && ev.preventDefault) ev.preventDefault();
+        openPortal(ev && ev.currentTarget);
+    };
 
 })();

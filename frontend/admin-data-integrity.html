@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+    <script src="js/html-safe.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <title>Data Integrity Audit - UploadM8 Admin</title>
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        .page-wrap { display:flex; flex-direction:column; gap:1rem; }
+        .toolbar { display:flex; gap:.65rem; flex-wrap:wrap; align-items:center; }
+        .kpi-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:.75rem; }
+        .kpi-card { background:var(--bg-card); border:1px solid var(--border-color); border-radius:10px; padding:.8rem; }
+        .kpi-label { color:var(--text-secondary); font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; }
+        .kpi-value { color:var(--text-primary); font-size:1.3rem; font-weight:700; margin-top:.2rem; }
+        .table-wrap { background:var(--bg-card); border:1px solid var(--border-color); border-radius:12px; overflow:hidden; }
+        table { width:100%; border-collapse:collapse; }
+        th, td { padding:.7rem .8rem; border-bottom:1px solid var(--border-color); text-align:left; vertical-align:top; font-size:.86rem; }
+        th { color:var(--text-secondary); font-size:.74rem; text-transform:uppercase; letter-spacing:.04em; }
+        .badge { display:inline-flex; align-items:center; gap:.3rem; border-radius:999px; padding:.2rem .5rem; font-size:.7rem; border:1px solid var(--border-color); }
+        .sev-error { color:#ef4444; border-color:rgba(239,68,68,.4); }
+        .sev-warning { color:#f59e0b; border-color:rgba(245,158,11,.4); }
+        .sev-info { color:#60a5fa; border-color:rgba(96,165,250,.4); }
+        .muted { color:var(--text-secondary); }
+        .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.75rem; white-space:pre-wrap; word-break:break-word; }
+        .table-outer { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+        @media (max-width: 768px) { table { min-width: 560px; } .toolbar { flex-direction: column; align-items: flex-start; } }
+    </style>
+</head>
+<body>
+    <div class="app-layout">
+        <aside class="sidebar" id="sidebar"></aside>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+        <header class="top-bar">
+            <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+            <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+            <div class="top-bar-actions">
+                <div data-wt-pills></div>
+                <button class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle Theme"><i class="fas fa-moon"></i></button>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <div id="loadingState" style="display:flex;align-items:center;justify-content:center;min-height:40vh;gap:1rem;">
+                <div class="loading-spinner"></div><div>Loading data integrity audit…</div>
+            </div>
+            <div id="accessDenied" style="display:none;align-items:center;justify-content:center;min-height:40vh;flex-direction:column;gap:1rem;">
+                <h2>Access Denied</h2>
+                <p class="muted">Admin privileges required.</p>
+                <a href="dashboard.html" class="btn btn-primary">Return to Dashboard</a>
+            </div>
+            <div id="content" style="display:none;" class="page-wrap">
+                <div style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;flex-wrap:wrap;">
+                    <div>
+                        <h1 class="page-title"><i class="fas fa-shield-check"></i> Data Integrity Audit</h1>
+                        <p class="page-subtitle">See when data checks failed, what was missing, and what we fixed automatically.</p>
+                    </div>
+                    <div class="toolbar">
+                        <select id="hoursFilter" class="form-select">
+                            <option value="24">Last 24h</option>
+                            <option value="72" selected>Last 72h</option>
+                            <option value="168">Last 7d</option>
+                            <option value="720">Last 30d</option>
+                        </select>
+                        <select id="severityFilter" class="form-select">
+                            <option value="">All Severities</option>
+                            <option value="ERROR">Errors</option>
+                            <option value="WARNING">Warnings</option>
+                            <option value="INFO">Info</option>
+                        </select>
+                        <button id="refreshBtn" class="btn btn-secondary"><i class="fas fa-sync-alt"></i> Refresh</button>
+                    </div>
+                </div>
+
+                <div class="kpi-grid">
+                    <div class="kpi-card"><div class="kpi-label">Total Events</div><div class="kpi-value" id="kpiTotal">0</div></div>
+                    <div class="kpi-card"><div class="kpi-label">Failed</div><div class="kpi-value" id="kpiFailed">0</div></div>
+                    <div class="kpi-card"><div class="kpi-label">Corrected</div><div class="kpi-value" id="kpiCorrected">0</div></div>
+                    <div class="kpi-card"><div class="kpi-label">Errors / Warnings</div><div class="kpi-value"><span id="kpiErrors">0</span> / <span id="kpiWarnings">0</span></div></div>
+                </div>
+
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Severity</th>
+                                <th>Action</th>
+                                <th>Outcome</th>
+                                <th>User</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="auditRows">
+                            <tr><td colspan="6" class="muted">Loading…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
+    <script src="app.js"></script>
+    <script src="wallet-tokens.js"></script>
+    <script>
+        function _fmt(n){ return Number(n||0).toLocaleString(); }
+        function _sevClass(s){
+            const v = String(s||'INFO').toUpperCase();
+            if(v === 'ERROR') return 'sev-error';
+            if(v === 'WARNING') return 'sev-warning';
+            return 'sev-info';
+        }
+
+        function renderSummary(sum){
+            const s = sum || {};
+            document.getElementById('kpiTotal').textContent = _fmt(s.total);
+            document.getElementById('kpiFailed').textContent = _fmt(s.failed);
+            document.getElementById('kpiCorrected').textContent = _fmt(s.corrected);
+            document.getElementById('kpiErrors').textContent = _fmt(s.errors);
+            document.getElementById('kpiWarnings').textContent = _fmt(s.warnings);
+        }
+
+        function renderRows(items){
+            const body = document.getElementById('auditRows');
+            const rows = Array.isArray(items) ? items : [];
+            if(!rows.length){
+                body.innerHTML = '<tr><td colspan="6" class="muted">No data integrity events found.</td></tr>';
+                return;
+            }
+            body.innerHTML = rows.map((r) => {
+                const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '--';
+                const sev = String(r.severity || 'INFO').toUpperCase();
+                const out = String(r.outcome || 'SUCCESS').toUpperCase();
+                const details = r.details ? JSON.stringify(r.details, null, 2) : '{}';
+                return '<tr>'
+                    + '<td>' + ts + '</td>'
+                    + '<td><span class="badge ' + _sevClass(sev) + '">' + sev + '</span></td>'
+                    + '<td><span class="mono">' + (r.action || '--') + '</span></td>'
+                    + '<td>' + out + '</td>'
+                    + '<td><span class="mono">' + (r.user_id || '--') + '</span></td>'
+                    + '<td><pre class="mono">' + details + '</pre></td>'
+                    + '</tr>';
+            }).join('');
+        }
+
+        async function loadAudit(){
+            const sev = document.getElementById('severityFilter')?.value || '';
+            const hours = document.getElementById('hoursFilter')?.value || '72';
+            const q = new URLSearchParams({ limit:'200', offset:'0', since_hours:String(hours) });
+            if(sev) q.set('severity', sev);
+            const data = await apiCall('/api/admin/audit/data-integrity?' + q.toString());
+            renderSummary(data && data.summary);
+            renderRows(data && data.items);
+        }
+
+        document.addEventListener('DOMContentLoaded', async () => {
+            const user = await initApp('admin-data-integrity', { forceAuthRefresh: false, skipWalletRefresh: true });
+            document.getElementById('loadingState').style.display = 'none';
+            if(!user || (user.role !== 'admin' && user.role !== 'master_admin')){
+                document.getElementById('accessDenied').style.display = 'flex';
+                return;
+            }
+            document.getElementById('content').style.display = 'flex';
+            const sp = new URLSearchParams(window.location.search);
+            const sevQ = (sp.get('severity') || '').toUpperCase();
+            const hrsQ = sp.get('hours') || sp.get('since_hours');
+            if(sevQ && ['ERROR','WARNING','INFO'].includes(sevQ)){
+                document.getElementById('severityFilter').value = sevQ;
+            }
+            if(hrsQ && ['24','72','168','720'].includes(hrsQ)){
+                document.getElementById('hoursFilter').value = hrsQ;
+            }
+            await loadAudit();
+            document.getElementById('refreshBtn').addEventListener('click', loadAudit);
+            document.getElementById('severityFilter').addEventListener('change', loadAudit);
+            document.getElementById('hoursFilter').addEventListener('change', loadAudit);
+        });
+    </script>
+</body>
+</html>

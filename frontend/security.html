@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Security Overview - UploadM8</title>
@@ -39,7 +41,7 @@
         .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
         .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
         @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
-        .sidebar-toc { position: sticky; top: 80px; }
+        .sidebar-toc { position: sticky; top: 5.5rem; z-index: 1; }
         .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
         .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
         .toc-list { list-style: none; }
@@ -91,6 +93,7 @@
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: var(--bg-secondary); }
         ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+        @media (max-width: 480px) { .hero { padding: 2.5rem 1.25rem 2rem; } .hero h1 { font-size: 2rem; } .nav { padding: 0.75rem 1rem; } .content-wrapper { padding: 2rem 1.25rem 3rem; } }
     </style>
 </head>
 <body>
@@ -98,7 +101,7 @@
 <nav class="nav">
     <div class="nav-container">
         <a href="index.html" class="nav-logo">
-            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            <img src="images/logo.svg" alt="UploadM8" style="height:32px;width:auto;">
             UploadM8
         </a>
         <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
@@ -110,9 +113,10 @@
         <div class="hero-badge"><i class="fas fa-lock"></i> Security</div>
         <h1>Security Overview</h1>
         <div class="hero-meta">
-            <span><i class="fas fa-calendar"></i> Updated: February 2026</span>
+            <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
+            <span><i class="fas fa-clock"></i> Last updated: April 2026</span>
             <span><i class="fas fa-shield-alt"></i> Infrastructure: Cloudflare R2 + Render</span>
-            <span><i class="fas fa-envelope"></i> Report: security@uploadm8.com</span>
+            <span><i class="fas fa-envelope"></i> Report: <a href="mailto:security@uploadm8.com">security@uploadm8.com</a></span>
         </div>
     </div>
 </div>
@@ -159,7 +163,7 @@
                 <div class="security-card">
                     <div class="security-card-icon"><i class="fas fa-list-alt"></i></div>
                     <h3>Audit Logging</h3>
-                    <p>Comprehensive logs capture all authentication events, API calls, data access, publishing actions, and administrative changes. Logs are retained for 12 months and are tamper-resistant.</p>
+                    <p>Operational logs capture authentication events, publishing actions, administrative changes, and system events. Admin/system event tables use a <strong>rolling retention window</strong> (typically about <strong>six months</strong>) with automated purge of older rows.</p>
                 </div>
                 <div class="security-card">
                     <div class="security-card-icon"><i class="fas fa-database"></i></div>
@@ -195,8 +199,10 @@
                     <tr><td>Database</td><td>PostgreSQL (Render)</td><td>Encrypted at rest, private network, automated backups</td></tr>
                     <tr><td>Job Queue</td><td>Redis (Render)</td><td>Private network, no external exposure, auth required</td></tr>
                     <tr><td>Video Storage</td><td>Cloudflare R2</td><td>AES-256 server-side encryption, signed URLs, zero egress</td></tr>
-                    <tr><td>CDN / WAF</td><td>Cloudflare</td><td>DDoS mitigation, bot management, rate limiting</td></tr>
+                    <tr><td>Object storage &amp; edge</td><td>Cloudflare (R2)</td><td>Server-side encryption, access controls; optional CDN/WAF when fronted by Cloudflare</td></tr>
+                    <tr><td>Transactional email</td><td>Mailgun</td><td>TLS to API; credentials in secrets</td></tr>
                     <tr><td>Payment Processing</td><td>Stripe</td><td>PCI DSS Level 1, no card data stored by UploadM8</td></tr>
+                    <tr><td>Error &amp; performance telemetry (optional)</td><td>Sentry</td><td>When <code>SENTRY_DSN</code> is set — sampled traces, stack traces, request metadata; no full media payloads</td></tr>
                 </tbody>
             </table>
         </div>
@@ -266,6 +272,8 @@
     <div class="footer-inner">
         <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
         <div class="footer-links">
+            <a href="how-it-works.html">How it works</a>
+            <a href="contact.html">Contact</a>
             <a href="privacy.html">Privacy</a>
             <a href="terms.html">Terms</a>
             <a href="security.html" class="active">Security</a>
@@ -274,10 +282,16 @@
             <a href="refunds.html">Refunds</a>
             <a href="dmca.html">DMCA</a>
             <a href="support.html">Support</a>
+            <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
         </div>
     </div>
 </footer>
 
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
 <script>
     const sections = document.querySelectorAll('.section-block[id]');
     const tocLinks = document.querySelectorAll('.toc-list a');

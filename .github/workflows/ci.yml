@@ -1,0 +1,81 @@
+# CI: router lint, dependency audit, pytest (non-E2E).
+#
+# Production secrets (JWT_SECRET, DATABASE_URL, TOKEN_ENC_KEYS, API keys, SENTRY_DSN, etc.)
+# belong only in the host secret store (e.g. GitHub Actions secrets, Render env). This workflow
+# uses an ephemeral Postgres service and generated throwaway JWT / TOKEN_ENC_KEYS for tests.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Monthly pip-audit reminder (also runs on every PR via pip-audit job below)
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  router-lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Router lint (line count + DB-touch lines)
+        run: python tools/lint_routers.py
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pip-audit
+        run: python -m pip install --upgrade pip pip-audit
+      - name: Audit locked dependencies
+        run: python -m pip_audit -r requirements-lock.txt --desc-on-events
+
+  pytest:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: uploadm8_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-lock.txt
+      - name: CI env for app import and DB migrations
+        run: |
+          echo "DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/uploadm8_test" >> "$GITHUB_ENV"
+          echo "JWT_SECRET=ci-github-actions-jwt-secret-min-32-characters-long" >> "$GITHUB_ENV"
+          KEY=$(python -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())")
+          echo "TOKEN_ENC_KEYS=v1:$KEY" >> "$GITHUB_ENV"
+          echo "REDIS_URL=" >> "$GITHUB_ENV"
+          echo "SERVE_FRONTEND=0" >> "$GITHUB_ENV"
+      - name: Run pytest (exclude E2E / Playwright)
+        run: python -m pytest tests/ -m "not e2e" -q --tb=short

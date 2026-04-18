@@ -1,9 +1,11 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
     <title>Email Preferences - UploadM8</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -197,12 +199,19 @@
         }
         .confirmed-state h2 { font-size: 1.5rem; margin-bottom: 0.75rem; }
         .confirmed-state p { color: #9ca3af; margin-bottom: 1.75rem; line-height: 1.6; }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 520px) {
+            .header { padding: 1rem; }
+            .main { padding: 1rem; }
+            .card { padding: 1.5rem 1.25rem; border-radius: 14px; }
+        }
     </style>
 </head>
 <body>
     <header class="header">
         <a href="index.html" class="logo">
-            <img src="images/logo.png" alt="UploadM8">
+            <img src="images/logo.svg" alt="UploadM8">
             UploadM8
         </a>
     </header>
@@ -213,7 +222,7 @@
             <!-- Main preferences form -->
             <div id="prefForm">
                 <div class="card-header">
-                    <div class="card-icon">📧</div>
+                    <div class="card-icon"></div>
                     <h1>Email Preferences</h1>
                     <p>Control which emails UploadM8 sends to you. Transactional emails (receipts, security alerts) cannot be disabled.</p>
                 </div>
@@ -314,10 +323,10 @@
                         <strong>Unsubscribe from All Optional Emails</strong>
                         <p>Turn off all non-essential emails at once. Transactional emails will still be sent.</p>
                     </div>
-                    <button class="unsub-btn" onclick="unsubscribeAll()">Unsubscribe All</button>
+                    <button class="unsub-btn" data-um8-fn="unsubscribeAll">Unsubscribe All</button>
                 </div>
 
-                <button class="save-btn" id="saveBtn" onclick="savePreferences()">
+                <button class="save-btn" id="saveBtn" data-um8-fn="savePreferences">
                     <i class="fas fa-check"></i> Save Preferences
                 </button>
 
@@ -337,7 +346,7 @@
 
             <!-- Unsubscribed all confirmation state -->
             <div id="unsubConfirmed" class="confirmed-state">
-                <div class="big-icon">✉️</div>
+                <div class="big-icon">️</div>
                 <h2>You've Been Unsubscribed</h2>
                 <p>All optional email notifications have been turned off. You'll still receive security alerts and billing receipts as required by law.</p>
                 <a href="settings.html" style="display:inline-block;padding:0.9rem 2.25rem;background:linear-gradient(135deg,#f97316,#ea580c);border-radius:10px;color:white;text-decoration:none;font-weight:600;">Go to Settings &rarr;</a>
@@ -351,31 +360,31 @@
 
     <footer class="footer">
         <span>© 2025 UploadM8</span>
+        <a href="dashboard.html">Dashboard</a>
+        <a href="settings.html#billing-panel">Token balance</a>
+        <a href="contact.html">Contact</a>
         <a href="terms.html">Terms</a>
         <a href="privacy.html">Privacy</a>
         <a href="support.html">Support</a>
+        <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
     </footer>
 
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
     <script>
-        (function () {
-            var m = /[?&]api=([^&]+)/.exec(location.search);
-            if (m) window.API_BASE = decodeURIComponent(m[1]).replace(/\/$/, '');
-            else if (!window.API_BASE && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin))
-                window.API_BASE = 'http://127.0.0.1:8000';
-        })();
-        const API_BASE = window.API_BASE || 'https://auth.uploadm8.com';
-
-        const accessToken = localStorage.getItem('access_token') || sessionStorage.getItem('access_token');
+        const accessToken = (typeof window.getAccessToken === 'function' && window.getAccessToken()) ||
+            sessionStorage.getItem('uploadm8_access_token') ||
+            sessionStorage.getItem('access_token');
 
         // Load current preferences on page load
         async function loadPreferences() {
             if (!accessToken) return; // guest view — defaults shown
             try {
-                const resp = await fetch(`${API_BASE}/api/me/preferences`, {
-                    headers: { 'Authorization': `Bearer ${accessToken}` }
-                });
-                if (resp.ok) {
-                    const prefs = await resp.json();
+                const prefs = await window.apiCall('/api/me/preferences');
+                if (prefs && typeof prefs === 'object') {
                     if ('email_notifications' in prefs) {
                         const en = prefs.email_notifications;
                         // If server returns a single boolean, apply to all optional toggles
@@ -417,24 +426,14 @@
             };
 
             try {
-                const headers = { 'Content-Type': 'application/json' };
-                if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`;
-
-                const resp = await fetch(`${API_BASE}/api/me/preferences`, {
+                await window.apiCall('/api/me/preferences', {
                     method: 'PATCH',
-                    headers,
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
                 });
-
-                if (resp.ok) {
-                    document.getElementById('alertSuccess').classList.add('show');
-                } else {
-                    const data = await resp.json().catch(() => ({}));
-                    document.getElementById('alertErrorMsg').textContent = data.detail || 'Could not save. Please try again.';
-                    document.getElementById('alertError').classList.add('show');
-                }
+                document.getElementById('alertSuccess').classList.add('show');
             } catch (e) {
-                document.getElementById('alertErrorMsg').textContent = 'Connection error. Please try again.';
+                document.getElementById('alertErrorMsg').textContent =
+                    (e && e.message) || 'Could not save. Please try again.';
                 document.getElementById('alertError').classList.add('show');
             }
 
@@ -459,13 +458,9 @@
                 }
             };
 
-            const headers = { 'Content-Type': 'application/json' };
-            if (accessToken) headers['Authorization'] = `Bearer ${accessToken}`;
-
-            fetch(`${API_BASE}/api/me/preferences`, {
+            window.apiCall('/api/me/preferences', {
                 method: 'PATCH',
-                headers,
-                body: JSON.stringify(payload)
+                body: JSON.stringify(payload),
             }).catch(() => {});
 
             // Show unsubscribed confirmation

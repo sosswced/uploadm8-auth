@@ -1,135 +1,233 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>KPI Dashboard - UploadM8</title>
-  <link rel="icon" type="image/x-icon" href="/favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="/images/logo.png">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.19.3/dist/xlsx.full.min.js"></script>
-  <style>
-    :root { --blue-600:#2563eb; --gray-50:#f9fafb; --gray-100:#f3f4f6; --gray-200:#e5e7eb; --gray-600:#4b5563; --gray-800:#1f2937; --gray-900:#111827; --red-500:#ef4444; --green-600:#16a34a; }
-    * { box-sizing:border-box; }
-    body { margin:0; font-family:'Plus Jakarta Sans',sans-serif; background:linear-gradient(135deg,var(--gray-900),#0b1220); color:#fff; }
-    .wrap { max-width:1200px; margin:0 auto; padding:28px 18px 70px; }
-    .topbar { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:18px; }
-    a.brand { display:flex; align-items:center; gap:10px; text-decoration:none; color:#fff; font-weight:800; }
-    a.brand img { height:28px; }
-    .actions { display:flex; gap:10px; flex-wrap:wrap; }
-    .btn { border:1px solid rgba(255,255,255,0.16); background:rgba(255,255,255,0.08); color:#fff; padding:10px 14px; border-radius:12px; cursor:pointer; font-weight:700; }
-    .btn.primary { background:linear-gradient(135deg,#3b82f6,#2563eb); border:none; }
-    .panel { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.10); border-radius:18px; padding:16px; }
-    .grid { display:grid; gap:14px; }
-    .grid.kpis { grid-template-columns: repeat(4, minmax(0,1fr)); }
-    .kpi { padding:16px; border-radius:18px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.10); }
-    .kpi .label { color:rgba(255,255,255,0.7); font-size:0.85rem; font-weight:700; }
-    .kpi .value { font-size:1.55rem; font-weight:900; margin-top:6px; }
-    .kpi .delta { margin-top:6px; font-size:0.85rem; color:rgba(255,255,255,0.75); }
-    .row { display:grid; grid-template-columns: 1.2fr 0.8fr; gap:14px; margin-top:14px; }
-    .chartWrap { height:320px; }
-    .filters { display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin: 10px 0 16px; }
-    .field { display:flex; flex-direction:column; gap:6px; }
-    label { color:rgba(255,255,255,0.7); font-size:0.85rem; font-weight:700; }
-    select, input { background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.16); color:#fff; padding:10px 12px; border-radius:12px; outline:none; }
-    table { width:100%; border-collapse:collapse; }
-    th, td { text-align:left; padding:10px 10px; border-bottom:1px solid rgba(255,255,255,0.10); font-size:0.9rem; }
-    th { color:rgba(255,255,255,0.75); font-weight:800; }
-    .muted { color:rgba(255,255,255,0.7); }
-    @media (max-width: 1100px) { .grid.kpis { grid-template-columns: repeat(2, minmax(0,1fr)); } .row { grid-template-columns: 1fr; } }
-  </style>
+
+    <script src="js/html-safe.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload KPIs (your account) - UploadM8</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <style>
+        .kpi-page-filters { display:flex; gap:0.75rem; flex-wrap:wrap; align-items:flex-end; margin-bottom:1.25rem; }
+        .kpi-page-filters .field { display:flex; flex-direction:column; gap:0.35rem; }
+        .kpi-page-filters label { font-size:0.75rem; font-weight:600; color:var(--text-muted); }
+        .kpi-page-filters select { padding:0.5rem 0.75rem; border-radius:8px; border:1px solid var(--border-color); background:var(--bg-input); color:var(--text-primary); font-family:inherit; }
+        .kpi-meta { font-size:0.8rem; color:var(--text-muted); align-self:center; }
+        .kpi-charts-row { display:grid; grid-template-columns:1.2fr 0.8fr; gap:1rem; margin-bottom:1rem; }
+        @media (max-width:1100px) { .kpi-charts-row { grid-template-columns:1fr; } }
+        .kpi-chart-box { height:300px; position:relative; }
+        .kpi-table-wrap { overflow:auto; }
+        .kpi-table-wrap table { width:100%; border-collapse:collapse; }
+        .kpi-table-wrap th, .kpi-table-wrap td { padding:0.65rem 0.75rem; border-bottom:1px solid var(--border-color); font-size:0.875rem; text-align:left; }
+        .kpi-table-wrap th { color:var(--text-muted); font-weight:600; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.04em; }
+        .ml-strat-line { margin-bottom:0.4rem; font-size:0.875rem; }
+        .ml-strat-line strong { color:var(--accent-orange, #f97316); }
+
+        /* ── Mobile overrides ── */
+        @media (max-width:768px) {
+            #kpiEngagementRow { grid-template-columns: repeat(2, 1fr) !important; }
+            .kpi-charts-row { grid-template-columns: 1fr; }
+            .kpi-page-filters { flex-direction: column; align-items: flex-start; }
+            .kpi-page-filters .field { width: 100%; }
+            .kpi-page-filters select { width: 100%; }
+        }
+        @media (max-width:480px) {
+            #kpiEngagementRow { grid-template-columns: 1fr !important; }
+        }
+    </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="topbar">
-      <a class="brand" href="/dashboard.html"><img src="/images/logo.png" alt="UploadM8">KPI Dashboard</a>
-      <div class="actions">
-        <button class="btn" onclick="location.href='/dashboard.html'">Back to app</button>
-        <button class="btn" onclick="refresh()">Refresh</button>
-        <button class="btn primary" onclick="exportExcel()">Export Excel</button>
-      </div>
-    </div>
+<div class="app-layout">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
 
-    <div class="panel">
-      <div class="filters">
-        <div class="field">
-          <label>Window (days)</label>
-          <select id="days">
-            <option value="7">7</option>
-            <option value="30" selected>30</option>
-            <option value="90">90</option>
-            <option value="365">365</option>
-          </select>
+    <header class="top-bar">
+        <button class="menu-toggle" id="menuToggle" type="button" aria-expanded="false" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+        <div class="top-bar-actions">
+            <div data-wt-pills></div>
+            <button class="theme-toggle" data-um8-fn="toggleTheme" type="button" aria-label="Toggle theme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
         </div>
-        <div class="field">
-          <label>Platform</label>
-          <select id="platform">
-            <option value="all" selected>All</option>
-            <option value="tiktok">TikTok</option>
-            <option value="youtube">YouTube</option>
-            <option value="instagram">Instagram</option>
-            <option value="facebook">Facebook</option>
-          </select>
+    </header>
+
+    <main class="main-content">
+        <div class="page-header">
+            <div>
+                <h1 class="page-title"><i class="fas fa-chart-bar text-orange"></i> Upload KPIs</h1>
+                <p class="page-subtitle">Throughput and success rates follow the platform filter below (all networks, or one platform; Instagram and Facebook can be limited to reels only). The views, likes, comments, and shares row matches Analytics and your Dashboard — one merged total per video. Charts use up to your latest 1,000 uploads; strategy hints use quality scores for the same window.</p>
+            </div>
+            <div class="flex gap-2 flex-wrap items-center">
+                <a href="dashboard.html" class="btn btn-secondary btn-sm"><i class="fas fa-home"></i> Dashboard</a>
+                <a href="analytics.html" class="btn btn-secondary btn-sm"><i class="fas fa-chart-line"></i> Analytics</a>
+                <a href="admin-kpi.html" class="btn btn-secondary btn-sm admin-only" style="display:none" title="Business-wide metrics (admin)"><i class="fas fa-chart-pie"></i> Admin KPIs</a>
+                <a href="admin-marketing.html" class="btn btn-secondary btn-sm hidden admin-only-marketing" title="Marketing ops and campaigns"><i class="fas fa-bullhorn" style="color:#f97316;"></i> Marketing Ops</a>
+                <button type="button" class="btn btn-primary btn-sm" data-um8-fn="refresh"><i class="fas fa-sync-alt"></i> Refresh</button>
+                <button type="button" class="btn btn-secondary btn-sm" data-um8-fn="exportExcel"><i class="fas fa-file-excel"></i> Export Excel</button>
+                <span id="kpiHealth" class="kpi-meta" title="Last data refresh">Updated: —</span>
+            </div>
         </div>
-        <div class="field">
-          <label>Status</label>
-          <select id="status">
-            <option value="all" selected>All</option>
-            <option value="success">Success</option>
-            <option value="failed">Failed</option>
-            <option value="scheduled">Scheduled</option>
-            <option value="processing">Processing</option>
-          </select>
+
+        <div class="card mb-4" style="border-color:rgba(139,92,246,.35);background:rgba(139,92,246,.05);">
+            <div class="card-header" style="padding-bottom:6px;">
+                <h3 class="card-title" style="font-size:1rem;"><i class="fas fa-wand-magic-sparkles" style="color:#a78bfa;"></i> Personalized tips</h3>
+            </div>
+            <div class="card-body" style="padding-top:6px;">
+                <div data-ai-coach="1" class="text-secondary" style="font-size:.85rem;line-height:1.45;">Loading personalized tips…</div>
+            </div>
         </div>
-        <button class="btn" onclick="refresh()">Apply</button>
-        <span class="muted" id="meta"></span>
-      </div>
 
-      <div class="grid kpis" id="kpiGrid"></div>
-    </div>
+        <!-- Engagement row — same source as Analytics & Dashboard -->
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.75rem;margin-bottom:1.25rem;" id="kpiEngagementRow">
+            <div class="card stat-card" style="padding:0.9rem 1rem;">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-eye"></i> Total Views</div>
+                <div class="stat-value" id="kpiEngViews" style="font-size:1.4rem;">—</div>
+                <div style="font-size:0.65rem;color:var(--text-muted);margin-top:2px;">Same totals as Analytics &amp; Dashboard</div>
+            </div>
+            <div class="card stat-card" style="padding:0.9rem 1rem;">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-heart"></i> Total Likes</div>
+                <div class="stat-value" id="kpiEngLikes" style="font-size:1.4rem;">—</div>
+                <div style="font-size:0.65rem;color:var(--text-muted);margin-top:2px;">Same totals as Analytics &amp; Dashboard</div>
+            </div>
+            <div class="card stat-card" style="padding:0.9rem 1rem;">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-comment"></i> Total Comments</div>
+                <div class="stat-value" id="kpiEngComments" style="font-size:1.4rem;">—</div>
+                <div style="font-size:0.65rem;color:var(--text-muted);margin-top:2px;">Same totals as Analytics &amp; Dashboard</div>
+            </div>
+            <div class="card stat-card" style="padding:0.9rem 1rem;">
+                <div class="card-title text-sm text-secondary"><i class="fas fa-share"></i> Total Shares</div>
+                <div class="stat-value" id="kpiEngShares" style="font-size:1.4rem;">—</div>
+                <div style="font-size:0.65rem;color:var(--text-muted);margin-top:2px;">Same totals as Analytics &amp; Dashboard</div>
+            </div>
+        </div>
 
-    <div class="row">
-      <div class="panel">
-        <h3 style="margin:0 0 10px;">Throughput</h3>
-        <div class="chartWrap"><canvas id="chartThroughput"></canvas></div>
-      </div>
-      <div class="panel">
-        <h3 style="margin:0 0 10px;">Platform mix</h3>
-        <div class="chartWrap"><canvas id="chartPlatforms"></canvas></div>
-      </div>
-    </div>
+        <div class="card mb-4">
+            <div class="kpi-page-filters">
+                    <label>Window (days)</label>
+                    <select id="days">
+                        <option value="7">7</option>
+                        <option value="30" selected>30</option>
+                        <option value="90">90</option>
+                        <option value="365">365</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label>Platform</label>
+                    <select id="platform">
+                        <option value="all" selected>All</option>
+                        <option value="tiktok">TikTok</option>
+                        <option value="youtube">YouTube</option>
+                        <option value="instagram">Instagram Reels</option>
+                        <option value="facebook">Facebook Reels</option>
+                        <option value="instagram_reels">Instagram Reels (catalog reels only)</option>
+                        <option value="facebook_reels">Facebook Reels (catalog reels only)</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label>Status</label>
+                    <select id="status">
+                        <option value="all" selected>All</option>
+                        <option value="success">Success</option>
+                        <option value="failed">Failed</option>
+                        <option value="scheduled">Scheduled</option>
+                        <option value="processing">Processing</option>
+                    </select>
+                </div>
+                <button type="button" class="btn btn-secondary btn-sm" data-um8-fn="refresh">Apply</button>
+                <span class="kpi-meta" id="meta"></span>
+            </div>
+            <p id="pikzelsV2UserKpi" class="kpi-meta" style="margin-top:0.5rem;"></p>
+            <div class="grid grid-4 gap-4" id="kpiGrid"></div>
+        </div>
 
-    <div class="panel" style="margin-top:14px;">
-      <h3 style="margin:0 0 10px;">Commercial-grade KPI table</h3>
-      <p class="muted" style="margin:0 0 12px;">This table is exportable and is designed to scale into a finance-grade operating cadence (weekly review, monthly board pack).</p>
-      <div style="overflow:auto;">
-        <table>
-          <thead><tr><th>KPI</th><th>Definition</th><th>Current</th><th>Target</th><th>Owner</th></tr></thead>
-          <tbody id="kpiTable"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
+        <div class="card mb-4">
+            <h3 class="card-title mb-2"><i class="fas fa-brain"></i> ML strategy performance</h3>
+            <p class="text-secondary text-sm mb-2">From <code>upload_quality_scores_daily</code> (per strategy engagement + CI). Used by the pipeline to bias thumbnail selection.</p>
+            <div id="mlStrategiesBox" class="text-secondary">Loading…</div>
+        </div>
 
+        <div class="kpi-charts-row">
+            <div class="card">
+                <h3 class="card-title mb-2">Throughput</h3>
+                <div class="kpi-chart-box"><canvas id="chartThroughput"></canvas></div>
+            </div>
+            <div class="card">
+                <h3 class="card-title mb-2">Platform mix</h3>
+                <div class="kpi-chart-box"><canvas id="chartPlatforms"></canvas></div>
+            </div>
+        </div>
+
+        <div class="card mb-4">
+            <h3 class="card-title mb-2">Commercial-grade KPI table</h3>
+            <p class="text-secondary text-sm mb-2">Exportable; aligns with weekly ops / board-style review.</p>
+            <div class="kpi-table-wrap">
+                <table>
+                    <thead><tr><th>KPI</th><th>Definition</th><th>Current</th><th>Target</th><th>Owner</th></tr></thead>
+                    <tbody id="kpiTable"></tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+</div>
+
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script src="shared-sidebar.js"></script>
+<script src="js/helpers-formatting.js"></script>
+<script src="js/upload-utils.js"></script>
+<script src="app.js"></script>
+<script src="js/m8-stats.js"></script>
+<script src="js/ai-coach.js"></script>
+<script src="wallet-tokens.js"></script>
 <script>
-const API_URL = 'https://auth.uploadm8.com';
-let token = localStorage.getItem('uploadm8_token');
-let uploadsCache = [];
+(function () {
+'use strict';
 
-function api(path, opts = {}) {
-  const headers = Object.assign({ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, (opts.headers || {}));
-  return fetch(API_URL + path, Object.assign({}, opts, { headers })).then(async r => {
-    const t = await r.text();
-    let j; try { j = t ? JSON.parse(t) : {}; } catch { j = { detail: t }; }
-    if (!r.ok) throw new Error(j.detail || ('HTTP ' + r.status));
-    return j;
-  });
+let uploadsCache = [];
+/** Last GET /api/analytics/overview — same upload/engagement definitions as Analytics. */
+let overviewSnapshot = null;
+let mlTopStrategies = [];
+let kpiHealthState = {
+  status: 'idle',
+  message: 'Updated: —',
+  at: null
+};
+
+/**
+ * Use shared apiCall (auth-stack.js): cookie session + auto refresh on 401.
+ * Do NOT cache the access token in a closure — initApp/checkAuth may rotate it.
+ */
+async function kpiApi(path) {
+  if (typeof window.apiCall !== 'function') throw new Error('kpi: load js/auth-stack.js (apiCall)');
+  return await window.apiCall(path);
+}
+
+async function fetchOverviewSnapshot() {
+  var days = parseInt(document.getElementById('days').value, 10);
+  var pf = document.getElementById('platform').value || 'all';
+  var path = '/api/analytics/overview?days=' + days + '&platform=' + encodeURIComponent(pf);
+  overviewSnapshot = await kpiApi(path);
+}
+
+function chartTheme() {
+  const s = getComputedStyle(document.documentElement);
+  const text = (s.getPropertyValue('--text-primary') || '#e5e7eb').trim();
+  const grid = (s.getPropertyValue('--border-color') || 'rgba(255,255,255,0.08)').trim();
+  const mut = (s.getPropertyValue('--text-muted') || 'rgba(255,255,255,0.5)').trim();
+  return { text, grid, mut };
 }
 
 function withinDays(d, days) {
-  const dt = new Date(d);
-  return (Date.now() - dt.getTime()) <= days*24*3600*1000;
+  var dt = new Date(d);
+  return (Date.now() - dt.getTime()) <= days * 24 * 3600 * 1000;
 }
 
 function normalizePlatforms(u) {
@@ -137,104 +235,135 @@ function normalizePlatforms(u) {
 }
 
 function normalizeStatus(u) {
-  return (u.status || '').toLowerCase();
+  var st = (u.status || '').toLowerCase();
+  // Backend uses completed/succeeded/partial as successful outcomes.
+  if (st === 'completed' || st === 'succeeded' || st === 'partial') return 'success';
+  if (st === 'queued' || st === 'pending' || st === 'staged' || st === 'ready_to_publish') return 'scheduled';
+  return st;
 }
 
 function filterUploads() {
-  const days = parseInt(document.getElementById('days').value, 10);
-  const platform = document.getElementById('platform').value;
-  const status = document.getElementById('status').value;
+  var days = parseInt(document.getElementById('days').value, 10);
+  var platform = document.getElementById('platform').value;
+  var status = document.getElementById('status').value;
 
-  return uploadsCache.filter(u => {
-    const created = u.created_at || u.createdAt || u.created;
+  return uploadsCache.filter(function (u) {
+    var created = u.created_at || u.createdAt || u.created;
     if (created && !withinDays(created, days)) return false;
 
-    const plats = normalizePlatforms(u).map(p => (p||'').toLowerCase());
-    if (platform !== 'all' && !plats.includes(platform)) return false;
+    var plats = normalizePlatforms(u).map(function (p) { return (p || '').toLowerCase(); });
+    var pf = platform;
+    if (pf === 'instagram_reels') pf = 'instagram';
+    if (pf === 'facebook_reels') pf = 'facebook';
+    if (platform !== 'all' && plats.indexOf(pf) === -1) return false;
 
-    const st = normalizeStatus(u);
+    var st = normalizeStatus(u);
     if (status !== 'all' && st !== status) return false;
 
     return true;
   });
 }
 
-function pct(n, d) { if (!d) return '0%'; return Math.round((n/d)*100) + '%'; }
-function fmt(n) { return (n ?? 0).toLocaleString(); }
+function pct(n, d) { if (!d) return '0%'; return Math.round((n / d) * 100) + '%'; }
+function fmt(n) { return (n != null) ? Number(n).toLocaleString() : '0'; }
+function fmtClock(d) {
+  if (!d) return '--:--:--';
+  try { return new Date(d).toLocaleTimeString(); } catch (e) { return '--:--:--'; }
+}
+
+function renderHealth() {
+  var el = document.getElementById('kpiHealth');
+  if (!el) return;
+  var color = 'var(--text-muted)';
+  if (kpiHealthState.status === 'ok') color = '#22c55e';
+  else if (kpiHealthState.status === 'loading') color = '#f59e0b';
+  else if (kpiHealthState.status === 'error') color = '#ef4444';
+  el.style.color = color;
+  el.textContent = kpiHealthState.message;
+}
 
 function buildKPIs(rows) {
-  const total = rows.length;
-  const success = rows.filter(u => normalizeStatus(u) === 'success').length;
-  const failed = rows.filter(u => normalizeStatus(u) === 'failed').length;
-  const scheduled = rows.filter(u => ['scheduled','queued','pending'].includes(normalizeStatus(u))).length;
+  var total = rows.length;
+  var success = rows.filter(function (u) { return normalizeStatus(u) === 'success'; }).length;
+  var failed = rows.filter(function (u) { return normalizeStatus(u) === 'failed'; }).length;
+  var scheduled = rows.filter(function (u) { return ['scheduled', 'queued', 'pending'].indexOf(normalizeStatus(u)) !== -1; }).length;
 
-  // Processing duration if present
-  const durations = rows.map(u => {
-    const a = new Date(u.created_at || u.createdAt || 0).getTime();
-    const b = new Date(u.completed_at || u.completedAt || u.updated_at || u.updatedAt || 0).getTime();
+  var durations = rows.map(function (u) {
+    var a = new Date(u.created_at || u.createdAt || 0).getTime();
+    var b = new Date(u.completed_at || u.completedAt || u.updated_at || u.updatedAt || 0).getTime();
     if (!a || !b || b < a) return null;
-    return (b - a)/1000;
-  }).filter(x => x != null);
+    return (b - a) / 1000;
+  }).filter(function (x) { return x != null; });
 
-  const avgSec = durations.length ? Math.round(durations.reduce((x,y)=>x+y,0)/durations.length) : null;
-  const p95Sec = durations.length ? durations.slice().sort((a,b)=>a-b)[Math.floor(durations.length*0.95)] : null;
+  var avgSec = durations.length ? Math.round(durations.reduce(function (x, y) { return x + y; }, 0) / durations.length) : null;
+  var p95Sec = durations.length ? durations.slice().sort(function (a, b) { return a - b; })[Math.floor(durations.length * 0.95)] : null;
 
-  const platforms = {};
-  rows.forEach(u => normalizePlatforms(u).forEach(p => {
-    p = (p||'').toLowerCase();
-    platforms[p] = (platforms[p]||0)+1;
-  }));
+  var platforms = {};
+  rows.forEach(function (u) {
+    normalizePlatforms(u).forEach(function (p) {
+      p = (p || '').toLowerCase();
+      platforms[p] = (platforms[p] || 0) + 1;
+    });
+  });
 
-  return { total, success, failed, scheduled, avgSec, p95Sec, platforms };
+  return { total: total, success: success, failed: failed, scheduled: scheduled, avgSec: avgSec, p95Sec: p95Sec, platforms: platforms };
 }
 
-function kpiCard(label, value, delta='') {
-  return `<div class="kpi"><div class="label">${label}</div><div class="value">${value}</div><div class="delta">${delta}</div></div>`;
+function kpiCard(label, value, delta) {
+  delta = delta || '';
+  return '<div class="card stat-card"><div class="card-title text-sm text-secondary">' + label + '</div><div class="stat-value">' + value + '</div><div class="stat-label">' + delta + '</div></div>';
 }
 
-let chartThroughput, chartPlatforms;
+var chartThroughput, chartPlatforms;
 
 function renderCharts(rows, kpis) {
-  // daily throughput
-  const byDay = {};
-  rows.forEach(u => {
-    const d = new Date(u.created_at || u.createdAt || Date.now());
-    const key = d.toISOString().slice(0,10);
-    byDay[key] = (byDay[key]||0)+1;
+  var th = chartTheme();
+  var byDay = {};
+  rows.forEach(function (u) {
+    var d = new Date(u.created_at || u.createdAt || Date.now());
+    var key = d.toISOString().slice(0, 10);
+    byDay[key] = (byDay[key] || 0) + 1;
   });
-  const labels = Object.keys(byDay).sort();
-  const values = labels.map(k => byDay[k]);
+  var labels = Object.keys(byDay).sort();
+  var values = labels.map(function (k) { return byDay[k]; });
 
-  const ctx1 = document.getElementById('chartThroughput');
+  var ctx1 = document.getElementById('chartThroughput');
   if (chartThroughput) chartThroughput.destroy();
   chartThroughput = new Chart(ctx1, {
     type: 'line',
-    data: { labels, datasets: [{ label: 'Uploads/day', data: values, tension: 0.2 }] },
-    options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ labels:{ color:'#fff' } } },
-      scales:{ x:{ ticks:{ color:'rgba(255,255,255,0.7)' }, grid:{ color:'rgba(255,255,255,0.08)' } },
-              y:{ ticks:{ color:'rgba(255,255,255,0.7)' }, grid:{ color:'rgba(255,255,255,0.08)' } } } }
+    data: { labels: labels, datasets: [{ label: 'Uploads/day', data: values, tension: 0.2, borderColor: '#f97316', backgroundColor: 'rgba(249,115,22,0.15)' }] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: th.text } } },
+      scales: {
+        x: { ticks: { color: th.mut }, grid: { color: th.grid } },
+        y: { ticks: { color: th.mut }, grid: { color: th.grid } }
+      }
+    }
   });
 
-  const pLabels = Object.keys(kpis.platforms).filter(k=>k).sort();
-  const pValues = pLabels.map(k => kpis.platforms[k]);
-  const ctx2 = document.getElementById('chartPlatforms');
+  var pLabels = Object.keys(kpis.platforms).filter(function (k) { return k; }).sort();
+  var pValues = pLabels.map(function (k) { return kpis.platforms[k]; });
+  var pDisplay = { tiktok:'TikTok', youtube:'YouTube', instagram:'Instagram Reels', facebook:'Facebook Reels' };
+  var ctx2 = document.getElementById('chartPlatforms');
   if (chartPlatforms) chartPlatforms.destroy();
   chartPlatforms = new Chart(ctx2, {
     type: 'doughnut',
-    data: { labels: pLabels.map(x=>x.toUpperCase()), datasets: [{ data: pValues }] },
-    options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'bottom', labels:{ color:'#fff' } } } }
+    data: { labels: pLabels.map(function (x) { return pDisplay[x] || x; }), datasets: [{ data: pValues, backgroundColor: ['#3b82f6', '#22c55e', '#a855f7', '#f97316', '#64748b'] }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom', labels: { color: th.text } } } }
   });
 }
 
 function renderTable(kpis) {
-  const rows = [
+  var rows = [
     ['Total uploads', 'Count of uploads in the selected window', fmt(kpis.total), '↑ WoW', 'Ops'],
     ['Success rate', 'Success / total', pct(kpis.success, kpis.total), '≥ 98%', 'Eng'],
     ['Failure rate', 'Failed / total', pct(kpis.failed, kpis.total), '≤ 2%', 'Eng'],
     ['Scheduled backlog', 'Uploads not yet completed (scheduled/queued/pending)', fmt(kpis.scheduled), 'Near 0', 'Ops'],
     ['Avg processing time', 'Mean seconds from created_at to completed_at (if timestamps exist)', kpis.avgSec ? (kpis.avgSec + 's') : 'N/A', '≤ 60s', 'Eng'],
     ['P95 processing time', '95th percentile processing seconds', kpis.p95Sec ? (kpis.p95Sec + 's') : 'N/A', '≤ 180s', 'Eng'],
-    ['Platform concentration', 'Top platform share = max(platform_count)/total', kpis.total ? (Math.round((Math.max(...Object.values(kpis.platforms||{0:0})) / Math.max(1,kpis.total))*100)+'%') : '0%', 'Balanced', 'Growth'],
+    ['Platform concentration', 'Top platform share = max(platform_count)/total', kpis.total ? (Math.round((Math.max.apply(null, Object.values(kpis.platforms || { 0: 0 })) / Math.max(1, kpis.total)) * 100) + '%') : '0%', 'Balanced', 'Growth'],
     ['Queue cancel rate', 'Canceled / total (requires cancel status)', 'N/A', 'Low', 'Ops'],
     ['Webhook delivery rate', 'Successful webhook posts / total events (requires event logs)', 'N/A', '≥ 99%', 'Eng'],
     ['OAuth connect success', 'Successful connects / attempts (requires event logs)', 'N/A', '≥ 95%', 'Eng'],
@@ -244,81 +373,228 @@ function renderTable(kpis) {
     ['CAC payback', 'CAC / gross profit per user (requires acquisition spend)', 'N/A', '≤ 3 mo', 'Finance'],
     ['Gross margin', '(Revenue - platform/infra costs) / revenue', 'N/A', '≥ 80%', 'Finance']
   ];
-  document.getElementById('kpiTable').innerHTML = rows.map(r =>
-    `<tr><td><strong>${r[0]}</strong></td><td class="muted">${r[1]}</td><td>${r[2]}</td><td class="muted">${r[3]}</td><td class="muted">${r[4]}</td></tr>`
-  ).join('');
+  document.getElementById('kpiTable').innerHTML = rows.map(function (r) {
+    return '<tr><td><strong>' + r[0] + '</strong></td><td class="text-secondary">' + r[1] + '</td><td>' + r[2] + '</td><td class="text-secondary">' + r[3] + '</td><td class="text-secondary">' + r[4] + '</td></tr>';
+  }).join('');
 }
 
 function renderKPIs(rows) {
-  const kpis = buildKPIs(rows);
-  document.getElementById('meta').textContent = `Rows: ${fmt(rows.length)} | Cached uploads: ${fmt(uploadsCache.length)}`;
+  var platform = (document.getElementById('platform').value || 'all');
+  var statusF = (document.getElementById('status').value || 'all');
+  var fromSample = buildKPIs(rows);
+  var kpis = fromSample;
+  var useOfficial = overviewSnapshot && overviewSnapshot.uploads && statusF === 'all';
+  if (useOfficial) {
+    var u = overviewSnapshot.uploads;
+    kpis = Object.assign({}, fromSample);
+    kpis.total = Number(u.total || 0);
+    kpis.success = Number(u.completed || 0);
+    kpis.failed = Number(u.failed || 0);
+    kpis.scheduled = Number(u.in_queue || 0);
+  }
+  var metaLine = 'Rows: ' + fmt(rows.length) + ' | Cached uploads: ' + fmt(uploadsCache.length);
+  if (useOfficial) {
+    var fp = (overviewSnapshot.filters && overviewSnapshot.filters.platform) || 'all';
+    metaLine += ' · Headline: /api/analytics/overview · platform=' + fp + ' (full window, not capped at 1000 rows)';
+  } else if (statusF !== 'all') {
+    metaLine += ' · Headline KPIs from sample (status filter active; server overview is all statuses)';
+  }
+  document.getElementById('meta').textContent = metaLine;
   document.getElementById('kpiGrid').innerHTML = [
     kpiCard('Uploads', fmt(kpis.total), 'Throughput'),
-    kpiCard('Success rate', pct(kpis.success, kpis.total), `${fmt(kpis.success)} successful`),
-    kpiCard('Failure rate', pct(kpis.failed, kpis.total), `${fmt(kpis.failed)} failed`),
+    kpiCard('Success rate', pct(kpis.success, kpis.total), fmt(kpis.success) + ' successful'),
+    kpiCard('Failure rate', pct(kpis.failed, kpis.total), fmt(kpis.failed) + ' failed'),
     kpiCard('Scheduled', fmt(kpis.scheduled), 'Backlog'),
-    kpiCard('Avg processing', kpis.avgSec ? (kpis.avgSec+'s') : 'N/A', 'Latency'),
-    kpiCard('P95 processing', kpis.p95Sec ? (kpis.p95Sec+'s') : 'N/A', 'Tail latency'),
-    kpiCard('Top platform', Object.keys(kpis.platforms).sort((a,b)=>kpis.platforms[b]-kpis.platforms[a])[0]?.toUpperCase() || 'N/A', 'Concentration'),
+    kpiCard('Avg processing', kpis.avgSec ? (kpis.avgSec + 's') : 'N/A', 'Latency'),
+    kpiCard('P95 processing', kpis.p95Sec ? (kpis.p95Sec + 's') : 'N/A', 'Tail latency'),
+    kpiCard('Top platform', Object.keys(kpis.platforms).sort(function (a, b) { return kpis.platforms[b] - kpis.platforms[a]; })[0] ? Object.keys(kpis.platforms).sort(function (a, b) { return kpis.platforms[b] - kpis.platforms[a]; })[0].toUpperCase() : 'N/A', 'Concentration'),
     kpiCard('Platforms', fmt(Object.keys(kpis.platforms).length), 'Coverage')
   ].join('');
   renderCharts(rows, kpis);
   renderTable(kpis);
-  window.__lastExport = { rows, kpis };
+  window.__lastExport = { rows: rows, kpis: kpis };
 }
 
 async function loadData() {
-  if (!token) { location.href='/login.html'; return; }
+  // Do not require getAccessToken() — many sessions are HttpOnly-cookie-only; apiCall still sends credentials:'include'.
 
-  // Prefer analytics endpoint if present, fall back to uploads list.
+  var days0 = parseInt((document.getElementById('days') || {}).value, 10) || 30;
+  var range0 = String(days0) + 'd';
+  var selectedPlatform = (document.getElementById('platform').value || 'all');
+  var uploadLimit = Math.min(800, Math.max(200, days0 * 12));
+
+  var m8Promise = window.M8Stats
+    ? window.M8Stats.load(range0).then(function (d) {
+        if (!d) return;
+        window.M8Stats.applyToElements(d, {
+          views:    'kpiEngViews',
+          likes:    'kpiEngLikes',
+          comments: 'kpiEngComments',
+          shares:   'kpiEngShares',
+        });
+      })
+    : Promise.resolve();
+
+  var qsPromise = (async function () {
+    try {
+      var qs = await kpiApi('/api/analytics/quality-scores?days=' + days0 + '&platform=' + encodeURIComponent(selectedPlatform)).catch(function () { return null; });
+      if (qs && Array.isArray(qs.rows) && qs.rows.length) {
+        var byKey = new Map();
+        for (var i = 0; i < qs.rows.length; i++) {
+          var r = qs.rows[i];
+          var k = String(r.strategy_key || 'default');
+          if (!byKey.has(k)) byKey.set(k, r);
+        }
+        mlTopStrategies = Array.from(byKey.values()).sort(function (a, b) {
+          return Number(b.ci95_high || 0) - Number(a.ci95_high || 0);
+        }).slice(0, 5);
+      } else {
+        mlTopStrategies = [];
+      }
+    } catch (e) {
+      mlTopStrategies = [];
+    }
+  })();
+
+  await Promise.all([
+    fetchOverviewSnapshot().catch(function () { overviewSnapshot = null; }),
+    qsPromise,
+    m8Promise,
+  ]);
+
+  var res = await Promise.all([
+    kpiApi('/api/uploads?limit=' + uploadLimit + '&meta=true'),
+    loadPikzelsUserKpi(),
+  ]);
+  res = res[0];
+  if (Array.isArray(res)) uploadsCache = res;
+  else uploadsCache = (res && Array.isArray(res.uploads)) ? res.uploads : [];
+}
+
+async function loadPikzelsUserKpi() {
+  var el = document.getElementById('pikzelsV2UserKpi');
+  if (!el) return;
+  var days = parseInt(document.getElementById('days').value, 10) || 30;
+  var range = String(days) + 'd';
   try {
-    const days = parseInt(document.getElementById('days').value, 10);
-    const overview = await api(`/api/analytics/overview?days=${days}`);
-    // Still load uploads list for export and charts (commercial-grade traceability).
-  } catch (e) { /* ignore */ }
+    var d = await kpiApi('/api/analytics/pikzels-v2-usage?range=' + encodeURIComponent(range));
+    var parts = (d.by_operation || []).map(function (r) { return (r.op || '?') + ': ' + (r.count || 0); });
+    el.textContent = 'Thumbnail Studio (Pikzels) actions this period: ' + (d.total_calls || 0)
+      + (parts.length ? ' — ' + parts.join(' · ') : '')
+      + ' · Open Thumbnail Studio from the nav anytime';
+  } catch (e) {
+    el.textContent = '';
+  }
+}
 
-  // Pull a large window for KPI derivation
-  const res = await api('/api/uploads?limit=1000');
-  uploadsCache = res.uploads || [];
+function renderMLStrategies() {
+  var el = document.getElementById('mlStrategiesBox');
+  if (!el) return;
+  if (!mlTopStrategies || !mlTopStrategies.length) {
+    el.textContent = 'No ML strategy data yet for this window. Uploads need completed performance metrics and the ML scoring job must have run.';
+    return;
+  }
+  el.innerHTML = mlTopStrategies.map(function (x) {
+    var key = String(x.strategy_key || 'default');
+    var mean = Number(x.mean_engagement || 0);
+    var ciHi = Number(x.ci95_high || 0);
+    var n = Number(x.samples || 0);
+    return '<div class="ml-strat-line"><strong>' + key + '</strong>: mean ' + mean.toFixed(2) + '% · CI95 high ' + ciHi.toFixed(2) + '% · n=' + n + '</div>';
+  }).join('');
 }
 
 async function refresh() {
   try {
+    if (window.M8Stats) window.M8Stats.invalidate();
+    kpiHealthState = { status: 'loading', message: 'Refreshing…', at: new Date().toISOString() };
+    renderHealth();
     await loadData();
     renderKPIs(filterUploads());
+    renderMLStrategies();
+    kpiHealthState = { status: 'ok', message: 'Updated ' + fmtClock(new Date()), at: new Date().toISOString() };
+    renderHealth();
   } catch (e) {
-    alert('KPI load failed: ' + e.message);
+    var msg = (e && e.message) ? e.message : String(e);
+    if (msg === 'Not authenticated' || (e && e.status === 401)) {
+      window.location.href = 'login.html';
+      return;
+    }
+    kpiHealthState = { status: 'error', message: 'Could not load · ' + msg, at: new Date().toISOString() };
+    renderHealth();
+    alert('KPI load failed: ' + msg);
   }
 }
 
 function exportExcel() {
-  const exp = window.__lastExport;
+  if (typeof XLSX === 'undefined') {
+    var msg = 'Excel library did not load (often blocked by an ad-blocker). Allow scripts for this site or disable the blocker for UploadM8.';
+    if (typeof window.showToast === 'function') window.showToast(msg, 'warning');
+    else alert(msg);
+    return;
+  }
+  var exp = window.__lastExport;
   if (!exp) return;
 
-  const kpiRows = Object.entries(exp.kpis).map(([k,v]) => ({ KPI: k, Value: (typeof v === 'object' ? JSON.stringify(v) : v) }));
-  const uploadRows = exp.rows.map(u => ({
-    id: u.id || u.upload_id || '',
-    title: u.title || '',
-    filename: u.filename || '',
-    status: u.status || '',
-    created_at: u.created_at || '',
-    scheduled_for: u.scheduled_for || u.scheduled_at || '',
-    platforms: (normalizePlatforms(u)||[]).join(',')
-  }));
+  var kpiRows = Object.entries(exp.kpis).map(function (kv) {
+    return { KPI: kv[0], Value: (typeof kv[1] === 'object' ? JSON.stringify(kv[1]) : kv[1]) };
+  });
+  var uploadRows = exp.rows.map(function (u) {
+    return {
+      id: u.id || u.upload_id || '',
+      title: u.title || '',
+      filename: u.filename || '',
+      status: u.status || '',
+      created_at: u.created_at || '',
+      scheduled_for: u.scheduled_for || u.scheduled_at || '',
+      platforms: (normalizePlatforms(u) || []).join(',')
+    };
+  });
 
-  const wb = XLSX.utils.book_new();
-  const ws1 = XLSX.utils.json_to_sheet(kpiRows);
-  const ws2 = XLSX.utils.json_to_sheet(uploadRows);
-  XLSX.utils.book_append_sheet(wb, ws1, 'KPIs');
-  XLSX.utils.book_append_sheet(wb, ws2, 'Uploads');
-  XLSX.writeFile(wb, `uploadm8_kpis_${new Date().toISOString().slice(0,10)}.xlsx`);
+  var wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(kpiRows), 'KPIs');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(uploadRows), 'Uploads');
+  XLSX.writeFile(wb, 'uploadm8_kpis_' + new Date().toISOString().slice(0, 10) + '.xlsx');
 }
 
 document.getElementById('days').addEventListener('change', refresh);
-document.getElementById('platform').addEventListener('change', () => renderKPIs(filterUploads()));
-document.getElementById('status').addEventListener('change', () => renderKPIs(filterUploads()));
+document.getElementById('platform').addEventListener('change', async function () {
+  try {
+    kpiHealthState = { status: 'loading', message: 'Loading platform…', at: new Date().toISOString() };
+    renderHealth();
+    await fetchOverviewSnapshot();
+    renderKPIs(filterUploads());
+    kpiHealthState = { status: 'ok', message: 'Updated ' + fmtClock(new Date()), at: new Date().toISOString() };
+    renderHealth();
+  } catch (e) {
+    var msg = (e && e.message) ? e.message : String(e);
+    overviewSnapshot = null;
+    kpiHealthState = { status: 'error', message: 'Could not load · ' + msg, at: new Date().toISOString() };
+    renderHealth();
+    renderKPIs(filterUploads());
+  }
+});
+document.getElementById('status').addEventListener('change', function () { renderKPIs(filterUploads()); });
 
-refresh();
+(async function () {
+  var user = null;
+  if (typeof initApp === 'function') {
+    try {
+      user = await initApp('kpi');
+    } catch (e) {
+      console.warn('initApp kpi', e);
+    }
+  }
+  if (!user && typeof checkAuth === 'function') {
+    try {
+      user = await checkAuth({ redirectOnFail: true, forceRefresh: false });
+    } catch (e2) {
+      console.warn('checkAuth kpi', e2);
+    }
+  }
+  if (!user) return;
+  await refresh();
+})();
+})();
 </script>
 </body>
 </html>

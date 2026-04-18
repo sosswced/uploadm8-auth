@@ -1,9 +1,11 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cookie Policy - UploadM8</title>
+    <title>Cookies &amp; similar technologies - UploadM8</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
@@ -39,7 +41,7 @@
         .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
         .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
         @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
-        .sidebar-toc { position: sticky; top: 80px; }
+        .sidebar-toc { position: sticky; top: 5.5rem; z-index: 1; }
         .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
         .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
         .toc-list { list-style: none; }
@@ -96,6 +98,7 @@
         .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
         .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
         ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: var(--bg-secondary); } ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+        @media (max-width: 480px) { .hero { padding: 2.5rem 1.25rem 2rem; } .hero h1 { font-size: 2rem; } .nav { padding: 0.75rem 1rem; } .content-wrapper { padding: 2rem 1.25rem 3rem; } }
     </style>
 </head>
 <body>
@@ -103,7 +106,7 @@
 <nav class="nav">
     <div class="nav-container">
         <a href="index.html" class="nav-logo">
-            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            <img src="images/logo.svg" alt="UploadM8" style="height:32px;width:auto;">
             UploadM8
         </a>
         <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
@@ -113,10 +116,10 @@
 <div class="hero">
     <div class="hero-inner">
         <div class="hero-badge"><i class="fas fa-cookie-bite"></i> Legal</div>
-        <h1>Cookie Policy</h1>
+        <h1>Cookies &amp; similar technologies</h1>
         <div class="hero-meta">
             <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
-            <span><i class="fas fa-clock"></i> Last Updated: February 2026</span>
+            <span><i class="fas fa-clock"></i> Last updated: April 2026</span>
         </div>
     </div>
 </div>
@@ -139,92 +142,94 @@
 
         <div class="callout callout-green">
             <i class="fas fa-check-circle"></i>
-            <div>UploadM8 uses cookies and similar technologies to operate the platform and provide you with a better experience. We do not use cookies for advertising, behavioral profiling, or selling your data to third parties.</div>
+            <div>UploadM8 uses <strong>browser storage</strong> (sessionStorage / localStorage) for sign-in and UI state, and may load third-party assets (fonts, icons) that can set their own cookies. We do <strong>not</strong> use advertising pixels, retargeting, or behavioral ad networks.</div>
         </div>
 
         <div class="section-block" id="what-are-cookies">
-            <div class="section-header"><div class="section-num">1</div><h2>What Are Cookies</h2></div>
+            <div class="section-header"><div class="section-num">1</div><h2>Cookies &amp; browser storage</h2></div>
             <div class="prose">
-                <p>Cookies are small text files stored on your device when you visit a website. They serve various functions — from keeping you logged in to remembering your preferences. We also use similar technologies including localStorage and session storage for application state management.</p>
-                <p>Cookies can be "session cookies" (deleted when you close your browser) or "persistent cookies" (remain on your device for a set duration). They can be set by us (first-party) or by third-party services we use.</p>
+                <p><strong>Cookies</strong> are small text files sites can store in your browser. <strong>sessionStorage</strong> and <strong>localStorage</strong> are separate browser APIs that work like on-device key/value stores.</p>
+                <p><strong>How UploadM8 signs you in today:</strong> the web app stores JWT access and refresh tokens in <strong>sessionStorage</strong> (primary). Legacy tokens in <strong>localStorage</strong> are migrated once and then removed. We do <em>not</em> rely on HttpOnly session cookies for API authentication in the current SPA.</p>
+                <p><strong>Third-party page assets:</strong> some pages load styles or scripts from CDNs (for example Font Awesome or Google Fonts). Those providers may set or read their own cookies under their policies.</p>
             </div>
         </div>
 
         <div class="section-block" id="types-we-use">
-            <div class="section-header"><div class="section-num">2</div><h2>Types of Cookies We Use</h2></div>
+            <div class="section-header"><div class="section-num">2</div><h2>What we store in your browser</h2></div>
             <div class="cookie-type-grid">
                 <div class="cookie-card">
                     <div class="cookie-card-header">
                         <div class="cookie-card-title">
                             <div class="cookie-card-icon icon-green"><i class="fas fa-lock"></i></div>
-                            Strictly Necessary
+                            Required for the app
                         </div>
-                        <span class="badge badge-always">Always Active</span>
+                        <span class="badge badge-always">Core</span>
                     </div>
-                    <p>These cookies are essential for the platform to function. They enable core features like authentication, security, and session management. You cannot opt out of these cookies — without them, the service cannot operate.</p>
-                    <div class="cookie-detail"><strong>Purpose:</strong> User authentication, CSRF protection, session state</div>
-                    <div class="cookie-detail"><strong>Duration:</strong> Session / up to 30 days for "remember me"</div>
-                    <div class="cookie-detail"><strong>Party:</strong> First-party (UploadM8 only)</div>
+                    <p>Access and refresh tokens, cached user snapshot, API base override, and similar keys in <strong>sessionStorage</strong> (and one-time migration from <strong>localStorage</strong>). Clearing site data or using private browsing will sign you out or reset state.</p>
+                    <div class="cookie-detail"><strong>Examples:</strong> <code style="font-size:0.8rem;">uploadm8_access_token</code>, <code style="font-size:0.8rem;">uploadm8_refresh_token</code>, <code style="font-size:0.8rem;">uploadm8_cached_user</code></div>
+                    <div class="cookie-detail"><strong>Duration:</strong> Until logout or tab/session clear (see auth code in <code style="font-size:0.8rem;">frontend/js/auth-stack.js</code>)</div>
+                    <div class="cookie-detail"><strong>Party:</strong> First-party (your browser only)</div>
                 </div>
 
                 <div class="cookie-card">
                     <div class="cookie-card-header">
                         <div class="cookie-card-title">
                             <div class="cookie-card-icon icon-orange"><i class="fas fa-sliders-h"></i></div>
-                            Preferences
+                            Preferences &amp; UI
                         </div>
-                        <span class="badge badge-optional">Optional</span>
+                        <span class="badge badge-optional">Comfort</span>
                     </div>
-                    <p>These cookies remember your preferences to personalize your experience — such as your chosen theme (dark/light mode), dashboard layout, and notification settings. Disabling these means your preferences reset on each visit.</p>
-                    <div class="cookie-detail"><strong>Purpose:</strong> Theme preference, UI layout, language settings</div>
-                    <div class="cookie-detail"><strong>Duration:</strong> Up to 1 year</div>
-                    <div class="cookie-detail"><strong>Party:</strong> First-party (UploadM8 only)</div>
+                    <p>Theme (<code style="font-size:0.8rem;">uploadm8_theme</code>), dashboard card order, upload-session helpers, and similar values in sessionStorage/localStorage. They improve UX but are not strictly required to reach the login screen.</p>
+                    <div class="cookie-detail"><strong>Purpose:</strong> Dark/light mode, layout, in-progress upload hints</div>
+                    <div class="cookie-detail"><strong>Duration:</strong> Session or until you clear site data</div>
+                    <div class="cookie-detail"><strong>Party:</strong> First-party</div>
                 </div>
 
                 <div class="cookie-card">
                     <div class="cookie-card-header">
                         <div class="cookie-card-title">
-                            <div class="cookie-card-icon icon-blue"><i class="fas fa-chart-bar"></i></div>
-                            Analytics
+                            <div class="cookie-card-icon icon-blue"><i class="fas fa-server"></i></div>
+                            Errors &amp; reliability
                         </div>
-                        <span class="badge badge-conditional">Opt-Out Available</span>
+                        <span class="badge badge-conditional">If configured</span>
                     </div>
-                    <p>These cookies help us understand how users interact with UploadM8 so we can improve the platform. Data is aggregated and anonymized — we cannot identify individual users from analytics data. No behavioral advertising is conducted.</p>
-                    <div class="cookie-detail"><strong>Purpose:</strong> Page views, feature usage, error tracking</div>
-                    <div class="cookie-detail"><strong>Duration:</strong> Up to 13 months</div>
-                    <div class="cookie-detail"><strong>Party:</strong> First-party and limited third-party analytics</div>
+                    <p>On the server, we may send redacted error and performance events to <strong>Sentry</strong> when enabled — that is not a browser cookie, but it is part of our overall telemetry story. See <a href="subprocessors.html#sentry">Subprocessors → Sentry</a>.</p>
+                    <div class="cookie-detail"><strong>Browser footprint:</strong> No dedicated UploadM8 analytics cookie today</div>
+                    <div class="cookie-detail"><strong>Advertising:</strong> None</div>
                 </div>
             </div>
         </div>
 
         <div class="section-block" id="specific-cookies">
-            <div class="section-header"><div class="section-num">3</div><h2>Specific Cookies We Set</h2></div>
+            <div class="section-header"><div class="section-num">3</div><h2>Storage keys (representative)</h2></div>
             <table class="data-table">
                 <thead>
-                    <tr><th>Cookie Name</th><th>Type</th><th>Purpose</th><th>Duration</th></tr>
+                    <tr><th>Key</th><th>Storage</th><th>Purpose</th><th>Typical duration</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>um8_session</td><td>Strictly Necessary</td><td>Authentication session token</td><td>Session</td></tr>
-                    <tr><td>um8_remember</td><td>Strictly Necessary</td><td>"Remember Me" persistent login</td><td>30 days</td></tr>
-                    <tr><td>um8_csrf</td><td>Strictly Necessary</td><td>Cross-site request forgery protection</td><td>Session</td></tr>
-                    <tr><td>um8_theme</td><td>Preferences</td><td>Dark/light mode preference</td><td>1 year</td></tr>
-                    <tr><td>um8_layout</td><td>Preferences</td><td>Dashboard card layout state</td><td>1 year</td></tr>
-                    <tr><td>um8_analytics</td><td>Analytics</td><td>Anonymized feature usage tracking</td><td>13 months</td></tr>
+                    <tr><td><code>uploadm8_access_token</code></td><td>sessionStorage</td><td>Bearer token for API calls</td><td>Until logout / tab data cleared</td></tr>
+                    <tr><td><code>uploadm8_refresh_token</code></td><td>sessionStorage</td><td>Obtain new access tokens</td><td>Same</td></tr>
+                    <tr><td><code>uploadm8_cached_user</code></td><td>sessionStorage</td><td>Reduce /me round-trips</td><td>Same</td></tr>
+                    <tr><td><code>uploadm8_theme</code></td><td>sessionStorage</td><td>Dark vs light UI</td><td>Same</td></tr>
+                    <tr><td><code>uploadm8_dashboard_order</code></td><td>sessionStorage</td><td>Dashboard layout</td><td>Same</td></tr>
+                    <tr><td><code>uploadm8.uploadSession</code></td><td>sessionStorage</td><td>In-progress upload UX</td><td>Same</td></tr>
                 </tbody>
             </table>
             <div class="callout callout-blue">
                 <i class="fas fa-ban"></i>
-                <div><strong>No advertising cookies.</strong> UploadM8 does not use advertising networks, retargeting pixels, Facebook Pixel, Google Ads cookies, or any third-party behavioral tracking cookies. We do not participate in any ad networks.</div>
+                <div><strong>No advertising cookies.</strong> We do not run Facebook Pixel, Google Ads remarketing, or ad-network trackers. Third-party CDNs used for fonts or icons may apply their own policies.</div>
             </div>
         </div>
 
         <div class="section-block" id="managing-cookies">
-            <div class="section-header"><div class="section-num">4</div><h2>Managing Your Cookie Preferences</h2></div>
+            <div class="section-header"><div class="section-num">4</div><h2>Managing storage &amp; third parties</h2></div>
             <div class="prose">
-                <h3>In-App Controls</h3>
-                <p>Visit <strong>Settings → Privacy → Cookie Preferences</strong> to opt out of analytics cookies. Strictly necessary and preference cookies cannot be disabled without breaking core functionality.</p>
-                <h3>Browser Controls</h3>
-                <p>You can control cookies through your browser settings. Note that disabling cookies may break UploadM8 authentication and core functionality.</p>
+                <h3>Browser controls</h3>
+                <p>Use your browser’s “clear site data” / “cookies and site data” tools for <strong>app.uploadm8.com</strong> (or the hostname you use). That will sign you out and remove saved layout/theme keys.</p>
+                <h3>Blocking third-party cookies</h3>
+                <p>Strict blocking may interfere with CDN-loaded fonts or icons. If the UI looks wrong, allow first-party scripts and styles for UploadM8 or self-host assets (enterprise setups).</p>
+                <h3>Do Not Track</h3>
+                <p>We do not respond to DNT signals in a standardized way today; we already avoid behavioral ad networks.</p>
             </div>
             <table class="data-table">
                 <thead><tr><th>Browser</th><th>Cookie Settings Location</th></tr></thead>
@@ -253,9 +258,9 @@
             <div class="toc-title">On This Page</div>
             <ul class="toc-list">
                 <li><a href="#what-are-cookies">1. What Are Cookies</a></li>
-                <li><a href="#types-we-use">2. Types We Use</a></li>
-                <li><a href="#specific-cookies">3. Specific Cookies</a></li>
-                <li><a href="#managing-cookies">4. Managing Preferences</a></li>
+                <li><a href="#types-we-use">2. Browser storage</a></li>
+                <li><a href="#specific-cookies">3. Storage keys</a></li>
+                <li><a href="#managing-cookies">4. Managing</a></li>
                 <li><a href="#contact">5. Questions</a></li>
             </ul>
         </div>
@@ -266,6 +271,8 @@
     <div class="footer-inner">
         <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
         <div class="footer-links">
+            <a href="how-it-works.html">How it works</a>
+            <a href="contact.html">Contact</a>
             <a href="privacy.html">Privacy</a>
             <a href="terms.html">Terms</a>
             <a href="security.html">Security</a>
@@ -273,11 +280,18 @@
             <a href="subprocessors.html">Subprocessors</a>
             <a href="refunds.html">Refunds</a>
             <a href="dmca.html">DMCA</a>
+            <a href="contact.html">Contact</a>
             <a href="support.html">Support</a>
+            <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
         </div>
     </div>
 </footer>
 
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
 <script>
     const sections = document.querySelectorAll('.section-block[id]');
     const tocLinks = document.querySelectorAll('.toc-list a');

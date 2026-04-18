@@ -90,6 +90,98 @@ async def send_welcome_email(email: str, name: str) -> None:
     await send_email(email, f"Welcome to UploadM8, {name}! 🎉 Your 30 free tokens are ready", html, from_addr=MAIL_FROM_SUPPORT)
 
 
+async def send_signup_confirmation_email(email: str, name: str, confirm_link: str) -> None:
+    """Sent when SIGNUP_EMAIL_VERIFICATION is enabled; link opens confirm-email.html with token."""
+    if not mailgun_ready():
+        return
+
+    html = email_shell(
+        gradient=GRAD_GREEN,
+        tagline="Confirm your email",
+        preheader_text=f"{name}, one quick click to activate your UploadM8 account.",
+        body_rows=(
+            section_tag("Verify your email", "#22c55e")
+            + intro_row(
+                f"Hi {name} — almost there! &#128075;",
+                "Please confirm your email address so we know how to reach you about uploads, "
+                "billing, and security alerts.",
+            )
+            + cta_button("Confirm my email", confirm_link, pt="24px", pb="20px")
+            + tinted_box(
+                f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.65;">'
+                f"If the button does not work, paste this link into your browser:<br/>"
+                f'<span style="word-break:break-all;color:#e5e7eb;">{confirm_link}</span></p>',
+                hex_color="#374151",
+                pb="36px",
+            )
+        ),
+        footer_note="You received this because someone signed up for UploadM8 with this address.",
+    )
+
+    await send_email(
+        email,
+        "Confirm your UploadM8 email",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+    )
+
+
+async def send_post_verification_welcome_email(email: str, name: str) -> None:
+    """
+    Sent once after the user confirms their email (signup flow).
+    Combines welcome messaging + Setup Handbook link (in-app guide).
+    """
+    if not mailgun_ready():
+        return
+
+    handbook_url = f"{FRONTEND_URL}/guide.html#feat-settings-playbook"
+
+    html = email_shell(
+        gradient=GRAD_ORANGE,
+        tagline="You're verified — let's publish.",
+        preheader_text=f"{name}, your email is confirmed. Open the Setup Handbook and start with your free tokens.",
+        body_rows=(
+            section_tag("Email verified", "#22c55e")
+            + intro_row(
+                f"Welcome aboard, {name}! &#127881;",
+                "Your email address is confirmed. Your account is live — open the dashboard to see your tier, "
+                "wallet balances, and everything included with your plan.",
+            )
+            + metric_hero(
+                "30",
+                "Free upload tokens",
+                "already in your wallet — no card required",
+                "#f97316",
+            )
+            + divider_accent()
+            + intro_row(
+                "Setup Handbook",
+                "The in-app <strong>Feature Guide</strong> walks through every setting — captions, thumbnails, "
+                "AI credits, scheduling, and how to avoid spending tokens you do not need. "
+                "You will also see the same playbook the first time you open your Dashboard.",
+            )
+            + cta_button("Open Setup Handbook", handbook_url, pt="8px", pb="8px")
+            + cta_button("Go to Dashboard", URL_DASHBOARD, pt="8px", pb="20px")
+            + tinted_box(
+                f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.65;">'
+                f'Need help? Reply to this email or write to '
+                f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">{SUPPORT_EMAIL}</a>.</p>',
+                hex_color="#374151",
+                pb="36px",
+            )
+        ),
+        footer_note="You received this because you verified an UploadM8 account.",
+    )
+
+    await send_email(
+        email,
+        f"You're in, {name}! — UploadM8 welcome + Setup Handbook",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Password reset link
 # ─────────────────────────────────────────────────────────────────────────────

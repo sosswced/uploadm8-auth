@@ -27,6 +27,28 @@
             --red:       #ef4444;
         }
 
+        [data-theme="light"], .light-mode {
+            --bg:        #f8fafc;
+            --card:      #ffffff;
+            --card2:     #f1f5f9;
+            --border:    #e2e8f0;
+            --border2:   #cbd5e1;
+            --text:      #0f172a;
+            --muted:     #475569;
+            --dim:       #94a3b8;
+        }
+        [data-theme="light"] .ambient-orb { display: none; }
+        [data-theme="light"] .card { box-shadow: 0 4px 24px rgba(0,0,0,.08); }
+        [data-theme="light"] .wallet-card.put  { background:rgba(249,115,22,.06); border-color:rgba(249,115,22,.18); }
+        [data-theme="light"] .wallet-card.aic  { background:rgba(139,92,246,.06); border-color:rgba(139,92,246,.18); }
+        [data-theme="light"] .amount-row { background:rgba(34,197,94,.05); border-color:rgba(34,197,94,.12); }
+        [data-theme="light"] .trial-strip { background:rgba(245,158,11,.06); border-color:rgba(245,158,11,.18); }
+        [data-theme="light"] .feat-item { background:rgba(0,0,0,.02); border-color:#e2e8f0; }
+        [data-theme="light"] .session-meta { border-color:#e2e8f0; }
+        [data-theme="light"] .btn-primary { box-shadow: 0 2px 12px rgba(249,115,22,.15); }
+        [data-theme="light"] .btn-secondary { border-color:#cbd5e1; color:var(--muted); }
+        [data-theme="light"] .btn-secondary:hover { border-color:var(--orange); color:var(--text); }
+
         body {
             font-family: 'Inter', sans-serif;
             background: var(--bg);
@@ -311,13 +333,13 @@
             <div class="reveal" id="r3">
                 <div class="wallet-grid">
                     <div class="wallet-card put">
-                        <div class="wallet-emoji">⚡</div>
+                        <div class="wallet-emoji"></div>
                         <div class="wallet-num" id="walletPUT">—</div>
                         <div class="wallet-lbl">PUT Tokens</div>
                         <div class="wallet-sub">Upload credits / mo</div>
                     </div>
                     <div class="wallet-card aic">
-                        <div class="wallet-emoji">🤖</div>
+                        <div class="wallet-emoji"></div>
                         <div class="wallet-num" id="walletAIC">—</div>
                         <div class="wallet-lbl">AI Credits</div>
                         <div class="wallet-sub">AI analysis / mo</div>
@@ -360,74 +382,48 @@
     </div><!-- /card-body -->
 </div><!-- /card -->
 
+<script src="../js/api-base.js"></script>
+<script src="../js/auth-stack.js"></script>
+<script src="../js/session-user-hydrate.js"></script>
+<script src="../js/public-shell-hydrate.js"></script>
+<script src="../js/tier-catalog.js"></script>
 <script>
 'use strict';
 /* ═══════════════════════════════════════════════════════════════
    UploadM8 — billing/success.html
    Reads LIVE Stripe session data via /api/billing/session
    then polls /api/me for wallet balance post-webhook.
+   Tier numbers: UploadM8TierCatalog + /api/entitlements/tiers
 ═══════════════════════════════════════════════════════════════ */
 
-const API_BASE = window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : 'https://auth.uploadm8.com');
+// Theme: align with app.js — sessionStorage + one-time localStorage migration; default dark
+(function applyBillingSuccessTheme() {
+    var t = 'dark';
+    try {
+        var stored = sessionStorage.getItem('uploadm8_theme') || sessionStorage.getItem('theme');
+        if (!stored) {
+            stored = localStorage.getItem('uploadm8_theme') || localStorage.getItem('theme');
+            if (stored) {
+                sessionStorage.setItem('uploadm8_theme', stored);
+                try { localStorage.removeItem('uploadm8_theme'); localStorage.removeItem('theme'); } catch (e2) {}
+            }
+        }
+        if (stored === 'light' || stored === 'dark') t = stored;
+        else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) t = 'light';
+    } catch (e) {}
+    document.documentElement.setAttribute('data-theme', t);
+    try {
+        document.body.classList.toggle('light-mode', t === 'light');
+        document.body.classList.toggle('dark-mode', t !== 'light');
+    } catch (e3) {}
+})();
+
 const TOKEN_KEY = 'uploadm8_access_token';
-
-// ── Tier metadata (mirrors entitlements.py) ─────────────────
-const TIER_META = {
-    free:           { name:'Free',            color:'#9ca3af', put:60,    aic:10,   bg:'rgba(156,163,175,.1)',  border:'rgba(156,163,175,.25)' },
-    creator_lite:   { name:'Creator Lite',    color:'#f97316', put:300,   aic:80,   bg:'rgba(249,115,22,.1)',   border:'rgba(249,115,22,.3)'   },
-    launch:         { name:'Creator Lite',    color:'#f97316', put:300,   aic:80,   bg:'rgba(249,115,22,.1)',   border:'rgba(249,115,22,.3)'   },
-    creator_pro:    { name:'Creator Pro',     color:'#8b5cf6', put:700,   aic:200,  bg:'rgba(139,92,246,.1)',   border:'rgba(139,92,246,.3)'   },
-    studio:         { name:'Studio',          color:'#3b82f6', put:2000,  aic:600,  bg:'rgba(59,130,246,.1)',   border:'rgba(59,130,246,.3)'   },
-    agency:         { name:'Agency',          color:'#22c55e', put:4500,  aic:1500, bg:'rgba(34,197,94,.1)',    border:'rgba(34,197,94,.3)'    },
-    friends_family: { name:'Friends & Family',color:'#fbbf24', put:999999,aic:999999,bg:'rgba(251,191,36,.1)', border:'rgba(251,191,36,.3)'   },
-    lifetime:       { name:'Lifetime',        color:'#fbbf24', put:999999,aic:999999,bg:'rgba(251,191,36,.1)', border:'rgba(251,191,36,.3)'   },
-    master_admin:   { name:'Admin',           color:'#ef4444', put:999999,aic:999999,bg:'rgba(239,68,68,.1)',   border:'rgba(239,68,68,.3)'    },
+var TC = window.UploadM8TierCatalog || {
+    load: function() { return Promise.resolve(); },
+    getTierMeta: function(t, fb) { return { name: t || fb || 'Plan', color: '#f97316' }; },
+    billingSuccessFeats: function() { return null; },
 };
-
-// ── Feature lists per tier ──────────────────────────────────
-const TIER_FEATS = {
-    free: [
-        { ok:true,  icon:'fa-cloud-upload-alt', label:'4 platform accounts'    },
-        { ok:false, icon:'fa-robot',            label:'AI captions'             },
-        { ok:false, icon:'fa-calendar-alt',     label:'Scheduled posts'         },
-        { ok:false, icon:'fa-film',             label:'HUD overlay'             },
-        { ok:true,  icon:'fa-chart-line',       label:'Basic analytics'         },
-        { ok:false, icon:'fa-bolt',             label:'Priority queue'          },
-    ],
-    creator_lite: [
-        { ok:true,  icon:'fa-cloud-upload-alt', label:'8 accounts (2 / platform)' },
-        { ok:true,  icon:'fa-robot',            label:'AI captions (enhanced)'    },
-        { ok:true,  icon:'fa-calendar-alt',     label:'Scheduled posts'           },
-        { ok:true,  icon:'fa-image',            label:'Up to 3 thumbnails'        },
-        { ok:true,  icon:'fa-bell',             label:'Webhook notifications'     },
-        { ok:true,  icon:'fa-chart-line',       label:'Standard analytics'        },
-    ],
-    creator_pro: [
-        { ok:true,  icon:'fa-cloud-upload-alt', label:'20 accounts (5 / platform)' },
-        { ok:true,  icon:'fa-robot',            label:'Advanced AI depth'           },
-        { ok:true,  icon:'fa-film',             label:'HUD burn-in overlay'         },
-        { ok:true,  icon:'fa-bolt',             label:'Priority queue (p2)'         },
-        { ok:true,  icon:'fa-image',            label:'5 candidate thumbnails'      },
-        { ok:true,  icon:'fa-users',            label:'3 team seats'                },
-    ],
-    studio: [
-        { ok:true,  icon:'fa-cloud-upload-alt', label:'60 accounts (15 / platform)' },
-        { ok:true,  icon:'fa-robot',            label:'Max AI — 15 frame scan'       },
-        { ok:true,  icon:'fa-file-excel',       label:'Excel export reports'         },
-        { ok:true,  icon:'fa-bolt',             label:'Turbo priority queue (p1)'    },
-        { ok:true,  icon:'fa-film',             label:'HUD burn-in overlay'          },
-        { ok:true,  icon:'fa-users',            label:'10 team seats'                },
-    ],
-    agency: [
-        { ok:true,  icon:'fa-cloud-upload-alt', label:'Unlimited accounts'          },
-        { ok:true,  icon:'fa-robot',            label:'Max AI + dense frame scan'   },
-        { ok:true,  icon:'fa-tag',              label:'White-label branding'        },
-        { ok:true,  icon:'fa-bolt',             label:'Top priority queue (p0)'     },
-        { ok:true,  icon:'fa-exchange-alt',     label:'Flex token transfers'        },
-        { ok:true,  icon:'fa-users',            label:'25 team seats'               },
-    ],
-};
-TIER_FEATS.launch = TIER_FEATS.creator_lite;
 
 // ── Helpers ─────────────────────────────────────────────────
 function $(id) { return document.getElementById(id); }
@@ -441,10 +437,10 @@ function fmtDate(ts) {
     return new Date(ts * 1000).toLocaleDateString('en-US',{ month:'long', day:'numeric', year:'numeric' });
 }
 function getToken() {
-    return localStorage.getItem(TOKEN_KEY) ||
+    return (typeof window.getAccessToken === 'function' && window.getAccessToken()) ||
            sessionStorage.getItem(TOKEN_KEY) ||
-           localStorage.getItem('auth_token') ||
-           localStorage.getItem('token') || null;
+           sessionStorage.getItem('access_token') ||
+           sessionStorage.getItem('token') || null;
 }
 
 function showState(id) {
@@ -458,14 +454,17 @@ function setLoadingDetail(msg) {
     if (el) el.textContent = msg;
 }
 
-// ── API calls ────────────────────────────────────────────────
+// ── API calls (js/api-base.js + js/auth-stack.js) ─────────────
 async function api(path, opts) {
-    var token = getToken();
-    var headers = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = 'Bearer ' + token;
-    var res = await fetch(API_BASE + path, Object.assign({ headers: headers }, opts || {}));
-    if (!res.ok) throw Object.assign(new Error(res.statusText), { status: res.status });
-    return res.json();
+    if (typeof window.apiCall !== 'function') throw new Error('billing/success: load js/auth-stack.js');
+    try {
+        return await window.apiCall(path, opts || {});
+    } catch (e) {
+        var err = new Error(e.message || 'Request failed');
+        err.status = e.status;
+        err.response = e.response || {};
+        throw err;
+    }
 }
 
 // Poll /api/me until subscription_status is active or trialing (max ~15s)
@@ -549,10 +548,16 @@ function revealAll(delays) {
 
 // ── Render subscription success ──────────────────────────────
 function renderSubscription(stripe, me) {
-    var tier   = (stripe && stripe.tier)  || (me && me.subscription_tier) || 'creator_lite';
+    var tier   = (stripe && stripe.tier) || (me && (me.tier || me.subscription_tier || (me.plan && me.plan.tier))) || 'free';
     var status = (stripe && stripe.subscription_status) || (me && me.subscription_status) || 'active';
-    var meta   = TIER_META[tier] || TIER_META.creator_lite;
-    var feats  = TIER_FEATS[tier] || TIER_FEATS.creator_lite;
+    var meta   = TC.getTierMeta(tier, 'free');
+    var featsRaw = TC.billingSuccessFeats(tier) || TC.billingSuccessFeats('free');
+    var feats  = Array.isArray(featsRaw) ? featsRaw : [];
+    if (!meta) {
+        $('errMsg').textContent = 'Could not load plan catalog. Check your connection and open Billing from settings.';
+        showState('stateError');
+        return;
+    }
     var isTest = stripe && stripe.is_test_mode;
     var isTrialing = status === 'trialing';
 
@@ -563,10 +568,11 @@ function renderSubscription(stripe, me) {
     setTimeout(function() { $('checkRing').classList.add('pop'); }, 80);
 
     // Eyebrow / headline
-    $('eyebrow').textContent  = isTrialing ? '7-Day Free Trial Active' : 'Subscription Confirmed';
+    var trialDays = (meta && meta.trial_days) ? meta.trial_days : 7;
+    $('eyebrow').textContent  = isTrialing ? (trialDays + '-Day Free Trial Active') : 'Subscription Confirmed';
     $('headline').textContent = meta.name + (isTrialing ? ' trial started.' : ' activated.');
     $('subline').textContent  = isTrialing
-        ? 'You have full ' + meta.name + ' access for 7 days. No charge until your trial ends.'
+        ? ('You have full ' + meta.name + ' access for ' + trialDays + ' days. No charge until your trial ends.')
         : 'Your wallet has been loaded. Credits renew automatically every billing period.';
 
     // Plan pill
@@ -586,7 +592,7 @@ function renderSubscription(stripe, me) {
             : fmtCurrency(amount, cur) + ' ' + (cur || 'USD');
     } else {
         $('amountLabel').textContent = 'Plan cost';
-        $('amountValue').textContent = isTrialing ? 'Free for 7 days' : 'Free';
+        $('amountValue').textContent = isTrialing ? ('Free for ' + trialDays + ' days') : 'Free';
     }
     var dot = $('statusDot');
     var stxt = $('statusText');
@@ -594,13 +600,32 @@ function renderSubscription(stripe, me) {
     if (status === 'trialing') { dot.style.background='#fbbf24'; stxt.textContent='Trial';    stxt.style.color='#fbbf24'; }
     if (status === 'past_due') { dot.style.background='#ef4444'; stxt.textContent='Past Due'; stxt.style.color='#ef4444'; }
 
-    // Trial banner
+    // Trial banner with live countdown
     if (isTrialing) {
         var trialEnd = stripe && stripe.trial_end;
-        var trialStr = trialEnd ? 'Trial ends ' + fmtDate(trialEnd) + '.' : 'Trial ends in 7 days.';
+        var trialEndMs = trialEnd ? trialEnd * 1000 : (Date.now() + trialDays * 86400000);
         var periodEnd = stripe && stripe.current_period_end;
-        if (periodEnd) trialStr += ' Card charged ' + fmtDate(periodEnd) + '.';
-        $('trialText').textContent = trialStr;
+
+        function renderTrialCountdown() {
+            var diff = trialEndMs - Date.now();
+            if (diff <= 0) {
+                $('trialText').textContent = 'Your trial has ended.';
+                return;
+            }
+            var days  = Math.floor(diff / 86400000);
+            var hours = Math.floor((diff % 86400000) / 3600000);
+            var mins  = Math.floor((diff % 3600000) / 60000);
+            var parts = [];
+            if (days > 0) parts.push(days + 'd');
+            parts.push(hours + 'h');
+            parts.push(mins + 'm');
+            var txt = parts.join(' ') + ' remaining';
+            if (periodEnd) txt += '. Card charged ' + fmtDate(periodEnd) + '.';
+            $('trialText').textContent = txt;
+        }
+
+        renderTrialCountdown();
+        setInterval(renderTrialCountdown, 60000);
         $('trialStrip').classList.add('show');
     }
 
@@ -657,14 +682,14 @@ function renderTopup(stripe, me) {
     setTimeout(function() { $('checkRing').classList.add('pop'); }, 80);
 
     $('eyebrow').textContent  = 'Top-Up Confirmed';
-    $('headline').textContent = fmtNum(amount) + ' ' + (wallet === 'put' ? '⚡ PUT' : '🤖 AIC') + ' added.';
+    $('headline').textContent = fmtNum(amount) + ' ' + (wallet === 'put' ? ' PUT' : ' AIC') + ' added.';
     $('subline').textContent  = 'Tokens have been credited to your wallet and are ready to use immediately.';
 
     var pill = $('planPill');
     pill.style.background = wallet === 'put' ? 'rgba(249,115,22,.1)'  : 'rgba(139,92,246,.1)';
     pill.style.border      = '1px solid ' + (wallet === 'put' ? 'rgba(249,115,22,.3)' : 'rgba(139,92,246,.3)');
     pill.style.color       = wallet === 'put' ? '#f97316' : '#8b5cf6';
-    pill.innerHTML = (wallet === 'put' ? '⚡ PUT Pack' : '🤖 AIC Pack') + ' — ' + fmtNum(amount) + ' tokens';
+    pill.innerHTML = (wallet === 'put' ? ' PUT Pack' : ' AIC Pack') + ' — ' + fmtNum(amount) + ' tokens';
 
     $('amountLabel').textContent = 'Charged';
     $('amountValue').textContent = fmtCurrency(charged, cur);
@@ -689,6 +714,8 @@ function renderTopup(stripe, me) {
 (async function main() {
     // Kick off loading animation
     document.body.classList.add('loaded');
+
+    try { await TC.load(); } catch (e) { console.warn('[BillingSuccess] tier catalog', e); }
 
     var params    = new URLSearchParams(window.location.search);
     var sessionId = params.get('session_id') || '';

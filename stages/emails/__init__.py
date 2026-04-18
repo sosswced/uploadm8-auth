@@ -93,6 +93,8 @@ FRONTEND PAGES NEEDED (now created):
 # ── Phase 1: Auth ─────────────────────────────────────────────────────────────
 from .auth import (
     send_welcome_email,
+    send_signup_confirmation_email,
+    send_post_verification_welcome_email,
     send_password_reset_email,
     send_password_changed_email,
     send_account_deleted_email,
@@ -149,6 +151,8 @@ from .lifecycle import (
 __all__ = [
     # Auth
     "send_welcome_email",
+    "send_signup_confirmation_email",
+    "send_post_verification_welcome_email",
     "send_password_reset_email",
     "send_password_changed_email",
     "send_account_deleted_email",

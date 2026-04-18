@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="js/html-safe.js"></script>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://static.cloudflareinsights.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 https://cloudflareinsights.com;">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Report a bug - UploadM8</title>
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+</head>
+<body>
+<div class="app-layout">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+    <header class="top-bar">
+        <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+        <div class="top-bar-actions">
+            <div data-wt-pills></div>
+            <button class="theme-toggle" data-um8-fn="toggleTheme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+        </div>
+    </header>
+    <main class="main-content">
+        <div class="page-header">
+            <div>
+                <h1 class="page-title"><i class="fas fa-bug" style="color:#f97316;margin-right:.4rem;"></i> Report a bug</h1>
+                <p class="page-subtitle">Send details to our team with optional screenshot and upload ID for faster fixes.</p>
+            </div>
+            <a href="support.html" class="btn btn-secondary btn-sm">Support center</a>
+        </div>
+        <div class="card" style="max-width:640px;">
+            <div id="bugAlertOk" style="display:none;margin-bottom:1rem;padding:1rem;border-radius:10px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.35);color:#86efac;font-size:.9rem;">Thanks — we logged your report and notified ops.</div>
+            <div id="bugAlertErr" style="display:none;margin-bottom:1rem;padding:1rem;border-radius:10px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.35);color:#fca5a5;font-size:.9rem;"></div>
+            <form id="bugForm">
+                <div class="form-group">
+                    <label class="form-label" for="bugMessage">What happened?</label>
+                    <textarea id="bugMessage" class="form-textarea" rows="6" required minlength="8" maxlength="8000" placeholder="Steps to reproduce, expected vs actual…"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="bugUploadId">Upload / job ID (optional)</label>
+                    <input type="text" id="bugUploadId" class="form-input" maxlength="80" placeholder="UUID from Queue or upload card">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="bugPageUrl">Page URL (optional)</label>
+                    <input type="text" id="bugPageUrl" class="form-input" maxlength="2000" placeholder="Auto-filled from this page">
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="bugShot">Screenshot (optional, PNG/JPEG/WebP, max 4MB)</label>
+                    <input type="file" id="bugShot" class="form-input" accept="image/png,image/jpeg,image/webp">
+                </div>
+                <button type="submit" class="btn btn-primary" id="bugSubmit"><i class="fas fa-paper-plane"></i> Submit report</button>
+            </form>
+        </div>
+    </main>
+</div>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script src="shared-sidebar.js"></script>
+<script src="js/helpers-formatting.js"></script>
+<script src="js/upload-utils.js"></script>
+<script src="app.js"></script>
+<script src="wallet-tokens.js"></script>
+<script>
+(function () {
+  document.getElementById('bugPageUrl').value = location.href.split('#')[0];
+  document.getElementById('bugForm').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    var ok = document.getElementById('bugAlertOk');
+    var err = document.getElementById('bugAlertErr');
+    var btn = document.getElementById('bugSubmit');
+    ok.style.display = 'none';
+    err.style.display = 'none';
+    var msg = document.getElementById('bugMessage').value.trim();
+    if (msg.length < 8) {
+      err.textContent = 'Please add a bit more detail (at least 8 characters).';
+      err.style.display = 'block';
+      return;
+    }
+    btn.disabled = true;
+    try {
+      if (typeof window.checkAuth === 'function') {
+        await window.checkAuth({ redirectOnFail: true, silent: false, forceRefresh: false });
+      }
+      var fd = new FormData();
+      fd.append('message', msg);
+      var uid = document.getElementById('bugUploadId').value.trim();
+      if (uid) fd.append('upload_id', uid);
+      var pu = document.getElementById('bugPageUrl').value.trim();
+      if (pu) fd.append('page_url', pu);
+      var shot = document.getElementById('bugShot').files[0];
+      if (shot) fd.append('screenshot', shot, shot.name);
+      var resp = await window.apiFetch('/api/support/bug-report', {
+        method: 'POST',
+        body: fd,
+        authRedirectOn401: true,
+      });
+      if (!resp.ok) {
+        var t = await resp.text().catch(function () { return ''; });
+        throw new Error(t || resp.status);
+      }
+      ok.style.display = 'block';
+      document.getElementById('bugForm').reset();
+      document.getElementById('bugPageUrl').value = location.href.split('#')[0];
+    } catch (x) {
+      err.textContent = (x && x.message) ? String(x.message) : 'Could not submit. Try again or email support@uploadm8.com.';
+      err.style.display = 'block';
+    } finally {
+      btn.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

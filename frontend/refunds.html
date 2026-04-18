@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Refund & Cancellation Policy - UploadM8</title>
@@ -39,7 +41,7 @@
         .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
         .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
         @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
-        .sidebar-toc { position: sticky; top: 80px; }
+        .sidebar-toc { position: sticky; top: 5.5rem; z-index: 1; }
         .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
         .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
         .toc-list { list-style: none; }
@@ -79,6 +81,7 @@
         .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
         .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
         ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: var(--bg-secondary); } ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+        @media (max-width: 480px) { .hero { padding: 2.5rem 1.25rem 2rem; } .hero h1 { font-size: 2rem; } .nav { padding: 0.75rem 1rem; } .content-wrapper { padding: 2rem 1.25rem 3rem; } }
     </style>
 </head>
 <body>
@@ -86,7 +89,7 @@
 <nav class="nav">
     <div class="nav-container">
         <a href="index.html" class="nav-logo">
-            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            <img src="images/logo.svg" alt="UploadM8" style="height:32px;width:auto;">
             UploadM8
         </a>
         <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
@@ -99,7 +102,7 @@
         <h1>Refund & Cancellation Policy</h1>
         <div class="hero-meta">
             <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
-            <span><i class="fas fa-clock"></i> Last Updated: February 2026</span>
+            <span><i class="fas fa-clock"></i> Last updated: April 2026</span>
         </div>
     </div>
 </div>
@@ -140,7 +143,7 @@
                     <tr>
                         <td>Annual Subscription</td>
                         <td>Prorated refund available within 14 days of renewal date. Reviewed case-by-case after 14 days. No refunds after 60 days.</td>
-                        <td>Email billing@uploadm8.com</td>
+                        <td>Email <a href="mailto:billing@uploadm8.com">billing@uploadm8.com</a></td>
                     </tr>
                     <tr>
                         <td>Enterprise / Custom</td>
@@ -257,6 +260,8 @@
     <div class="footer-inner">
         <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
         <div class="footer-links">
+            <a href="how-it-works.html">How it works</a>
+            <a href="contact.html">Contact</a>
             <a href="privacy.html">Privacy</a>
             <a href="terms.html">Terms</a>
             <a href="security.html">Security</a>
@@ -264,11 +269,18 @@
             <a href="subprocessors.html">Subprocessors</a>
             <a href="refunds.html" class="active">Refunds</a>
             <a href="dmca.html">DMCA</a>
+            <a href="contact.html">Contact</a>
             <a href="support.html">Support</a>
+            <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
         </div>
     </div>
 </footer>
 
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
 <script>
     const sections = document.querySelectorAll('.section-block[id]');
     const tocLinks = document.querySelectorAll('.toc-list a');

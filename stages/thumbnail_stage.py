@@ -13,7 +13,8 @@ Flow:
   5. Detect content category (3-layer: user hint → filename → general)
   6. AI selection pass — send all candidates to GPT-4o-mini with
      category-specific selection criteria (picks the most ENGAGING frame
-     for the content type, not just the sharpest)
+     for the content type, not just the sharpest). Skipped when Thumbnail
+     Studio + Pikzels will render first (sharpest frame is enough as compositor input).
   7. Set ctx.thumbnail_path  = AI-selected (or sharpest as fallback)
      Set ctx.thumbnail_paths = all candidates in chronological order
      Set ctx.thumbnail_scores = {str(path): score} for all candidates
@@ -54,12 +55,19 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from core.content_attribution import (
+    normalize_thumbnail_render_pipeline,
+    normalize_thumbnail_selection_mode,
+)
+
 from .context import JobContext, THUMBNAIL_BRIEF_PROMPT
 from .errors import SkipStage
+from .ai_service_costs import user_pref_ai_service_enabled
+from .pikzels_api import render_thumbnail_with_studio_renderer, studio_renderer_enabled
 
 logger = logging.getLogger("uploadm8-worker.thumbnail")
 
@@ -858,14 +866,16 @@ def _distribute_offsets(
     duration: float,
     n: int,
     user_offset: Optional[float] = None,
+    min_gap_seconds: Optional[float] = None,
 ) -> List[float]:
     """
-    Generate N evenly-spaced offsets across the video duration.
+    Generate N offsets across the video duration.
 
-    Anchors: first frame at 5% (avoids black intros), last at 90% (avoids fade-outs).
-    Middle N-2 frames distributed evenly between anchors.
-    n==1 uses user_offset if provided, else 30%.
-    All values clamped to [0.5, duration-0.5].
+    When ``min_gap_seconds`` is set (>0) and n>1, place frames starting near 5% duration
+    stepping by that many seconds (clamped), matching Upload Preferences "Thumbnail interval".
+
+    Otherwise: evenly-spaced anchors (5% … 90%) with distributed middles.
+    n==1 uses user_offset if provided, else 30%. All values clamped to [0.5, duration-0.5].
     """
     if duration <= 0:
         duration = 30.0
@@ -878,16 +888,80 @@ def _distribute_offsets(
     if n == 1:
         return [clamp(user_offset if user_offset is not None else duration * 0.30)]
 
+    gap = float(min_gap_seconds) if min_gap_seconds is not None else 0.0
+    if gap > 0 and n > 1:
+        start = clamp(duration * 0.05)
+        end_limit = clamp(duration * 0.95)
+        pts: List[float] = []
+        t = start
+        while len(pts) < n and t <= end_limit + 1e-6:
+            pts.append(clamp(t))
+            t += gap
+        if len(pts) >= n:
+            return pts[:n]
+
     if n == 2:
         return [clamp(duration * 0.05), clamp(duration * 0.90)]
 
-    start  = clamp(duration * 0.05)
-    end    = clamp(duration * 0.90)
+    start = clamp(duration * 0.05)
+    end = clamp(duration * 0.90)
     middle_count = n - 2
-    step   = (end - start) / (middle_count + 1)
+    step = (end - start) / (middle_count + 1)
     middle = [clamp(start + step * (i + 1)) for i in range(middle_count)]
 
     return [start] + middle + [end]
+
+
+def _thumbnail_styled_render_order(
+    pipeline_pref: str,
+    *,
+    studio_ok: bool,
+    ai_edit_ok: bool,
+) -> List[str]:
+    """
+    Per-platform compositing attempts. Values: studio | ai_edit | template.
+    Mirrors ML attribution keys (thumbnailRenderPipeline).
+    """
+    p = (pipeline_pref or "auto").lower().strip()
+    if p not in ("auto", "studio_renderer", "ai_edit", "template", "none"):
+        p = "auto"
+    if p == "none":
+        return []
+    if p == "template":
+        return ["template"]
+    if p == "ai_edit":
+        order: List[str] = []
+        if ai_edit_ok:
+            order.append("ai_edit")
+        if studio_ok:
+            order.append("studio")
+        order.append("template")
+        return order
+    # auto & studio_renderer — studio stack first when enabled
+    out: List[str] = []
+    if studio_ok:
+        out.append("studio")
+    if ai_edit_ok:
+        out.append("ai_edit")
+    out.append("template")
+    return out
+
+
+def _studio_persona_for_request(us: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Return (persona payload for studio API, options dict) when persona mode is on."""
+    if not bool(us.get("thumbnail_persona_enabled") or us.get("thumbnailPersonaEnabled")):
+        return None, None
+    try:
+        strength = int(us.get("thumbnail_persona_strength") or us.get("thumbnailPersonaStrength") or 70)
+    except (TypeError, ValueError):
+        strength = 70
+    strength = max(0, min(100, strength))
+    opts: Dict[str, Any] = {"persona_strength": strength}
+    # Pikzels v2 expects ``persona`` = Pikzonality UUID (see docs /v2/thumbnail/image), not UploadM8 row id.
+    pkz = (us.get("thumbnail_pikzels_persona_id") or us.get("thumbnailPikzelsPersonaId") or "").strip()
+    if pkz:
+        return {"id": pkz}, opts
+    return None, opts
 
 
 # ============================================================
@@ -932,20 +1006,50 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     if not ctx.temp_dir:
         raise SkipStage("No temp directory available")
 
+    us = ctx.user_settings or {}
+    render_pipeline_pref = normalize_thumbnail_render_pipeline(us)
+    if not (us.get("auto_thumbnails") or us.get("autoThumbnails")):
+        raise SkipStage("Auto-thumbnails disabled in user preferences")
+
     # ── Tier gates ──────────────────────────────────────────────────────────
     max_thumbnails = 1
     if ctx.entitlements:
         max_thumbnails = max(1, int(getattr(ctx.entitlements, "max_thumbnails", 1) or 1))
 
+    designer_on = user_pref_ai_service_enabled(us, "thumbnail_ai", default=True)
     ai_key_present = bool(OPENAI_API_KEY)
     can_ai = ai_key_present and bool(getattr(ctx.entitlements, "can_ai", False) if ctx.entitlements else False)
+    can_ai_designer = can_ai and designer_on
 
-    # When AI is active, extract at least 4 frames so it has meaningful choices.
-    # On free tier (can_ai=False), extraction_count == max_thumbnails.
-    extraction_count = max(max_thumbnails, 4 if can_ai else 1)
+    studio_flow_early = bool(us.get("thumbnail_studio_enabled") or us.get("thumbnailStudioEnabled"))
+    use_studio_engine_early = bool(
+        us.get("thumbnail_studio_engine_enabled")
+        or us.get("thumbnailStudioEngineEnabled")
+        or us.get("thumbnail_pikzels_enabled")
+        or us.get("thumbnailPikzelsEnabled")
+    )
+    pikzels_studio_pipeline = bool(
+        designer_on
+        and studio_flow_early
+        and use_studio_engine_early
+        and studio_renderer_enabled()
+    )
+    can_custom_thumbs = bool(
+        getattr(ctx.entitlements, "can_custom_thumbnails", False) if ctx.entitlements else False
+    )
+    styled_enabled_early = us.get("styled_thumbnails", us.get("styledThumbnails", True))
+    pikzels_overrides_frame_selection = bool(
+        pikzels_studio_pipeline
+        and can_custom_thumbs
+        and styled_enabled_early
+        and render_pipeline_pref != "none"
+    )
+
+    # When thumbnail designer (AI) is on, extract at least 4 frames for selection.
+    extraction_count = max(max_thumbnails, 4 if can_ai_designer else 1)
 
     # User-specified manual offset (single-thumbnail mode only)
-    raw_offset = (ctx.user_settings or {}).get("thumbnail_offset", DEFAULT_THUMBNAIL_OFFSET)
+    raw_offset = us.get("thumbnail_offset", DEFAULT_THUMBNAIL_OFFSET)
     try:
         user_offset = float(raw_offset)
         user_offset = max(0.0, min(user_offset, MAX_THUMBNAIL_OFFSET))
@@ -959,18 +1063,30 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         f"Thumbnail stage: video={video_path.name}, "
         f"max_thumbnails={max_thumbnails}, extraction_count={extraction_count}, "
         f"category={category}, "
-        f"ai={'enabled' if can_ai else ('no-key' if not ai_key_present else 'plan-gate')}"
+        f"ai_designer={'on' if can_ai_designer else 'off'} "
+        f"(plan={'ok' if can_ai else ('no-key' if not ai_key_present else 'gate')})"
     )
 
     # ── Duration probe ──────────────────────────────────────────────────────
     duration = await _get_video_duration(video_path)
     logger.debug(f"Video duration: {duration:.1f}s")
 
+    raw_interval = us.get("thumbnail_interval", us.get("thumbnailInterval"))
+    min_gap: Optional[float] = None
+    if raw_interval is not None:
+        try:
+            g = float(raw_interval)
+            if g > 0:
+                min_gap = g
+        except (TypeError, ValueError):
+            min_gap = None
+
     # ── Distribute offsets ──────────────────────────────────────────────────
     offsets = _distribute_offsets(
         duration=duration,
         n=extraction_count,
         user_offset=user_offset if extraction_count == 1 else None,
+        min_gap_seconds=min_gap,
     )
     logger.debug(f"Thumbnail offsets: {[f'{o:.1f}s' for o in offsets]}")
 
@@ -1007,8 +1123,28 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     # ── AI selection pass ───────────────────────────────────────────────────
     ai_selected_path: Optional[Path] = None
     selection_method = "sharpness"
+    selection_mode = normalize_thumbnail_selection_mode(us)
+    # Do not skip when pipeline is "ai_edit" — that path runs GPT image edit first,
+    # which still benefits from GPT frame selection before any Pikzels step.
+    pipeline_studio_first = render_pipeline_pref in ("auto", "studio_renderer") or (
+        render_pipeline_pref == "template" and pikzels_studio_pipeline
+    )
+    skip_ai_frame_pick = bool(
+        pikzels_overrides_frame_selection and selection_mode == "ai" and pipeline_studio_first
+    )
+    if skip_ai_frame_pick:
+        logger.info(
+            "Thumbnail frame selection: Pikzels/studio pipeline active — "
+            "using sharpest frame as compositor input (skipping GPT frame pick)"
+        )
+        selection_method = "sharpness_pikzels_input"
 
-    if can_ai and len(candidates) > 1:
+    if selection_mode == "sharpness" or skip_ai_frame_pick:
+        if selection_mode == "sharpness" and not skip_ai_frame_pick:
+            logger.debug(
+                "Thumbnail frame selection: user pref thumbnailSelectionMode=sharpness — AI pick skipped"
+            )
+    elif can_ai_designer and len(candidates) > 1:
         try:
             ai_selected_path = await _ai_select_best_frame(candidates, category, ctx)
         except Exception as e:
@@ -1023,9 +1159,16 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                 f"{sharpness_best_path.name}"
             )
     else:
-        reason = "no API key" if not ai_key_present else (
-            "plan gate" if not can_ai else "only 1 candidate"
-        )
+        if selection_mode != "sharpness" and not designer_on:
+            reason = "thumbnail designer disabled (pref or aiServiceThumbnailDesigner)"
+        elif selection_mode != "sharpness" and not ai_key_present:
+            reason = "no API key"
+        elif selection_mode != "sharpness" and not can_ai:
+            reason = "plan gate"
+        elif len(candidates) <= 1:
+            reason = "only 1 candidate"
+        else:
+            reason = "pref sharpness"
         logger.debug(f"AI thumbnail selection skipped: {reason}")
 
     # ── Final best frame ────────────────────────────────────────────────────
@@ -1058,18 +1201,19 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     ctx.output_artifacts["thumbnail_scores"]            = json.dumps(
         {str(p): round(s, 4) for p, s in candidates}
     )
+    if render_pipeline_pref == "none":
+        ctx.output_artifacts["thumbnail_render_method"] = "none"
 
     # ── Styled thumbnails (MrBeast-style composite) — Trill + non-Trill, every upload ──
     # Gated by: can_custom_thumbnails + user pref styled_thumbnails (default True)
     can_custom = bool(getattr(ctx.entitlements, "can_custom_thumbnails", False) if ctx.entitlements else False)
     can_ai_style = bool(getattr(ctx.entitlements, "can_ai_thumbnail_styling", False) if ctx.entitlements else False)
-    us = ctx.user_settings or {}
     styled_enabled = us.get("styled_thumbnails", us.get("styledThumbnails", True))
-    if can_custom and styled_enabled and ctx.temp_dir:
+    if can_custom and styled_enabled and ctx.temp_dir and render_pipeline_pref != "none":
         brief: Optional[Dict] = None
-        if can_ai:
+        if can_ai_designer:
             brief = await _generate_thumbnail_brief(ctx, category)
-        if not brief and can_ai:
+        if not brief and can_ai_designer:
             # Fallback brief when GPT fails — minimal defaults
             brief = {
                 "selected_headline": (ctx.get_effective_title() or "WATCH")[:20].upper(),
@@ -1121,20 +1265,68 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                               and p in [pl.lower() for pl in (ctx.platforms or [])]]
         render_method = "none"
         primary_styled: Optional[Path] = None  # Prefer YouTube for primary
+        studio_flow = bool(us.get("thumbnail_studio_enabled") or us.get("thumbnailStudioEnabled"))
+        use_studio_engine = bool(
+            us.get("thumbnail_studio_engine_enabled")
+            or us.get("thumbnailStudioEngineEnabled")
+            or us.get("thumbnail_pikzels_enabled")
+            or us.get("thumbnailPikzelsEnabled")
+        )
+        persona_api, studio_opts = _studio_persona_for_request(us)
+
+        studio_ok = bool(
+            designer_on
+            and studio_flow
+            and use_studio_engine
+            and studio_renderer_enabled()
+            and isinstance(brief, dict)
+        )
+        ai_edit_ok = bool(can_ai_designer and can_ai_style and OPENAI_API_KEY)
+        # Legacy "template only" pipeline would skip Pikzels entirely; when the studio
+        # engine is enabled, prefer auto ordering so the API render runs first.
+        effective_render_pipeline = render_pipeline_pref
+        if studio_ok and render_pipeline_pref == "template":
+            effective_render_pipeline = "auto"
+            logger.info(
+                "thumbnail_render_pipeline=template overridden to auto "
+                "(Pikzels/studio renderer active for this job)"
+            )
+        render_steps = _thumbnail_styled_render_order(
+            effective_render_pipeline,
+            studio_ok=studio_ok,
+            ai_edit_ok=ai_edit_ok,
+        )
+
         for platform in platforms_to_render:
             out_name = f"thumb_styled_{platform}_{ctx.upload_id}.jpg"
             out_path = ctx.temp_dir / out_name
             ok = False
-            if can_ai_style and OPENAI_API_KEY:
-                ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=False)
-                if not ok:
-                    ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=True)
+            for step in render_steps:
+                if step == "studio" and studio_ok:
+                    ok = await render_thumbnail_with_studio_renderer(
+                        best_path,
+                        brief,
+                        platform,
+                        out_path,
+                        upload_id=str(ctx.upload_id),
+                        category=category,
+                        persona=persona_api,
+                        options=studio_opts,
+                    )
+                    if ok:
+                        render_method = "studio_renderer"
+                elif step == "ai_edit" and ai_edit_ok:
+                    ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=False)
+                    if not ok:
+                        ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=True)
+                    if ok:
+                        render_method = "ai_edit"
+                elif step == "template":
+                    ok = _render_template_thumbnail(best_path, brief, platform, out_path)
+                    if ok:
+                        render_method = "template"
                 if ok:
-                    render_method = "ai_edit"
-            if not ok:
-                ok = _render_template_thumbnail(best_path, brief, platform, out_path)
-                if ok:
-                    render_method = "template"
+                    break
             if ok:
                 platform_map[platform] = str(out_path)
                 if primary_styled is None or platform == "youtube":

@@ -9,8 +9,9 @@ for use in AI caption/title/hashtag generation.
 import logging
 import asyncio
 import math
+import os
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 
 import httpx
 
@@ -151,14 +152,50 @@ def get_representative_coords(data_points: List[Dict]) -> Optional[Tuple[float, 
     return None
 
 
-async def reverse_geocode(lat: float, lon: float) -> Optional[str]:
-    """
-    Reverse geocode coordinates to a human-readable location string.
-    Uses OpenStreetMap Nominatim (free, no API key).
+def _nominatim_address_parts(data: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Normalize Nominatim JSON into fields we persist on TelemetryData."""
+    address = data.get("address") or {}
+    if not isinstance(address, dict):
+        address = {}
+    city = (
+        address.get("city")
+        or address.get("town")
+        or address.get("village")
+        or address.get("suburb")
+        or address.get("hamlet")
+        or address.get("county")
+        or ""
+    )
+    state = address.get("state") or address.get("region") or ""
+    country = (address.get("country") or "").strip() or None
+    country_code = (address.get("country_code") or "").strip().upper() or None
+    road = (
+        address.get("road")
+        or address.get("pedestrian")
+        or address.get("path")
+        or address.get("motorway")
+        or address.get("trunk")
+        or address.get("primary")
+        or ""
+    )
+    road = str(road).strip() or None
+    display = ", ".join(p for p in [str(city).strip(), str(state).strip()] if p)
+    if not display and country_code:
+        display = country_code
+    full_display = (data.get("display_name") or "").strip() or None
+    return {
+        "location_display": display or full_display,
+        "location_city": str(city).strip() or None,
+        "location_state": str(state).strip() or None,
+        "location_country": country or country_code,
+        "location_road": road,
+        "nominatim_display_name": full_display,
+    }
 
-    Returns:
-        Location string like "Los Angeles, California" or "Las Vegas, Nevada"
-        None if geocoding fails.
+
+async def reverse_geocode_details(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    """
+    Reverse geocode via Nominatim; return structured fields for TelemetryData + M8 scene graph.
     """
     try:
         async with httpx.AsyncClient(timeout=GEOCODE_TIMEOUT) as client:
@@ -168,49 +205,50 @@ async def reverse_geocode(lat: float, lon: float) -> Optional[str]:
                     "lat": lat,
                     "lon": lon,
                     "format": "json",
-                    "zoom": 10,  # city level
+                    "zoom": 18,
                     "addressdetails": 1,
                 },
                 headers={"User-Agent": "UploadM8/1.0 (uploadm8.com)"},
             )
 
             if resp.status_code != 200:
-                logger.warning(f"Geocode HTTP {resp.status_code} for ({lat}, {lon})")
+                logger.warning("Geocode HTTP %s for (%.4f, %.4f)", resp.status_code, lat, lon)
                 return None
 
             data = resp.json()
-            address = data.get("address", {})
-
-            # Build location string: prefer city/town, fallback to county
-            city = (
-                address.get("city") or
-                address.get("town") or
-                address.get("village") or
-                address.get("suburb") or
-                address.get("county") or
-                ""
-            )
-            state = (
-                address.get("state") or
-                address.get("region") or
-                ""
-            )
-            country = address.get("country_code", "").upper()
-
-            parts = [p for p in [city, state] if p]
-            if not parts and country:
-                return country
-
-            location = ", ".join(parts)
-            logger.info(f"Geocoded ({lat:.4f}, {lon:.4f}) → {location}")
-            return location or None
+            if not isinstance(data, dict):
+                return None
+            parts = _nominatim_address_parts(data)
+            if parts.get("location_display"):
+                logger.info(
+                    "Geocoded (%.4f, %.4f) → %s",
+                    lat,
+                    lon,
+                    parts["location_display"],
+                )
+            return parts
 
     except asyncio.TimeoutError:
-        logger.warning(f"Geocode timeout for ({lat}, {lon})")
+        logger.warning("Geocode timeout for (%s, %s)", lat, lon)
         return None
     except Exception as e:
-        logger.warning(f"Geocode error for ({lat}, {lon}): {e}")
+        logger.warning("Geocode error for (%s, %s): %s", lat, lon, e)
         return None
+
+
+async def reverse_geocode(lat: float, lon: float) -> Optional[str]:
+    """
+    Reverse geocode coordinates to a human-readable location string.
+    Uses OpenStreetMap Nominatim (free, no API key).
+
+    Returns:
+        Location string like "Los Angeles, California" or "Las Vegas, Nevada"
+        None if geocoding fails.
+    """
+    details = await reverse_geocode_details(lat, lon)
+    if not details:
+        return None
+    return details.get("location_display")
 
 
 def calculate_trill_score(
@@ -275,12 +313,13 @@ def calculate_trill_score(
         bucket = "chill"
 
     return TrillScore(
-        total=total,
-        speed_score=int(speed_score),
-        distance_score=0,
-        duration_score=0,
-        altitude_score=0,
-        thrill_factor=round(telemetry.max_speed_mph / max(telemetry.avg_speed_mph, 1), 2),
+        score=int(total),
+        bucket=bucket,
+        speed_score=float(speed_score),
+        speeding_score=float(speeding_score),
+        euphoria_score=float(euphoria_score),
+        consistency_score=float(consistency_score),
+        excessive_speed=bool(telemetry.max_speed_mph >= float(euphoria_mph)),
     )
 
 
@@ -357,21 +396,79 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
 
     logger.info(f"Trill score: {trill.total} (bucket derived from score)")
 
-    # ─── REVERSE GEOCODING ────────────────────────────────────────────────────
-    coords = get_representative_coords(telemetry.points)
+    # ─── GPS coordinates from .map (start + midpoint for geocode / scene graph) ─
+    pts = telemetry.points
+    if pts:
+        try:
+            la = float(pts[0]["lat"])
+            lo = float(pts[0]["lon"])
+            if -90 <= la <= 90 and -180 <= lo <= 180 and not (abs(la) < 1e-9 and abs(lo) < 1e-9):
+                telemetry.start_lat = la
+                telemetry.start_lon = lo
+        except (KeyError, TypeError, ValueError):
+            pass
+    mid = get_representative_coords(telemetry.points)
+    if mid:
+        telemetry.mid_lat, telemetry.mid_lon = mid[0], mid[1]
+
+    # ─── REVERSE GEOCODING (persist on TelemetryData for M8 / Trill / captions) ─
+    coords = mid
     if coords:
         lat, lon = coords
-        logger.info(f"Reverse geocoding telemetry location ({lat:.5f}, {lon:.5f})...")
-        location_name = await reverse_geocode(lat, lon)
-        if location_name:
-            ctx.location_name = location_name
-            logger.info(f"Location resolved: {location_name}")
+        logger.info("Reverse geocoding telemetry midpoint (%.5f, %.5f)...", lat, lon)
+        details = await reverse_geocode_details(lat, lon)
+        if details:
+            telemetry.location_display = details.get("location_display")
+            telemetry.location_city = details.get("location_city")
+            telemetry.location_state = details.get("location_state")
+            telemetry.location_country = details.get("location_country")
+            telemetry.location_road = details.get("location_road")
+            loc = telemetry.location_display
+            if loc:
+                ctx.location_name = loc
+                logger.info("Location resolved: %s", loc)
         else:
-            logger.warning("Reverse geocode returned no result — location will be omitted from captions")
+            logger.warning(
+                "Reverse geocode returned no result — location will be omitted from captions"
+            )
             ctx.location_name = None
     else:
         logger.warning("No valid GPS coordinates found in .map file")
         ctx.location_name = None
+
+    # ─── Second geocode at route start when far from midpoint (OSM etiquette: pause) ─
+    try:
+        min_sep = float(os.environ.get("TELEMETRY_START_GEOCODE_MIN_SEPARATION_MILES", "5") or 5)
+    except (TypeError, ValueError):
+        min_sep = 5.0
+    min_sep = max(1.0, min(min_sep, 200.0))
+    if (
+        telemetry.start_lat is not None
+        and telemetry.start_lon is not None
+        and telemetry.mid_lat is not None
+        and telemetry.mid_lon is not None
+    ):
+        sep = _haversine_miles(
+            float(telemetry.start_lat),
+            float(telemetry.start_lon),
+            float(telemetry.mid_lat),
+            float(telemetry.mid_lon),
+        )
+        if sep >= min_sep:
+            await asyncio.sleep(1.15)
+            start_details = await reverse_geocode_details(
+                float(telemetry.start_lat), float(telemetry.start_lon)
+            )
+            if start_details and start_details.get("location_display"):
+                telemetry.location_start_display = start_details["location_display"]
+                logger.info(
+                    "Geocoded route start (%.2f mi from mid): %s",
+                    sep,
+                    telemetry.location_start_display,
+                )
     # ─────────────────────────────────────────────────────────────────────────
+
+    ctx.telemetry_data = telemetry
+    ctx.telemetry = telemetry
 
     return ctx

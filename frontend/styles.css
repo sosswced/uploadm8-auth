@@ -6,13 +6,15 @@
 /* ============================================================
    CSS Variables - Theme System
    ============================================================ */
-:root {
+   :root {
     /* Dark theme (default) */
     --bg-primary: #0a0a0f;
     --bg-secondary: #12121a;
     --bg-card: #1a1a24;
     --bg-hover: #22222e;
+    --bg-subtle: #16161f;
     --bg-input: rgba(255, 255, 255, 0.05);
+    --primary: #f97316;
     
     --text-primary: #ffffff;
     --text-secondary: #9ca3af;
@@ -45,7 +47,9 @@
     --bg-secondary: #ffffff;
     --bg-card: #ffffff;
     --bg-hover: #f1f5f9;
+    --bg-subtle: #f8fafc;
     --bg-input: #f1f5f9;
+    --primary: #f97316;
     
     --text-primary: #0f172a;
     --text-secondary: #475569;
@@ -116,6 +120,18 @@ input, select, textarea {
 /* ============================================================
    Layout - App Shell
    ============================================================ */
+/* Guide embedded in Settings iframe: strip chrome, keep single-column guide */
+html.in-iframe #uploadm8AppRoot > .sidebar,
+html.in-iframe #uploadm8AppRoot > .sidebar-overlay,
+html.in-iframe #uploadm8AppRoot > .top-bar {
+    display: none !important;
+}
+html.in-iframe #uploadm8AppRoot > .main-content.guide-page-main {
+    margin-left: 0 !important;
+    padding: 0 !important;
+    padding-top: 0 !important;
+}
+
 .app-layout {
     display: flex;
     min-height: 100vh;
@@ -145,15 +161,24 @@ input, select, textarea {
     left: 0;
     width: 260px;
     height: 100vh;
+    height: 100dvh;
+    max-height: 100vh;
+    max-height: 100dvh;
     background: var(--bg-secondary);
     border-right: 1px solid var(--border-color);
     display: flex;
     flex-direction: column;
+    overflow: hidden;
     z-index: 100;
     transition: transform 0.3s;
+    /* Keep drawer above fixed wallet HUD/FAB (z-index ~9989) so taps hit the menu */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-sizing: border-box;
+    overscroll-behavior-y: contain;
 }
 
 .sidebar-header {
+    flex-shrink: 0;
     padding: 1.5rem;
     border-bottom: 1px solid var(--border-color);
 }
@@ -173,10 +198,20 @@ input, select, textarea {
     height: 32px;
 }
 
+/* flex-basis 0 (not auto) is required on WebKit/iOS or the middle panel won't shrink and won't scroll */
 .sidebar-nav {
-    flex: 1;
+    flex: 1 1 0;
+    flex-basis: 0;
+    min-height: 0;
     padding: 1rem 0;
     overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+    /* Promote compositing layer — fixes “stuck” scroll inside transformed drawer on iOS */
+    transform: translateZ(0);
+    -webkit-transform: translateZ(0);
 }
 
 .nav-section {
@@ -230,14 +265,48 @@ input, select, textarea {
 }
 
 .sidebar-footer {
+    flex-shrink: 0;
     padding: 1rem 1.5rem;
+    padding-bottom: max(1rem, env(safe-area-inset-bottom, 0px));
     border-top: 1px solid var(--border-color);
+    position: relative;
+    z-index: 1;
+    background: var(--bg-secondary);
 }
 
 .user-info {
     display: flex;
     align-items: center;
     gap: 0.75rem;
+}
+
+/* Sidebar footer: reliable taps on phones */
+.sidebar-footer #sidebarLogoutBtn {
+    min-width: 44px;
+    min-height: 44px;
+    touch-action: manipulation;
+    flex-shrink: 0;
+}
+
+/* Sidebar footer: profile block opens Settings (name + tier + avatar). */
+.sidebar-footer-profile {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex: 1;
+    min-width: 0;
+    text-decoration: none;
+    color: inherit;
+}
+.sidebar-footer-profile:hover {
+    opacity: 0.92;
+}
+
+/* Keep profile identity visible for every authenticated user. */
+.user-info .user-details,
+.user-info .user-avatar {
+    opacity: 1;
+    visibility: visible;
 }
 
 .user-avatar {
@@ -301,6 +370,11 @@ input, select, textarea {
     display: block;
 }
 
+/* When closed, never let the full-screen overlay steal taps (some WebKit edge cases). */
+.sidebar-overlay.hidden {
+    pointer-events: none !important;
+}
+
 /* ============================================================
    Top Bar (Mobile)
    ============================================================ */
@@ -351,6 +425,35 @@ input, select, textarea {
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+/* Keep token pills on one row on mobile: wrapped rows paint outside fixed top-bar height
+   and sit under z-index 10000, blocking taps on main content (e.g. Settings tabs, back). */
+@media (max-width: 1024px) {
+    .top-bar-actions {
+        flex-wrap: nowrap;
+        flex: 1 1 auto;
+        min-width: 0;
+        justify-content: flex-end;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-width: thin;
+    }
+    .top-bar-actions::-webkit-scrollbar {
+        height: 0;
+    }
+    .top-bar .menu-toggle {
+        flex-shrink: 0;
+    }
+    .top-bar-logo {
+        flex-shrink: 0;
+    }
+}
+
+/* Pills in page-header: visible on desktop only (top-bar hidden). On mobile, top-bar shows pills. */
+@media (max-width: 1024px) {
+    .desktop-pills { display: none !important; }
 }
 
 /* Token pills (PUT/AIC) */
@@ -1235,11 +1338,34 @@ a, button, [onclick] {
         width: min(280px, 85vw);
         z-index: 200;
     }
+    /* Off-canvas drawer must not keep a full-height hit target on iOS/WebKit (blocked Settings taps, menu). */
+    .sidebar:not(.open) {
+        pointer-events: none;
+    }
+    .sidebar.open {
+        pointer-events: auto;
+        /* Above token FAB / HUD; still below top bar (10000) so burger stays usable */
+        z-index: 9995;
+    }
     .sidebar-overlay {
         z-index: 199;
     }
+    /* Top bar + menu must sit above the dim overlay and main content so the burger is always tappable */
     .top-bar {
-        z-index: 198;
+        z-index: 10000;
+        pointer-events: auto;
+        isolation: isolate;
+        width: 100%;
+        box-sizing: border-box;
+        /* Strict clip: children (token pills, icons) must not extend the hit-testing box below 60px */
+        overflow: hidden;
+        min-height: 60px;
+        max-height: 60px;
+        align-items: center;
+    }
+    .main-content {
+        position: relative;
+        z-index: 1;
     }
 }
 
@@ -1260,6 +1386,11 @@ a, button, [onclick] {
         display: flex;
         align-items: center;
         justify-content: center;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: rgba(249, 115, 22, 0.2);
+        cursor: pointer;
+        position: relative;
+        z-index: 2;
     }
 }
 
@@ -1530,4 +1661,366 @@ a, button, [onclick] {
         padding: 0 1rem;
     }
 }
+
+/* ============================================================
+   Settings Page
+   ============================================================ */
+.settings-tabs-container { margin-bottom: 2rem; }
+.settings-tabs {
+    display: flex;
+    gap: 0.5rem;
+    background: var(--bg-card);
+    padding: 0.5rem;
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border-color);
+    overflow-x: auto;
+}
+.settings-tab {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1.25rem;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    white-space: nowrap;
+}
+.settings-tab:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+}
+.settings-tab.active {
+    background: var(--accent-orange);
+    color: #fff;
+}
+.settings-panel { display: none; }
+.settings-panel.active { display: block; }
+/* Avoid `contain` here — it has caused missed taps on mobile Safari for heavy Settings panels. */
+
+@media (max-width: 1024px) {
+    .settings-tabs-container {
+        position: sticky;
+        top: 60px;
+        z-index: 20;
+        margin-bottom: 1rem;
+        padding-top: 0.25rem;
+        background: var(--bg-primary);
+    }
+    .settings-tab {
+        flex-shrink: 0;
+        min-height: 44px;
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: rgba(249, 115, 22, 0.2);
+    }
+    .page-header .btn-icon {
+        touch-action: manipulation;
+        -webkit-tap-highlight-color: rgba(249, 115, 22, 0.2);
+    }
+}
+.settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 1.5rem;
+}
+@media (max-width: 900px) {
+    .settings-grid { grid-template-columns: 1fr; }
+}
+
+.profile-avatar-section {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+    padding-bottom: 2rem;
+    border-bottom: 1px solid var(--border-color);
+}
+.avatar-preview {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent-orange), #fb923c);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.avatar-preview span { font-size: 2rem; font-weight: 600; color: #fff; }
+
+.form-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+}
+@media (max-width: 600px) {
+    .form-grid { grid-template-columns: 1fr; }
+}
+.form-actions {
+    margin-top: 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border-color);
+}
+
+.status-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--border-color);
+}
+.status-item:last-child { border-bottom: none; }
+.status-label { color: var(--text-secondary); }
+.account-id-full {
+    font-family: monospace;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    word-break: break-all;
+    max-width: 200px;
+    text-align: right;
+}
+.account-id-full:hover { color: var(--accent-orange); }
+
+.preference-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 0;
+    border-bottom: 1px solid var(--border-color);
+    gap: 1rem;
+}
+.preference-item:last-child { border-bottom: none; }
+.preference-info { flex: 1; }
+.preference-label { font-weight: 500; display: block; }
+.preference-desc { font-size: 0.85rem; color: var(--text-secondary); }
+
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 48px;
+    height: 26px;
+    flex-shrink: 0;
+}
+.toggle-switch input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: var(--bg-input);
+    border: 1px solid var(--border-color);
+    border-radius: 26px;
+    transition: 0.3s;
+}
+.toggle-slider:before {
+    position: absolute;
+    content: "";
+    height: 20px;
+    width: 20px;
+    left: 2px;
+    bottom: 2px;
+    background: var(--bg-card);
+    border-radius: 50%;
+    transition: 0.3s;
+}
+.toggle-switch input:checked + .toggle-slider {
+    background: var(--accent-orange);
+    border-color: var(--accent-orange);
+}
+.toggle-switch input:checked + .toggle-slider:before {
+    transform: translateX(22px);
+}
+
+.color-picker-wrapper { display: flex; align-items: center; gap: 0.75rem; }
+.color-picker-input {
+    width: 50px;
+    height: 40px;
+    border: 2px solid var(--border-color);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.color-picker-input:hover {
+    border-color: var(--accent-orange);
+    transform: scale(1.05);
+}
+.color-hex-display {
+    font-family: 'Courier New', monospace;
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+    background: var(--bg-input);
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    min-width: 80px;
+    text-align: center;
+    font-weight: 600;
+}
+
+.form-select-sm { padding: 0.5rem; font-size: 0.875rem; min-width: 120px; }
+.btn-block { width: 100%; }
+.form-hint {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* ============================================================
+   MOBILE HARDENING v5.2 — Final global polish
+   All rules here intentionally override page-level inline
+   styles where needed (uses !important sparingly).
+   ============================================================ */
+
+/* ── Prevent horizontal overflow at shell level ── */
+body { overflow-x: hidden; }
+.main-content { overflow-x: hidden; }
+
+/* ── All standard tables: min-width so they scroll rather than squish ── */
+@media (max-width: 768px) {
+    .table-container table,
+    .table-card table { min-width: 480px; }
+}
+
+/* ── Content tables (analytics deep-dive, kpi table wrap): force h-scroll ── */
+.content-table { overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+.kpi-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* ── Upload page: AI preference key column ── */
+@media (max-width: 520px) {
+    .ai-pref-row { flex-direction: column; gap: 0.15rem; }
+    .ai-pref-row .k { min-width: unset !important; font-size: 0.82rem; }
+    .ai-pref-row .v { font-size: 0.82rem; }
+}
+
+/* ── Upload page: schedule slot datetime-local inputs ── */
+@media (max-width: 640px) {
+    .schedule-slot-item { flex-wrap: wrap; gap: 0.5rem; }
+    .schedule-slot-item input[type="datetime-local"] { min-width: unset !important; width: 100%; }
+    .schedule-slot-item .file-name { white-space: normal; word-break: break-word; }
+}
+
+/* ── KPI engagement row (kpi.html, inline grid override) ── */
+@media (max-width: 768px) {
+    #kpiEngagementRow { grid-template-columns: repeat(2, 1fr) !important; }
+}
+@media (max-width: 480px) {
+    #kpiEngagementRow { grid-template-columns: 1fr !important; }
+}
+
+/* ── Auth pages: first/last name row ── */
+@media (max-width: 500px) {
+    .name-row { flex-direction: column !important; gap: 0 !important; }
+    .name-row .form-group { flex: unset !important; margin-bottom: 1.25rem; }
+}
+
+/* ── Auth pages: header nav links on small phones ── */
+@media (max-width: 520px) {
+    .header { padding: 0.75rem 1rem !important; flex-wrap: wrap; }
+    .header-nav { gap: 0.3rem; flex-wrap: wrap; }
+    .home-btn { padding: 0.35rem 0.55rem; font-size: 0.78rem; }
+    .main { padding: 1rem !important; }
+    .login-card,
+    .signup-card { padding: 1.5rem 1.25rem !important; border-radius: 14px !important; }
+}
+
+/* ── Platforms page: card header wraps on small screens ── */
+@media (max-width: 520px) {
+    .card-header { flex-wrap: wrap; }
+    .card-header > .btn { white-space: nowrap; }
+}
+
+/* ── Scheduled page: calendar day cells shrink on tiny phones ── */
+@media (max-width: 480px) {
+    .calendar-day { min-height: 52px !important; padding: 0.3rem; aspect-ratio: unset; }
+    .day-number { font-size: 0.75rem; }
+    .upload-dot { width: 6px; height: 6px; }
+    .calendar-weekdays { font-size: 0.65rem; }
+}
+
+/* ── Queue page: filter controls stack ── */
+@media (max-width: 500px) {
+    .filter-controls { flex-direction: column; }
+    .search-input-wrapper { min-width: unset !important; width: 100%; }
+    .quota-badge { justify-content: center; text-align: center; width: 100%; }
+    .page-header-right { flex-wrap: wrap; gap: 0.5rem; }
+}
+
+/* ── Admin pages: users table wrapper ── */
+.users-table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+@media (max-width: 768px) {
+    .users-table { min-width: 620px; }
+    .admin-users-table { min-width: 620px; }
+}
+
+/* ── Toast: full width on mobile ── */
+@media (max-width: 640px) {
+    #toastContainer { left: 0.75rem; right: 0.75rem; max-width: calc(100vw - 1.5rem); }
+    .toast { width: 100%; box-sizing: border-box; }
+}
+
+/* ── Index / marketing: hero + pricing grid ── */
+@media (max-width: 480px) {
+    .hero h1 { font-size: 1.9rem !important; }
+    .hero p { font-size: 1rem !important; }
+    .pricing-grid { grid-template-columns: 1fr !important; gap: 1rem !important; }
+    .footer-container { grid-template-columns: 1fr !important; gap: 2rem !important; }
+    .nav { padding: 0.75rem 1rem !important; }
+    .section-header h2 { font-size: 1.75rem; }
+    .features-grid { grid-template-columns: 1fr !important; }
+}
+
+/* ── Billing success modal: wallet row ── */
+@media (max-width: 500px) {
+    #bsWalletRow, #bsFeatureGrid { grid-template-columns: 1fr !important; }
+    #billingSuccessModal > div:last-child { padding: 1.5rem 1.25rem !important; }
+}
+
+/* ── Global: prevent inputs / selects from overflowing parent ── */
+input, select, textarea { max-width: 100%; }
+
+/* ── Prevent long URLs/text from causing overflow ── */
+.page-subtitle, .card-body p, .stat-label { word-break: break-word; overflow-wrap: break-word; }
+
+/* ── Responsive: stack flex rows on very small phones ── */
+@media (max-width: 400px) {
+    .flex-wrap { gap: 0.4rem; }
+    .btn { min-height: 42px; padding: 0.55rem 1rem; }
+}
+
+/* Platform logos sourced from frontend/images/platforms */
+i.fab.fa-tiktok,
+i.fab.fa-youtube,
+i.fab.fa-instagram,
+i.fab.fa-facebook,
+i.fab.fa-facebook-f {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    background-position: center;
+    background-repeat: no-repeat;
+    /* Fill icon bounds with the PNG mark on all pages */
+    background-size: 100% 100%;
+    vertical-align: -0.125em;
+    color: transparent !important;
+}
+
+i.fab.fa-tiktok::before,
+i.fab.fa-youtube::before,
+i.fab.fa-instagram::before,
+i.fab.fa-facebook::before,
+i.fab.fa-facebook-f::before {
+    content: "";
+}
+
+i.fab.fa-tiktok { background-image: url("images/platforms/tiktok.png"); }
+i.fab.fa-youtube { background-image: url("images/platforms/youtube.png"); }
+i.fab.fa-instagram { background-image: url("images/platforms/instagram.png"); }
+i.fab.fa-facebook,
+i.fab.fa-facebook-f { background-image: url("images/platforms/facebook.png"); }
 

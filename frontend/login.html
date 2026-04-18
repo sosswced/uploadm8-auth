@@ -1,88 +1,417 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sign In — UploadM8</title>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-  <style>
-    :root { --primary: #7c3aed; --primary-dark: #5b21b6; --bg: #0f0f12; --card: #1a1a1f; --text: #e4e4e7; --muted: #71717a; --danger: #ef4444; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    .auth-card { background: var(--card); border-radius: 16px; padding: 2.5rem; width: 100%; max-width: 400px; border: 1px solid #2a2a2f; }
-    .auth-card h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
-    .auth-card .sub { color: var(--muted); margin-bottom: 1.5rem; font-size: 0.9rem; }
-    .form-group { margin-bottom: 1rem; }
-    .form-group label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.3rem; color: var(--muted); }
-    .form-group input { width: 100%; padding: 0.7rem 0.9rem; border-radius: 8px; border: 1px solid #2a2a2f; background: var(--bg); color: var(--text); font-size: 0.95rem; outline: none; transition: border-color 0.2s; }
-    .form-group input:focus { border-color: var(--primary); }
-    .btn { display: block; width: 100%; padding: 0.75rem; border-radius: 8px; font-weight: 600; text-align: center; cursor: pointer; border: none; font-size: 0.95rem; margin-top: 0.5rem; }
-    .btn-primary { background: var(--primary); color: white; }
-    .btn-primary:hover { background: var(--primary-dark); }
-    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
-    .error-msg { color: var(--danger); font-size: 0.85rem; margin-top: 0.5rem; display: none; }
-    .links { margin-top: 1.25rem; text-align: center; font-size: 0.85rem; color: var(--muted); }
-    .links a { color: var(--primary); text-decoration: none; }
-    .links a:hover { text-decoration: underline; }
-  </style>
+
+    <script src="js/html-safe.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://static.cloudflareinsights.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 http://127.0.0.1:3000 http://localhost:3000 https://cloudflareinsights.com;">
+    <title>Sign In - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; background: #0a0a0f; color: #ffffff; min-height: 100vh; display: flex; flex-direction: column; }
+        .header { padding: 1.5rem 2rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; position: relative; }
+        .logo { display: flex; align-items: center; gap: 0.75rem; text-decoration: none; color: white; font-size: 1.5rem; font-weight: 700; }
+        .logo img { height: 32px; }
+        .mobile-menu-btn {
+            display: none;
+            background: none;
+            border: 1px solid rgba(255,255,255,0.15);
+            color: #fff;
+            font-size: 1.25rem;
+            padding: 0.45rem 0.65rem;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-left: auto;
+            touch-action: manipulation;
+        }
+        .header-nav { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+        .home-btn { color: #9ca3af; text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; transition: all 0.2s; font-size: 0.9rem; }
+        .home-btn:hover { background: rgba(255,255,255,0.05); color: white; }
+        .main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 2rem; }
+        .login-card { background: #12121a; border: 1px solid rgba(255,255,255,0.05); border-radius: 20px; padding: 2.5rem; width: 100%; max-width: 420px; }
+        .login-header { text-align: center; margin-bottom: 2rem; }
+        .login-header h1 { font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .login-header p { color: #9ca3af; }
+        .alert { display: none; padding: 1rem; border-radius: 10px; margin-bottom: 1.5rem; font-size: 0.9rem; align-items: center; gap: 0.75rem; }
+        .alert.show { display: flex; }
+        .alert-error { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #fca5a5; }
+        .alert-info { background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); color: #93c5fd; }
+        .alert-success { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.3); color: #86efac; }
+        .form-group { margin-bottom: 1.5rem; }
+        .form-label { display: block; font-size: 0.9rem; font-weight: 500; margin-bottom: 0.5rem; color: #9ca3af; }
+        .input-group { position: relative; }
+        .form-input { width: 100%; padding: 0.875rem 1rem; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; color: white; font-size: 1rem; transition: all 0.2s; }
+        .form-input:focus { outline: none; border-color: #f97316; background: rgba(255,255,255,0.08); }
+        .input-icon { position: absolute; right: 1rem; top: 50%; transform: translateY(-50%); color: #6b7280; cursor: pointer; }
+        .input-icon:hover { color: #9ca3af; }
+        .form-extras { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; flex-wrap: wrap; gap: 0.75rem; }
+        .checkbox-label { display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.9rem; color: #9ca3af; }
+        .checkbox-label input { accent-color: #f97316; width: 16px; height: 16px; }
+        .forgot-link { color: #f97316; text-decoration: none; font-size: 0.9rem; }
+        .forgot-link:hover { text-decoration: underline; }
+        .submit-btn { width: 100%; padding: 1rem; background: #f97316; border: none; border-radius: 10px; color: white; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 0.5rem; }
+        .submit-btn:hover { background: #ea580c; transform: translateY(-1px); }
+        .submit-btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+        .signup-link { text-align: center; margin-top: 2rem; color: #9ca3af; }
+        .signup-link a { color: #f97316; text-decoration: none; font-weight: 500; }
+        .signup-link a:hover { text-decoration: underline; }
+        .footer { padding: 1.5rem 2rem; text-align: center; color: #9ca3af; font-size: 0.85rem; border-top: 1px solid rgba(255,255,255,0.05); }
+        .footer a { color: #9ca3af; text-decoration: none; margin: 0 0.75rem; transition: color 0.2s; }
+        .footer a:hover { color: white; }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 768px) {
+            .mobile-menu-btn { display: inline-flex; align-items: center; justify-content: center; }
+            .header-nav {
+                display: none;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 0.5rem;
+                position: absolute;
+                top: calc(100% + 0.35rem);
+                left: 0;
+                right: 0;
+                padding: 1rem;
+                background: #12121a;
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 12px;
+                z-index: 200;
+                box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+            }
+            .header-nav.open { display: flex; }
+            .header-nav .home-btn { justify-content: flex-start; width: 100%; }
+        }
+        @media (max-width: 520px) {
+            .header { padding: 1rem; }
+            .header-nav { gap: 0.3rem; }
+            .home-btn { padding: 0.35rem 0.55rem; font-size: 0.78rem; }
+            .main { padding: 1rem; }
+            .login-card { padding: 1.5rem 1.25rem; border-radius: 14px; }
+            .login-header h1 { font-size: 1.5rem; }
+        }
+        @media (max-width: 400px) {
+            .form-extras { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+        }
+    </style>
 </head>
 <body>
-  <div class="auth-card">
-    <h1>Sign in</h1>
-    <p class="sub">Welcome back to UploadM8</p>
-    <form id="login-form" autocomplete="on">
-      <div class="form-group">
-        <label for="email">Email</label>
-        <input id="email" type="email" placeholder="you@example.com" required autocomplete="email" />
-      </div>
-      <div class="form-group">
-        <label for="password">Password</label>
-        <input id="password" type="password" placeholder="Your password" required autocomplete="current-password" />
-      </div>
-      <div id="error" class="error-msg"></div>
-      <button type="submit" class="btn btn-primary" id="submit-btn">Sign in</button>
-    </form>
-    <div class="links">
-      <a href="/forgot-password.html">Forgot password?</a><br />
-      Don't have an account? <a href="/signup.html">Sign up</a>
-    </div>
-  </div>
+    <header class="header">
+        <a href="index.html" class="logo">
+            <img src="images/logo.svg" alt="UploadM8">
+            UploadM8
+        </a>
+        <button type="button" class="mobile-menu-btn" id="authMobileMenuBtn" data-um8-fn="toggleAuthMobileNav" aria-label="Open menu" aria-expanded="false"><i class="fas fa-bars"></i></button>
+        <nav class="header-nav" id="authHeaderNav" aria-label="Quick links">
+            <a href="index.html#features" class="home-btn" style="border-style:dashed;"><i class="fas fa-star"></i> Features</a>
+            <a href="index.html#pricing" class="home-btn" style="border-style:dashed;"><i class="fas fa-tags"></i> Pricing</a>
+            <a href="how-it-works.html" class="home-btn" style="border-style:dashed;"><i class="fas fa-question-circle"></i> How it works</a>
+            <a href="contact.html" class="home-btn" style="border-style:dashed;"><i class="fas fa-envelope"></i> Contact</a>
+            <a href="support.html" class="home-btn" style="border-style:dashed;"><i class="fas fa-headset"></i> Support</a>
+            <a href="index.html" class="home-btn">
+                <i class="fas fa-home"></i> Home
+            </a>
+        </nav>
+    </header>
 
-  <script>
-    const API_BASE = (typeof API_BASE_URL !== 'undefined') ? API_BASE_URL : (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : (window.location.hostname === 'app.uploadm8.com' ? 'https://auth.uploadm8.com' : ''));
+    <main class="main">
+        <div class="login-card">
+            <div class="login-header">
+                <h1>Welcome Back</h1>
+                <p>Sign in to continue to UploadM8</p>
+            </div>
 
-    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+            <div id="alertError" class="alert alert-error">
+                <i class="fas fa-exclamation-circle"></i>
+                <span id="errorMessage">Invalid email or password</span>
+            </div>
+            <div id="alertInfo" class="alert alert-info">
+                <i class="fas fa-info-circle"></i>
+                <span id="infoMessage">Session expired. Please sign in again.</span>
+            </div>
+            <div id="alertSuccess" class="alert alert-success">
+                <i class="fas fa-check-circle"></i>
+                <span id="successMessage">Account created! Please sign in.</span>
+            </div>
 
-    const form = document.getElementById('login-form');
-    const errEl = document.getElementById('error');
-    const btn = document.getElementById('submit-btn');
+            <form id="loginForm" onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label class="form-label" for="email">Email Address</label>
+                    <input type="email" id="email" class="form-input" placeholder="you@example.com" required autocomplete="email">
+                </div>
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      errEl.style.display = 'none';
-      const email = document.getElementById('email').value.trim();
-      const password = document.getElementById('password').value;
-      if (!email || !password) { errEl.textContent = 'Please fill in all fields.'; errEl.style.display = 'block'; return; }
+                <div class="form-group">
+                    <label class="form-label" for="password">Password</label>
+                    <div class="input-group">
+                        <input type="password" id="password" class="form-input" placeholder="••••••••" required autocomplete="current-password">
+                        <i class="fas fa-eye input-icon" id="togglePassword" data-um8-fn="togglePasswordVisibility" title="Show password" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();togglePasswordVisibility();}"></i>
+                    </div>
+                </div>
 
-      btn.disabled = true; btn.textContent = 'Signing in...';
-      try {
-        const r = await fetch(API_BASE + '/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password })
+                <div class="form-extras">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="rememberMe" checked>
+                        Remember me
+                    </label>
+                    <a href="forgot-password.html" class="forgot-link">Forgot password?</a>
+                </div>
+
+                <button type="submit" class="submit-btn" id="submitBtn">
+                    <span>Sign In</span>
+                </button>
+            </form>
+
+            <div class="signup-link">
+                Don't have an account? <a href="signup.html">Sign up free</a>
+            </div>
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span>© 2025 UploadM8</span>
+        <a href="dashboard.html">Dashboard</a>
+        <a href="settings.html#billing-panel">Token balance</a>
+        <a href="contact.html">Contact</a>
+        <a href="terms.html">Terms</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="how-it-works.html">How it works</a>
+        <a href="support.html">Support</a>
+        <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
+    </footer>
+
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script>
+        var TOKEN_KEY = 'uploadm8_access_token';
+        var REFRESH_KEY = 'uploadm8_refresh_token';
+
+        function detailToString(d) {
+            if (d == null || d === '') return 'Invalid email or password';
+            if (typeof d === 'string') return d;
+            if (Array.isArray(d))
+                return d.map(function (x) { return (x && x.msg) ? x.msg : JSON.stringify(x); }).join('; ');
+            if (typeof d === 'object' && d.message) return String(d.message);
+            if (typeof d === 'object' && d.msg) return d.msg;
+            try { return JSON.stringify(d); } catch (e) { return String(d); }
+        }
+
+        document.addEventListener('DOMContentLoaded', function () {
+            hideAllAlerts();
+
+            var token = (typeof window.getAccessToken === 'function' && window.getAccessToken()) || sessionStorage.getItem(TOKEN_KEY) || '';
+            if (token) {
+                verifyAndRedirect(token);
+                return;
+            }
+            verifyCookieSessionMaybeRedirect().then(function (didRedirect) {
+                if (didRedirect) return;
+                var authMsg = sessionStorage.getItem('uploadm8_auth_message');
+                if (authMsg) {
+                    sessionStorage.removeItem('uploadm8_auth_message');
+                    showInfo(authMsg);
+                }
+                var signupSuccess = sessionStorage.getItem('uploadm8_signup_success');
+                if (signupSuccess) {
+                    sessionStorage.removeItem('uploadm8_signup_success');
+                    showSuccess('Check your inbox to verify your email, then sign in here.');
+                }
+            });
         });
-        const data = await r.json();
-        if (!r.ok) { errEl.textContent = esc(data.detail || 'Login failed'); errEl.style.display = 'block'; return; }
-        localStorage.setItem('access_token', data.access_token);
-        if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
-        const params = new URLSearchParams(window.location.search);
-        window.location.href = params.get('redirect') || '/settings.html';
-      } catch (err) {
-        errEl.textContent = 'Network error. Please try again.'; errEl.style.display = 'block';
-      } finally {
-        btn.disabled = false; btn.textContent = 'Sign in';
-      }
+
+        async function verifyCookieSessionMaybeRedirect() {
+            try {
+                var resp = await window.apiFetch('/api/me', {
+                    method: 'GET',
+                    authRedirectOn401: false,
+                });
+                if (resp.ok) {
+                    var params = new URLSearchParams(window.location.search);
+                    window.location.href = params.get('redirect') || 'dashboard.html';
+                    return true;
+                }
+            } catch (e) {
+                console.debug('Cookie session check skipped:', e);
+            }
+            return false;
+        }
+
+        async function verifyAndRedirect(token) {
+            try {
+                var resp = await window.apiFetch('/api/me', {
+                    credentials: 'include',
+                    headers: { 'Authorization': 'Bearer ' + token },
+                    authRedirectOn401: false,
+                });
+                if (resp.ok) {
+                    var params = new URLSearchParams(window.location.search);
+                    window.location.href = params.get('redirect') || 'dashboard.html';
+                } else {
+                    localStorage.removeItem(TOKEN_KEY);
+                    localStorage.removeItem(REFRESH_KEY);
+                    sessionStorage.removeItem(TOKEN_KEY);
+                    sessionStorage.removeItem(REFRESH_KEY);
+                    try {
+                        sessionStorage.removeItem('uploadm8_cached_user');
+                        sessionStorage.removeItem('uploadm8_cached_user_at');
+                        localStorage.removeItem('uploadm8_cached_user');
+                        localStorage.removeItem('uploadm8_cached_user_at');
+                        sessionStorage.removeItem('uploadm8_avatar_ss_url');
+                        sessionStorage.removeItem('uploadm8_avatar_ss_sub');
+                    } catch (_) {}
+                }
+            } catch (e) {
+                console.error('Verify token error:', e);
+            }
+        }
+
+        function hideAllAlerts() {
+            document.getElementById('alertError').classList.remove('show');
+            document.getElementById('alertInfo').classList.remove('show');
+            document.getElementById('alertSuccess').classList.remove('show');
+        }
+
+        function showError(message) {
+            hideAllAlerts();
+            document.getElementById('errorMessage').textContent = message;
+            document.getElementById('alertError').classList.add('show');
+        }
+
+        function showInfo(message) {
+            hideAllAlerts();
+            document.getElementById('infoMessage').textContent = message;
+            document.getElementById('alertInfo').classList.add('show');
+        }
+
+        function showSuccess(message) {
+            hideAllAlerts();
+            document.getElementById('successMessage').textContent = message;
+            document.getElementById('alertSuccess').classList.add('show');
+        }
+
+        function togglePasswordVisibility() {
+            var passwordInput = document.getElementById('password');
+            var toggleIcon = document.getElementById('togglePassword');
+
+            if (passwordInput.type === 'password') {
+                passwordInput.type = 'text';
+                toggleIcon.classList.remove('fa-eye');
+                toggleIcon.classList.add('fa-eye-slash');
+            } else {
+                passwordInput.type = 'password';
+                toggleIcon.classList.remove('fa-eye-slash');
+                toggleIcon.classList.add('fa-eye');
+            }
+        }
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            hideAllAlerts();
+
+            var email = document.getElementById('email').value.trim();
+            var password = document.getElementById('password').value;
+            var rememberMe = document.getElementById('rememberMe').checked;
+            var submitBtn = document.getElementById('submitBtn');
+
+            if (!email || !password) {
+                showError('Please enter both email and password');
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Signing in...';
+
+            try {
+                if (typeof window.login !== 'function') {
+                    showError('Sign-in unavailable: load js/auth-stack.js');
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = '<span>Sign In</span>';
+                    return;
+                }
+                var loginResult = await window.login(email, password, rememberMe);
+                if (!loginResult.success) {
+                    showError(loginResult.error || 'Invalid email or password');
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = '<span>Sign In</span>';
+                    return;
+                }
+
+                try {
+                    var me = await window.apiFetch('/api/me', {
+                        method: 'GET',
+                        authRedirectOn401: false,
+                    });
+                    if (me.ok) {
+                        var user = await me.json();
+                        if (user && user.email) {
+                            var uid = String(user.id || user.user_id || '');
+                            var bearer = (typeof window.getAccessToken === 'function' && window.getAccessToken()) || '';
+                            var marker = bearer ? String(bearer).slice(-24) : ('cookie_uid:' + uid);
+                            if (uid && marker) {
+                                var ts = String(Date.now());
+                                var payload = { user: user, uid: uid, tokenMarker: marker };
+                                sessionStorage.setItem('uploadm8_cached_user', JSON.stringify(payload));
+                                sessionStorage.setItem('uploadm8_cached_user_at', ts);
+                            }
+                            var av = user.avatar_url || user.avatarUrl;
+                            if (av && uid) {
+                                try {
+                                    sessionStorage.setItem('uploadm8_avatar_ss_sub', uid);
+                                    sessionStorage.setItem('uploadm8_avatar_ss_url', av);
+                                } catch (_) {}
+                            }
+                        }
+                    }
+                } catch (_) {}
+
+                if (loginResult.must_reset_password) {
+                    try {
+                        sessionStorage.setItem('uploadm8_must_reset_password', '1');
+                    } catch (_) {}
+                    window.location.href = 'settings.html?password_reset_required=1#security';
+                    return;
+                }
+
+                var params = new URLSearchParams(window.location.search);
+                window.location.href = params.get('redirect') || 'dashboard.html';
+            } catch (err) {
+                console.error('Login error:', err);
+                showError('Connection error. If the API runs on another port, open this page from the same origin or add ?api=http://127.0.0.1:PORT');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<span>Sign In</span>';
+            }
+        }
+    </script>
+    <script>
+    function toggleAuthMobileNav() {
+        var nav = document.getElementById('authHeaderNav');
+        var btn = document.getElementById('authMobileMenuBtn');
+        if (!nav) return;
+        var on = nav.classList.toggle('open');
+        if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+    }
+    document.addEventListener('click', function (e) {
+        var nav = document.getElementById('authHeaderNav');
+        var btn = document.getElementById('authMobileMenuBtn');
+        if (!nav || !nav.classList.contains('open')) return;
+        if (btn && (btn === e.target || btn.contains(e.target))) return;
+        if (nav.contains(e.target)) return;
+        nav.classList.remove('open');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
     });
-  </script>
+    document.querySelectorAll('#authHeaderNav a').forEach(function (a) {
+        a.addEventListener('click', function () {
+            var nav = document.getElementById('authHeaderNav');
+            var btn = document.getElementById('authMobileMenuBtn');
+            if (nav) nav.classList.remove('open');
+            if (btn) btn.setAttribute('aria-expanded', 'false');
+        });
+    });
+    </script>
+    <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"48e34920cedd42e3b88cf8587cbcdc0a","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>

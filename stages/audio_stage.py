@@ -36,8 +36,11 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from .errors import SkipStage, StageError, ErrorCode
+import httpx
+
+from .errors import SkipStage
 from .context import JobContext
+from .ai_service_costs import billing_env_from_os, user_pref_ai_service_enabled
 
 logger = logging.getLogger("uploadm8-worker.audio")
 
@@ -121,6 +124,42 @@ async def _extract_audio_wav(video_path: Path, out_path: Path) -> bool:
 # Whisper transcription
 # ---------------------------------------------------------------------------
 
+async def _gpt_audio_summary_from_transcript(transcript: str) -> Optional[str]:
+    """Small GPT-4o-mini summary when aiServiceAudioSummary is on."""
+    if not transcript.strip() or not OPENAI_API_KEY:
+        return None
+    model = os.environ.get("OPENAI_AUDIO_SUMMARY_MODEL", "gpt-4o-mini")
+    prompt = (
+        "In 2–4 short phrases, summarize themes, pacing, and vibe of this spoken content "
+        "for social video metadata. No bullet labels, no JSON.\n\n"
+        + transcript[:2500]
+    )
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 150,
+                    "temperature": 0.35,
+                },
+            )
+            if r.status_code != 200:
+                logger.warning("GPT audio summary HTTP %s", r.status_code)
+                return None
+            data = r.json()
+            txt = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            return txt.strip() or None
+    except Exception as e:
+        logger.warning("GPT audio summary failed: %s", e)
+        return None
+
+
 async def _transcribe_wav(wav_path: Path) -> Optional[str]:
     """
     Send a WAV file to OpenAI Whisper and return the transcript text.
@@ -185,48 +224,40 @@ async def _transcribe_wav(wav_path: Path) -> Optional[str]:
 
 async def run_audio_context_stage(ctx: JobContext) -> JobContext:
     """
-    Execute the audio context stage.
+    Audio analysis stack: Whisper (optional), GPT audio summary (optional),
+    plus reserved hooks for YAMNet / ACR when those engines are wired.
 
-    On success:   ctx.ai_transcript is set (str, ≤ TRANSCRIPT_MAX_CHARS chars).
-                  ctx.audio_path is set to the temporary WAV path.
-    On any skip:  SkipStage is raised — pipeline continues unchanged.
-    On any error: logs a warning, returns ctx unchanged (never raises to caller).
-
-    The caption_stage reads ctx.ai_transcript in _build_grounding_evidence()
-    and injects it into every OpenAI prompt as factual evidence, giving the
-    model "what was actually said" in addition to "what was actually shown."
+    Respects per-service upload preferences (aiService* + audio_transcription).
     """
     ctx.mark_stage("audio")
 
-    # ------------------------------------------------------------------ #
-    # Gate 1: Tier must have AI enabled                                   #
-    # ------------------------------------------------------------------ #
     if ctx.entitlements and not ctx.entitlements.can_ai:
         raise SkipStage("AI not enabled for this tier — skipping audio context")
 
-    if not OPENAI_API_KEY:
-        raise SkipStage("OPENAI_API_KEY not configured — skipping audio context")
-
-    # ------------------------------------------------------------------ #
-    # Gate 2: User opt-out via settings                                   #
-    # Default True so existing users get the feature automatically.       #
-    # ------------------------------------------------------------------ #
-    use_audio = ctx.user_settings.get("use_audio_context", True)
+    us = ctx.user_settings or {}
+    use_audio = bool(us.get("use_audio_context", us.get("useAudioContext", True)))
     if not use_audio:
         raise SkipStage("Audio context disabled by user setting (use_audio_context=false)")
 
-    # ------------------------------------------------------------------ #
-    # Gate 3: Video must have an audio stream                             #
-    # video_info is populated by transcode_stage from ffprobe output.     #
-    # ------------------------------------------------------------------ #
-    audio_codec = ctx.video_info.get("audio_codec")
+    env_audio = billing_env_from_os()
+    transcribe_pref = bool(us.get("audio_transcription", us.get("audioTranscription", True)))
+    want_whisper = transcribe_pref and user_pref_ai_service_enabled(us, "audio_whisper", True)
+    want_yamnet = env_audio.get("YAMNET_ENABLED", True) and user_pref_ai_service_enabled(
+        us, "audio_yamnet", True
+    )
+    want_acr = env_audio.get("ACRCLOUD_CONFIGURED", False) and user_pref_ai_service_enabled(
+        us, "audio_acr", True
+    )
+    want_gpt_summary = user_pref_ai_service_enabled(us, "audio_gpt_classify", True)
+
+    if not any((want_whisper, want_yamnet, want_acr, want_gpt_summary)):
+        raise SkipStage("All audio analysis services disabled in upload preferences")
+
+    audio_codec = (ctx.video_info or {}).get("audio_codec")
     if not audio_codec:
         raise SkipStage("Video has no audio stream — skipping audio context")
 
-    # ------------------------------------------------------------------ #
-    # Gate 4: Duration bounds (cost + quality guards)                     #
-    # ------------------------------------------------------------------ #
-    duration = float(ctx.video_info.get("duration", 0.0))
+    duration = float((ctx.video_info or {}).get("duration", 0.0))
     if duration < AUDIO_MIN_DURATION_SECS:
         raise SkipStage(
             f"Clip too short ({duration:.1f}s < {AUDIO_MIN_DURATION_SECS}s) — skipping audio context"
@@ -234,15 +265,9 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
     if duration > AUDIO_MAX_DURATION_SECS:
         raise SkipStage(
             f"Clip too long ({duration:.0f}s > {AUDIO_MAX_DURATION_SECS:.0f}s) — "
-            f"skipping audio context to control Whisper cost"
+            f"skipping audio context to control cost"
         )
 
-    # ------------------------------------------------------------------ #
-    # Resolve input video                                                  #
-    # Prefer the processed (HUD+watermarked+transcoded) path.             #
-    # The audio stream in the processed file is identical to the original #
-    # (FFmpeg copies it through losslessly in most cases).                #
-    # ------------------------------------------------------------------ #
     input_video: Optional[Path] = None
     if ctx.processed_video_path and ctx.processed_video_path.exists():
         input_video = ctx.processed_video_path
@@ -252,44 +277,50 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
     if not input_video:
         raise SkipStage("No video file available for audio extraction")
 
+    if not ctx.temp_dir:
+        raise SkipStage("No temp directory available for audio extraction")
+
     logger.info(
-        f"Audio context: {input_video.name} | "
-        f"duration={duration:.1f}s | codec={audio_codec}"
+        f"Audio context: {input_video.name} | duration={duration:.1f}s | codec={audio_codec} | "
+        f"whisper={want_whisper} yamnet={want_yamnet} acr={want_acr} gpt_sum={want_gpt_summary}"
     )
 
-    # ------------------------------------------------------------------ #
-    # Step 1: Extract audio → WAV                                         #
-    # ------------------------------------------------------------------ #
+    ctx.audio_context = dict(getattr(ctx, "audio_context", None) or {})
+
     wav_path = ctx.temp_dir / "audio_context.wav"
     extracted = await _extract_audio_wav(input_video, wav_path)
-
     if not extracted:
-        # Non-fatal: caption stage will run without transcript
-        logger.warning("Audio extraction failed — continuing without transcript")
+        logger.warning("Audio extraction failed — skipping audio sub-services")
         return ctx
 
-    ctx.audio_path = wav_path  # stored for reference; temp_dir cleans up automatically
+    ctx.audio_path = wav_path
 
-    # ------------------------------------------------------------------ #
-    # Step 2: Transcribe with Whisper                                     #
-    # ------------------------------------------------------------------ #
-    transcript = await _transcribe_wav(wav_path)
+    if want_whisper and OPENAI_API_KEY:
+        transcript = await _transcribe_wav(wav_path)
+        if transcript:
+            if len(transcript) > TRANSCRIPT_MAX_CHARS:
+                transcript = transcript[:TRANSCRIPT_MAX_CHARS] + "…"
+            ctx.ai_transcript = transcript
+            ctx.audio_context["transcript_chars"] = len(transcript)
+            logger.info("Whisper transcript stored (%s chars)", len(transcript))
+    elif want_whisper:
+        logger.warning("Speech-to-text requested but OPENAI_API_KEY is not set")
 
-    if not transcript:
-        logger.info("No transcript produced — continuing without audio context")
-        return ctx
+    if want_yamnet:
+        ctx.audio_context.setdefault("yamnet_events", [])
+        logger.debug("YAMNet: no local classifier loaded — pref honored, events left empty")
 
-    # ------------------------------------------------------------------ #
-    # Step 3: Cap length and store in context                             #
-    # ------------------------------------------------------------------ #
-    if len(transcript) > TRANSCRIPT_MAX_CHARS:
-        transcript = transcript[:TRANSCRIPT_MAX_CHARS] + "…"
-        logger.info(f"Transcript capped at {TRANSCRIPT_MAX_CHARS} chars")
+    if want_acr:
+        ctx.audio_context.setdefault("music_fingerprint", None)
+        logger.debug("ACRCloud: client not wired in worker — pref honored, skipped")
 
-    ctx.ai_transcript = transcript
-    logger.info(
-        f"Audio context stage complete — "
-        f"transcript stored ({len(ctx.ai_transcript)} chars)"
-    )
+    if want_gpt_summary and OPENAI_API_KEY:
+        base = (ctx.ai_transcript or "").strip()
+        if base:
+            summary = await _gpt_audio_summary_from_transcript(base)
+            if summary:
+                ctx.audio_context["gpt_audio_summary"] = summary
+    elif want_gpt_summary:
+        logger.debug("Audio summary requested but no OpenAI key or empty transcript")
 
     return ctx

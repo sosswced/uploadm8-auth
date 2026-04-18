@@ -7,7 +7,7 @@ services:
     name: uploadm8-api
     env: python
     runtime: python311
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements-lock.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
@@ -28,6 +28,8 @@ services:
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
+      # Frontend: also configure /billing-success.html → /billing/success.html (308) via
+      # frontend/_redirects (Netlify/Pages) or frontend/serve.json (npx serve) for old links.
       - key: STRIPE_SUCCESS_URL
         value: https://app.uploadm8.com/billing/success.html?session_id={CHECKOUT_SESSION_ID}
       - key: STRIPE_CANCEL_URL
@@ -63,3 +65,6 @@ services:
         value: uploadm8:jobs
       - key: PRIORITY_JOB_QUEUE
         value: uploadm8:priority
+      # Opt-in marketing touchpoint loop (see services/marketing_touchpoint_runner.py)
+      - key: MARKETING_AUTOMATION_ENABLED
+        value: "1"

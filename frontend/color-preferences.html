@@ -1,12 +1,14 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+
+    <script src="js/html-safe.js"></script>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Color Preferences - UploadM8</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="styles.css" rel="stylesheet">
@@ -153,129 +155,35 @@
             color: white;
             font-size: 16px;
         }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 640px) {
+            .save-section { flex-direction: column; align-items: flex-start; gap: 1rem; }
+            .save-actions { width: 100%; }
+            .save-actions .btn { flex: 1; justify-content: center; }
+        }
     </style>
 </head>
 <body>
     <div class="app-layout">
         <!-- Sidebar -->
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header">
-                <a href="dashboard.html" class="sidebar-logo">
-                    <img src="images/logo.png" alt="UploadM8">
-                    <span>UploadM8</span>
-                </a>
-            </div>
-            
-            <nav class="sidebar-nav">
-                <div class="nav-section">
-                    <div class="nav-section-title">Main</div>
-                    <a href="dashboard.html" class="nav-link">
-                        <i class="fas fa-home"></i>
-                        <span>Dashboard</span>
-                    </a>
-                    <a href="upload.html" class="nav-link">
-                        <i class="fas fa-cloud-upload-alt"></i>
-                        <span>Upload</span>
-                    </a>
-                    <a href="queue.html" class="nav-link">
-                        <i class="fas fa-list"></i>
-                        <span>Queue</span>
-                    </a>
-                    <a href="scheduled.html" class="nav-link">
-                        <i class="fas fa-calendar-alt"></i>
-                        <span>Scheduled</span>
-                    </a>
-                </div>
-                
-                <div class="nav-section">
-                    <div class="nav-section-title">Platforms</div>
-                    <a href="platforms.html" class="nav-link">
-                        <i class="fas fa-plug"></i>
-                        <span>Connected Accounts</span>
-                    </a>
-                    <a href="groups.html" class="nav-link">
-                        <i class="fas fa-layer-group"></i>
-                        <span>Account Groups</span>
-                    </a>
-                </div>
-
-                <div class="nav-section">
-                    <div class="nav-section-title">Insights</div>
-                    <a href="analytics.html" class="nav-link">
-                        <i class="fas fa-chart-line"></i>
-                        <span>Analytics</span>
-                    </a>
-                </div>
-
-                <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                    <div class="nav-section-title">Admin</div>
-                    <a href="admin.html" class="nav-link">
-                        <i class="fas fa-shield-alt"></i>
-                        <span>Admin Panel</span>
-                    </a>
-                    <a href="account-management.html" class="nav-link">
-                        <i class="fas fa-users-cog"></i>
-                        <span>Account Mgmt</span>
-                    </a>
-                    <a href="admin-kpi.html" class="nav-link">
-                        <i class="fas fa-chart-pie"></i>
-                        <span>KPI Dashboard</span>
-                    </a>
-                    <a href="admin-calculator.html" class="nav-link">
-                        <i class="fas fa-calculator"></i>
-                        <span>Biz Calculator</span>
-                    </a>
-                    <a href="admin-wallet.html" class="nav-link">
-                        <i class="fas fa-coins"></i>
-                        <span>Wallet Manager</span>
-                    </a>
-                </div>
-
-                <div class="nav-section">
-                    <div class="nav-section-title">Account</div>
-                    <a href="settings.html" class="nav-link">
-                        <i class="fas fa-sliders-h"></i>
-                        <span>Settings</span>
-                    </a>
-                    <a href="color-preferences.html" class="nav-link active">
-                        <i class="fas fa-palette"></i>
-                        <span>Colors</span>
-                    </a>
-                    <a href="guide.html" class="nav-link">
-                        <i class="fas fa-book-open"></i>
-                        <span>Feature Guide</span>
-                    </a>
-                </div>
-            </nav>
-
-            <div class="sidebar-footer">
-                <div class="user-info">
-                    <div class="user-avatar" id="userAvatar">U</div>
-                    <div class="user-details">
-                        <div class="user-name" id="userName">User</div>
-                        <div class="user-tier" id="userTier">Free</div>
-                    </div>
-                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
-                        <i class="fas fa-sign-out-alt"></i>
-                    </button>
-                </div>
-            </div>
-        </aside>
+        <aside class="sidebar" id="sidebar"></aside>
         
         <!-- Sidebar Overlay (Mobile) -->
-        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
 
         <!-- Top Bar (Mobile) -->
         <header class="top-bar">
-            <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()">
+            <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu">
                 <i class="fas fa-bars"></i>
             </button>
             <div class="top-bar-logo">
-                <img src="images/logo.png" alt="UploadM8">
+                <img src="images/logo.svg" alt="UploadM8">
                 <span>UploadM8</span>
             </div>
             <div class="top-bar-actions">
-                <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme">
+                <div data-wt-pills></div>
+                <button type="button" class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle Theme" aria-label="Toggle theme">
                     <i class="fas fa-moon" id="themeToggleIconMobile"></i>
                 </button>
             </div>
@@ -283,8 +191,9 @@
 
         <!-- Main Content -->
         <main class="main-content">
-            <div class="page-header">
-                <button class="back-btn" onclick="history.back()">
+            <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;">
+                <div style="display:flex;align-items:center;gap:1rem;">
+                <button class="back-btn" data-um8-fn="um8HistoryBack">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <line x1="19" y1="12" x2="5" y2="12"></line>
                         <polyline points="12 19 5 12 12 5"></polyline>
@@ -295,6 +204,8 @@
                     <h1>Color Preferences</h1>
                     <p class="page-subtitle">Customize platform colors and accent themes</p>
                 </div>
+                </div>
+                <div data-wt-pills class="desktop-pills"></div>
             </div>
 
             <div class="color-grid">
@@ -314,10 +225,10 @@
                         <span class="color-hex" id="tiktokHex">#000000</span>
                     </div>
                     <div class="preset-colors">
-                        <div class="preset-color" style="background: #000000;" onclick="setColor('tiktok', '#000000')"></div>
-                        <div class="preset-color" style="background: #FF0050;" onclick="setColor('tiktok', '#FF0050')"></div>
-                        <div class="preset-color" style="background: #00F2EA;" onclick="setColor('tiktok', '#00F2EA')"></div>
-                        <div class="preset-color" style="background: #6B7280;" onclick="setColor('tiktok', '#6B7280')"></div>
+                        <div class="preset-color" style="background: #000000;" data-um8-fn="setColor" data-um8-args=\'["tiktok","#000000"]\'></div>
+                        <div class="preset-color" style="background: #FF0050;" data-um8-fn="setColor" data-um8-args=\'["tiktok","#FF0050"]\'></div>
+                        <div class="preset-color" style="background: #00F2EA;" data-um8-fn="setColor" data-um8-args=\'["tiktok","#00F2EA"]\'></div>
+                        <div class="preset-color" style="background: #6B7280;" data-um8-fn="setColor" data-um8-args=\'["tiktok","#6B7280"]\'></div>
                     </div>
                 </div>
 
@@ -337,10 +248,10 @@
                         <span class="color-hex" id="youtubeHex">#FF0000</span>
                     </div>
                     <div class="preset-colors">
-                        <div class="preset-color" style="background: #FF0000;" onclick="setColor('youtube', '#FF0000')"></div>
-                        <div class="preset-color" style="background: #CC0000;" onclick="setColor('youtube', '#CC0000')"></div>
-                        <div class="preset-color" style="background: #E62117;" onclick="setColor('youtube', '#E62117')"></div>
-                        <div class="preset-color" style="background: #6B7280;" onclick="setColor('youtube', '#6B7280')"></div>
+                        <div class="preset-color" style="background: #FF0000;" data-um8-fn="setColor" data-um8-args=\'["youtube","#FF0000"]\'></div>
+                        <div class="preset-color" style="background: #CC0000;" data-um8-fn="setColor" data-um8-args=\'["youtube","#CC0000"]\'></div>
+                        <div class="preset-color" style="background: #E62117;" data-um8-fn="setColor" data-um8-args=\'["youtube","#E62117"]\'></div>
+                        <div class="preset-color" style="background: #6B7280;" data-um8-fn="setColor" data-um8-args=\'["youtube","#6B7280"]\'></div>
                     </div>
                 </div>
 
@@ -360,10 +271,10 @@
                         <span class="color-hex" id="instagramHex">#E4405F</span>
                     </div>
                     <div class="preset-colors">
-                        <div class="preset-color" style="background: #E4405F;" onclick="setColor('instagram', '#E4405F')"></div>
-                        <div class="preset-color" style="background: #C13584;" onclick="setColor('instagram', '#C13584')"></div>
-                        <div class="preset-color" style="background: #F77737;" onclick="setColor('instagram', '#F77737')"></div>
-                        <div class="preset-color" style="background: #6B7280;" onclick="setColor('instagram', '#6B7280')"></div>
+                        <div class="preset-color" style="background: #E4405F;" data-um8-fn="setColor" data-um8-args=\'["instagram","#E4405F"]\'></div>
+                        <div class="preset-color" style="background: #C13584;" data-um8-fn="setColor" data-um8-args=\'["instagram","#C13584"]\'></div>
+                        <div class="preset-color" style="background: #F77737;" data-um8-fn="setColor" data-um8-args=\'["instagram","#F77737"]\'></div>
+                        <div class="preset-color" style="background: #6B7280;" data-um8-fn="setColor" data-um8-args=\'["instagram","#6B7280"]\'></div>
                     </div>
                 </div>
 
@@ -383,10 +294,10 @@
                         <span class="color-hex" id="facebookHex">#1877F2</span>
                     </div>
                     <div class="preset-colors">
-                        <div class="preset-color" style="background: #1877F2;" onclick="setColor('facebook', '#1877F2')"></div>
-                        <div class="preset-color" style="background: #4267B2;" onclick="setColor('facebook', '#4267B2')"></div>
-                        <div class="preset-color" style="background: #0E76BC;" onclick="setColor('facebook', '#0E76BC')"></div>
-                        <div class="preset-color" style="background: #6B7280;" onclick="setColor('facebook', '#6B7280')"></div>
+                        <div class="preset-color" style="background: #1877F2;" data-um8-fn="setColor" data-um8-args=\'["facebook","#1877F2"]\'></div>
+                        <div class="preset-color" style="background: #4267B2;" data-um8-fn="setColor" data-um8-args=\'["facebook","#4267B2"]\'></div>
+                        <div class="preset-color" style="background: #0E76BC;" data-um8-fn="setColor" data-um8-args=\'["facebook","#0E76BC"]\'></div>
+                        <div class="preset-color" style="background: #6B7280;" data-um8-fn="setColor" data-um8-args=\'["facebook","#6B7280"]\'></div>
                     </div>
                 </div>
 
@@ -406,10 +317,10 @@
                         <span class="color-hex" id="accentHex">#F97316</span>
                     </div>
                     <div class="preset-colors">
-                        <div class="preset-color" style="background: #F97316;" onclick="setColor('accent', '#F97316')"></div>
-                        <div class="preset-color" style="background: #3B82F6;" onclick="setColor('accent', '#3B82F6')"></div>
-                        <div class="preset-color" style="background: #10B981;" onclick="setColor('accent', '#10B981')"></div>
-                        <div class="preset-color" style="background: #8B5CF6;" onclick="setColor('accent', '#8B5CF6')"></div>
+                        <div class="preset-color" style="background: #F97316;" data-um8-fn="setColor" data-um8-args=\'["accent","#F97316"]\'></div>
+                        <div class="preset-color" style="background: #3B82F6;" data-um8-fn="setColor" data-um8-args=\'["accent","#3B82F6"]\'></div>
+                        <div class="preset-color" style="background: #10B981;" data-um8-fn="setColor" data-um8-args=\'["accent","#10B981"]\'></div>
+                        <div class="preset-color" style="background: #8B5CF6;" data-um8-fn="setColor" data-um8-args=\'["accent","#8B5CF6"]\'></div>
                     </div>
                 </div>
             </div>
@@ -420,11 +331,11 @@
                     <p>Your custom colors will be applied across all pages</p>
                 </div>
                 <div class="save-actions">
-                    <button class="btn btn-secondary" onclick="resetToDefaults()">
+                    <button type="button" class="btn btn-secondary" data-um8-fn="resetToDefaults">
                         <i class="fas fa-undo"></i>
                         Reset to Defaults
                     </button>
-                    <button class="btn btn-primary" onclick="saveColors()">
+                    <button type="button" class="btn btn-primary" data-um8-fn="saveColors">
                         <i class="fas fa-save"></i>
                         Save Colors
                     </button>
@@ -433,8 +344,16 @@
         </main>
     </div>
 
-    <script src="wallet-tokens.js"></script>
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
     <script src="app.js"></script>
+    <script src="wallet-tokens.js"></script>
     <script>
         const defaultColors = {
             tiktok: '#000000',
@@ -444,9 +363,14 @@
             accent: '#F97316'
         };
 
-        // Initialize
+        // Initialize (app.js is sole auth — initApp)
         document.addEventListener('DOMContentLoaded', async () => {
-            await initAuth();
+            if (typeof initApp !== 'function') {
+                window.location.href = 'login.html';
+                return;
+            }
+            const user = await initApp('color-preferences');
+            if (!user) return;
             await loadColors();
             setupColorListeners();
         });
@@ -454,8 +378,7 @@
         // Load current color preferences
         async function loadColors() {
             try {
-                const response = await apiCall('/api/colors');
-                const colors = await response.json();
+                const colors = await apiCall('/api/colors');
                 
                 setColor('tiktok', colors.tiktok_color);
                 setColor('youtube', colors.youtube_color);
@@ -464,12 +387,20 @@
                 setColor('accent', colors.accent_color);
             } catch (error) {
                 console.error('Failed to load colors:', error);
-                showToast('error', 'Failed to load color preferences');
+                if (typeof showToast === 'function') showToast('Failed to load color preferences', 'error');
             }
         }
 
         // Set color for a specific platform
-        function setColor(platform, color) {
+        function setColor(first, second, third) {
+            let platform, color;
+            if (first && typeof first === 'object' && first.currentTarget) {
+                platform = second;
+                color = third;
+            } else {
+                platform = first;
+                color = second;
+            }
             const input = document.getElementById(`${platform}Color`);
             const hex = document.getElementById(`${platform}Hex`);
             const icon = document.getElementById(`${platform}IconPreview`);
@@ -508,10 +439,10 @@
                     body: JSON.stringify(colorData)
                 });
 
-                showToast('success', 'Color preferences saved successfully!');
+                if (typeof showToast === 'function') showToast('Color preferences saved successfully!', 'success');
             } catch (error) {
                 console.error('Failed to save colors:', error);
-                showToast('error', 'Failed to save color preferences');
+                if (typeof showToast === 'function') showToast('Failed to save color preferences', 'error');
             }
         }
 
@@ -526,11 +457,6 @@
             }
         }
 
-        function showToast(type, message) {
-            // Implement toast notification
-            console.log(`${type}: ${message}`);
-            alert(message);
-        }
     </script>
 </body>
 </html>

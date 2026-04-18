@@ -1,11 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>How It Works - UploadM8</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="/images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="/images/logo.svg">
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root { --blue-600:#2563eb; --gray-50:#f9fafb; --gray-200:#e5e7eb; --gray-600:#4b5563; --gray-800:#1f2937; --gray-900:#111827; }
@@ -26,12 +28,13 @@
     .muted { color:var(--gray-600); font-size:0.95rem; }
     .callout { background:#eff6ff; border:1px solid #dbeafe; border-radius:14px; padding:14px 16px; color:#1d4ed8; }
     code { background:#f3f4f6; padding:2px 6px; border-radius:6px; }
+    @media (max-width: 480px) { h1 { font-size: 1.6rem; } .container { padding: 28px 16px 60px; } }
   </style>
 </head>
 <body>
   <div class="topbar">
     <div class="wrap">
-      <a class="brand" href="/"><img src="/images/logo.png" alt="UploadM8"><span>UploadM8</span></a>
+      <a class="brand" href="/"><img src="/images/logo.svg" alt="UploadM8"><span>UploadM8</span></a>
       <div class="actions">
         <a href="/dashboard.html">Open app</a>
       </div>
@@ -40,7 +43,7 @@
 
   <div class="container">
     <h1>How it works</h1>
-    <p class="sub">Last updated: January 26, 2026</p>
+    <p class="sub">Last updated: March 16, 2026</p>
 
     <div class="card">
       
@@ -59,6 +62,7 @@
   <li><strong>Connect platforms</strong> via OAuth in <a href="/dashboard.html#platforms">Connected Platforms</a>.</li>
   <li><strong>Upload videos</strong> and select destinations (TikTok, YouTube Shorts, Instagram Reels, Facebook Reels).</li>
   <li><strong>Choose timing</strong>: post now, smart schedule, or manual scheduling per video.</li>
+  <li><strong>Processing pipeline runs:</strong> transcode → <strong>audio transcription via Whisper</strong> (Stage 5.5) → thumbnail generation → AI captions enriched with speech context → publish.</li>
   <li><strong>Monitor</strong> queue countdowns, success/failure, and platform-specific results.</li>
   <li><strong>Get notified</strong> via Discord webhook (testable from Settings).</li>
 </ol>
@@ -73,5 +77,10 @@
 
     <p class="muted" style="margin-top:18px;">© 2026 UploadM8. All rights reserved.</p>
   </div>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
 </body>
 </html>

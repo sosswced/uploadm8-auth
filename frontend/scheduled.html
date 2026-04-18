@@ -1,11 +1,14 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Scheduled Uploads - UploadM8</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="styles.css" rel="stylesheet">
@@ -19,14 +22,14 @@
             margin-bottom: 1.5rem;
         }
         .stat-card {
-            background: var(--card-bg, white);
+            background: var(--bg-card);
             border-radius: 12px;
             padding: 1rem;
             display: flex;
             align-items: center;
             gap: 1rem;
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-            border: 1px solid var(--border-color, #E5E7EB);
+            border: 1px solid var(--border-color);
         }
         .stat-icon {
             width: 40px; height: 40px; border-radius: 10px;
@@ -36,53 +39,53 @@
         .stat-icon.today   { background: rgba(59,130,246,0.1);  color: #3B82F6; }
         .stat-icon.week    { background: rgba(16,185,129,0.1);  color: #10B981; }
         .stat-content { display: flex; flex-direction: column; }
-        .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--text-primary, #1F2937); }
-        .stat-label { font-size: 0.75rem; color: var(--text-secondary, #6B7280); text-transform: uppercase; letter-spacing: 0.5px; }
+        .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--text-primary); }
+        .stat-label { font-size: 0.75rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
 
         /* ── View Toggle ────────────────────────────── */
         .view-toggle { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
         .view-btn {
             display: flex; align-items: center; gap: 0.5rem;
             padding: 0.5rem 1rem;
-            border: 1px solid var(--border-color, #E5E7EB);
-            background: var(--card-bg, white);
+            border: 1px solid var(--border-color);
+            background: var(--bg-card);
             border-radius: 8px; cursor: pointer; transition: all 0.2s;
             font-size: 0.875rem; font-weight: 500;
-            color: var(--text-primary, #1F2937);
+            color: var(--text-primary);
         }
-        .view-btn:hover { background: var(--hover-bg, #F9FAFB); }
+        .view-btn:hover { background: var(--bg-hover); }
         .view-btn.active { background: #F97316; color: white; border-color: #F97316; }
         .view-btn svg { width: 18px; height: 18px; }
 
         /* ── Calendar ───────────────────────────────── */
         .calendar-card { padding: 1.5rem; }
         .calendar-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
-        .calendar-header h3 { flex: 1; text-align: center; margin: 0; font-size: 1.125rem; font-weight: 600; color: var(--text-primary, #1F2937); }
+        .calendar-header h3 { flex: 1; text-align: center; margin: 0; font-size: 1.125rem; font-weight: 600; color: var(--text-primary); }
         .calendar-nav-btn {
             width: 36px; height: 36px;
             display: flex; align-items: center; justify-content: center;
-            border: 1px solid var(--border-color, #E5E7EB);
-            background: var(--card-bg, white); border-radius: 8px; cursor: pointer; transition: all 0.2s;
-            color: var(--text-primary, #374151);
+            border: 1px solid var(--border-color);
+            background: var(--bg-card); border-radius: 8px; cursor: pointer; transition: all 0.2s;
+            color: var(--text-primary);
         }
-        .calendar-nav-btn:hover { background: var(--hover-bg, #F9FAFB); }
+        .calendar-nav-btn:hover { background: var(--bg-hover); }
         .calendar-grid { display: flex; flex-direction: column; }
         .calendar-weekdays {
             display: grid; grid-template-columns: repeat(7,1fr); gap: 4px;
             font-weight: 600; font-size: 0.75rem; text-transform: uppercase;
-            color: var(--text-secondary, #6B7280);
+            color: var(--text-secondary);
             padding-bottom: 0.5rem; border-bottom: 1px solid var(--border-color, #E5E7EB);
             margin-bottom: 0.5rem; text-align: center;
         }
         .calendar-days { display: grid; grid-template-columns: repeat(7,1fr); gap: 4px; }
         .calendar-day {
             aspect-ratio: 1; padding: 0.5rem;
-            border: 1px solid var(--border-color, #E5E7EB); border-radius: 8px;
+            border: 1px solid var(--border-color); border-radius: 8px;
             min-height: 80px; display: flex; flex-direction: column;
             cursor: default; transition: all 0.2s;
-            background: var(--card-bg, white); color: var(--text-primary, #374151);
+            background: var(--bg-card); color: var(--text-primary, #374151);
         }
-        .calendar-day.other-month { color: var(--text-muted, #D1D5DB); background: var(--bg-subtle, #F9FAFB); }
+        .calendar-day.other-month { color: var(--text-muted); background: var(--bg-subtle); }
         .calendar-day.today { background: rgba(249,115,22,0.1); border-color: #F97316; }
         .calendar-day.today .day-number {
             background: #F97316; color: white; border-radius: 50%;
@@ -99,33 +102,41 @@
         .scheduled-list { display: flex; flex-direction: column; gap: 1rem; }
         .list-date-group { border: 1px solid var(--border-color, #E5E7EB); border-radius: 8px; overflow: hidden; }
         .list-date-header {
-            background: var(--bg-subtle, #F9FAFB); color: var(--text-primary, #374151);
+            background: var(--bg-subtle); color: var(--text-primary);
             padding: 0.75rem 1rem; font-size: 0.875rem; font-weight: 600;
         }
         .scheduled-item {
             display: flex; align-items: center; gap: 1rem; padding: 1rem;
             border-bottom: 1px solid var(--border-color, #E5E7EB);
             transition: background 0.2s; cursor: pointer;
-            background: var(--card-bg, white);
+            background: var(--bg-card);
         }
-        .scheduled-item:hover { background: var(--hover-bg, #F9FAFB); }
+        .scheduled-item:hover { background: var(--bg-hover); }
         .scheduled-item:last-child { border-bottom: none; }
         .scheduled-thumb { width: 60px; height: 60px; border-radius: 8px; overflow: hidden; flex-shrink: 0; }
         .scheduled-thumb img { width: 100%; height: 100%; object-fit: cover; }
         .thumb-placeholder {
-            width: 100%; height: 100%; background: var(--bg-subtle, #F3F4F6);
+            width: 100%; height: 100%; background: var(--bg-input);
             display: flex; align-items: center; justify-content: center;
-            color: var(--text-muted, #9CA3AF); font-size: 1.5rem;
+            color: var(--text-muted); font-size: 1.5rem;
         }
         .scheduled-info { flex: 1; min-width: 0; }
-        .scheduled-title { display: block; font-weight: 500; color: var(--text-primary, #1F2937); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .scheduled-title { display: block; font-weight: 500; color: var(--text-primary); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
         .scheduled-meta { display: flex; align-items: center; gap: 1rem; margin-top: 0.25rem; }
-        .scheduled-time { display: flex; align-items: center; gap: 0.25rem; font-size: 0.875rem; color: var(--text-secondary, #6B7280); }
+        .scheduled-time { display: flex; align-items: center; gap: 0.25rem; font-size: 0.875rem; color: var(--text-secondary); }
         .scheduled-platforms { display: flex; gap: 0.25rem; }
         .platform-badge {
             width: 24px; height: 24px; border-radius: 4px;
             display: inline-flex; align-items: center; justify-content: center;
             color: white; font-size: 0.75rem;
+            position: relative; overflow: hidden; flex-shrink: 0;
+        }
+        .platform-badge.platform-badge-avatar {
+            background-size: cover; background-position: center;
+        }
+        .platform-badge.platform-badge-avatar > i {
+            position: relative; z-index: 1;
+            filter: drop-shadow(0 0 2px rgba(0,0,0,0.85));
         }
         .scheduled-actions { display: flex; gap: 0.5rem; }
 
@@ -133,113 +144,212 @@
         .smart-schedule-times { margin-top: 0.75rem; display: flex; flex-direction: column; gap: 0.25rem; }
         .smart-time-row {
             display: flex; align-items: center; gap: 0.5rem;
-            font-size: 0.8rem; color: var(--text-secondary, #6B7280);
+            font-size: 0.8rem; color: var(--text-secondary);
         }
 
         /* ── Day Popup ──────────────────────────────── */
         .day-popup-overlay {
             position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000;
+            backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
             display: flex; align-items: center; justify-content: center;
             opacity: 0; pointer-events: none; transition: opacity 0.2s;
+            padding: 1rem;
         }
         .day-popup-overlay.active { opacity: 1; pointer-events: all; }
         .day-popup {
-            background: var(--card-bg, white); border-radius: 12px; padding: 1.5rem;
-            width: 90%; max-width: 480px; max-height: 80vh; overflow-y: auto;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            background: var(--bg-card); border-radius: 16px; padding: 1.5rem;
+            width: 100%; max-width: 480px; max-height: 80vh; overflow-y: auto;
+            box-shadow: 0 0 0 1px rgba(249,115,22,0.1), 0 24px 56px rgba(0,0,0,0.4);
+            border-top: 3px solid #F97316;
         }
         .day-popup-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
-        .day-popup-header h4 { margin: 0; font-weight: 600; color: var(--text-primary, #1F2937); }
-        .day-popup-close { background: none; border: none; cursor: pointer; color: var(--text-secondary, #6B7280); font-size: 1.25rem; padding: 0; }
+        .day-popup-header h4 { margin: 0; font-weight: 600; color: var(--text-primary); }
+        .day-popup-close { background: none; border: none; cursor: pointer; color: var(--text-secondary); font-size: 1.25rem; padding: 0; }
         .day-popup-item {
             display: flex; gap: 0.75rem; padding: 0.75rem 0.5rem;
             border-bottom: 1px solid var(--border-color, #E5E7EB); cursor: pointer; border-radius: 6px;
         }
         .day-popup-item:last-child { border-bottom: none; }
-        .day-popup-item:hover { background: var(--hover-bg, #F9FAFB); }
-        .day-popup-thumb { width: 48px; height: 48px; border-radius: 6px; overflow: hidden; flex-shrink: 0; background: var(--bg-subtle, #F3F4F6); display: flex; align-items: center; justify-content: center; color: var(--text-muted, #9CA3AF); }
+        .day-popup-item:hover { background: var(--bg-hover); }
+        .day-popup-thumb { width: 48px; height: 48px; border-radius: 6px; overflow: hidden; flex-shrink: 0; background: var(--bg-input); display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
         .day-popup-thumb img { width: 100%; height: 100%; object-fit: cover; }
         .day-popup-info { flex: 1; min-width: 0; }
-        .day-popup-title { font-weight: 500; font-size: 0.875rem; color: var(--text-primary, #1F2937); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-        .day-popup-meta { font-size: 0.75rem; color: var(--text-secondary, #6B7280); margin-top: 2px; display: flex; gap: 0.5rem; align-items: center; }
+        .day-popup-title { font-weight: 500; font-size: 0.875rem; color: var(--text-primary); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .day-popup-meta { font-size: 0.75rem; color: var(--text-secondary); margin-top: 2px; display: flex; gap: 0.5rem; align-items: center; }
 
         /* ── Empty State ────────────────────────────── */
         .empty-state {
             display: flex; flex-direction: column; align-items: center;
             justify-content: center; padding: 4rem 2rem; text-align: center;
         }
-        .empty-state-icon { color: var(--text-muted, #D1D5DB); margin-bottom: 1rem; }
-        .empty-state h3 { margin: 0 0 0.5rem; color: var(--text-primary, #1F2937); }
-        .empty-state p { color: var(--text-secondary, #6B7280); margin: 0 0 1.5rem; }
+        .empty-state-icon { color: var(--text-muted); margin-bottom: 1rem; }
+        .empty-state h3 { margin: 0 0 0.5rem; color: var(--text-primary); }
+        .empty-state p { color: var(--text-secondary); margin: 0 0 1.5rem; }
 
         /* ── Edit Modal ─────────────────────────────── */
         .modal {
             position: fixed; inset: 0; z-index: 2000;
-            background: rgba(0,0,0,0.5);
+            background: rgba(0,0,0,0.55);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
             display: flex; align-items: center; justify-content: center;
-            opacity: 0; pointer-events: none; transition: opacity 0.2s;
+            opacity: 0; pointer-events: none; transition: opacity 0.22s ease;
+            padding: 1rem;
         }
         .modal.active { opacity: 1; pointer-events: all; }
         .modal-content {
-            background: var(--card-bg, white); border-radius: 12px;
-            width: 90%; max-width: 520px; max-height: 90vh; overflow-y: auto;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            background: var(--bg-card);
+            border-radius: 16px;
+            width: 100%; max-width: 540px; max-height: 90vh; overflow-y: auto;
+            box-shadow:
+                0 0 0 1px rgba(249,115,22,0.12),
+                0 24px 64px rgba(0,0,0,0.45);
+            border-top: 3px solid #F97316;
         }
         .modal-header {
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 1.25rem 1.5rem; border-bottom: 1px solid var(--border-color, #E5E7EB);
+            display: flex; justify-content: space-between; align-items: flex-start;
+            padding: 1.25rem 1.5rem 1rem; border-bottom: 1px solid var(--border-color, #E5E7EB);
+            gap: 1rem;
         }
-        .modal-header h3 { margin: 0; font-weight: 600; color: var(--text-primary, #1F2937); }
-        .modal-close { background: none; border: none; cursor: pointer; color: var(--text-secondary, #6B7280); }
-        .modal-body { padding: 1.5rem; display: flex; flex-direction: column; gap: 1rem; }
+        .modal-header h3 { margin: 0; font-weight: 600; color: var(--text-primary); font-size: 1.05rem; line-height: 1.35; }
+        .modal-close {
+            background: var(--bg-input); border: 1px solid var(--border-color);
+            border-radius: 10px; width: 36px; height: 36px;
+            cursor: pointer; color: var(--text-secondary);
+            display: flex; align-items: center; justify-content: center;
+            flex-shrink: 0; transition: background 0.15s, color 0.15s;
+        }
+        .modal-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .modal-body { padding: 0 1.5rem 1.5rem; display: flex; flex-direction: column; gap: 1rem; }
+        .modal-body.modal-body-pad-top { padding-top: 1.25rem; }
         .modal-footer {
             display: flex; justify-content: space-between; align-items: center;
-            padding: 1rem 1.5rem; border-top: 1px solid var(--border-color, #E5E7EB); gap: 0.75rem;
+            flex-wrap: wrap;
+            padding: 1rem 1.5rem 1.25rem; border-top: 1px solid var(--border-color, #E5E7EB); gap: 0.75rem;
         }
         .modal-footer-right { display: flex; gap: 0.5rem; margin-left: auto; }
 
+        #editModal.modal-loading-body .edit-modal-hydrated { visibility: hidden; position: absolute; width: 0; height: 0; overflow: hidden; pointer-events: none; }
+        #editModal.modal-loading-body .edit-modal-loading { display: flex; }
+        .edit-modal-loading {
+            display: none; flex-direction: column; align-items: stretch; justify-content: center;
+            gap: 1rem; min-height: 220px; padding: 1.5rem 0 0;
+        }
+        .sk-line {
+            height: 12px; border-radius: 6px;
+            background: linear-gradient(90deg, var(--bg-input) 0%, var(--bg-hover) 50%, var(--bg-input) 100%);
+            background-size: 200% 100%;
+            animation: sk-shimmer 1.1s ease-in-out infinite;
+        }
+        .sk-line.w-40 { width: 40%; }
+        .sk-line.w-60 { width: 60%; }
+        .sk-line.w-80 { width: 80%; }
+        .sk-line.h-24 { height: 24px; border-radius: 8px; }
+        .sk-thumb {
+            width: 88px; height: 88px; border-radius: 12px;
+            background: linear-gradient(90deg, var(--bg-input) 0%, var(--bg-hover) 50%, var(--bg-input) 100%);
+            background-size: 200% 100%;
+            animation: sk-shimmer 1.1s ease-in-out infinite;
+            flex-shrink: 0;
+        }
+        @keyframes sk-shimmer {
+            0% { background-position: 100% 0; }
+            100% { background-position: -100% 0; }
+        }
+        .edit-modal-skeleton-row { display: flex; gap: 1rem; align-items: flex-start; }
+
+        .scheduled-modal-meta {
+            display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem;
+            margin-bottom: 0.25rem;
+        }
+        .scheduled-status-pill {
+            display: inline-flex; align-items: center; gap: 0.35rem;
+            font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+            padding: 0.25rem 0.55rem; border-radius: 999px;
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            background: var(--bg-input);
+        }
+        .scheduled-status-pill.status-staged { border-color: rgba(249,115,22,0.35); color: #fb923c; background: rgba(249,115,22,0.08); }
+        .scheduled-status-pill.status-queued { border-color: rgba(59,130,246,0.35); color: #60a5fa; background: rgba(59,130,246,0.08); }
+        .scheduled-status-pill.status-ready { border-color: rgba(16,185,129,0.35); color: #34d399; background: rgba(16,185,129,0.08); }
+        .scheduled-mode-chip {
+            font-size: 0.72rem; color: var(--text-secondary);
+            display: inline-flex; align-items: center; gap: 0.35rem;
+        }
+        .scheduled-readonly-banner {
+            font-size: 0.8125rem; color: var(--text-secondary);
+            background: rgba(239,68,68,0.08);
+            border: 1px solid rgba(239,68,68,0.25);
+            border-radius: 10px; padding: 0.65rem 0.85rem;
+            display: none; align-items: flex-start; gap: 0.5rem;
+        }
+        .scheduled-readonly-banner.visible { display: flex; }
+        .scheduled-readonly-banner i { color: #f87171; margin-top: 0.1rem; }
+        .scheduled-caption-preview {
+            font-size: 0.8125rem; color: var(--text-secondary); line-height: 1.45;
+            max-height: 4.5em; overflow: hidden;
+            display: none;
+        }
+        .scheduled-caption-preview.visible { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+        .scheduled-accounts-line {
+            font-size: 0.78rem; color: var(--text-muted);
+            display: none; align-items: center; gap: 0.35rem; flex-wrap: wrap;
+        }
+        .scheduled-accounts-line.visible { display: flex; }
+        .scheduled-accounts-line i { opacity: 0.75; }
+
         .upload-preview {
-            display: flex; gap: 1rem; padding: 1rem;
-            background: var(--bg-subtle, #F9FAFB); border-radius: 8px;
+            display: flex; gap: 1rem; padding: 1.1rem 1.15rem;
+            background: linear-gradient(145deg, var(--bg-subtle), var(--bg-input));
+            border-radius: 12px;
+            border: 1px solid var(--border-color);
         }
         .preview-thumb {
-            width: 80px; height: 80px; border-radius: 8px; overflow: hidden; flex-shrink: 0;
-            background: var(--bg-subtle, #F3F4F6); display: flex; align-items: center; justify-content: center;
-            color: var(--text-muted, #9CA3AF); font-size: 2rem;
+            width: 88px; height: 88px; border-radius: 12px; overflow: hidden; flex-shrink: 0;
+            background: var(--bg-input); display: flex; align-items: center; justify-content: center;
+            color: var(--text-muted); font-size: 2rem;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
         }
         .preview-thumb img { width: 100%; height: 100%; object-fit: cover; }
-        .preview-info { flex: 1; }
-        .preview-title { font-weight: 600; color: var(--text-primary, #1F2937); margin-bottom: 0.25rem; font-size: 0.9rem; }
-        .preview-platforms { display: flex; gap: 0.25rem; flex-wrap: wrap; margin-top: 0.25rem; }
+        .preview-info { flex: 1; min-width: 0; }
+        .preview-title { font-weight: 600; color: var(--text-primary); margin-bottom: 0.35rem; font-size: 0.95rem; line-height: 1.3; }
+        .preview-platforms { display: flex; gap: 0.25rem; flex-wrap: wrap; margin-top: 0.35rem; }
 
         .form-group { display: flex; flex-direction: column; gap: 0.375rem; }
-        .form-label { font-size: 0.875rem; font-weight: 500; color: var(--text-primary, #374151); }
+        .form-label { font-size: 0.875rem; font-weight: 500; color: var(--text-primary); }
         .form-input {
-            padding: 0.5rem 0.75rem; border: 1px solid var(--border-color, #E5E7EB);
+            padding: 0.5rem 0.75rem; border: 1px solid var(--border-color);
             border-radius: 8px; font-size: 0.875rem; width: 100%;
-            background: var(--input-bg, white); color: var(--text-primary, #1F2937);
+            background: var(--bg-input); color: var(--text-primary);
             box-sizing: border-box;
         }
         .form-input:focus { outline: none; border-color: #F97316; box-shadow: 0 0 0 2px rgba(249,115,22,0.15); }
 
         /* Smart schedule editors in modal */
+        #smartScheduleEditors {
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            background: var(--bg-input);
+        }
         .smart-edit-row {
-            display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0;
+            display: flex; align-items: center; gap: 0.75rem; padding: 0.65rem 0.85rem;
             border-bottom: 1px solid var(--border-color, #F3F4F6);
         }
         .smart-edit-row:last-child { border-bottom: none; }
-        .smart-edit-platform { display: flex; align-items: center; gap: 0.5rem; width: 110px; flex-shrink: 0; font-size: 0.85rem; color: var(--text-primary, #374151); font-weight: 500; }
+        .smart-edit-platform { display: flex; align-items: center; gap: 0.5rem; min-width: 118px; flex-shrink: 0; font-size: 0.85rem; color: var(--text-primary); font-weight: 500; }
         .smart-edit-input {
-            flex: 1; padding: 0.4rem 0.6rem; border: 1px solid var(--border-color, #E5E7EB);
-            border-radius: 6px; font-size: 0.8rem;
-            background: var(--input-bg, white); color: var(--text-primary, #1F2937);
+            flex: 1; min-width: 0; padding: 0.5rem 0.65rem; border: 1px solid var(--border-color);
+            border-radius: 8px; font-size: 0.8125rem;
+            background: var(--bg-card); color: var(--text-primary);
         }
-        .smart-edit-input:focus { outline: none; border-color: #F97316; }
+        .smart-edit-input:focus { outline: none; border-color: #F97316; box-shadow: 0 0 0 2px rgba(249,115,22,0.12); }
 
         /* Loading spinner */
         .page-spinner {
             display: flex; flex-direction: column; align-items: center; justify-content: center;
-            padding: 4rem 2rem; gap: 1rem; color: var(--text-secondary, #6B7280);
+            padding: 4rem 2rem; gap: 1rem; color: var(--text-secondary);
         }
         .page-spinner i { font-size: 2rem; color: #F97316; }
 
@@ -247,6 +357,20 @@
             .calendar-day { min-height: 50px; padding: 0.25rem; }
             .calendar-day .day-number { font-size: 0.75rem; }
             .stats-row { grid-template-columns: 1fr 1fr; }
+            .view-toggle { flex-wrap: wrap; }
+            .view-btn { flex: 1; justify-content: center; }
+            .scheduled-item { flex-wrap: wrap; }
+            .scheduled-info { min-width: 0; width: 100%; }
+            .scheduled-actions { width: 100%; justify-content: flex-end; }
+            .modal-footer { flex-direction: column; gap: 0.5rem; align-items: stretch; }
+            .modal-footer .btn { width: 100%; justify-content: center; }
+        }
+        @media (max-width: 480px) {
+            .calendar-days { gap: 2px; }
+            .calendar-weekdays { gap: 2px; }
+            .calendar-day { padding: 0.2rem; min-height: 44px; }
+            .upload-preview { flex-direction: column; }
+            .preview-thumb { width: 100%; height: 160px; }
         }
     </style>
 </head>
@@ -254,107 +378,33 @@
 <div class="app-layout">
 
     <!-- ── Sidebar ─────────────────────────────────────────── -->
-    <aside class="sidebar" id="sidebar">
-        <div class="sidebar-header">
-            <a href="dashboard.html" class="sidebar-logo">
-                <img src="images/logo.png" alt="UploadM8">
-                <span>UploadM8</span>
-            </a>
-        </div>
-        <nav class="sidebar-nav">
-            <div class="nav-section">
-                <div class="nav-section-title">Main</div>
-                <a href="dashboard.html" class="nav-link">
-                    <i class="fas fa-home"></i><span>Dashboard</span>
-                </a>
-                <a href="upload.html" class="nav-link">
-                    <i class="fas fa-cloud-upload-alt"></i><span>Upload</span>
-                </a>
-                <a href="queue.html" class="nav-link">
-                    <i class="fas fa-list"></i><span>Queue</span>
-                </a>
-                <a href="scheduled.html" class="nav-link active">
-                    <i class="fas fa-calendar-alt"></i><span>Scheduled</span>
-                </a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Platforms</div>
-                <a href="platforms.html" class="nav-link">
-                    <i class="fas fa-plug"></i><span>Connected Accounts</span>
-                </a>
-                <a href="groups.html" class="nav-link">
-                    <i class="fas fa-layer-group"></i><span>Account Groups</span>
-                </a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Insights</div>
-                <a href="analytics.html" class="nav-link">
-                    <i class="fas fa-chart-line"></i><span>Analytics</span>
-                </a>
-            </div>
-            <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                <div class="nav-section-title">Admin</div>
-                <a href="admin.html" class="nav-link">
-                    <i class="fas fa-cog"></i><span>Admin Panel</span>
-                </a>
-                <a href="admin-users.html" class="nav-link">
-                    <i class="fas fa-users"></i><span>User Management</span>
-                </a>
-                <a href="admin-kpi.html" class="nav-link">
-                    <i class="fas fa-chart-bar"></i><span>KPI Dashboard</span>
-                </a>
-                <a href="admin-calculator.html" class="nav-link">
-                    <i class="fas fa-calculator"></i><span>Biz Calculator</span>
-                </a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Account</div>
-                <a href="settings.html" class="nav-link">
-                    <i class="fas fa-sliders-h"></i><span>Settings</span>
-                </a>
-            </div>
-        </nav>
-
-        <div class="sidebar-footer">
-            <div class="user-info">
-                <div class="user-avatar" id="userAvatar">U</div>
-                <div class="user-details">
-                    <div class="user-name" id="userName">Loading...</div>
-                    <div class="user-tier" id="userTier">Free</div>
-                </div>
-                <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
-                    <i class="fas fa-sign-out-alt"></i>
-                </button>
-            </div>
-        </div>
-    </aside>
+    <aside class="sidebar" id="sidebar"></aside>
 
     <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
 
-    <!-- ── Main Content ────────────────────────────────────── -->
+    <header class="top-bar">
+        <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+        <div class="top-bar-actions">
+            <div data-wt-pills></div>
+            <a href="upload.html" class="btn btn-primary btn-sm"><i class="fas fa-plus"></i> Schedule Upload</a>
+            <button class="btn btn-secondary btn-sm" data-um8-fn="refreshData" data-refresh-btn title="Refresh"><i class="fas fa-sync-alt"></i></button>
+            <button type="button" class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle theme" aria-label="Toggle theme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+        </div>
+    </header>
+
     <main class="main-content">
-
-        <!-- Top Bar -->
-        <header class="top-bar">
-            <button class="menu-toggle" id="menuToggle">
-                <i class="fas fa-bars"></i>
-            </button>
-            <div class="top-bar-logo">
-                <img src="images/logo.png" alt="UploadM8"><span>UploadM8</span>
+        <div class="page-header">
+            <div>
+                <h1 class="page-title">Scheduled Uploads</h1>
+                <p class="page-subtitle">Manage your content calendar</p>
             </div>
-            <div class="top-bar-actions">
-                <a href="upload.html" class="btn btn-primary btn-sm">
-                    <i class="fas fa-plus"></i> Schedule Upload
-                </a>
-                <button class="btn btn-secondary btn-sm" onclick="refreshData()" id="refreshBtn" title="Refresh">
-                    <i class="fas fa-sync-alt"></i>
-                </button>
-                <button id="themeToggle" class="btn btn-ghost btn-icon" title="Toggle theme">
-                    <i class="fas fa-moon" id="themeToggleIcon"></i>
-                </button>
+            <div class="top-bar-actions" style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;">
+                <div data-wt-pills class="desktop-pills"></div>
+                <a href="upload.html" class="btn btn-primary btn-sm"><i class="fas fa-plus"></i> Schedule Upload</a>
+                <button class="btn btn-secondary btn-sm" data-um8-fn="refreshData" data-refresh-btn title="Refresh"><i class="fas fa-sync-alt"></i></button>
             </div>
-        </header>
-
+        </div>
         <!-- Loading state — shown while fetching, then swapped out -->
         <div id="loadingState" class="page-spinner">
             <i class="fas fa-spinner fa-spin"></i>
@@ -391,7 +441,7 @@
 
             <!-- View Toggle -->
             <div class="view-toggle">
-                <button class="view-btn active" data-view="calendar" onclick="setView('calendar')">
+                <button class="view-btn active" data-view="calendar" data-um8-fn="setView" data-um8-arg="calendar">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="3" y="4" width="18" height="18" rx="2"/>
                         <line x1="16" y1="2" x2="16" y2="6"/>
@@ -400,7 +450,7 @@
                     </svg>
                     Calendar
                 </button>
-                <button class="view-btn" data-view="list" onclick="setView('list')">
+                <button class="view-btn" data-view="list" data-um8-fn="setView" data-um8-arg="list">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <line x1="8" y1="6" x2="21" y2="6"/>
                         <line x1="8" y1="12" x2="21" y2="12"/>
@@ -416,18 +466,18 @@
             <!-- Calendar View (hidden until setView is called) -->
             <div class="card calendar-card" id="calendarView" style="display:none;">
                 <div class="calendar-header">
-                    <button class="calendar-nav-btn" onclick="changeMonth(-1)">
+                    <button class="calendar-nav-btn" data-um8-fn="changeMonth" data-um8-args="[-1]">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <polyline points="15 18 9 12 15 6"/>
                         </svg>
                     </button>
                     <h3 id="calendarTitle">Loading...</h3>
-                    <button class="calendar-nav-btn" onclick="changeMonth(1)">
+                    <button class="calendar-nav-btn" data-um8-fn="changeMonth" data-um8-args="[1]">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <polyline points="9 18 15 12 9 6"/>
                         </svg>
                     </button>
-                    <button class="btn btn-secondary btn-sm" onclick="goToToday()">Today</button>
+                    <button class="btn btn-secondary btn-sm" data-um8-fn="goToToday">Today</button>
                 </div>
                 <div class="calendar-grid">
                     <div class="calendar-weekdays">
@@ -476,10 +526,10 @@
 
 <!-- ── Day Uploads Popup ─────────────────────────────────── -->
 <div class="day-popup-overlay" id="dayPopup">
-    <div class="day-popup" onclick="event.stopPropagation()">
+    <div class="day-popup" data-um8-stop-propagation="1">
         <div class="day-popup-header">
             <h4 id="dayPopupTitle">Uploads</h4>
-            <button class="day-popup-close" onclick="closeDayPopup()">&times;</button>
+            <button class="day-popup-close" data-um8-fn="closeDayPopup">&times;</button>
         </div>
         <div id="dayPopupList"></div>
     </div>
@@ -487,17 +537,38 @@
 
 <!-- ── Edit Modal ────────────────────────────────────────── -->
 <div class="modal" id="editModal">
-    <div class="modal-content" onclick="event.stopPropagation()">
+    <div class="modal-content" data-um8-stop-propagation="1">
         <div class="modal-header">
             <h3 id="modalTitle">Edit Scheduled Upload</h3>
-            <button class="modal-close" onclick="closeEditModal()">
+            <button type="button" class="modal-close" data-um8-fn="closeEditModal" title="Close">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <line x1="18" y1="6" x2="6" y2="18"/>
                     <line x1="6" y1="6" x2="18" y2="18"/>
                 </svg>
             </button>
         </div>
-        <div class="modal-body">
+
+        <div class="edit-modal-loading" id="editModalLoading" aria-busy="false">
+            <div class="edit-modal-skeleton-row">
+                <div class="sk-thumb" aria-hidden="true"></div>
+                <div style="flex:1;display:flex;flex-direction:column;gap:0.65rem;">
+                    <div class="sk-line w-60 h-24"></div>
+                    <div class="sk-line w-40"></div>
+                    <div class="sk-line w-80"></div>
+                </div>
+            </div>
+            <div class="sk-line w-80"></div>
+            <div class="sk-line w-80"></div>
+            <p style="margin:0;font-size:0.8125rem;color:var(--text-secondary);text-align:center;">Loading schedule details…</p>
+        </div>
+
+        <div class="edit-modal-hydrated" id="editModalHydrated">
+        <div class="modal-body modal-body-pad-top">
+
+            <div class="scheduled-readonly-banner" id="scheduledReadonlyBanner" role="status">
+                <i class="fas fa-lock"></i>
+                <span>This upload is no longer editable from the calendar.</span>
+            </div>
 
             <!-- Upload preview strip -->
             <div class="upload-preview">
@@ -506,15 +577,23 @@
                     <img id="previewImage" src="" alt="" style="display:none; width:100%; height:100%; object-fit:cover;">
                 </div>
                 <div class="preview-info">
+                    <div class="scheduled-modal-meta">
+                        <span id="scheduledStatusPill" class="scheduled-status-pill"></span>
+                        <span class="scheduled-mode-chip" id="scheduledModeChip"></span>
+                    </div>
                     <div class="preview-title" id="previewTitle"></div>
+                    <div class="scheduled-accounts-line" id="scheduledAccountsLine">
+                        <i class="fas fa-user-circle"></i><span id="scheduledAccountsText"></span>
+                    </div>
                     <div class="preview-platforms" id="previewPlatforms"></div>
+                    <p class="scheduled-caption-preview" id="scheduledCaptionPreview"></p>
                 </div>
             </div>
 
             <!-- Title -->
             <div class="form-group">
                 <label class="form-label" for="editTitle">Title</label>
-                <input type="text" id="editTitle" class="form-input" placeholder="Video title">
+                <input type="text" id="editTitle" class="form-input" placeholder="Video title" autocomplete="off">
             </div>
 
             <!-- Regular schedule fields -->
@@ -542,37 +621,48 @@
             <div id="smartScheduleSection" style="display:none;">
                 <div class="form-group">
                     <label class="form-label">Per-Platform Schedule</label>
+                    <p class="form-hint" style="margin:-0.25rem 0 0.5rem;font-size:0.8125rem;color:var(--text-secondary);">Each platform can publish at a different time.</p>
                     <div id="smartScheduleEditors"></div>
                 </div>
             </div>
 
         </div>
         <div class="modal-footer">
-            <button class="btn btn-danger btn-sm" onclick="cancelScheduledUpload()">
+            <button type="button" class="btn btn-danger btn-sm" id="cancelUploadBtn" data-um8-fn="cancelScheduledUpload">
                 <i class="fas fa-trash"></i> Cancel Upload
             </button>
             <div class="modal-footer-right">
-                <button class="btn btn-secondary" onclick="closeEditModal()">Discard</button>
-                <button class="btn btn-primary" onclick="saveScheduledUpload()" id="saveBtn">
+                <button type="button" class="btn btn-secondary" data-um8-fn="closeEditModal">Discard</button>
+                <button type="button" class="btn btn-primary" data-um8-fn="saveScheduledUpload" id="saveBtn">
                     <i class="fas fa-save"></i> Save Changes
                 </button>
             </div>
         </div>
+        </div><!-- /editModalHydrated -->
     </div>
 </div>
 
 <!-- Scripts -->
-<script src="wallet-tokens.js"></script>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script src="shared-sidebar.js"></script>
+<script src="js/helpers-formatting.js"></script>
+<script src="js/upload-utils.js"></script>
 <script src="app.js"></script>
+<script src="wallet-tokens.js"></script>
 <script>
 // ============================================================
-// STATE
+// STATE — initApp, apiCall, showToast come from app.js
 // ============================================================
 let scheduledUploads = [];
 let currentDate      = new Date();
 let currentView      = 'calendar';
 let selectedUploadId = null;
 let selectedUpload   = null;
+let _editModalSeq    = 0;
 let userColors = {
     tiktok: '#000000', youtube: '#FF0000',
     instagram: '#E4405F', facebook: '#1877F2', accent: '#F97316'
@@ -599,50 +689,61 @@ function withTimeout(promise, ms = 12000) {
 // ============================================================
 document.addEventListener('DOMContentLoaded', async () => {
     const _loadingEl = document.getElementById('loadingState');
+    const _pageContent = document.getElementById('pageContent');
 
     function _showLoadError(msg) {
         if (!_loadingEl) return;
         _loadingEl.innerHTML =
-            '<i class="fas fa-exclamation-triangle" style="color:#ef4444;font-size:2rem;"></i>' +
+            '<i class="fas fa-exclamation-triangle" style="color:var(--accent-red);font-size:2rem;"></i>' +
             '<span style="color:var(--text-secondary)">' + msg + '</span>' +
-            '<button onclick="location.reload()" class="btn btn-primary btn-sm" style="margin-top:.5rem;">' +
+            '<button type="button" data-um8-fn="um8LocationReload" class="btn btn-primary btn-sm" style="margin-top:.5rem;">' +
             '<i class="fas fa-redo"></i> Retry</button>';
+        _loadingEl.style.display = 'flex';
+    }
+
+    function _revealContent() {
+        if (_loadingEl) _loadingEl.style.display = 'none';
+        if (_pageContent) _pageContent.style.display = 'block';
     }
 
     // Hard timeout — if initApp hangs for any reason, show error and let user retry
     const _initTimeout = setTimeout(() => {
         console.error('[Scheduled] initApp timed out after 20s');
         _showLoadError('Loading timed out. Check your connection.');
+        _revealContent();
     }, 20000);
 
     try {
+        if (typeof initApp !== 'function') {
+            throw new Error('App not initialized. Ensure app.js loads correctly.');
+        }
         const user = await initApp('scheduled');
         clearTimeout(_initTimeout);
 
         if (!user) {
-            // checkAuth handles redirect to login; if still here show a message
-            _showLoadError('Could not verify your session. <a href="login.html" style="color:#f97316;">Log in</a>');
+            _showLoadError('Could not verify your session. <a href="login.html" style="color:var(--accent-orange);">Log in</a>');
+            _revealContent();
             return;
         }
 
-        // Reveal shell immediately — data loads independently below
-        _loadingEl.style.display = 'none';
-        document.getElementById('pageContent').style.display = 'block';
-
+        _revealContent();
         setupModalHandlers();
 
-        // Fire independently — a slow/failing endpoint never blocks the others
         loadColorPreferences().catch(e => console.warn('[Scheduled] colors unavailable:', e));
-        loadScheduledStats().catch(e => console.error('[Scheduled] stats failed:', e));
-        loadScheduledUploads().catch(e => {
-            console.error('[Scheduled] uploads failed:', e);
-            _showScheduledEmpty();
-        });
+        void loadScheduledPlatformAvatars().catch(() => {});
+        void Promise.all([
+            loadScheduledStats().catch(e => console.error('[Scheduled] stats failed:', e)),
+            loadScheduledUploads().catch(e => {
+                console.error('[Scheduled] uploads failed:', e);
+                _showScheduledEmpty();
+            }),
+        ]);
 
     } catch (err) {
         clearTimeout(_initTimeout);
         console.error('[Scheduled] init failed:', err);
-        _showLoadError('Page failed to load. ' + (err.message || '') + ' <a href="javascript:location.reload()" style="color:#f97316;">Retry</a>');
+        _showLoadError('Page failed to load. ' + (err.message || '') + ' <a href="javascript:location.reload()" style="color:var(--accent-orange);">Retry</a>');
+        _revealContent();
     }
 });
 
@@ -667,15 +768,22 @@ function setupModalHandlers() {
 // REFRESH BUTTON
 // ============================================================
 async function refreshData() {
-    const btn = document.getElementById('refreshBtn');
-    const icon = btn ? btn.querySelector('i') : null;
-    if (btn) btn.disabled = true;
-    if (icon) icon.classList.add('fa-spin');
+    const buttons = Array.from(document.querySelectorAll('[data-refresh-btn]'));
+    buttons.forEach((btn) => {
+        btn.disabled = true;
+        const icon = btn.querySelector('i');
+        if (icon) icon.classList.add('fa-spin');
+    });
     try {
+        await loadScheduledPlatformAvatars().catch(() => {});
         await Promise.all([loadScheduledStats(), loadScheduledUploads()]);
+        if (scheduledUploads.length > 0) setView(currentView);
     } finally {
-        if (btn) btn.disabled = false;
-        if (icon) icon.classList.remove('fa-spin');
+        buttons.forEach((btn) => {
+            btn.disabled = false;
+            const icon = btn.querySelector('i');
+            if (icon) icon.classList.remove('fa-spin');
+        });
     }
 }
 
@@ -685,6 +793,24 @@ async function refreshData() {
 //      Never call .json() on the result — that throws TypeError
 //      which kills the entire DOMContentLoaded block silently.
 // ============================================================
+async function loadScheduledPlatformAvatars() {
+    window._scheduledPlatformAvatars = {};
+    const pd = await apiCall('/api/platforms');
+    const src = pd?.platforms || pd || {};
+    if (typeof src !== 'object' || !src) return;
+    Object.entries(src).forEach(([p, accounts]) => {
+        const arr = Array.isArray(accounts) ? accounts : [];
+        const primary = arr.find(a => a.is_primary) || arr[0];
+        if (primary) {
+            window._scheduledPlatformAvatars[p] = {
+                avatar: primary.avatar || primary.account_avatar_url || null,
+                name: primary.name || primary.account_name || p,
+                username: primary.username || primary.account_username || ''
+            };
+        }
+    });
+}
+
 async function loadColorPreferences() {
     try {
         const colors = await apiCall('/api/colors');   // parsed object, not Response
@@ -749,7 +875,11 @@ function _hideScheduledEmpty() {
 // ============================================================
 // VIEW TOGGLE
 // ============================================================
-function setView(view) {
+function setView(first, second) {
+    const view =
+        second !== undefined && second !== null && second !== ''
+            ? String(second)
+            : String(first);
     currentView = view;
     document.querySelectorAll('.view-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.view === view);
@@ -773,7 +903,12 @@ function setView(view) {
 // ============================================================
 // CALENDAR
 // ============================================================
-function changeMonth(delta) {
+function changeMonth(first, second) {
+    const delta =
+        second !== undefined && second !== null && second !== ''
+            ? Number(second)
+            : Number(first);
+    if (!Number.isFinite(delta)) return;
     currentDate.setMonth(currentDate.getMonth() + delta);
     renderCalendar();
 }
@@ -1003,7 +1138,7 @@ function createListItem(upload) {
     }
 
     return `
-        <div class="scheduled-item" onclick="openEditModal('${upload.id}')">
+        <div class="scheduled-item" data-um8-fn="openEditModal" data-um8-arg="${upload.id}" role="button" tabindex="0">
             <div class="scheduled-thumb">
                 ${upload.thumbnail
                     ? `<img src="${upload.thumbnail}" alt="">`
@@ -1018,7 +1153,7 @@ function createListItem(upload) {
                 ${smartHtml}
             </div>
             <div class="scheduled-actions">
-                <button class="btn btn-icon btn-secondary" onclick="event.stopPropagation(); openEditModal('${upload.id}')" title="Edit">
+                <button type="button" class="btn btn-icon btn-secondary" data-um8-stop-before-fn="1" data-um8-fn="openEditModal" data-um8-arg="${upload.id}" title="Edit">
                     <i class="fas fa-edit"></i>
                 </button>
             </div>
@@ -1042,70 +1177,40 @@ function formatDateHeader(date) {
 // ============================================================
 // EDIT MODAL
 // ============================================================
-async function openEditModal(uploadId) {
-    let upload = scheduledUploads.find(u => u.id === uploadId);
-    if (!upload) return;
+async function openEditModal(first, second) {
+    const uploadId =
+        second !== undefined && second !== null && second !== ''
+            ? String(second)
+            : String(first);
+    const base = scheduledUploads.find(u => u.id === uploadId);
+    if (!base) return;
 
-    // Fetch fresh detail (gets smart_schedule, hashtags, full data)
+    const mySeq = ++_editModalSeq;
+    selectedUploadId = uploadId;
+    document.getElementById('modalTitle').textContent = 'Loading…';
+    document.getElementById('editModal').classList.add('active', 'modal-loading-body');
+    const loadEl = document.getElementById('editModalLoading');
+    if (loadEl) loadEl.setAttribute('aria-busy', 'true');
+
+    let upload;
     try {
         const fresh = await apiCall(`/api/scheduled/${uploadId}`);
-        upload = { ...upload, ...fresh };
+        if (mySeq !== _editModalSeq) return;
+        upload = { ...base, ...fresh };
+        if (base.target_account_details && base.target_account_details.length)
+            upload.target_account_details = base.target_account_details;
     } catch (err) {
         console.warn('Could not refresh upload detail, using cached copy:', err);
+        if (mySeq !== _editModalSeq) return;
+        upload = { ...base };
     }
 
-    selectedUploadId = uploadId;
-    selectedUpload   = upload;
+    if (mySeq !== _editModalSeq) return;
+    selectedUpload = upload;
+    document.getElementById('editModal').classList.remove('modal-loading-body');
+    if (loadEl) loadEl.setAttribute('aria-busy', 'false');
 
-    const isSmartMode = upload.schedule_mode === 'smart';
-
-    document.getElementById('modalTitle').textContent = isSmartMode
-        ? 'Edit Smart Schedule'
-        : 'Edit Scheduled Upload';
-
-    // Title
-    document.getElementById('editTitle').value    = upload.title || '';
-    document.getElementById('editTimezone').value = upload.timezone || 'America/Chicago';
-
-    // Thumbnail preview
-    const previewThumb = document.getElementById('previewThumb');
-    const previewImage = document.getElementById('previewImage');
-    const previewIcon  = document.getElementById('previewIcon');
-    if (upload.thumbnail) {
-        previewImage.src = upload.thumbnail;
-        previewImage.style.display = 'block';
-        if (previewIcon) previewIcon.style.display = 'none';
-        previewImage.onerror = () => {
-            previewImage.style.display = 'none';
-            if (previewIcon) previewIcon.style.display = '';
-        };
-    } else {
-        previewImage.style.display = 'none';
-        if (previewIcon) previewIcon.style.display = '';
-    }
-
-    document.getElementById('previewTitle').textContent = upload.title || 'Untitled';
-    document.getElementById('previewPlatforms').innerHTML =
-        (upload.platforms || []).map(p => _scheduledPlatformBadge(p)).join('');
-
-    // Show correct fields
-    document.getElementById('regularScheduleSection').style.display = isSmartMode ? 'none' : 'block';
-    document.getElementById('smartScheduleSection').style.display   = isSmartMode ? 'block' : 'none';
-
-    if (isSmartMode) {
-        buildSmartEditors(upload);
-    } else {
-        if (upload.scheduled_time) {
-            const d   = new Date(upload.scheduled_time);
-            const pad = n => String(n).padStart(2, '0');
-            document.getElementById('editDateTime').value =
-                `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-        } else {
-            document.getElementById('editDateTime').value = '';
-        }
-    }
-
-    document.getElementById('editModal').classList.add('active');
+    applyEditModalContent(upload);
 }
 
 function buildSmartEditors(upload) {
@@ -1141,9 +1246,146 @@ function buildSmartEditors(upload) {
 }
 
 function closeEditModal() {
-    document.getElementById('editModal').classList.remove('active');
+    _editModalSeq++;
+    const m = document.getElementById('editModal');
+    m.classList.remove('active', 'modal-loading-body');
+    document.getElementById('editModalLoading')?.setAttribute('aria-busy', 'false');
     selectedUploadId = null;
     selectedUpload   = null;
+}
+
+function _applyScheduleStatusPill(el, status) {
+    if (!el) return;
+    const s = (status || '').toLowerCase();
+    const labels = {
+        pending: 'Pending',
+        staged: 'Staged',
+        queued: 'Queued',
+        scheduled: 'Scheduled',
+        ready_to_publish: 'Ready to publish'
+    };
+    let extra = '';
+    if (s === 'staged' || s === 'pending') extra = ' status-staged';
+    else if (s === 'queued') extra = ' status-queued';
+    else if (s === 'ready_to_publish') extra = ' status-ready';
+    const icon = s === 'queued' ? 'fa-stream' : (s === 'ready_to_publish' ? 'fa-check-circle' : 'fa-hourglass-half');
+    const label = labels[s] || (status ? String(status) : '—');
+    el.className = 'scheduled-status-pill' + extra;
+    el.innerHTML = `<i class="fas ${icon}"></i> ${label}`;
+}
+
+function _ensureTimezoneSelectValue(tz) {
+    const sel = document.getElementById('editTimezone');
+    if (!sel || !tz) return;
+    const has = Array.from(sel.options).some(o => o.value === tz);
+    if (!has) {
+        const o = document.createElement('option');
+        o.value = tz;
+        o.textContent = tz.replace(/_/g, ' ');
+        sel.appendChild(o);
+    }
+    sel.value = tz;
+}
+
+function _setEditModalEditable(upload) {
+    const ok = upload.is_editable !== false;
+    const ro = document.getElementById('scheduledReadonlyBanner');
+    if (ro) ro.classList.toggle('visible', !ok);
+
+    ['editTitle', 'editDateTime', 'editTimezone'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !ok;
+    });
+    document.querySelectorAll('#smartScheduleEditors .smart-edit-input').forEach(el => { el.disabled = !ok; });
+
+    const saveBtn = document.getElementById('saveBtn');
+    const delBtn  = document.getElementById('cancelUploadBtn');
+    if (saveBtn) saveBtn.disabled = !ok;
+    if (delBtn)  delBtn.disabled  = !ok;
+}
+
+function applyEditModalContent(upload) {
+    const isSmartMode = upload.schedule_mode === 'smart';
+
+    document.getElementById('modalTitle').textContent = isSmartMode
+        ? 'Edit Smart Schedule'
+        : 'Edit Scheduled Upload';
+
+    _applyScheduleStatusPill(document.getElementById('scheduledStatusPill'), upload.status);
+
+    const modeEl = document.getElementById('scheduledModeChip');
+    if (modeEl) {
+        modeEl.innerHTML = isSmartMode
+            ? '<i class="fas fa-magic" style="color:#F97316;"></i> Smart schedule'
+            : '<i class="fas fa-calendar-alt" style="color:var(--text-secondary);"></i> One time for all platforms';
+    }
+
+    const accLine = document.getElementById('scheduledAccountsLine');
+    const accText = document.getElementById('scheduledAccountsText');
+    const details = upload.target_account_details;
+    if (accLine && accText && Array.isArray(details) && details.length > 0) {
+        const bits = details.map(d => {
+            const u = d.username || d.name || '';
+            return u ? `@${String(u).replace(/^@/, '')}` : (d.name || d.platform || '');
+        }).filter(Boolean);
+        accText.textContent = bits.join(' · ');
+        accLine.classList.add('visible');
+    } else if (accLine) {
+        accLine.classList.remove('visible');
+    }
+
+    const capEl = document.getElementById('scheduledCaptionPreview');
+    const cap = (upload.caption && String(upload.caption).trim()) ? String(upload.caption).trim() : '';
+    if (capEl) {
+        if (cap) {
+            capEl.textContent = cap.length > 280 ? cap.slice(0, 277) + '…' : cap;
+            capEl.classList.add('visible');
+        } else {
+            capEl.textContent = '';
+            capEl.classList.remove('visible');
+        }
+    }
+
+    document.getElementById('editTitle').value = upload.title || '';
+    _ensureTimezoneSelectValue(upload.timezone || 'America/Chicago');
+
+    const previewThumb = document.getElementById('previewThumb');
+    const previewImage = document.getElementById('previewImage');
+    const previewIcon  = document.getElementById('previewIcon');
+    if (upload.thumbnail) {
+        previewImage.src = upload.thumbnail;
+        previewImage.style.display = 'block';
+        if (previewIcon) previewIcon.style.display = 'none';
+        previewImage.onerror = () => {
+            previewImage.style.display = 'none';
+            if (previewIcon) previewIcon.style.display = '';
+        };
+    } else {
+        previewImage.style.display = 'none';
+        if (previewIcon) previewIcon.style.display = '';
+    }
+
+    document.getElementById('previewTitle').textContent = upload.title || 'Untitled';
+    document.getElementById('previewPlatforms').innerHTML =
+        (upload.platforms || []).map(p => _scheduledPlatformBadge(p)).join('');
+
+    document.getElementById('regularScheduleSection').style.display = isSmartMode ? 'none' : 'block';
+    document.getElementById('smartScheduleSection').style.display   = isSmartMode ? 'block' : 'none';
+
+    if (isSmartMode) {
+        buildSmartEditors(upload);
+    } else {
+        if (upload.scheduled_time) {
+            const d   = new Date(upload.scheduled_time);
+            const pad = n => String(n).padStart(2, '0');
+            document.getElementById('editDateTime').value =
+                `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        } else {
+            document.getElementById('editDateTime').value = '';
+        }
+    }
+
+    _setEditModalEditable(upload);
 }
 
 // ============================================================
@@ -1155,6 +1397,10 @@ function closeEditModal() {
 // ============================================================
 async function saveScheduledUpload() {
     if (!selectedUploadId || !selectedUpload) return;
+    if (selectedUpload.is_editable === false) {
+        showToast('This upload can no longer be edited.', 'warning');
+        return;
+    }
 
     const saveBtn = document.getElementById('saveBtn');
     saveBtn.disabled = true;
@@ -1224,6 +1470,10 @@ async function saveScheduledUpload() {
 // ============================================================
 async function cancelScheduledUpload() {
     if (!selectedUploadId) return;
+    if (selectedUpload && selectedUpload.is_editable === false) {
+        showToast('This upload can no longer be cancelled from here.', 'warning');
+        return;
+    }
     if (!confirm('Cancel this scheduled upload? Tokens will be refunded.')) return;
 
     try {
@@ -1260,8 +1510,17 @@ function _scheduledPlatformBadge(platform) {
         facebook:  'fab fa-facebook'
     };
     const icon = icons[p] || 'fas fa-globe';
+    const av = (window._scheduledPlatformAvatars || {})[p];
+    const url = av && av.avatar ? String(av.avatar).replace(/'/g, '%27') : '';
+    if (url) {
+        return `<span class="platform-badge platform-badge-avatar" style="background-color:${color};background-image:url('${url}')" title="${p}"><i class="${icon}"></i></span>`;
+    }
     return `<span class="platform-badge" style="background:${color}" title="${p}"><i class="${icon}"></i></span>`;
 }
+
+window.closeDayPopup = closeDayPopup;
+window.closeEditModal = closeEditModal;
+window.openEditModal = openEditModal;
 </script>
 </body>
 </html>

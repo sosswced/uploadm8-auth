@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+    <script src="js/html-safe.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confirming Email – UploadM8</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: #0f0f0f;
+            color: #ffffff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ── Header ── */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1.25rem 2rem;
+            border-bottom: 1px solid rgba(255,255,255,0.07);
+            background: rgba(15,15,15,0.95);
+            backdrop-filter: blur(10px);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-decoration: none;
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #ffffff;
+            letter-spacing: -0.3px;
+        }
+        .logo img { height: 28px; width: auto; }
+        .logo span { color: #f97316; }
+
+        /* ── Main ── */
+        .main {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 3rem 1.5rem;
+        }
+        .card {
+            background: #1a1a1a;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 2.75rem 2.5rem;
+            width: 100%;
+            max-width: 440px;
+            text-align: center;
+        }
+
+        /* ── States ── */
+        .state { display: none; }
+        .state.active { display: block; }
+
+        /* ── Icon ring ── */
+        .icon-ring {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 1.75rem;
+            font-size: 2rem;
+        }
+        .icon-ring.loading {
+            background: rgba(59,130,246,0.1);
+            border: 1px solid rgba(59,130,246,0.25);
+            color: #3b82f6;
+        }
+        .icon-ring.success {
+            background: rgba(34,197,94,0.1);
+            border: 1px solid rgba(34,197,94,0.25);
+            color: #22c55e;
+        }
+        .icon-ring.error {
+            background: rgba(239,68,68,0.1);
+            border: 1px solid rgba(239,68,68,0.25);
+            color: #ef4444;
+        }
+
+        /* ── Spinner ── */
+        .spinner {
+            width: 36px;
+            height: 36px;
+            border: 3px solid rgba(59,130,246,0.15);
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* ── Text ── */
+        .card h1 {
+            margin: 0 0 0.75rem;
+            font-size: 1.75rem;
+            font-weight: 700;
+            letter-spacing: -0.4px;
+        }
+        .card p {
+            margin: 0 0 1.5rem;
+            color: #9ca3af;
+            font-size: 0.95rem;
+            line-height: 1.65;
+        }
+        .card p.muted { color: #6b7280; font-size: 0.875rem; }
+
+        /* ── Redirect bar ── */
+        .redirect-bar {
+            background: rgba(34,197,94,0.08);
+            border: 1px solid rgba(34,197,94,0.2);
+            border-radius: 8px;
+            padding: 0.875rem 1rem;
+            font-size: 0.875rem;
+            color: #86efac;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            justify-content: center;
+        }
+        .redirect-countdown { font-weight: 700; }
+
+        /* ── Button ── */
+        .btn-primary {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.875rem 2rem;
+            background: #f97316;
+            border: none;
+            border-radius: 10px;
+            color: white;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+            width: 100%;
+        }
+        .btn-primary:hover { background: #ea6c10; transform: translateY(-1px); }
+
+        .btn-secondary {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.875rem 2rem;
+            background: transparent;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 10px;
+            color: #9ca3af;
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+            width: 100%;
+            margin-top: 0.75rem;
+        }
+        .btn-secondary:hover { color: #ffffff; border-color: rgba(255,255,255,0.25); }
+
+        /* ── Footer ── */
+        .footer {
+            padding: 1.5rem 2rem;
+            border-top: 1px solid rgba(255,255,255,0.06);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 1.5rem;
+            font-size: 0.8rem;
+            color: #4b5563;
+        }
+        .footer a { color: #6b7280; text-decoration: none; }
+        .footer a:hover { color: #9ca3af; }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 520px) {
+            body { padding: 0; }
+            .card { padding: 2rem 1.25rem; border-radius: 14px; margin: 1rem; }
+        }
+    </style>
+</head>
+<body>
+
+    <header class="header">
+        <a href="index.html" class="logo">
+            <img src="images/logo.svg" alt="UploadM8" onerror="this.style.display='none'">
+            Upload<span>M8</span>
+        </a>
+    </header>
+
+    <main class="main">
+        <div class="card">
+
+            <!-- ── LOADING STATE ── -->
+            <div id="stateLoading" class="state active">
+                <div class="icon-ring loading">
+                    <div class="spinner"></div>
+                </div>
+                <h1>Confirming your email…</h1>
+                <p>Hang tight, we're verifying your link.</p>
+            </div>
+
+            <!-- ── SUCCESS STATE ── -->
+            <div id="stateSuccess" class="state">
+                <div class="icon-ring success">
+                    <i class="fas fa-check"></i>
+                </div>
+                <h1>Email confirmed!</h1>
+                <p>Your account is now active. Welcome to UploadM8 — let's get your first video uploaded.</p>
+
+                <div class="redirect-bar">
+                    <i class="fas fa-circle-notch fa-spin"></i>
+                    Redirecting to dashboard in <span class="redirect-countdown" id="redirectCount">3</span>s…
+                </div>
+
+                <a href="dashboard.html" class="btn-primary">
+                    <i class="fas fa-rocket"></i> Go to Dashboard
+                </a>
+            </div>
+
+            <!-- ── ERROR STATE ── -->
+            <div id="stateError" class="state">
+                <div class="icon-ring error">
+                    <i class="fas fa-xmark"></i>
+                </div>
+                <h1 id="errorTitle">Link expired</h1>
+                <p id="errorBody">This confirmation link has expired or already been used. Request a new one below.</p>
+
+                <a href="signup.html" class="btn-primary" id="resendBtn">
+                    <i class="fas fa-user-plus"></i> Sign up again
+                </a>
+                <a href="login.html" class="btn-secondary">
+                    <i class="fas fa-arrow-right"></i> Back to login
+                </a>
+            </div>
+
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span>© 2025 UploadM8</span>
+        <a href="dashboard.html">Dashboard</a>
+        <a href="settings.html#billing-panel">Token balance</a>
+        <a href="contact.html">Contact</a>
+        <a href="terms.html">Terms</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="support.html">Support</a>
+        <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
+    </footer>
+
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script>
+        // ── Helpers ──
+        function showState(id) {
+            ['stateLoading', 'stateSuccess', 'stateError'].forEach(s => {
+                document.getElementById(s).classList.toggle('active', s === id);
+            });
+        }
+
+        function startRedirectCountdown() {
+            let count = 3;
+            const el = document.getElementById('redirectCount');
+            const tick = () => {
+                if (count <= 0) { window.location.href = 'dashboard.html'; return; }
+                el.textContent = count;
+                count--;
+                setTimeout(tick, 1000);
+            };
+            tick();
+        }
+
+        function showError(title, body) {
+            document.getElementById('errorTitle').textContent = title;
+            document.getElementById('errorBody').textContent = body;
+            showState('stateError');
+        }
+
+        // ── Main: read token and confirm ──
+        (async function confirmEmail() {
+            const params = new URLSearchParams(window.location.search);
+            const token  = params.get('token');
+
+            if (!token) {
+                showError('Missing confirmation token', 'No token was found in the link. Please check your email or request a new confirmation.');
+                return;
+            }
+
+            try {
+                const resp = await window.apiFetch(
+                    '/api/auth/confirm-email?token=' + encodeURIComponent(token),
+                    { method: 'GET', authRedirectOn401: false }
+                );
+
+                const data = await resp.json().catch(() => ({}));
+
+                if (!resp.ok) {
+                    const msg =
+                        (typeof window.uploadM8ApiErrorMessage === 'function' && window.uploadM8ApiErrorMessage(data)) || '';
+                    if (msg.toLowerCase().includes('expired')) {
+                        showError('Link expired', 'This confirmation link has expired. Confirmation links are valid for 24 hours. Click below to resend.');
+                    } else if (msg.toLowerCase().includes('already')) {
+                        // Already confirmed — just redirect with tokens if returned
+                        if (data.access_token && typeof window.applyUploadM8AuthSession === 'function') {
+                            window.applyUploadM8AuthSession(data.access_token, data.refresh_token, true);
+                        } else if (data.access_token && typeof window.setTokens === 'function') {
+                            window.setTokens(data.access_token, data.refresh_token, true);
+                        }
+                        showState('stateSuccess');
+                        startRedirectCountdown();
+                    } else {
+                        showError('Invalid link', msg || 'This confirmation link is invalid. Please request a new one.');
+                    }
+                    return;
+                }
+
+                // ── Success: store tokens and redirect ──
+                if (data.access_token && typeof window.applyUploadM8AuthSession === 'function') {
+                    window.applyUploadM8AuthSession(data.access_token, data.refresh_token, true);
+                } else if (data.access_token && typeof window.setTokens === 'function') {
+                    window.setTokens(data.access_token, data.refresh_token, true);
+                }
+                try {
+                    sessionStorage.setItem('uploadm8_post_verify_onboarding', '1');
+                } catch (_) {}
+
+                showState('stateSuccess');
+                startRedirectCountdown();
+
+            } catch (err) {
+                console.error('Email confirmation error:', err);
+                showError('Connection error', 'Could not reach the server. Please check your internet connection and try again.');
+            }
+        })();
+    </script>
+
+</body>
+</html>

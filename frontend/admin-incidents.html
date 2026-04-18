@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="js/html-safe.js"></script>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ops incidents - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="styles.css" rel="stylesheet">
+    <style>
+        #incTable th, #incTable td { padding: 0.45rem 0.5rem; border-bottom: 1px solid var(--border-color); text-align: left; vertical-align: top; }
+        #incTable th { color: var(--text-muted); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; }
+    </style>
+</head>
+<body>
+<div class="app-layout">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+    <header class="top-bar">
+        <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+    </header>
+    <main class="main-content">
+        <div class="page-header">
+            <div>
+                <h1 class="page-title"><i class="fas fa-ambulance" style="color:#ef4444;margin-right:.4rem;"></i> Operational incidents</h1>
+                <p class="page-subtitle">Upload failures, worker errors, bug reports, and client JS errors (admin).</p>
+            </div>
+            <a href="admin.html" class="btn btn-secondary btn-sm">Admin home</a>
+        </div>
+        <div id="incErr" class="card" style="display:none;color:#fca5a5;margin-bottom:1rem;"></div>
+        <div class="card" style="overflow-x:auto;">
+            <table id="incTable" style="width:100%;font-size:.82rem;border-collapse:collapse;">
+                <thead><tr><th>When</th><th>Type</th><th>Source</th><th>Subject</th><th>User</th><th>Upload</th></tr></thead>
+                <tbody id="incBody"><tr><td colspan="6">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </main>
+</div>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script src="shared-sidebar.js"></script>
+<script src="app.js"></script>
+<script>
+(function () {
+  function esc(s) {
+    if (s == null) return '';
+    var d = document.createElement('div');
+    d.textContent = String(s);
+    return d.innerHTML;
+  }
+  async function load() {
+    var errEl = document.getElementById('incErr');
+    var body = document.getElementById('incBody');
+    errEl.style.display = 'none';
+    try {
+      if (typeof window.apiCall !== 'function') throw new Error('apiCall missing');
+      var data = await window.apiCall('/api/admin/operational-incidents?limit=120');
+      var rows = (data && data.incidents) ? data.incidents : [];
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="6">No incidents yet.</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.map(function (r) {
+        return '<tr><td>' + esc(r.created_at || '') + '</td><td>' + esc(r.incident_type) + '</td><td>' + esc(r.source)
+          + '</td><td>' + esc((r.subject || '').slice(0, 80)) + '</td><td>' + esc(r.user_id || '—')
+          + '</td><td>' + esc(r.upload_id || '—') + '</td></tr>';
+      }).join('');
+    } catch (e) {
+      errEl.textContent = (e && e.message) ? e.message : 'Failed to load';
+      errEl.style.display = 'block';
+      body.innerHTML = '<tr><td colspan="6">—</td></tr>';
+    }
+  }
+  document.addEventListener('DOMContentLoaded', function () {
+    if (typeof window.initApp === 'function') window.initApp();
+    setTimeout(load, 400);
+  });
+})();
+</script>
+</body>
+</html>

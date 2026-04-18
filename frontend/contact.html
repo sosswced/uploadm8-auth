@@ -1,157 +1,270 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 http://127.0.0.1:3000 http://localhost:3000;">
   <title>Contact - UploadM8</title>
-  <link rel="icon" type="image/x-icon" href="/favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="/images/logo.png">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="images/logo.svg">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
     :root {
-        --blue-50:#eff6ff; --blue-100:#dbeafe; --blue-500:#3b82f6; --blue-600:#2563eb;
-        --orange-500:#f97316;
-        --gray-50:#f9fafb; --gray-100:#f3f4f6; --gray-200:#e5e7eb; --gray-300:#d1d5db;
-        --gray-400:#9ca3af; --gray-500:#6b7280; --gray-600:#4b5563; --gray-700:#374151;
-        --gray-800:#1f2937; --gray-900:#111827;
-        --green-500:#22c55e; --red-500:#ef4444; --yellow-500:#eab308;
+      --bg-primary: #0a0a0f; --bg-secondary: #12121a; --bg-card: #1a1a24; --bg-hover: #22222e;
+      --bg-input: rgba(255,255,255,0.05); --text-primary: #ffffff; --text-secondary: #9ca3af;
+      --text-muted: #6b7280; --border-color: rgba(255,255,255,0.08); --border-hover: rgba(255,255,255,0.15);
+      --accent-orange: #f97316; --accent-orange-hover: #ea580c; --accent-blue: #3b82f6;
+      --accent-green: #22c55e; --accent-red: #ef4444; --accent-purple: #8b5cf6;
+      --radius-sm: 6px; --radius-md: 10px; --radius-lg: 16px;
     }
-    *{margin:0;padding:0;box-sizing:border-box;}
-    body{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--gray-50);color:var(--gray-800);line-height:1.65;}
-    nav{position:sticky;top:0;background:rgba(255,255,255,0.95);backdrop-filter:blur(20px);border-bottom:1px solid var(--gray-200);z-index:10;padding:0 24px;}
-    .nav-container{max-width:1100px;margin:0 auto;height:72px;display:flex;align-items:center;justify-content:space-between;}
-    .logo{display:flex;align-items:center;gap:10px;text-decoration:none;}
-    .logo img{height:34px;}
-    .nav-links{display:flex;align-items:center;gap:18px;}
-    .nav-links a{color:var(--gray-600);text-decoration:none;font-weight:600;font-size:0.95rem;}
-    .nav-links a:hover{color:var(--gray-900);}
-    .nav-buttons{display:flex;gap:12px;align-items:center;}
-    .btn{padding:10px 18px;border-radius:10px;font-weight:700;font-size:0.95rem;text-decoration:none;display:inline-flex;align-items:center;gap:8px;border:1px solid transparent;cursor:pointer;}
-    .btn-ghost{background:transparent;border-color:var(--gray-300);color:var(--gray-700);}
-    .btn-ghost:hover{background:var(--gray-100);}
-    .btn-primary{background:linear-gradient(135deg,var(--blue-500),var(--blue-600));color:#fff;box-shadow:0 6px 18px rgba(59,130,246,0.35);}
-    .btn-primary:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(59,130,246,0.45);}
-    .wrap{max-width:1100px;margin:0 auto;padding:56px 24px;}
-    .card{background:#fff;border:1px solid var(--gray-200);border-radius:18px;padding:28px;}
-    h1{font-size:2.2rem;line-height:1.15;color:var(--gray-900);margin-bottom:10px;}
-    .meta{color:var(--gray-500);font-weight:600;margin-bottom:22px;}
-    h2{font-size:1.25rem;color:var(--gray-900);margin-top:26px;margin-bottom:10px;}
-    p{color:var(--gray-700);margin:10px 0;}
-    ul{padding-left:20px;margin:10px 0;color:var(--gray-700);}
-    li{margin:6px 0;}
-    .callout{border-left:4px solid var(--blue-500);background:var(--blue-50);padding:14px 16px;border-radius:12px;margin:16px 0;color:var(--gray-700);}
-    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:14px;}
-    .pill{display:inline-flex;gap:8px;align-items:center;padding:6px 12px;border-radius:999px;background:var(--gray-100);border:1px solid var(--gray-200);font-weight:700;color:var(--gray-700);font-size:0.85rem;}
-    footer{border-top:1px solid var(--gray-200);background:#fff;}
-    .foot{max-width:1100px;margin:0 auto;padding:26px 24px;color:var(--gray-500);display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;}
-    .foot a{color:var(--gray-600);text-decoration:none;font-weight:700;}
-    .foot a:hover{color:var(--gray-900);}
-    @media (max-width:900px){.grid{grid-template-columns:1fr;}.nav-links{display:none;}}
-</style>
+    html { scroll-behavior: smooth; }
+    body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg-primary); color: var(--text-primary); line-height: 1.7; min-height: 100vh; }
+    a { color: var(--accent-orange); text-decoration: none; transition: color 0.2s; }
+    a:hover { color: var(--accent-orange-hover); }
+    .nav { position: sticky; top: 0; z-index: 100; padding: 1rem 2rem; background: rgba(10,10,15,0.97); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); }
+    .nav-container { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
+    .nav-logo { display: flex; align-items: center; gap: 0.75rem; font-size: 1.25rem; font-weight: 700; color: white; text-decoration: none; }
+    .back-btn { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; font-weight: 500; padding: 0.5rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-md); transition: all 0.2s; }
+    .back-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--bg-hover); }
+    .hero { padding: 4rem 2rem 3rem; background: linear-gradient(180deg, rgba(59,130,246,0.06) 0%, transparent 100%); border-bottom: 1px solid var(--border-color); }
+    .hero-inner { max-width: 900px; margin: 0 auto; }
+    .hero-badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.875rem; background: rgba(59,130,246,0.1); border: 1px solid rgba(59,130,246,0.25); border-radius: 50px; font-size: 0.8rem; font-weight: 600; color: var(--accent-blue); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 1.25rem; }
+    .hero h1 { font-size: 2.75rem; font-weight: 800; margin-bottom: 0.75rem; }
+    .hero p { color: var(--text-secondary); font-size: 1.1rem; max-width: 600px; }
+    .hero p strong { color: var(--text-primary); font-weight: 600; }
+    .legal-nav { background: var(--bg-secondary); border-bottom: 1px solid var(--border-color); padding: 0 2rem; overflow-x: auto; }
+    .legal-nav-inner { max-width: 1280px; margin: 0 auto; display: flex; }
+    .legal-nav a { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
+    .legal-nav a:hover { color: var(--text-primary); }
+    .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
+    .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem 4rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
+    @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
+    .article { min-width: 0; }
+    .form-column { max-width: 640px; margin: 0 auto; }
+    .sidebar-toc { position: sticky; top: 5.5rem; z-index: 1; }
+    .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
+    .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
+    .toc-list { list-style: none; }
+    .toc-list li { margin-bottom: 0.125rem; }
+    .toc-list a { display: block; padding: 0.4rem 0.75rem; color: var(--text-secondary); font-size: 0.85rem; border-radius: var(--radius-sm); border-left: 2px solid transparent; transition: all 0.2s; text-decoration: none; }
+    .toc-list a:hover, .toc-list a.active { color: var(--accent-orange); border-left-color: var(--accent-orange); background: rgba(249,115,22,0.07); }
+    .lead { color: var(--text-secondary); margin-bottom: 1.5rem; font-size: 1rem; }
+    .lead a { font-weight: 600; }
+    .card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.75rem 2rem; }
+    .form-group { margin-bottom: 1.25rem; }
+    .form-label { display: block; font-size: 0.9rem; font-weight: 500; margin-bottom: 0.5rem; color: var(--text-secondary); }
+    .form-input, .form-textarea { width: 100%; padding: 0.875rem 1rem; background: var(--bg-input); border: 1px solid var(--border-color); border-radius: var(--radius-md); color: var(--text-primary); font-size: 1rem; font-family: inherit; transition: border-color 0.2s; }
+    .form-input:focus, .form-textarea:focus { outline: none; border-color: var(--accent-orange); }
+    .form-textarea { min-height: 140px; resize: vertical; }
+    .btn { padding: 0.75rem 1.5rem; border-radius: var(--radius-md); font-weight: 600; text-decoration: none; transition: all 0.2s; cursor: pointer; border: none; font-size: 0.95rem; display: inline-flex; align-items: center; gap: 0.5rem; justify-content: center; }
+    .btn-primary { background: var(--accent-orange); color: white; width: 100%; }
+    .btn-primary:hover { background: var(--accent-orange-hover); }
+    .btn-primary:disabled { opacity: 0.7; cursor: not-allowed; }
+    .callout { padding: 1rem 1.25rem; border-radius: var(--radius-md); margin-bottom: 1.25rem; font-size: 0.9rem; display: none; }
+    .callout.show { display: block; }
+    .callout.ok { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.3); color: #86efac; }
+    .callout.err { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #fca5a5; }
+    .hint { color: var(--text-muted); font-size: 0.85rem; margin-top: 1rem; }
+    .callout-inline { display: flex; gap: 0.875rem; padding: 1rem 1.25rem; border-radius: var(--radius-md); margin-bottom: 1.5rem; font-size: 0.9rem; background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); color: #93c5fd; }
+    .callout-inline i { flex-shrink: 0; margin-top: 0.1rem; color: var(--accent-blue); }
+    .footer { background: var(--bg-secondary); border-top: 1px solid var(--border-color); padding: 2rem; margin-top: 4rem; }
+    .footer-inner { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; }
+    .footer-copy { color: var(--text-muted); font-size: 0.85rem; }
+    .footer-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+    .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
+    .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
+    ::-webkit-scrollbar { width: 6px; height: 6px; } ::-webkit-scrollbar-track { background: var(--bg-secondary); } ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+    @media (max-width: 480px) {
+        .hero { padding: 2.5rem 1.25rem 2rem; }
+        .hero h1 { font-size: 2rem; }
+        .nav { padding: 0.75rem 1rem; }
+        .content-wrapper { padding: 2rem 1.25rem 3rem; }
+        .contact-grid { grid-template-columns: 1fr !important; }
+    }
+  </style>
 </head>
 <body>
-  <nav>
-    <div class="nav-container">
-      <a class="logo" href="/index.html"><img src="/images/logo.png" alt="UploadM8"></a>
-      
-        <div class="nav-links">
-            <a href="/index.html">Home</a>
-            <a href="/contact.html">Contact</a>
-        </div>
-    
-      <div class="nav-buttons">
-        <a class="btn btn-ghost" href="/login.html">Log in</a>
-        <a class="btn btn-primary" href="/signup.html">Get started free</a>
+
+<nav class="nav">
+  <div class="nav-container">
+    <a href="index.html" class="nav-logo">
+      <img src="images/logo.svg" alt="UploadM8" style="height:32px;width:auto;">
+      UploadM8
+    </a>
+    <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
+  </div>
+</nav>
+
+<div class="hero">
+  <div class="hero-inner">
+    <div class="hero-badge"><i class="fas fa-paper-plane"></i> Contact</div>
+    <h1>Contact us</h1>
+    <p>Billing, platform connections, or product questions — send a message and we’ll reply by email. Use <strong>On This Page</strong> to jump to a section, or open the <a href="how-it-works.html">How it works</a> guide and <a href="support.html">Support Center</a>.</p>
+  </div>
+</div>
+
+<nav class="legal-nav" aria-label="Legal and policies">
+  <div class="legal-nav-inner">
+    <a href="privacy.html"><i class="fas fa-shield-alt"></i> Privacy</a>
+    <a href="terms.html"><i class="fas fa-file-contract"></i> Terms</a>
+    <a href="security.html"><i class="fas fa-lock"></i> Security</a>
+    <a href="cookies.html"><i class="fas fa-cookie-bite"></i> Cookies</a>
+    <a href="subprocessors.html"><i class="fas fa-server"></i> Subprocessors</a>
+    <a href="refunds.html"><i class="fas fa-undo"></i> Refunds</a>
+    <a href="dmca.html"><i class="fas fa-gavel"></i> DMCA</a>
+    <a href="support.html" class="active"><i class="fas fa-headset"></i> Support</a>
+  </div>
+</nav>
+
+<div class="content-wrapper">
+
+  <article class="article">
+  <div class="form-column">
+  <div class="section-block" id="routing">
+  <div class="callout-inline">
+    <i class="fas fa-info-circle"></i>
+    <div>For department inboxes (billing, privacy, security, etc.), see <a href="support.html#departments">Support → Contact by department</a>. Urgent security issues: <a href="mailto:security@uploadm8.com">security@uploadm8.com</a>.</div>
+  </div>
+
+  <p class="lead">Join the <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord community</a> for tips, token balance chat, and product updates.</p>
+  </div>
+
+  <div class="section-block" id="contact-message-section">
+  <div id="alertBox" class="callout" role="status"></div>
+
+  <div class="card">
+    <form id="contactForm">
+      <div class="form-group">
+        <label class="form-label" for="name">Name</label>
+        <input class="form-input" id="name" name="name" required minlength="2" autocomplete="name">
       </div>
+      <div class="form-group">
+        <label class="form-label" for="email">Email</label>
+        <input class="form-input" id="email" name="email" type="email" required autocomplete="email">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="subject">Subject</label>
+        <input class="form-input" id="subject" name="subject" required>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="message">Message</label>
+        <textarea class="form-textarea" id="message" name="message" required></textarea>
+      </div>
+      <button type="submit" class="btn btn-primary" id="sendBtn">Send message</button>
+      <p class="hint">If the request can’t reach our API (e.g. offline), we’ll open your email client as a fallback.</p>
+    </form>
+  </div>
+  </div>
+  </div>
+  </article>
+
+  <aside class="sidebar-toc" aria-label="On this page">
+    <div class="toc-card">
+      <div class="toc-title">On This Page</div>
+      <ul class="toc-list">
+        <li><a href="#routing">Routing &amp; community</a></li>
+        <li><a href="#contact-message-section">Send a message</a></li>
+      </ul>
     </div>
-  </nav>
+  </aside>
 
-  <div class="wrap">
-    <div class="card">
-      <h1>Contact UploadM8</h1>
-      <div class="meta">Last updated: January 26, 2026</div>
-      
-<p>For support, billing, and platform connection issues, use the form below. Submissions are routed to <a href="mailto:sosswced@gmail.com">sosswced@gmail.com</a>.</p>
+</div>
 
-<h2>Contact form</h2>
-<div id="alert" class="callout" style="display:none;"></div>
-<form id="contactForm" style="margin-top:14px;display:grid;gap:12px;">
-  <div>
-    <label style="font-weight:800;color:var(--gray-900);display:block;margin-bottom:6px;">Name</label>
-    <input id="name" required minlength="2" style="width:100%;padding:12px 14px;border:1px solid var(--gray-300);border-radius:12px;font-family:inherit;font-size:1rem;">
+<footer class="footer">
+  <div class="footer-inner">
+    <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
+    <div class="footer-links">
+      <a href="how-it-works.html">How it works</a>
+      <a href="contact.html" class="active">Contact</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="terms.html">Terms</a>
+      <a href="security.html">Security</a>
+      <a href="cookies.html">Cookies</a>
+      <a href="subprocessors.html">Subprocessors</a>
+      <a href="refunds.html">Refunds</a>
+      <a href="dmca.html">DMCA</a>
+      <a href="support.html">Support</a>
+      <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
+    </div>
   </div>
-  <div>
-    <label style="font-weight:800;color:var(--gray-900);display:block;margin-bottom:6px;">Email</label>
-    <input id="email" type="email" required style="width:100%;padding:12px 14px;border:1px solid var(--gray-300);border-radius:12px;font-family:inherit;font-size:1rem;">
-  </div>
-  <div>
-    <label style="font-weight:800;color:var(--gray-900);display:block;margin-bottom:6px;">Subject</label>
-    <input id="subject" required style="width:100%;padding:12px 14px;border:1px solid var(--gray-300);border-radius:12px;font-family:inherit;font-size:1rem;">
-  </div>
-  <div>
-    <label style="font-weight:800;color:var(--gray-900);display:block;margin-bottom:6px;">Message</label>
-    <textarea id="message" required rows="6" style="width:100%;padding:12px 14px;border:1px solid var(--gray-300);border-radius:12px;font-family:inherit;font-size:1rem;"></textarea>
-  </div>
-  <button class="btn btn-primary" type="submit" id="sendBtn" style="justify-content:center;">Submit</button>
-  <div style="color:var(--gray-500);font-weight:600;font-size:0.9rem;">If the form cannot reach the API, it will open your email client as a fallback.</div>
-</form>
+</footer>
 
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
 <script>
-  const API_URL = 'https://auth.uploadm8.com';
-  const TO = 'sosswced@gmail.com';
-  const form = document.getElementById('contactForm');
-  const alertBox = document.getElementById('alert');
-  const btn = document.getElementById('sendBtn');
-
-  function show(msg, ok=true){
-    alertBox.style.display='block';
-    alertBox.style.borderLeftColor = ok ? 'var(--green-500)' : 'var(--red-500)';
-    alertBox.innerHTML = msg;
+  (function () {
+    var sections = document.querySelectorAll('.section-block[id]');
+    var tocLinks = document.querySelectorAll('.toc-list a');
+    if (sections.length && tocLinks.length) {
+      var observer = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (entry.isIntersecting) {
+            tocLinks.forEach(function (link) {
+              link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id);
+            });
+          }
+        });
+      }, { rootMargin: '-20% 0% -60% 0%' });
+      sections.forEach(function (s) { observer.observe(s); });
+    }
+  })();
+</script>
+<script>
+  var TO = 'support@uploadm8.com';
+  function showAlert(msg, ok) {
+    var el = document.getElementById('alertBox');
+    el.textContent = msg;
+    el.className = 'callout show ' + (ok ? 'ok' : 'err');
   }
-
-  form.addEventListener('submit', async (e)=>{
+  document.getElementById('contactForm').addEventListener('submit', async function (e) {
     e.preventDefault();
-    btn.disabled=true; btn.textContent='Sending...';
-    const payload = {
-      name: document.getElementById('name').value,
-      email: document.getElementById('email').value,
-      subject: document.getElementById('subject').value,
-      message: document.getElementById('message').value
+    var btn = document.getElementById('sendBtn');
+    var payload = {
+      name: document.getElementById('name').value.trim(),
+      email: document.getElementById('email').value.trim(),
+      subject: document.getElementById('subject').value.trim(),
+      message: document.getElementById('message').value.trim()
     };
+    btn.disabled = true;
+    btn.textContent = 'Sending…';
     try {
-      const r = await fetch(API_URL + '/api/support/contact', {
-        method:'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(payload)
+      if (typeof window.apiFetch !== 'function') throw new Error('apiFetch missing');
+      var r = await window.apiFetch('/api/support/contact', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        authRedirectOn401: false,
       });
-      if (!r.ok) throw new Error('API returned ' + r.status);
-      show('<strong>Submitted.</strong> We received your message and will respond by email.');
-      form.reset();
+      if (!r.ok) {
+        var errBody = await r.json().catch(function () { return null; });
+        var apiMsg =
+          (typeof window.uploadM8ApiErrorMessage === 'function' && window.uploadM8ApiErrorMessage(errBody)) || '';
+        throw new Error(apiMsg || ('HTTP ' + r.status));
+      }
+      showAlert('Thanks — we received your message and will reply by email.', true);
+      e.target.reset();
     } catch (err) {
-      const mailto = `mailto:${TO}?subject=${encodeURIComponent('[UploadM8] ' + payload.subject)}&body=${encodeURIComponent('From: ' + payload.name + ' <' + payload.email + '>\n\n' + payload.message)}`;
-      show('<strong>Fallback:</strong> opening your email client to send the message directly.', false);
-      window.location.href = mailto;
+      var mailto = 'mailto:' + TO + '?subject=' + encodeURIComponent('[UploadM8] ' + payload.subject) + '&body=' + encodeURIComponent('From: ' + payload.name + ' <' + payload.email + '>\n\n' + payload.message);
+      var isNetwork =
+        err instanceof TypeError ||
+        (err && err.name === 'AbortError') ||
+        (err && String(err.message || '').toLowerCase().indexOf('failed to fetch') >= 0);
+      if (!isNetwork && err && err.message) {
+        showAlert(err.message, false);
+      } else {
+        showAlert('Could not reach the server. Opening your email app…', false);
+        window.location.href = mailto;
+      }
     } finally {
-      btn.disabled=false; btn.textContent='Submit';
+      btn.disabled = false;
+      btn.textContent = 'Send message';
     }
   });
 </script>
-
-    </div>
-  </div>
-
-  <footer>
-    <div class="foot">
-      <div>© 2026 UploadM8</div>
-      <div style="display:flex;gap:14px;flex-wrap:wrap;">
-        <a href="/about.html">About</a>
-        <a href="/blog.html">Blog</a>
-        <a href="/contact.html">Contact</a>
-        <a href="/privacy.html">Privacy</a>
-        <a href="/terms.html">Terms</a>
-        <a href="/data-deletion.html">Data deletion</a>
-      </div>
-    </div>
-  </footer>
 </body>
 </html>

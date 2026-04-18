@@ -1,12 +1,14 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+
+    <script src="js/html-safe.js"></script>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://static.cloudflareinsights.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 https://cloudflareinsights.com;">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Upload Queue - UploadM8</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="styles.css" rel="stylesheet">
@@ -36,6 +38,14 @@
         .stat-label { font-size:.875rem; color:var(--text-secondary); font-weight:500; }
         .stat-value { font-size:1.75rem; font-weight:700; color:var(--text-primary); }
 
+        .queue-live-engagement {
+            display:none; align-items:center; gap:0.5rem; flex-wrap:wrap;
+            margin: -0.25rem 0 1.25rem 0; padding: 0.65rem 1rem;
+            background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.22);
+            border-radius: 10px; font-size: 0.8rem; color: var(--text-secondary);
+        }
+        .queue-live-engagement strong { color: var(--text-primary); font-weight: 700; }
+
         /* ── Filter Bar ── */
         .filter-bar { display:flex; flex-direction:column; gap:1rem; margin-bottom:1.5rem; }
         .filter-tabs {
@@ -57,8 +67,10 @@
         .search-input-wrapper .search-icon { position:absolute; left:.75rem; top:50%; transform:translateY(-50%); color:var(--text-secondary); font-size:.875rem; }
         .search-input { width:100%; padding:.75rem .75rem .75rem 2.25rem; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08); border-radius:10px; color:var(--text-primary); font-size:.875rem; box-sizing:border-box; }
         .search-input:focus { outline:none; border-color:rgba(249,115,22,.3); box-shadow:0 0 0 3px rgba(249,115,22,.1); }
-        .filter-select { padding:.75rem 2rem .75rem .75rem; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08); border-radius:10px; color:var(--text-primary); font-size:.875rem; font-weight:500; cursor:pointer; appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 9L1 4h10z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right .75rem center; }
+        .filter-select { padding:.75rem 2rem .75rem .75rem; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.08); border-radius:10px; color:var(--text-primary); font-size:.875rem; font-weight:500; cursor:pointer; appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 9L1 4h10z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right .75rem center; color-scheme: dark; }
         .filter-select:focus { outline:none; border-color:rgba(249,115,22,.3); }
+        /* Native option list often renders light background — force readable text */
+        .filter-select option { background-color: #1a1a24; color: #e8e8ef; }
 
         /* ── Page header ── */
         .page-header-left { display:flex; align-items:center; gap:16px; flex:1; min-width:0; }
@@ -152,7 +164,7 @@
 
         /* Platform chips */
         .platform-chips { display:flex; flex-wrap:wrap; gap:5px; }
-        .platform-chip { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; border-radius:20px; font-size:.68rem; font-weight:500; text-decoration:none; border:1px solid transparent; transition:opacity .15s,transform .12s,box-shadow .12s; cursor:pointer; white-space:nowrap; }
+        .platform-chip { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; border-radius:20px; font-size:.68rem; font-weight:500; text-decoration:none; border:1px solid transparent; transition:opacity .15s,transform .12s,box-shadow .12s; cursor:pointer; white-space:normal; }
         .platform-chip:hover { opacity:.9; transform:translateY(-1px); box-shadow:0 2px 8px rgba(0,0,0,.25); text-decoration:none; }
         .chip-youtube   { background:rgba(255,0,0,.12);    color:#ff4444; border-color:rgba(255,0,0,.3); }
         .chip-tiktok    { background:rgba(105,201,208,.12); color:#69C9D0; border-color:rgba(105,201,208,.3); }
@@ -163,6 +175,28 @@
         .chip-no-link { opacity:.65; border-style:dashed !important; cursor:default; }
         .chip-failed-entry { opacity:.45; }
         .chip-avatar { width:16px; height:16px; border-radius:50%; object-fit:cover; flex-shrink:0; border:1px solid rgba(255,255,255,.2); vertical-align:middle; }
+        .chip-avatar-slot { display:inline-flex; width:16px; height:16px; flex-shrink:0; align-items:center; justify-content:center; position:relative; }
+        .chip-avatar-slot .chip-avatar { position:absolute; inset:0; width:16px; height:16px; }
+        .chip-avatar-fallback {
+            display:inline-flex; align-items:center; justify-content:center;
+            width:16px; height:16px; border-radius:50%; flex-shrink:0;
+            font-size:7px; font-weight:800; color:#fff;
+            background:linear-gradient(135deg,rgba(249,115,22,.75),rgba(139,92,246,.75));
+            border:1px solid rgba(255,255,255,.25);
+        }
+        .chip-mid { display:flex; flex-direction:column; align-items:flex-start; gap:2px; min-width:0; white-space:normal; }
+        .chip-line { font-size:.68rem; font-weight:500; line-height:1.2; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .chip-tier-pill {
+            font-size:.55rem; font-weight:600; text-transform:uppercase; letter-spacing:.03em;
+            padding:1px 6px; border-radius:999px; background:rgba(0,0,0,.22); border:1px solid rgba(255,255,255,.12); opacity:.9;
+        }
+        .vis-pill { font-size:0.58rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em; padding:1px 6px; border-radius:4px; margin-left:6px; flex-shrink:0; line-height:1.2; }
+        .vis-public { background:rgba(34,197,94,.18); color:#86efac; border:1px solid rgba(34,197,94,.35); }
+        .vis-private { background:rgba(107,114,128,.25); color:#d1d5db; border:1px solid rgba(107,114,128,.4); }
+        .vis-unlisted { background:rgba(234,179,8,.15); color:#fcd34d; border:1px solid rgba(234,179,8,.35); }
+        .vis-removed { background:rgba(239,68,68,.15); color:#fca5a5; border:1px solid rgba(239,68,68,.35); }
+        a.platform-chip { color: inherit; }
+        a.platform-chip .chip-line { color: inherit; }
 
         /* Action buttons col */
         .row-actions { display:flex; align-items:flex-start; gap:6px; flex-shrink:0; padding-top:18px; flex-wrap:wrap; }
@@ -198,6 +232,24 @@
         .platform-results-row { display:flex; gap:4px; flex-wrap:wrap; margin-top:4px; }
         .platform-result-avatar { width:20px; height:20px; border-radius:50%; object-fit:cover; flex-shrink:0; }
         .platform-result-avatar-lg { width:32px; height:32px; }
+
+        /* ── Mobile overrides ── */
+        @media (max-width:640px) {
+            .queue-stats { grid-template-columns: repeat(2, 1fr); gap: 0.75rem; }
+            .filter-tabs .filter-tab { padding:.45rem .6rem; font-size:.8rem; }
+            .uploads-header { flex-wrap: wrap; gap: 0.5rem; padding: 10px 12px; }
+            .uploads-count { font-size: 13px; flex-wrap: wrap; }
+            .upload-row { flex-wrap: nowrap; gap: 8px; padding: 10px 12px; }
+            .row-actions { padding-top: 0; align-items: center; }
+            .bulk-actions { flex-direction: column; }
+            .bulk-info { font-size: 13px; }
+            .pagination { flex-direction: column; gap: 0.75rem; text-align: center; }
+            .pagination-controls { justify-content: center; }
+        }
+        @media (max-width:480px) {
+            .queue-stats { grid-template-columns: 1fr; }
+            .upload-thumb { width: 72px; height: 44px; flex-shrink: 0; }
+        }
 
         /* Platform badges (modal) */
         .platform-badge { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
@@ -250,72 +302,23 @@
 <body>
 <div class="app-layout">
 
-    <aside class="sidebar" id="sidebar">
-        <div class="sidebar-header">
-            <a href="dashboard.html" class="sidebar-logo">
-                <img src="images/logo.png" alt="UploadM8">
-                <span>UploadM8</span>
-            </a>
-        </div>
-        <nav class="sidebar-nav">
-            <div class="nav-section">
-                <div class="nav-section-title">Main</div>
-                <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
-                <a href="upload.html"    class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-                <a href="queue.html"     class="nav-link active"><i class="fas fa-list"></i><span>Queue</span></a>
-                <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Platforms</div>
-                <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-                <a href="groups.html"    class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Insights</div>
-                <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-            </div>
-            <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                <div class="nav-section-title">Admin</div>
-                <a href="admin.html"              class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
-                <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
-                <a href="admin-kpi.html"          class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
-                <a href="admin-calculator.html"   class="nav-link"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
-                <a href="admin-wallet.html"       class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-            </div>
-            <div class="nav-section">
-                <div class="nav-section-title">Account</div>
-                <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-                <a href="guide.html"    class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-            </div>
-        </nav>
-        <div class="sidebar-footer">
-            <div class="user-info">
-                <div class="user-avatar" id="userAvatar">U</div>
-                <div class="user-details">
-                    <div class="user-name" id="userName">User</div>
-                    <div class="user-tier" id="userTier">Free</div>
-                </div>
-                <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out">
-                    <i class="fas fa-sign-out-alt"></i>
-                </button>
-            </div>
-        </div>
-    </aside>
+    <aside class="sidebar" id="sidebar"></aside>
 
-    <div class="sidebar-overlay hidden" id="sidebarOverlay" aria-hidden="true"></div>
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
 
     <header class="top-bar">
-        <button class="btn btn-icon menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
-        <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
+        <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
         <div class="top-bar-actions">
-            <button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+            <div data-wt-pills></div>
+            <button class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle Theme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
         </div>
     </header>
 
     <main class="main-content">
         <div class="page-header">
             <div class="page-header-left">
-                <button class="btn btn-icon" onclick="history.back()" title="Go Back"><i class="fas fa-arrow-left"></i></button>
+                <button class="btn btn-icon" data-um8-fn="um8HistoryBack" title="Go Back"><i class="fas fa-arrow-left"></i></button>
                 <div>
                     <h1 style="display:flex;align-items:center;gap:.6rem;">Upload Queue
                         <span id="liveRefreshDot" title="Refreshing…" style="width:8px;height:8px;border-radius:50%;background:var(--accent-green,#22c55e);display:inline-block;opacity:0;transition:opacity .3s;flex-shrink:0;margin-top:.15rem;"></span>
@@ -323,8 +326,9 @@
                     <p class="page-subtitle">Manage and track your uploads</p>
                 </div>
             </div>
-            <div class="page-header-right">
-                <button class="btn btn-icon" onclick="toggleHideFigures()" title="Toggle Visibility"><i class="fas fa-eye" id="toggleFiguresIcon"></i></button>
+            <div class="page-header-right" style="display:flex;align-items:center;gap:12px;">
+                <div data-wt-pills class="desktop-pills"></div>
+                <button class="btn btn-icon" data-um8-fn="toggleHideFigures" title="Toggle Visibility"><i class="fas fa-eye" id="toggleFiguresIcon"></i></button>
                 <span class="quota-badge" id="quotaBadge"><i class="fas fa-upload"></i><span id="quotaText">0/50</span></span>
             </div>
         </div>
@@ -348,6 +352,32 @@
             </div>
         </div>
 
+        <!-- Engagement strip: same source as Analytics & Dashboard -->
+        <div id="queueLiveEngagement" class="queue-live-engagement" aria-live="polite">
+            <i class="fas fa-bolt" style="color:var(--accent-orange,#f97316);"></i>
+            <span>Engagement (last 30 days, same as Analytics):</span>
+            <strong id="queueLiveViews">0</strong> <span>views</span>
+            <span style="opacity:.5;">·</span>
+            <strong id="queueLiveLikes">0</strong> <span>likes</span>
+            <span style="opacity:.5;">·</span>
+            <strong id="queueLiveComments">0</strong> <span>comments</span>
+            <span style="opacity:.5;">·</span>
+            <strong id="queueLiveShares">0</strong> <span>shares</span>
+            <span id="queueLivePlats" style="opacity:.75;font-size:0.72rem;"></span>
+        </div>
+
+        <!-- Unified catalog aggregate — shared CatalogAgg widget -->
+        <div id="queueAggWidget" data-catalog-agg="true" data-catalog-agg-period="30d" style="margin-bottom:1.25rem;"></div>
+
+        <div class="card mb-4" style="border-color:rgba(139,92,246,.35);background:rgba(139,92,246,.05);">
+            <div class="card-header" style="padding-bottom:6px;">
+                <h3 class="card-title" style="font-size:1rem;"><i class="fas fa-wand-magic-sparkles" style="color:#a78bfa;"></i> Personalized tips</h3>
+            </div>
+            <div class="card-body" style="padding-top:6px;">
+                <div data-ai-coach="1" class="text-secondary" style="font-size:.85rem;line-height:1.45;">Loading personalized tips…</div>
+            </div>
+        </div>
+
         <div class="filter-bar">
             <div class="filter-tabs">
                 <button class="filter-tab active" data-filter="all">All</button>
@@ -366,8 +396,10 @@
                     <option value="all">All Platforms</option>
                     <option value="tiktok">TikTok</option>
                     <option value="youtube">YouTube</option>
-                    <option value="instagram">Instagram</option>
-                    <option value="facebook">Facebook</option>
+                    <option value="instagram">Instagram Reels</option>
+                    <option value="facebook">Facebook Reels</option>
+                    <option value="instagram_reels">Instagram Reels (alias)</option>
+                    <option value="facebook_reels">Facebook Reels (alias)</option>
                 </select>
                 <select id="dateFilter" class="filter-select">
                     <option value="all">All Time</option>
@@ -375,16 +407,16 @@
                     <option value="week">This Week</option>
                     <option value="month">This Month</option>
                 </select>
-                <button class="btn btn-secondary" onclick="refreshQueue()"><i class="fas fa-sync-alt"></i> Refresh</button>
+                <button class="btn btn-secondary" data-um8-fn="refreshQueue"><i class="fas fa-sync-alt"></i> Refresh</button>
             </div>
         </div>
 
         <div class="bulk-actions" id="bulkActions">
             <span class="bulk-info"><span id="selectedCount">0</span> selected</span>
             <div class="bulk-buttons">
-                <button class="btn btn-secondary" onclick="retrySelected()"><i class="fas fa-redo"></i> Retry Failed</button>
-                <button class="btn btn-danger"    onclick="deleteSelected()"><i class="fas fa-trash"></i> Delete Selected</button>
-                <button class="btn btn-secondary" onclick="clearSelection()"><i class="fas fa-times"></i> Clear</button>
+                <button class="btn btn-secondary" data-um8-fn="retrySelected"><i class="fas fa-redo"></i> Retry Failed</button>
+                <button class="btn btn-danger" data-um8-fn="deleteSelected"><i class="fas fa-trash"></i> Delete Selected</button>
+                <button class="btn btn-secondary" data-um8-fn="clearSelection"><i class="fas fa-times"></i> Clear</button>
             </div>
         </div>
 
@@ -410,14 +442,14 @@
             <div class="error-icon"><i class="fas fa-exclamation-circle"></i></div>
             <h3>Failed to load uploads</h3>
             <p id="errorMessage">An error occurred while loading your uploads.</p>
-            <button class="btn btn-primary" onclick="loadQueue()"><i class="fas fa-redo"></i> Try Again</button>
+            <button class="btn btn-primary" data-um8-fn="loadQueue"><i class="fas fa-redo"></i> Try Again</button>
         </div>
 
         <div class="pagination" id="pagination" style="display:none;">
             <div class="pagination-info">Page <span id="currentPage">1</span> of <span id="totalPages">1</span></div>
             <div class="pagination-controls">
-                <button class="btn-secondary" id="prevPage" onclick="changePage(-1)" disabled><i class="fas fa-chevron-left"></i> Previous</button>
-                <button class="btn-secondary" id="nextPage" onclick="changePage(1)">Next <i class="fas fa-chevron-right"></i></button>
+                <button class="btn-secondary" id="prevPage" data-um8-fn="changePage" data-um8-args="[-1]" disabled><i class="fas fa-chevron-left"></i> Previous</button>
+                <button class="btn-secondary" id="nextPage" data-um8-fn="changePage" data-um8-args="[1]">Next <i class="fas fa-chevron-right"></i></button>
             </div>
         </div>
     </main>
@@ -425,28 +457,28 @@
 
 <!-- ── Upload Detail Modal ── -->
 <div class="modal" id="uploadDetailModal" style="display:none;">
-    <div class="modal-overlay" onclick="closeModal('uploadDetailModal')"></div>
+    <div class="modal-overlay" data-um8-fn="closeModal" data-um8-arg="uploadDetailModal"></div>
     <div class="modal-content" style="max-width:600px;">
         <div class="modal-header">
             <h2>Upload Details</h2>
-            <button class="modal-close" onclick="closeModal('uploadDetailModal')"><i class="fas fa-times"></i></button>
+            <button class="modal-close" data-um8-fn="closeModal" data-um8-arg="uploadDetailModal"><i class="fas fa-times"></i></button>
         </div>
         <div class="modal-body" id="uploadDetailBody"></div>
         <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeModal('uploadDetailModal')">Close</button>
-            <button class="btn btn-secondary" id="editUploadBtn" style="display:none;" onclick="openQueueEditModal()"><i class="fas fa-edit"></i> Edit</button>
-            <button class="btn btn-primary"   id="retryUploadBtn" style="display:none;" onclick="retryUpload()"><i class="fas fa-redo"></i> Retry Upload</button>
+            <button class="btn btn-secondary" data-um8-fn="closeModal" data-um8-arg="uploadDetailModal">Close</button>
+            <button class="btn btn-secondary" id="editUploadBtn" style="display:none;" data-um8-fn="openQueueEditModal"><i class="fas fa-edit"></i> Edit</button>
+            <button class="btn btn-primary"   id="retryUploadBtn" style="display:none;" data-um8-fn="um8RetryUploadCurrent"><i class="fas fa-redo"></i> Retry Upload</button>
         </div>
     </div>
 </div>
 
 <!-- ── Edit Upload Modal ── -->
 <div class="modal" id="queueEditModal" style="display:none;">
-    <div class="modal-overlay" onclick="closeQueueEditModal()"></div>
+    <div class="modal-overlay" data-um8-fn="closeQueueEditModal"></div>
     <div class="modal-content" style="max-width:560px;">
         <div class="modal-header">
             <h2>Edit Upload</h2>
-            <button class="modal-close" onclick="closeQueueEditModal()"><i class="fas fa-times"></i></button>
+            <button class="modal-close" data-um8-fn="closeQueueEditModal"><i class="fas fa-times"></i></button>
         </div>
         <div class="modal-body">
             <div style="margin-bottom:14px;">
@@ -456,7 +488,7 @@
                         <i class="fas fa-video" style="color:var(--text-secondary);font-size:1.5rem;"></i>
                         <img id="queueEditThumbImg" src="" alt="" style="display:none;width:100%;height:100%;object-fit:cover;">
                     </div>
-                    <button type="button" class="btn btn-secondary btn-sm" onclick="generateQueueThumbnail()"><i class="fas fa-image"></i> Generate New Thumbnail</button>
+                    <button type="button" class="btn btn-secondary btn-sm" data-um8-fn="generateQueueThumbnail"><i class="fas fa-image"></i> Generate New Thumbnail</button>
                 </div>
             </div>
             <div style="margin-bottom:14px;">
@@ -482,34 +514,45 @@
             </div>
         </div>
         <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeQueueEditModal()">Cancel</button>
-            <button class="btn btn-primary"   onclick="saveQueueEdit()"><i class="fas fa-save"></i> Save Changes</button>
+            <button class="btn btn-secondary" data-um8-fn="closeQueueEditModal">Cancel</button>
+            <button class="btn btn-primary" data-um8-fn="saveQueueEdit"><i class="fas fa-save"></i> Save Changes</button>
         </div>
     </div>
 </div>
 
 <!-- ── Delete Modal ── -->
 <div class="modal" id="deleteModal" style="display:none;">
-    <div class="modal-overlay" onclick="closeDeleteModal()"></div>
+    <div class="modal-overlay" data-um8-fn="closeDeleteModal" role="button" tabindex="0"></div>
     <div class="modal-content modal-sm">
         <div class="modal-header">
             <h2>Delete Upload</h2>
-            <button class="modal-close" onclick="closeDeleteModal()"><i class="fas fa-times"></i></button>
+            <button type="button" class="modal-close" data-um8-fn="closeDeleteModal" aria-label="Close"><i class="fas fa-times"></i></button>
         </div>
         <div class="modal-body">
             <p>Are you sure you want to delete this upload? This action cannot be undone. This only removes it from UploadM8 — any content already published to platforms must be deleted manually on each platform.</p>
         </div>
         <div class="modal-footer">
-            <button class="btn btn-secondary" onclick="closeDeleteModal()">Cancel</button>
-            <button class="btn btn-danger"    onclick="confirmDelete()"><i class="fas fa-trash"></i> Delete</button>
+            <button type="button" class="btn btn-secondary" data-um8-fn="closeDeleteModal">Cancel</button>
+            <button type="button" class="btn btn-danger" data-um8-fn="confirmDelete"><i class="fas fa-trash"></i> Delete</button>
         </div>
     </div>
 </div>
 
 <div id="toastContainer"></div>
 
-<script src="wallet-tokens.js"></script>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script src="shared-sidebar.js"></script>
+<script src="js/helpers-formatting.js"></script>
+<script src="js/upload-utils.js"></script>
 <script src="app.js"></script>
+<script src="js/ai-coach.js"></script>
+<script src="wallet-tokens.js"></script>
+<script src="js/catalog-aggregate.js"></script>
+<script src="js/m8-stats.js"></script>
 <script>
 /* ═══════════════════════════════════════════════════════
    SHARED CONSTANTS (mirrors dashboard.html)
@@ -526,7 +569,7 @@ const PLATFORM_ALIASES = {
     instagram:'instagram', instagram_reels:'instagram', instagramreels:'instagram', ig:'instagram', ig_reels:'instagram', reels:'instagram',
     facebook:'facebook', facebook_reels:'facebook', facebookreels:'facebook', fb:'facebook', fb_reels:'facebook',
 };
-const PLABEL = { youtube:'YouTube', tiktok:'TikTok', instagram:'Instagram', facebook:'Facebook' };
+const PLABEL = { youtube:'YouTube', tiktok:'TikTok', instagram:'Instagram Reels', facebook:'Facebook Reels' };
 const PICON  = {
     youtube:   '<i class="fab fa-youtube"></i>',
     tiktok:    '<i class="fab fa-tiktok"></i>',
@@ -546,6 +589,55 @@ function normalizePlatform(raw) {
     if (!raw) return null;
     return PLATFORM_ALIASES[String(raw).toLowerCase().trim()] || String(raw).toLowerCase().trim();
 }
+function normalizePlatformKey(raw) {
+    return normalizePlatform(raw) || String(raw || '').toLowerCase().trim();
+}
+function resolvePlatformAccountMatch(entry, platform, avatarMap) {
+    const p = normalizePlatform(platform) || platform;
+    const list = (window._platformAccountsByPlatform && window._platformAccountsByPlatform[p]) || [];
+    const tokenRow = entry.token_row_id || entry.token_id || entry.platform_token_id;
+    const accId = entry.account_id;
+    const uname = String(entry.account_username || entry.username || '').replace(/^@+/, '').trim().toLowerCase();
+    const aname = String(entry.account_name || entry.name || '').trim().toLowerCase();
+    let match = null;
+    if (tokenRow && list.length) match = list.find(a => String(a.id) === String(tokenRow));
+    if (!match && accId && list.length) match = list.find(a => String(a.account_id || '') === String(accId));
+    if (!match && uname && list.length) match = list.find(a => String(a.username || '').replace(/^@+/, '').trim().toLowerCase() === uname);
+    if (!match && aname && list.length) match = list.find(a => String(a.name || '').trim().toLowerCase() === aname);
+    const fb = avatarMap[p] || {};
+    return {
+        avatar: (match && match.avatar) || fb.avatar || '',
+        name: (match && match.name) || fb.name || '',
+        username: (match && match.username) || fb.username || '',
+    };
+}
+function chipAvatarHtml(displayAvatar, letterSource) {
+    const letter = String(letterSource || '?').trim().charAt(0).toUpperCase() || '?';
+    if (displayAvatar) {
+        return `<span class="chip-avatar-slot"><img referrerpolicy="no-referrer" loading="lazy" decoding="async" class="chip-avatar" src="${escapeHtml(displayAvatar)}" alt="" onerror="this.style.display='none';var n=this.nextElementSibling;if(n)n.style.display='inline-flex';"><span class="chip-avatar chip-avatar-fallback" style="display:none" aria-hidden="true">${escapeHtml(letter)}</span></span>`;
+    }
+    return `<span class="chip-avatar chip-avatar-fallback" aria-hidden="true">${escapeHtml(letter)}</span>`;
+}
+function tierPillHtml() {
+    return '';
+}
+function visibilityPillHtml(entry) {
+    if (!entry || typeof entry !== 'object') return '';
+    const pres = String(entry.platform_presence || '').toLowerCase();
+    if (pres === 'not_found') {
+        return '<span class="vis-pill vis-removed" title="Video not returned by platform API (removed or inaccessible)">Removed</span>';
+    }
+    const v = String(entry.visibility || '').toLowerCase();
+    if (!v) return '';
+    if (v === 'public') return '<span class="vis-pill vis-public">Public</span>';
+    if (v === 'private') return '<span class="vis-pill vis-private">Private</span>';
+    if (v === 'unlisted') return '<span class="vis-pill vis-unlisted">Unlisted</span>';
+    return '';
+}
+function normalizeChipAvatarUrl(v) {
+    const s = String(v || '').trim();
+    return /^https?:\/\//i.test(s) ? s : '';
+}
 function fmtNum(n) {
     if (!n && n !== 0) return '0';
     if (n >= 1_000_000) return (n/1_000_000).toFixed(1)+'M';
@@ -564,6 +656,17 @@ function escapeHtml(str) {
     if (!str) return '';
     return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+function copyFailureDiagFromPre(first, second) {
+    const preId =
+        second !== undefined && second !== null && second !== ''
+            ? String(second)
+            : String(first);
+    const el = document.getElementById(preId);
+    if (!el || !navigator.clipboard) return;
+    navigator.clipboard.writeText(el.textContent || '').then(() => {
+        if (typeof showToast === 'function') showToast('Diagnostics copied', 'success');
+    }).catch(() => {});
+}
 function getRelativeTime(dateString) {
     if (!dateString) return '—';
     const diff = Date.now() - new Date(dateString).getTime();
@@ -575,6 +678,25 @@ function getRelativeTime(dateString) {
     return fmtDate(dateString);
 }
 function formatDateTime(iso) { return iso ? new Date(iso).toLocaleString() : '—'; }
+
+/** Parse hashtags from API (array, JSON string, or comma/space-separated string). Fixes display bug when DB returns string. */
+function parseHashtagsForDisplay(raw) {
+  if (typeof um8CoerceHashtagList === 'function') return um8CoerceHashtagList(raw);
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.map(t => String(t).trim()).filter(Boolean);
+  const s = String(raw).trim();
+  if (!s) return [];
+  try {
+    const parsed = JSON.parse(s);
+    if (Array.isArray(parsed)) return parsed.map(t => String(t).trim()).filter(Boolean);
+  } catch (_) {}
+  return s.split(/[\s,]+/).map(t => t.trim()).filter(Boolean);
+}
+function hashtagsToDisplayStr(raw) {
+  if (typeof um8HashtagsDisplayString === 'function') return um8HashtagsDisplayString(raw);
+  const arr = parseHashtagsForDisplay(raw);
+  return arr.map(t => (String(t).startsWith('#') ? t : '#' + t)).join(' ');
+}
 
 /* ═══════════════════════════════════════════════════════
    NORMALIZE UPLOAD (mirrors dashboard)
@@ -596,12 +718,28 @@ function normalizeUpload(u) {
         return d;
     });
     const platforms = (u.platforms || []).map(normalizePlatform).filter(Boolean);
-    const views    = u.views    || prList.reduce((s,r)=>s+(r.view_count||r.views||0),0) || 0;
-    const likes    = u.likes    || prList.reduce((s,r)=>s+(r.like_count||r.likes||0),0) || 0;
-    const comments = u.comments || prList.reduce((s,r)=>s+(r.comment_count||r.comments||0),0) || 0;
-    const shares   = u.shares   || prList.reduce((s,r)=>s+(r.share_count||r.shares||0),0) || 0;
+    const aggViews = prList.reduce((s, r) => s + Number(r.view_count ?? r.views ?? r.viewCount ?? r.plays ?? 0), 0);
+    const aggLikes = prList.reduce((s, r) => s + Number(r.like_count ?? r.likes ?? r.likeCount ?? 0), 0);
+    const aggComments = prList.reduce((s, r) => s + Number(r.comment_count ?? r.comments ?? r.commentCount ?? 0), 0);
+    const aggShares = prList.reduce((s, r) => s + Number(r.share_count ?? r.shares ?? r.shareCount ?? 0), 0);
+    const col = (v, agg) => {
+        const n = v != null && v !== '' ? Number(v) : NaN;
+        const base = Number.isFinite(n) ? n : agg;
+        return Math.max(Number(base) || 0, Number(agg) || 0);
+    };
+    let views = col(u.views, aggViews);
+    let likes = col(u.likes, aggLikes);
+    let comments = col(u.comments, aggComments);
+    let shares = col(u.shares, aggShares);
+    if (!Number.isFinite(views)) views = aggViews;
+    if (!Number.isFinite(likes)) likes = aggLikes;
+    if (!Number.isFinite(comments)) comments = aggComments;
+    if (!Number.isFinite(shares)) shares = aggShares;
+    const st0 = String(u.status || '').toLowerCase();
     const hasAnyVideoId = prList.some(r => {
-        return r.success !== false && !!(r.platform_video_id||r.video_id||r.media_id||r.post_id||r.share_id||r.publish_id||r.platform_url||r.url);
+        const hasId = !!(r.platform_video_id || r.video_id || r.media_id || r.post_id || r.share_id || r.publish_id || r.platform_url || r.url);
+        if (st0 === 'partial' && hasId) return true;
+        return r.success !== false && hasId;
     });
     return { ...u, id:String(u.id||''), _title:title, _prList:prList, _platforms:platforms, _views:views, _likes:likes, _comments:comments, _shares:shares, _hasVideoId:hasAnyVideoId };
 }
@@ -609,36 +747,46 @@ function normalizeUpload(u) {
 /* ═══════════════════════════════════════════════════════
    URL BUILDERS (mirrors dashboard)
 ═══════════════════════════════════════════════════════ */
-function buildUrlFromEntry(entry) {
-    if (!entry) return null;
-    const direct = entry.platform_url||entry.url||entry.video_url||entry.post_url||entry.share_url||entry.permalink;
-    if (direct) return direct;
-    const p   = normalizePlatform(entry.platform)||'';
-    const vid = entry.platform_video_id||entry.video_id||entry.videoId||entry.id||entry.media_id||entry.post_id||entry.share_id||entry.item_id||entry.shortcode;
-    if (!vid) return null;
-    if (p==='youtube')   return `https://www.youtube.com/shorts/${vid}`;
-    if (p==='facebook')  return `https://www.facebook.com/reel/${vid}`;
-    if (p==='tiktok')    return `https://www.tiktok.com/@${entry.username||entry.author||'_'}/video/${vid}`;
-    if (p==='instagram') return (entry.shortcode||entry.ig_shortcode) ? `https://www.instagram.com/reel/${entry.shortcode||entry.ig_shortcode}/` : null;
-    return null;
+function normalizeOutboundUrl(candidate) {
+    return window.UploadM8Urls ? UploadM8Urls.normalizeOutboundUrl(candidate) : null;
 }
-function buildPlatformUrl(platform, upload) {
-    if (upload.video_url) return upload.video_url;
-    if (upload.platform_urls?.[platform]) return upload.platform_urls[platform];
-    const entry = (upload._prList||[]).find(r=>normalizePlatform(r.platform)===platform)||{};
-    return buildUrlFromEntry(entry);
+function isKnownSocialPostHost(urlStr) {
+    return window.UploadM8Urls ? UploadM8Urls.isKnownSocialPostHost(urlStr) : false;
+}
+function isLikelySourceOrCdnVideoUrl(urlStr) {
+    return window.UploadM8Urls ? UploadM8Urls.isLikelySourceOrCdnVideoUrl(urlStr) : false;
+}
+function buildUrlFromEntry(entry) {
+    return window.UploadM8Urls ? UploadM8Urls.buildUrlFromEntry(entry, normalizePlatform) : null;
+}
+function buildProfileUrl(platform, entry) {
+    return window.UploadM8Urls ? UploadM8Urls.buildProfileUrl(platform, entry, normalizePlatform) : null;
+}
+function buildPlatformUrl(platform, upload, hintEntry) {
+    const pr = upload._prList || [];
+    const pNorm = normalizePlatform(platform) || '';
+    let entry = null;
+    if (hintEntry && normalizePlatform(hintEntry.platform) === pNorm) {
+        entry = hintEntry;
+    } else if (hintEntry && typeof entryTokenRowId === 'function') {
+        const tid = entryTokenRowId(hintEntry);
+        if (tid) entry = pr.find(r => normalizePlatform(r.platform) === pNorm && entryTokenRowId(r) === tid) || null;
+    }
+    if (!entry) entry = pr.find(r => normalizePlatform(r.platform) === pNorm) || {};
+    const fromPr = buildUrlFromEntry(entry);
+    if (fromPr) return fromPr;
+    const mapped = upload.platform_urls?.[platform];
+    if (mapped && window.UploadM8Urls) {
+        const nu = normalizeOutboundUrl(mapped);
+        if (nu && !isLikelySourceOrCdnVideoUrl(nu) && UploadM8Urls.isPlausibleWatchUrl(nu, pNorm)) return nu;
+    }
+    const vu = normalizeOutboundUrl(upload.video_url);
+    if (vu && window.UploadM8Urls && isKnownSocialPostHost(vu) && !isLikelySourceOrCdnVideoUrl(vu) && UploadM8Urls.isPlausibleWatchUrl(vu, pNorm)) return vu;
+    return null;
 }
 function resolvePlatformUrl(plat, r) {
     if (!r) return null;
-    if (r.url||r.video_url||r.share_url||r.link||r.permalink) return r.url||r.video_url||r.share_url||r.link||r.permalink;
-    const p = String(plat||'').toLowerCase();
-    const id = r.shortcode||r.platform_video_id||r.video_id||r.videoId||r.post_id||r.postId||r.id||r.media_id||r.share_id;
-    if (!id) return null;
-    if (p==='tiktok')    return `https://www.tiktok.com/@${r.username||r.author||'_'}/video/${id}`;
-    if (p==='youtube')   return `https://www.youtube.com/watch?v=${id}`;
-    if (p==='instagram') return `https://www.instagram.com/reel/${id}/`;
-    if (p==='facebook')  return String(id).includes('_') ? `https://www.facebook.com/${id}` : `https://www.facebook.com/watch/?v=${id}`;
-    return null;
+    return buildUrlFromEntry({ ...r, platform: r.platform || plat });
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -662,7 +810,7 @@ function startCountdown(elementId, targetIso, isSmart) {
         }
         const s=Math.floor(diff/1000), d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60), sec=s%60;
         const parts = d>0?[`${d}d`,`${h}h`,`${m}m`]:h>0?[`${h}h`,`${m}m`,`${sec}s`]:[`${m}m`,`${sec}s`];
-        el.innerHTML=`<i class="fas fa-clock"></i> ${isSmart?'✦ Smart upload in':'Uploading in'} <strong>${parts.join(' ')}</strong>`;
+        el.innerHTML=`<i class="fas fa-clock"></i> ${isSmart?' Smart upload in':'Uploading in'} <strong>${parts.join(' ')}</strong>`;
     }
     tick();
     _timers[elementId] = setInterval(tick,1000);
@@ -685,6 +833,9 @@ let debounceTimer;
 let uploadWatchInterval = null;
 let _loadQueueInFlight  = false;
 let _loadQueueRequestId = 0;
+let _queueAnalyticsSyncTimer = null;
+let _platformAvatarCacheAt = 0;
+const PLATFORM_AVATAR_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /* ═══════════════════════════════════════════════════════
    INIT
@@ -693,26 +844,195 @@ document.addEventListener('DOMContentLoaded', async () => {
     const user = await initApp('queue');
     if (!user) return;
 
-    if (user.plan) {
-        const used  = user.plan.uploads_used  || 0;
-        const limit = user.plan.uploads_limit || 50;
-        document.getElementById('quotaText').textContent = `${used}/${limit}`;
-    }
+    const ent = (typeof getEntitlements === 'function')
+        ? getEntitlements(user)
+        : (user.entitlements || user.plan || {});
+    const used = Number(ent.uploads_used ?? ent.put_used ?? user.uploads_this_month ?? 0) || 0;
+    const rawLimit = ent.uploads_limit ?? ent.put_monthly ?? user.upload_quota ?? getUploadLimit(user);
+    const limit = (rawLimit === -1 || Number(rawLimit) >= 999999) ? '∞' : (Number(rawLimit) || 50);
+    document.getElementById('quotaText').textContent = `${used}/${limit}`;
 
     setupFilterTabs();
     setupSearch();
-    setupModalEventListeners();
     initHideFigures();
-    await loadQueue();
+    window.addEventListener('uploadm8:analytics-sync', onQueueAnalyticsSyncSignal);
+    void loadQueue(false).catch((e) => console.error('[Queue] loadQueue:', e));
+    loadQueueCatalogAggregate();
 
     const params = new URLSearchParams(window.location.search);
     if (params.get('from_upload')==='true') startUploadWatchPolling();
 });
 
-function setupModalEventListeners() {
-    ['deleteModal','uploadDetailModal','queueEditModal'].forEach(id=>{
-        document.querySelector(`#${id} .modal-content`)?.addEventListener('click', e=>e.stopPropagation());
-    });
+// ── Queue catalog aggregate — delegate to shared widget ──────────────────────
+function loadQueueCatalogAggregate() {
+    if (window.CatalogAgg) window.CatalogAgg.load('queueAggWidget', '30d');
+}
+
+function applyQueueAggregateBar(agg) {
+    const bar = document.getElementById('queueLiveEngagement');
+    const vEl = document.getElementById('queueLiveViews');
+    const lEl = document.getElementById('queueLiveLikes');
+    const cEl = document.getElementById('queueLiveComments');
+    const sEl = document.getElementById('queueLiveShares');
+    const pEl = document.getElementById('queueLivePlats');
+    if (!agg || !bar || !vEl || !lEl) {
+        if (bar) bar.style.display = 'none';
+        return;
+    }
+    const v = Number(agg.views) || 0;
+    const l = Number(agg.likes) || 0;
+    const c = Number(agg.comments) || 0;
+    const s = Number(agg.shares) || 0;
+    vEl.textContent = fmtNum(v);
+    lEl.textContent = fmtNum(l);
+    if (cEl) cEl.textContent = fmtNum(c);
+    if (sEl) sEl.textContent = fmtNum(s);
+    if (pEl) pEl.textContent = (agg.platforms_included && agg.platforms_included.length)
+        ? ' · ' + agg.platforms_included.join(', ') : '';
+    bar.style.display = 'flex';
+}
+
+async function refreshQueueAggregateBarFromCache() {
+    try {
+        // Canonical source — same computation as Analytics & Dashboard.
+        const data = window.M8Stats
+            ? await window.M8Stats.load('30d')
+            : await apiCall('/api/analytics?range=30d').catch(() => null);
+        if (data) {
+            const plats = (data.live_aggregate && data.live_aggregate.platforms_included) || [];
+            applyQueueAggregateBar({
+                views: data.views,
+                likes: data.likes,
+                comments: data.comments,
+                shares: data.shares,
+                platforms_included: plats,
+            });
+        } else {
+            applyQueueAggregateBar(null);
+        }
+    } catch (_) {
+        applyQueueAggregateBar(null);
+    }
+}
+
+async function ensurePlatformAvatarCache(force = false) {
+    const hasCache = window._platformAvatars && typeof window._platformAvatars === 'object' && Object.keys(window._platformAvatars).length > 0;
+    if (!force && hasCache && (Date.now() - _platformAvatarCacheAt) < PLATFORM_AVATAR_CACHE_TTL_MS) return;
+    if (!force) {
+        try {
+            const src = window.UploadM8Cache && typeof window.UploadM8Cache.getUserScoped === 'function'
+                ? window.UploadM8Cache.getUserScoped('platform_accounts', { storage: 'session', maxAgeMs: PLATFORM_AVATAR_CACHE_TTL_MS })
+                : null;
+            if (src && typeof src === 'object') {
+                    window._platformAvatars = {};
+                    window._platformAccountsByPlatform = {};
+                    if (typeof src === 'object') {
+                        Object.entries(src).forEach(([p, accounts]) => {
+                            const arr = Array.isArray(accounts) ? accounts : [];
+                            const pNorm = normalizePlatformKey(p);
+                            window._platformAccountsByPlatform[p] = arr;
+                            window._platformAccountsByPlatform[pNorm] = arr;
+                            const primary = arr.find(a => a.is_primary) || arr[0];
+                            if (primary) {
+                                const info = {
+                                    avatar: primary.avatar || primary.account_avatar_url || null,
+                                    name: primary.name || primary.account_name || pNorm || p,
+                                    username: primary.username || primary.account_username || '',
+                                };
+                                window._platformAvatars[p] = info;
+                                window._platformAvatars[pNorm] = info;
+                            }
+                        });
+                    }
+                    _platformAvatarCacheAt = Date.now();
+                    return;
+            }
+        } catch (_) {}
+    }
+    try {
+        const pd = await apiCall('/api/platforms');
+        const src = pd?.platforms || pd || {};
+        window._platformAvatars = {};
+        window._platformAccountsByPlatform = {};
+        if (typeof src === 'object') {
+            Object.entries(src).forEach(([p, accounts]) => {
+                const arr = Array.isArray(accounts) ? accounts : [];
+                const pNorm = normalizePlatformKey(p);
+                window._platformAccountsByPlatform[p] = arr;
+                window._platformAccountsByPlatform[pNorm] = arr;
+                const primary = arr.find(a => a.is_primary) || arr[0];
+                if (primary) {
+                    const info = {
+                        avatar: primary.avatar || primary.account_avatar_url || null,
+                        name: primary.name || primary.account_name || pNorm || p,
+                        username: primary.username || primary.account_username || '',
+                    };
+                    window._platformAvatars[p] = info;
+                    window._platformAvatars[pNorm] = info;
+                }
+            });
+        }
+        try {
+            if (window.UploadM8Cache && typeof window.UploadM8Cache.setUserScoped === 'function') {
+                window.UploadM8Cache.setUserScoped('platform_accounts', src, { storage: 'session' });
+            }
+        } catch (_) {}
+        _platformAvatarCacheAt = Date.now();
+    } catch (_) {
+        window._platformAvatars = window._platformAvatars || {};
+        window._platformAccountsByPlatform = window._platformAccountsByPlatform || {};
+    }
+}
+
+function _scheduleQueueAggregateRefresh() {
+    if (_queueAnalyticsSyncTimer) clearTimeout(_queueAnalyticsSyncTimer);
+    _queueAnalyticsSyncTimer = setTimeout(() => {
+        refreshQueueAggregateBarFromCache().catch(() => null);
+    }, 900);
+}
+
+/** Sum stats-bar metrics across all loaded queue rows — used after per-video Sync for KPI rollup + cross-page sync. */
+function _sumQueueUploadEngagement(rows) {
+    const list = Array.isArray(rows) ? rows : [];
+    return list.reduce((acc, u) => {
+        acc.views += Number(u?._views || u?.views || 0) || 0;
+        acc.likes += Number(u?._likes || u?.likes || 0) || 0;
+        acc.comments += Number(u?._comments || u?.comments || 0) || 0;
+        acc.shares += Number(u?._shares || u?.shares || 0) || 0;
+        return acc;
+    }, { views: 0, likes: 0, comments: 0, shares: 0 });
+}
+
+function _emitQueueRollupAnalyticsSync() {
+    try {
+        const cur = window.currentUser && (window.currentUser.id || window.currentUser.user_id || window.currentUser.uid);
+        if (!cur) return;
+        const sum = _sumQueueUploadEngagement(uploads || []);
+        window.dispatchEvent(new CustomEvent('uploadm8:analytics-sync', {
+            detail: {
+                user_id: String(cur),
+                skip_dashboard_reload: true,
+                dash: {
+                    engagement: {
+                        views: sum.views,
+                        likes: sum.likes,
+                        comments: sum.comments,
+                        shares: sum.shares,
+                    },
+                },
+            },
+        }));
+    } catch (_) {}
+}
+
+function onQueueAnalyticsSyncSignal(e) {
+    const payload = e && e.detail ? e.detail : null;
+    try {
+        const cur = window.currentUser && (window.currentUser.id || window.currentUser.user_id || window.currentUser.uid);
+        const pid = payload && payload.user_id;
+        if (!pid || !cur || String(pid) !== String(cur)) return;
+    } catch (_) {}
+    _scheduleQueueAggregateRefresh();
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -752,12 +1072,38 @@ async function loadQueue(silent=false) {
     _setLiveDot(true);
 
     try {
+        if (!silent) {
+            // Avoid heavy refresh-all on normal queue load.
+        }
         const viewParam = ['pending','processing','completed','failed','partial'].includes(currentFilter)
             ? `&view=${currentFilter==='partial'?'completed':currentFilter}` : '';
-        const [queueStatsRes, uploadsRes] = await Promise.all([
-            apiCall('/api/uploads/queue-stats').catch(()=>({pending:0,processing:0,completed:0,failed:0})),
-            apiCall(`/api/uploads?limit=200${viewParam}`)
-        ]);
+        const viewQs = ['pending','processing','completed','failed','partial'].includes(currentFilter)
+            ? '&upload_view=' + encodeURIComponent(currentFilter === 'partial' ? 'completed' : currentFilter)
+            : '';
+        let queueStatsRes, uploadsRes;
+        try {
+            const boot = await apiCall('/api/shell/bootstrap?context=queue&upload_limit=200' + viewQs);
+            if (boot && boot.queue_stats && boot.uploads != null) {
+                queueStatsRes = boot.queue_stats;
+                uploadsRes = boot.uploads;
+                if (boot.platforms && window.UploadM8Cache && typeof window.UploadM8Cache.setUserScoped === 'function') {
+                    const inner = boot.platforms.platforms || boot.platforms;
+                    try {
+                        window.UploadM8Cache.setUserScoped('platform_accounts', inner && typeof inner === 'object' ? inner : {}, { storage: 'session' });
+                    } catch (_) {}
+                }
+            } else {
+                throw new Error('bootstrap_incomplete');
+            }
+        } catch (_bootErr) {
+            const pair = await Promise.all([
+                apiCall('/api/uploads/queue-stats').catch(()=>({pending:0,processing:0,completed:0,failed:0})),
+                apiCall(`/api/uploads?limit=200${viewParam}`),
+            ]);
+            queueStatsRes = pair[0];
+            uploadsRes = pair[1];
+        }
+        await ensurePlatformAvatarCache(false);
         if (thisRequest !== _loadQueueRequestId) return;
 
         const stats = (queueStatsRes && typeof queueStatsRes==='object' && 'pending' in queueStatsRes)
@@ -765,29 +1111,29 @@ async function loadQueue(silent=false) {
         window._queueStats = stats;
 
         let raw = Array.isArray(uploadsRes) ? uploadsRes : (uploadsRes?.uploads||uploadsRes?.data?.uploads||[]);
-        uploads = (raw||[]).map(normalizeUpload);
-
-        // Fetch platform avatars (like dashboard does)
-        try {
-            const pd = await apiCall('/api/platforms');
-            const src = pd?.platforms||pd||{};
-            window._platformAvatars = {};
-            if (typeof src==='object') {
-                Object.entries(src).forEach(([p,accounts])=>{
-                    const arr = Array.isArray(accounts)?accounts:[];
-                    const primary = arr.find(a=>a.is_primary)||arr[0];
-                    if (primary) window._platformAvatars[p] = {
-                        avatar:   primary.avatar||primary.account_avatar_url||null,
-                        name:     primary.name||primary.account_name||p,
-                        username: primary.username||primary.account_username||'',
-                    };
-                });
+        const prevById = new Map((uploads || []).map(u => [String(u.id || ''), u]));
+        uploads = (raw||[]).map(normalizeUpload).map(u => {
+            const prev = prevById.get(String(u.id || ''));
+            if (!prev) return u;
+            const prevThumb = prev.thumbnail_url || prev.thumbnail || prev.cover_url || null;
+            const nextThumb = u.thumbnail_url || u.thumbnail || u.cover_url || null;
+            if (prevThumb && (!nextThumb || prevThumb !== nextThumb)) {
+                u.thumbnail_url = prev.thumbnail_url || prevThumb;
             }
-        } catch(_) { window._platformAvatars = window._platformAvatars || {}; }
+            return u;
+        });
+
+        const runAgg = () => { void refreshQueueAggregateBarFromCache().catch(() => null); };
+        if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback(runAgg, { timeout: 5000 });
+        } else {
+            setTimeout(runAgg, 350);
+        }
 
         reconcileActiveUploadsRegistry();
         updateStats(stats);
         applyFilters();
+        // Backfill of older uploads is triggered by explicit account connect/manual refresh.
         queueShowLoading(false);
         showFromUploadBanner();
     } catch(error) {
@@ -807,8 +1153,8 @@ async function loadQueue(silent=false) {
 async function _rescueLocalUploads() {
     if (uploads.length>0) return;
     const ids = new Set();
-    try { (JSON.parse(localStorage.getItem('uploadm8.uploadSession')||'{}').ids||[]).forEach(id=>ids.add(String(id))); } catch(_){}
-    try { (JSON.parse(localStorage.getItem('uploadm8.activeUploads.v1')||'{}').ids||[]).forEach(id=>ids.add(String(id))); } catch(_){}
+    try { (JSON.parse(sessionStorage.getItem('uploadm8.uploadSession')||'{}').ids||[]).forEach(id=>ids.add(String(id))); } catch(_){}
+    try { (JSON.parse(sessionStorage.getItem('uploadm8.activeUploads.v1')||'{}').ids||[]).forEach(id=>ids.add(String(id))); } catch(_){}
     if (!ids.size) return;
     const rescued = (await Promise.all([...ids].map(async id=>{
         try { const d=await apiCall(`/api/uploads/${id}`); if(d&&d.id) return normalizeUpload({...d,id:String(d.id)}); } catch(_){}
@@ -835,9 +1181,15 @@ function updateStats(statsFromApi) {
     document.getElementById('processingCount').textContent = stats.processing??0;
     document.getElementById('completedCount').textContent  = stats.completed??0;
     document.getElementById('failedCount').textContent     = stats.failed??0;
-    if (window.currentUser?.plan) {
-        const used=window.currentUser.plan.uploads_used||0, limit=window.currentUser.plan.uploads_limit||50;
-        document.getElementById('quotaText').textContent=`${used}/${limit}`;
+    const user = window.currentUser || null;
+    if (user) {
+        const ent = (typeof getEntitlements === 'function')
+            ? getEntitlements(user)
+            : (user.entitlements || user.plan || {});
+        const used = Number(ent.uploads_used ?? ent.put_used ?? user.uploads_this_month ?? 0) || 0;
+        const rawLimit = ent.uploads_limit ?? ent.put_monthly ?? user.upload_quota ?? getUploadLimit(user);
+        const limit = (rawLimit === -1 || Number(rawLimit) >= 999999) ? '∞' : (Number(rawLimit) || 50);
+        document.getElementById('quotaText').textContent = `${used}/${limit}`;
     }
 }
 
@@ -855,8 +1207,11 @@ function applyFilters() {
             if (currentFilter==='failed'     && !FAILED_STATUSES.includes(s)) return false;
         }
         if (platformFilter!=='all') {
+            let pf = platformFilter;
+            if (pf === 'instagram_reels') pf = 'instagram';
+            if (pf === 'facebook_reels') pf = 'facebook';
             const plats = upload._platforms||[];
-            if (!plats.includes(platformFilter)) return false;
+            if (!plats.includes(pf)) return false;
         }
         if (searchTerm) {
             const hay = [upload._title, upload.account_name, upload.account_username, ...(upload._platforms||[])].filter(Boolean).join(' ').toLowerCase();
@@ -928,7 +1283,13 @@ function renderQueue() {
         const thumb       = upload.thumbnail_url||upload.thumbnail||upload.cover_url||null;
         const timestamp   = upload.created_at||upload.uploaded_at||upload.timestamp||null;
         const scheduledAt = upload.scheduled_time||upload.scheduled_at||upload.publish_time||null;
-        const hasStats    = isSuccess && (views||likes||comments||shares);
+        const showEngagementRow = (isSuccess && hasVideoId) || isPartial;
+        const stat = (n) => {
+            const v = Number(n);
+            if (!Number.isFinite(v)) return '—';
+            const s = fmtNum(v);
+            return s != null ? s : '0';
+        };
         const progress    = Number(upload.progress)||0;
 
         /* — Status pill — */
@@ -936,7 +1297,14 @@ function renderQueue() {
         if      (isSuccess) { pillCls='pill-success';   pillIco='fa-check-circle';       pillLbl=upload.status_label||'succeeded'; }
         else if (isPartial) { pillCls='pill-partial';   pillIco='fa-exclamation-triangle';pillLbl='partial'; }
         else if (isFailed)  { pillCls='pill-failed';    pillIco='fa-times-circle';        pillLbl='failed'; }
-        else if (isProcess) { pillCls='pill-processing';pillIco='fa-circle-notch fa-spin';pillLbl='processing'; }
+        else if (isProcess) {
+            pillCls='pill-processing'; pillIco='fa-circle-notch fa-spin'; pillLbl='processing';
+            const lu = upload.updated_at || upload.updatedAt;
+            if (lu) {
+                const ageMs = Date.now() - new Date(lu).getTime();
+                if (ageMs > 25 * 60 * 1000) pillLbl = 'processing (stale)';
+            }
+        }
         else if (isSmart && isStaged) { pillCls='pill-smart'; pillIco='fa-magic'; pillLbl='smart schedule'; }
         else if (isStaged)  { pillCls='pill-staged';    pillIco='fa-clock';               pillLbl=upload.status_label||rawStatus; }
         else                { pillCls='pill-unknown';   pillIco='fa-question-circle';     pillLbl=rawStatus; }
@@ -953,7 +1321,7 @@ function renderQueue() {
                 </div>`;
             } else {
                 cdHtml = `<div class="countdown-block">
-                    <span class="${timerCls}"><i class="fas fa-hourglass-half"></i> ${isSmart?'✦ Awaiting optimal time':'Awaiting schedule time'}</span>
+                    <span class="${timerCls}"><i class="fas fa-hourglass-half"></i> ${isSmart?' Awaiting optimal time':'Awaiting schedule time'}</span>
                 </div>`;
             }
         }
@@ -961,31 +1329,52 @@ function renderQueue() {
         /* — Processing progress — */
         let progressHtml = '';
         if (isProcess && upload.progress!=null) {
+            const lu2 = upload.updated_at || upload.updatedAt;
+            let staleHint = '';
+            if (lu2 && (Date.now() - new Date(lu2).getTime() > 25 * 60 * 1000)) {
+                staleHint = ' · last update 25m+ ago — refreshing may show failed if the worker restarted';
+            }
             progressHtml = `<div class="progress-bar-container"><div class="progress-bar" style="width:${progress}%"></div></div>
-                <span class="progress-text">${progress}%${typeof upload.current_stage==='string'?' · '+upload.current_stage:''}</span>`;
+                <span class="progress-text">${progress}%${typeof upload.current_stage==='string'?' · '+upload.current_stage:''}${staleHint}</span>`;
         }
 
         /* — Error message — */
         let errHtml = '';
         if (upload.error) {
             const errStr = typeof upload.error==='string' ? upload.error : (upload.error?.message||JSON.stringify(upload.error));
+            const ec = upload.error_code || upload.errorCode || '';
             errHtml = `<div class="upload-error-msg"><i class="fas fa-exclamation-triangle"></i> ${escapeHtml(errStr)}</div>`;
+            if (ec) {
+                errHtml += `<div style="font-size:11px;opacity:.85;margin-top:4px;padding-left:1.35rem;">Code: <code>${escapeHtml(ec)}</code></div>`;
+            }
+            if (upload.failure_diag && typeof upload.failure_diag === 'object') {
+                const fid = 'fd-row-' + String(upload.id || '').replace(/[^a-z0-9-]/gi, '');
+                const fj = JSON.stringify(upload.failure_diag, null, 2);
+                errHtml += `<details style="margin-top:8px;font-size:11px;padding-left:1.2rem;"><summary style="cursor:pointer;color:var(--text-secondary);">Diagnostics (copy for support)</summary>
+                <pre id="${fid}" style="margin-top:6px;padding:8px;background:rgba(0,0,0,.22);border-radius:6px;overflow:auto;max-height:160px;white-space:pre-wrap;">${escapeHtml(fj)}</pre>
+                <button type="button" class="btn-secondary" style="margin-top:4px;font-size:11px;padding:4px 10px;" data-um8-fn="copyFailureDiagFromPre" data-um8-arg="${fid}">Copy JSON</button></details>`;
+            }
         }
 
-        /* — Stats bar — */
+        let pipelineDiagHtml = '';
+        const pmRow = upload.pipeline_manifest || upload.pipelineManifest;
+        if (pmRow && typeof pmRow === 'object') {
+            const pid = 'pm-row-' + String(upload.id || '').replace(/[^a-z0-9-]/gi, '');
+            const pj = JSON.stringify(pmRow, null, 2);
+            pipelineDiagHtml = `<details style="margin-top:8px;font-size:11px;padding-left:1.2rem;"><summary style="cursor:pointer;color:var(--text-secondary);">Pipeline & providers (debug)</summary>
+                <pre id="${pid}" style="margin-top:6px;padding:8px;background:rgba(0,0,0,.22);border-radius:6px;overflow:auto;max-height:160px;white-space:pre-wrap;">${escapeHtml(pj)}</pre>
+                <button type="button" class="btn-secondary" style="margin-top:4px;font-size:11px;padding:4px 10px;" data-um8-fn="copyFailureDiagFromPre" data-um8-arg="${pid}">Copy JSON</button></details>`;
+        }
+
+        /* — Stats bar (same logic as dashboard: zero metrics are valid, not “pending”) — */
         let statsHtml = '';
-        if (hasStats) {
+        if (showEngagementRow) {
             statsHtml = `<div class="stats-bar">
-                ${views    ? `<span class="stat-chip blur-value"><i class="fas fa-eye"></i>${fmtNum(views)}</span>` : ''}
-                ${likes    ? `<span class="stat-chip blur-value"><i class="fas fa-heart"></i>${fmtNum(likes)}</span>` : ''}
-                ${comments ? `<span class="stat-chip blur-value"><i class="fas fa-comment"></i>${fmtNum(comments)}</span>` : ''}
-                ${shares   ? `<span class="stat-chip blur-value"><i class="fas fa-share"></i>${fmtNum(shares)}</span>` : ''}
-                <button class="row-sync-btn" onclick="rowSyncStats('${upload.id}',this)" title="Refresh stats"><i class="fas fa-sync-alt"></i> Sync</button>
-            </div>`;
-        } else if (isSuccess && hasVideoId) {
-            statsHtml = `<div class="stats-bar">
-                <span class="stat-chip no-stats"><i class="fas fa-chart-bar"></i> Stats pending</span>
-                <button class="row-sync-btn" onclick="rowSyncStats('${upload.id}',this)" title="Fetch stats"><i class="fas fa-sync-alt"></i> Sync</button>
+                <span class="stat-chip"><i class="fas fa-eye"></i><span class="stat-views">${stat(views)}</span></span>
+                <span class="stat-chip"><i class="fas fa-heart"></i><span class="stat-likes">${stat(likes)}</span></span>
+                <span class="stat-chip"><i class="fas fa-comment"></i><span class="stat-comments">${stat(comments)}</span></span>
+                <span class="stat-chip"><i class="fas fa-share"></i><span class="stat-shares">${stat(shares)}</span></span>
+                <button class="row-sync-btn" type="button" data-um8-fn="rowSyncStats" data-um8-arg="${upload.id}" title="Refresh stats from platforms"><i class="fas fa-sync-alt"></i> Sync</button>
             </div>`;
         } else if (isSuccess && !hasVideoId) {
             statsHtml = `<div class="stats-bar"><span class="stat-chip no-stats"><i class="fas fa-hourglass-half"></i> Awaiting confirmation</span></div>`;
@@ -993,66 +1382,115 @@ function renderQueue() {
 
         /* — Platform chips — */
         const avatarMap = window._platformAvatars || {};
-        const chipEntries = prList.length>0 ? prList : platforms.map(p=>({platform:p}));
+        const chipEntries = buildChipEntries(prList, upload, normalizePlatform);
         let chipsHtml = '';
         if (chipEntries.length) {
             chipsHtml = `<div class="platform-chips">${chipEntries.map(entry=>{
                 const p = normalizePlatform(entry.platform)||'unknown';
+                const matched = resolvePlatformAccountMatch(entry, p, avatarMap);
                 const entryUsername = entry.account_username||entry.username||'';
                 const entryName     = entry.account_name||entry.name||'';
-                const entryAvatar   = entry.account_avatar||'';
-                const fallback      = avatarMap[p]||{};
-                const displayUsername = entryUsername||fallback.username||'';
-                const displayName     = entryName||fallback.name||PLABEL[p]||p;
-                const displayAvatar   = entryAvatar||fallback.avatar||'';
-                const dispLabel = displayUsername ? `@${String(displayUsername).replace(/^@+/,'')}` : displayName;
-                const url       = buildUrlFromEntry(entry)||buildPlatformUrl(p,upload);
+                const entryAvatar   = entry.account_avatar||entry.avatar||entry.account_avatar_url||'';
+                const displayUsername = (entryUsername||matched.username||'').replace(/^@+/,'').trim();
+                const displayName     = (entryName||matched.name||'').trim();
+                const displayAvatar   = normalizeChipAvatarUrl(entryAvatar||matched.avatar||'');
+                const platLabel = PLABEL[p]||p;
+                let lineMain, subBits = '';
+                if (displayName) {
+                    lineMain = displayName;
+                    if (displayUsername && displayName.toLowerCase() !== displayUsername.toLowerCase()) subBits = ' · @' + displayUsername;
+                } else if (displayUsername) lineMain = '@' + displayUsername;
+                else lineMain = platLabel;
+                const letterSrc = displayName || displayUsername || platLabel;
+                const leftIcon = chipAvatarHtml(displayAvatar, letterSrc);
+                const tierHtml = tierPillHtml();
+                const visHtml = visibilityPillHtml(entry);
+                const textBlock = `<span class="chip-mid"><span class="chip-line">${escapeHtml(lineMain)}${escapeHtml(subBits)}</span>${tierHtml}${visHtml}</span>`;
+                const entryForUrl = { ...entry };
+                if (matched.username && !entryForUrl.account_username) entryForUrl.account_username = matched.username;
+                if (matched.username && !entryForUrl.username) entryForUrl.username = matched.username;
+                const videoUrl   = buildUrlFromEntry(entryForUrl)||buildPlatformUrl(p,upload,entry);
+                const profileUrl = buildProfileUrl(p, entryForUrl);
+                const resolved = window.UploadM8Urls
+                    ? UploadM8Urls.resolveChipHref(entry, upload, videoUrl, profileUrl)
+                    : { href: videoUrl || profileUrl, kind: videoUrl ? 'video' : 'profile', tip: '' };
+                const url = resolved.href;
                 const chipCls   = ['youtube','tiktok','instagram','facebook'].includes(p) ? `chip-${p}` : 'chip-default';
-                const leftIcon  = displayAvatar
-                    ? `<img src="${displayAvatar}" class="chip-avatar" alt="${escapeHtml(dispLabel)}" onerror="this.style.display='none'">`
-                    : (PICON[p]||'<i class="fas fa-globe"></i>');
-                const extIcon = url ? ' <i class="fas fa-external-link-alt chip-ext"></i>' : '';
-                const inner   = `${leftIcon} ${escapeHtml(dispLabel)}${extIcon}`;
-                const tipAcct = displayUsername ? ` (${escapeHtml(dispLabel)})` : '';
-                const tip = url ? `Watch on ${PLABEL[p]||p}${tipAcct}` : entry.error_message ? `Failed: ${entry.error_message}` : entry.success===false ? `Publish failed on ${PLABEL[p]||p}` : 'Link not yet available';
+                const extIcon = resolved.kind === 'video'
+                    ? ' <i class="fas fa-external-link-alt chip-ext" title="Watch video"></i>'
+                    : resolved.kind === 'profile'
+                        ? ' <i class="fas fa-user chip-ext" title="View profile"></i>'
+                        : ' <i class="fas fa-link-slash chip-ext" title="No post URL yet"></i>';
+                const inner   = `${leftIcon}${textBlock}${extIcon}`;
+                const tipAcct = displayUsername ? ` (@${displayUsername})` : (displayName ? ` (${displayName})` : '');
+                let tipRaw = '';
+                if (resolved.kind === 'video') tipRaw = `Watch on ${PLABEL[p]||p}${tipAcct}`;
+                else if (resolved.kind === 'profile') tipRaw = `View profile on ${PLABEL[p]||p}${tipAcct}`;
+                else if (entry.error_message) tipRaw = `Failed: ${entry.error_message}`;
+                else if (entry.success===false) tipRaw = `Publish failed on ${PLABEL[p]||p}`;
+                else tipRaw = resolved.tip || 'Post link pending';
+                const tip = escapeHtml(tipRaw);
                 const entryFailed = entry.success===false;
                 const failedCls = entryFailed ? ' chip-no-link chip-failed-entry' : '';
-                return url && !entryFailed
-                    ? `<a href="${url}" target="_blank" rel="noopener" class="platform-chip ${chipCls}${failedCls}" title="${tip}">${inner}</a>`
+                const showLink = url && (!entryFailed || resolved.kind === 'profile');
+                return showLink
+                    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener" class="platform-chip ${chipCls}${failedCls}" title="${tip}">${inner}</a>`
                     : `<span class="platform-chip ${chipCls} chip-no-link${failedCls}" title="${tip}">${inner}</span>`;
             }).join('')}</div>`;
         }
 
         /* — Thumbnail — */
-        const firstUrl = platforms.length ? buildPlatformUrl(platforms[0],upload) : null;
-        const firstAv  = platforms.length ? (avatarMap[platforms[0]]?.avatar||null) : null;
+        let firstUrl = null;
+        for (let ci = 0; ci < chipEntries.length; ci++) {
+            const ent = chipEntries[ci];
+            const p0 = normalizePlatform(ent.platform) || '';
+            const m0 = resolvePlatformAccountMatch(ent, p0, avatarMap);
+            const efu = { ...ent };
+            if (m0.username && !efu.account_username) efu.account_username = m0.username;
+            if (m0.username && !efu.username) efu.username = m0.username;
+            const cand = buildUrlFromEntry(efu) || buildPlatformUrl(p0, upload, ent);
+            if (cand && window.UploadM8Urls && UploadM8Urls.isPlausibleWatchUrl(cand, p0)) {
+                firstUrl = cand;
+                break;
+            }
+        }
+        let firstAv = null;
+        if (chipEntries.length > 0) {
+            const ent0 = chipEntries[0];
+            const pAv = normalizePlatform(ent0.platform) || '';
+            const mAv = resolvePlatformAccountMatch(ent0, pAv, avatarMap);
+            firstAv = normalizeChipAvatarUrl(ent0.account_avatar || ent0.avatar || ent0.account_avatar_url || mAv.avatar || '') || null;
+        }
+        const thumbPlatLabel = chipEntries.length
+            ? (PLABEL[normalizePlatform(chipEntries[0].platform) || ''] || chipEntries[0].platform || 'video')
+            : (PLABEL[platforms[0]] || platforms[0] || 'video');
         let imgInner;
         if (thumb) {
-            imgInner = `<img id="qthumb-${upload.id}" src="${thumb}" alt="thumb" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+            imgInner = `<img id="qthumb-${upload.id}" referrerpolicy="no-referrer" loading="lazy" decoding="async" src="${thumb}" alt="thumb" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
                         <i class="fas fa-film upload-thumb-placeholder" style="display:none;"></i>`;
-        } else if (isSuccess) {
+        } else if (isSuccess || isPartial) {
             imgInner = firstAv
-                ? `<img id="qthumb-${upload.id}" src="${firstAv}" alt="avatar" style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;" onerror="this.style.display='none';">
+                ? `<img id="qthumb-${upload.id}" referrerpolicy="no-referrer" loading="lazy" decoding="async" src="${firstAv}" alt="avatar" style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;" onerror="this.style.display='none';">
                    <i class="fas fa-spinner fa-spin" style="position:absolute;font-size:.8rem;color:var(--text-secondary);bottom:4px;right:4px;"></i>`
                 : `<i class="fas fa-spinner fa-spin upload-thumb-placeholder" style="font-size:1.2rem;opacity:.4;"></i>`;
         } else if (isProcess) {
             imgInner = `<i class="fas fa-circle-notch fa-spin upload-thumb-placeholder" style="font-size:1.2rem;opacity:.5;color:#60a5fa;"></i>`;
         } else if (firstAv) {
-            imgInner = `<img src="${firstAv}" alt="avatar" style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;" onerror="this.style.display='none';">`;
+            imgInner = `<img referrerpolicy="no-referrer" loading="lazy" decoding="async" src="${firstAv}" alt="avatar" style="width:48px;height:48px;border-radius:50%;object-fit:cover;opacity:.7;" onerror="this.style.display='none';">`;
         } else {
             imgInner = `<i class="fas fa-film upload-thumb-placeholder"></i>`;
         }
-        const thumbHtml = (isSuccess && firstUrl)
-            ? `<a href="${firstUrl}" target="_blank" rel="noopener" class="upload-thumb" title="Open ${PLABEL[platforms[0]]||platforms[0]||'video'}">${imgInner}<i class="fas fa-external-link-alt play-icon"></i></a>`
+        const thumbHtml = ((isSuccess || isPartial) && firstUrl)
+            ? `<a href="${escapeHtml(firstUrl)}" target="_blank" rel="noopener" class="upload-thumb" title="Open ${escapeHtml(thumbPlatLabel)}">${imgInner}<i class="fas fa-external-link-alt play-icon"></i></a>`
             : `<div class="upload-thumb">${imgInner}</div>`;
 
         /* — Action buttons — */
         const actionBtns = `
-            <button class="btn-icon" onclick="viewUploadDetails('${upload.id}')" title="View Details"><i class="fas fa-eye"></i></button>
-            ${isEditable ? `<button class="btn-icon" onclick="currentUploadId='${upload.id}';openQueueEditModal();" title="Edit"><i class="fas fa-edit"></i></button>` : ''}
-            ${canRetry   ? `<button class="btn-icon btn-icon-success" onclick="retryUpload('${upload.id}')" title="Retry"><i class="fas fa-redo"></i></button>` : ''}
-            ${canCancel  ? `<button class="btn-icon btn-icon-warning" onclick="cancelUpload('${upload.id}')" title="Cancel"><i class="fas fa-stop"></i></button>` : ''}
-            <button class="btn-icon btn-icon-danger" onclick="showDeleteModal('${upload.id}')" title="Delete"><i class="fas fa-trash"></i></button>`;
+            <button type="button" class="btn-icon" data-um8-fn="viewUploadDetails" data-um8-arg="${upload.id}" title="View Details"><i class="fas fa-eye"></i></button>
+            ${isEditable ? `<button type="button" class="btn-icon" data-um8-fn="um8QueueEditUpload" data-um8-arg="${upload.id}" title="Edit"><i class="fas fa-edit"></i></button>` : ''}
+            ${canRetry   ? `<button type="button" class="btn-icon btn-icon-success" data-um8-fn="retryUpload" data-um8-arg="${upload.id}" title="Retry"><i class="fas fa-redo"></i></button>` : ''}
+            ${canCancel  ? `<button type="button" class="btn-icon btn-icon-warning" data-um8-fn="cancelUpload" data-um8-arg="${upload.id}" title="Cancel"><i class="fas fa-stop"></i></button>` : ''}
+            <button type="button" class="btn-icon btn-icon-danger" data-um8-fn="showDeleteModal" data-um8-arg="${upload.id}" title="Delete"><i class="fas fa-trash"></i></button>`;
 
         return `<div class="upload-row${selectedUploads.has(upload.id)?' row-selected':''}" data-id="${upload.id}">
             <div class="row-check">
@@ -1065,7 +1503,7 @@ function renderQueue() {
                     <span class="status-pill ${pillCls}"><i class="fas ${pillIco}"></i> ${pillLbl}</span>
                     <span class="upload-time">${timestamp ? getRelativeTime(timestamp) : '—'}</span>
                 </div>
-                ${cdHtml}${progressHtml}${errHtml}${statsHtml}${chipsHtml}
+                ${cdHtml}${progressHtml}${errHtml}${pipelineDiagHtml}${statsHtml}${chipsHtml}
             </div>
             <div class="row-actions">${actionBtns}</div>
         </div>`;
@@ -1086,22 +1524,110 @@ function renderQueue() {
 /* ═══════════════════════════════════════════════════════
    SYNC STATS (row-level)
 ═══════════════════════════════════════════════════════ */
-async function rowSyncStats(uploadId, btnEl) {
+async function rowSyncStats(first, second) {
+    let uploadId, btnEl;
+    if (first && typeof first === 'object' && typeof first.preventDefault === 'function') {
+        btnEl = this && this.nodeType === 1 ? this : null;
+        uploadId = String(second || '');
+    } else {
+        uploadId = String(first || '');
+        btnEl = second;
+    }
+    if (!uploadId || !btnEl) return;
     btnEl.disabled=true; btnEl.innerHTML='<i class="fas fa-spinner fa-spin"></i>';
     const reset=()=>{ btnEl.disabled=false; btnEl.innerHTML='<i class="fas fa-sync-alt"></i> Sync'; };
     try {
         const res = await Promise.race([
             apiCall(`/api/uploads/${uploadId}/sync-analytics`,{method:'POST',body:'{}'}),
-            new Promise((_,rej)=>setTimeout(()=>rej(new Error('Timed out')),15000))
+            new Promise((_,rej)=>setTimeout(()=>rej(new Error('Timed out')),30000))
         ]);
         if (res?.synced) {
             const u = uploads.find(u=>u.id===uploadId);
-            if (u) { u._views=res.views||0; u._likes=res.likes||0; u._comments=res.comments||0; u._shares=res.shares||0; u.views=res.views||0; u.likes=res.likes||0; u.comments=res.comments||0; u.shares=res.shares||0; }
-            applyFilters();
+            if (u) {
+                const rv = (v)=> (v===undefined||v===null||Number.isNaN(Number(v))?0:Number(v));
+                const v=rv(res.views), l=rv(res.likes), c=rv(res.comments), sh=rv(res.shares);
+                u._views=v; u._likes=l; u._comments=c; u._shares=sh; u.views=v; u.likes=l; u.comments=c; u.shares=sh;
+            }
+            const row = btnEl.closest('.upload-row');
+            if (row) {
+                const statCell = (n) => {
+                    const x = Number(n);
+                    if (!Number.isFinite(x)) return '—';
+                    return fmtNum(x);
+                };
+                const upd=(cls,val)=>{ const el=row.querySelector(cls); if(el) el.textContent=statCell(val); };
+                upd('.stat-views',res.views); upd('.stat-likes',res.likes);
+                upd('.stat-comments',res.comments); upd('.stat-shares',res.shares);
+            }
             showToast(`Synced — ${fmtNum(res.views||0)} total views`,'success');
-        } else { reset(); showToast(res?.message||'Stats unavailable — try again later','warning'); }
+            _emitQueueRollupAnalyticsSync();
+            await refreshQueueAggregateBarFromCache();
+            btnEl.innerHTML='<i class="fas fa-check"></i> Sync'; setTimeout(reset,2000);
+        } else { reset(); showToast(res?.message||res?.reason||'Stats unavailable — try again later','warning'); }
     } catch(e) { reset(); showToast(e?.message||'Failed to sync stats','error'); }
 }
+
+let _queueAutoSyncInFlight = false;
+let _queueLastAutoSyncAt = 0;
+function _queueSyncAllThrottleKey() {
+    const uid = (window.currentUser && (window.currentUser.id || window.currentUser.user_id || window.currentUser.uid)) || 'anon';
+    return 'uploadm8_sync_all_analytics_at:' + String(uid);
+}
+async function triggerQueueGlobalAnalyticsSync(reason) {
+    try {
+        const key = _queueSyncAllThrottleKey();
+        const now = Date.now();
+        const last = Number(sessionStorage.getItem(key) || 0);
+        const force = String(reason || '') === 'oauth_connect';
+        if (!force && (now - last) < (10 * 60 * 1000)) return;
+        sessionStorage.setItem(key, String(now));
+        await apiCall('/api/uploads/sync-analytics/all?max_uploads=800&async_mode=true', { method: 'POST', body: '{}' });
+        await apiCall('/api/analytics/refresh-all?async_mode=true', { method: 'POST', body: '{}' }).catch(function () {});
+        if (window.M8Stats) window.M8Stats.invalidate();
+    } catch (_) {}
+}
+async function autoSyncQueueCompletedUploads() {
+    const MIN_GAP_MS = 45000;
+    if (_queueAutoSyncInFlight) return;
+    if (Date.now() - _queueLastAutoSyncAt < MIN_GAP_MS) return;
+    const hasEligible = (uploads || []).some(u => {
+        const st = String(u.status || '').toLowerCase();
+        return (SUCCESSFUL_STATUSES.includes(st) && !!u._hasVideoId) || st === 'partial';
+    });
+    if (!hasEligible) return;
+    _queueAutoSyncInFlight = true;
+    _queueLastAutoSyncAt = Date.now();
+    try {
+        // Single async batch call prevents per-row timeout storms.
+        await apiCall('/api/uploads/sync-analytics/all?max_uploads=800&async_mode=true', { method: 'POST', body: '{}' }).catch(() => null);
+        await apiCall('/api/analytics/refresh-all?async_mode=true', { method: 'POST', body: '{}' }).catch(() => null);
+    } catch (_) {
+    } finally {
+        _queueAutoSyncInFlight = false;
+    }
+}
+window.addEventListener('uploadm8:aggregate-refreshed', function () {
+    void triggerQueueGlobalAnalyticsSync('oauth_connect');
+});
+window.addEventListener('uploadm8:analytics-refresh-all', function (e) {
+    const payload = e && e.detail;
+    const cur = (window.currentUser && (window.currentUser.id || window.currentUser.user_id || window.currentUser.uid))
+        ? String(window.currentUser.id || window.currentUser.user_id || window.currentUser.uid)
+        : null;
+    const pid = payload && payload.user_id ? String(payload.user_id) : null;
+    if (!cur || !pid || cur !== pid) return;
+    if (payload && payload.master) {
+        void loadQueue(true).catch(function () { return null; });
+        void refreshQueueAggregateBarFromCache();
+        setTimeout(function () { void refreshQueueAggregateBarFromCache(); }, 2500);
+        return;
+    }
+    void refreshQueueAggregateBarFromCache();
+    setTimeout(() => { void refreshQueueAggregateBarFromCache(); }, 2500);
+});
+setInterval(function () {
+    void autoSyncQueueCompletedUploads();
+}, 60000);
 
 /* ═══════════════════════════════════════════════════════
    FOCUS & BANNER
@@ -1122,18 +1648,18 @@ function showFromUploadBanner() {
     if (params.get('from_upload')!=='true') return;
     if (document.getElementById('fromUploadBanner')) return;
     let session={};
-    try { session=JSON.parse(localStorage.getItem('uploadm8.uploadSession')||'{}'); } catch(_){}
+    try { session=JSON.parse(sessionStorage.getItem('uploadm8.uploadSession')||'{}'); } catch(_){}
     const activeIds=session.ids||[];
     if (!activeIds.length) return;
     const banner = document.createElement('div');
     banner.id='fromUploadBanner'; banner.className='from-upload-banner';
-    banner.innerHTML=`<div><div style="font-weight:600;margin-bottom:4px;"><i class="fas fa-cloud-upload-alt" style="color:var(--accent-orange);margin-right:6px;"></i>Upload in progress (${activeIds.length} file${activeIds.length>1?'s':''})</div><div style="font-size:.875rem;color:var(--text-secondary);">Processing — this page will refresh automatically.</div></div><button class="btn btn-ghost btn-sm" onclick="dismissUploadBanner()" title="Dismiss"><i class="fas fa-times"></i></button>`;
+    banner.innerHTML=`<div><div style="font-weight:600;margin-bottom:4px;"><i class="fas fa-cloud-upload-alt" style="color:var(--accent-orange);margin-right:6px;"></i>Upload in progress (${activeIds.length} file${activeIds.length>1?'s':''})</div><div style="font-size:.875rem;color:var(--text-secondary);">Processing — this page will refresh automatically.</div></div><button class="btn btn-ghost btn-sm" data-um8-fn="dismissUploadBanner" title="Dismiss"><i class="fas fa-times"></i></button>`;
     const queueList=document.getElementById('queueList');
     if (queueList?.parentNode) queueList.parentNode.insertBefore(banner,queueList);
 }
 function dismissUploadBanner() {
     document.getElementById('fromUploadBanner')?.remove();
-    try { localStorage.removeItem('uploadm8.uploadSession'); } catch(_){}
+    try { sessionStorage.removeItem('uploadm8.uploadSession'); } catch(_){}
     const url=new URL(window.location); url.searchParams.delete('from_upload'); url.searchParams.delete('focus');
     window.history.replaceState({}, '', url.toString());
 }
@@ -1147,9 +1673,15 @@ function startUploadWatchPolling() {
     uploadWatchInterval=setInterval(async()=>{
         if (Date.now()-startedAt>=MAX_WATCH_MS) { clearInterval(uploadWatchInterval); uploadWatchInterval=null; await loadQueue(true); return; }
         let session={};
-        try { session=JSON.parse(localStorage.getItem('uploadm8.uploadSession')||'{}'); } catch(_){}
+        try { session=JSON.parse(sessionStorage.getItem('uploadm8.uploadSession')||'{}'); } catch(_){}
         const hasActive=(session.ids||[]).some(id=>{ const u=uploads.find(u=>u.id===String(id)); return !u||['pending','queued','processing'].includes(u.status); });
-        if (!hasActive) { clearInterval(uploadWatchInterval); uploadWatchInterval=null; return; }
+        if (!hasActive) {
+            clearInterval(uploadWatchInterval);
+            uploadWatchInterval = null;
+            await loadQueue(true).catch(function () { return null; });
+            void autoSyncQueueCompletedUploads();
+            return;
+        }
         await loadQueue(true);
     },3000);
 }
@@ -1157,18 +1689,18 @@ setInterval(()=>{
     if (uploadWatchInterval) return;
     const hasProcessing=uploads.some(u=>u.status==='processing'||u.status==='cancel_requested');
     let hasSession=false;
-    try { const s=JSON.parse(localStorage.getItem('uploadm8.uploadSession')||'{}'); if(s.active&&s.ids?.length) hasSession=s.ids.some(id=>{ const u=uploads.find(x=>x.id===String(id)); return !u||['pending','queued','processing'].includes(u?.status); }); } catch(_){}
+    try { const s=JSON.parse(sessionStorage.getItem('uploadm8.uploadSession')||'{}'); if(s.active&&s.ids?.length) hasSession=s.ids.some(id=>{ const u=uploads.find(x=>x.id===String(id)); return !u||['pending','queued','processing'].includes(u?.status); }); } catch(_){}
     if (hasProcessing||hasSession) loadQueue(true);
 },5000);
 
 function reconcileActiveUploadsRegistry() {
     try {
-        const raw=localStorage.getItem('uploadm8.activeUploads.v1'); if(!raw) return;
+        const raw=sessionStorage.getItem('uploadm8.activeUploads.v1'); if(!raw) return;
         const obj=JSON.parse(raw); const ids=Array.isArray(obj?.ids)?obj.ids.map(String):[];
         if(!ids.length) return;
         const terminal=new Set(['completed','succeeded','failed','partial','cancelled']);
         const alive=ids.filter(id=>{ const u=uploads.find(x=>x.id===String(id)); if(!u) return true; return !terminal.has(String(u.status||'').toLowerCase()); });
-        localStorage.setItem('uploadm8.activeUploads.v1',JSON.stringify({ids:alive,ts:Date.now()}));
+        sessionStorage.setItem('uploadm8.activeUploads.v1',JSON.stringify({ids:alive,ts:Date.now()}));
     } catch(_){}
 }
 
@@ -1207,7 +1739,15 @@ async function deleteSelected() {
 /* ═══════════════════════════════════════════════════════
    CRUD
 ═══════════════════════════════════════════════════════ */
-async function cancelUpload(id, notify=true) {
+async function cancelUpload(first, second, third) {
+    let id, notify = true;
+    if (first && typeof first === 'object' && 'preventDefault' in first) {
+        id = String(second || '');
+        notify = third !== false;
+    } else {
+        id = String(first || '');
+        notify = second !== false;
+    }
     try {
         const response=await apiCall(`/api/uploads/${id}/cancel`,{method:'POST'});
         const data=(response&&typeof response.json==='function')?await response.json():(response||{});
@@ -1227,7 +1767,16 @@ async function deleteUpload(id, notify=true) {
         return false;
     } catch(error){ if(notify) showToast(`Delete failed: ${error.message}`,'error'); return false; }
 }
-async function retryUpload(id=null, notify=true) {
+async function retryUpload(first=null, second=true, third) {
+    let id = null;
+    let notify = true;
+    if (first && typeof first === 'object' && 'preventDefault' in first) {
+        id = second !== undefined && second !== null && second !== '' ? String(second) : null;
+        notify = third !== false;
+    } else {
+        id = first !== undefined && first !== null && first !== '' ? String(first) : null;
+        notify = second !== false;
+    }
     const uploadId=id||currentUploadId; if(!uploadId) return false;
     try {
         const response=await apiCall(`/api/uploads/${uploadId}/retry`,{method:'POST'});
@@ -1259,17 +1808,18 @@ function renderDetailedPlatformResults(upload) {
         const label=acct?`${plat} (${acct})`:plat;
         const url=resolvePlatformUrl(plat,r);
         const av=r.account_avatar||r.avatar;
-        const avHtml=(av&&typeof av==='string'&&av.startsWith('http'))?`<img src="${escapeHtml(av)}" alt="" class="platform-result-avatar platform-result-avatar-lg" loading="lazy" onerror="this.style.display='none'">`:'' ;
+        const avHtml=(av&&typeof av==='string'&&av.startsWith('http'))?`<img referrerpolicy="no-referrer" loading="lazy" decoding="async" src="${escapeHtml(av)}" alt="" class="platform-result-avatar platform-result-avatar-lg" onerror="this.style.display='none'">`:'' ;
         let errorMsg=r.error||r.error_message||r.error_detail;
         if(typeof errorMsg==='string'&&(errorMsg.trim().startsWith('{')||errorMsg.trim().startsWith('['))){ try{const p2=JSON.parse(errorMsg);errorMsg=p2.error?.message||p2.message||p2.error_detail||errorMsg;}catch(e){} }
         const fallbackId=r.shortcode||r.video_id||r.id||r.videoId||r.post_id||r.media_id;
         const fallbackHtml=(ok&&!url&&fallbackId)?`<div style="font-size:13px;margin-top:8px;color:var(--text-secondary);"><i class="fas fa-info-circle"></i> ID: ${escapeHtml(String(fallbackId))}</div>`:'';
+        const visModal = visibilityPillHtml(r);
         return `<div style="background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:8px;padding:12px;margin-bottom:8px;">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                <span class="platform-badge platform-${plat.toLowerCase()}" style="display:inline-flex;align-items:center;gap:8px;">${avHtml}<i class="${getPlatformIcon(plat.toLowerCase())}"></i> ${label}</span>
+                <span class="platform-badge platform-${plat.toLowerCase()}" style="display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;">${avHtml}<i class="${getPlatformIcon(plat.toLowerCase())}"></i> ${label}${visModal}</span>
                 <span class="pub-result-badge ${ok?'ok':'fail'}"><i class="fas fa-${ok?'check':'times'}"></i> ${ok?'Success':'Failed'}</span>
             </div>
-            ${url?`<div style="margin-top:8px;padding-top:8px;border-top:1px dashed rgba(255,255,255,0.1);"><a href="${url}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-blue);text-decoration:none;display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:500;"><i class="fas fa-external-link-alt"></i> View Live Post on ${label}</a></div>`:fallbackHtml}
+            ${url?`<div style="margin-top:8px;padding-top:8px;border-top:1px dashed rgba(255,255,255,0.1);"><a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-blue);text-decoration:none;display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:500;"><i class="fas fa-external-link-alt"></i> View Live Post on ${label}</a></div>`:fallbackHtml}
             ${errorMsg?`<div style="font-size:13px;color:var(--accent-red);margin-top:8px;background:rgba(239,68,68,0.1);padding:8px;border-radius:6px;word-break:break-word;"><i class="fas fa-exclamation-triangle" style="margin-right:4px;"></i>${escapeHtml(String(errorMsg))}</div>`:''}
         </div>`;
     }).join('');
@@ -1282,7 +1832,7 @@ function renderModalAnalyticsPanel(upload) {
         <div class="analytics-panel-title">
             <span><i class="fas fa-chart-line"></i> Upload Analytics</span>
             <div style="display:flex;gap:8px;align-items:center;">
-                <button class="modal-sync-btn" id="modal-syncbtn-${upload.id}" onclick="syncAndRefreshModal('${upload.id}',event)"><i class="fas fa-sync-alt"></i> Sync</button>
+                <button type="button" class="modal-sync-btn" id="modal-syncbtn-${upload.id}" data-um8-fn="syncAndRefreshModal" data-um8-arg="${upload.id}"><i class="fas fa-sync-alt"></i> Sync</button>
                 <a href="analytics.html" target="_blank" style="color:#10b981;font-size:11px;font-weight:600;text-decoration:none;display:flex;align-items:center;gap:3px;"><i class="fas fa-external-link-alt"></i> Full Analytics</a>
             </div>
         </div>
@@ -1296,14 +1846,15 @@ function renderModalAnalyticsPanel(upload) {
     </div>`;
 }
 
-function viewUploadDetails(id) {
+function viewUploadDetails(first, second) {
+    const id = second !== undefined && second !== null && second !== '' ? String(second) : String(first);
     currentUploadId=id;
     const upload=uploads.find(u=>u.id===id); if(!upload) return;
     const body=document.getElementById('uploadDetailBody');
     const displayTitle=upload.ai_title||upload.title||upload._title||'';
     const displayCaption=upload.ai_caption||upload.caption||'';
     const rawTags=upload.ai_hashtags?.length?upload.ai_hashtags:(upload.hashtags||[]);
-    const hashtagStr=Array.isArray(rawTags)?rawTags.map(t=>{const s=String(t).trim();return s.startsWith('#')?s:'#'+s;}).join(' '):String(rawTags||'');
+    const hashtagStr=hashtagsToDisplayStr(rawTags);
     const aiHtml=(displayTitle||displayCaption||hashtagStr)?`<div style="margin-top:1.25rem;border-top:1px solid var(--border-color);padding-top:1rem;">
         <label style="display:block;font-weight:600;margin-bottom:10px;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);"><i class="fas fa-magic" style="margin-right:4px;color:var(--accent-orange);"></i>AI-Generated Content</label>
         ${displayTitle?`<div style="margin-bottom:.75rem;"><div style="font-size:.7rem;color:var(--text-secondary);font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.35rem;">Title</div><div style="background:rgba(249,115,22,.07);border:1px solid rgba(249,115,22,.2);border-radius:8px;padding:.6rem .85rem;font-size:.9rem;color:var(--text-primary);">${escapeHtml(displayTitle)}</div></div>`:''}
@@ -1311,7 +1862,10 @@ function viewUploadDetails(id) {
         ${hashtagStr?`<div><div style="font-size:.7rem;color:var(--text-secondary);font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:.35rem;">Hashtags</div><div style="background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.2);border-radius:8px;padding:.6rem .85rem;font-size:.8rem;color:#60a5fa;word-break:break-word;">${escapeHtml(hashtagStr)}</div></div>`:''}
     </div>`:'';
 
-    const isSuccess=SUCCESSFUL_STATUSES.includes((upload.status||'').toLowerCase());
+    const rawDetailStatus = (upload.status||'').toLowerCase();
+    const isSuccess=SUCCESSFUL_STATUSES.includes(rawDetailStatus);
+    const isPartialDetail = rawDetailStatus === 'partial';
+    const detailPillCls = isSuccess ? 'pill-success' : FAILED_STATUSES.includes(rawDetailStatus) ? 'pill-failed' : isPartialDetail ? 'pill-partial' : 'pill-staged';
     const thumb=upload.thumbnail_url||upload.thumbnail||null;
     body.innerHTML=`<div>
         <div class="upload-detail-header">
@@ -1320,19 +1874,22 @@ function viewUploadDetails(id) {
                 <h3>${escapeHtml(displayTitle||upload.filename||'Untitled')}</h3>
                 <div class="detail-meta">
                     ${(upload._platforms||[]).slice(0,3).map(p=>`<span class="platform-badge platform-${p}"><i class="${getPlatformIcon(p)}"></i> ${p}</span>`).join('')}
-                    <span class="status-pill ${isSuccess?'pill-success':FAILED_STATUSES.includes((upload.status||'').toLowerCase())?'pill-failed':'pill-staged'}"><i class="fas fa-circle" style="font-size:.4rem;"></i> ${upload.status||'unknown'}</span>
+                    <span class="status-pill ${detailPillCls}"><i class="fas fa-circle" style="font-size:.4rem;"></i> ${upload.status||'unknown'}</span>
                 </div>
             </div>
         </div>
         <div class="upload-detail-grid">
             <div class="detail-item"><label>Created</label><span>${formatDateTime(upload.created_at)}</span></div>
-            ${upload._views?`<div class="detail-item"><label>Views</label><span class="blur-value">${fmtNum(upload._views)}</span></div>`:''}
-            ${upload._likes?`<div class="detail-item"><label>Likes</label><span class="blur-value">${fmtNum(upload._likes)}</span></div>`:''}
+            ${(upload._views!=null&&upload._views!=='')?`<div class="detail-item"><label>Views</label><span class="blur-value">${fmtNum(upload._views)}</span></div>`:''}
+            ${(upload._likes!=null&&upload._likes!=='')?`<div class="detail-item"><label>Likes</label><span class="blur-value">${fmtNum(upload._likes)}</span></div>`:''}
             ${upload.error?`<div class="detail-item" style="grid-column:1/-1"><label>Error</label><span style="color:var(--accent-red);word-break:break-word;">${escapeHtml(typeof upload.error==='string'?upload.error:JSON.stringify(upload.error))}</span></div>`:''}
+            ${(upload.error_code||upload.errorCode)?`<div class="detail-item" style="grid-column:1/-1"><label>Error code</label><span><code>${escapeHtml(upload.error_code||upload.errorCode||'')}</code></span></div>`:''}
+            ${(upload.failure_diag && typeof upload.failure_diag==='object')?(()=>{const mid='fd-modal-'+String(upload.id||'').replace(/[^a-z0-9-]/gi,'');const fj=JSON.stringify(upload.failure_diag,null,2);return `<div class="detail-item" style="grid-column:1/-1"><label>Diagnostics</label><div><pre id="${mid}" style="font-size:11px;padding:8px;background:rgba(0,0,0,.22);border-radius:6px;overflow:auto;max-height:200px;white-space:pre-wrap;">${escapeHtml(fj)}</pre><button type="button" class="btn-secondary" style="margin-top:6px;font-size:12px;" data-um8-fn="copyFailureDiagFromPre" data-um8-arg="${mid}">Copy JSON for support</button></div></div>`;})():''}
+            ${(()=>{const pm=upload.pipeline_manifest||upload.pipelineManifest;if(!pm||typeof pm!=='object')return '';const mid='pm-modal-'+String(upload.id||'').replace(/[^a-z0-9-]/gi,'');const pj=JSON.stringify(pm,null,2);return `<div class="detail-item" style="grid-column:1/-1"><label>Pipeline & providers</label><div><pre id="${mid}" style="font-size:11px;padding:8px;background:rgba(0,0,0,.22);border-radius:6px;overflow:auto;max-height:220px;white-space:pre-wrap;">${escapeHtml(pj)}</pre><button type="button" class="btn-secondary" style="margin-top:6px;font-size:12px;" data-um8-fn="copyFailureDiagFromPre" data-um8-arg="${mid}">Copy JSON</button></div></div>`;})()}
         </div>
         ${aiHtml}
         ${(isSuccess||FAILED_STATUSES.includes((upload.status||'').toLowerCase())||(upload.platform_results&&upload.platform_results.length>0))?`<div style="margin-top:1.5rem;border-top:1px solid var(--border-color);padding-top:1rem;"><label style="display:block;font-weight:600;margin-bottom:12px;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-secondary);">Platform Breakdown</label>${renderDetailedPlatformResults(upload)}</div>`:''}
-        ${isSuccess?renderModalAnalyticsPanel(upload):''}
+        ${(isSuccess||isPartialDetail)?renderModalAnalyticsPanel(upload):''}
     </div>`;
 
     const retryBtn=document.getElementById('retryUploadBtn');
@@ -1343,19 +1900,33 @@ function viewUploadDetails(id) {
     modal.style.display='flex'; modal.classList.add('active');
 }
 
-async function syncAndRefreshModal(id, event) {
-    event?.stopPropagation();
+async function syncAndRefreshModal(first, second) {
+    let id;
+    let event = null;
+    if (first && typeof first === 'object' && 'preventDefault' in first && typeof second === 'string') {
+        event = first;
+        id = second;
+    } else {
+        id = first;
+        event = second;
+    }
+    if (event && typeof event.stopPropagation === 'function') event.stopPropagation();
     const btn=document.getElementById('modal-syncbtn-'+id);
     if(btn){btn.disabled=true;btn.classList.add('spinning');}
     try {
         const data=await apiCall(`/api/uploads/${id}/sync-analytics`,{method:'POST'});
         if(!data||!data.synced){showToast('No live stats available yet','info');return;}
         const u=uploads.find(u=>u.id===id);
-        if(u){u._views=data.views||0;u._likes=data.likes||0;u._comments=data.comments||0;u._shares=data.shares||0;}
+        if(u){
+            u._views=data.views||0; u._likes=data.likes||0; u._comments=data.comments||0; u._shares=data.shares||0;
+            u.views=u._views; u.likes=u._likes; u.comments=u._comments; u.shares=u._shares;
+        }
         const setEl=(elId,val)=>{const el=document.getElementById(elId);if(el)el.textContent=fmtNum(val||0);};
         setEl(`modal-views-${id}`,data.views); setEl(`modal-likes-${id}`,data.likes);
         setEl(`modal-comments-${id}`,data.comments); setEl(`modal-shares-${id}`,data.shares);
         showToast('Analytics synced from platforms','success');
+        _emitQueueRollupAnalyticsSync();
+        await refreshQueueAggregateBarFromCache();
         applyFilters();
     } catch(e){ showToast('Sync failed: '+(e.message||'Unknown error'),'error'); }
     finally { if(btn){btn.disabled=false;btn.classList.remove('spinning');} }
@@ -1376,7 +1947,7 @@ async function openQueueEditModal() {
     if(thumbUrl){thumbImg.src=thumbUrl;thumbImg.style.display='block';thumbPreview.querySelector('.fa-video')?.style.setProperty('display','none');}
     else{thumbImg.src='';thumbImg.style.display='none';thumbPreview.querySelector('.fa-video')?.style.setProperty('display','block');}
     const rawTags=data.ai_hashtags?.length?data.ai_hashtags:(data.hashtags||[]);
-    const tagStr=Array.isArray(rawTags)?rawTags.map(t=>(String(t).startsWith('#')?t:'#'+t)).join(' '):String(rawTags||'');
+    const tagStr=hashtagsToDisplayStr(rawTags);
     document.getElementById('queueEditTitle').value=data.ai_title||data.title||data.filename||'';
     document.getElementById('queueEditCaption').value=data.ai_caption||data.caption||'';
     document.getElementById('queueEditHashtags').value=tagStr;
@@ -1431,7 +2002,7 @@ async function saveQueueEdit() {
 }
 async function generateQueueThumbnail() {
     if(!currentUploadId) return;
-    const btn=document.querySelector('#queueEditModal button[onclick="generateQueueThumbnail()"]');
+    const btn=document.querySelector('#queueEditModal button[data-um8-fn="generateQueueThumbnail"]');
     if(btn){btn.disabled=true;btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Generating…';}
     try {
         const res=await apiCall(`/api/uploads/${currentUploadId}/generate-thumbnail`,{method:'POST'});
@@ -1450,7 +2021,11 @@ async function generateQueueThumbnail() {
 /* ═══════════════════════════════════════════════════════
    DELETE MODAL
 ═══════════════════════════════════════════════════════ */
-function showDeleteModal(id) {
+function showDeleteModal(first, second) {
+    const id =
+        second !== undefined && second !== null && second !== ''
+            ? String(second)
+            : String(first);
     if(!id) return;
     currentUploadId=id;
     const modal=document.getElementById('deleteModal');
@@ -1462,20 +2037,52 @@ function closeDeleteModal() {
     currentUploadId=null;
 }
 async function confirmDelete() { if(currentUploadId) await deleteUpload(currentUploadId); closeDeleteModal(); }
-function closeModal(id) {
+window.um8QueueEditUpload = function (_ev, id) {
+    currentUploadId = String(id || '');
+    openQueueEditModal();
+};
+window.um8RetryUploadCurrent = function () {
+    retryUpload(null, true);
+};
+function closeModal(first, second) {
+    const id =
+        second !== undefined && second !== null && second !== ''
+            ? String(second)
+            : String(first);
     const modal=document.getElementById(id);
     if(modal){modal.style.display='none';modal.classList.remove('active');}
 }
+window.closeModal = closeModal;
+window.closeQueueEditModal = closeQueueEditModal;
+window.closeDeleteModal = closeDeleteModal;
 
 /* ═══════════════════════════════════════════════════════
    PAGINATION
 ═══════════════════════════════════════════════════════ */
-function changePage(delta) {
+function changePage(first, second) {
+    let delta = NaN;
+    if (second !== undefined && second !== null && second !== '') {
+        delta = Number(second);
+    } else {
+        delta = Number(first);
+    }
+    if (!Number.isFinite(delta)) return;
     const totalPages=Math.ceil(filteredUploads.length/itemsPerPage);
     currentPage=Math.max(1,Math.min(totalPages,currentPage+delta));
     renderQueue(); window.scrollTo({top:0,behavior:'smooth'});
 }
-async function refreshQueue() { await loadQueue(); showToast('Queue refreshed','success'); }
+async function refreshQueue() {
+    if (typeof window.uploadM8MasterRefreshStats === 'function') {
+        await window.uploadM8MasterRefreshStats({ silent: true });
+    } else {
+        await apiCall('/api/uploads/sync-analytics/all?max_uploads=800&async_mode=true', { method: 'POST', body: '{}' }).catch(() => null);
+        await apiCall('/api/analytics/refresh-all?async_mode=true', { method: 'POST', body: '{}' }).catch(() => null);
+        await apiCall('/api/analytics/platform-metrics?force=true').catch(() => null);
+    }
+    await ensurePlatformAvatarCache(true);
+    await loadQueue(false);
+    showToast('Queue refreshed', 'success');
+}
 
 /* ═══════════════════════════════════════════════════════
    UI HELPERS
@@ -1496,12 +2103,12 @@ function queueShowError(message) {
 function queueHideError() { document.getElementById('errorState').style.display='none'; }
 function _setLiveDot(active) { const dot=document.getElementById('liveRefreshDot'); if(dot) dot.style.opacity=active?'1':'0'; }
 function initHideFigures() {
-    if(localStorage.getItem('uploadm8_hide_figures')==='true'){ document.body.classList.add('hide-figures'); const icon=document.getElementById('toggleFiguresIcon'); if(icon) icon.className='fas fa-eye-slash'; }
+    if(sessionStorage.getItem('uploadm8_hide_figures')==='true'){ document.body.classList.add('hide-figures'); const icon=document.getElementById('toggleFiguresIcon'); if(icon) icon.className='fas fa-eye-slash'; }
 }
 function toggleHideFigures() {
     const isHidden=document.body.classList.toggle('hide-figures');
     const icon=document.getElementById('toggleFiguresIcon'); if(icon) icon.className=isHidden?'fas fa-eye-slash':'fas fa-eye';
-    localStorage.setItem('uploadm8_hide_figures',isHidden?'true':'false');
+    sessionStorage.setItem('uploadm8_hide_figures',isHidden?'true':'false');
     showToast(isHidden?'Numbers hidden':'Numbers visible','info');
 }
 </script>

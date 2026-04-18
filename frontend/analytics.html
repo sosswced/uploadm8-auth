@@ -1,15 +1,17 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Analytics - UploadM8</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="styles.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
     <style>
         /* ── Page header ── */
@@ -29,15 +31,19 @@
         .tab-content.active{display:block}
 
         /* ── KPI cards ── */
-        .kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:2rem}
-        @media(max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}}
-        @media(max-width:600px){.kpi-grid{grid-template-columns:1fr}}
+        .kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1rem}
+        .kpi-grid.engagement-row{grid-template-columns:repeat(4,1fr);margin-bottom:2rem}
+        @media(max-width:1200px){.kpi-grid,.kpi-grid.engagement-row{grid-template-columns:repeat(2,1fr)}}
+        @media(max-width:600px){.kpi-grid,.kpi-grid.engagement-row{grid-template-columns:1fr}}
         .kpi-card{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1.25rem;display:flex;align-items:center;gap:1rem}
         .kpi-icon{width:48px;height:48px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.25rem;flex-shrink:0}
         .kpi-icon.uploads{background:rgba(59,130,246,0.15);color:#3b82f6}
         .kpi-icon.success{background:rgba(34,197,94,0.15);color:#22c55e}
         .kpi-icon.views{background:rgba(139,92,246,0.15);color:#8b5cf6}
         .kpi-icon.engagement{background:rgba(249,115,22,0.15);color:#f97316}
+        .kpi-icon.likes{background:rgba(236,72,153,0.15);color:#ec4899}
+        .kpi-icon.comments{background:rgba(20,184,166,0.15);color:#14b8a6}
+        .kpi-icon.shares{background:rgba(245,158,11,0.15);color:#f59e0b}
         .kpi-icon.trill{background:rgba(168,85,247,0.15);color:#a855f7}
         .kpi-icon.speed{background:rgba(249,115,22,0.15);color:#f97316}
         .kpi-content{flex:1;min-width:0}
@@ -80,7 +86,6 @@
         .live-pill.cached{background:rgba(234,179,8,0.15);color:#eab308}
         .live-pill.error{background:rgba(239,68,68,0.15);color:#ef4444}
         .live-pill.nc{background:rgba(107,114,128,0.15);color:#6b7280}
-        .live-pill.sandbox{background:rgba(251,146,60,0.15);color:#fb923c}
         .live-pill .dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex-shrink:0}
         .live-pill.live .dot{animation:blink 1.8s infinite}
         @keyframes blink{0%,100%{opacity:1}50%{opacity:0.3}}
@@ -135,13 +140,12 @@
         .scope-badge.fallback{background:rgba(234,179,8,0.15);color:#eab308}
         .scope-badge.pending{background:rgba(107,114,128,0.15);color:#6b7280}
         .scope-badge.error{background:rgba(239,68,68,0.15);color:#ef4444}
-        .scope-badge.sandbox{background:rgba(251,146,60,0.15);color:#fb923c}
         /* Platform context notes */
         .scope-context-note{
             margin-top:0.6rem;padding:0.5rem 0.65rem;border-radius:6px;font-size:0.68rem;
             line-height:1.5;display:flex;align-items:flex-start;gap:0.4rem;
         }
-        .scope-context-note.sandbox{background:rgba(251,146,60,0.08);border:1px solid rgba(251,146,60,0.2);color:#fb923c}
+        .scope-context-note.live{background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);color:#10b981}
         .scope-context-note.unverified{background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.2);color:#eab308}
         .scope-context-note.pending{background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);color:#60a5fa}
         .scope-context-note i{margin-top:1px;flex-shrink:0}
@@ -150,66 +154,93 @@
         .data-source-tag{font-size:0.6rem;color:var(--text-muted);margin-top:0.4rem;text-align:right;font-style:italic}
         .data-source-tag .source-highlight{color:#10b981;font-weight:600;font-style:normal}
         .data-source-tag .source-fallback{color:#eab308;font-weight:600;font-style:normal}
+
+        /* Content source badge (Top Performing table) */
+        .src-badge{display:inline-flex;align-items:center;gap:0.25rem;font-size:0.62rem;font-weight:700;padding:0.15rem 0.45rem;border-radius:10px;white-space:nowrap;}
+        .src-badge.uploadm8{background:rgba(139,92,246,0.15);color:#a78bfa;}
+        .src-badge.linked{background:rgba(16,185,129,0.15);color:#10b981;}
+        .src-badge.external{background:rgba(234,179,8,0.12);color:#eab308;}
+
+        /* Catalog platform chip */
+        .cat-chip{display:inline-flex;align-items:center;gap:0.4rem;padding:0.35rem 0.75rem;border-radius:20px;background:var(--bg-card);border:1px solid var(--border-color);font-size:0.75rem;font-weight:600;}
+        .cat-chip .cc-plat{color:var(--text-muted);font-size:0.68rem;text-transform:uppercase;letter-spacing:0.04em;}
+        .cat-chip .cc-views{color:var(--text-primary);}
+        .cat-chip .cc-eng{color:#f97316;font-size:0.65rem;}
+
+        /* ── CRM / Deep Dive tab ── */
+        .crm-shell{display:grid;grid-template-columns:minmax(260px,320px) 1fr;gap:1.25rem;align-items:start}
+        @media(max-width:1000px){.crm-shell{grid-template-columns:1fr}}
+        .crm-sidebar{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:0.75rem;position:sticky;top:1rem}
+        .crm-sidebar-title{font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin:0 0 0.75rem 0.35rem;display:flex;align-items:center;gap:0.4rem}
+        .crm-plat-row{display:flex;align-items:flex-start;gap:0.65rem;padding:0.65rem 0.7rem;border-radius:10px;cursor:pointer;border:1px solid transparent;transition:background 0.15s,border-color 0.15s;margin-bottom:0.35rem}
+        .crm-plat-row:hover{background:var(--bg-hover)}
+        .crm-plat-row.active{background:rgba(249,115,22,0.08);border-color:rgba(249,115,22,0.35)}
+        .crm-plat-icon{width:38px;height:38px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:1rem;flex-shrink:0}
+        .crm-plat-meta{flex:1;min-width:0}
+        .crm-plat-name{font-weight:700;font-size:0.88rem;display:flex;align-items:center;gap:0.35rem;flex-wrap:wrap}
+        .crm-plat-mini{font-size:0.68rem;color:var(--text-muted);margin-top:0.2rem;line-height:1.35}
+        .crm-detail{background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;padding:1rem 1.1rem}
+        .crm-detail-head{display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem}
+        .crm-detail-title{font-size:1.05rem;font-weight:700;margin:0;display:flex;align-items:center;gap:0.5rem}
+        .crm-kpi-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:0.5rem;margin-bottom:1rem}
+        .crm-kpi-cell{background:var(--bg-secondary,rgba(255,255,255,0.04));border-radius:8px;padding:0.5rem 0.55rem;text-align:center}
+        .crm-kpi-cell .v{font-size:0.95rem;font-weight:700;color:var(--text-primary)}
+        .crm-kpi-cell .l{font-size:0.58rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);margin-top:0.15rem}
+        .crm-kpi-cell.live-strip{border:1px solid rgba(16,185,129,0.2)}
+        .crm-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.6rem;margin-bottom:0.75rem}
+        .crm-toolbar label{font-size:0.78rem;color:var(--text-secondary);display:flex;align-items:center;gap:0.35rem}
+        .crm-toolbar select{padding:0.35rem 0.6rem;border-radius:8px;border:1px solid var(--border-color);background:var(--bg-card);color:var(--text-primary);font-size:0.8rem;font-family:inherit}
+        .crm-vid-thumb{width:44px;height:44px;border-radius:6px;object-fit:cover;background:var(--bg-secondary);flex-shrink:0}
+        .crm-title-cell{max-width:220px}
+        @media(min-width:900px){.crm-title-cell{max-width:320px}}
+        .crm-timeline-bar{display:flex;flex-wrap:wrap;align-items:flex-end;gap:0.75rem 1rem;padding:1rem 1.1rem;background:var(--bg-card);border:1px solid var(--border-color);border-radius:12px;margin-bottom:1.25rem}
+        .crm-timeline-bar label{font-size:0.72rem;font-weight:600;color:var(--text-muted);display:flex;flex-direction:column;gap:0.25rem}
+        .crm-timeline-bar select,.crm-timeline-bar input[type="date"]{padding:0.4rem 0.55rem;border-radius:8px;border:1px solid var(--border-color);background:var(--bg-card);color:var(--text-primary);font-size:0.8rem;font-family:inherit}
+        .crm-timeline-actions{display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap}
+        .crm-btn-sm{padding:0.4rem 0.75rem;border-radius:8px;font-size:0.78rem;font-weight:600;cursor:pointer;border:1px solid var(--border-color);background:var(--bg-secondary);color:var(--text-primary);font-family:inherit}
+        .crm-btn-sm:hover{background:var(--bg-hover)}
+        .crm-rollup-strip{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:0.5rem;margin-bottom:1rem;padding:0.85rem 1rem;background:rgba(139,92,246,0.06);border:1px solid rgba(139,92,246,0.2);border-radius:10px}
+        .crm-rollup-strip .lbl{grid-column:1/-1;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#a78bfa;margin-bottom:0.2rem}
+        a.crm-vid-link,a.crm-thumb-link{color:inherit;text-decoration:none}
+        a.crm-vid-link:hover,a.crm-thumb-link:hover{text-decoration:underline;color:var(--accent-orange)}
+        a.crm-thumb-link{display:inline-block;line-height:0;border-radius:6px}
+
+        /* ── Mobile overrides ── */
+        @media(max-width:768px){
+            .page-header{flex-direction:column;align-items:flex-start;gap:0.75rem}
+            .page-header-left{flex-wrap:wrap;gap:0.5rem}
+            .page-actions{width:100%;flex-wrap:wrap}
+            .page-actions select{flex:1;min-width:0}
+            .tab-btn{padding:0.6rem 0.9rem;font-size:0.8rem}
+            .refresh-bar{flex-direction:column;align-items:flex-start}
+            .crm-toolbar{flex-direction:column;align-items:flex-start}
+        }
+        @media(max-width:600px){
+            .kpi-grid,.kpi-grid.engagement-row{grid-template-columns:repeat(2,1fr)}
+            .content-table{overflow-x:auto}
+            .content-table table{min-width:520px}
+            .crm-timeline-bar{flex-direction:column;align-items:flex-start}
+            .crm-detail-head{flex-direction:column;align-items:flex-start}
+            .tab-navigation{gap:0.25rem}
+        }
+        @media(max-width:400px){
+            .kpi-grid,.kpi-grid.engagement-row{grid-template-columns:1fr}
+        }
     </style>
 </head>
 <body>
     <div class="app-layout">
         <!-- ── Sidebar ── -->
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header">
-                <a href="dashboard.html" class="sidebar-logo">
-                    <img src="images/logo.png" alt="UploadM8">
-                    <span>UploadM8</span>
-                </a>
-            </div>
-            <nav class="sidebar-nav">
-                <div class="nav-section">
-                    <div class="nav-section-title">Main</div>
-                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
-                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
-                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Platforms</div>
-                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-                    <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Insights</div>
-                    <a href="analytics.html" class="nav-link active"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-                </div>
-                <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                    <div class="nav-section-title">Admin</div>
-                    <a href="admin.html" class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
-                    <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
-                    <a href="admin-kpi.html" class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
-                    <a href="admin-calculator.html" class="nav-link"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
-                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Account</div>
-                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-                    <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-                </div>
-            </nav>
-            <div class="sidebar-footer">
-                <div class="user-info">
-                    <div class="user-avatar" id="userAvatar">U</div>
-                    <div class="user-details">
-                        <div class="user-name" id="userName">Loading...</div>
-                        <div class="user-tier" id="userTier">-</div>
-                    </div>
-                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out"><i class="fas fa-sign-out-alt"></i></button>
-                </div>
-            </div>
-        </aside>
+        <aside class="sidebar" id="sidebar"></aside>
 
-        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
         <header class="top-bar">
-            <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
-            <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
-            <div class="top-bar-actions"><button class="theme-toggle" onclick="toggleTheme()"><i class="fas fa-moon"></i></button></div>
+            <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+            <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+            <div class="top-bar-actions">
+                <div data-wt-pills></div>
+                <button class="theme-toggle" type="button" aria-label="Toggle theme" data-um8-fn="toggleTheme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+            </div>
         </header>
 
         <!-- ── Main content ── -->
@@ -231,7 +262,8 @@
                             <p>Track your upload performance and engagement across all platforms</p>
                         </div>
                     </div>
-                    <div class="page-actions">
+                    <div class="page-actions" style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;">
+                        <div data-wt-pills class="desktop-pills"></div>
                         <select id="dateRangeSelect" class="form-select" style="min-width:150px;">
                             <option value="7">Last 7 Days</option>
                             <option value="30" selected>Last 30 Days</option>
@@ -239,21 +271,42 @@
                             <option value="365">Last Year</option>
                             <option value="all">All Time</option>
                         </select>
-                        <button class="btn btn-secondary" id="exportBtn" onclick="exportToExcel()">
+                        <a href="kpi.html" class="btn btn-secondary" title="Throughput, success rates, strategy scores">
+                            <i class="fas fa-chart-bar"></i> Upload KPIs
+                        </a>
+                        <a href="admin-kpi.html" class="btn btn-secondary admin-only" style="display:none" title="Business-wide admin KPIs">
+                            <i class="fas fa-chart-pie"></i> Admin KPIs
+                        </a>
+                        <a href="admin-marketing.html" class="btn btn-secondary hidden admin-only-marketing" title="Marketing ops and campaigns">
+                            <i class="fas fa-bullhorn" style="color:#f97316;"></i> Marketing Ops
+                        </a>
+                        <button class="btn btn-secondary" id="exportBtn" data-um8-fn="exportToExcel">
                             <i class="fas fa-download"></i> Export
                         </button>
                     </div>
                 </div>
 
+                <div class="card mb-4" style="border-color:rgba(139,92,246,.35);background:rgba(139,92,246,.05);">
+                    <div class="card-header" style="padding-bottom:6px;">
+                        <h3 class="card-title" style="font-size:1rem;"><i class="fas fa-wand-magic-sparkles" style="color:#a78bfa;"></i> Personalized tips</h3>
+                    </div>
+                    <div class="card-body" style="padding-top:6px;">
+                        <div data-ai-coach="1" class="text-secondary" style="font-size:.85rem;line-height:1.45;">Loading personalized tips…</div>
+                    </div>
+                </div>
+
                 <!-- Tab Navigation -->
                 <div class="tab-navigation">
-                    <button class="tab-btn active" onclick="switchTab('overview')">
+                    <button class="tab-btn active" data-um8-fn="switchTab" data-um8-arg="overview">
                         <i class="fas fa-chart-bar"></i> Overview
                     </button>
-                    <button class="tab-btn" onclick="switchTab('platforms')">
+                    <button class="tab-btn" data-um8-fn="switchTab" data-um8-arg="platforms">
                         <i class="fas fa-share-alt"></i> Platform Stats
                     </button>
-                    <button class="tab-btn" id="trillTabBtn" onclick="switchTab('trill')" style="display:none;">
+                    <button class="tab-btn" data-um8-fn="switchTab" data-um8-arg="crm">
+                        <i class="fas fa-sitemap"></i> Deep Dive
+                    </button>
+                    <button class="tab-btn" id="trillTabBtn" data-um8-fn="switchTab" data-um8-arg="trill" style="display:none;">
                         <i class="fas fa-tachometer-alt"></i> Trill Stats
                     </button>
                 </div>
@@ -263,7 +316,7 @@
                 ══════════════════════════════════════════════ -->
                 <div class="tab-content active" id="overviewTab">
 
-                    <!-- 4-up KPI strip -->
+                    <!-- Upload pipeline KPIs -->
                     <div class="kpi-grid">
                         <div class="kpi-card">
                             <div class="kpi-icon uploads"><i class="fas fa-cloud-upload-alt"></i></div>
@@ -282,6 +335,18 @@
                             </div>
                         </div>
                         <div class="kpi-card">
+                            <div class="kpi-icon engagement"><i class="fas fa-chart-line"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Engagement Rate</div>
+                                <div class="kpi-value" id="engagementRate">--%</div>
+                                <div class="kpi-change positive" id="engagementChange"><i class="fas fa-arrow-up"></i> --%</div>
+                            </div>
+                        </div>
+                        <div class="kpi-card" style="opacity:0;pointer-events:none;"></div>
+                    </div>
+                    <!-- Canonical engagement KPIs — same source as Dashboard & Queue (GET /api/analytics) -->
+                    <div class="kpi-grid engagement-row" id="analyticsEngagementRow">
+                        <div class="kpi-card">
                             <div class="kpi-icon views"><i class="fas fa-eye"></i></div>
                             <div class="kpi-content">
                                 <div class="kpi-label">Total Views</div>
@@ -290,14 +355,34 @@
                             </div>
                         </div>
                         <div class="kpi-card">
-                            <div class="kpi-icon engagement"><i class="fas fa-heart"></i></div>
+                            <div class="kpi-icon likes"><i class="fas fa-heart"></i></div>
                             <div class="kpi-content">
-                                <div class="kpi-label">Engagement</div>
-                                <div class="kpi-value" id="engagementRate">--%</div>
-                                <div class="kpi-change positive" id="engagementChange"><i class="fas fa-arrow-up"></i> --%</div>
+                                <div class="kpi-label">Total Likes</div>
+                                <div class="kpi-value" id="totalLikes">--</div>
+                            </div>
+                        </div>
+                        <div class="kpi-card">
+                            <div class="kpi-icon comments"><i class="fas fa-comment"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Total Comments</div>
+                                <div class="kpi-value" id="totalComments">--</div>
+                            </div>
+                        </div>
+                        <div class="kpi-card">
+                            <div class="kpi-icon shares"><i class="fas fa-share"></i></div>
+                            <div class="kpi-content">
+                                <div class="kpi-label">Total Shares</div>
+                                <div class="kpi-value" id="totalShares">--</div>
                             </div>
                         </div>
                     </div>
+                    <p style="font-size:0.72rem;color:var(--text-muted);margin:-0.5rem 0 1rem 0;line-height:1.45;">
+                        Views, likes, comments, and shares are merged across your connected accounts &mdash; the same totals as your Dashboard and Queue. &ldquo;All connected accounts&rdquo; farther down can include videos you did not publish through UploadM8, so those figures may be higher than the headline row.
+                    </p>
+
+                    <!-- Unified catalog aggregate — shared CatalogAgg widget -->
+                    <div id="analyticsAggWidget" data-catalog-agg="true" data-catalog-agg-period="30d" style="margin-bottom:1.5rem;"></div>
+                    <p id="analyticsPikzelsV2Line" style="font-size:0.78rem;color:var(--text-muted);margin-bottom:1rem;"></p>
 
                     <!-- Charts -->
                     <div class="charts-row">
@@ -315,16 +400,24 @@
                         </div>
                     </div>
 
-                    <!-- Top Performing Content -->
+                    <!-- Top Performing Content — unified catalog + uploads -->
                     <div class="content-table">
-                        <div class="content-table-header">
+                        <div class="content-table-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
                             <h3 class="chart-title"><i class="fas fa-trophy" style="color:#f97316;"></i> Top Performing Content</h3>
+                            <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap;">
+                                <span style="font-size:0.72rem;color:var(--text-muted);" id="topContentSourceNote">UploadM8 uploads only</span>
+                                <label style="display:inline-flex;align-items:center;gap:0.35rem;font-size:0.75rem;cursor:pointer;color:var(--text-secondary);">
+                                    <input type="checkbox" id="topContentCatalogToggle" onchange="reloadTopContent()" style="accent-color:#8b5cf6;">
+                                    Include all catalog videos
+                                </label>
+                            </div>
                         </div>
                         <table>
                             <thead>
                                 <tr>
                                     <th>Video</th>
                                     <th>Platform</th>
+                                    <th>Source</th>
                                     <th>Views</th>
                                     <th>Likes</th>
                                     <th>Comments</th>
@@ -333,7 +426,7 @@
                                 </tr>
                             </thead>
                             <tbody id="topContentTable">
-                                <tr><td colspan="7" class="empty-state"><i class="fas fa-film"></i><p>No content data yet</p></td></tr>
+                                <tr><td colspan="8" class="empty-state"><i class="fas fa-film"></i><p>No content data yet</p></td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -351,9 +444,25 @@
                             <span id="refreshStatusText">Loading live data…</span>
                             <span id="nextRefreshText" style="margin-left:0.5rem;"></span>
                         </div>
-                        <button class="btn-refresh" id="refreshBtn" onclick="refreshPlatformMetrics(true)">
+                        <button class="btn-refresh" id="refreshBtn" data-um8-fn="refreshPlatformMetrics" data-um8-args="[true]">
                             <i class="fas fa-sync-alt"></i> Refresh Now
                         </button>
+                    </div>
+
+                    <!-- API Status Summary -->
+                    <div id="apiStatusSummary" style="display:flex;gap:0.75rem;margin-bottom:1.25rem;flex-wrap:wrap;">
+                        <div style="display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.85rem;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;font-size:0.78rem;font-weight:600;color:#10b981;">
+                            <i class="fab fa-youtube" style="font-size:1rem;color:#ff0000;"></i> YouTube API <span style="font-weight:700;">Live</span>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.85rem;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;font-size:0.78rem;font-weight:600;color:#10b981;">
+                            <i class="fab fa-tiktok" style="font-size:1rem;color:#69c9d0;"></i> TikTok API <span style="font-weight:700;">Live</span>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.85rem;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);border-radius:8px;font-size:0.78rem;font-weight:600;color:#60a5fa;">
+                            <i class="fab fa-instagram" style="font-size:1rem;color:#E1306C;"></i> Instagram Reels <span style="font-weight:400;">Pending Review</span>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.85rem;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);border-radius:8px;font-size:0.78rem;font-weight:600;color:#60a5fa;">
+                            <i class="fab fa-facebook-f" style="font-size:1rem;color:#1877f2;"></i> Facebook Reels <span style="font-weight:400;">Pending Review</span>
+                        </div>
                     </div>
 
                     <!-- Scope Health Panel -->
@@ -382,7 +491,7 @@
                             </div>
                             <!-- Instagram Scopes -->
                             <div class="scope-platform">
-                                <div class="scope-platform-name" style="color:#E1306C;"><i class="fab fa-instagram"></i> Instagram</div>
+                                <div class="scope-platform-name" style="color:#E1306C;"><i class="fab fa-instagram"></i> Instagram Reels</div>
                                 <div class="scope-item"><span class="scope-name">instagram_basic</span><span class="scope-badge pending" id="scope-ig-basic">--</span></div>
                                 <div class="scope-item"><span class="scope-name">instagram_manage_insights</span><span class="scope-badge pending" id="scope-ig-insights">--</span></div>
                                 <div class="scope-item"><span class="scope-name">instagram_content_publish</span><span class="scope-badge pending" id="scope-ig-publish">--</span></div>
@@ -390,7 +499,7 @@
                             </div>
                             <!-- Facebook Scopes -->
                             <div class="scope-platform">
-                                <div class="scope-platform-name" style="color:#1877f2;"><i class="fab fa-facebook-f"></i> Facebook</div>
+                                <div class="scope-platform-name" style="color:#1877f2;"><i class="fab fa-facebook-f"></i> Facebook Reels</div>
                                 <div class="scope-item"><span class="scope-name">pages_read_engagement</span><span class="scope-badge pending" id="scope-fb-engagement">--</span></div>
                                 <div class="scope-item"><span class="scope-name">read_insights</span><span class="scope-badge pending" id="scope-fb-insights">--</span></div>
                                 <div class="scope-item"><span class="scope-name">publish_video</span><span class="scope-badge pending" id="scope-fb-publish">--</span></div>
@@ -447,6 +556,9 @@
                                 <div class="platform-stat"><div class="platform-stat-value" id="yt-minutes">--</div><div class="platform-stat-label">Min Watched</div></div>
                                 <div class="platform-stat"><div class="platform-stat-value" id="yt-videos">--</div><div class="platform-stat-label">Videos</div></div>
                             </div>
+                            <p class="yt-metrics-footnote" style="font-size:11px;color:var(--text-muted);margin:10px 0 0;line-height:1.4;opacity:.9;">
+                                Subscriber and video counts come from YouTube directly. Views, likes, comments, shares, average watch time, and minutes watched use YouTube Analytics over a <strong>rolling ~30&nbsp;day</strong> window, which may not match the exact dates you see in YouTube Studio. If you connect more than one channel, we add the numbers together.
+                            </p>
                             <div class="data-source-tag" id="yt-source-tag"></div>
                             <div class="mini-chart"><canvas id="youtubeMiniChart"></canvas></div>
                         </div>
@@ -456,7 +568,7 @@
                             <div class="platform-card-header">
                                 <div class="platform-card-header-left">
                                     <div class="platform-icon instagram"><i class="fab fa-instagram"></i></div>
-                                    <div class="platform-name">Instagram</div>
+                                    <div class="platform-name">Instagram Reels</div>
                                 </div>
                                 <span class="live-pill nc" id="badge-instagram"><span class="dot"></span><span id="badge-instagram-text">--</span></span>
                             </div>
@@ -478,7 +590,7 @@
                             <div class="platform-card-header">
                                 <div class="platform-card-header-left">
                                     <div class="platform-icon facebook"><i class="fab fa-facebook-f"></i></div>
-                                    <div class="platform-name">Facebook</div>
+                                    <div class="platform-name">Facebook Reels</div>
                                 </div>
                                 <span class="live-pill nc" id="badge-facebook"><span class="dot"></span><span id="badge-facebook-text">--</span></span>
                             </div>
@@ -496,24 +608,125 @@
 
                     </div><!-- /.platform-grid -->
 
-                    <!-- Top content table also visible here -->
+                    <!-- Top content table also visible here (mirrors Overview tab) -->
                     <div class="content-table">
-                        <div class="content-table-header">
+                        <div class="content-table-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
                             <h3 class="chart-title"><i class="fas fa-trophy" style="color:#f97316;"></i> Top Performing Content</h3>
+                            <span style="font-size:0.72rem;color:var(--text-muted);">Showing all catalog videos (UploadM8 + external)</span>
                         </div>
                         <table>
                             <thead>
                                 <tr>
-                                    <th>Video</th><th>Platform</th><th>Views</th><th>Likes</th><th>Comments</th><th>Shares</th><th>Engagement</th>
+                                    <th>Video</th><th>Platform</th><th>Source</th><th>Views</th><th>Likes</th><th>Comments</th><th>Shares</th><th>Engagement</th>
                                 </tr>
                             </thead>
                             <tbody id="topContentTable2">
-                                <tr><td colspan="7" class="empty-state"><i class="fas fa-film"></i><p>No content data yet</p></td></tr>
+                                <tr><td colspan="8" class="empty-state"><i class="fas fa-film"></i><p>No content data yet</p></td></tr>
                             </tbody>
                         </table>
                     </div>
 
                 </div><!-- /#platformsTab -->
+
+                <!-- ══════════════════════════════════════════════
+                     DEEP DIVE (CRM-style per-platform)
+                ══════════════════════════════════════════════ -->
+                <div class="tab-content" id="crmTab">
+                    <p style="font-size:0.88rem;color:var(--text-secondary);margin:0 0 0.75rem 0;line-height:1.5;">
+                        Control center for connected accounts: pick a <strong>time window</strong> (presets or custom dates), then a <strong>platform</strong> and optionally one <strong>account</strong> to see catalog rollups, live API KPIs per account, and every synced video.
+                    </p>
+                    <div class="crm-timeline-bar">
+                        <label>Timeline
+                            <select id="crmTimelineMode" onchange="window._crmOnTimelineModeChange()">
+                                <option value="preset">Presets</option>
+                                <option value="custom">Custom range</option>
+                            </select>
+                        </label>
+                        <div id="crmPresetWrap">
+                            <label>Range
+                                <select id="crmPresetSelect">
+                                    <option value="7">Last 7 days</option>
+                                    <option value="30" selected>Last 30 days</option>
+                                    <option value="90">Last 90 days</option>
+                                    <option value="365">Last year</option>
+                                    <option value="all">All time</option>
+                                </select>
+                            </label>
+                        </div>
+                        <div id="crmCustomWrap" style="display:none;flex-wrap:wrap;gap:0.75rem;align-items:flex-end;">
+                            <label>Start
+                                <input type="date" id="crmDateStart">
+                            </label>
+                            <label>End
+                                <input type="date" id="crmDateEnd">
+                            </label>
+                        </div>
+                        <div class="crm-timeline-actions">
+                            <button type="button" class="crm-btn-sm" data-um8-fn="loadCrmDeepDive" title="Reload catalog and tables"><i class="fas fa-check"></i> Apply</button>
+                            <button type="button" class="crm-btn-sm" data-um8-fn="_crmSyncTimelineFromPageHeader" title="Match Analytics header dropdown"><i class="fas fa-link"></i> Match page header</button>
+                        </div>
+                    </div>
+                    <div class="crm-rollup-strip" id="crmRollupStrip" style="display:none;">
+                        <div class="lbl"><i class="fas fa-globe-americas"></i> All platforms (catalog)</div>
+                    </div>
+                    <div class="crm-shell">
+                        <aside class="crm-sidebar">
+                            <div class="crm-sidebar-title"><i class="fas fa-layer-group"></i> Platforms</div>
+                            <div id="crmPlatformList">
+                                <div style="padding:1rem;color:var(--text-muted);font-size:0.85rem;">Loading…</div>
+                            </div>
+                        </aside>
+                        <div class="crm-detail">
+                            <div class="crm-detail-head">
+                                <h2 class="crm-detail-title" id="crmDetailHeading"><i class="fas fa-chart-pie"></i> Select a platform</h2>
+                                <a href="platforms.html" class="btn btn-secondary btn-sm" style="font-size:0.8rem;"><i class="fas fa-plug"></i> Connected accounts</a>
+                            </div>
+                            <div class="crm-toolbar" style="margin-bottom:0.75rem;padding-bottom:0.75rem;border-bottom:1px solid var(--border-color);">
+                                <label>Account
+                                    <select id="crmAccountFilter" style="min-width:220px;" onchange="window.selectCrmPlatform(window.__crmSelectedPlatform)">
+                                        <option value="">All accounts (merged)</option>
+                                    </select>
+                                </label>
+                                <span style="font-size:0.72rem;color:var(--text-muted);max-width:28rem;line-height:1.35;" id="crmAccountHint"></span>
+                            </div>
+                            <p id="crmDetailSub" style="font-size:0.78rem;color:var(--text-muted);margin:-0.25rem 0 1rem 0;"></p>
+                            <div class="crm-kpi-strip" id="crmCatalogKpis"></div>
+                            <div class="crm-kpi-strip" id="crmLiveKpis" style="display:none;"></div>
+                            <div class="crm-toolbar">
+                                <label>Source
+                                    <select id="crmSourceFilter" onchange="window.selectCrmPlatform(window.__crmSelectedPlatform)">
+                                        <option value="all">All sources</option>
+                                        <option value="uploadm8">UploadM8</option>
+                                        <option value="linked">Linked</option>
+                                        <option value="external">External</option>
+                                    </select>
+                                </label>
+                                <span style="font-size:0.72rem;color:var(--text-muted);" id="crmTableMeta"></span>
+                            </div>
+                            <div class="content-table" style="margin:0;">
+                                <table>
+                                    <thead id="crmVideoThead">
+                                        <tr>
+                                            <th style="width:52px;"></th>
+                                            <th>Video</th>
+                                            <th class="crm-col-account" style="display:none;">Account</th>
+                                            <th>Source</th>
+                                            <th>Views</th>
+                                            <th>Likes</th>
+                                            <th>Comments</th>
+                                            <th>Shares</th>
+                                            <th>Eng.</th>
+                                            <th>Published</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="crmVideoTable">
+                                        <tr><td colspan="10" class="empty-state"><i class="fas fa-mouse-pointer"></i><p>Choose a platform on the left</p></td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div><!-- /#crmTab -->
 
                 <!-- ══════════════════════════════════════════════
                      TRILL STATS TAB
@@ -569,11 +782,21 @@
         </main>
     </div><!-- /.app-layout -->
 
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
+    <script src="app.js"></script>
+    <script src="js/m8-stats.js"></script>
+    <script src="js/catalog-aggregate.js"></script>
+    <script src="js/ai-coach.js"></script>
     <script src="wallet-tokens.js"></script>
-<script src="app.js"></script>
     <script>
     (function(){
-        const API_BASE = window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : 'https://auth.uploadm8.com');
         let uploadChart = null, platformChart = null, speedBucketChart = null;
         let currentAnalyticsData = null;
         let countdownTimer = null;
@@ -600,74 +823,775 @@
             if(s < 60) return s + 's';
             return Math.floor(s/60)+'m '+(s%60)+'s';
         }
+        function escapeHtml(s){
+            const d = document.createElement('div');
+            d.textContent = s == null ? '' : String(s);
+            return d.innerHTML;
+        }
+        /**
+         * Match catalog row → platform-metrics account row (same platform_tokens identity / channel).
+         * Uses catalog `account_id` (native channel id) vs metrics poll rows.
+         */
+        function _findMetricsAccountForCatalogRow(u){
+            if(!u) return null;
+            const plat = String(u.platform || '').toLowerCase();
+            const pm = window.__analyticsPlatformMetrics && window.__analyticsPlatformMetrics.platforms
+                ? window.__analyticsPlatformMetrics.platforms[plat] : null;
+            const aid = u.account_id != null && u.account_id !== '' ? String(u.account_id).trim() : '';
+            if(!aid) return null;
+            if(pm && Array.isArray(pm.accounts)){
+                for(var i = 0; i < pm.accounts.length; i++){
+                    var a = pm.accounts[i];
+                    if(!a) continue;
+                    if(String(a.account_id || '').trim() === aid) return a;
+                }
+            }
+            const list = window.__crmPlatformAccountsList || [];
+            for(var j = 0; j < list.length; j++){
+                var b = list[j];
+                if(!b) continue;
+                if(String(b.platform || '').toLowerCase() !== plat) continue;
+                if(String(b.account_id || '').trim() === aid){
+                    return {
+                        token_row_id: b.id,
+                        account_id: b.account_id,
+                        metrics: {
+                            status: 'live',
+                            channel_title: b.account_name,
+                            title: b.account_name,
+                            username: b.account_username,
+                            display_name: b.account_name,
+                            page_name: b.account_name,
+                            name: b.account_name,
+                        },
+                    };
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Catalog row → watch URL, scoped to the connected channel when multiple accounts exist.
+         * `metricsAccountRow` optional: { account_id, token_row_id, metrics } from platform-metrics `accounts[]`.
+         */
+        function _catalogVideoWatchUrl(u, metricsAccountRow){
+            if(!u) return null;
+            const acct = metricsAccountRow !== undefined && metricsAccountRow !== null
+                ? metricsAccountRow
+                : _findMetricsAccountForCatalogRow(u);
+            const m = acct && acct.metrics ? acct.metrics : {};
+            const p = String(u.platform || '').toLowerCase();
+
+            let raw = String(u.platform_url || u.url || u.video_url || '').trim();
+            if(raw && /^https?:\/\//i.test(raw)){
+                if(p === 'tiktok' && (m.username || m.display_name)){
+                    const uname = String(m.username || m.display_name || '').replace(/^@+/, '').trim();
+                    let vid = u.platform_video_id != null && u.platform_video_id !== '' ? String(u.platform_video_id).trim() : '';
+                    if(vid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(vid)) vid = '';
+                    if(uname && vid && raw.indexOf('/@' + uname) === -1 && /tiktok\.com/i.test(raw)){
+                        return 'https://www.tiktok.com/@' + encodeURIComponent(uname) + '/video/' + encodeURIComponent(vid);
+                    }
+                }
+                return raw;
+            }
+
+            let vid = u.platform_video_id != null && u.platform_video_id !== '' ? String(u.platform_video_id).trim() : '';
+            if(vid && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(vid)) vid = '';
+            if(!vid) return null;
+
+            if(p === 'youtube'){
+                return 'https://www.youtube.com/watch?v=' + encodeURIComponent(vid);
+            }
+            if(p === 'facebook'){
+                const pageId = String(m.page_id || (acct && acct.account_id) || u.account_id || '').trim();
+                if(/^\d+$/.test(vid) && pageId && /^\d+$/.test(pageId)){
+                    return 'https://www.facebook.com/' + encodeURIComponent(pageId) + '/videos/' + encodeURIComponent(vid);
+                }
+                if(/^\d+$/.test(vid)) return 'https://www.facebook.com/watch/?v=' + encodeURIComponent(vid);
+                if(vid.indexOf('_') >= 0) return 'https://www.facebook.com/' + vid;
+                return 'https://www.facebook.com/watch/?v=' + encodeURIComponent(vid);
+            }
+            if(p === 'tiktok'){
+                const uname = String(m.username || m.display_name || '').replace(/^@+/, '').trim();
+                if(uname) return 'https://www.tiktok.com/@' + encodeURIComponent(uname) + '/video/' + encodeURIComponent(vid);
+                return 'https://www.tiktok.com/video/' + encodeURIComponent(vid);
+            }
+            if(p === 'instagram'){
+                if(vid && !/^\d+$/.test(vid)){
+                    return 'https://www.instagram.com/p/' + encodeURIComponent(vid) + '/';
+                }
+                return null;
+            }
+            return null;
+        }
         function setBadge(platform, state){
             const el  = document.getElementById('badge-'+platform);
             const txt = document.getElementById('badge-'+platform+'-text');
             if(!el) return;
             el.className = 'live-pill ' + state;
-            const labels = {live:'Live', cached:'Cached', error:'Error', nc:'Not Connected', sandbox:'Sandbox'};
+            const labels = {live:'Live', cached:'Cached', error:'Error', nc:'Not Connected'};
             if(txt) txt.textContent = labels[state] || state;
         }
 
         // ── tab switching ────────────────────────────────────────────────
-        window.switchTab = function(tabName){
+        window.switchTab = function(tabNameOrEv, maybeName){
+            const tabName =
+                maybeName !== undefined && maybeName !== null && maybeName !== ''
+                    ? String(maybeName)
+                    : String(tabNameOrEv);
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.querySelector(`.tab-btn[onclick="switchTab('${tabName}')"]`)?.classList.add('active');
+            document.querySelector(`.tab-btn[data-um8-arg="${tabName}"]`)?.classList.add('active');
             document.getElementById(tabName+'Tab')?.classList.add('active');
             if(tabName === 'trill' && currentAnalyticsData) loadTrillUploads();
             if(tabName === 'platforms') refreshPlatformMetrics(false);
+            if(tabName === 'crm'){
+                refreshPlatformMetrics(false);
+                if(typeof window._crmEnsureCustomDates === 'function') window._crmEnsureCustomDates();
+                if(typeof window.loadCrmDeepDive === 'function') window.loadCrmDeepDive();
+            }
         };
 
         // ── init ─────────────────────────────────────────────────────────
         document.addEventListener('DOMContentLoaded', async () => {
             const user = await initApp('analytics');
             if(!user) return;
-            initCharts();                       // init first so canvas is ready
-            await loadAnalytics();             // load overview tab data
-            refreshPlatformMetrics(false);     // kick off platform stats in background (no await — don't block overview)
-            document.getElementById('dateRangeSelect')?.addEventListener('change', loadAnalytics);
+            try { initCharts(); } catch(e) { console.warn('Chart init failed:', e); }
+            document.getElementById('loadingState').style.display = 'none';
+            document.getElementById('analyticsContent').style.display = 'block';
+            await loadAnalytics();
+            refreshPlatformMetrics(false);     // page load is cached-first for fast UI
+            const runIdleAnalytics = function() {
+                loadAnalyticsPikzelsV2().catch(function () {});
+                try { loadCatalogAggregate(); } catch (e) { console.warn('catalog agg', e); }
+            };
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(runIdleAnalytics, { timeout: 5000 });
+            } else {
+                setTimeout(runIdleAnalytics, 400);
+            }
+            document.getElementById('dateRangeSelect')?.addEventListener('change', () => {
+                loadAnalytics();
+                loadAnalyticsPikzelsV2();
+                loadCatalogAggregate();
+            });
+        });
+
+        async function loadAnalyticsPikzelsV2() {
+            const el = document.getElementById('analyticsPikzelsV2Line');
+            if (!el || typeof apiCall !== 'function') return;
+            const range = document.getElementById('dateRangeSelect')?.value || '30';
+            const map = {'7':'7d','30':'30d','90':'90d','365':'1y','all':'all'};
+            const apiRange = map[range] || '30d';
+            try {
+                const d = await apiCall('/api/analytics/pikzels-v2-usage?range=' + encodeURIComponent(apiRange));
+                const parts = (d.by_operation || []).map(function (r) { return (r.op || '?') + ': ' + (r.count || 0); });
+                el.textContent = 'Thumbnail Studio (Pikzels) actions this period: ' + (d.total_calls || 0)
+                    + (parts.length ? ' — ' + parts.join(' · ') : '')
+                    + ' · Open Thumbnail Studio from the nav anytime';
+            } catch (e) {
+                el.textContent = '';
+            }
+        }
+
+        function _applySharedAnalyticsSync(payload){
+            if(!payload || !payload.analytics) return;
+            try {
+                const cur = window.currentUser && (window.currentUser.id || window.currentUser.user_id || window.currentUser.uid);
+                const pid = payload.user_id;
+                if (!pid || !cur || String(pid) !== String(cur)) return;
+            } catch(_) {}
+            currentAnalyticsData = payload.analytics;
+            updateKPIs(payload.analytics);
+        }
+
+        window.addEventListener('uploadm8:analytics-sync', function(e){
+            _applySharedAnalyticsSync(e && e.detail);
+        });
+
+        window.addEventListener('uploadm8:analytics-refresh-all', function(e){
+            const payload = e && e.detail;
+            const cur = window.currentUser && (window.currentUser.id || window.currentUser.user_id || window.currentUser.uid);
+            const pid = payload && payload.user_id;
+            if (!cur || !pid || String(cur) !== String(pid)) return;
+            refreshPlatformMetrics(false);
         });
 
         // ── core analytics (uploads / KPIs) ─────────────────────────────
         async function loadAnalytics(){
             const range = document.getElementById('dateRangeSelect')?.value || '30';
-            const map = {'7':'7d','30':'30d','90':'90d','365':'1y','all':'1y'};
+            const map = {'7':'7d','30':'30d','90':'90d','365':'1y','all':'all'};
+            const apiRange = map[range] || '30d';
             try{
-                const data = await apiCall('/api/analytics?range='+(map[range]||'30d'));
+                // M8Stats is the canonical source — deduplicates and caches
+                const data = await (window.M8Stats
+                    ? window.M8Stats.load(apiRange)
+                    : apiCall('/api/analytics?range=' + apiRange));
                 if(!data) return;
                 currentAnalyticsData = data;
-                document.getElementById('loadingState').style.display = 'none';
-                document.getElementById('analyticsContent').style.display = 'block';
                 updateKPIs(data);
                 updateCharts(data);
-                loadTopContent(map[range]||'30d');
+                reloadTopContent();
                 if(data.trill && data.trill.trill_uploads > 0){
                     document.getElementById('trillTabBtn').style.display = 'flex';
                     updateTrillStats(data.trill);
                 }
             }catch(e){
                 console.error('Analytics load error:', e);
-                document.getElementById('loadingState').style.display = 'none';
-                document.getElementById('analyticsContent').style.display = 'block';
                 showToast('Failed to load analytics','error');
             }
         }
 
         function updateKPIs(data){
             setText('totalUploads', fmtNum(data.total_uploads || 0));
-            const sr = data.total_uploads > 0 ? Math.round((data.completed/data.total_uploads)*100) : 0;
-            setText('successRate', sr+'%');
-            setText('totalViews', fmtNum(data.views || 0));
-            const eng = data.views > 0 ? ((data.likes||0)/data.views*100).toFixed(1)+'%' : '0%';
-            setText('engagementRate', eng);
+            const sr = (data.success_rate_pct != null && data.success_rate_pct !== undefined)
+                ? Number(data.success_rate_pct).toFixed(1)
+                : (data.total_uploads > 0 ? ((data.completed / data.total_uploads) * 100).toFixed(1) : '0.0');
+            setText('successRate', sr + '%');
+            const showV = Number(data.views || 0);
+            const showL = Number(data.likes || 0);
+            const showC = Number(data.comments || 0);
+            const showS = Number(data.shares || 0);
+            // Canonical engagement row (Views/Likes/Comments/Shares) — same source as Dashboard & Queue
+            if (window.M8Stats) {
+                window.M8Stats.applyToElements(data, {
+                    views:           'totalViews',
+                    likes:           'totalLikes',
+                    comments:        'totalComments',
+                    shares:          'totalShares',
+                    engagement_rate: 'engagementRate',
+                });
+            } else {
+                setText('totalViews', fmtNum(showV));
+                setText('totalLikes', fmtNum(showL));
+                setText('totalComments', fmtNum(showC));
+                setText('totalShares', fmtNum(showS));
+                const interactions = showL + showC + showS;
+                setText('engagementRate', showV > 0 ? ((interactions / showV) * 100).toFixed(1) + '%' : '0%');
+            }
         }
 
+        // ── Catalog aggregate — delegate to shared widget ────────────────
+        function loadCatalogAggregate(){
+            const range = document.getElementById('dateRangeSelect')?.value || '30';
+            // Map analytics page range selector → period string
+            const rangeMap = {'7':'7d','30':'30d','90':'90d','365':'365d','all':'all'};
+            const period = rangeMap[range] || '30d';
+            if (window.CatalogAgg) window.CatalogAgg.load('analyticsAggWidget', period);
+        }
+
+        window.triggerCatalogSync = function() {
+            if (window.CatalogAgg) window.CatalogAgg._sync('analyticsAggWidget');
+        };
+
+        // ── Deep Dive (CRM) tab ─────────────────────────────────────────
+        window.__crmSelectedPlatform = null;
+        const _CRM_PLAT_ORDER = ['tiktok','youtube','instagram','facebook'];
+        const _CRM_PLAT_META = {
+            tiktok:    { label:'TikTok',             icon:'fab fa-tiktok',     cls:'tiktok' },
+            youtube:   { label:'YouTube',            icon:'fab fa-youtube',    cls:'youtube' },
+            instagram: { label:'Instagram Reels',  icon:'fab fa-instagram',  cls:'instagram' },
+            facebook:  { label:'Facebook Reels',   icon:'fab fa-facebook-f', cls:'facebook' },
+        };
+
+        window._crmOnTimelineModeChange = function(){
+            const mode = document.getElementById('crmTimelineMode')?.value || 'preset';
+            const presetWrap = document.getElementById('crmPresetWrap');
+            const customWrap = document.getElementById('crmCustomWrap');
+            if(presetWrap) presetWrap.style.display = mode === 'preset' ? '' : 'none';
+            if(customWrap) customWrap.style.display = mode === 'preset' ? 'none' : 'flex';
+        };
+
+        window._crmSyncTimelineFromPageHeader = function(){
+            const hdr = document.getElementById('dateRangeSelect')?.value || '30';
+            const sel = document.getElementById('crmPresetSelect');
+            if(sel) sel.value = hdr;
+            const tm = document.getElementById('crmTimelineMode');
+            if(tm) tm.value = 'preset';
+            window._crmOnTimelineModeChange();
+            window.loadCrmDeepDive();
+        };
+
+        /** Returns aggregate qs (period), content qs (days or start/end), label. All suffixes start with &. */
+        function _crmTimelineQuery(){
+            const mode = document.getElementById('crmTimelineMode')?.value || 'preset';
+            if(mode === 'custom'){
+                const ds = document.getElementById('crmDateStart')?.value;
+                const de = document.getElementById('crmDateEnd')?.value;
+                if(!ds || !de) return { error:'Choose start and end dates for the custom range.', qs:'', contentQs:'', label:'', periodLabel:'' };
+                const startMs = Date.parse(ds + 'T00:00:00.000Z');
+                const endInclusiveMs = Date.parse(de + 'T00:00:00.000Z');
+                if(endInclusiveMs < startMs) return { error:'End date must be on or after start date.', qs:'', contentQs:'', label:'', periodLabel:'' };
+                const endEx = new Date(endInclusiveMs);
+                endEx.setUTCDate(endEx.getUTCDate() + 1);
+                const qs = '&start=' + encodeURIComponent(new Date(startMs).toISOString()) +
+                    '&end=' + encodeURIComponent(endEx.toISOString());
+                return {
+                    qs,
+                    contentQs: qs,
+                    label: new Date(ds).toLocaleDateString() + ' – ' + new Date(de).toLocaleDateString(),
+                    periodLabel: 'custom',
+                };
+            }
+            const preset = document.getElementById('crmPresetSelect')?.value || '30';
+            const periodMap = {'7':'7d','30':'30d','90':'90d','365':'365d','all':'all'};
+            const p = periodMap[preset] || '30d';
+            const qs = '&period=' + encodeURIComponent(p);
+            const contentQs = preset === 'all' ? '' : ('&days=' + encodeURIComponent(preset));
+            const lab = preset === 'all' ? 'All time' : ('Last ' + preset + ' days');
+            return { qs, contentQs, label: lab, periodLabel: p };
+        }
+
+        function _crmAccountLabel(plat, metrics, accountId){
+            const m = metrics || {};
+            if(plat === 'tiktok') return (m.username || m.display_name || accountId || 'TikTok').toString().slice(0,48);
+            if(plat === 'youtube') return (m.channel_title || m.title || accountId || 'YouTube').toString().slice(0,48);
+            if(plat === 'instagram') return (m.username || m.name || accountId || 'Instagram').toString().slice(0,48);
+            if(plat === 'facebook') return (m.page_name || m.name || accountId || 'Page').toString().slice(0,48);
+            return (accountId || 'Account').toString().slice(0,32);
+        }
+
+        /** Prefer human-readable names from /api/platform-accounts over raw channel/page IDs. */
+        function _crmResolveAccountDropdownLabel(plat, row){
+            const m = row.metrics || {};
+            const accountId = row.account_id;
+            const tokenId = row.token_row_id;
+            const list = window.__crmPlatformAccountsList || [];
+            for(var i = 0; i < list.length; i++){
+                var a = list[i];
+                if(!a || String(a.platform || '').toLowerCase() !== plat) continue;
+                var match = (tokenId && String(a.id) === String(tokenId))
+                    || (accountId != null && String(a.account_id) === String(accountId));
+                if(!match) continue;
+                var nm = (a.account_name || '').trim();
+                var un = (a.account_username || '').trim();
+                if(plat === 'youtube' || plat === 'facebook'){
+                    if(nm) return nm.slice(0, 56);
+                    if(un) return un.slice(0, 56);
+                } else {
+                    if(un) return un.slice(0, 56);
+                    if(nm) return nm.slice(0, 56);
+                }
+                break;
+            }
+            return _crmAccountLabel(plat, m, accountId);
+        }
+
+        async function _crmFillAccountSelect(plat){
+            const sel = document.getElementById('crmAccountFilter');
+            const hint = document.getElementById('crmAccountHint');
+            if(!sel) return;
+            const prev = sel.value;
+            sel.innerHTML = '<option value="">All accounts (merged)</option>';
+            if(!window.__crmPlatformAccountsList || !window.__crmPlatformAccountsList.length){
+                try{
+                    const res = await apiCall('/api/platform-accounts');
+                    window.__crmPlatformAccountsList = (res && res.accounts) ? res.accounts : [];
+                }catch(_e){
+                    window.__crmPlatformAccountsList = [];
+                }
+            }
+            const pm = window.__analyticsPlatformMetrics && window.__analyticsPlatformMetrics.platforms
+                ? window.__analyticsPlatformMetrics.platforms[plat] : null;
+            let rows = pm && Array.isArray(pm.accounts) ? pm.accounts : [];
+            if(rows.length === 0){
+                rows = (window.__crmPlatformAccountsList || []).filter(function(a){
+                    return String(a.platform || '').toLowerCase() === plat;
+                }).map(function(a){
+                    return {
+                        token_row_id: a.id,
+                        account_id: a.account_id,
+                        metrics: {
+                            status: 'live',
+                            channel_title: a.account_name,
+                            title: a.account_name,
+                            username: a.account_username,
+                            display_name: a.account_name,
+                            page_name: a.account_name,
+                            name: a.account_name,
+                        },
+                    };
+                });
+            }
+            rows.forEach(function(a){
+                const m = a.metrics || {};
+                const st = (m.status || a.status || '');
+                const lab = _crmResolveAccountDropdownLabel(plat, a) + (st && st !== 'live' ? ' ('+st+')' : '');
+                const o = document.createElement('option');
+                o.value = a.token_row_id || '';
+                o.textContent = lab;
+                sel.appendChild(o);
+            });
+            if(prev && Array.prototype.some.call(sel.options, function(o){ return o.value === prev; })) sel.value = prev;
+            if(hint){
+                hint.textContent = rows.length > 1
+                    ? 'Merged KPIs sum every connected account. Pick one account for catalog + live stats scoped to that identity.'
+                    : '';
+            }
+        }
+
+        function _crmRenderRollup(agg){
+            const strip = document.getElementById('crmRollupStrip');
+            if(!strip || !agg) return;
+            strip.style.display = 'grid';
+            const t = agg.total_videos||0, v = agg.views||0, l = agg.likes||0, c = agg.comments||0, s = agg.shares||0;
+            const er = agg.engagement_rate != null ? Number(agg.engagement_rate).toFixed(1) : '0.0';
+            strip.innerHTML =
+                '<div class="lbl"><i class="fas fa-globe-americas"></i> All platforms (catalog)</div>'+
+                '<div class="crm-kpi-cell"><div class="v">'+fmtNum(t)+'</div><div class="l">Videos</div></div>'+
+                '<div class="crm-kpi-cell"><div class="v">'+fmtNum(v)+'</div><div class="l">Views</div></div>'+
+                '<div class="crm-kpi-cell"><div class="v">'+fmtNum(l)+'</div><div class="l">Likes</div></div>'+
+                '<div class="crm-kpi-cell"><div class="v">'+fmtNum(c)+'</div><div class="l">Comments</div></div>'+
+                '<div class="crm-kpi-cell"><div class="v">'+fmtNum(s)+'</div><div class="l">Shares</div></div>'+
+                '<div class="crm-kpi-cell"><div class="v">'+er+'%</div><div class="l">Engagement</div></div>';
+        }
+
+        function _crmLiveKpiCells(plat, basePm, singleMetrics, uploadCount){
+            const pm = singleMetrics || basePm || {};
+            const up = uploadCount != null ? uploadCount : (basePm && basePm.uploads);
+            if(plat === 'tiktok'){
+                return '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(up||0)+'</div><div class="l">Uploads*</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.views||0)+'</div><div class="l">Views</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.likes||0)+'</div><div class="l">Likes</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.comments||0)+'</div><div class="l">Comments</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.shares||0)+'</div><div class="l">Shares</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+(pm.followers!=null?fmtNum(pm.followers):'—')+'</div><div class="l">Followers</div></div>';
+            }
+            if(plat === 'youtube'){
+                return '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(up||0)+'</div><div class="l">Uploads*</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.views||0)+'</div><div class="l">Views</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.likes||0)+'</div><div class="l">Likes</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.comments||0)+'</div><div class="l">Comments</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.subscribers||0)+'</div><div class="l">Subscribers</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.video_count||0)+'</div><div class="l">Videos</div></div>';
+            }
+            if(plat === 'instagram'){
+                return '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(up||0)+'</div><div class="l">Uploads*</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.views||0)+'</div><div class="l">Plays</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.likes||0)+'</div><div class="l">Likes</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.comments||0)+'</div><div class="l">Comments</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.saves||0)+'</div><div class="l">Saves</div></div>'+
+                    '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.reach||0)+'</div><div class="l">Reach</div></div>';
+            }
+            return '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(up||0)+'</div><div class="l">Uploads*</div></div>'+
+                '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.views||0)+'</div><div class="l">Views</div></div>'+
+                '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.reactions||0)+'</div><div class="l">Reactions</div></div>'+
+                '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.comments||0)+'</div><div class="l">Comments</div></div>'+
+                '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.shares||0)+'</div><div class="l">Shares</div></div>'+
+                '<div class="crm-kpi-cell live-strip"><div class="v">'+fmtNum(pm.followers||0)+'</div><div class="l">Followers</div></div>';
+        }
+
+        window._crmEnsureCustomDates = function(){
+            const ds = document.getElementById('crmDateStart');
+            const de = document.getElementById('crmDateEnd');
+            if(ds && de && !ds.value && !de.value){
+                const d = new Date();
+                de.value = d.toISOString().slice(0,10);
+                const s = new Date(d.getTime() - 29 * 864e5);
+                ds.value = s.toISOString().slice(0,10);
+            }
+        };
+
+        window.loadCrmDeepDive = async function(){
+            const listEl = document.getElementById('crmPlatformList');
+            const tq = _crmTimelineQuery();
+            if(tq.error){
+                showToast(tq.error, 'error');
+                return;
+            }
+            if(listEl) listEl.innerHTML = '<div style="padding:1rem;color:var(--text-muted);font-size:0.85rem;"><i class="fas fa-spinner fa-spin"></i> Loading platforms…</div>';
+            try{
+                if(!window.__crmPlatformAccountsList || !window.__crmPlatformAccountsList.length){
+                    const resPa = await apiCall('/api/platform-accounts');
+                    window.__crmPlatformAccountsList = (resPa && resPa.accounts) ? resPa.accounts : [];
+                }
+                window.__crmPlatformAccountsByCount = {};
+                (window.__crmPlatformAccountsList || []).forEach(function(a){
+                    const p = String(a.platform || '').toLowerCase();
+                    window.__crmPlatformAccountsByCount[p] = (window.__crmPlatformAccountsByCount[p] || 0) + 1;
+                });
+            }catch(_e){
+                window.__crmPlatformAccountsList = [];
+                window.__crmPlatformAccountsByCount = {};
+            }
+            let agg;
+            try{
+                agg = await apiCall('/api/catalog/aggregate?' + tq.qs.slice(1));
+            }catch(e){
+                console.error('CRM aggregate:', e);
+                if(listEl) listEl.innerHTML = '<div class="empty-state" style="padding:1rem;">Could not load catalog</div>';
+                return;
+            }
+            window.__crmAggregate = agg;
+            _crmRenderRollup(agg);
+            try{
+                window.__crmUploadCountsByToken = await apiCall('/api/analytics/upload-counts-by-token');
+            }catch(_e){
+                window.__crmUploadCountsByToken = { by_platform: {} };
+            }
+            const byPlat = agg && agg.by_platform ? agg.by_platform : {};
+            const rows = _CRM_PLAT_ORDER.map(function(key){
+                const meta = _CRM_PLAT_META[key];
+                const row = byPlat[key] || { video_count:0, views:0, likes:0, comments:0, shares:0, engagement_rate:0 };
+                const pm = window.__analyticsPlatformMetrics && window.__analyticsPlatformMetrics.platforms
+                    ? window.__analyticsPlatformMetrics.platforms[key] : null;
+                let conn = '—';
+                const nConn = window.__crmPlatformAccountsByCount && window.__crmPlatformAccountsByCount[key];
+                if(pm){
+                    if(pm.status === 'not_connected'){
+                        conn = (nConn > 0) ? (nConn + ' accts') : 'Not connected';
+                    }else if(pm.status === 'error') conn = 'Error';
+                    else conn = (pm.accounts_polled > 1 ? pm.accounts_polled + ' accts' : 'Connected');
+                } else if(nConn > 0){
+                    conn = nConn + ' accts';
+                }
+                const active = window.__crmSelectedPlatform === key ? ' active' : '';
+                const v = row.views||0, eng = row.engagement_rate != null ? Number(row.engagement_rate).toFixed(1) : '0.0';
+                return '<div class="crm-plat-row'+active+'" data-plat="'+key+'" data-um8-fn="selectCrmPlatform" data-um8-arg="'+key+'">'+
+                    '<div class="platform-icon '+meta.cls+' crm-plat-icon"><i class="'+meta.icon+'"></i></div>'+
+                    '<div class="crm-plat-meta">'+
+                    '<div class="crm-plat-name">'+meta.label+' <span style="font-size:0.65rem;font-weight:600;color:var(--text-muted);">'+conn+'</span></div>'+
+                    '<div class="crm-plat-mini">'+fmtNum(row.video_count||0)+' videos · '+fmtNum(v)+' views · '+eng+'% eng.</div>'+
+                    '</div></div>';
+            }).join('');
+            if(listEl) listEl.innerHTML = rows || '';
+            const pick = window.__crmSelectedPlatform && _CRM_PLAT_ORDER.indexOf(window.__crmSelectedPlatform) >= 0
+                ? window.__crmSelectedPlatform : 'tiktok';
+            await window.selectCrmPlatform(pick);
+        };
+
+        window.selectCrmPlatform = async function(first, second, third){
+            let plat, opts;
+            if (first && typeof first === 'object' && first.currentTarget) {
+                plat = second;
+                opts = third || {};
+            } else {
+                plat = first;
+                opts = (typeof second === 'object' && second !== null) ? second : {};
+            }
+            opts = opts || {};
+            if(!plat || _CRM_PLAT_ORDER.indexOf(plat) < 0) return;
+            window.__crmSelectedPlatform = plat;
+            document.querySelectorAll('.crm-plat-row').forEach(function(el){
+                el.classList.toggle('active', el.getAttribute('data-plat') === plat);
+            });
+            await _crmFillAccountSelect(plat);
+            const tokenId = document.getElementById('crmAccountFilter')?.value || '';
+            const pm = window.__analyticsPlatformMetrics && window.__analyticsPlatformMetrics.platforms
+                ? window.__analyticsPlatformMetrics.platforms[plat] : null;
+            let accountRow = null;
+            let singleMetrics = null;
+            if(tokenId && pm && Array.isArray(pm.accounts)){
+                accountRow = pm.accounts.find(function(a){ return String(a.token_row_id) === String(tokenId); }) || null;
+                singleMetrics = accountRow && accountRow.metrics && accountRow.metrics.status === 'live' ? accountRow.metrics : (accountRow && accountRow.metrics ? accountRow.metrics : null);
+            }
+            if(!accountRow && tokenId && window.__crmPlatformAccountsList && window.__crmPlatformAccountsList.length){
+                const hit = window.__crmPlatformAccountsList.find(function(a){
+                    return String(a.id) === String(tokenId) && String(a.platform || '').toLowerCase() === plat;
+                });
+                if(hit){
+                    accountRow = {
+                        token_row_id: hit.id,
+                        account_id: hit.account_id,
+                        metrics: {
+                            status: 'live',
+                            channel_title: hit.account_name,
+                            title: hit.account_name,
+                            username: hit.account_username,
+                        },
+                    };
+                    singleMetrics = accountRow.metrics;
+                }
+            }
+            let catalogAccountQs = '';
+            if(tokenId && accountRow && accountRow.account_id){
+                catalogAccountQs = '&account_id=' + encodeURIComponent(String(accountRow.account_id));
+            }
+            const tq = _crmTimelineQuery();
+            if(tq.error){
+                showToast(tq.error, 'error');
+                return;
+            }
+            let aggPlat = (window.__crmAggregate && window.__crmAggregate.by_platform && window.__crmAggregate.by_platform[plat]) || {};
+            if(tokenId && accountRow && accountRow.account_id){
+                try{
+                    const ap = await apiCall('/api/catalog/aggregate?platform=' + encodeURIComponent(plat) + catalogAccountQs + (tq.qs || ''));
+                    if(ap && ap.by_platform && ap.by_platform[plat]) aggPlat = ap.by_platform[plat];
+                    else if(ap && ap.total_videos != null){
+                        aggPlat = {
+                            video_count: ap.total_videos,
+                            views: ap.views, likes: ap.likes, comments: ap.comments, shares: ap.shares,
+                            engagement_rate: ap.engagement_rate,
+                        };
+                    }
+                }catch(_e){
+                    /* keep sidebar rollup */
+                }
+            }
+            const meta = _CRM_PLAT_META[plat];
+            const head = document.getElementById('crmDetailHeading');
+            if(head) head.innerHTML = '<i class="'+meta.icon+'" style="opacity:.9;"></i> '+meta.label + (tokenId ? ' · one account' : '');
+            const sub = document.getElementById('crmDetailSub');
+            const w = window.__crmAggregate && window.__crmAggregate.window_start_utc;
+            const w2 = window.__crmAggregate && window.__crmAggregate.window_end_exclusive_utc;
+            if(sub){
+                var line = 'Catalog: ' + tq.label;
+                if(tq.periodLabel !== 'custom' && w && w2) line += ' · ' + new Date(w).toLocaleDateString() + ' – ' + new Date(w2).toLocaleDateString();
+                sub.textContent = line;
+            }
+            const ck = document.getElementById('crmCatalogKpis');
+            if(ck){
+                const er = aggPlat.engagement_rate != null ? Number(aggPlat.engagement_rate).toFixed(1) : '0.0';
+                const scope = tokenId ? 'This account · catalog' : 'Platform · catalog';
+                ck.innerHTML =
+                    '<div style="grid-column:1/-1;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-bottom:0.25rem;">'+scope+'</div>'+
+                    '<div class="crm-kpi-cell"><div class="v">'+fmtNum(aggPlat.video_count||0)+'</div><div class="l">Videos</div></div>'+
+                    '<div class="crm-kpi-cell"><div class="v">'+fmtNum(aggPlat.views||0)+'</div><div class="l">Views</div></div>'+
+                    '<div class="crm-kpi-cell"><div class="v">'+fmtNum(aggPlat.likes||0)+'</div><div class="l">Likes</div></div>'+
+                    '<div class="crm-kpi-cell"><div class="v">'+fmtNum(aggPlat.comments||0)+'</div><div class="l">Comments</div></div>'+
+                    '<div class="crm-kpi-cell"><div class="v">'+fmtNum(aggPlat.shares||0)+'</div><div class="l">Shares</div></div>'+
+                    '<div class="crm-kpi-cell"><div class="v">'+er+'%</div><div class="l">Engagement</div></div>';
+            }
+            const lk = document.getElementById('crmLiveKpis');
+            if(lk){
+                const liveLabel = (window.__analyticsPlatformMetrics && window.__analyticsPlatformMetrics.cached) ? 'Live API (cached)' : 'Live API';
+                const upMap = (window.__crmUploadCountsByToken && window.__crmUploadCountsByToken.by_platform) || {};
+                const upOne = tokenId ? (upMap[plat] && upMap[plat][tokenId]) : null;
+                const foot = tokenId
+                    ? '<div style="grid-column:1/-1;font-size:0.62rem;color:var(--text-muted);margin-top:0.35rem;">*Uploads = completed jobs explicitly targeted at this connection. Empty targets are not split per account.</div>'
+                    : '<div style="grid-column:1/-1;font-size:0.62rem;color:var(--text-muted);margin-top:0.35rem;">*Uploads = all completed jobs for this platform (multi-account).</div>';
+                if(tokenId){
+                    if(singleMetrics && singleMetrics.status === 'live'){
+                        lk.style.display = 'grid';
+                        lk.innerHTML = '<div style="grid-column:1/-1;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#10b981;margin:0.5rem 0 0.25rem 0;">'+liveLabel+' · one account</div>'+
+                            _crmLiveKpiCells(plat, pm, singleMetrics, upOne)+foot;
+                    } else if(accountRow && accountRow.metrics && accountRow.metrics.status === 'error'){
+                        lk.style.display = 'grid';
+                        lk.innerHTML = '<div style="grid-column:1/-1;font-size:0.75rem;color:#ef4444;">Could not refresh live data: '+escapeHtml((accountRow.metrics.error_detail||accountRow.metrics.error||'error').toString().slice(0,200))+'</div>';
+                    } else {
+                        lk.style.display = 'none';
+                        lk.innerHTML = '';
+                    }
+                } else if(pm && pm.status === 'live'){
+                    lk.style.display = 'grid';
+                    lk.innerHTML = '<div style="grid-column:1/-1;font-size:0.65rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#10b981;margin:0.5rem 0 0.25rem 0;">'+liveLabel+' · merged accounts</div>'+
+                        _crmLiveKpiCells(plat, pm, null, pm.uploads)+foot;
+                } else if(pm && pm.status === 'error'){
+                    lk.style.display = 'grid';
+                    lk.innerHTML = '<div style="grid-column:1/-1;font-size:0.75rem;color:#ef4444;">Could not refresh live data: '+escapeHtml((pm.error_detail||pm.error||'error').toString().slice(0,200))+'</div>';
+                } else {
+                    lk.style.display = 'none';
+                    lk.innerHTML = '';
+                }
+            }
+            if(opts.skipVideos) return;
+            const src = document.getElementById('crmSourceFilter')?.value || 'all';
+            const srcQs = src === 'all' ? '' : ('&source=' + encodeURIComponent(src));
+            const tbody = document.getElementById('crmVideoTable');
+            const metaEl = document.getElementById('crmTableMeta');
+            const showAcctCol = !tokenId;
+            document.querySelectorAll('.crm-col-account').forEach(function(th){ th.style.display = showAcctCol ? '' : 'none'; });
+            const colSpan = showAcctCol ? 10 : 9;
+            if(tbody) tbody.innerHTML = '<tr><td colspan="'+colSpan+'" class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>Loading videos…</p></td></tr>';
+            try{
+                const timeForContent = tq.contentQs != null ? tq.contentQs : tq.qs;
+                var contentUrl = '/api/catalog/content?platform='+encodeURIComponent(plat)+'&sort=views&limit=200&order=desc'+timeForContent+srcQs+catalogAccountQs;
+                const res = await apiCall(contentUrl);
+                const items = res && res.items ? res.items : [];
+                const total = res && res.total != null ? res.total : items.length;
+                if(metaEl) metaEl.textContent = items.length + ' shown · ' + total + ' in filter';
+                if(!items.length){
+                    if(tbody) tbody.innerHTML = '<tr><td colspan="'+colSpan+'" class="empty-state"><i class="fas fa-film"></i><p>No videos in this window — sync catalog or narrow filters.</p></td></tr>';
+                    return;
+                }
+                if(tbody) tbody.innerHTML = items.map(function(u){
+                    const v = u.views||0, l = u.likes||0, c = u.comments||0, s = u.shares||0;
+                    const eng = u.engagement_rate != null ? Number(u.engagement_rate).toFixed(1)+'%' : (v>0 ? ((l+c+s)/v*100).toFixed(1)+'%' : '0%');
+                    const title = escapeHtml((u.title && String(u.title).trim()) ? u.title : (u.platform_video_id || 'Untitled'));
+                    var accForUrl = (tokenId && accountRow && String(accountRow.account_id||'') === String(u.account_id||''))
+                        ? accountRow
+                        : _findMetricsAccountForCatalogRow(u);
+                    const href = _catalogVideoWatchUrl(u, accForUrl);
+                    const linkStart = href ? '<a href="'+escapeHtml(href)+'" target="_blank" rel="noopener noreferrer" class="crm-vid-link" title="Open video">' : '';
+                    const linkEnd = href ? '</a>' : '';
+                    const thumbImg = u.thumbnail_url
+                        ? '<img class="crm-vid-thumb" src="'+escapeHtml(u.thumbnail_url)+'" alt="" loading="lazy" onerror="this.style.visibility=\'hidden\'">'
+                        : '<div class="crm-vid-thumb"></div>';
+                    const thumb = href
+                        ? '<a href="'+escapeHtml(href)+'" target="_blank" rel="noopener noreferrer" class="crm-thumb-link" title="Open video">'+thumbImg+'</a>'
+                        : thumbImg;
+                    const pub = u.published_at ? new Date(u.published_at).toLocaleDateString() : '—';
+                    const acctDisp = (u.account_label && String(u.account_label).trim()) ? String(u.account_label).trim() : String(u.account_id || '');
+                    const acct = escapeHtml(acctDisp.slice(0, 48));
+                    const acctCell = showAcctCol ? '<td style="font-size:0.72rem;color:var(--text-muted);" title="'+acct+'">'+acct+'</td>' : '';
+                    return '<tr>'+
+                        '<td>'+thumb+'</td>'+
+                        '<td class="crm-title-cell" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="'+title+'">'+linkStart+title+linkEnd+'</td>'+
+                        acctCell+
+                        '<td>'+_srcBadge(u.source)+'</td>'+
+                        '<td>'+fmtNum(v)+'</td><td>'+fmtNum(l)+'</td><td>'+fmtNum(c)+'</td><td>'+fmtNum(s)+'</td>'+
+                        '<td>'+eng+'</td><td style="font-size:0.8rem;">'+pub+'</td>'+
+                        '</tr>';
+                }).join('');
+            }catch(err){
+                console.error('CRM content:', err);
+                if(tbody) tbody.innerHTML = '<tr><td colspan="'+colSpan+'" class="empty-state">Failed to load videos</td></tr>';
+                if(metaEl) metaEl.textContent = '';
+            }
+        };
+
+        // ── Source badge helper ─────────────────────────────────────────
+        function _srcBadge(source){
+            if (!source) return '';
+            const map = {
+                uploadm8: {cls:'uploadm8', icon:'fa-rocket',     label:'UploadM8'},
+                linked:   {cls:'linked',   icon:'fa-link',       label:'Linked'},
+                external: {cls:'external', icon:'fa-globe',      label:'External'},
+            };
+            const m = map[source] || {cls:'external', icon:'fa-globe', label: source};
+            return `<span class="src-badge ${m.cls}"><i class="fas ${m.icon}"></i>${m.label}</span>`;
+        }
+
+        // ── reloadTopContent — decides which data source to use ─────────
+        window.reloadTopContent = function(){
+            const useCatalog = document.getElementById('topContentCatalogToggle')?.checked;
+            const noteEl = document.getElementById('topContentSourceNote');
+            if (useCatalog) {
+                if (noteEl) noteEl.textContent = 'All catalog videos (UploadM8 + external)';
+                loadTopContentFromCatalog();
+            } else {
+                if (noteEl) noteEl.textContent = 'UploadM8 uploads only';
+                const range = document.getElementById('dateRangeSelect')?.value || '30';
+                const map = {'7':'7d','30':'30d','90':'90d','365':'1y','all':'all'};
+                loadTopContent(map[range] || '30d');
+            }
+        };
+
         // ── platform metrics (live) ──────────────────────────────────────
-        window.refreshPlatformMetrics = async function(force){
+        async function _pollForFreshPlatformCache(previousFetchedAt, maxWaitMs){
+            const started = Date.now();
+            const baseline = String(previousFetchedAt || '');
+            while ((Date.now() - started) < maxWaitMs) {
+                await new Promise(r => setTimeout(r, 1200));
+                try {
+                    const next = await apiCall('/api/analytics/platform-metrics/cached');
+                    const nextTs = String((next && next.fetched_at) || '');
+                    if (nextTs && nextTs !== baseline) return next;
+                } catch (_) {}
+            }
+            return null;
+        }
+
+        window.refreshPlatformMetrics = async function(first, second){
+            let force = false;
+            if (first && typeof first === 'object' && 'preventDefault' in first) {
+                force = second === true || second === 'true';
+            } else {
+                force = !!first;
+            }
             const btn = document.getElementById('refreshBtn');
             if(btn){ btn.classList.add('spinning'); btn.disabled = true; }
-            setText('refreshStatusText', 'Fetching live data…');
+            setText('refreshStatusText', force ? 'Refreshing in background…' : 'Loading cached data…');
             // Reset all scope badges to loading state
             const allScopeIds = [
                 'scope-tt-videolist','scope-tt-userstats','scope-tt-publish',
@@ -677,11 +1601,36 @@
             ];
             allScopeIds.forEach(id => setScopeBadge(id, 'pending', '…'));
             try{
-                const data = await apiCall('/api/analytics/platform-metrics'+(force?'?force=true':''));
+                const initial = await apiCall('/api/analytics/platform-metrics/cached').catch(() => null);
+                if (initial) applyPlatformData(initial);
+
+                if(force){
+                    setText('refreshStatusText', 'Refreshing live platform stats…');
+                    let refreshOk = false;
+                    try {
+                        const syncRes = await apiCall('/api/analytics/refresh-all?async_mode=false', { method:'POST', body:'{}' });
+                        refreshOk = !!(syncRes && syncRes.ok);
+                    } catch (_) {
+                        // Fallback to queued refresh if synchronous call times out/fails.
+                        await apiCall('/api/analytics/refresh-all?async_mode=true', { method:'POST', body:'{}' }).catch(() => null);
+                    }
+                    const fresh = await _pollForFreshPlatformCache(initial && initial.fetched_at, refreshOk ? 9000 : 12000);
+                    if (fresh) {
+                        applyPlatformData(fresh);
+                        return;
+                    }
+                }
+                const data = await apiCall('/api/analytics/platform-metrics/cached');
+                if ((!data || !data.platforms || !Object.keys(data.platforms).length) && !force) {
+                    const fallback = await apiCall('/api/analytics/platform-metrics').catch(() => null);
+                    applyPlatformData(fallback || data || {});
+                    return;
+                }
                 applyPlatformData(data);
             }catch(e){
                 console.warn('Platform metrics endpoint not available yet:', e.message);
-                setText('refreshStatusText', 'Platform data unavailable — deploy backend endpoint first');
+                window.__analyticsPlatformMetrics = null;
+                setText('refreshStatusText', 'Platform data unavailable right now');
                 ['tiktok','youtube','instagram','facebook'].forEach(p => setBadge(p,'nc'));
                 // Mark all scopes as error state
                 const allScopeIds = [
@@ -706,20 +1655,21 @@
 
         // ── Context note helper ───────────────────────────────────────────────
         // Shows a contextual explanation inside the scope card when a platform
-        // has a known limitation (sandbox, unverified app, pending review).
+        // has a known limitation or shows API approval status.
         const _CONTEXT_NOTES = {
             tt: {
-                sandbox: {cls:'sandbox', icon:'fa-flask', text:
-                    '<strong>TikTok Sandbox Mode</strong> — Scopes are granted and working. ' +
-                    'Data is limited to sandbox test accounts. Apply for production access to go live.'},
-                error:   {cls:'sandbox', icon:'fa-exclamation-triangle', text:
-                    'Token may need refreshing. Disconnect and reconnect your TikTok account to restore access.'},
+                live: {cls:'live', icon:'fa-check-circle', text:
+                    '<strong>TikTok API — Live</strong> · Production-approved app with full access to ' +
+                    '<code>video.list</code>, <code>user.info.stats</code>, and <code>video.publish</code>. ' +
+                    'Views, likes, comments, and shares update in real time.'},
+                error: {cls:'unverified', icon:'fa-exclamation-triangle', text:
+                    'Token expired or revoked. Disconnect and reconnect your TikTok account in ' +
+                    '<a href="platforms.html" style="color:inherit;text-decoration:underline;">Connected Accounts</a> to restore access.'},
             },
             yt: {
-                unverified: {cls:'unverified', icon:'fa-clock', text:
-                    '<strong>App not yet verified by Google</strong> — <code>yt-analytics.readonly</code> works for ' +
-                    'the account owner (you) while in testing. Channel stats are shown as a fallback. ' +
-                    'Analytics will upgrade automatically once Google verifies the app.'},
+                live: {cls:'live', icon:'fa-check-circle', text:
+                    '<strong>YouTube API — Live</strong> · Full access to YouTube Data API v3 and ' +
+                    'YouTube Analytics API. Views, likes, comments, shares, watch time, and subscriber counts update in real time.'},
             },
             ig: {
                 pending: {cls:'pending', icon:'fa-hourglass-half', text:
@@ -748,17 +1698,20 @@
         }
 
         // ── Data source tag helper ─────────────────────────────────────────────
-        function setSourceTag(id, source){
+        function setSourceTag(id, source, fullLabel){
             const el = document.getElementById(id);
             if(!el) return;
-            if(!source){ el.innerHTML=''; return; }
-            const isAnalytics = source.includes('analytics') || source.includes('insights') || source.includes('video.list');
+            if(!source && !fullLabel){ el.innerHTML=''; return; }
+            const display = fullLabel || source;
+            if(!display){ el.innerHTML=''; return; }
+            const isAnalytics = (source||'').includes('analytics') || (source||'').includes('insights') || (source||'').includes('video.list');
             const cls = isAnalytics ? 'source-highlight' : 'source-fallback';
-            el.innerHTML = 'Data via: <span class="'+cls+'">'+source+'</span>';
+            el.innerHTML = fullLabel ? '<span class="'+cls+'">'+display+'</span>' : 'Data via: <span class="'+cls+'">'+display+'</span>';
         }
 
         function applyPlatformData(data){
             if(!data || !data.platforms) return;
+            window.__analyticsPlatformMetrics = data;
             const p  = data.platforms;
             const ts = data.fetched_at ? new Date(data.fetched_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '';
             const stateLabel = data.cached ? 'Cached' : 'Live';
@@ -787,21 +1740,22 @@
                 setScopeBadge('scope-tt-publish','pending','Not connected');
                 _setContextNote('tt', null);
             } else if(tt.status==='error'){
-                // Distinguish sandbox mode (403/401) from hard error
-                const isSandbox = tt.error && (String(tt.error).includes('sandbox') ||
-                    String(tt.error).includes('401') || String(tt.error).includes('403') ||
-                    String(tt.error).includes('video_list_http_4'));
-                setBadge('tiktok', isSandbox ? 'sandbox' : 'error');
+                setBadge('tiktok','error');
                 setText('tt-uploads', fmtNum(tt.uploads||0));
-                if(isSandbox){
-                    setScopeBadge('scope-tt-videolist','fallback','Sandbox Mode');
-                    setScopeBadge('scope-tt-userstats','fallback','Sandbox Mode');
-                    setScopeBadge('scope-tt-publish','fallback','Sandbox Mode');
-                    _setContextNote('tt','sandbox');
+                setScopeBadge('scope-tt-videolist','error','Error');
+                setScopeBadge('scope-tt-userstats','error','Error');
+                setScopeBadge('scope-tt-publish','pending','--');
+                var ttHint = (tt.error_detail || tt.error || '').toString();
+                if (ttHint && (ttHint.indexOf('access_token') >= 0 || ttHint.indexOf('invalid') >= 0 || ttHint.indexOf('401') >= 0)) {
+                    _setContextNote('tt','error');
+                } else if (ttHint) {
+                    var nel = document.getElementById('note-tt');
+                    if (nel) {
+                        nel.innerHTML = '<div class="scope-context-note unverified"><i class="fas fa-exclamation-triangle"></i><span><strong>TikTok API</strong> — ' +
+                            escapeHtml(ttHint.slice(0, 280)) +
+                            ' · <a href="platforms.html" style="color:inherit;text-decoration:underline;">Reconnect</a> if this persists.</span></div>';
+                    }
                 } else {
-                    setScopeBadge('scope-tt-videolist','error','Error');
-                    setScopeBadge('scope-tt-userstats','error','Error');
-                    setScopeBadge('scope-tt-publish','pending','--');
                     _setContextNote('tt','error');
                 }
             } else {
@@ -816,14 +1770,12 @@
                 setText('tt-following',    tt.following  != null ? fmtNum(tt.following)  : 'N/A');
                 setText('tt-total-likes',  tt.total_likes != null ? fmtNum(tt.total_likes) : 'N/A');
                 setText('tt-video-count',  tt.video_count != null ? fmtNum(tt.video_count) : 'N/A');
-                setSourceTag('tt-source-tag', tt.analytics_source||null);
-                _setContextNote('tt', null);
-                // Scope badges
-                setScopeBadge('scope-tt-videolist', 'active', '✓ Active');
-                setScopeBadge('scope-tt-userstats',
-                    tt.followers != null ? 'active' : 'fallback',
-                    tt.followers != null ? '✓ Active' : 'Needs reconnect');
-                setScopeBadge('scope-tt-publish', 'active', '✓ Active');
+                setSourceTag('tt-source-tag', tt.analytics_source||null,
+                    tt.analytics_source === 'video.list+user.info.stats' ? 'Live data via video.list + user.info.stats' : null);
+                _setContextNote('tt', 'live');
+                setScopeBadge('scope-tt-videolist', 'active', ' Active');
+                setScopeBadge('scope-tt-userstats', 'active', ' Active');
+                setScopeBadge('scope-tt-publish', 'active', ' Active');
             }
 
             // ── YouTube ───────────────────────────────────────────────────────
@@ -839,6 +1791,15 @@
                 setScopeBadge('scope-yt-readonly','error','Error');
                 setScopeBadge('scope-yt-analytics','error','Error');
                 setScopeBadge('scope-yt-upload','pending','--');
+                var ytHint = (yt.error_detail || yt.error || '').toString();
+                if (ytHint) {
+                    var ynel = document.getElementById('note-yt');
+                    if (ynel) {
+                        ynel.innerHTML = '<div class="scope-context-note unverified"><i class="fas fa-exclamation-triangle"></i><span><strong>YouTube API</strong> — ' +
+                            escapeHtml(ytHint.slice(0, 280)) +
+                            ' · <a href="platforms.html" style="color:inherit;text-decoration:underline;">Reconnect</a></span></div>';
+                    }
+                }
             } else {
                 setBadge('youtube', data.cached?'cached':'live');
                 setText('yt-uploads',  fmtNum(yt.uploads));
@@ -850,15 +1811,11 @@
                 setText('yt-subs',     fmtNum(yt.subscribers));
                 setText('yt-minutes',  fmtNum(yt.minutes_watched));
                 setText('yt-videos',   fmtNum(yt.video_count));
-                const ytFromAnalytics = yt.analytics_source === 'yt-analytics';
                 setSourceTag('yt-source-tag', yt.analytics_source||null);
-                // Scope badges
-                setScopeBadge('scope-yt-readonly', 'active', '✓ Active');
-                setScopeBadge('scope-yt-analytics',
-                    ytFromAnalytics ? 'active' : 'fallback',
-                    ytFromAnalytics ? '✓ Active' : 'Unverified App');
-                setScopeBadge('scope-yt-upload', 'active', '✓ Active');
-                _setContextNote('yt', ytFromAnalytics ? null : 'unverified');
+                setScopeBadge('scope-yt-readonly', 'active', ' Active');
+                setScopeBadge('scope-yt-analytics', 'active', ' Active');
+                setScopeBadge('scope-yt-upload', 'active', ' Active');
+                _setContextNote('yt', 'live');
             }
 
             // ── Instagram ─────────────────────────────────────────────────────
@@ -885,12 +1842,12 @@
                 setText('ig-shares',   fmtNum(ig.shares));
                 setSourceTag('ig-source-tag', ig.analytics_source||null);
                 // Scope badges
-                setScopeBadge('scope-ig-basic',    'active', '✓ Active');
+                setScopeBadge('scope-ig-basic',    'active', ' Active');
                 const igInsightsOk = ig.analytics_source === 'instagram_manage_insights';
                 setScopeBadge('scope-ig-insights',
                     igInsightsOk ? 'active' : 'fallback',
-                    igInsightsOk ? '✓ Active' : 'Pending Approval');
-                setScopeBadge('scope-ig-publish',  'active', '✓ Active');
+                    igInsightsOk ? ' Active' : 'Pending Approval');
+                setScopeBadge('scope-ig-publish',  'active', ' Active');
                 _setContextNote('ig', igInsightsOk ? null : 'pending');
             }
 
@@ -917,14 +1874,72 @@
                 setText('fb-followers', fmtNum(fb.followers));
                 setSourceTag('fb-source-tag', fb.analytics_source||null);
                 // Scope badges
-                setScopeBadge('scope-fb-engagement', 'active', '✓ Active');
+                setScopeBadge('scope-fb-engagement', 'active', ' Active');
                 const fbInsightsOk = !!fb.analytics_source;
                 setScopeBadge('scope-fb-insights',
                     fbInsightsOk ? 'active' : 'fallback',
-                    fbInsightsOk ? '✓ Active' : 'Pending Approval');
-                setScopeBadge('scope-fb-publish', 'active', '✓ Active');
+                    fbInsightsOk ? ' Active' : 'Pending Approval');
+                setScopeBadge('scope-fb-publish', 'active', ' Active');
                 _setContextNote('fb', fbInsightsOk ? null : 'pending');
             }
+
+            // Update the API status summary badges based on actual connection data
+            _updateApiStatusSummary(p);
+
+            const agg = data.aggregate;
+            if (agg && (agg.views || agg.likes || agg.comments || agg.shares)) {
+                const parts = [];
+                if (agg.views)    parts.push(fmtNum(agg.views) + ' views');
+                if (agg.likes)    parts.push(fmtNum(agg.likes) + ' likes');
+                if (agg.comments) parts.push(fmtNum(agg.comments) + ' comments');
+                if (agg.shares)   parts.push(fmtNum(agg.shares) + ' shares');
+                const pl = (agg.platforms_included && agg.platforms_included.length)
+                    ? ' (' + agg.platforms_included.join(', ') + ')' : '';
+                const extra = 'Combined live' + pl + ': ' + parts.join(' · ');
+                const cur = document.getElementById('refreshStatusText');
+                if (cur && extra) {
+                    const t = cur.textContent || '';
+                    if (t.indexOf('Combined live') === -1) cur.textContent = t + (t ? ' · ' : '') + extra;
+                }
+            }
+            if (document.getElementById('crmTab')?.classList.contains('active') && window.__crmSelectedPlatform && typeof window.selectCrmPlatform === 'function') {
+                window.selectCrmPlatform(window.__crmSelectedPlatform, { skipVideos: true });
+            }
+        }
+
+        function _updateApiStatusSummary(platforms) {
+            const container = document.getElementById('apiStatusSummary');
+            if (!container) return;
+            const badges = [
+                { key: 'youtube',   icon: 'fab fa-youtube',    color: '#ff0000', label: 'YouTube',   apiLive: true },
+                { key: 'tiktok',    icon: 'fab fa-tiktok',     color: '#69c9d0', label: 'TikTok',    apiLive: true },
+                { key: 'instagram', icon: 'fab fa-instagram',  color: '#E1306C', label: 'Instagram Reels', apiLive: false },
+                { key: 'facebook',  icon: 'fab fa-facebook-f', color: '#1877f2', label: 'Facebook Reels',  apiLive: false },
+            ];
+            container.innerHTML = badges.map(function (b) {
+                var p = platforms[b.key] || {};
+                var connected = p.status && p.status !== 'not_connected';
+                var hasError  = p.status === 'error';
+                var state, stateLabel, bg, border, textColor;
+                if (!connected) {
+                    state = 'nc'; stateLabel = 'Not Connected';
+                    bg = 'rgba(107,114,128,0.08)'; border = 'rgba(107,114,128,0.2)'; textColor = '#6b7280';
+                } else if (hasError) {
+                    state = 'error'; stateLabel = 'Error';
+                    bg = 'rgba(239,68,68,0.08)'; border = 'rgba(239,68,68,0.2)'; textColor = '#ef4444';
+                } else if (b.apiLive) {
+                    state = 'live'; stateLabel = 'Live';
+                    bg = 'rgba(16,185,129,0.08)'; border = 'rgba(16,185,129,0.2)'; textColor = '#10b981';
+                } else {
+                    state = 'pending'; stateLabel = 'Pending Review';
+                    bg = 'rgba(59,130,246,0.08)'; border = 'rgba(59,130,246,0.2)'; textColor = '#60a5fa';
+                }
+                return '<div style="display:flex;align-items:center;gap:0.5rem;padding:0.5rem 0.85rem;' +
+                    'background:' + bg + ';border:1px solid ' + border + ';border-radius:8px;' +
+                    'font-size:0.78rem;font-weight:600;color:' + textColor + ';">' +
+                    '<i class="' + b.icon + '" style="font-size:1rem;color:' + b.color + ';"></i> ' +
+                    b.label + ' <span style="font-weight:700;">' + stateLabel + '</span></div>';
+            }).join('');
         }
 
         // ── charts ───────────────────────────────────────────────────────
@@ -961,7 +1976,7 @@
                 platformChart = new Chart(platformCtx, {
                     type:'doughnut',
                     data:{
-                        labels:['TikTok','YouTube','Instagram','Facebook'],
+                        labels:['TikTok','YouTube','Instagram Reels','Facebook Reels'],
                         datasets:[{ data:[0,0,0,0], backgroundColor:['#69c9d0','#FF0000','#E1306C','#1877F2'], borderWidth:0 }]
                     },
                     options:{
@@ -975,7 +1990,7 @@
                 speedBucketChart = new Chart(speedCtx, {
                     type:'doughnut',
                     data:{
-                        labels:['🏆 Glory Boy','🔥 Euphoric','⚡ Send It','🏁 Spirited','😎 Cruise'],
+                        labels:[' Glory Boy',' Euphoric',' Send It',' Spirited',' Cruise'],
                         datasets:[{ data:[0,0,0,0,0], backgroundColor:['#a855f7','#f97316','#3b82f6','#10b981','#6b7280'], borderWidth:0 }]
                     },
                     options:{
@@ -1010,8 +2025,11 @@
         async function loadTrillUploads(){
             try{
                 const range = document.getElementById('dateRangeSelect')?.value||'30';
-                const map = {'7':'7d','30':'30d','90':'90d','365':'1y','all':'1y'};
-                const data = await apiCall('/api/analytics?range='+(map[range]||'30d'));
+                const map = {'7':'7d','30':'30d','90':'90d','365':'1y','all':'all'};
+                const apiRange = map[range]||'30d';
+                const data = await (window.M8Stats
+                    ? window.M8Stats.load(apiRange)
+                    : apiCall('/api/analytics?range=' + apiRange));
                 if(data?.trill?.uploads && data.trill.uploads.length > 0){
                     document.getElementById('trillTable').innerHTML = data.trill.uploads.map(u=>`
                         <tr>
@@ -1029,60 +2047,107 @@
         }
 
         // ── Top Performing Content ────────────────────────────────────────
+        function getRangeStart(range){
+            if(range === 'all') return null;
+            const now = Date.now();
+            const mapMs = {'7d':7*864e5,'30d':30*864e5,'90d':90*864e5,'1y':365*864e5};
+            return new Date(now - (mapMs[range] || mapMs['30d']));
+        }
+
+        async function fetchAllCompletedUploads(){
+            const out = [];
+            let cursor = null;
+            let guard = 0;
+            do {
+                const q = new URLSearchParams();
+                q.set('view', 'completed'); q.set('meta', 'true'); q.set('limit', '500');
+                if (cursor) q.set('cursor', cursor);
+                const res = await apiCall('/api/uploads?' + q.toString());
+                const rows = Array.isArray(res) ? res : (res?.uploads || []);
+                if (rows.length) out.push(...rows);
+                cursor = (res && res.next_cursor) ? res.next_cursor : null;
+                guard++;
+            } while (cursor && guard < 50);
+            return out;
+        }
+
+        // UploadM8-only top content (existing path)
         async function loadTopContent(range){
             const tbody  = document.getElementById('topContentTable');
             const tbody2 = document.getElementById('topContentTable2');
             if(!tbody && !tbody2) return;
+            const emptyHtml = '<tr><td colspan="8" class="empty-state"><i class="fas fa-film"></i><p>No content data yet</p></td></tr>';
             try{
-                // Note: backend status= only accepts single values, so filter client-side
-                const data = await apiCall('/api/uploads?limit=50').catch(()=>null);
-                if(!data) return;
-                const allItems = Array.isArray(data) ? data : (data.uploads || data.items || []);
-                // Sort by views desc, then filter to completed
+                const allItems = await fetchAllCompletedUploads();
+                const startAt = getRangeStart(range);
                 const items = allItems
-                    .filter(u => ['completed','succeeded','partial'].includes(u.status))
-                    .sort((a,b) => (b.views||0) - (a.views||0));
+                    .filter(u => ['completed','succeeded','partial'].includes((u.status||'').toLowerCase()))
+                    .filter(u => {
+                        if (!startAt) return true;
+                        const ts = u.created_at || u.completed_at;
+                        if (!ts) return true;
+                        const d = new Date(ts);
+                        return !isNaN(d) ? d >= startAt : true;
+                    })
+                    .sort((a,b) => Number(b.views||0) - Number(a.views||0));
                 if(!items.length){
-                    // Show the upload even with 0 views so the table is never falsely empty
-                    const anyDone = allItems.filter(u => ['completed','succeeded','partial'].includes(u.status));
-                    if(anyDone.length) {
-                        const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'K' : String(n||0);
-                        const rows = anyDone.slice(0,10).map(u => {
-                            const views=u.views||0,likes=u.likes||0,comments=u.comments||0,shares=u.shares||0;
-                            const eng = views > 0 ? ((likes+comments+shares)/views*100).toFixed(1)+'%' : '—';
-                            const plats = Array.isArray(u.platforms) ? u.platforms.join(', ') : (u.platform||'--');
-                            const title = u.title || u.filename || 'Untitled';
-                            return `<tr><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${title}">${title}</td>
-                                <td>${plats}</td><td>${fmt(views)}</td><td>${fmt(likes)}</td>
-                                <td>${fmt(comments)}</td><td>${fmt(shares)}</td><td>${eng}</td></tr>`;
-                        }).join('');
-                        if(tbody)  tbody.innerHTML  = rows;
-                        if(tbody2) tbody2.innerHTML = rows;
-                    }
+                    if(tbody)  tbody.innerHTML = emptyHtml;
+                    if(tbody2) tbody2.innerHTML = emptyHtml;
                     return;
                 }
-                const fmt = n => n >= 1000000 ? (n/1000000).toFixed(1)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'K' : String(n||0);
-                const rows = items.slice(0,10).map(u => {
-                    const views    = u.views    || 0;
-                    const likes    = u.likes    || 0;
-                    const comments = u.comments || 0;
-                    const shares   = u.shares   || 0;
-                    const eng      = views > 0 ? ((likes+comments+shares)/views*100).toFixed(1)+'%' : '0%';
-                    const plats    = Array.isArray(u.platforms) ? u.platforms.join(', ') : (u.platform || '--');
-                    const title    = u.title || u.original_filename || u.filename || 'Untitled';
+                const html = items.slice(0, 100).map(u => {
+                    const v = u.views||0, l = u.likes||0, c = u.comments||0, s = u.shares||0;
+                    const eng = v > 0 ? ((l+c+s)/v*100).toFixed(1)+'%' : '0%';
+                    const plats = Array.isArray(u.platforms) ? u.platforms.join(', ') : (u.platform||'--');
+                    const title = escapeHtml(u.title || u.original_filename || u.filename || 'Untitled');
                     return `<tr>
-                        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${title}</td>
+                        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${title}">${title}</td>
                         <td>${plats}</td>
-                        <td>${fmt(views)}</td>
-                        <td>${fmt(likes)}</td>
-                        <td>${fmt(comments)}</td>
-                        <td>${fmt(shares)}</td>
+                        <td>${_srcBadge('uploadm8')}</td>
+                        <td>${fmtNum(v)}</td><td>${fmtNum(l)}</td><td>${fmtNum(c)}</td><td>${fmtNum(s)}</td>
                         <td>${eng}</td>
                     </tr>`;
                 }).join('');
-                if(tbody)  tbody.innerHTML  = rows;
-                if(tbody2) tbody2.innerHTML = rows;
+                if(tbody)  tbody.innerHTML  = html;
+                if(tbody2) tbody2.innerHTML = html;
             }catch(e){ console.error('Top content error:', e); }
+        }
+
+        // Catalog-backed top content (all platforms, all sources)
+        async function loadTopContentFromCatalog(){
+            const tbody  = document.getElementById('topContentTable');
+            const tbody2 = document.getElementById('topContentTable2');
+            if(!tbody && !tbody2) return;
+            const range = document.getElementById('dateRangeSelect')?.value || '30';
+            const days  = range === 'all' ? '' : '&days=' + range;
+            const emptyHtml = '<tr><td colspan="8" class="empty-state"><i class="fas fa-film"></i><p>No catalog videos yet — click Sync Catalog to import</p></td></tr>';
+            try{
+                const res = await apiCall('/api/catalog/content?sort=views&limit=100&order=desc' + days);
+                const items = res?.items || [];
+                if(!items.length){
+                    if(tbody)  tbody.innerHTML = emptyHtml;
+                    if(tbody2) tbody2.innerHTML = emptyHtml;
+                    return;
+                }
+                const html = items.map(u => {
+                    const v = u.views||0, l = u.likes||0, c = u.comments||0, s = u.shares||0;
+                    const eng = v > 0 ? ((l+c+s)/v*100).toFixed(1)+'%' : '0%';
+                    const title = escapeHtml(u.title || u.platform_video_id || 'Untitled');
+                    const watch = _catalogVideoWatchUrl(u, _findMetricsAccountForCatalogRow(u));
+                    const urlHtml = watch
+                        ? `<a href="${escapeHtml(watch)}" target="_blank" rel="noopener noreferrer" class="crm-vid-link" title="Open video on ${escapeHtml(u.platform||'platform')}">${title}</a>`
+                        : title;
+                    return `<tr>
+                        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${title}">${urlHtml}</td>
+                        <td>${escapeHtml(u.platform||'--')}</td>
+                        <td>${_srcBadge(u.source)}</td>
+                        <td>${fmtNum(v)}</td><td>${fmtNum(l)}</td><td>${fmtNum(c)}</td><td>${fmtNum(s)}</td>
+                        <td>${eng}</td>
+                    </tr>`;
+                }).join('');
+                if(tbody)  tbody.innerHTML  = html;
+                if(tbody2) tbody2.innerHTML = html;
+            }catch(e){ console.error('Catalog top content error:', e); }
         }
 
         // ── Excel export ─────────────────────────────────────────────────
@@ -1090,9 +2155,10 @@
             const btn = document.getElementById('exportBtn');
             if(btn){ btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Exporting…'; }
             try{
-                const range = document.getElementById('dateRangeSelect')?.value||'30';
-                const r = await fetch(API_BASE+'/api/analytics/export?days='+range,{
-                    headers:{'Authorization':'Bearer '+getToken()}
+                const raw = document.getElementById('dateRangeSelect')?.value||'30';
+                const range = raw === 'all' ? '3650' : raw;
+                const r = await window.apiFetch('/api/analytics/export?days=' + range, {
+                    method: 'GET',
                 });
                 if(r.ok){
                     const blob = await r.blob();

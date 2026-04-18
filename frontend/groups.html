@@ -1,12 +1,14 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+
+    <script src="js/html-safe.js"></script>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Account Groups - UploadM8</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="styles.css" rel="stylesheet">
@@ -53,70 +55,45 @@
             display: flex; gap: 0.75rem; justify-content: flex-end;
             padding: 1rem 1.5rem; border-top: 1px solid var(--border-color);
         }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 640px) {
+            .modal-ftr { flex-direction: column; align-items: stretch; }
+            .modal-ftr .btn { width: 100%; justify-content: center; }
+        }
+        /* Keep #loadingState outside #groupsGrid so renderGroups() innerHTML does not remove it */
+        .groups-grid-area .loading-state {
+            align-items: center;
+            justify-content: center;
+            gap: 1rem;
+            padding: 4rem;
+            flex-direction: column;
+            color: var(--text-muted);
+        }
     </style>
 </head>
 <body class="groups-page">
     <div class="app-layout">
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header">
-                <a href="dashboard.html" class="sidebar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></a>
-            </div>
-            <nav class="sidebar-nav">
-                <div class="nav-section">
-                    <div class="nav-section-title">Main</div>
-                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
-                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
-                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Platforms</div>
-                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-                    <a href="groups.html" class="nav-link active"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Insights</div>
-                    <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-                </div>
-                <div class="nav-section admin-only" id="adminSection" style="display:none;">
-                    <div class="nav-section-title">Admin</div>
-                    <a href="admin.html" class="nav-link"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
-                    <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
-                    <a href="admin-kpi.html" class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
-                    <a href="admin-calculator.html" class="nav-link"><i class="fas fa-calculator"></i><span>Biz Calculator</span></a>
-                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-                </div>
-                <div class="nav-section">
-                    <div class="nav-section-title">Account</div>
-                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-                    <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-                </div>
-            </nav>
-            <div class="sidebar-footer">
-                <div class="user-info">
-                    <div class="user-avatar" id="userAvatar">U</div>
-                    <div class="user-details">
-                        <div class="user-name" id="userName">User</div>
-                        <div class="user-tier" id="userTier">Free</div>
-                    </div>
-                    <button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out"><i class="fas fa-sign-out-alt"></i></button>
-                </div>
-            </div>
-        </aside>
+        <aside class="sidebar" id="sidebar"></aside>
         
-        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
         
         <header class="top-bar">
-            <button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
-            <div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div>
-            <div class="top-bar-actions"><button class="theme-toggle" onclick="toggleTheme()" title="Toggle Theme"><i class="fas fa-moon"></i></button></div>
+            <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+            <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+            <div class="top-bar-actions">
+                <div data-wt-pills></div>
+                <button class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle Theme"><i class="fas fa-moon"></i></button>
+            </div>
         </header>
         
         <main class="main-content">
             <div class="page-header">
                 <div class="page-header-left"><div><h1>Account Groups</h1><p class="page-subtitle">Organize accounts for bulk uploads</p></div>
                 </div>
-                <div class="page-header-right"><button class="btn btn-primary" id="newGroupBtn"><i class="fas fa-plus"></i><span>New Group</span></button>
+                <div class="page-header-right" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div data-wt-pills class="desktop-pills"></div>
+                    <button class="btn btn-primary" id="newGroupBtn"><i class="fas fa-plus"></i><span>New Group</span></button>
                 </div>
             </div>
 
@@ -164,8 +141,9 @@
                 </div>
             </div>
 
-            <div class="groups-grid" id="groupsGrid">
-                <div class="loading-state" id="loadingState"><div class="spinner"></div><p>Loading groups...</p></div>
+            <div class="groups-grid-area">
+                <div class="loading-state" id="loadingState" style="display:flex;"><div class="spinner"></div><p>Loading groups...</p></div>
+                <div class="groups-grid" id="groupsGrid"></div>
             </div>
 
             <div class="empty-state" id="emptyState" style="display: none;">
@@ -182,7 +160,7 @@
         <div class="modal-box">
             <div class="modal-hdr">
                 <h2 id="groupModalTitle">Create Group</h2>
-                <button type="button" class="close-btn" id="groupCloseX">&times;</button>
+                <button type="button" class="close-btn" id="groupCloseX" data-um8-fn="hideGroupModal" aria-label="Close">&times;</button>
             </div>
             <div class="modal-bdy">
                 <div style="margin-bottom:1rem;">
@@ -204,7 +182,7 @@
                 </div>
             </div>
             <div class="modal-ftr">
-                <button type="button" class="btn btn-secondary" id="groupCancelBtn">Cancel</button>
+                <button type="button" class="btn btn-secondary" id="groupCancelBtn" data-um8-fn="hideGroupModal">Cancel</button>
                 <button type="button" class="btn btn-primary" id="groupSaveBtn"><i class="fas fa-save"></i> Save</button>
             </div>
         </div>
@@ -215,14 +193,14 @@
         <div class="modal-box small">
             <div class="modal-hdr">
                 <h2>Delete Group</h2>
-                <button type="button" class="close-btn" id="deleteCloseX">&times;</button>
+                <button type="button" class="close-btn" id="deleteCloseX" data-um8-fn="hideDeleteModal" aria-label="Close">&times;</button>
             </div>
             <div class="modal-bdy">
                 <p>Are you sure you want to delete "<strong id="deleteGroupName"></strong>"?</p>
                 <p style="color:#64748b;font-size:0.875rem;">This will not delete the accounts, only the group.</p>
             </div>
             <div class="modal-ftr">
-                <button type="button" class="btn btn-secondary" id="deleteCancelBtn">Cancel</button>
+                <button type="button" class="btn btn-secondary" id="deleteCancelBtn" data-um8-fn="hideDeleteModal">Cancel</button>
                 <button type="button" class="btn btn-danger" id="deleteConfirmBtn"><i class="fas fa-trash"></i> Delete</button>
             </div>
         </div>
@@ -230,8 +208,16 @@
 
     <div class="toast-container" id="toastContainer"></div>
 
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
+    <script src="app.js"></script>
     <script src="wallet-tokens.js"></script>
-<script src="app.js"></script>
     <script>
         let groups = [], accounts = [], currentGroupId = null, selectedColor = '#F97316';
         const colors = ['#F97316','#3B82F6','#10B981','#8B5CF6','#EC4899','#EF4444'];
@@ -239,11 +225,11 @@
 
         // ---- LocalStorage persistence helpers ----
         function cacheGroups() {
-            try { localStorage.setItem(GROUPS_CACHE_KEY, JSON.stringify(groups)); } catch(_) {}
+            try { sessionStorage.setItem(GROUPS_CACHE_KEY, JSON.stringify(groups)); } catch(_) {}
         }
         function loadCachedGroups() {
             try {
-                const raw = localStorage.getItem(GROUPS_CACHE_KEY);
+                const raw = sessionStorage.getItem(GROUPS_CACHE_KEY);
                 if (raw) return JSON.parse(raw);
             } catch(_) {}
             return null;
@@ -254,13 +240,22 @@
         function hideGroupModal() { document.getElementById('groupModal').classList.remove('show'); currentGroupId = null; }
         function showDeleteModal() { document.getElementById('deleteModal').classList.add('show'); }
         function hideDeleteModal() { document.getElementById('deleteModal').classList.remove('show'); currentGroupId = null; }
+        window.hideGroupModal = hideGroupModal;
+        window.hideDeleteModal = hideDeleteModal;
 
         function getPlatformIcon(p) {
             return {'tiktok':'fab fa-tiktok','youtube':'fab fa-youtube','instagram':'fab fa-instagram','facebook':'fab fa-facebook'}[p] || 'fas fa-globe';
         }
 
-        function showLoading(s) { document.getElementById('loadingState').style.display = s ? 'flex' : 'none'; }
-        function dismissInfoCard() { document.getElementById('infoCard').style.display = 'none'; localStorage.setItem('groupsInfoDismissed','true'); }
+        function showLoading(s) {
+            const el = document.getElementById('loadingState');
+            if (el) el.style.display = s ? 'flex' : 'none';
+        }
+        function dismissInfoCard() {
+            const el = document.getElementById('infoCard');
+            if (el) el.style.display = 'none';
+            sessionStorage.setItem('groupsInfoDismissed','true');
+        }
 
         document.addEventListener('DOMContentLoaded', async () => {
             // Wire up all buttons
@@ -300,15 +295,18 @@
                 cp.appendChild(btn);
             });
             
-            if (localStorage.getItem('groupsInfoDismissed') === 'true') document.getElementById('infoCard').style.display = 'none';
+            if (sessionStorage.getItem('groupsInfoDismissed') === 'true') {
+                const ic = document.getElementById('infoCard');
+                if (ic) ic.style.display = 'none';
+            }
             
-            await initApp();
+            await initApp('groups');
             await loadData();
         });
 
         async function loadData() {
             showLoading(true);
-            if (!window.currentUser) { const u = await checkAuth({redirectOnFail:true}); if(!u) { showLoading(false); return; } }
+            if (!window.currentUser) { showLoading(false); return; }
             try {
                 const d = await apiCall('/api/platform-accounts');
                 const raw = Array.isArray(d) ? d : (d.accounts || []);
@@ -320,7 +318,7 @@
                 });
             } catch(e) { accounts = []; }
 
-            // Load groups: try API first, fall back to localStorage cache
+            // Load groups: try API first, fall back to session cache
             let apiGroupsLoaded = false;
             try {
                 const d = await apiCall('/api/groups');
@@ -341,7 +339,10 @@
             }
 
             updateOverview(); renderGroups(); showLoading(false);
-            if (groups.length > 0 || localStorage.getItem('groupsInfoDismissed') === 'true') document.getElementById('infoCard').style.display = 'none';
+            if (groups.length > 0 || sessionStorage.getItem('groupsInfoDismissed') === 'true') {
+                const ic = document.getElementById('infoCard');
+                if (ic) ic.style.display = 'none';
+            }
         }
 
         function updateOverview() {
@@ -371,7 +372,7 @@
                     </div>
                     <div class="group-stats"><div class="group-stat"><i class="fas fa-users"></i><span class="blur-value">${ma.length}</span> accounts</div><div class="group-stat"><i class="fas fa-cloud-upload-alt"></i><span class="blur-value">${g.uploads_count||0}</span> uploads</div></div>
                     <div class="group-platforms">${Object.entries(pc).map(([p,n])=>`<span class="platform-mini platform-${p}"><i class="${getPlatformIcon(p)}"></i> ${n}</span>`).join('')}</div>
-                    <div class="group-members">${ma.slice(0,4).map(a=>`<div class="member-avatar" title="${a.account_name||''}">${a.account_avatar_url?`<img src="${a.account_avatar_url}">`:`<i class="${getPlatformIcon(a.platform)}"></i>`}</div>`).join('')}${ma.length>4?`<div class="member-avatar more">+${ma.length-4}</div>`:''}</div>
+                    <div class="group-members">${ma.slice(0,4).map(a=>`<div class="member-avatar" title="${a.account_name||''}">${a.account_avatar_url?`<img referrerpolicy="no-referrer" loading="lazy" decoding="async" src="${a.account_avatar_url}">`:`<i class="${getPlatformIcon(a.platform)}"></i>`}</div>`).join('')}${ma.length>4?`<div class="member-avatar more">+${ma.length-4}</div>`:''}</div>
                     <div class="group-card-footer"><a href="upload.html?group=${g.id}" data-group-id="${g.id}" class="btn btn-primary btn-sm btn-block upload-to-group"><i class="fas fa-cloud-upload-alt"></i> Upload to Group</a></div>
                 </div>`;
             }).join('');
@@ -383,7 +384,7 @@
                 const gid = a.dataset.groupId;
                 if (gid) sessionStorage.setItem('upload_selected_group_id', String(gid));
             }));
-if (localStorage.getItem('hideFigures') === 'true') document.body.classList.add('hide-figures');
+if (sessionStorage.getItem('uploadm8_hide_figures') === 'true') document.body.classList.add('hide-figures');
         }
 
         function openCreateModal() {
@@ -562,7 +563,7 @@ if (localStorage.getItem('hideFigures') === 'true') document.body.classList.add(
         .overview-stat:nth-child(1) .stat-icon{background:rgba(99,102,241,.15);color:#818cf8}
         .overview-stat:nth-child(2) .stat-icon{background:rgba(16,185,129,.15);color:#34d399}
         .overview-stat:nth-child(3) .stat-icon{background:rgba(249,115,22,.15);color:#fb923c}
-        .overview-stat i{display:none}
+        .overview-stat .stat-icon i{display:inline-block;font-size:1.05rem;line-height:1}
         .overview-stat span{font-size:1.75rem;font-weight:800;color:var(--text-primary,#f1f5f9);line-height:1}
         .overview-stat .stat-trend{font-size:.75rem;color:#34d399;font-weight:500}
         .overview-stat label{color:var(--text-secondary,#94a3b8);font-size:.875rem;font-weight:500;display:none}

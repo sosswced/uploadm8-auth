@@ -1,16 +1,24 @@
 [
   {
     "AllowedOrigins": [
+      "https://app.uploadm8.com",
+      "https://uploadm8.com",
       "http://localhost:8080",
       "http://localhost:3000",
+      "http://localhost:8000",
+      "http://localhost:8001",
       "http://127.0.0.1:8080",
       "http://127.0.0.1:3000",
-      "https://app.uploadm8.com",
-      "https://uploadm8.com"
+      "http://127.0.0.1:8000",
+      "http://127.0.0.1:8001"
     ],
-    "AllowedMethods": ["GET", "PUT", "HEAD"],
-    "AllowedHeaders": ["Content-Type", "Content-Length", "x-amz-content-sha256"],
-    "ExposeHeaders": ["ETag"],
+    "AllowedMethods": ["GET", "PUT", "POST", "HEAD"],
+    "AllowedHeaders": [
+      "content-type",
+      "content-length",
+      "x-amz-content-sha256"
+    ],
+    "ExposeHeaders": ["ETag", "x-amz-request-id", "x-amz-id-2"],
     "MaxAgeSeconds": 3600
   }
 ]

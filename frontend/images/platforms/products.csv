@@ -1,0 +1,17 @@
+id,Name,Type,Date (UTC),Description,Statement Descriptor,Unit Label,Url,Tax Code,type (metadata),lookup_key (metadata),tier (metadata),amount (metadata),wallet (metadata)
+prod_UDD0CCQzccfHTY,UploadM8 AIC 50 Top-Up,service,2026-03-25 08:14,"50 AI credits (AIC) for your UploadM8 wallet. Use them for AI-powered caption generation, hashtag optimization, thumbnail analysis, and smart scheduling suggestions. Credits never expire. First-time bonus may apply.",,,,,topup,,,50,aic
+prod_UDD0VgzKZur5Qy,UploadM8 PUT 50 Top-Up,service,2026-03-25 08:14,"50 upload tokens (PUT) for your UploadM8 wallet. Use them to publish videos across TikTok, YouTube Shorts, Instagram Reels, and Facebook Reels. Tokens never expire. First-time bonus may apply.",,,,,topup,,,50,put
+prod_UDD0JV6l2sbrmM,UploadM8 Agency,service,2026-03-25 08:14,"Maximum scale for agencies managing multiple brands. 300 connected accounts per platform, 7-day scheduling lookahead, 8,000 uploads + 2,500 AI credits per month. Dedicated processing lane, white-label, unlimited queue depth, and full team management. 7-day free trial.",,,,,,uploadm8_agency_monthly,agency,,
+prod_UDD0NSQKtdQM7D,UploadM8 Studio,service,2026-03-25 08:14,"Built for content studios and power users. 75 connected accounts per platform, 72-hour scheduling window, 3,500 uploads + 1,000 AI credits per month. Turbo throughput, analytics export, white-label options, and larger team support. 7-day free trial.",,,,,,uploadm8_studio_monthly,studio,,
+prod_UDD01YK0Fa5SW5,UploadM8 Creator Pro,service,2026-03-25 08:14,"For creators who are serious about growth. Connect up to 25 accounts per platform, schedule 24 hours ahead, and unlock 1,200 uploads + 350 AI credits per month with priority processing and team seats. Advanced AI optimization included. 7-day free trial.",,,,,,uploadm8_creator_pro_monthly,creator_pro,,
+prod_UDD0jSiHkf0s0n,UploadM8 Creator Lite,service,2026-03-25 08:14,"Perfect for solo creators just getting started. Publish to 10 accounts per platform, schedule up to 12 hours ahead, and get 400 uploads + 120 AI credits every month — with no watermark from day one. Includes webhooks, templates, and enhanced AI scanning. 7-day free trial.",,,,,,uploadm8_creator_lite_monthly,creator_lite,,
+prod_UDCtac0VKnuOWo,UploadM8 AIC 1000 Top-Up,service,2026-03-25 08:07,1000 AIC tokens — one-time purchase,,,,,,,,1000,aic
+prod_UDCtn73TukitZY,UploadM8 AIC 500 Top-Up,service,2026-03-25 08:07,500 AIC tokens — one-time purchase,,,,,,,,500,aic
+prod_UDCt4lB4Dz0SCC,UploadM8 AIC 250 Top-Up,service,2026-03-25 08:07,250 AIC tokens — one-time purchase,,,,,,,,250,aic
+prod_UDCt2xbikvyhjF,UploadM8 AIC 100 Top-Up,service,2026-03-25 08:07,100 AIC tokens — one-time purchase,,,,,,,,100,aic
+prod_UDCt8PqZ9z1VnF,UploadM8 AIC 50 Top-Up,service,2026-03-25 08:07,50 AIC tokens — one-time purchase,,,,,,,,50,aic
+prod_UDCtO4lzDCD4d0,UploadM8 PUT 1000 Top-Up,service,2026-03-25 08:07,1000 PUT tokens — one-time purchase,,,,,,,,1000,put
+prod_UDCtR9OeXCSlEB,UploadM8 PUT 500 Top-Up,service,2026-03-25 08:07,500 PUT tokens — one-time purchase,,,,,,,,500,put
+prod_UDCtU5bvgTdZdn,UploadM8 PUT 250 Top-Up,service,2026-03-25 08:07,250 PUT tokens — one-time purchase,,,,,,,,250,put
+prod_UDCtoSuZPbF0yl,UploadM8 PUT 100 Top-Up,service,2026-03-25 08:07,100 PUT tokens — one-time purchase,,,,,,,,100,put
+prod_UDCtVBGtibAVxy,UploadM8 PUT 50 Top-Up,service,2026-03-25 08:07,50 PUT tokens — one-time purchase,,,,,,,,50,put

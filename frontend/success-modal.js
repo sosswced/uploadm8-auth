@@ -1,70 +1,15 @@
 /**
- * UploadM8 — Billing Success Modal
- * =================================
- * Drop this script tag AFTER auth-core.js on dashboard.html.
+ * UploadM8 — Billing Success + Post-verify onboarding modal
+ * ==========================================================
+ * Drop this script tag AFTER app.js and js/tier-catalog.js on the page.
  *
- * Fires when the URL contains ?billing_success=1 (set by billing/success.html redirect).
- * Verifies the Stripe session, reads entitlements from /api/me, then shows a
- * high-tech animated modal with 3 tabs: Welcome → What's Included → Quick Start.
- *
- * Usage:
- *   <script src="success-modal.js"></script>
- *   (No other setup needed — self-activating)
+ * 1) Billing: URL ?billing_success=1 (billing/success.html) — Stripe session + /api/me.
+ * 2) Onboarding: sessionStorage uploadm8_post_verify_onboarding=1 (set by confirm-email.html
+ *    after first successful email verification) — same modal shell, tier/entitlements/steps.
  */
 
 (function () {
     'use strict';
-
-    // ── Entitlement metadata — mirrors entitlements.py TIER_CONFIG exactly ──
-    const TIER_META = {
-        free:          { name: 'Free',           price: 0,     put: 60,    aic: 10,   color: '#6b7280', icon: 'fa-circle',      lane: 'Standard' },
-        creator_lite:  { name: 'Creator Lite',   price: 9.99,  put: 300,   aic: 80,   color: '#f97316', icon: 'fa-bolt',        lane: 'Standard (p3)' },
-        launch:        { name: 'Creator Lite',   price: 9.99,  put: 300,   aic: 80,   color: '#f97316', icon: 'fa-bolt',        lane: 'Standard (p3)' },
-        creator_pro:   { name: 'Creator Pro',    price: 19.99, put: 700,   aic: 200,  color: '#f97316', icon: 'fa-rocket',      lane: 'Priority (p2)' },
-        studio:        { name: 'Studio',         price: 49.99, put: 2000,  aic: 600,  color: '#a855f7', icon: 'fa-film',        lane: 'Turbo (p1)' },
-        agency:        { name: 'Agency',         price: 99.99, put: 4500,  aic: 1500, color: '#ec4899', icon: 'fa-building',    lane: 'Dedicated (p0)' },
-        friends_family:{ name: 'Friends & Family',price: 0,   put: 999999,aic: 999999,color: '#10b981',icon: 'fa-heart',       lane: 'Dedicated (p0)' },
-        lifetime:      { name: 'Lifetime',       price: 0,    put: 999999,aic: 999999,color: '#10b981', icon: 'fa-infinity',   lane: 'Dedicated (p0)' },
-        master_admin:  { name: 'Administrator',  price: 0,    put: 999999,aic: 999999,color: '#ef4444', icon: 'fa-shield-alt', lane: 'Dedicated (p0)' },
-    };
-
-    // Feature list per tier — what to show in "What's Included"
-    function buildFeatureList(tier, ent) {
-        const meta = TIER_META[tier] || TIER_META.free;
-        const unlimited = meta.put >= 999999;
-
-        const all = [
-            // [label, description, included, tierRequired]
-            ['⚡ ' + (unlimited ? 'Unlimited' : meta.put.toLocaleString()) + ' PUT / month',
-             'Processing tokens for uploading & distributing videos', true, null],
-            ['🤖 ' + (unlimited ? 'Unlimited' : meta.aic.toLocaleString()) + ' AI Credits / month',
-             'Power AI captions, hashtags & analysis', ent ? ent.can_ai || meta.aic > 0 : meta.aic > 0, 'creator_lite'],
-            ['🚫 No watermark',
-             'Your videos publish clean with no UploadM8 branding', !(ent ? ent.can_watermark : tier === 'free'), 'creator_lite'],
-            ['🗓️ Smart scheduling (' + meta.lane + ')',
-             'Schedule posts up to ' + (tier === 'free' ? '2 hours' : tier === 'creator_lite' ? '12 hours' : tier === 'creator_pro' ? '24 hours' : tier === 'studio' ? '48 hours' : '7 days') + ' ahead',
-             !(tier === 'free'), 'creator_lite'],
-            ['🚀 Priority processing',
-             'Your uploads jump the queue — faster turnaround', ['creator_pro','studio','agency','friends_family','lifetime','master_admin'].includes(tier), 'creator_pro'],
-            ['🤖 AI captions & hashtags',
-             'Auto-generate platform-optimized captions and hashtag sets', ent ? ent.can_ai : tier !== 'free', 'creator_lite'],
-            ['🎬 HUD burn',
-             'Burn dynamic overlays & stats directly into your video', ent ? ent.can_burn_hud : ['creator_pro','studio','agency'].includes(tier), 'creator_pro'],
-            ['📊 Analytics',
-             'Track performance across all platforms in one place', !['free'].includes(tier), 'creator_lite'],
-            ['📥 Export analytics',
-             'Download your data as Excel / CSV', ['studio','agency','friends_family','lifetime','master_admin'].includes(tier), 'studio'],
-            ['👥 Team seats (' + (tier === 'creator_pro' ? 3 : tier === 'studio' ? 10 : tier === 'agency' ? 25 : tier === 'free' || tier === 'creator_lite' ? 1 : 999) + ')',
-             'Invite collaborators to your workspace', tier !== 'free', 'creator_lite'],
-            ['🏷️ White-label',
-             'Remove all UploadM8 branding for your clients', ['agency','friends_family','lifetime','master_admin'].includes(tier), 'agency'],
-            ['🔗 Webhooks',
-             'Fire HTTP events to your own systems on upload events', tier !== 'free', 'creator_lite'],
-            ['♾️ Flex transfers',
-             'Transfer wallet credits between team members', ['agency','friends_family','lifetime','master_admin'].includes(tier), 'agency'],
-        ];
-        return all;
-    }
 
     const QUICK_STEPS = [
         { icon: 'fa-plug', title: 'Connect your platforms', desc: 'Go to <strong>Connected Accounts</strong> and link TikTok, YouTube, Instagram, and Facebook.', link: 'platforms.html', cta: 'Connect now →' },
@@ -320,19 +265,15 @@
 
     // ── Helpers ──────────────────────────────────────────────────────────────
     function getToken() {
-        return localStorage.getItem('uploadm8_access_token')
-            || sessionStorage.getItem('uploadm8_access_token')
-            || localStorage.getItem('auth_token')
-            || null;
+        return (typeof window.getAccessToken === 'function' && window.getAccessToken()) ||
+            sessionStorage.getItem('uploadm8_access_token') ||
+            sessionStorage.getItem('access_token') ||
+            null;
     }
 
     async function apiGet(path) {
-        const token = getToken();
-        const r = await fetch((window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : 'https://auth.uploadm8.com')) + path, {
-            headers: token ? { Authorization: 'Bearer ' + token } : {}
-        });
-        if (!r.ok) throw new Error(r.status);
-        return r.json();
+        if (typeof window.apiCall !== 'function') throw new Error('success-modal: load js/auth-stack.js');
+        return window.apiCall(path, { method: 'GET' });
     }
 
     function fmt(n) {
@@ -361,32 +302,46 @@
     }
 
     // ── Build modal HTML ─────────────────────────────────────────────────────
-    function buildModal(user, sessionData) {
-        const tier = user?.subscription_tier || sessionData?.tier || 'free';
-        const meta = TIER_META[tier] || TIER_META.free;
-        const ent = user?.plan || null;
-        const isTrialing = user?.subscription_status === 'trialing' || sessionData?.subscription_status === 'trialing';
+    function buildModal(user, sessionData, opts) {
+        opts = opts || {};
+        const onboarding = !!opts.onboarding;
+        const TC = window.UploadM8TierCatalog;
+        if (!TC || typeof TC.getTierMeta !== 'function') return null;
+        const tier = (typeof window.getTier === 'function' && user)
+            ? window.getTier(user)
+            : (user?.tier || user?.subscription_tier || user?.plan?.tier || sessionData?.tier || 'free');
+        const meta = TC.getTierMeta(tier, 'free');
+        if (!meta) return null;
+        const ent = (typeof window.getEntitlements === 'function' && user)
+            ? window.getEntitlements(user)
+            : (user?.entitlements || user?.plan || null);
+        const isTrialing = !onboarding && (user?.subscription_status === 'trialing' || sessionData?.subscription_status === 'trialing');
         const wallet = user?.wallet || {};
         const putBal = wallet.put_balance != null ? wallet.put_balance : meta.put;
         const aicBal = wallet.aic_balance != null ? wallet.aic_balance : meta.aic;
-        const features = buildFeatureList(tier, ent);
+        const features = TC.successModalFeatureList(tier, ent);
+        const trialDays = meta.trial_days || 7;
+
+        const welcomeSub = onboarding
+            ? `Your email is verified. You are on <strong>${meta.name}</strong> — here is what you can use right now. Open the <strong>Setup Handbook</strong> anytime from the Feature Guide.`
+            : `Your <strong>${meta.name}</strong> subscription is active and your wallet has been funded for this billing period.`;
 
         // ── Tab 1: Welcome ────────────────────────────────────────────────
         const welcomeHTML = `
 <div class="um8-welcome-hero">
     <div class="um8-check-ring"><i class="fas fa-check"></i></div>
     <div class="um8-welcome-headline">You're in, ${(user?.name || user?.email || '').split(' ')[0] || 'friend'}!</div>
-    <div class="um8-welcome-sub">Your <strong>${meta.name}</strong> subscription is active and your wallet has been funded for this billing period.</div>
-    ${isTrialing ? `<div class="um8-trial-pill"><i class="fas fa-clock"></i> 7-day free trial — your card charges on day 7</div>` : ''}
+    <div class="um8-welcome-sub">${welcomeSub}</div>
+    ${isTrialing ? `<div class="um8-trial-pill"><i class="fas fa-clock"></i> ${trialDays}-day free trial — your card charges when the trial ends</div>` : ''}
 </div>
 <div class="um8-wallet-row">
     <div class="um8-wallet-card">
-        <div class="um8-wallet-emoji">⚡</div>
+        <div class="um8-wallet-emoji"></div>
         <div class="um8-wallet-num">${fmt(putBal)}</div>
         <div class="um8-wallet-lbl">PUT Tokens Available</div>
     </div>
     <div class="um8-wallet-card">
-        <div class="um8-wallet-emoji">🤖</div>
+        <div class="um8-wallet-emoji"></div>
         <div class="um8-wallet-num">${fmt(aicBal)}</div>
         <div class="um8-wallet-lbl">AI Credits Available</div>
     </div>
@@ -411,7 +366,7 @@
         const stepsHTML = `
 <div class="um8-steps">
 ${QUICK_STEPS.map((s, i) => `
-<a href="${s.link}" class="um8-step" onclick="um8Close()">
+<a href="${s.link}" class="um8-step" data-um8-fn="um8Close">
     <div class="um8-step-num">${i + 1}</div>
     <div>
         <div class="um8-step-title"><i class="fas ${s.icon}" style="color:#f97316;margin-right:.4rem;"></i>${s.title}</div>
@@ -421,17 +376,27 @@ ${QUICK_STEPS.map((s, i) => `
 </a>`).join('')}
 </div>`;
 
-        return { welcomeHTML, includedHTML, stepsHTML, meta, tier };
+        return { welcomeHTML, includedHTML, stepsHTML, meta, tier, trialDays, onboarding };
     }
 
     // ── Render into DOM ──────────────────────────────────────────────────────
-    function renderModal(user, sessionData) {
-        const { welcomeHTML, includedHTML, stepsHTML, meta } = buildModal(user, sessionData);
+    function renderModal(user, sessionData, opts) {
+        const built = buildModal(user, sessionData, opts);
+        if (!built) {
+            console.warn('[success-modal] tier catalog not ready');
+            return;
+        }
+        const { welcomeHTML, includedHTML, stepsHTML, meta, onboarding } = built;
+
+        const ariaLabel = onboarding ? 'Welcome to UploadM8' : 'Subscription confirmed';
+        const badgeLine = onboarding
+            ? `<i class="fas fa-envelope-circle-check"></i> ${meta.name} — email verified`
+            : `<i class="fas fa-check-circle"></i> ${meta.name} — Active`;
 
         const overlay = document.createElement('div');
         overlay.id = 'um8-success-overlay';
         overlay.innerHTML = `
-<div id="um8-success-modal" role="dialog" aria-modal="true" aria-label="Subscription confirmed">
+<div id="um8-success-modal" role="dialog" aria-modal="true" aria-label="${ariaLabel}">
     <div id="um8-modal-header">
         <div class="um8-header-top">
             <div class="um8-plan-info">
@@ -440,7 +405,7 @@ ${QUICK_STEPS.map((s, i) => `
                 </div>
                 <div>
                     <div class="um8-plan-badge">
-                        <i class="fas fa-check-circle"></i> ${meta.name} — Active
+                        ${badgeLine}
                     </div>
                     <div style="font-size:.75rem;color:#6b7280;margin-top:.25rem;">
                         ${meta.put >= 999999 ? 'Unlimited' : meta.put.toLocaleString() + ' PUT'} · 
@@ -448,14 +413,14 @@ ${QUICK_STEPS.map((s, i) => `
                     </div>
                 </div>
             </div>
-            <button class="um8-close-btn" onclick="um8Close()" aria-label="Close">
+            <button type="button" class="um8-close-btn" data-um8-fn="um8Close" aria-label="Close">
                 <i class="fas fa-times"></i>
             </button>
         </div>
         <div class="um8-tabs">
-            <div class="um8-tab active" data-panel="welcome" onclick="um8Tab(this,'welcome')">🎉 Welcome</div>
-            <div class="um8-tab" data-panel="included" onclick="um8Tab(this,'included')">✅ What's Included</div>
-            <div class="um8-tab" data-panel="quickstart" onclick="um8Tab(this,'quickstart')">⚡ Quick Start</div>
+            <div class="um8-tab active" data-panel="welcome" role="button" tabindex="0" data-um8-fn="um8Tab" data-um8-arg="welcome"> Welcome</div>
+            <div class="um8-tab" data-panel="included" role="button" tabindex="0" data-um8-fn="um8Tab" data-um8-arg="included"> What's Included</div>
+            <div class="um8-tab" data-panel="quickstart" role="button" tabindex="0" data-um8-fn="um8Tab" data-um8-arg="quickstart"> Quick Start</div>
         </div>
     </div>
     <div id="um8-modal-body">
@@ -466,13 +431,13 @@ ${QUICK_STEPS.map((s, i) => `
     <div id="um8-modal-footer">
         <div class="um8-footer-hint">
             <i class="fas fa-book-open" style="color:#f97316;margin-right:.3rem;"></i>
-            Full feature guide → <a href="guide.html" onclick="um8Close()">guide.html</a>
+            Full feature guide → <a href="guide.html" data-um8-fn="um8Close">guide.html</a>
         </div>
         <div style="display:flex;gap:.6rem;">
-            <a href="guide.html" class="um8-btn-ghost" onclick="um8Close()">
+            <a href="guide.html" class="um8-btn-ghost" data-um8-fn="um8Close">
                 <i class="fas fa-book"></i> Full Guide
             </a>
-            <a href="upload.html" class="um8-btn-primary" onclick="um8Close()">
+            <a href="upload.html" class="um8-btn-primary" data-um8-fn="um8Close">
                 <i class="fas fa-cloud-upload-alt"></i> Start Uploading
             </a>
         </div>
@@ -493,11 +458,16 @@ ${QUICK_STEPS.map((s, i) => `
     }
 
     // ── Global tab / close functions (need global scope for onclick attrs) ──
-    window.um8Tab = function (el, panelId) {
+    window.um8Tab = function (first, second) {
+        const el = first && first.currentTarget ? first.currentTarget : first;
+        const panelId =
+            second !== undefined && second !== null && second !== '' ? String(second) : '';
+        if (!el || !panelId) return;
         document.querySelectorAll('.um8-tab').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.um8-tab-panel').forEach(p => p.classList.remove('active'));
         el.classList.add('active');
-        document.getElementById('um8-panel-' + panelId).classList.add('active');
+        const panel = document.getElementById('um8-panel-' + panelId);
+        if (panel) panel.classList.add('active');
     };
 
     window.um8Close = function () {
@@ -510,13 +480,29 @@ ${QUICK_STEPS.map((s, i) => `
         const url = new URL(window.location.href);
         url.searchParams.delete('billing_success');
         url.searchParams.delete('session_id');
+        url.searchParams.delete('onboarding');
         window.history.replaceState({}, '', url.toString());
     };
 
     // ── Init ─────────────────────────────────────────────────────────────────
     async function init() {
         const params = new URLSearchParams(window.location.search);
-        if (!params.has('billing_success')) return;
+        let onboarding = false;
+        try {
+            if (sessionStorage.getItem('uploadm8_post_verify_onboarding') === '1') {
+                sessionStorage.removeItem('uploadm8_post_verify_onboarding');
+                onboarding = true;
+            }
+        } catch (_) {}
+
+        if (!params.has('billing_success') && !onboarding) return;
+
+        // dashboard.html already shows billingSuccessOverlay for ?billing_success=1 — skip duplicate modal
+        if (params.has('billing_success') && !onboarding) {
+            try {
+                if (document.getElementById('billingSuccessOverlay')) return;
+            } catch (_) {}
+        }
 
         // Inject CSS once
         if (!document.getElementById('um8-success-css')) {
@@ -529,6 +515,26 @@ ${QUICK_STEPS.map((s, i) => `
         const sessionId = params.get('session_id');
         let user = window.currentUser || null;
         let sessionData = null;
+
+        if (window.UploadM8TierCatalog && typeof window.UploadM8TierCatalog.load === 'function') {
+            try { await window.UploadM8TierCatalog.load(); } catch (e) { console.warn('[success-modal] tier catalog', e); }
+        }
+
+        if (onboarding) {
+            for (let i = 0; i < 8; i++) {
+                try {
+                    const me = await apiGet('/api/me');
+                    user = (typeof window._normalizeUserPayload === 'function' && me)
+                        ? window._normalizeUserPayload(Object.assign({}, me))
+                        : me;
+                    if (user && user.email) break;
+                } catch (e) {
+                    if (i < 7) await new Promise(r => setTimeout(r, 400));
+                }
+            }
+            renderModal(user, null, { onboarding: true });
+            return;
+        }
 
         // Fetch session data from our billing endpoint
         if (sessionId) {
@@ -544,22 +550,25 @@ ${QUICK_STEPS.map((s, i) => `
             for (let i = 0; i < 8; i++) {
                 try {
                     const me = await apiGet('/api/me');
-                    if (me?.subscription_status === 'active' || me?.subscription_status === 'trialing') {
-                        user = me; break;
+                    user = (typeof window._normalizeUserPayload === 'function' && me)
+                        ? window._normalizeUserPayload(Object.assign({}, me))
+                        : me;
+                    if (user?.subscription_status === 'active' || user?.subscription_status === 'trialing') {
+                        break;
                     }
                     if (i < 7) await new Promise(r => setTimeout(r, 1500));
                 } catch (e) { break; }
             }
         }
 
-        renderModal(user, sessionData);
+        renderModal(user, sessionData, { onboarding: false });
     }
 
     // Run after DOM is ready
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
-        // Small delay so auth-core.js can set window.currentUser first
+        // Small delay so app.js can set window.currentUser first
         setTimeout(init, 600);
     }
 })();

@@ -46,13 +46,33 @@
   const AIC_PER_UPLOAD  = 3;    // AIC per job
   const BILLING_URL     = 'settings.html#billing';
   const PRICING_URL     = 'index.html#pricing';
-  const API_BASE        = (typeof window !== 'undefined' && window.API_BASE)
-    ? window.API_BASE
-    : (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin)
-      ? 'http://127.0.0.1:8000'
-      : '');
+  /** Resolve API root on each request — canonical: js/api-base.js (resolveUploadM8ApiOrigin / getUploadM8ApiBase). */
+  function _apiBase() {
+    try {
+      if (typeof window.resolveUploadM8ApiOrigin === 'function') {
+        return window.resolveUploadM8ApiOrigin();
+      }
+      if (typeof window.getUploadM8ApiBase === 'function') {
+        return window.getUploadM8ApiBase();
+      }
+    } catch (_) {}
+    var b = '';
+    try {
+      if (typeof window !== 'undefined' && window.API_BASE) {
+        b = String(window.API_BASE).replace(/\/$/, '');
+      }
+    } catch (_) {}
+    return b || 'https://auth.uploadm8.com';
+  }
   const CACHE_TTL_MS    = 60_000; // 60s min between full fetches
   const HUD_REFRESH_MS  = 90_000; // re-render interval
+  const ANALYTICS_SYNC_KEY = 'uploadm8_analytics_sync_v1';
+  const NUDGE_MAX_IMPRESSIONS_PER_DAY = 4;
+  const NUDGE_SESSION_MAX = 2;
+  const NUDGE_IMPRESSIONS_KEY = 'wt_nudge_impressions_v1';
+  const NUDGE_SESSION_KEY = 'wt_nudge_session_v1';
+  const NUDGE_LAST_TYPE_KEY = 'wt_last_nudge_type_v1';
+  const NUDGE_LAST_AT_KEY = 'wt_last_nudge_at_v1';
 
   /* Fallback tier metadata — overwritten by /api/entitlements/tiers on init */
   let _tierMeta = {
@@ -84,10 +104,50 @@
     dash:       null,         // /api/dashboard/stats
     analytics:  null,         // /api/analytics
     ledger:     [],           // /api/wallet ledger
+    serverWalletMeta: null,  // last GET /api/wallet (banners, burn %, links)
     tierConfig: null,         // /api/entitlements/tiers (server canonical)
     lastFetch:  0,
     inFlight:   false,
+    hudPollId:  null,
   };
+
+  /** Dashboard/queue already load stats + analytics; skip duplicate heavy fetches + sync broadcast on first paint. */
+  let _pageLiteFetch = false;
+
+  function _isLiteWalletPage() {
+    try {
+      const p = (location.pathname || '').toLowerCase();
+      // Lite = wallet + tiers only (skip dashboard stats + 30d analytics) — upload is latency-sensitive.
+      return /(?:^|\/)dashboard\.html$/i.test(p) || /(?:^|\/)queue\.html$/i.test(p)
+        || /(?:^|\/)upload\.html$/i.test(p) || /(?:^|\/)thumbnail-studio\.html$/i.test(p)
+        || /\/dashboard\/?$/i.test(p) || /\/queue\/?$/i.test(p) || /\/upload\/?$/i.test(p)
+        || /\/thumbnail-studio\/?$/i.test(p);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /* ─────────────────────────────────────────────
+   * INSTANT HYDRATION — read app.js sessionStorage cache
+   * Pills render immediately from cache, no blink. No DB/API on every page load.
+   * ───────────────────────────────────────────── */
+  (function _hydrateFromSession() {
+    try {
+      const raw = sessionStorage.getItem('uploadm8_cached_user');
+      const at  = sessionStorage.getItem('uploadm8_cached_user_at');
+      if (!raw || !at) return;
+      const age = Date.now() - parseInt(at, 10);
+      if (age > 20 * 60 * 1000) return;
+      const parsed = JSON.parse(raw);
+      if (typeof window._cachePayloadMatchesCurrentToken === 'function' &&
+          !window._cachePayloadMatchesCurrentToken(parsed)) return;
+      const user = (parsed && parsed.user && typeof parsed.user === 'object') ? parsed.user : parsed;
+      if (!user || !user.email) return;
+      _s.user   = user;
+      _s.wallet = user.wallet || _s.wallet;
+      _s.ent    = user.entitlements || _s.ent;
+    } catch (_) {}
+  })();
 
   /* ─────────────────────────────────────────────
    * CSS INJECTION
@@ -184,28 +244,31 @@
 .wt-dismiss:hover{color:rgba(255,255,255,.6)}
 
 /* ── HUD ────────────────────────────────────── */
-.wt-fab{position:fixed;bottom:24px;right:24px;z-index:9989;width:48px;height:48px;
+.wt-fab{position:fixed;bottom:24px;right:24px;z-index:10050;width:48px;height:48px;
   border-radius:50%;background:linear-gradient(135deg,#1f1f1f,#111);
   border:1.5px solid rgba(255,255,255,.1);box-shadow:0 8px 24px rgba(0,0,0,.45);
   display:flex;align-items:center;justify-content:center;cursor:pointer;
   transition:transform .2s,box-shadow .2s;font-size:20px}
 .wt-fab:hover{transform:scale(1.08);box-shadow:0 12px 32px rgba(0,0,0,.55)}
+.wt-fab-emoji{line-height:1;display:inline-flex;align-items:center;justify-content:center}
 .wt-fab-dot{position:absolute;top:3px;right:3px;width:10px;height:10px;border-radius:50%;
   background:#f97316;border:2px solid #111;animation:wt-dot 2s ease-in-out infinite}
 @keyframes wt-dot{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.4);opacity:.8}}
-.wt-hud{position:fixed;bottom:24px;right:24px;z-index:9990;width:320px;border-radius:16px;
+.wt-hud{position:fixed;bottom:24px;right:24px;z-index:10051;width:320px;border-radius:16px;
   overflow:hidden;font-family:'DM Mono','Fira Code',monospace;background:#0a0a0a;
   box-shadow:0 20px 60px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.06);
-  transform:translateY(120%);transition:transform .35s cubic-bezier(.34,1.56,.64,1)}
-.wt-hud.open{transform:translateY(0)}
+  transform:translateY(120%);transition:transform .35s cubic-bezier(.34,1.56,.64,1);
+  pointer-events:none}
+.wt-hud.open{transform:translateY(0);pointer-events:auto}
 .wt-hud-head{display:flex;align-items:center;justify-content:space-between;
   padding:14px 16px 10px;background:linear-gradient(135deg,#111,#1a1a1a);
   border-bottom:1px solid rgba(255,255,255,.07)}
 .wt-hud-title{font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#e5e7eb}
-.wt-hud-x{background:none;border:none;color:#6b7280;cursor:pointer;font-size:16px;line-height:1;
-  padding:0;width:20px;height:20px;display:flex;align-items:center;justify-content:center;
-  border-radius:4px;transition:color .15s,background .15s}
-.wt-hud-x:hover{color:#e5e7eb;background:rgba(255,255,255,.08)}
+.wt-hud-x{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#e5e7eb;cursor:pointer;
+  font-size:18px;font-weight:600;line-height:1;padding:0;width:32px;height:32px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;border-radius:8px;
+  transition:color .15s,background .15s,border-color .15s}
+.wt-hud-x:hover{color:#fff;background:rgba(255,255,255,.14);border-color:rgba(255,255,255,.2)}
 .wt-hud-body{padding:14px 16px;max-height:80vh;overflow-y:auto}
 .wt-hud-body::-webkit-scrollbar{width:3px}
 .wt-hud-body::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:99px}
@@ -285,7 +348,7 @@
   }
 
   function _lvlIcon(l) {
-    return { healthy: '●', notice: '◐', low: '◑', critical: '⚠', empty: '⊘' }[l] || '●';
+    return { healthy: '●', notice: '◐', low: '◑', critical: '', empty: '⊘' }[l] || '●';
   }
 
   function _fillCls(l) {
@@ -408,11 +471,11 @@
     if (!nextTier) {
       if (m.putAvail < PUT_PER_UPLOAD * 10) {
         return {
-          icon: '💳', cls: 'upsell',
+          icon: '', cls: 'upsell',
           title: 'Top Up Your Arsenal',
           msg: `${m.putAvail} PUT remaining. Top up to stay in the game.`,
           sub: null, features: [],
-          cta: [{ label: '⚡ Add Tokens', href: BILLING_URL, style: 'primary' }],
+          cta: [{ label: ' Add Tokens', href: BILLING_URL, style: 'primary' }],
         };
       }
       return null;
@@ -424,7 +487,7 @@
 
     if (roi > 50 && views30 > 300) {
       return {
-        icon: '🚀', cls: 'upsell',
+        icon: '', cls: 'upsell',
         title: `${roi}× Return — Time to Scale`,
         msg: `Every PUT token generates ~${roi} views. ${nextM.label || nextTier} unlocks ${gainStr} automatically.`,
         sub: 'Your content converts. The ceiling is your token limit.',
@@ -438,34 +501,34 @@
 
     if (daysLeft < 10 && daysLeft < 999 && putUsed > 0) {
       return {
-        icon: '🔥', cls: 'upsell',
+        icon: '', cls: 'upsell',
         title: `Tokens Gone in ~${daysLeft} Day${daysLeft !== 1 ? 's' : ''}`,
         msg: `At your pace you'll hit zero mid-month. ${nextM.label || nextTier} auto-refills ${gainStr} every cycle.`,
         sub: null, features: feats,
         cta: [
           { label: `Upgrade to ${nextM.label || nextTier}`, href: BILLING_URL, style: 'primary' },
-          { label: 'Top Up Instead', href: BILLING_URL + '?tab=topup', style: 'secondary' },
+          { label: 'Top Up Instead', href: BILLING_URL, style: 'secondary' },
         ],
       };
     }
 
     if (uploadsLeft < 5 && totalUps > 2) {
       return {
-        icon: '📈', cls: 'upsell',
+        icon: '', cls: 'upsell',
         title: `Only ${uploadsLeft} Upload${uploadsLeft !== 1 ? 's' : ''} Left`,
         msg: `${doneUps} published · ${successPct}% success. ${nextM.label || nextTier} adds ${gainStr} to keep momentum.`,
         sub: "Don't let an empty wallet break your streak.",
         features: feats,
         cta: [
           { label: `Upgrade to ${nextM.label || nextTier}`, href: BILLING_URL, style: 'purple' },
-          { label: 'Top Up Now', href: BILLING_URL + '?tab=topup', style: 'secondary' },
+          { label: 'Top Up Now', href: BILLING_URL, style: 'secondary' },
         ],
       };
     }
 
     if (tier === 'free' && totalUps >= 1) {
       return {
-        icon: '⚡', cls: 'upsell',
+        icon: '', cls: 'upsell',
         title: "You've Got the Flow — Go Pro",
         msg: `${totalUps} upload${totalUps !== 1 ? 's' : ''} done. Creator Lite gives 3× tokens${!canAi ? ', AI captions' : ''} & priority queue.`,
         sub: 'First 7 days free. Cancel any time.',
@@ -485,23 +548,52 @@
    * ───────────────────────────────────────────── */
   function _tok() {
     try {
-      return localStorage.getItem('uploadm8_access_token')
-          || localStorage.getItem('uploadm8_token')
-          || localStorage.getItem('access_token')
-          || localStorage.getItem('accessToken')
-          || localStorage.getItem('token') || '';
+      if (typeof window.getAccessToken === 'function') return window.getAccessToken() || '';
+      if (typeof window.getToken === 'function') return window.getToken() || '';
+      return sessionStorage.getItem('uploadm8_access_token')
+          || sessionStorage.getItem('uploadm8_token')
+          || sessionStorage.getItem('access_token')
+          || sessionStorage.getItem('accessToken')
+          || sessionStorage.getItem('token') || '';
     } catch { return ''; }
   }
 
+  function _stopHudPoll() {
+    if (_s.hudPollId == null) return;
+    try {
+      clearInterval(_s.hudPollId);
+    } catch (_) {}
+    _s.hudPollId = null;
+  }
+
+  function _authFailureStopsHud(e) {
+    if (!e) return false;
+    const msg = String(e.message || '');
+    if (e.status === 401 || msg === 'Session expired' || msg === 'Email not verified') return true;
+    return false;
+  }
+
   async function _get(path) {
+    if (typeof window.apiCall === 'function') {
+      try {
+        return await window.apiCall(path);
+      } catch (e) {
+        if (_authFailureStopsHud(e)) _stopHudPoll();
+        return null;
+      }
+    }
     const t = _tok();
     try {
-      const r = await fetch(API_BASE + path, {
+      const base = _apiBase();
+      const url = base ? (base + path) : path;
+      const r = await fetch(url, {
         headers: t ? { Authorization: `Bearer ${t}` } : {},
         credentials: 'include',
       });
       return r.ok ? r.json() : null;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
   function _applyTierConfig(data) {
@@ -517,9 +609,14 @@
   }
 
   async function _fetchAll(force = false) {
+    const offlineUntil =
+      typeof window.__uploadm8ApiOfflineUntil === 'number' ? window.__uploadm8ApiOfflineUntil : 0;
+    if (Date.now() < offlineUntil) return;
     if (!force && Date.now() - _s.lastFetch < CACHE_TTL_MS) return;
     if (_s.inFlight) return;
     _s.inFlight = true;
+
+    const lite = !force && _pageLiteFetch;
 
     try {
       // Use window.currentUser if available (from app.js session cache or checkAuth) — avoids duplicate /api/me
@@ -527,9 +624,12 @@
       if (!_s.user) {
         const me = await _get('/api/me');
         if (me) {
-          _s.user   = me;
-          _s.wallet = me.wallet;
-          _s.ent    = me.entitlements;
+          const u = (typeof window._normalizeUserPayload === 'function')
+            ? window._normalizeUserPayload(Object.assign({}, me))
+            : me;
+          _s.user   = u;
+          _s.wallet = u.wallet;
+          _s.ent    = u.entitlements;
         }
       } else {
         _s.wallet = _s.wallet || _s.user.wallet;
@@ -541,6 +641,24 @@
         tierData = await _get('/api/entitlements/tiers');
         if (!tierData) tierData = await _get('/api/entitlements');
       }
+      // No session — do not call dashboard / analytics / wallet (401 noise in DevTools + useless load).
+      if (!_s.user) {
+        if (tierData) _applyTierConfig(tierData);
+        return;
+      }
+
+      if (lite) {
+        const w = await _get('/api/wallet');
+        if (w) {
+          _s.ledger = (w.ledger || []).slice(0, 8);
+          if (w.wallet) _s.wallet = w.wallet;
+          _s.serverWalletMeta = w;
+        }
+        if (tierData) _applyTierConfig(tierData);
+        _s.lastFetch = Date.now();
+        return;
+      }
+
       const [d, a, w] = await Promise.allSettled([
         _get('/api/dashboard/stats'),
         _get('/api/analytics?range=30d'),
@@ -552,13 +670,29 @@
       if (w.status === 'fulfilled' && w.value) {
         _s.ledger = (w.value.ledger || []).slice(0, 8);
         if (w.value.wallet) _s.wallet = w.value.wallet;
+        _s.serverWalletMeta = w.value;
       }
       if (tierData) _applyTierConfig(tierData);
 
       _s.lastFetch = Date.now();
+      _broadcastAnalyticsSync();
     } finally {
       _s.inFlight = false;
     }
+  }
+
+  function _broadcastAnalyticsSync() {
+    try {
+      const userId = (_s.user && (_s.user.id || _s.user.user_id || _s.user.uid)) || null;
+      const payload = {
+        at: Date.now(),
+        user_id: userId ? String(userId) : null,
+        dash: _s.dash || null,
+        analytics: _s.analytics || null,
+      };
+      sessionStorage.setItem(ANALYTICS_SYNC_KEY, JSON.stringify(payload));
+      window.dispatchEvent(new CustomEvent('uploadm8:analytics-sync', { detail: payload }));
+    } catch (_) {}
   }
 
   function _resolve() {
@@ -567,6 +701,63 @@
       _s.wallet = window.currentUser.wallet;
       _s.ent    = window.currentUser.entitlements;
     }
+  }
+
+  function _sessionId() {
+    try {
+      let sid = sessionStorage.getItem('uploadm8_session_id');
+      if (sid) return sid;
+      sid = (Math.random().toString(36).slice(2) + Date.now().toString(36)).slice(0, 24);
+      sessionStorage.setItem('uploadm8_session_id', sid);
+      return sid;
+    } catch (_) {
+      return String(Date.now());
+    }
+  }
+
+  async function _emitMarketingEvent(eventType, payload = {}) {
+    try {
+      if (!_tok()) return;
+      if (typeof window.apiCall === 'function') {
+        await window.apiCall('/api/marketing/events', {
+          method: 'POST',
+          body: JSON.stringify({
+            event_type: eventType,
+            nudge_type: payload.type || 'general',
+            nudge_severity: payload.severity || null,
+            cta_variant: payload.cta_variant || null,
+            urgency_variant: payload.urgency_variant || null,
+            ordering_variant: payload.ordering_variant || null,
+            page: location && location.pathname ? location.pathname : null,
+            session_id: _sessionId(),
+            metadata: payload.metadata || {},
+          }),
+        });
+        return;
+      }
+      const t = _tok();
+      const base = _apiBase();
+      const url = base ? base + '/api/marketing/events' : '/api/marketing/events';
+      await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${t}`,
+        },
+        body: JSON.stringify({
+          event_type: eventType,
+          nudge_type: payload.type || 'general',
+          nudge_severity: payload.severity || null,
+          cta_variant: payload.cta_variant || null,
+          urgency_variant: payload.urgency_variant || null,
+          ordering_variant: payload.ordering_variant || null,
+          page: location && location.pathname ? location.pathname : null,
+          session_id: _sessionId(),
+          metadata: payload.metadata || {},
+        }),
+      });
+    } catch (_) {}
   }
 
   /* ─────────────────────────────────────────────
@@ -617,6 +808,11 @@
   /* ─────────────────────────────────────────────
    * BANNER RENDERER
    * ───────────────────────────────────────────── */
+  function _serverBannerCls(sev) {
+    const map = { blocking: 'empty', urgent: 'critical', warning: 'low', info: 'upsell', promo: 'upsell' };
+    return map[sev] || 'upsell';
+  }
+
   function _renderBanner(el, userOverride) {
     if (!el) return;
     if (userOverride) { _s.user = userOverride; _s.wallet = userOverride.wallet; _s.ent = userOverride.entitlements; }
@@ -624,19 +820,86 @@
     const m   = _metrics();
     const key = `wt_dismissed_${m.overall}_${new Date().toDateString()}`;
     el.querySelectorAll('.wt-banner').forEach(b => b.remove());
-    if (localStorage.getItem(key)) return;
+    if (sessionStorage.getItem(key)) return;
+
+    const api = _s.serverWalletMeta;
+    const apiOpps = (api && Array.isArray(api.sales_opportunities) && api.sales_opportunities.length)
+      ? api.sales_opportunities
+      : ((api && Array.isArray(api.banners)) ? api.banners : []);
+    if (apiOpps.length) {
+      const b = _pickOpportunityForPage(apiOpps);
+      if (!b) return;
+      if (!_canShowNudge(b.type || 'general', b.severity || 'info')) return;
+      const sk = `wt_srv_${b.type || 'b'}_${new Date().toDateString()}`;
+      if (sessionStorage.getItem(sk)) return;
+      const cls = _serverBannerCls(b.severity);
+      const ex = api.experiments || {};
+      const title = _applyUrgencyExperimentTitle(b.title || 'Notice', b, ex);
+      const body  = _applyUrgencyExperimentBody(b.body || '', b, ex);
+      const ctaHref = _applyOrderingExperimentLink(b.cta_link, b, ex);
+      const cta   = (b.cta_label && b.cta_link)
+        ? `<div class="wt-banner-actions"><a href="${ctaHref}" class="wt-bbtn wt-bbtn-primary">${_applyCtaExperimentText(b.cta_label, b, ex)}</a></div>`
+        : '';
+      const banner = document.createElement('div');
+      banner.className = `wt-banner wt-banner-${cls}`;
+      banner.innerHTML = `
+        <div class="wt-banner-icon">${cls === 'critical' ? '' : cls === 'low' ? '️' : cls === 'empty' ? '' : ''}</div>
+        <div class="wt-banner-body">
+          <div class="wt-banner-title">${title}</div>
+          <div class="wt-banner-msg">${body}</div>
+          ${cta}
+        </div>
+        <button class="wt-dismiss" aria-label="Dismiss">×</button>`;
+      banner.querySelector('.wt-dismiss').addEventListener('click', () => {
+        try { sessionStorage.setItem(sk, '1'); } catch {}
+        _emitMarketingEvent('dismissed', {
+          type: b.type || 'general',
+          severity: b.severity || 'info',
+          cta_variant: (api.experiments || {}).cta_variant,
+          urgency_variant: (api.experiments || {}).urgency_variant,
+          ordering_variant: (api.experiments || {}).ordering_variant,
+          metadata: (b && typeof b.metadata === 'object') ? b.metadata : {},
+        });
+        banner.style.cssText += ';opacity:0;transform:translateY(-6px);transition:all .25s';
+        setTimeout(() => banner.remove(), 260);
+      });
+      banner.querySelectorAll('a').forEach(a => {
+        a.addEventListener('click', () => {
+          _markNudgeImpression(b.type || 'general');
+          _emitMarketingEvent('clicked', {
+            type: b.type || 'general',
+            severity: b.severity || 'info',
+            cta_variant: (api.experiments || {}).cta_variant,
+            urgency_variant: (api.experiments || {}).urgency_variant,
+            ordering_variant: (api.experiments || {}).ordering_variant,
+            metadata: (b && typeof b.metadata === 'object') ? b.metadata : {},
+          });
+        });
+      });
+      _markNudgeImpression(b.type || 'general');
+      _emitMarketingEvent('shown', {
+        type: b.type || 'general',
+        severity: b.severity || 'info',
+        cta_variant: (api.experiments || {}).cta_variant,
+        urgency_variant: (api.experiments || {}).urgency_variant,
+        ordering_variant: (api.experiments || {}).ordering_variant,
+        metadata: (b && typeof b.metadata === 'object') ? b.metadata : {},
+      });
+      el.insertBefore(banner, el.firstChild);
+      return;
+    }
 
     const cfg = _bannerCfg(m);
     if (!cfg) return;
 
     const featsHtml = (cfg.features && cfg.features.length)
-      ? `<div class="wt-feature-list">${cfg.features.map(f => `<span class="wt-feat-chip">✓ ${f}</span>`).join('')}</div>` : '';
+      ? `<div class="wt-feature-list">${cfg.features.map(f => `<span class="wt-feat-chip"> ${f}</span>`).join('')}</div>` : '';
 
     const roiHtml = (cfg.roi && cfg.views)
-      ? `<div class="wt-roi-badge">📊 ${cfg.roi}× ROI · ${cfg.views.toLocaleString()} views / 30d</div>` : '';
+      ? `<div class="wt-roi-badge"> ${cfg.roi}× ROI · ${cfg.views.toLocaleString()} views / 30d</div>` : '';
 
     const aiBadge = m.canAi
-      ? `<div class="wt-ai-badge">✦ AI Captions & Hashtags Enabled</div>` : '';
+      ? `<div class="wt-ai-badge"> AI Captions & Hashtags Enabled</div>` : '';
 
     const banner = document.createElement('div');
     banner.className = `wt-banner wt-banner-${cfg.cls}`;
@@ -652,7 +915,7 @@
       <button class="wt-dismiss" aria-label="Dismiss">×</button>`;
 
     banner.querySelector('.wt-dismiss').addEventListener('click', () => {
-      try { localStorage.setItem(key, '1'); } catch {}
+      try { sessionStorage.setItem(key, '1'); } catch {}
       banner.style.cssText += ';opacity:0;transform:translateY(-6px);transition:all .25s';
       setTimeout(() => banner.remove(), 260);
     });
@@ -660,40 +923,169 @@
     el.insertBefore(banner, el.firstChild);
   }
 
+  function _pickOpportunityForPage(opps) {
+    if (!Array.isArray(opps) || !opps.length) return null;
+    const hard = opps.find(o => o && (o.severity === 'blocking' || o.severity === 'urgent'));
+    if (hard) return hard;
+    const eligible = opps.filter(Boolean);
+    if (!eligible.length) return null;
+    const d = new Date();
+    const daySeed = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}`;
+    const page = (location && location.pathname ? location.pathname : '/').toLowerCase();
+    const seed = `${daySeed}|${page}`;
+    let hash = 0;
+    for (let i = 0; i < seed.length; i++) hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0;
+    const idx = Math.abs(hash) % Math.min(eligible.length, 3);
+    return eligible[idx];
+  }
+
+  function _applyCtaExperimentText(text, opp, exp) {
+    const t = String(text || 'View Plans');
+    if (!exp || !exp.cta_variant) return t;
+    if (exp.cta_variant === 'B') {
+      if (/upgrade/i.test(t)) return t.replace(/upgrade/ig, 'Unlock');
+      if (/top up/i.test(t)) return t.replace(/top up/ig, 'Add Credits');
+      return `Get ${t}`;
+    }
+    return t;
+  }
+
+  function _applyUrgencyExperimentTitle(title, opp, exp) {
+    const t = String(title || 'Notice');
+    if (!exp || exp.urgency_variant !== 'B') return t;
+    if ((opp && (opp.severity === 'warning' || opp.severity === 'promo' || opp.severity === 'info')) && !/^Today: /i.test(t)) {
+      return `Today: ${t}`;
+    }
+    return t;
+  }
+
+  function _applyUrgencyExperimentBody(body, opp, exp) {
+    const b = String(body || '');
+    if (!exp || exp.urgency_variant !== 'B') return b;
+    if (opp && (opp.severity === 'warning' || opp.severity === 'promo' || opp.severity === 'info')) {
+      return `${b} Limited-time momentum window this week.`;
+    }
+    return b;
+  }
+
+  function _applyOrderingExperimentLink(link, opp, exp) {
+    const l = String(link || BILLING_URL);
+    if (!exp || exp.ordering_variant !== 'B') return l;
+    if (!opp || !opp.type) return l;
+    if (String(opp.type).includes('upgrade')) return BILLING_URL;
+    if (String(opp.type).includes('put_') || String(opp.type).includes('aic_')) return BILLING_URL;
+    return l;
+  }
+
+  function _cooldownMsForSeverity(sev) {
+    if (sev === 'blocking') return 15 * 60 * 1000;
+    if (sev === 'urgent') return 45 * 60 * 1000;
+    if (sev === 'warning') return 90 * 60 * 1000;
+    if (sev === 'promo') return 6 * 60 * 60 * 1000;
+    return 3 * 60 * 60 * 1000;
+  }
+
+  function _loadNudgeState() {
+    const day = new Date().toDateString();
+    try {
+      const raw = sessionStorage.getItem(NUDGE_IMPRESSIONS_KEY);
+      const obj = raw ? JSON.parse(raw) : {};
+      if (!obj || obj.day !== day) return { day, total: 0 };
+      return { day, total: Number(obj.total || 0) };
+    } catch (_) {
+      return { day, total: 0 };
+    }
+  }
+
+  function _saveNudgeState(s) {
+    try { sessionStorage.setItem(NUDGE_IMPRESSIONS_KEY, JSON.stringify(s)); } catch (_) {}
+  }
+
+  function _loadNudgeSessionCount() {
+    try { return Number(sessionStorage.getItem(NUDGE_SESSION_KEY) || 0); } catch (_) { return 0; }
+  }
+
+  function _saveNudgeSessionCount(v) {
+    try { sessionStorage.setItem(NUDGE_SESSION_KEY, String(v)); } catch (_) {}
+  }
+
+  function _canShowNudge(type, sev) {
+    const s = _loadNudgeState();
+    const ss = _loadNudgeSessionCount();
+    if (s.total >= NUDGE_MAX_IMPRESSIONS_PER_DAY || ss >= NUDGE_SESSION_MAX) return false;
+    let lastAt = 0;
+    let lastType = '';
+    try {
+      lastAt = Number(sessionStorage.getItem(NUDGE_LAST_AT_KEY) || 0);
+      lastType = String(sessionStorage.getItem(NUDGE_LAST_TYPE_KEY) || '');
+    } catch (_) {}
+    const now = Date.now();
+    const cooldown = _cooldownMsForSeverity(sev);
+    if (lastType === String(type || '') && (now - lastAt) < cooldown) return false;
+    return true;
+  }
+
+  function _markNudgeImpression(type) {
+    const s = _loadNudgeState();
+    s.total = Number(s.total || 0) + 1;
+    _saveNudgeState(s);
+    _saveNudgeSessionCount(_loadNudgeSessionCount() + 1);
+    try {
+      sessionStorage.setItem(NUDGE_LAST_TYPE_KEY, String(type || 'general'));
+      sessionStorage.setItem(NUDGE_LAST_AT_KEY, String(Date.now()));
+    } catch (_) {}
+  }
+
+  function _ensureGlobalBannerSlots() {
+    // Every authenticated app page gets one canonical banner slot unless a page defines its own.
+    if (document.querySelector('[data-wt-banner]')) return;
+    const host = document.querySelector('main.main-content')
+      || document.querySelector('.main-content')
+      || document.querySelector('main')
+      || document.body;
+    if (!host) return;
+    const slot = document.createElement('div');
+    slot.setAttribute('data-wt-banner', '');
+    slot.setAttribute('data-wt-auto-banner', '1');
+    slot.style.marginTop = '8px';
+    if (host.firstChild) host.insertBefore(slot, host.firstChild);
+    else host.appendChild(slot);
+  }
+
   function _bannerCfg(m) {
     const { overall, putAvail, aicAvail, uploadsLeft, burnDay, daysLeft } = m;
 
     if (overall === 'empty') return {
-      cls: 'empty', icon: '⛔',
+      cls: 'empty', icon: '',
       title: 'Zero Tokens — Uploads Paused',
       msg: "You've hit your limit. Add tokens to resume publishing.",
       sub: null, features: [],
       cta: [
-        { label: '💳 Top Up Tokens', href: BILLING_URL, style: 'primary' },
+        { label: ' Top Up Tokens', href: BILLING_URL, style: 'primary' },
         { label: 'Upgrade Plan',     href: PRICING_URL, style: 'secondary' },
       ],
     };
 
     if (overall === 'critical') return {
-      cls: 'critical', icon: '🚨',
+      cls: 'critical', icon: '',
       title: `Only ${uploadsLeft} Upload${uploadsLeft !== 1 ? 's' : ''} Left!`,
       msg: `${putAvail} PUT · ${aicAvail} AIC remaining. Next upload may fail.`,
       sub: burnDay > 0 ? `At your pace: ~${daysLeft} day${daysLeft !== 1 ? 's' : ''} until empty.` : 'Top up to avoid interruption.',
       features: [],
       cta: [
-        { label: '🔥 Top Up Now',              href: BILLING_URL, style: 'primary' },
+        { label: ' Top Up Now',              href: BILLING_URL, style: 'primary' },
         { label: 'Upgrade for Auto-Refill',    href: BILLING_URL, style: 'secondary' },
       ],
     };
 
     if (overall === 'low') return {
-      cls: 'low', icon: '⚠️',
+      cls: 'low', icon: '️',
       title: 'Running Low on Tokens',
       msg: `${putAvail} PUT · ${aicAvail} AIC — about ${uploadsLeft} upload${uploadsLeft !== 1 ? 's' : ''} remaining.`,
       sub: 'Top up now to keep publishing without interruption.',
       features: [],
       cta: [
-        { label: '➕ Add Tokens',  href: BILLING_URL, style: 'primary' },
+        { label: ' Add Tokens',  href: BILLING_URL, style: 'primary' },
         { label: 'Upgrade Plan',   href: PRICING_URL, style: 'secondary' },
       ],
     };
@@ -709,11 +1101,15 @@
     _resolve();
     const m = _metrics();
 
-    const fab = document.createElement('button');
-    fab.id = 'wt-fab'; fab.className = 'wt-fab';
+    const existingFab = document.getElementById('wt-fab');
+    const fab = existingFab || document.createElement('button');
+    fab.id = 'wt-fab';
+    fab.className = 'wt-fab';
     fab.title = 'Wallet & Token Stats';
     fab.setAttribute('aria-label', 'Open wallet panel');
-    fab.innerHTML = '💰';
+    fab.setAttribute('type', 'button');
+    // Use emoji so the button is never blank even if icon fonts fail.
+    fab.innerHTML = '<span class="wt-fab-emoji" aria-hidden="true">💰</span>';
     if (m.overall === 'critical' || m.overall === 'empty') {
       const dot = document.createElement('div'); dot.className = 'wt-fab-dot'; fab.appendChild(dot);
     }
@@ -725,17 +1121,31 @@
     hud.setAttribute('aria-label', 'Wallet and Token Stats');
     hud.innerHTML = `
       <div class="wt-hud-head">
-        <span class="wt-hud-title">⬡ Token Wallet</span>
-        <button class="wt-hud-x" id="wt-close" aria-label="Close">✕</button>
+        <span class="wt-hud-title">⬡ 💎 Token Wallet 💰</span>
+        <button type="button" class="wt-hud-x" id="wt-close" aria-label="Close wallet panel"><span aria-hidden="true">×</span></button>
       </div>
       <div class="wt-hud-body" id="wt-hud-body">${_hudInner(m)}</div>`;
 
-    document.body.appendChild(fab);
+    if (!existingFab) document.body.appendChild(fab);
     document.body.appendChild(hud);
 
-    fab.addEventListener('click', () => hud.classList.toggle('open'));
-    document.getElementById('wt-close').addEventListener('click', () => hud.classList.remove('open'));
-    document.addEventListener('keydown', e => { if (e.key === 'Escape') hud.classList.remove('open'); });
+    function wtCloseHud() {
+      hud.classList.remove('open');
+    }
+
+    fab.addEventListener('click', () => {
+      const opening = !hud.classList.contains('open');
+      hud.classList.toggle('open', opening);
+      if (opening) {
+        // Open immediately from cache so the first tap always responds; refresh in background.
+        _refreshHud();
+        void _fetchAll(true).then(() => {
+          _refreshHud();
+        });
+      }
+    });
+    document.getElementById('wt-close').addEventListener('click', wtCloseHud);
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') wtCloseHud(); });
   }
 
   function _hudInner(m) {
@@ -765,7 +1175,7 @@
 
   function _hudEntBadges(m) {
     const badges = [];
-    if (m.canAi)       badges.push('✦ AI');
+    if (m.canAi)       badges.push(' AI');
     if (m.canSchedule) badges.push('⏱ Scheduler');
     if (!badges.length) return '';
     return `<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px">${
@@ -792,7 +1202,7 @@
     const urgCss = m.daysLeft < 5 ? 'color:#f87171' : m.daysLeft < 14 ? 'color:#fbbf24' : 'color:#34d399';
     return `
       <div class="wt-burn">
-        <span class="wt-burn-ico">🔥</span>
+        <span class="wt-burn-ico"></span>
         <div class="wt-burn-txt">Burning <strong>~${m.burnDay.toFixed(1)} PUT/day</strong> —
           <span style="${urgCss};font-weight:700">~${m.daysLeft}d left</span> at this pace.
         </div>
@@ -830,10 +1240,10 @@
     const nextM = m.nextTier ? (_tierMeta[m.nextTier] || {}) : null;
     return `
       <div class="wt-cta-row">
-        <a href="${BILLING_URL}?tab=topup" class="wt-hbtn wt-hbtn-primary">⚡ Top Up</a>
+        <a href="${BILLING_URL}" class="wt-hbtn wt-hbtn-primary"> Top Up</a>
         ${nextM
           ? `<a href="${BILLING_URL}" class="wt-hbtn wt-hbtn-secondary">↑ ${nextM.label || m.nextTier}</a>`
-          : `<a href="${BILLING_URL}" class="wt-hbtn wt-hbtn-secondary">⚙ Billing</a>`}
+          : `<a href="${BILLING_URL}" class="wt-hbtn wt-hbtn-secondary"> Billing</a>`}
       </div>`;
   }
 
@@ -853,28 +1263,62 @@
     }
   }
 
-  /* ─────────────────────────────────────────────
-   * PUBLIC API
-   * ───────────────────────────────────────────── */
-  async function init(opts = {}) {
-    _css();
-    if (opts.user) { _s.user = opts.user; _s.wallet = opts.user.wallet; _s.ent = opts.user.entitlements; }
-    _resolve();
-    await _fetchAll();
-
-    document.querySelectorAll('[data-wt-pills]').forEach(_renderPills);
-    document.querySelectorAll('[data-wt-banner]').forEach(el => _renderBanner(el));
-    if (!opts.noHud) _buildHud();
-
-    setInterval(async () => {
-      await _fetchAll(true);
+  function _startHudPoll() {
+    if (_s.hudPollId != null) return;
+    _s.hudPollId = setInterval(async () => {
+      _resolve();
+      if (!_s.user) return;
+      await _fetchAll(false);
       document.querySelectorAll('[data-wt-pills]').forEach(_renderPills);
       document.querySelectorAll('[data-wt-banner]').forEach(el => _renderBanner(el));
       _refreshHud();
     }, HUD_REFRESH_MS);
   }
 
-  function _auto() { init({ user: window.currentUser || null }); }
+  /* ─────────────────────────────────────────────
+   * PUBLIC API
+   * ───────────────────────────────────────────── */
+  async function init(opts = {}) {
+    _css();
+    _pageLiteFetch = !!opts.liteFetch;
+    if (opts.user) { _s.user = opts.user; _s.wallet = opts.user.wallet; _s.ent = opts.user.entitlements; }
+    _resolve();
+    _ensureGlobalBannerSlots();
+
+    // 1. Paint pills/banners immediately from cache — zero blink, no DB read
+    document.querySelectorAll('[data-wt-pills]').forEach(_renderPills);
+    document.querySelectorAll('[data-wt-banner]').forEach(el => _renderBanner(el));
+    if (!opts.noHud) _buildHud();
+
+    // 2. Background refresh — dashboard/analytics/wallet for HUD; re-render when done
+    _fetchAll().then(() => {
+      document.querySelectorAll('[data-wt-pills]').forEach(_renderPills);
+      document.querySelectorAll('[data-wt-banner]').forEach(el => _renderBanner(el));
+      _refreshHud();
+      _maybeEmitConvertedEvent();
+      if (_s.user) _startHudPoll();
+    });
+  }
+
+  function _maybeEmitConvertedEvent() {
+    try {
+      const k = `wt_conv_evt_${new Date().toDateString()}_${(location && location.pathname) || ''}`;
+      if (sessionStorage.getItem(k)) return;
+      const path = (location && location.pathname ? location.pathname : '').toLowerCase();
+      const q = (location && location.search ? location.search : '').toLowerCase();
+      const isConvertedPath = path.includes('/billing/success');
+      const isConvertedQuery = q.includes('checkout=success') || q.includes('billing=success');
+      if (!isConvertedPath && !isConvertedQuery) return;
+      sessionStorage.setItem(k, '1');
+      _emitMarketingEvent('converted', { type: 'checkout_success', severity: 'info' });
+    } catch (_) {}
+  }
+
+  function _auto() {
+    // Never seed from window.currentUser — hydrate can set it before HttpOnly session is validated;
+    // _fetchAll loads /api/me first when _s.user is absent, avoiding 401 storms on /api/wallet.
+    init({ user: null, liteFetch: _isLiteWalletPage() });
+  }
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', _auto);
@@ -882,14 +1326,32 @@
     setTimeout(_auto, 0);
   }
 
+  /** uploadm8:user fires on every updateUserUI(); _fetchAll(true) bypassed cache → triple GET storm + server resets. */
+  let _lastUploadm8UserEventId = null;
+
   window.addEventListener('uploadm8:user', e => {
     if (!e.detail) return;
+    const uid = String(
+      e.detail.id || e.detail.user_id || e.detail.uid || e.detail.email || ''
+    ).toLowerCase();
+    const userChanged = uid ? uid !== _lastUploadm8UserEventId : _lastUploadm8UserEventId == null;
+    if (uid) _lastUploadm8UserEventId = uid;
+
     _s.user = e.detail;
     _s.wallet = e.detail.wallet;
     _s.ent    = e.detail.entitlements;
     document.querySelectorAll('[data-wt-pills]').forEach(_renderPills);
     document.querySelectorAll('[data-wt-banner]').forEach(el => _renderBanner(el));
     _refreshHud();
+    // Same user: respect CACHE_TTL (avoids hammering stats/analytics/wallet on every chrome paint).
+    void _fetchAll(userChanged).then(() => {
+      document.querySelectorAll('[data-wt-pills]').forEach(_renderPills);
+      document.querySelectorAll('[data-wt-banner]').forEach(el => _renderBanner(el));
+      _refreshHud();
+      // Start interval only after the first aggregate fetch — avoids racing /api/me
+      // validation with dashboard/wallet GETs (stale session 401 noise in DevTools).
+      if (_s.user) _startHudPoll();
+    });
   });
 
   /* ─────────────────────────────────────────────
@@ -897,11 +1359,14 @@
    * ───────────────────────────────────────────── */
   window.WalletTokens = {
     init,
+    stopHudPoll: _stopHudPoll,
     refresh: async () => {
       await _fetchAll(true);
+      _ensureGlobalBannerSlots();
       document.querySelectorAll('[data-wt-pills]').forEach(_renderPills);
       document.querySelectorAll('[data-wt-banner]').forEach(el => _renderBanner(el));
       _refreshHud();
+      _broadcastAnalyticsSync();
     },
     getMetrics: () => { _resolve(); return _metrics(); },
     getState:   () => _s,
@@ -946,7 +1411,13 @@
     getUsageLevel: _lvl,
 
     renderTokenPills(container) {
-      _css(); _resolve(); _renderPills(container);
+      _css(); _resolve();
+      if (!container) return;
+      if (container.matches && container.matches('[data-wt-pills]')) {
+        _renderPills(container);
+        return;
+      }
+      container.querySelectorAll('[data-wt-pills]').forEach(_renderPills);
     },
 
     renderUsageBanner(container, user) {

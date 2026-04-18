@@ -25,6 +25,7 @@ FIX v2 — Connection resilience for large video files:
 Exports:
   - download_file(r2_key, local_path)
   - upload_file(local_path, r2_key, content_type)
+  - object_exists(r2_key)
   - delete_file(r2_key)
   - generate_presigned_url(r2_key, expires)
   - get_public_url(r2_key)
@@ -255,6 +256,33 @@ async def upload_file(
             raise
 
     raise RuntimeError(f"R2 upload exhausted {_MAX_RETRIES} retries: {r2_key}") from last_exc
+
+
+async def object_exists(r2_key: str) -> bool:
+    """
+    Return True if the object exists in R2 (HTTP 200 on HEAD).
+    False for 404 / NoSuchKey; re-raises on other errors.
+    """
+    from botocore.exceptions import ClientError
+
+    def _head() -> bool:
+        client = _make_client()
+        try:
+            client.head_object(Bucket=R2_BUCKET_NAME, Key=r2_key)
+            return True
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "") or ""
+            if code in ("404", "NoSuchKey", "NotFound") or "404" in str(code):
+                return False
+            raise
+
+    try:
+        return await asyncio.get_event_loop().run_in_executor(None, _head)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "") or ""
+        if code in ("404", "NoSuchKey", "NotFound") or "404" in str(code):
+            return False
+        raise
 
 
 async def delete_file(r2_key: str) -> None:

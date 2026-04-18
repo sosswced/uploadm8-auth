@@ -76,3 +76,15 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+
+# --- Google / GCP service account keys ---
+*-service-account*.json
+social-media-up-*.json
+*.serviceaccount.json
+
+# --- Claude / editor tooling ---
+.claude/
+.cursor/
+
+# --- Local debug artefacts ---
+debug-*.log

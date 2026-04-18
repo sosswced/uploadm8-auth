@@ -1,95 +1,441 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sign Up — UploadM8</title>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-  <style>
-    :root { --primary: #7c3aed; --primary-dark: #5b21b6; --bg: #0f0f12; --card: #1a1a1f; --text: #e4e4e7; --muted: #71717a; --danger: #ef4444; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    .auth-card { background: var(--card); border-radius: 16px; padding: 2.5rem; width: 100%; max-width: 400px; border: 1px solid #2a2a2f; }
-    .auth-card h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
-    .auth-card .sub { color: var(--muted); margin-bottom: 1.5rem; font-size: 0.9rem; }
-    .form-group { margin-bottom: 1rem; }
-    .form-group label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.3rem; color: var(--muted); }
-    .form-group input { width: 100%; padding: 0.7rem 0.9rem; border-radius: 8px; border: 1px solid #2a2a2f; background: var(--bg); color: var(--text); font-size: 0.95rem; outline: none; transition: border-color 0.2s; }
-    .form-group input:focus { border-color: var(--primary); }
-    .hint { font-size: 0.75rem; color: var(--muted); margin-top: 0.2rem; }
-    .btn { display: block; width: 100%; padding: 0.75rem; border-radius: 8px; font-weight: 600; text-align: center; cursor: pointer; border: none; font-size: 0.95rem; margin-top: 0.5rem; }
-    .btn-primary { background: var(--primary); color: white; }
-    .btn-primary:hover { background: var(--primary-dark); }
-    .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
-    .error-msg { color: var(--danger); font-size: 0.85rem; margin-top: 0.5rem; display: none; }
-    .links { margin-top: 1.25rem; text-align: center; font-size: 0.85rem; color: var(--muted); }
-    .links a { color: var(--primary); text-decoration: none; }
-    .links a:hover { text-decoration: underline; }
-  </style>
+
+    <script src="js/html-safe.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://static.cloudflareinsights.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 http://127.0.0.1:3000 http://localhost:3000 https://cloudflareinsights.com;">
+    <title>Sign Up - UploadM8</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; background: #0a0a0f; color: #ffffff; min-height: 100vh; display: flex; flex-direction: column; }
+        .header { padding: 1.5rem 2rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; position: relative; }
+        .logo { display: flex; align-items: center; gap: 0.75rem; text-decoration: none; color: white; font-size: 1.5rem; font-weight: 700; }
+        .logo img { height: 32px; }
+        .mobile-menu-btn {
+            display: none;
+            background: none;
+            border: 1px solid rgba(255,255,255,0.15);
+            color: #fff;
+            font-size: 1.25rem;
+            padding: 0.45rem 0.65rem;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-left: auto;
+            touch-action: manipulation;
+        }
+        .header-nav { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+        .home-btn { color: #9ca3af; text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; transition: all 0.2s; font-size: 0.9rem; }
+        .home-btn:hover { background: rgba(255,255,255,0.05); color: white; }
+        .main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 2rem; }
+        .signup-card { background: #12121a; border: 1px solid rgba(255,255,255,0.05); border-radius: 20px; padding: 2.5rem; width: 100%; max-width: 420px; }
+        .signup-header { text-align: center; margin-bottom: 2rem; }
+        .signup-header h1 { font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem; }
+        .signup-header p { color: #9ca3af; }
+        .alert { display: none; padding: 1rem; border-radius: 10px; margin-bottom: 1.5rem; font-size: 0.9rem; align-items: center; gap: 0.75rem; }
+        .alert.show { display: flex; }
+        .alert-error { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); color: #fca5a5; }
+        .alert-success { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.3); color: #86efac; }
+        .form-group { margin-bottom: 1.25rem; }
+        .name-row { display: flex; gap: 1rem; margin-bottom: 1.25rem; }
+        .name-row .form-group { margin-bottom: 0; flex: 1; }
+        .form-label { display: block; font-size: 0.9rem; font-weight: 500; margin-bottom: 0.5rem; color: #9ca3af; }
+        .input-group { position: relative; }
+        .form-input { width: 100%; padding: 0.875rem 1rem; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; color: white; font-size: 1rem; transition: all 0.2s; }
+        .form-input:focus { outline: none; border-color: #f97316; background: rgba(255,255,255,0.08); }
+        .form-input.error { border-color: #ef4444; }
+        .input-icon { position: absolute; right: 1rem; top: 50%; transform: translateY(-50%); color: #6b7280; cursor: pointer; }
+        .input-icon:hover { color: #9ca3af; }
+        .validation-hint { font-size: 0.75rem; color: #ef4444; margin-top: 0.25rem; display: none; }
+        .validation-hint.show { display: block; }
+        .password-strength { margin-top: 0.5rem; }
+        .password-strength-bar { height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden; }
+        .password-strength-fill { height: 100%; width: 0%; transition: all 0.3s; border-radius: 2px; }
+        .password-strength-text { font-size: 0.75rem; margin-top: 0.25rem; color: #9ca3af; }
+        .checkbox-label { display: flex; align-items: flex-start; gap: 0.5rem; cursor: pointer; font-size: 0.85rem; color: #9ca3af; margin-bottom: 1.5rem; }
+        .checkbox-label input { accent-color: #f97316; width: 16px; height: 16px; margin-top: 0.1rem; flex-shrink: 0; }
+        .checkbox-label a { color: #f97316; text-decoration: none; }
+        .checkbox-label a:hover { text-decoration: underline; }
+        .submit-btn { width: 100%; padding: 1rem; background: #f97316; border: none; border-radius: 10px; color: white; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 0.5rem; }
+        .submit-btn:hover { background: #ea580c; transform: translateY(-1px); }
+        .submit-btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+        .login-link { text-align: center; margin-top: 2rem; color: #9ca3af; }
+        .login-link a { color: #f97316; text-decoration: none; font-weight: 500; }
+        .login-link a:hover { text-decoration: underline; }
+        .footer { padding: 1.5rem 2rem; text-align: center; color: #9ca3af; font-size: 0.85rem; border-top: 1px solid rgba(255,255,255,0.05); }
+        .footer a { color: #9ca3af; text-decoration: none; margin: 0 0.75rem; transition: color 0.2s; }
+        .footer a:hover { color: white; }
+        .selected-plan { background: rgba(249, 115, 22, 0.1); border: 1px solid rgba(249, 115, 22, 0.3); border-radius: 10px; padding: 1rem; margin-bottom: 1.5rem; display: flex; justify-content: space-between; align-items: center; }
+        .selected-plan .plan-name { font-weight: 600; color: #f97316; }
+        .selected-plan .plan-price { color: #9ca3af; font-size: 0.9rem; }
+        .selected-plan.hidden { display: none; }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 768px) {
+            .mobile-menu-btn { display: inline-flex; align-items: center; justify-content: center; }
+            .header-nav {
+                display: none;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 0.5rem;
+                position: absolute;
+                top: calc(100% + 0.35rem);
+                left: 0;
+                right: 0;
+                padding: 1rem;
+                background: #12121a;
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 12px;
+                z-index: 200;
+                box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+            }
+            .header-nav.open { display: flex; }
+            .header-nav .home-btn { justify-content: flex-start; width: 100%; }
+        }
+        @media (max-width: 520px) {
+            .header { padding: 1rem; }
+            .header-nav { gap: 0.3rem; }
+            .home-btn { padding: 0.35rem 0.55rem; font-size: 0.78rem; }
+            .main { padding: 1rem; }
+            .signup-card { padding: 1.5rem 1.25rem; border-radius: 14px; max-width: 100%; }
+            .signup-header h1 { font-size: 1.5rem; }
+        }
+        @media (max-width: 400px) {
+            .name-row { flex-direction: column; gap: 0; }
+            .name-row .form-group { flex: unset; margin-bottom: 1.25rem; }
+        }
+    </style>
 </head>
 <body>
-  <div class="auth-card">
-    <h1>Create account</h1>
-    <p class="sub">Start uploading to all platforms in minutes</p>
-    <form id="signup-form" autocomplete="on">
-      <div class="form-group">
-        <label for="name">Name</label>
-        <input id="name" type="text" placeholder="Your name" required minlength="2" autocomplete="name" />
-      </div>
-      <div class="form-group">
-        <label for="email">Email</label>
-        <input id="email" type="email" placeholder="you@example.com" required autocomplete="email" />
-      </div>
-      <div class="form-group">
-        <label for="password">Password</label>
-        <input id="password" type="password" placeholder="Min 8 characters" required minlength="8" autocomplete="new-password" />
-        <div class="hint">At least 8 characters</div>
-      </div>
-      <div id="error" class="error-msg"></div>
-      <button type="submit" class="btn btn-primary" id="submit-btn">Create account</button>
-    </form>
-    <div class="links">
-      Already have an account? <a href="/login.html">Sign in</a>
-    </div>
-  </div>
+    <header class="header">
+        <a href="index.html" class="logo">
+            <img src="images/logo.svg" alt="UploadM8">
+            UploadM8
+        </a>
+        <button type="button" class="mobile-menu-btn" id="authMobileMenuBtn" data-um8-fn="toggleAuthMobileNav" aria-label="Open menu" aria-expanded="false"><i class="fas fa-bars"></i></button>
+        <nav class="header-nav" id="authHeaderNav" aria-label="Quick links">
+            <a href="index.html#features" class="home-btn" style="border-style:dashed;"><i class="fas fa-star"></i> Features</a>
+            <a href="index.html#pricing" class="home-btn" style="border-style:dashed;"><i class="fas fa-tags"></i> Pricing</a>
+            <a href="how-it-works.html" class="home-btn" style="border-style:dashed;"><i class="fas fa-question-circle"></i> How it works</a>
+            <a href="contact.html" class="home-btn" style="border-style:dashed;"><i class="fas fa-envelope"></i> Contact</a>
+            <a href="support.html" class="home-btn" style="border-style:dashed;"><i class="fas fa-headset"></i> Support</a>
+            <a href="login.html" class="home-btn"><i class="fas fa-sign-in-alt"></i> Sign in</a>
+            <a href="index.html" class="home-btn">
+                <i class="fas fa-home"></i> Home
+            </a>
+        </nav>
+    </header>
 
-  <script>
-    const API_BASE = (typeof API_BASE_URL !== 'undefined') ? API_BASE_URL : (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : (window.location.hostname === 'app.uploadm8.com' ? 'https://auth.uploadm8.com' : ''));
+    <main class="main">
+        <div class="signup-card">
+            <div class="signup-header">
+                <h1>Create Account</h1>
+                <p>Start your free trial today</p>
+            </div>
 
-    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+            <div id="alertError" class="alert alert-error">
+                <i class="fas fa-exclamation-circle"></i>
+                <span id="errorMessage">Something went wrong</span>
+            </div>
+            <div id="alertSuccess" class="alert alert-success">
+                <i class="fas fa-check-circle"></i>
+                <span id="successMessage">Account created successfully!</span>
+            </div>
 
-    const form = document.getElementById('signup-form');
-    const errEl = document.getElementById('error');
-    const btn = document.getElementById('submit-btn');
+            <div id="selectedPlan" class="selected-plan hidden">
+                <div>
+                    <div class="plan-name" id="planName">Creator Plan</div>
+                    <div class="plan-price" id="planPrice">7-day free trial, then $19/month</div>
+                </div>
+                <a href="index.html#pricing" style="color: #9ca3af; font-size: 0.85rem;">Change</a>
+            </div>
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      errEl.style.display = 'none';
-      const name = document.getElementById('name').value.trim();
-      const email = document.getElementById('email').value.trim();
-      const password = document.getElementById('password').value;
+            <form id="signupForm" onsubmit="handleSignup(event)">
+                <div class="name-row">
+                    <div class="form-group">
+                        <label class="form-label" for="firstName">First Name</label>
+                        <input type="text" id="firstName" class="form-input" placeholder="John" required autocomplete="given-name" minlength="2">
+                        <div class="validation-hint" id="firstNameHint">Min 2 characters</div>
+                    </div>
 
-      if (!name || !email || !password) { errEl.textContent = 'Please fill in all fields.'; errEl.style.display = 'block'; return; }
-      if (password.length < 8) { errEl.textContent = 'Password must be at least 8 characters.'; errEl.style.display = 'block'; return; }
+                    <div class="form-group">
+                        <label class="form-label" for="lastName">Last Name</label>
+                        <input type="text" id="lastName" class="form-input" placeholder="Doe" required autocomplete="family-name" minlength="2">
+                        <div class="validation-hint" id="lastNameHint">Min 2 characters</div>
+                    </div>
+                </div>
 
-      btn.disabled = true; btn.textContent = 'Creating account...';
-      try {
-        const r = await fetch(API_BASE + '/api/auth/register', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, email, password })
+                <div class="form-group">
+                    <label class="form-label" for="email">Email Address</label>
+                    <input type="email" id="email" class="form-input" placeholder="you@example.com" required autocomplete="email">
+                    <div class="validation-hint" id="emailHint">Please enter a valid email address</div>
+                </div>
+
+                <div class="form-group">
+                    <label class="form-label" for="password">Password</label>
+                    <div class="input-group">
+                        <input type="password" id="password" class="form-input" placeholder="••••••••" required autocomplete="new-password" minlength="8" oninput="checkPasswordStrength()">
+                        <i class="fas fa-eye input-icon" id="togglePassword" data-um8-fn="togglePasswordVisibility" title="Show password" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();togglePasswordVisibility();}"></i>
+                    </div>
+                    <div class="password-strength">
+                        <div class="password-strength-bar">
+                            <div class="password-strength-fill" id="passwordStrengthFill"></div>
+                        </div>
+                        <div class="password-strength-text" id="passwordStrengthText">Enter at least 8 characters</div>
+                    </div>
+                </div>
+
+                <label class="checkbox-label">
+                    <input type="checkbox" id="agreeTerms" required>
+                    <span>I agree to the <a href="terms.html" target="_blank" rel="noopener">Terms of Service</a> and <a href="privacy.html" target="_blank" rel="noopener">Privacy Policy</a></span>
+                </label>
+
+                <button type="submit" class="submit-btn" id="submitBtn">
+                    <span>Create Account</span>
+                </button>
+            </form>
+
+            <div class="login-link">
+                Already have an account? <a href="login.html">Sign in</a>
+            </div>
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span>© 2025 UploadM8</span>
+        <a href="dashboard.html">Dashboard</a>
+        <a href="settings.html#billing-panel">Token balance</a>
+        <a href="contact.html">Contact</a>
+        <a href="terms.html">Terms</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="how-it-works.html">How it works</a>
+        <a href="support.html">Support</a>
+        <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
+    </footer>
+
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script>
+        var TOKEN_KEY = 'uploadm8_access_token';
+        var REFRESH_KEY = 'uploadm8_refresh_token';
+
+        var PLANS = {
+            'creator': { name: 'Creator Plan', price: '7-day free trial, then $19/month' },
+            'studio': { name: 'Studio Plan', price: '7-day free trial, then $49/month' },
+            'agency': { name: 'Agency Plan', price: '7-day free trial, then $99/month' }
+        };
+
+        function detailToString(d) {
+            if (d == null || d === '') return 'Registration failed. Please try again.';
+            if (typeof d === 'string') return d;
+            if (Array.isArray(d))
+                return d.map(function (x) { return (x && x.msg) ? x.msg : JSON.stringify(x); }).join('; ');
+            if (typeof d === 'object' && d.message) return String(d.message);
+            if (typeof d === 'object' && d.msg) return d.msg;
+            try { return JSON.stringify(d); } catch (e) { return String(d); }
+        }
+
+        document.addEventListener('DOMContentLoaded', function () {
+            hideAllAlerts();
+
+            var urlParams = new URLSearchParams(window.location.search);
+            var plan = urlParams.get('plan');
+            if (plan && PLANS[plan]) {
+                document.getElementById('selectedPlan').classList.remove('hidden');
+                document.getElementById('planName').textContent = PLANS[plan].name;
+                document.getElementById('planPrice').textContent = PLANS[plan].price;
+            }
+
+            var token = (typeof window.getAccessToken === 'function' && window.getAccessToken()) || sessionStorage.getItem(TOKEN_KEY) || '';
+            if (token) {
+                window.location.href = 'dashboard.html';
+            }
         });
-        const data = await r.json();
-        if (!r.ok) { errEl.textContent = esc(data.detail || 'Registration failed'); errEl.style.display = 'block'; return; }
-        localStorage.setItem('access_token', data.access_token);
-        if (data.refresh_token) localStorage.setItem('refresh_token', data.refresh_token);
-        window.location.href = '/settings.html';
-      } catch (err) {
-        errEl.textContent = 'Network error. Please try again.'; errEl.style.display = 'block';
-      } finally {
-        btn.disabled = false; btn.textContent = 'Create account';
-      }
+
+        function hideAllAlerts() {
+            document.getElementById('alertError').classList.remove('show');
+            document.getElementById('alertSuccess').classList.remove('show');
+            document.querySelectorAll('.validation-hint').forEach(function (h) { h.classList.remove('show'); });
+            document.querySelectorAll('.form-input').forEach(function (i) { i.classList.remove('error'); });
+        }
+
+        function showError(message) {
+            hideAllAlerts();
+            document.getElementById('errorMessage').textContent = message;
+            document.getElementById('alertError').classList.add('show');
+        }
+
+        function showSuccess(message) {
+            hideAllAlerts();
+            document.getElementById('successMessage').textContent = message;
+            document.getElementById('alertSuccess').classList.add('show');
+        }
+
+        function togglePasswordVisibility() {
+            var passwordInput = document.getElementById('password');
+            var toggleIcon = document.getElementById('togglePassword');
+
+            if (passwordInput.type === 'password') {
+                passwordInput.type = 'text';
+                toggleIcon.classList.remove('fa-eye');
+                toggleIcon.classList.add('fa-eye-slash');
+            } else {
+                passwordInput.type = 'password';
+                toggleIcon.classList.remove('fa-eye-slash');
+                toggleIcon.classList.add('fa-eye');
+            }
+        }
+
+        function checkPasswordStrength() {
+            var password = document.getElementById('password').value;
+            var fill = document.getElementById('passwordStrengthFill');
+            var text = document.getElementById('passwordStrengthText');
+
+            var strength = 0;
+            var label = 'Enter at least 8 characters';
+            var color = '#ef4444';
+
+            if (password.length >= 8) strength += 25;
+            if (password.length >= 12) strength += 25;
+            if (/[A-Z]/.test(password)) strength += 15;
+            if (/[a-z]/.test(password)) strength += 10;
+            if (/[0-9]/.test(password)) strength += 15;
+            if (/[^A-Za-z0-9]/.test(password)) strength += 10;
+
+            if (strength <= 25) {
+                label = 'Weak password';
+                color = '#ef4444';
+            } else if (strength <= 50) {
+                label = 'Fair password';
+                color = '#f97316';
+            } else if (strength <= 75) {
+                label = 'Good password';
+                color = '#eab308';
+            } else {
+                label = 'Strong password';
+                color = '#22c55e';
+            }
+
+            fill.style.width = Math.min(strength, 100) + '%';
+            fill.style.background = color;
+            text.textContent = label;
+            text.style.color = color;
+        }
+
+        function validateForm() {
+            var valid = true;
+            hideAllAlerts();
+
+            var firstName = document.getElementById('firstName');
+            var lastName = document.getElementById('lastName');
+            var email = document.getElementById('email');
+            var password = document.getElementById('password');
+            var agree = document.getElementById('agreeTerms');
+
+            if (firstName.value.trim().length < 2) {
+                firstName.classList.add('error');
+                document.getElementById('firstNameHint').classList.add('show');
+                valid = false;
+            }
+
+            if (lastName.value.trim().length < 2) {
+                lastName.classList.add('error');
+                document.getElementById('lastNameHint').classList.add('show');
+                valid = false;
+            }
+
+            if (!email.value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+                email.classList.add('error');
+                document.getElementById('emailHint').classList.add('show');
+                valid = false;
+            }
+
+            if (password.value.length < 8) {
+                password.classList.add('error');
+                valid = false;
+            }
+
+            if (!agree.checked) {
+                showError('Please agree to the Terms of Service and Privacy Policy.');
+                valid = false;
+            }
+
+            return valid;
+        }
+
+        async function handleSignup(e) {
+            e.preventDefault();
+
+            if (!validateForm()) return;
+
+            var firstName = document.getElementById('firstName').value.trim();
+            var lastName = document.getElementById('lastName').value.trim();
+            var name = (firstName + ' ' + lastName).trim();
+            var email = document.getElementById('email').value.trim();
+            var password = document.getElementById('password').value;
+            var submitBtn = document.getElementById('submitBtn');
+
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating account...';
+
+            try {
+                if (typeof window.register !== 'function') {
+                    showError('Registration unavailable: load js/auth-stack.js');
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = '<span>Create Account</span>';
+                    return;
+                }
+                var reg = await window.register(name, email, password);
+                if (!reg.success) {
+                    showError(reg.error || 'Registration failed');
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = '<span>Create Account</span>';
+                    return;
+                }
+
+                sessionStorage.setItem('uploadm8_signup_success', '1');
+                var em = reg.email || email;
+                window.location.href = 'check-email.html?email=' + encodeURIComponent(em);
+            } catch (err) {
+                console.error('Signup error:', err);
+                showError('Connection error. If the API runs on another port, use the same origin or ?api=http://127.0.0.1:PORT');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<span>Create Account</span>';
+            }
+        }
+    </script>
+    <script>
+    function toggleAuthMobileNav() {
+        var nav = document.getElementById('authHeaderNav');
+        var btn = document.getElementById('authMobileMenuBtn');
+        if (!nav) return;
+        var on = nav.classList.toggle('open');
+        if (btn) btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+    }
+    document.addEventListener('click', function (e) {
+        var nav = document.getElementById('authHeaderNav');
+        var btn = document.getElementById('authMobileMenuBtn');
+        if (!nav || !nav.classList.contains('open')) return;
+        if (btn && (btn === e.target || btn.contains(e.target))) return;
+        if (nav.contains(e.target)) return;
+        nav.classList.remove('open');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
     });
-  </script>
+    document.querySelectorAll('#authHeaderNav a').forEach(function (a) {
+        a.addEventListener('click', function () {
+            var nav = document.getElementById('authHeaderNav');
+            var btn = document.getElementById('authMobileMenuBtn');
+            if (nav) nav.classList.remove('open');
+            if (btn) btn.setAttribute('aria-expanded', 'false');
+        });
+    });
+    </script>
+    <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"48e34920cedd42e3b88cf8587cbcdc0a","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>

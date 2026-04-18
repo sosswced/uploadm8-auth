@@ -1,6 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://static.cloudflareinsights.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 https://cloudflareinsights.com;">
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Feature Guide — UploadM8</title>
@@ -10,7 +13,27 @@
     <style>
 /* ── Guide-specific overrides ─────────────────────────────── */
 .guide-layout { display:grid; grid-template-columns:260px 1fr; min-height:100vh; }
-@media(max-width:900px){ .guide-layout{ grid-template-columns:1fr; } .guide-toc{ display:none; } }
+/* Inside app shell: share viewport with fixed sidebar + top bar */
+.guide-layout--app { min-height: min(100vh, 100dvh); width: 100%; }
+@media (min-width: 1025px) {
+    .guide-layout--app {
+        min-height: calc(100dvh - 5rem);
+        grid-template-columns: minmax(200px, 220px) minmax(0, 1fr);
+    }
+    .guide-page-main .guide-toc {
+        position: sticky;
+        top: 0.5rem;
+        max-height: calc(100dvh - 6rem);
+        height: auto;
+        min-height: 0;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
+        align-self: start;
+    }
+}
+/* Single column on narrow screens; keep TOC visible (horizontal scroll on small phones below) */
+@media(max-width:900px){ .guide-layout, .guide-layout--app { grid-template-columns:1fr; } }
 
 /* Table of contents sidebar */
 .guide-toc {
@@ -98,6 +121,19 @@
 .comp-table tr:hover td { background:rgba(255,255,255,.02); }
 .check-yes { color:#22c55e; } .check-no { color:rgba(255,255,255,.2); }
 
+/* Settings Playbook — in-section mini nav */
+.playbook-nav {
+    display:flex; flex-wrap:wrap; gap:.4rem .65rem;
+    padding:.75rem 1rem; margin-bottom:1.25rem;
+    background:var(--bg-card); border:1px solid var(--border-color); border-radius:10px;
+    font-size:.76rem; line-height:1.4;
+}
+.playbook-nav a { color:#f97316; text-decoration:none; }
+.playbook-nav a:hover { text-decoration:underline; }
+.playbook-subhd { font-size:.72rem; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--text-muted); margin:1.25rem 0 .5rem; }
+.playbook-kv { font-size:.82rem; color:var(--text-secondary); margin:.35rem 0 .35rem 1rem; padding-left:.65rem; border-left:2px solid rgba(249,115,22,.25); }
+.playbook-kv code { font-size:.78rem; }
+
 /* Page header */
 .guide-header { padding:2rem 2.5rem 1rem; border-bottom:1px solid var(--border-color); background:var(--bg-secondary); }
 .guide-breadcrumb { font-size:.78rem; color:var(--text-muted); margin-bottom:.5rem; }
@@ -123,6 +159,29 @@ html.in-iframe .guide-toc           { position: sticky; top: 0; height: 100vh; o
 
 /* Tag for showing which features are "yours" */
 .yours-tag { display:inline-flex; align-items:center; gap:.3rem; padding:.15rem .5rem; background:rgba(34,197,94,.12); color:#22c55e; border-radius:999px; font-size:.65rem; font-weight:700; }
+
+/* ── Mobile overrides ── */
+@media (max-width: 768px) {
+    .guide-layout, .guide-layout--app { grid-template-columns: 1fr; }
+    .guide-toc {
+        width: 100%;
+        height: auto;
+        max-height: none;
+        position: static;
+        overflow-x: auto;
+        overflow-y: hidden;
+        -webkit-overflow-scrolling: touch;
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+        display: block;
+    }
+    .guide-toc-inner { padding: 1rem; }
+    .guide-content { padding: 1.5rem 1rem; }
+}
+@media (max-width: 480px) {
+    .guide-header { padding: 1rem; }
+    .guide-page-title { font-size: 1.4rem; }
+}
 </style>
 </head>
 <body>
@@ -135,13 +194,25 @@ if (window.self !== window.top) {
 }
 </script>
 
-<div class="guide-layout">
+<div class="app-layout" id="uploadm8AppRoot">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+    <header class="top-bar">
+        <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+        <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div>
+        <div class="top-bar-actions">
+            <div data-wt-pills></div>
+            <button type="button" class="theme-toggle" data-um8-fn="toggleTheme" title="Toggle theme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+        </div>
+    </header>
+    <main class="main-content guide-page-main">
+<div class="guide-layout guide-layout--app">
 
   <!-- ── Left TOC ─────────────────────────────────────────── -->
   <aside class="guide-toc">
     <a href="dashboard.html" class="toc-back"><i class="fas fa-arrow-left"></i> Dashboard</a>
     <a href="dashboard.html" class="toc-logo">
-      <img src="images/logo.png" alt="UploadM8">
+      <img src="images/logo.svg" alt="UploadM8">
       <span>UploadM8</span>
     </a>
     <div style="font-size:.72rem;font-weight:700;color:var(--text-primary);margin-bottom:1rem;">Feature Guide</div>
@@ -151,6 +222,10 @@ if (window.self !== window.top) {
     <a class="toc-link" data-target="gs-wallet"><i class="fas fa-wallet"></i> PUT & AIC Wallet</a>
     <a class="toc-link" data-target="gs-platforms"><i class="fas fa-plug"></i> Connecting Platforms</a>
 
+    <div class="toc-section-title">Preferences &amp; Setup</div>
+    <a class="toc-link" data-target="feat-settings-playbook"><i class="fas fa-sliders-h"></i> Settings Playbook</a>
+    <a class="toc-link" data-target="feat-settings-defaults"><i class="fas fa-sliders"></i> Defaults, Colors &amp; Scan Depth</a>
+
     <div class="toc-section-title">Core Features</div>
     <a class="toc-link" data-target="feat-upload"><i class="fas fa-cloud-upload-alt"></i> Upload System</a>
     <a class="toc-link" data-target="feat-scheduler"><i class="fas fa-calendar-alt"></i> Scheduler</a>
@@ -159,8 +234,10 @@ if (window.self !== window.top) {
 
     <div class="toc-section-title">AI & Video</div>
     <a class="toc-link" data-target="feat-ai"><i class="fas fa-robot"></i> AI Engine</a>
+    <a class="toc-link" data-target="feat-audio"><i class="fas fa-microphone"></i> Audio Transcription</a>
     <a class="toc-link" data-target="feat-hud"><i class="fas fa-film"></i> HUD Overlay</a>
     <a class="toc-link" data-target="feat-thumbnails"><i class="fas fa-image"></i> Thumbnails</a>
+    <a class="toc-link" data-target="feat-pikzels"><i class="fas fa-wand-magic-sparkles"></i> Thumbnail Studio &amp; Pikzels</a>
 
     <div class="toc-section-title">Analytics & Reports</div>
     <a class="toc-link" data-target="feat-analytics"><i class="fas fa-chart-line"></i> Analytics</a>
@@ -184,7 +261,10 @@ if (window.self !== window.top) {
     <!-- Page header -->
     <div class="guide-header">
       <div class="guide-breadcrumb"><a href="dashboard.html">Dashboard</a> / Feature Guide</div>
-      <h1 class="guide-page-title"><i class="fas fa-book-open" style="color:#f97316;margin-right:.5rem;font-size:1.4rem;"></i>UploadM8 Feature Guide</h1>
+      <div style="display:flex;flex-wrap:wrap;align-items:center;gap:1rem;margin-bottom:.5rem;">
+        <h1 class="guide-page-title" style="margin:0;"><i class="fas fa-book-open" style="color:#f97316;margin-right:.5rem;font-size:1.4rem;"></i>UploadM8 Feature Guide</h1>
+        <div data-wt-pills></div>
+      </div>
       <p class="guide-page-sub">Everything you need to master every feature — from first upload to agency-scale automation.</p>
     </div>
 
@@ -209,6 +289,33 @@ if (window.self !== window.top) {
         <button class="plan-btn" data-tier="agency"><i class="fas fa-circle" style="font-size:.55rem;color:#22c55e;"></i> Agency</button>
       </div>
 
+      <div class="feat-card" style="margin-top:-.5rem;">
+        <div class="feat-card-header">
+          <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-compass"></i></div>
+          <div>
+            <div class="feat-card-title">Quick Links (Most Used Pages)</div>
+            <div class="feat-card-desc">Use these shortcuts to jump to the right page fast. This list is for everyday use, not technical setup.</div>
+          </div>
+        </div>
+        <div class="feat-card-body open">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.5rem .9rem;font-size:.84rem;">
+            <a href="dashboard.html" style="color:#f97316;text-decoration:none;">Dashboard</a>
+            <a href="upload.html" style="color:#f97316;text-decoration:none;">Upload</a>
+            <a href="queue.html" style="color:#f97316;text-decoration:none;">Queue</a>
+            <a href="scheduled.html" style="color:#f97316;text-decoration:none;">Scheduled Posts</a>
+            <a href="platforms.html" style="color:#f97316;text-decoration:none;">Connected Accounts</a>
+            <a href="groups.html" style="color:#f97316;text-decoration:none;">Account Groups</a>
+            <a href="analytics.html" style="color:#f97316;text-decoration:none;">Analytics</a>
+            <a href="thumbnail-studio.html" style="color:#f97316;text-decoration:none;">Thumbnail Studio</a>
+            <a href="settings.html" style="color:#f97316;text-decoration:none;">Settings</a>
+            <a href="settings.html#billing" style="color:#f97316;text-decoration:none;">Billing and Wallet</a>
+            <a href="account-management.html" style="color:#f97316;text-decoration:none;">Account Management</a>
+            <a href="support.html" style="color:#f97316;text-decoration:none;">Support</a>
+            <a href="admin.html" style="color:#f97316;text-decoration:none;">Admin Home</a>
+          </div>
+        </div>
+      </div>
+
       <!-- ════════════ GETTING STARTED ════════════ -->
       <div class="guide-section" id="gs-upload">
         <div class="section-header">
@@ -230,7 +337,7 @@ if (window.self !== window.top) {
               <li><strong>Watch it process</strong> — UploadM8 transcodes, validates, and publishes. Check the <a href="queue.html" style="color:#f97316;">Queue</a> for live status.</li>
               <li><strong>Check results</strong> — Once done, each platform chip in the Dashboard shows a direct link to your live post.</li>
             </ol>
-            <div class="tip"><strong>Pro tip:</strong> Your first upload uses PUT tokens from your wallet. Free plans get 60 PUT/month; paid plans get 300–4500. Each upload costs 10+ PUT depending on platforms and features.</div>
+            <div class="tip"><strong>Pro tip:</strong> Your first upload uses PUT tokens from your wallet. Free includes 120 PUT / 1,200 AIC per month (released daily, UTC); paid tiers scale up to 22,000 PUT / 140,000 AIC per month. Unused credits roll over. Each upload costs 10+ PUT depending on platforms and features.</div>
           </div>
         </div>
       </div>
@@ -243,12 +350,12 @@ if (window.self !== window.top) {
         </div>
 
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
-            <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;">⚡</div>
+            <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"></div>
             <div>
               <div class="feat-card-title">PUT Tokens — Upload Processing Credits</div>
-              <div class="feat-card-desc">Each upload job costs PUT tokens. They cover the processing, transcoding, and publishing costs. Your wallet refills automatically every billing period.</div>
+              <div class="feat-card-desc">Each upload job costs PUT tokens. They cover the processing, transcoding, and publishing costs. Your plan allowance is released daily (UTC); unused balance rolls over month to month.</div>
             </div>
           </div>
           <div class="feat-card-body">
@@ -267,9 +374,9 @@ if (window.self !== window.top) {
         </div>
 
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
-            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;">🤖</div>
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"></div>
             <div>
               <div class="feat-card-title">AIC — AI Credits</div>
               <div class="feat-card-desc">AI Credits fuel every AI-powered feature: caption generation, hashtag suggestions, thumbnail selection, and video analysis. Paid tiers only.</div>
@@ -285,29 +392,29 @@ if (window.self !== window.top) {
               <tr><td>Max</td><td>6</td><td>Studio, Agency</td></tr>
             </table>
             <p style="font-size:.78rem;color:var(--text-muted);margin-top:.5rem;">+ frame surcharge: 0 (≤6 frames), +1 (7–12), +2 (13–24)</p>
-            <div class="tip"><strong>Free plan:</strong> No AIC are consumed since AI features are disabled. AIC only matter once you're on a paid plan.</div>
+            <div class="tip"><strong>AIC note:</strong> All plans include AIC, and higher tiers include more for heavier AI usage. Your settings still control which AI features run for each upload.</div>
           </div>
         </div>
 
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-sync"></i></div>
             <div>
-              <div class="feat-card-title">Monthly Refills & Top-Ups</div>
-              <div class="feat-card-desc">Your wallet resets to your plan's full allocation every billing period. Need more? Buy top-up packs anytime without changing your plan.</div>
+              <div class="feat-card-title">Monthly allowance, rollover & top-ups</div>
+              <div class="feat-card-desc">Included PUT and AIC are budgeted per month and released daily (UTC). Unused balances roll over and stack—nothing is wiped at period boundaries. Need more? Buy top-up packs anytime; they never expire.</div>
             </div>
           </div>
           <div class="feat-card-body">
             <table class="comp-table">
               <tr><th>Plan</th><th>PUT / month</th><th>AIC / month</th></tr>
-              <tr><td>Free</td><td>60</td><td>10</td></tr>
-              <tr><td>Creator Lite</td><td>300</td><td>80</td></tr>
-              <tr><td>Creator Pro</td><td>700</td><td>200</td></tr>
-              <tr><td>Studio</td><td>2,000</td><td>600</td></tr>
-              <tr><td>Agency</td><td>4,500</td><td>1,500</td></tr>
+              <tr><td>Free</td><td>120</td><td>1,200</td></tr>
+              <tr><td>Creator Lite</td><td>500</td><td>4,500</td></tr>
+              <tr><td>Creator Pro</td><td>1,800</td><td>13,000</td></tr>
+              <tr><td>Studio</td><td>7,000</td><td>45,000</td></tr>
+              <tr><td>Agency</td><td>22,000</td><td>140,000</td></tr>
             </table>
-            <div class="note"><strong>Top-ups:</strong> Available in Billing settings. PUT packs from $2.99 (50 PUT) to $29.99 (1000 PUT). AIC packs from $3.99 (100 AIC) to $49.99 (2500 AIC). Top-ups don't expire.</div>
+            <div class="note"><strong>Rollover:</strong> Unused included credits stay in your wallet and stack with future daily releases and top-ups. <strong>Top-ups:</strong> Available in Billing settings. PUT packs from $4.99 (250 PUT) to $49.99 (5,000 PUT). AIC packs from $4.99 (500 AIC) to $59.99 (10,000 AIC). Top-ups never expire.</div>
           </div>
         </div>
       </div>
@@ -319,7 +426,7 @@ if (window.self !== window.top) {
           <div><div class="section-title">Connecting Platforms</div><div class="section-sub">OAuth authorization for TikTok, YouTube, Instagram & Facebook</div></div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-link"></i></div>
             <div>
@@ -337,13 +444,465 @@ if (window.self !== window.top) {
             </ol>
             <table class="comp-table" style="margin-top:.75rem;">
               <tr><th>Plan</th><th>Max accounts total</th><th>Per platform</th></tr>
-              <tr><td>Free</td><td>4</td><td>1</td></tr>
-              <tr><td>Creator Lite</td><td>8</td><td>2</td></tr>
-              <tr><td>Creator Pro</td><td>20</td><td>5</td></tr>
-              <tr><td>Studio</td><td>60</td><td>15</td></tr>
-              <tr><td>Agency</td><td>Unlimited</td><td>Unlimited</td></tr>
+              <tr><td>Free</td><td>16</td><td>4</td></tr>
+              <tr><td>Creator Lite</td><td>40</td><td>10</td></tr>
+              <tr><td>Creator Pro</td><td>100</td><td>25</td></tr>
+              <tr><td>Studio</td><td>300</td><td>75</td></tr>
+              <tr><td>Agency</td><td>1,200</td><td>300</td></tr>
             </table>
             <div class="tip"><strong>Token expiry:</strong> Platform tokens expire periodically. UploadM8 will alert you in the dashboard if a connection needs to be re-authorized.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ SETTINGS PLAYBOOK ════════════ -->
+      <div class="guide-section" id="feat-settings-playbook">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(249,115,22,.12);color:#f97316;"><i class="fas fa-sliders-h"></i></div>
+          <div>
+            <div class="section-title">Settings Playbook</div>
+            <div class="section-sub">End-to-end reference: where each knob lives, how settings merge into the worker, plan clamps, dependencies, credit impact, and troubleshooting — so you can configure once and trust the pipeline.</div>
+          </div>
+        </div>
+
+        <p class="tip" style="margin-top:-1rem;margin-bottom:1rem;"><strong>Email &amp; dashboard:</strong> After you verify your email, we send a welcome message with a link to this playbook. The first time you open the Dashboard, the same handbook appears in a short modal until you dismiss it or follow a link. You can always return via <strong>Setup Handbook</strong> in the sidebar or <a href="dashboard.html" style="color:#f97316;">Dashboard</a> quick actions.</p>
+
+        <nav class="playbook-nav" aria-label="Playbook sections">
+          <a href="#playbook-storage">Storage &amp; merge</a> ·
+          <a href="#playbook-limits">Plan limits</a> ·
+          <a href="#playbook-checklist">Preflight</a> ·
+          <a href="#playbook-profiles">Profiles</a> ·
+          <a href="#feat-settings-defaults">Colors &amp; scan depth</a> ·
+          <a href="#playbook-per-upload">Per-upload</a> ·
+          <a href="#playbook-trill-hud">Drive &amp; HUD</a> ·
+          <a href="#playbook-notifications">Notifications</a> ·
+          <a href="#playbook-glossary">Glossary</a> ·
+          <a href="#playbook-troubleshoot">Troubleshoot</a>
+        </nav>
+
+        <div class="feat-card" id="playbook-storage">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-database"></i></div>
+            <div>
+              <div class="feat-card-title">Where your settings actually live (and what wins)</div>
+              <div class="feat-card-desc">UploadM8 merges several stores before a job runs. Knowing this explains “I toggled it but nothing changed” and duplicate-looking fields.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);line-height:1.6;margin:0 0 .75rem;">The worker builds one effective preference object per upload. Rough precedence:</p>
+            <ol class="how-steps">
+              <li><strong><code>user_preferences</code> (Save All Preferences)</strong> — Auto captions/thumbnails, styled thumbs, thumbnail interval, default privacy, hashtag lists, Trill toggles (<strong>Enable Drive Analysis</strong>, min score, AI enhancement, Trill model), audio master + per-service AI flags, email/discord fields, and more. This is the main “upload defaults” table.</li>
+              <li><strong><code>users.preferences</code> (caption / hashtag overlay)</strong> — Caption style, tone, voice, AI caption scan depth slider, and some hashtag/caption fields loaded via profile APIs can overlay here. When both exist, this layer can override specific keys for merged results.</li>
+              <li><strong><code>user_settings</code></strong> — <strong>Speed HUD burn-in</strong> is read from <code>hud_enabled</code> here (plus HUD position, speed thresholds, colors, etc.). The Trill HUD checkbox in Settings is saved so presign cost and the HUD stage see the same flag.</li>
+            </ol>
+            <div class="note"><strong>Practical rule:</strong> After changing anything material, use <strong>Save All Preferences</strong> on <a href="settings.html" style="color:#f97316;">Settings</a>. If you only moved sliders without saving, the next upload still uses the last persisted snapshot — the queue never guesses.</div>
+            <div class="tip"><strong>Scheduled &amp; queued jobs:</strong> Jobs typically snapshot preferences around submit time. Changing settings mid-queue affects <em>new</em> submissions first; already-queued work may have been priced and configured with the older snapshot.</div>
+          </div>
+        </div>
+
+        <div class="feat-card" id="playbook-limits">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-table"></i></div>
+            <div>
+              <div class="feat-card-title">Plan limits that clamp your knobs</div>
+              <div class="feat-card-desc">Your subscription tier hard-caps frames, thumbnail candidates, HUD, and AI styling — the UI slider cannot exceed these values.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Plan</th><th>Max caption scan frames</th><th>Thumbnail candidates (tier max)</th><th>AI thumbnail styling</th><th>HUD burn-in</th><th>Watermark</th></tr>
+              <tr><td>Free</td><td>3</td><td>3</td><td class="check-no">—</td><td class="check-no">—</td><td>Yes</td></tr>
+              <tr><td>Creator Lite</td><td>5</td><td>5</td><td class="check-no">—</td><td class="check-no">—</td><td>No</td></tr>
+              <tr><td>Creator Pro</td><td>8</td><td>8</td><td class="check-yes">Yes</td><td class="check-yes">Yes</td><td>No</td></tr>
+              <tr><td>Studio</td><td>15</td><td>12</td><td class="check-yes">Yes</td><td class="check-yes">Yes</td><td>No</td></tr>
+              <tr><td>Agency</td><td>15</td><td>20</td><td class="check-yes">Yes</td><td class="check-yes">Yes</td><td>No</td></tr>
+            </table>
+            <p style="font-size:.8rem;color:var(--text-secondary);margin:.5rem 0 0;">Higher <strong>AI Caption Scan Depth</strong> increases vision context for story captions and usually increases <strong>AIC</strong> reservation. The worker clamps your requested frame count to your tier’s <strong>max_caption_frames</strong> even if an older client sent a higher number.</p>
+          </div>
+        </div>
+
+        <div class="feat-card" id="playbook-checklist">
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-map-signs"></i></div>
+            <div>
+              <div class="feat-card-title">Start here: preflight checklist before every upload</div>
+              <div class="feat-card-desc">Most issues are a missing dependency (speech-to-text needs audio context), a plan limit, or <strong>Use AI</strong> turned off on the upload form. Work through this once; then behavior is predictable.</div>
+            </div>
+          </div>
+          <div class="feat-card-body open">
+            <ol class="how-steps">
+              <li><strong>Plan + wallet</strong> — Match tier to intent: Free includes AI but with watermarks, tight frame caps, and no HUD. Confirm <strong>PUT</strong> and <strong>AIC</strong> in <a href="settings.html#billing" style="color:#f97316;">Billing</a>; presign reserves a hold against both when AI/HUD/thumbnails are in play.</li>
+              <li><strong>Persist everything</strong> — In <a href="settings.html" style="color:#f97316;">Settings</a> → <strong>Preferences</strong>, set toggles and click <strong>Save All Preferences</strong>. That path persists preferences, syncs HUD where applicable, and saves platform colors in one action. Browser-only changes never reach the worker.</li>
+              <li><strong>Upload form: Use AI</strong> — On <a href="upload.html" style="color:#f97316;">Upload</a>, <strong>Use AI</strong> must be on for GPT captions, hashtag AI, and AI thumbnail selection/styling for that batch. Turning it off is intentional “dumb publish”: transcoding and publish can still run, but AI stages are skipped for cost and predictability.</li>
+              <li><strong>Telemetry pairs</strong> — Drive Insights, Trill scoring, and speed HUD need a <code>.map</code> alongside the video in the same submission (matching basename or whatever your export tool produces). Mark telemetry when your uploader asks — mismatched or missing maps mean no score and no map-based HUD.</li>
+              <li><strong>Dependency chains</strong> — Order matters: <strong>Enable Audio Context</strong> before expecting transcription or audio summaries. <strong>Auto-generate Thumbnails</strong> before <strong>Styled Thumbnails</strong>. <strong>Enable Drive Analysis</strong> before <strong>Telemetry Insights</strong> matters for captions. See the dependency tables below.</li>
+              <li><strong>Best-effort pipeline</strong> — Even with every toggle on, a stage can skip (vendor timeout, missing API key on the deployment, clip length limits). The job can still succeed; open <a href="queue.html" style="color:#f97316;">Queue</a> → job detail to see which stages ran vs skipped.</li>
+            </ol>
+            <div class="note"><strong>Two different “personas”:</strong> <em>Caption Voice / Persona</em> (Caption &amp; AI) shapes how GPT writes titles and captions. <em>Thumbnail Studio persona</em> (persona UUID + strength) applies only to optional Aurora/Pikzels-style renders — they never substitute for each other.</div>
+          </div>
+        </div>
+
+        <div class="feat-card" id="playbook-profiles">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-user-astronaut"></i></div>
+            <div>
+              <div class="feat-card-title">Ready-made setup profiles (copy one, then tune)</div>
+              <div class="feat-card-desc">Use these as baselines — every profile still requires Save All Preferences and appropriate plan tier.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <div class="playbook-subhd">Minimum cost / fast queue</div>
+            <p class="playbook-kv">Turn off <strong>Scene Understanding</strong>, <strong>Video Analyzer</strong>, <strong>Music Detection</strong>, and <strong>Emotion Signals</strong> unless you need them. Keep <strong>Caption Writer</strong> on only if you want AI copy. Lower <strong>AI Caption Scan Depth</strong> to the minimum that still reads well for your format. Disable <strong>AI-Generated Hashtags</strong> if you hand-pick tags.</p>
+            <div class="playbook-subhd">Balanced creator (default quality)</div>
+            <p class="playbook-kv"><strong>Auto captions</strong> + <strong>Auto thumbnails</strong> on, <strong>Styled thumbnails</strong> on if your tier allows. <strong>Frame Inspector</strong> + <strong>Speech-to-Text</strong> on. <strong>Audio Context</strong> on with selective audio sub-services. Scan depth around mid-tier for your plan.</p>
+            <div class="playbook-subhd">Maximum context (long-form, story-heavy)</div>
+            <p class="playbook-kv">Raise <strong>AI Caption Scan Depth</strong> toward your plan cap. Enable <strong>Video Analyzer</strong> / <strong>Scene Understanding</strong> only on deployments where those integrations are configured (otherwise they no-op). Keep transcription on for spoken narrative. Expect higher <strong>AIC</strong> holds.</p>
+            <div class="playbook-subhd">Drive / motorsports / speed content</div>
+            <p class="playbook-kv"><strong>Enable Drive Analysis</strong> + upload <code>.map</code>. For Trill language in captions, add <strong>Telemetry Insights</strong> + <strong>AI Content Enhancement</strong> (subject to min score). For overlay only, enable <strong>Speed HUD</strong> and tune MPH thresholds; you can leave Telemetry Insights off if you do not want map data in the caption model.</p>
+            <div class="playbook-subhd">Talk-first / podcast clips</div>
+            <p class="playbook-kv"><strong>Enable Audio Context</strong>, <strong>Speech-to-Text</strong>, and <strong>Audio Content Summary</strong> on; you can lower scan depth if the visual is static. Style captions toward <strong>factual</strong> or <strong>story</strong> with a <strong>calm</strong> or <strong>authentic</strong> tone.</p>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"><i class="fas fa-list-check"></i></div>
+            <div>
+              <div class="feat-card-title">Upload Preferences — dependency matrix</div>
+              <div class="feat-card-desc">Settings → Upload Preferences. Treat this as a dependency graph: parent toggles first, then children, then per-service AI controls.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Setting</th><th>Requires</th><th>Successful setup &amp; notes</th></tr>
+              <tr>
+                <td><strong>Auto-generate Captions</strong></td>
+                <td>Plan with AI; <strong>Use AI</strong> on upload; <strong>Caption and Hashtag Writer</strong> in AI Service Controls</td>
+                <td>Master switch for GPT titles/captions. Pair with <strong>AI Caption Scan Depth</strong> and Caption &amp; AI style/tone/voice. Without <strong>Use AI</strong> on the upload form, this preference is ignored for that job.</td>
+              </tr>
+              <tr>
+                <td><strong>Auto-generate Thumbnails</strong></td>
+                <td>AI-capable plan; <strong>Thumbnail Designer</strong> on</td>
+                <td>Extracts up to your tier’s <strong>max_thumbnails</strong> candidates, scores sharpness, and may call vision to pick the best frame. <strong>Thumbnail Interval</strong> (1–60s) controls how far apart samples sit on the timeline — lower values for fast-cut content, higher for slow B-roll.</td>
+              </tr>
+              <tr>
+                <td><strong>Default Privacy</strong></td>
+                <td>—</td>
+                <td><strong>Public</strong>, <strong>Unlisted</strong>, or <strong>Private</strong> when the upload form leaves privacy blank. Per-upload overrides always win.</td>
+              </tr>
+              <tr>
+                <td><strong>AI Caption Scan Depth</strong></td>
+                <td><strong>Caption Writer</strong> on; <strong>Use AI</strong> on upload; within tier max (see Plan limits table)</td>
+                <td>Frames sampled for visual story context before the caption model runs. More frames → richer scene understanding → higher typical <strong>AIC</strong>. The slider cannot exceed your plan’s max (15 on Studio/Agency; lower on smaller tiers).</td>
+              </tr>
+              <tr>
+                <td><strong>Speech-to-Text</strong> (upload prefs)</td>
+                <td><strong>Enable Audio Context</strong>; <strong>Speech-to-Text</strong> in AI Service Controls; audible clip ~3s–~10min</td>
+                <td>Whisper (or deployment equivalent) produces transcript text that flows into caption context. Silent clips, ultra-short hooks, or extremely long files may skip the stage by design.</td>
+              </tr>
+              <tr>
+                <td><strong>Styled Thumbnails</strong></td>
+                <td><strong>Auto-generate Thumbnails</strong>; tier with <strong>ai_thumbnail_styling</strong> (Creator Pro and above)</td>
+                <td>Enables composite/template path (text, badges, overlays). Lite/Free may still get thumbnails but not full styled compositing — upgrade if you never see branded overlays.</td>
+              </tr>
+              <tr>
+                <td><strong>Thumbnail Studio</strong> + <strong>AuroraRender</strong> + <strong>Persona</strong></td>
+                <td>Studio workflow toggles; optional <strong>Persona ID</strong>; server <code>PIKZELS_API_KEY</code> / render API</td>
+                <td>External render first when healthy; internal pipeline fallback on failure. Save personas in <a href="thumbnail-studio.html" style="color:#f97316;">Thumbnail Studio</a> and paste UUID into defaults for batch consistency.</td>
+              </tr>
+              <tr>
+                <td><strong>AI-Generated Hashtags</strong></td>
+                <td><strong>Use AI</strong>; <strong>Caption Writer</strong> (same bundle as caption generation); within <strong>max hashtags</strong> / count settings</td>
+                <td>Respects <strong>AI hashtag count</strong>, <strong>style</strong> (e.g. trending vs niche vs mixed), <strong>blocked</strong> list, and platform-specific lists. Turning off saves AIC if captions are manual-only.</td>
+              </tr>
+            </table>
+            <div class="tip"><strong>Operators:</strong> Thumbnail Studio proxy and Aurora upload rendering need valid API configuration on the server (<code>PIKZELS_API_KEY</code> / <code>THUMB_RENDER_API_KEY</code> and URLs). Missing keys → API errors in Studio and upload-time fallback to internal thumbnails.</div>
+          </div>
+        </div>
+
+        <div id="feat-settings-defaults" style="scroll-margin-top:1.5rem;">
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-palette"></i></div>
+            <div>
+              <div class="feat-card-title">Platform Colors — badges on styled thumbnails</div>
+              <div class="feat-card-desc">Per-platform hex colors apply to styled thumbnail templates (badge and focal accents). Accent color can influence highlight strokes.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <ol class="how-steps">
+              <li>In <a href="settings.html" style="color:#f97316;">Settings</a> → Preferences, scroll to <strong>Platform Colors</strong>.</li>
+              <li>Set TikTok, YouTube, Instagram, and Facebook colors — these map to each platform’s styled output.</li>
+              <li>Set <strong>Accent</strong> if you want a consistent highlight color for focal cues (where the template uses it).</li>
+              <li>Click <strong>Save All Preferences</strong> so colors are stored with your account.</li>
+            </ol>
+            <div class="note"><strong>Requires styled thumbnails:</strong> Colors affect the composite/template path. If Auto Thumbnails or styled composites are off — or your plan is template-only — you may not see custom badge colors until those features are active.</div>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-gauge-high"></i></div>
+            <div>
+              <div class="feat-card-title">AI Caption Scan Depth — frames per video</div>
+              <div class="feat-card-desc">Higher numbers give the model more visual context (and use more AIC). Your plan caps the maximum; the UI shows the allowed range.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <ol class="how-steps">
+              <li>Turn on <strong>Auto-generate Captions</strong> and keep <strong>Caption and Hashtag Writer</strong> on in AI Service Controls.</li>
+              <li>Set <strong>AI Caption Scan Depth</strong> in Upload Preferences to match your content — fast cuts may need more frames; simple talking-head clips may need fewer.</li>
+              <li>Stay at or below your plan’s frame cap (see <a href="#playbook-limits" style="color:#f97316;">Plan limits</a> — up to <strong>15</strong> frames on Studio/Agency; lower tiers cap earlier).</li>
+              <li><strong>Save All Preferences</strong>, then upload — scan depth applies to jobs that start processing after the save completes.</li>
+            </ol>
+            <div class="tip"><strong>Choosing a number:</strong> For jump-cut vlogs or multi-location days, bias higher (within your cap) so the model sees distinct beats. For single-angle rants or screen recordings, 3–5 frames often suffice and trims AIC.</div>
+          </div>
+        </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-pen-fancy"></i></div>
+            <div>
+              <div class="feat-card-title">Caption &amp; AI Settings — global writing style</div>
+              <div class="feat-card-desc">Applies when the pipeline generates captions. Manual title/caption text you enter on the upload form is treated as authoritative — AI does not overwrite your locked-in copy unless your workflow explicitly replaces it downstream.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.82rem;color:var(--text-secondary);line-height:1.55;margin:0 0 .65rem;">Three independent axes are combined in the prompt. Think of them as <em>structure</em>, <em>mood</em>, and <em>character</em>:</p>
+            <table class="comp-table">
+              <tr><th>Caption Style</th><th>What it does</th></tr>
+              <tr><td><code>story</code></td><td>Arc-first narration: setup → beat → payoff. Great for day-in-the-life and narrative vlogs.</td></tr>
+              <tr><td><code>punchy</code></td><td>Hook-forward, short clauses, emphasis on the first line. Strong for Shorts/Reels retention.</td></tr>
+              <tr><td><code>factual</code></td><td>Neutral, descriptive lead; minimizes flourish. Good for tutorials, newsy clips, product demos.</td></tr>
+            </table>
+            <table class="comp-table" style="margin-top:.65rem;">
+              <tr><th>Caption Tone</th><th>What it does</th></tr>
+              <tr><td><code>hype</code></td><td>High energy, exclamation-friendly, momentum language.</td></tr>
+              <tr><td><code>calm</code></td><td>Steady, conversational, avoids aggressive CTAs.</td></tr>
+              <tr><td><code>cinematic</code></td><td>Visual, atmospheric wording; treats the clip like a scene.</td></tr>
+              <tr><td><code>authentic</code></td><td>Direct, human, “talking to a friend” register — default for many creators.</td></tr>
+            </table>
+            <table class="comp-table" style="margin-top:.65rem;">
+              <tr><th>Caption Voice / Persona</th><th>What it does</th></tr>
+              <tr><td><code>default</code></td><td>Balanced creator voice — no strong caricature.</td></tr>
+              <tr><td><code>mentor</code></td><td>Teaching cadence, clear takeaways, supportive authority.</td></tr>
+              <tr><td><code>hypebeast</code></td><td>Streetwear/energy culture flavor layered on the tone you picked.</td></tr>
+              <tr><td><code>best_friend</code></td><td>Casual asides, inclusive language, low formality.</td></tr>
+              <tr><td><code>teacher</code></td><td>Stepwise, patient explanations; assumes the viewer is learning.</td></tr>
+              <tr><td><code>cinematic_narrator</code></td><td>Third-person trailer voice; pairs well with <code>cinematic</code> tone.</td></tr>
+            </table>
+            <ol class="how-steps" style="margin-top:.75rem;">
+              <li>Pick style, tone, and voice to match your channel promise — misalignment (e.g. <code>factual</code> + <code>hypebeast</code>) can work ironically but often reads inconsistent.</li>
+              <li>If <strong>Trill AI model</strong> is exposed separately for drive-enhanced captions, that selector only affects the telemetry-enriched caption path; general caption model picks may live in the same settings card.</li>
+              <li><strong>Save All Preferences</strong>; changes apply to the next processed jobs, not retroactively to published posts.</li>
+            </ol>
+            <div class="note"><strong>Together:</strong> These dimensions plus scan depth, transcript, frame inspector labels, and optional map/telemetry context all feed the same caption stage — starving any upstream feature (e.g. no transcript when you talk for 60s) limits what GPT can say no matter how strong the persona is.</div>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-hashtag"></i></div>
+            <div>
+              <div class="feat-card-title">Hashtag Settings — always-on, per platform, AI, caps</div>
+              <div class="feat-card-desc">Hashtags are merged from several sources, deduped, filtered, then clamped. Understanding order prevents surprises on publish.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <ol class="how-steps">
+              <li>Turn on <strong>AI-Generated Hashtags</strong> when you want the model to propose tags (consumes <strong>AIC</strong> alongside caption generation when <strong>Use AI</strong> is on).</li>
+              <li>Set <strong>AI hashtag count</strong> (how many AI tags to aim for) and <strong>style</strong> — e.g. trending vs niche vs mixed — to bias discovery vs community-specific tags.</li>
+              <li>Add <strong>Always Include</strong> tags for brand or campaign tags you need on every post regardless of platform.</li>
+              <li>Fill <strong>Platform-specific</strong> lists (TikTok, YouTube, Instagram, Facebook) when the same caption should carry different tag mixes per destination.</li>
+              <li>Maintain <strong>Blocked</strong> for banned, off-brand, or legally sensitive tags — blocked wins against every other source, including AI.</li>
+              <li>Set <strong>Max hashtags</strong> and <strong>Hashtag position</strong> (<strong>start</strong>, <strong>end</strong>, or <strong>caption</strong> embedding where supported) to match each platform’s best practice.</li>
+            </ol>
+            <div class="tip"><strong>Merge intuition:</strong> At presign, manual upload tags are normalized and deblocked first. Always-include and platform lists merge in downstream publish logic; AI tags append when enabled. Duplicates collapse; blocked tags never appear. If your list exceeds <strong>max hashtags</strong>, the tail is cut — raise the cap modestly or shorten always-on lists.</div>
+            <div class="note"><strong>Compliance:</strong> AI suggestions are probabilistic. Keep blocked lists updated for regulated niches (finance, health, contests) and audit a few publishes after big setting changes.</div>
+          </div>
+        </div>
+
+        <div class="feat-card" id="playbook-trill-hud">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-road"></i></div>
+            <div>
+              <div class="feat-card-title">Drive Insights (BETA) — telemetry, Trill score, captions, HUD</div>
+              <div class="feat-card-desc">Four related concepts: (1) ingesting the <code>.map</code>, (2) scoring the run, (3) feeding captions, (4) burning a speed HUD. They share files but use different toggles.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Layer</th><th>Toggle / setting</th><th>Effect</th></tr>
+              <tr><td>Consent &amp; ingest</td><td><strong>Enable Drive Analysis</strong> (<code>trill_enabled</code>)</td><td>Master switch: allows parsing telemetry and computing Trill-related signals when a <code>.map</code> is present.</td></tr>
+              <tr><td>Caption context</td><td><strong>Telemetry Insights</strong> (AI Service Controls)</td><td>When Drive Analysis is on and a map exists, map-derived hooks can influence <strong>AI captions</strong>. Off → HUD may still use the map, but caption text won’t get Trill-style beats from telemetry.</td></tr>
+              <tr><td>Caption intensity</td><td><strong>AI Content Enhancement</strong> (<code>trill_ai_enhance</code>)</td><td>When on, stronger “story beat” instructions can be injected for qualifying scores. Off → lighter or no Trill-flavored narrative block even if data exists.</td></tr>
+              <tr><td>Quality gate</td><td><strong>Minimum Trill Score</strong> (0–100)</td><td>Below threshold, aggressive Trill caption content is suppressed so mundane drives don’t read like track days.</td></tr>
+              <tr><td>Pixel output</td><td><strong>Speed HUD</strong> (synced to <code>hud_enabled</code> in account settings)</td><td>Burns speed/telemetry overlay into the rendered video before publish. Requires eligible plan (Creator Pro+), map file, and HUD styling thresholds you configure (speeding / euphoria MPH, colors, font).</td></tr>
+            </table>
+            <ol class="how-steps" style="margin-top:.75rem;">
+              <li>Enable <strong>Drive Analysis</strong> and save preferences.</li>
+              <li>Enable <strong>Telemetry Insights</strong> if you want map data in captions; skip if you only want HUD pixels.</li>
+              <li>Upload video + <code>.map</code> together; verify your exporter’s naming so the worker pairs them reliably.</li>
+              <li>Tune <strong>Minimum Trill Score</strong> after watching a few Queue summaries — too low reads noisy; too high rarely triggers.</li>
+              <li>Adjust <strong>speeding</strong> / <strong>euphoria</strong> MPH thresholds to match your region’s units (where the UI exposes MPH) and how aggressively you want those labels.</li>
+              <li>Optionally pick a dedicated <strong>Trill OpenAI model</strong> when shown — balances cost vs flourish for telemetry-heavy prompts.</li>
+            </ol>
+            <div class="note"><strong>HUD vs captions:</strong> HUD needs map + <code>hud_enabled</code> + tier. Captions need <strong>Use AI</strong> + caption services + (for Trill text) Drive Analysis + Telemetry Insights + usually AI enhancement for the boldest beats.</div>
+            <div class="tip"><strong>Filming workflow:</strong> Treat the <code>.map</code> like audio sync — if you re-render the video, regenerate or re-copy the map from the same take so timestamps still align.</div>
+          </div>
+        </div>
+
+        <div class="feat-card" id="playbook-per-upload">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(251,191,36,.1);color:#fbbf24;"><i class="fas fa-upload"></i></div>
+            <div>
+              <div class="feat-card-title">Per-upload overrides (what the form can still change)</div>
+              <div class="feat-card-desc">Saved preferences are defaults; a few upload-time choices override or gate the pipeline for that job only.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Control</th><th>Effect</th></tr>
+              <tr><td><strong>Use AI</strong></td><td>Global gate for AI spend on this job. Off → skips GPT caption/hashtag/thumbnail AI even if every Settings toggle is on. Use for “raw transcode + publish” batches.</td></tr>
+              <tr><td><strong>Telemetry / has map</strong></td><td>Signals that a <code>.map</code> accompanies the file so presign and downstream stages allocate telemetry work. Missing flag or file → Trill/HUD paths may no-op.</td></tr>
+              <tr><td>Manual title, caption, hashtags</td><td>Seed the publish payload; hashtag blocking and max limits still apply. AI may augment when enabled, depending on field locks in your UI version.</td></tr>
+              <tr><td>Privacy, schedule, targets</td><td>Per job: choose accounts, scheduled time, smart spread — they do not change global defaults in Settings.</td></tr>
+            </table>
+            <div class="tip"><strong>Debugging tip:</strong> If “Settings look correct” but AI never runs, check <strong>Use AI</strong> first — it is the most common false-negative.</div>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-waveform-lines"></i></div>
+            <div>
+              <div class="feat-card-title">Audio Intelligence</div>
+              <div class="feat-card-desc">Master switch first; then fine-tune sub-services. Audio off is a hard stop for every dependent stage.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <ol class="how-steps">
+              <li>Turn on <strong>Enable Audio Context</strong> (<code>use_audio_context</code>). Off → transcription, music ID, environmental audio classifiers, summaries, and emotion-from-audio paths do not run.</li>
+              <li>Enable <strong>Speech-to-text</strong> in Upload Preferences for Whisper-style transcripts, and keep <strong>Speech-to-Text</strong> enabled under AI Service Controls — both ends must agree.</li>
+              <li>Use <strong>AI Service Controls</strong> to disable expensive detectors individually: music fingerprinting, audio event labels, semantic audio summary, emotion signals — each saves some <strong>AIC</strong> when you don’t need that modality.</li>
+              <li>Expect graceful skips when the source clip has no usable audio track, is extremely short, or blows duration limits — the pipeline continues without transcript context.</li>
+            </ol>
+            <div class="note"><strong>Why summaries matter:</strong> Even if you disable vision-heavy features, a short <strong>Audio Content Summary</strong> often helps GPT understand “what the viewer hears” for music-forward or ambient storytelling clips.</div>
+          </div>
+        </div>
+
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(251,191,36,.1);color:#fbbf24;"><i class="fas fa-gauge-high"></i></div>
+            <div>
+              <div class="feat-card-title">AI Service Controls — cost vs quality</div>
+              <div class="feat-card-desc">Each toggle maps to a worker stage or vendor integration. Off = that signal never reaches GPT/thumbnail code paths, and presign may reserve less <strong>AIC</strong>.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>UI label</th><th>Backend flag (reference)</th><th>What it affects</th></tr>
+              <tr><td>Telemetry Insights</td><td><code>ai_service_telemetry</code></td><td>Map → caption context when Drive Analysis + <code>.map</code> present. HUD can still consume maps separately.</td></tr>
+              <tr><td>Audio Event Detection</td><td><code>ai_service_audio_signals</code></td><td>Environmental / YAMNet-style audio labels for context.</td></tr>
+              <tr><td>Music Detection</td><td><code>ai_service_music_detection</code></td><td>Track identification when provider keys exist.</td></tr>
+              <tr><td>Audio Content Summary</td><td><code>ai_service_audio_summary</code></td><td>Natural-language summary of the soundtrack for captions.</td></tr>
+              <tr><td>Speech-to-Text</td><td><code>ai_service_speech_to_text</code></td><td>Transcript text for caption prompting.</td></tr>
+              <tr><td>Frame Inspector</td><td><code>ai_service_frame_inspector</code></td><td>Vision labels on sampled frames (objects, OCR, faces).</td></tr>
+              <tr><td>Video Analyzer</td><td><code>ai_service_video_analyzer</code></td><td>Shot/label analytics via Google Video Intelligence when enabled.</td></tr>
+              <tr><td>Scene Understanding</td><td><code>ai_service_scene_understanding</code></td><td>Deep video understanding via Twelve Labs when enabled.</td></tr>
+              <tr><td>Caption and Hashtag Writer</td><td><code>ai_service_caption_writer</code></td><td>GPT title/caption/hashtag generation bundle.</td></tr>
+              <tr><td>Thumbnail Designer</td><td><code>ai_service_thumbnail_designer</code></td><td>Thumbnail extraction, AI pick, styled composite pipeline.</td></tr>
+            </table>
+            <div class="tip"><strong>Env limits:</strong> Toggles are necessary but not sufficient — integrations need API keys and quota on the deployment. If a toggle is on and the stage still skips, inspect Queue logs / support bundle for “missing provider” messages.</div>
+            <div class="note"><strong>Savings strategy:</strong> Disable the heaviest vision providers first (Scene Understanding, Video Analyzer) on non-cinematic content; keep Frame Inspector + Speech-to-Text if you still need strong captions.</div>
+          </div>
+        </div>
+
+        <div class="feat-card" id="playbook-notifications">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-bell"></i></div>
+            <div>
+              <div class="feat-card-title">Notifications, email, Discord, scheduled alerts</div>
+              <div class="feat-card-desc">These settings do not change AI quality, but they change how quickly you notice failures, quota issues, or finished jobs.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <ul style="margin:.35rem 0 .35rem 1.1rem;padding:0;font-size:.83rem;color:var(--text-secondary);line-height:1.55;">
+              <li><strong>Email notifications</strong> — Master email on/off for product mail (transactional + optional marketing depending on your account flags).</li>
+              <li><strong>Auth security alerts</strong> — Login anomalies and password events; keep on for managed accounts.</li>
+              <li><strong>Digest emails</strong> — Periodic summaries so you don’t live inside the Queue UI.</li>
+              <li><strong>Scheduled alert emails</strong> — Pings when scheduled posts fail or need attention.</li>
+              <li><strong>Discord webhook</strong> — Paste a channel webhook URL to mirror key job events into Discord for teams.</li>
+            </ul>
+            <div class="tip">Webhook URLs are secrets — treat them like API keys. Rotate if leaked.</div>
+          </div>
+        </div>
+
+        <div class="feat-card" id="playbook-glossary">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(156,163,175,.15);color:#9ca3af;"><i class="fas fa-book"></i></div>
+            <div>
+              <div class="feat-card-title">Glossary — terms we reuse everywhere</div>
+              <div class="feat-card-desc">Short definitions so cross-links in this guide stay unambiguous.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Term</th><th>Meaning</th></tr>
+              <tr><td><strong>PUT</strong></td><td>Upload / processing credits reserved at presign; consumed when work completes (transcode, HUD burn, publish).</td></tr>
+              <tr><td><strong>AIC</strong></td><td>AI credits for model calls — captions, vision picks, summaries, optional external renders.</td></tr>
+              <tr><td><strong>Presign</strong></td><td>Step that validates entitlements, merges hashtags, reserves wallet holds, and issues the R2 upload URL.</td></tr>
+              <tr><td><strong>Worker</strong></td><td>Background processor executing pipeline stages after your file lands in object storage.</td></tr>
+              <tr><td><strong>Best-effort</strong></td><td>Stages may skip without failing the whole job; always verify in Queue details when output looks “thin.”</td></tr>
+              <tr><td><strong>Trill score</strong></td><td>Heuristic intensity of a telemetry session; gates how much spicy driving language is allowed in captions.</td></tr>
+              <tr><td><strong>Styled thumbnail</strong></td><td>Composite thumbnail with designed overlays — distinct from a raw frame grab.</td></tr>
+              <tr><td><strong>Entitlements</strong></td><td>Plan-derived limits (frames, thumbnails, HUD, watermark) enforced server-side.</td></tr>
+            </table>
+          </div>
+        </div>
+
+        <div class="feat-card" id="playbook-troubleshoot">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(239,68,68,.1);color:#ef4444;"><i class="fas fa-life-ring"></i></div>
+            <div>
+              <div class="feat-card-title">If something didn’t run — expanded triage</div>
+              <div class="feat-card-desc">Work top to bottom; the first matching fix usually resolves the symptom.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <table class="comp-table">
+              <tr><th>Symptom</th><th>Most likely causes (in order)</th></tr>
+              <tr><td>No AI caption</td><td><strong>Use AI</strong> off on upload → <strong>Caption Writer</strong> service off → <strong>Auto-generate Captions</strong> off → empty <strong>AIC</strong> wallet / billing issue → manual caption already locked and UI skipped generation.</td></tr>
+              <tr><td>Caption generic / ignores video</td><td>Scan depth too low for fast edits → <strong>Frame Inspector</strong> off → transcript missing because audio off → no map while shooting driving content.</td></tr>
+              <tr><td>No transcript</td><td><strong>Enable Audio Context</strong> off → upload prefs speech off → <strong>ai_service_speech_to_text</strong> off → clip shorter than minimum / longer than max → silent audio track.</td></tr>
+              <tr><td>No music ID</td><td><strong>Music Detection</strong> off → provider not configured → royalty-free beds with no fingerprint match.</td></tr>
+              <tr><td>No styled thumbnail</td><td><strong>Auto Thumbnails</strong> off → <strong>Styled</strong> off → tier lacks <strong>ai_thumbnail_styling</strong> → <strong>Thumbnail Designer</strong> service off.</td></tr>
+              <tr><td>Thumbnails look unbranded</td><td>Platform colors unsaved → styled path disabled → template-only tier.</td></tr>
+              <tr><td>No Trill language in captions</td><td>No <code>.map</code> → <strong>Drive Analysis</strong> off → <strong>Telemetry Insights</strong> off → score &lt; minimum → <strong>AI Content Enhancement</strong> off → <strong>Use AI</strong> off.</td></tr>
+              <tr><td>HUD missing</td><td>Tier without HUD → <code>hud_enabled</code> false → no map → map/video mismatch → insufficient PUT reservation.</td></tr>
+              <tr><td>HUD works, captions plain</td><td>Expected when <strong>Telemetry Insights</strong> is off — turn on (with Drive Analysis) to feed captions; HUD uses different gates.</td></tr>
+              <tr><td>Queue stuck / limit errors</td><td>Hit <strong>queue_depth</strong> for tier → wait for completions → upgrade plan → cancel stale jobs if safe.</td></tr>
+              <tr><td>Wallet / presign errors</td><td>Insufficient <strong>PUT</strong> or <strong>AIC</strong> for the reserved formula → top up → reduce AI/HUD for test uploads.</td></tr>
+              <tr><td>Thumbnail Studio API errors</td><td>Missing <code>PIKZELS_API_KEY</code> / render API on server → invalid persona UUID → upstream outage (falls back internally).</td></tr>
+              <tr><td>Everything AI off suddenly</td><td>Session logged out → preferences failed to load defaults → re-save preferences → confirm subscription active.</td></tr>
+            </table>
+            <div class="note"><strong>When to open a ticket:</strong> Attach upload ID, timestamp, and whether <strong>Use AI</strong> was on. Operators can trace stage-level skips faster than guessing from the published post alone.</div>
           </div>
         </div>
       </div>
@@ -356,7 +915,7 @@ if (window.self !== window.top) {
         </div>
 
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"><i class="fas fa-film"></i></div>
             <div>
@@ -365,23 +924,28 @@ if (window.self !== window.top) {
             </div>
           </div>
           <div class="feat-card-body">
-            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;">Pipeline stages in order:</p>
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;">Typical processing order (skips any stage you turned off or that isn’t needed):</p>
             <ol class="how-steps">
-              <li><strong>Presign</strong> — Frontend requests a secure upload URL. Wallet is checked, PUT/AIC is reserved as a hold.</li>
-              <li><strong>R2 Upload</strong> — File goes directly to Cloudflare R2 (never touches the API server).</li>
-              <li><strong>Download to worker</strong> — Worker pulls the file from R2 to local temp storage.</li>
-              <li><strong>FFmpeg transcode</strong> — Video is re-encoded to each platform's required spec (resolution, codec, bitrate, aspect ratio).</li>
-              <li><strong>AI analysis</strong> — If enabled, AI scans keyframes for captions, hashtags, thumbnails.</li>
-              <li><strong>HUD burn-in</strong> — If enabled, overlay is composited onto the video.</li>
-              <li><strong>Publish</strong> — Transcoded versions are uploaded to each connected account via platform APIs.</li>
-              <li><strong>Settle wallet</strong> — On success: hold is captured (PUT/AIC debited). On failure: hold is released (no cost).</li>
+              <li><strong>Presign</strong> — Frontend requests a secure upload URL. Wallet is checked; PUT/AIC is reserved as a hold.</li>
+              <li><strong>R2 Upload</strong> — File goes directly to Cloudflare R2 (not through the app server).</li>
+              <li><strong>Worker download</strong> — Worker pulls the file to temp storage.</li>
+              <li><strong>Telemetry / map</strong> — If a <code>.map</code> file is present and settings allow, route and Trill data are parsed (needed for Drive captions and/or HUD).</li>
+              <li><strong>HUD burn-in</strong> — If enabled and your plan supports it, speed overlay is composited on the working video.</li>
+              <li><strong>Watermark</strong> — Applied when your plan uses watermarks.</li>
+              <li><strong>Transcode</strong> — FFmpeg produces per-platform video variants.</li>
+              <li><strong>Audio &amp; vision AI</strong> — Audio context, optional scene / video intelligence, frame inspection (per your AI Service toggles).</li>
+              <li><strong>Thumbnails</strong> — Frames picked and styled per settings.</li>
+              <li><strong>Captions</strong> — Titles, captions, hashtags generated when enabled.</li>
+              <li><strong>Publish</strong> — Outputs go to each selected account via platform APIs.</li>
+              <li><strong>Settle wallet</strong> — On success the hold is captured; on failure it is released.</li>
             </ol>
+            <div class="note"><strong>Best-effort:</strong> A stage may skip (timeout, missing vendor key, clip limits) while the rest of the pipeline continues — the job can still succeed with partial AI.</div>
             <div class="note"><strong>File requirements:</strong> MP4, MOV, AVI, MKV or WebM. Max 4GB. Recommended: 1080×1920 (9:16 portrait) for short-form platforms.</div>
           </div>
         </div>
 
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"><i class="fas fa-align-left"></i></div>
             <div>
@@ -415,7 +979,7 @@ if (window.self !== window.top) {
         </div>
 
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(251,191,36,.1);color:#fbbf24;"><i class="fas fa-clock"></i></div>
             <div>
@@ -434,10 +998,10 @@ if (window.self !== window.top) {
             </ol>
             <table class="comp-table">
               <tr><th>Plan</th><th>Lookahead window</th><th>Queue depth</th></tr>
-              <tr><td>Creator Lite</td><td>12 hours</td><td>500 jobs</td></tr>
-              <tr><td>Creator Pro</td><td>24 hours</td><td>5,000 jobs</td></tr>
-              <tr><td>Studio</td><td>48 hours</td><td>25,000 jobs</td></tr>
-              <tr><td>Agency</td><td>1 week (168h)</td><td>Unlimited</td></tr>
+              <tr><td>Creator Lite</td><td>12 hours</td><td>100 jobs</td></tr>
+              <tr><td>Creator Pro</td><td>24 hours</td><td>500 jobs</td></tr>
+              <tr><td>Studio</td><td>72 hours</td><td>2,500 jobs</td></tr>
+              <tr><td>Agency</td><td>168 hours (7 days)</td><td>99,999 jobs</td></tr>
             </table>
             <div class="tip"><strong>Lookahead explained:</strong> A 24-hour lookahead means your video is fully transcoded and ready 24 hours before publish time. This prevents delays at the exact publish moment.</div>
           </div>
@@ -451,7 +1015,7 @@ if (window.self !== window.top) {
           <div><div class="section-title">Job Queue</div><div class="section-sub">Track every upload from pending to published</div></div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-tasks"></i></div>
             <div>
@@ -483,7 +1047,7 @@ if (window.self !== window.top) {
           <div><div class="section-title">Account Groups</div><div class="section-sub">Organize accounts into named groups for bulk publishing</div></div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-object-group"></i></div>
             <div>
@@ -515,7 +1079,7 @@ if (window.self !== window.top) {
           </div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-brain"></i></div>
             <div>
@@ -541,6 +1105,54 @@ if (window.self !== window.top) {
               <tr><td>Agency</td><td>Max</td><td>15</td></tr>
             </table>
             <div class="tip"><strong>More frames = better AI:</strong> Higher frame counts give the AI more visual context, improving caption accuracy for fast-cut or visually complex videos.</div>
+            <div class="tip" style="margin-top:.75rem;"><strong>Learning from your posts:</strong> On the <strong>Dashboard</strong>, the <strong>Personalized tips</strong> panel highlights caption and thumbnail choices that tended to get more interaction, using your own results. When you have enough history, you can <strong>apply recommended prefs</strong> to Settings in one click.</div>
+            <div class="note" style="margin-top:.75rem;"><strong>Settings:</strong> For step-by-step toggles (caption style/tone/voice, AI Service Controls, per-upload <strong>Use AI</strong>), see <a href="#feat-settings-playbook" style="color:#3b82f6;">Settings Playbook</a> above.</div>
+          </div>
+        </div>
+      </div>
+
+
+      <!-- ════════════ AUDIO CONTEXT ════════════ -->
+      <div class="guide-section" id="feat-audio">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(139,92,246,.12);color:#8b5cf6;"><i class="fas fa-microphone"></i></div>
+          <div>
+            <div class="section-title">Audio Transcription (Whisper)</div>
+            <div class="section-sub">
+              <span class="tier-badge tb-free"><i class="fas fa-bolt"></i> All Plans</span>
+              <span style="margin-left:.5rem;font-size:.75rem;color:#a78bfa;font-weight:600;">NEW</span>
+            </div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-waveform-lines" style="font-size:.8rem;"></i></div>
+            <div>
+              <div class="feat-card-title">Speech-aware AI captions via OpenAI Whisper</div>
+              <div class="feat-card-desc">Before generating captions, UploadM8 now extracts the audio from your video, sends it to OpenAI Whisper, and injects the transcript into every AI prompt — so GPT-4o knows exactly what was said, not just what was shown.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;"><strong>Pipeline position (Stage 5.5):</strong></p>
+            <ol class="how-steps">
+              <li><strong>Transcode completes</strong> — video is in its final format, audio codec confirmed.</li>
+              <li><strong>FFmpeg extracts audio</strong> — a temporary WAV file is created from the video's audio stream.</li>
+              <li><strong>Whisper transcribes</strong> — the WAV is sent to OpenAI Whisper (whisper-1). Transcript is capped at 3,000 characters.</li>
+              <li><strong>Transcript is injected</strong> — caption_stage receives <code>ctx.ai_transcript</code> alongside the video frames, producing grounded, accurate captions.</li>
+              <li><strong>Temp file is deleted</strong> — the WAV is cleaned up with the job's temp directory.</li>
+            </ol>
+            <div class="note"><strong>Example:</strong> A 60s driving clip where the narrator says <em>"Coming into the final chicane here at Laguna Seca"</em> will generate captions mentioning Laguna Seca — not just a generic driving description.</div>
+            <table class="comp-table">
+              <tr><th>Condition</th><th>Behaviour</th></tr>
+              <tr><td>No audio stream</td><td>Stage skips gracefully — captions use frames only</td></tr>
+              <tr><td>Clip &lt; 3 seconds</td><td>Skipped (too short for useful transcript)</td></tr>
+              <tr><td>Clip &gt; 10 minutes</td><td>Skipped (cost guard — configurable via env)</td></tr>
+              <tr><td>Whisper API error</td><td>Warning logged; captions continue without transcript</td></tr>
+              <tr><td>User opt-out</td><td>Turn off <strong>Enable Audio Context</strong> and/or <strong>Speech-to-text</strong> and/or the <strong>Speech-to-Text</strong> AI Service Control in <a href="settings.html" style="color:#f97316;">Settings</a></td></tr>
+            </table>
+            <div class="note" style="margin-top:.75rem;"><strong>Setup order:</strong> Enable <strong>Audio Context</strong> first, then speech-to-text — see <a href="#feat-settings-playbook" style="color:#3b82f6;">Settings Playbook</a>.</div>
+            <div class="tip"><strong>Cost note:</strong> Whisper costs ~$0.006/min at the platform level. For a Creator Pro user running 75 uploads/month of 60s clips, this adds ~$0.45/month in infrastructure cost — well within plan margin.</div>
           </div>
         </div>
       </div>
@@ -557,7 +1169,7 @@ if (window.self !== window.top) {
           </div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-layer-group"></i></div>
             <div>
@@ -585,7 +1197,7 @@ if (window.self !== window.top) {
           <div><div class="section-title">Thumbnail Generation</div><div class="section-sub">Auto-generated candidate frames from your video</div></div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(251,191,36,.1);color:#fbbf24;"><i class="fas fa-camera"></i></div>
             <div>
@@ -603,6 +1215,39 @@ if (window.self !== window.top) {
               <tr><td>Agency</td><td>15</td></tr>
             </table>
             <div class="tip"><strong>Manual selection:</strong> On paid plans, all candidate frames are stored and you can pick your preferred thumbnail from the upload detail page after processing completes.</div>
+            <div class="note" style="margin-top:.75rem;"><strong>Pipeline extras:</strong> Paid flows can combine Playwright HTML renders, optional cloud image models (Replicate / fal.ai), background removal, Google Vision on key frames, and persona consistency — see <a href="subprocessors.html" style="color:#f97316;">Subprocessors</a> for the full vendor list.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════ THUMBNAIL STUDIO / PIKZELS ════════════ -->
+      <div class="guide-section" id="feat-pikzels">
+        <div class="section-header">
+          <div class="section-icon" style="background:rgba(139,92,246,.12);color:#8b5cf6;"><i class="fas fa-wand-magic-sparkles"></i></div>
+          <div>
+            <div class="section-title">Thumbnail Studio &amp; Pikzels</div>
+            <div class="section-sub">Interactive thumbnails, scores, titles, and persona helpers — billed separately from a plain auto-thumb</div>
+          </div>
+        </div>
+        <div class="feat-card">
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
+          <div class="feat-card-header">
+            <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-palette"></i></div>
+            <div>
+              <div class="feat-card-title">What it is</div>
+              <div class="feat-card-desc"><a href="thumbnail-studio.html" style="color:#f97316;">Thumbnail Studio</a> is where you refine thumbnails with creative control. When Pikzels is enabled on our side, your session talks to <strong>Pikzels</strong> securely through UploadM8 — so prompts and images are sent for generation, edits, scoring, title ideas, and persona or style helpers without exposing secret keys in the browser.</div>
+            </div>
+          </div>
+          <div class="feat-card-body">
+            <p style="font-size:.83rem;color:var(--text-secondary);margin-bottom:.75rem;"><strong>How it differs from queue thumbnails:</strong> uploads can still auto-generate quick options from your video. Studio is for iterating by hand; each tool use spends upload or AI credits depending on the action (see <a href="settings.html#billing" style="color:#f97316;">Billing</a> for your balances).</p>
+            <ol class="how-steps">
+              <li>Open <a href="thumbnail-studio.html" style="color:#f97316;">Thumbnail Studio</a> from the app nav.</li>
+              <li>Sign in — requests require your normal UploadM8 session.</li>
+              <li>Choose a tool (prompt, recreate, edit, score, titles, persona…).</li>
+              <li>Review outputs; download or send assets into your upload workflow as your process allows.</li>
+            </ol>
+            <div class="tip"><strong>Upload pipeline + persona:</strong> In <a href="settings.html" style="color:#f97316;">Settings → Preferences</a> you can enable AuroraRender / persona options so scheduled uploads can reference a saved persona from Studio (when configured). Full dependency list: <a href="#feat-settings-playbook" style="color:#3b82f6;">Settings Playbook</a>.</div>
+            <div class="note"><strong>Privacy:</strong> inputs you send to Studio are processed by Pikzels as a subprocessor — see <a href="privacy.html#information-collected" style="color:#f97316;">Privacy → AI data</a> and <a href="subprocessors.html#pikzels" style="color:#f97316;">Subprocessors → Pikzels</a>.</div>
           </div>
         </div>
       </div>
@@ -614,7 +1259,7 @@ if (window.self !== window.top) {
           <div><div class="section-title">Analytics</div><div class="section-sub">Track views, likes, and engagement across every platform</div></div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(34,197,94,.1);color:#22c55e;"><i class="fas fa-chart-bar"></i></div>
             <div>
@@ -665,7 +1310,7 @@ if (window.self !== window.top) {
           </div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(249,115,22,.1);color:#f97316;"><i class="fas fa-satellite-dish"></i></div>
             <div>
@@ -697,8 +1342,8 @@ if (window.self !== window.top) {
               <th style="color:#3b82f6;">Studio<br><span style="font-weight:400;font-size:.7rem;">$49.99/mo</span></th>
               <th style="color:#22c55e;">Agency<br><span style="font-weight:400;font-size:.7rem;">$99.99/mo</span></th>
             </tr>
-            <tr><td>PUT / month</td><td>60</td><td>300</td><td>700</td><td>2,000</td><td>4,500</td></tr>
-            <tr><td>AIC / month</td><td>10</td><td>80</td><td>200</td><td>600</td><td>1,500</td></tr>
+            <tr><td>PUT / month</td><td>120</td><td>500</td><td>1,800</td><td>7,000</td><td>22,000</td></tr>
+            <tr><td>AIC / month</td><td>1,200</td><td>4,500</td><td>13,000</td><td>45,000</td><td>140,000</td></tr>
             <tr><td>Connected accounts</td><td>4 (1/platform)</td><td>8 (2/platform)</td><td>20 (5/platform)</td><td>60 (15/platform)</td><td>Unlimited</td></tr>
             <tr><td>Watermark removed</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
             <tr><td>AI captions</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
@@ -709,7 +1354,7 @@ if (window.self !== window.top) {
             <tr><td>White label</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
             <tr><td>Flex transfers</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
             <tr><td>Team seats</td><td>1</td><td>1</td><td>3</td><td>10</td><td>25</td></tr>
-            <tr><td>Queue depth</td><td>25</td><td>500</td><td>5,000</td><td>25,000</td><td>∞</td></tr>
+            <tr><td>Queue depth</td><td>10</td><td>100</td><td>500</td><td>2,500</td><td>99,999</td></tr>
             <tr><td>7-day free trial</td><td><i class="fas fa-times check-no"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td><td><i class="fas fa-check check-yes"></i></td></tr>
           </table>
         </div>
@@ -726,30 +1371,30 @@ if (window.self !== window.top) {
             <div class="feat-card-icon" style="background:rgba(251,191,36,.1);color:#fbbf24;"><i class="fas fa-plus-circle"></i></div>
             <div>
               <div class="feat-card-title">One-time token packs</div>
-              <div class="feat-card-desc">Top-up packs are one-time purchases. They're added to your wallet immediately and don't expire. Perfect for high-output months without upgrading your plan.</div>
+              <div class="feat-card-desc">Top-up packs are one-time purchases. They're added to your wallet immediately and never expire. They stack with rolled-over monthly allowance and other top-ups.</div>
             </div>
           </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:1rem;">
             <div>
-              <div style="font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#f97316;margin-bottom:.6rem;">⚡ PUT Packs</div>
+              <div style="font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#f97316;margin-bottom:.6rem;"> PUT Packs</div>
               <table class="comp-table">
                 <tr><th>Tokens</th><th>Price</th></tr>
-                <tr><td>50 PUT</td><td>$2.99</td></tr>
-                <tr><td>100 PUT</td><td>$4.99</td></tr>
-                <tr><td>250 PUT</td><td>$9.99</td></tr>
-                <tr><td>500 PUT</td><td>$17.99</td></tr>
-                <tr><td>1,000 PUT</td><td>$29.99</td></tr>
+                <tr><td>250 PUT</td><td>$4.99</td></tr>
+                <tr><td>500 PUT</td><td>$8.99</td></tr>
+                <tr><td>1,000 PUT</td><td>$14.99</td></tr>
+                <tr><td>2,500 PUT</td><td>$29.99</td></tr>
+                <tr><td>5,000 PUT</td><td>$49.99</td></tr>
               </table>
             </div>
             <div>
-              <div style="font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#8b5cf6;margin-bottom:.6rem;">🤖 AIC Packs</div>
+              <div style="font-size:.72rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#8b5cf6;margin-bottom:.6rem;"> AIC Packs</div>
               <table class="comp-table">
                 <tr><th>Credits</th><th>Price</th></tr>
-                <tr><td>100 AIC</td><td>$3.99</td></tr>
-                <tr><td>250 AIC</td><td>$7.99</td></tr>
-                <tr><td>500 AIC</td><td>$14.99</td></tr>
-                <tr><td>1,000 AIC</td><td>$24.99</td></tr>
-                <tr><td>2,500 AIC</td><td>$49.99</td></tr>
+                <tr><td>500 AIC</td><td>$4.99</td></tr>
+                <tr><td>1,000 AIC</td><td>$8.99</td></tr>
+                <tr><td>2,500 AIC</td><td>$18.99</td></tr>
+                <tr><td>5,000 AIC</td><td>$34.99</td></tr>
+                <tr><td>10,000 AIC</td><td>$59.99</td></tr>
               </table>
             </div>
           </div>
@@ -786,7 +1431,7 @@ if (window.self !== window.top) {
           </div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(139,92,246,.1);color:#8b5cf6;"><i class="fas fa-tachometer-alt"></i></div>
             <div>
@@ -839,7 +1484,7 @@ if (window.self !== window.top) {
           </div>
         </div>
         <div class="feat-card">
-          <button class="feat-toggle" onclick="toggleCard(this)"><i class="fas fa-chevron-down"></i></button>
+          <button class="feat-toggle" type="button" data-um8-fn="toggleCard"><i class="fas fa-chevron-down"></i></button>
           <div class="feat-card-header">
             <div class="feat-card-icon" style="background:rgba(59,130,246,.1);color:#3b82f6;"><i class="fas fa-user-plus"></i></div>
             <div>
@@ -875,25 +1520,35 @@ if (window.self !== window.top) {
       </div>
 
     </div><!-- /guideContent -->
-  </div><!-- /main -->
+  </div><!-- /main column -->
 </div><!-- /guide-layout -->
+    </main>
+</div><!-- /app-layout -->
 
-<script src="wallet-tokens.js"></script>
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script src="shared-sidebar.js"></script>
+<script src="js/helpers-formatting.js"></script>
+<script src="js/upload-utils.js"></script>
 <script src="app.js"></script>
-<script src="auth-core.js"></script>
+<script src="wallet-tokens.js"></script>
 <script>
 document.addEventListener('DOMContentLoaded', async function() {
     // Use same auth pattern as all other pages
     var user = null;
-    try { user = await initApp('guide'); } catch(e) {}
+    try { user = await initApp('guide'); } catch(e) { console.warn('guide initApp:', e); }
+    if (!user) return;
 
     // Show "your plan" banner if user is loaded
-    if (user && user.subscription_tier) {
-        var tier = user.subscription_tier;
+    if (user) {
+        var tier = (typeof getTier === 'function' ? getTier(user) : (user.subscription_tier || 'free'));
         var NAMES = { free:'Free', creator_lite:'Creator Lite', launch:'Creator Lite', creator_pro:'Creator Pro', studio:'Studio', agency:'Agency', master_admin:'Admin', lifetime:'Lifetime' };
         var COLORS= { free:'#9ca3af', creator_lite:'#f97316', launch:'#f97316', creator_pro:'#8b5cf6', studio:'#3b82f6', agency:'#22c55e', master_admin:'#ef4444', lifetime:'#fbbf24' };
-        var puts  = { free:60, creator_lite:300, creator_pro:700, studio:2000, agency:4500 };
-        var aics  = { free:10, creator_lite:80,  creator_pro:200, studio:600,  agency:1500 };
+        var puts  = { free:80, creator_lite:400, creator_pro:1200, studio:3500, agency:8000 };
+        var aics  = { free:50, creator_lite:120, creator_pro:350, studio:1000, agency:2500 };
         var name  = NAMES[tier] || tier;
         var col   = COLORS[tier] || '#f97316';
         document.getElementById('bannerPlanName').innerHTML = '<span style="color:'+col+'">'+name+'</span> — Your current plan';
@@ -937,10 +1592,11 @@ document.addEventListener('DOMContentLoaded', async function() {
 
 // Feature card toggle
 function toggleCard(btn) {
-    var body = btn.closest('.feat-card').querySelector('.feat-card-body');
+    var el = btn && btn.currentTarget ? btn.currentTarget : btn;
+    var body = el.closest('.feat-card').querySelector('.feat-card-body');
     if (!body) return;
     body.classList.toggle('open');
-    var icon = btn.querySelector('i');
+    var icon = el.querySelector('i');
     if (icon) icon.style.transform = body.classList.contains('open') ? 'rotate(180deg)' : '';
 }
 

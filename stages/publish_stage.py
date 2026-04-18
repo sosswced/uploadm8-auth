@@ -6,7 +6,8 @@ Publish per-platform transcoded videos to social media platforms.
 Platform-specific publish flows:
   TikTok   - Content Posting API v2: init upload -> PUT binary -> publish_id
   YouTube  - Resumable upload: init -> PUT binary -> video_id
-  Instagram - Graph API Reels: create container (video_url) -> poll status -> publish
+  Instagram - Graph API Reels: create container (video_url) -> poll status -> publish;
+    optional first-comment hashtag block when hashtagPosition=comment
   Facebook - Graph API: multipart upload or URL-based Reels
 
 Key behaviors:
@@ -18,15 +19,15 @@ Key behaviors:
 
 Exports used by verify_stage:
   - decrypt_token(token_row) -> dict or None
-  - init_enc_keys() -> None
+  - init_enc_keys() -> None  (delegates to core.auth; raises if TOKEN_ENC_KEYS missing)
 """
 
 import os
+import re
 import json
 import asyncio
 import logging
 import base64
-import math
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -47,6 +48,8 @@ META_API_VERSION = "v21.0"
 # Instagram container polling
 IG_POLL_INTERVAL = 5       # seconds between polls
 IG_POLL_MAX_ATTEMPTS = 36  # 3 minutes max (36 * 5s)
+# IG Comment API message limit (stay under Meta limits; UTF-8 safe slice)
+IG_HASHTAG_COMMENT_MAX = 1900
 
 # Presigned URL expiry for Meta uploads (1 hour)
 PRESIGNED_URL_EXPIRY = 3600
@@ -215,37 +218,22 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
 # Token Encryption (used by this stage + verify_stage)
 # =====================================================================
 
-TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
-_ENC_KEYS: Dict[str, bytes] = {}
-
-
 def init_enc_keys():
-    """Parse encryption keys from environment."""
-    global _ENC_KEYS
-    if not TOKEN_ENC_KEYS:
-        return
+    """Load TOKEN_ENC_KEYS into core.state (same contract as the API process)."""
+    from core.auth import init_enc_keys as _core_init
 
-    clean = TOKEN_ENC_KEYS.strip().strip('"').replace("\\n", "")
-    parts = [p.strip() for p in clean.split(",") if p.strip()]
-    for part in parts:
-        if ":" not in part:
-            continue
-        kid, b64key = part.split(":", 1)
-        try:
-            raw = base64.b64decode(b64key.strip())
-            if len(raw) == 32:
-                _ENC_KEYS[kid.strip()] = raw
-        except Exception:
-            pass
+    _core_init()
 
 
 def decrypt_token_blob(blob: Any) -> dict:
     """Decrypt platform token blob."""
+    import core.state
+
     if isinstance(blob, str):
         blob = json.loads(blob)
 
     kid = blob.get("kid", "v1")
-    key = _ENC_KEYS.get(kid)
+    key = core.state.ENC_KEYS.get(kid)
     if not key:
         raise ValueError(f"Unknown key id: {kid}")
 
@@ -294,6 +282,41 @@ def decrypt_token(token_row: Any) -> Optional[dict]:
 # Content Derivation
 # =====================================================================
 
+# AI / DB glitches sometimes embed a JSON-ish array as one "hashtag" in the caption.
+_STRAY_HASH_JSON_BLOB = re.compile(r'#\s*"\s*\[(?:\\"|[^\]])*?\]\s*"', re.DOTALL)
+# Same junk without outer quotes: `#["a" "b"]` or `#[\"a\" \"b\"]`
+_STRAY_HASH_JSON_BRACKET = re.compile(r'#\s*\[(?:\\.|[^\]]){0,800}?\]', re.DOTALL)
+
+
+def _strip_stray_hashtag_json_blob(text: str) -> str:
+    """Remove serialized JSON-array hashtag junk from caption/description text."""
+    if not text:
+        return ""
+    cleaned = _STRAY_HASH_JSON_BLOB.sub(" ", text)
+    cleaned = _STRAY_HASH_JSON_BRACKET.sub(" ", cleaned)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def _utf16_rune_len(s: str) -> int:
+    """TikTok limits `title` by UTF-16 code units (see Direct Post API)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _utf16_clip(s: str, max_runes: int) -> str:
+    if not s or max_runes <= 0:
+        return ""
+    if _utf16_rune_len(s) <= max_runes:
+        return s
+    lo, hi = 0, len(s)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _utf16_rune_len(s[:mid]) <= max_runes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return s[:lo]
+
+
 def _get_title(ctx: JobContext) -> str:
     """Get the best available title for publishing."""
     return ctx.get_effective_title() if hasattr(ctx, "get_effective_title") else (
@@ -307,19 +330,24 @@ def _get_title(ctx: JobContext) -> str:
 
 def _get_caption(ctx: JobContext) -> str:
     """Get the best available caption/description for publishing."""
-    return ctx.get_effective_caption() if hasattr(ctx, "get_effective_caption") else (
-        getattr(ctx, "ai_caption", None)
-        or getattr(ctx, "caption", None)
-        or getattr(ctx, "description", None)
-        or ""
+    raw = (
+        ctx.get_effective_caption()
+        if hasattr(ctx, "get_effective_caption")
+        else (
+            getattr(ctx, "ai_caption", None)
+            or getattr(ctx, "caption", None)
+            or getattr(ctx, "description", None)
+            or ""
+        )
     )
+    return _strip_stray_hashtag_json_blob(str(raw or "").strip())
 
 
 def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
     """Get hashtag string for publishing.
 
     Uses get_effective_hashtags(platform) which merges in order:
-    always_hashtags → platform_hashtags for this platform → base → AI.
+    always_hashtags → platform_hashtags → upload (base) hashtags → M8 → generic AI.
     Same pipeline for all sources; blocked tags filtered throughout.
     """
     if hasattr(ctx, "get_effective_hashtags"):
@@ -329,17 +357,50 @@ def _get_hashtags(ctx: JobContext, platform: str = "") -> str:
     if isinstance(merged, list):
         tags = [str(t).strip() for t in merged if str(t).strip()]
     else:
-        import re as _re
-        tags = [p for p in _re.split(r"[\s,]+", str(merged).strip()) if p]
+        tags = [p for p in re.split(r"[\s,]+", str(merged).strip()) if p]
     normalised = [t if t.startswith("#") else f"#{t}" for t in tags if t]
     return " ".join(normalised) if normalised else ""
+
+
+def _instagram_first_comment_mode(ctx: JobContext) -> bool:
+    """True when user chose 'First comment (IG only)' / legacy caption-as-comment style."""
+    try:
+        us = ctx.user_settings or {}
+        pos = str(us.get("hashtagPosition") or us.get("hashtag_position") or "end").lower()
+        return pos in ("comment", "caption")
+    except Exception:
+        return False
+
+
+async def _instagram_post_hashtag_first_comment(
+    client: httpx.AsyncClient,
+    media_id: str,
+    access_token: str,
+    hashtag_text: str,
+) -> tuple[bool, str]:
+    """POST /{ig-media-id}/comments — hashtags only, after reel is live. Returns (ok, error_snippet)."""
+    msg = (hashtag_text or "").strip()
+    if not msg:
+        return True, ""
+    msg = msg[:IG_HASHTAG_COMMENT_MAX]
+    url = f"https://graph.facebook.com/{META_API_VERSION}/{media_id}/comments"
+    resp = await client.post(
+        url,
+        params={"access_token": access_token, "message": msg},
+    )
+    if resp.status_code != 200:
+        return False, (resp.text or "")[:500]
+    return True, ""
 
 
 def _build_platform_caption(ctx: JobContext, platform: str) -> str:
     """Build caption + hashtags for a specific platform.
 
     Includes platform-specific hashtags from user_settings.
-    Respects the user's hashtag_position preference (start / end).
+    Respects ``hashtagPosition``: ``start`` | ``end`` for all platforms; ``comment`` / ``caption``
+    applies **only to Instagram** — reel caption is prose-only and hashtags are posted afterward
+    via Graph ``/{media-id}/comments`` (see ``publish_to_instagram``). Other platforms treat
+    ``comment``/``caption`` like ``end`` so hashtags are never dropped.
     """
     caption = _get_caption(ctx)
     hashtags = _get_hashtags(ctx, platform=platform)
@@ -358,14 +419,31 @@ def _build_platform_caption(ctx: JobContext, platform: str) -> str:
             or us.get("hashtag_position")
             or "end"
         ).lower()
-        if hashtag_position not in ("start", "end"):
+        if hashtag_position not in ("start", "end", "comment", "caption"):
             hashtag_position = "end"
     except Exception:
         pass
 
+    pl = (platform or "").strip().lower()
+    if hashtag_position in ("comment", "caption"):
+        if pl == "instagram":
+            # Reel caption = story only; hashtags go to first comment after publish.
+            return _strip_stray_hashtag_json_blob(caption)
+        hashtag_position = "end"
+
     if hashtag_position == "start":
-        return f"{hashtags}\n\n{caption}"
-    return f"{caption}\n\n{hashtags}"
+        out = f"{hashtags}\n\n{caption}"
+    else:
+        out = f"{caption}\n\n{hashtags}"
+    return _strip_stray_hashtag_json_blob(out)
+
+
+def _tiktok_post_title(ctx: JobContext) -> str:
+    """TikTok `post_info.title` is the full caption (hashtags allowed), max 2200 UTF-16 runes."""
+    caption = (_build_platform_caption(ctx, "tiktok") or "").strip()
+    if not caption:
+        return _utf16_clip(_get_title(ctx), 2200)
+    return _utf16_clip(caption, 2200)
 
 
 def _build_full_caption(ctx: JobContext) -> str:
@@ -414,7 +492,12 @@ def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
 # =====================================================================
 
 
-async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = None) -> dict:
+async def _refresh_tiktok_token(
+    token_data: dict,
+    db_pool=None,
+    user_id: str = None,
+    token_row_id: str | None = None,
+) -> dict:
     """Refresh a TikTok access token using the stored refresh_token.
     TikTok access tokens expire after 24 hours; refresh tokens after 365 days.
     Persists the new token blob to DB if db_pool and user_id are provided.
@@ -446,7 +529,10 @@ async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = N
             if resp.status_code == 200:
                 new_tokens = resp.json()
                 logger.info("TikTok: Token refreshed successfully")
-                new_access  = new_tokens.get("access_token", token_data["access_token"])
+                new_access = new_tokens.get("access_token") or token_data.get("access_token")
+                if not new_access:
+                    logger.warning("TikTok: refresh response missing access_token")
+                    return token_data
                 new_refresh = new_tokens.get("refresh_token", refresh_token)
                 new_open_id = new_tokens.get("open_id") or token_data.get("open_id")
                 updated = {
@@ -467,6 +553,7 @@ async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = N
                             access_token=new_access,
                             refresh_token=new_refresh,
                             open_id=new_open_id,
+                            token_row_id=token_row_id,
                         )
                     except Exception as save_err:
                         logger.warning(f"TikTok: Failed to persist refreshed token: {save_err}")
@@ -480,7 +567,13 @@ async def _refresh_tiktok_token(token_data: dict, db_pool=None, user_id: str = N
 
 
 
-async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, user_id: str = None) -> dict:
+async def _refresh_meta_token(
+    token_data: dict,
+    platform: str,
+    db_pool=None,
+    user_id: str = None,
+    token_row_id: str | None = None,
+) -> dict:
     """Refresh a Meta (Instagram/Facebook) Page access token.
     
     Meta Page tokens obtained via /me/accounts are long-lived (~60 days).
@@ -554,6 +647,7 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                                     user_id=user_id,
                                     platform=platform,
                                     access_token=new_page_token,
+                                    token_row_id=token_row_id,
                                 )
                             except Exception as save_err:
                                 logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
@@ -631,6 +725,7 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
                         user_id=user_id,
                         platform=platform,
                         access_token=updated["access_token"],
+                        token_row_id=token_row_id,
                     )
                 except Exception as save_err:
                     logger.warning(f"{platform}: Failed to persist refreshed token: {save_err}")
@@ -642,24 +737,44 @@ async def _refresh_meta_token(token_data: dict, platform: str, db_pool=None, use
 
 
 
-def _instagram_media_id_to_shortcode(media_id: str) -> Optional[str]:
+def _tiktok_file_upload_chunk_plan(file_size: int) -> tuple[int, int]:
+    """Return (chunk_size, total_chunk_count) for TikTok FILE_UPLOAD init.
+
+    TikTok's Media Transfer Guide documents ``chunk_size = 10_000_000`` bytes with
+    ``total_chunk_count = video_size // chunk_size`` (integer floor). The first
+    ``total_chunk_count - 1`` PUT bodies are exactly ``chunk_size`` bytes; the
+    final body carries the remainder (may exceed ``chunk_size``, up to 128 MB).
+
+    Files above 64 MB must use multiple chunks; files below 5 MB use one chunk
+    equal to ``video_size`` (per TikTok).
     """
-    Convert an Instagram numeric media_id to its public shortcode.
-    Instagram shortcodes are base62 encoded from the lower 64 bits of
-    the media_id (specifically the portion after stripping the shard ID).
-    Used to construct valid instagram.com/reel/{shortcode}/ URLs.
-    """
-    ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    try:
-        n = int(media_id.split("_")[0])  # strip user_id suffix if present
-        # Instagram shortcode = base62 encoding of media_id
-        result = []
-        while n > 0:
-            result.append(ALPHABET[n % 62])
-            n //= 62
-        return "".join(reversed(result)) if result else None
-    except Exception:
-        return None
+    min_c = 5 * 1024 * 1024
+    max_single = 64 * 1024 * 1024
+    doc_chunk = 10 * 1024 * 1024  # same as TikTok's published FILE_UPLOAD example
+    max_last = 128 * 1024 * 1024
+    max_chunks = 1000
+
+    if file_size <= 0:
+        raise ValueError("TikTok upload: empty video file")
+    if file_size < min_c:
+        return file_size, 1
+    if file_size <= max_single:
+        return file_size, 1
+
+    c = doc_chunk
+    if file_size // c > max_chunks:
+        c = max(min_c, (file_size + max_chunks - 1) // max_chunks)
+        c = min(64 * 1024 * 1024, c)
+
+    n = file_size // c
+    last = file_size - (n - 1) * c
+
+    if n < 2 or n > max_chunks or last <= 0 or last > max_last or (n > 1 and last < min_c):
+        raise ValueError(
+            f"TikTok upload: invalid chunk geometry size={file_size} c={c} n={n} last={last}"
+        )
+
+    return c, n
 
 
 async def publish_to_tiktok(
@@ -684,50 +799,20 @@ async def publish_to_tiktok(
             error_message="No access token"
         )
 
-    title = _get_title(ctx)
-    caption = _build_platform_caption(ctx, "tiktok")
-    # TikTok uses title field (max 150 chars), caption goes in description
-    tiktok_title = (caption or title)[:150]
+    # TikTok Direct Post: `post_info.title` is the full caption (max 2200 UTF-16 runes).
+    tiktok_title = _tiktok_post_title(ctx)
 
     try:
         file_size = video_path.stat().st_size
 
-        # TikTok Content Posting API v2 chunk rules:
-        #   - Each chunk must be between 5 MB and 64 MB (inclusive)
-        #   - The LAST chunk may be smaller than chunk_size but must be ≥ 5 MB
-        #     UNLESS it is the only chunk (single-chunk upload for files ≤ 64 MB)
-        #   - TikTok validates: chunk_size * (total_chunk_count - 1) < video_size
-        #                                ≤ chunk_size * total_chunk_count
-        #
-        # ROOT CAUSE OF PREVIOUS FAILURE:
-        #   Using chunk_size=64 MB and computing total_chunk_count via ceiling
-        #   division sent chunk_size * total_chunk_count = 128 MB for an 88 MB
-        #   file.  TikTok sees the declared chunk_size doesn't divide evenly into
-        #   video_size and rejects with "total chunk count is invalid".
-        #
-        # FIX: Compute total_chunk_count first (targeting ~32 MB chunks, well
-        #   inside TikTok's 5-64 MB range), then derive chunk_size as
-        #   ceil(file_size / total_chunk_count).  This guarantees:
-        #     chunk_size * total_chunk_count ≥ file_size  (last chunk ≤ chunk_size)
-        #     chunk_size * (total_chunk_count-1) < file_size  (total_count not over-counted)
-        #   All chunks are ~30 MB — safely within both bounds on every file size.
+        # TikTok Media Transfer Guide: total_chunk_count = video_size // chunk_size
+        # (floor).  See _tiktok_file_upload_chunk_plan.
+        chunk_size, total_chunk_count = _tiktok_file_upload_chunk_plan(file_size)
 
-        _64MB  = 64 * 1024 * 1024
-        _5MB   = 5  * 1024 * 1024
-        TARGET = 32 * 1024 * 1024   # aim for ~32 MB chunks
-
-        if file_size <= _64MB:
-            # Single-chunk upload — simplest case, always accepted
-            chunk_size = file_size
-            total_chunk_count = 1
-        else:
-            # Compute how many chunks we need at ~32 MB each
-            total_chunk_count = math.ceil(file_size / TARGET)
-            # Derive chunk_size so it evenly covers the whole file.
-            # ceil division ensures chunk_size * total_chunk_count >= file_size.
-            chunk_size = math.ceil(file_size / total_chunk_count)
-            # Safety clamp — chunk_size must be in [5 MB, 64 MB]
-            chunk_size = max(_5MB, min(_64MB, chunk_size))
+        tiktok_privacy = resolve_privacy_level(
+            getattr(ctx, "privacy", None) or "public",
+            "tiktok",
+        )
 
         async with httpx.AsyncClient(timeout=120) as client:
             # Step 1: Initialize upload
@@ -740,10 +825,7 @@ async def publish_to_tiktok(
                 json={
                     "post_info": {
                         "title": tiktok_title,
-                        "privacy_level": resolve_privacy_level(
-                            getattr(ctx, "privacy", None) or "public",
-                            "tiktok",
-                        ),
+                        "privacy_level": tiktok_privacy,
                     },
                     "source_info": {
                         "source": "FILE_UPLOAD",
@@ -775,13 +857,18 @@ async def publish_to_tiktok(
                     error_message="No upload URL returned"
                 )
 
-            # Step 2: Upload video in chunks (or single chunk for small files)
-            # TikTok requires Content-Range: bytes {start}-{end}/{total} per chunk
+            # Step 2: Upload video — first (N-1) parts are exactly chunk_size bytes
+            # (TikTok); final part is the remainder (may be larger than chunk_size).
             with open(video_path, "rb") as f:
+                offset = 0
                 for chunk_index in range(total_chunk_count):
-                    chunk_start = chunk_index * chunk_size
-                    chunk_data = f.read(chunk_size)
+                    if chunk_index < total_chunk_count - 1:
+                        chunk_data = f.read(chunk_size)
+                    else:
+                        chunk_data = f.read()
+                    chunk_start = offset
                     chunk_end = chunk_start + len(chunk_data) - 1
+                    offset = chunk_end + 1
 
                     upload_resp = await client.put(
                         upload_url,
@@ -810,6 +897,10 @@ async def publish_to_tiktok(
                 success=True,
                 publish_id=publish_id,
                 verify_status="pending",
+                response_payload={
+                    "tiktok_privacy_level": tiktok_privacy,
+                    "upload_privacy": (getattr(ctx, "privacy", None) or "public"),
+                },
             )
 
     except Exception as e:
@@ -822,7 +913,12 @@ async def publish_to_tiktok(
         )
 
 
-async def _refresh_youtube_token(token_data: dict, db_pool=None, user_id: str = None) -> dict:
+async def _refresh_youtube_token(
+    token_data: dict,
+    db_pool=None,
+    user_id: str = None,
+    token_row_id: str | None = None,
+) -> dict:
     """Attempt to refresh a YouTube access token using the stored refresh_token.
     Returns updated token_data dict with new access_token, or original if refresh fails.
     Persists updated token to DB if db_pool and user_id are provided.
@@ -865,6 +961,7 @@ async def _refresh_youtube_token(token_data: dict, db_pool=None, user_id: str = 
                             user_id=user_id,
                             platform="youtube",
                             access_token=new_access,
+                            token_row_id=token_row_id,
                         )
                     except Exception as save_err:
                         logger.warning(f"YouTube: Failed to persist refreshed token: {save_err}")
@@ -1194,12 +1291,56 @@ async def publish_to_instagram(
                 )
 
             media_id = publish_resp.json().get("id")
-            # Build Instagram URL using shortcode (base62 of media_id)
-            # instagram.com/reel/{numeric_id} doesn't work — must use shortcode
-            ig_shortcode = _instagram_media_id_to_shortcode(str(media_id)) if media_id else None
-            platform_url = f"https://www.instagram.com/reel/{ig_shortcode}/" if ig_shortcode else None
+            platform_url: Optional[str] = None
+            last_http: Optional[int] = None
+            if media_id:
+                for _ig_attempt in range(2):
+                    try:
+                        perm_resp = await client.get(
+                            f"https://graph.facebook.com/{META_API_VERSION}/{media_id}",
+                            params={
+                                "access_token": access_token,
+                                "fields": "permalink,shortcode",
+                            },
+                        )
+                        last_http = perm_resp.status_code
+                        if perm_resp.status_code == 200:
+                            pj = perm_resp.json()
+                            platform_url = (pj.get("permalink") or "").strip() or None
+                            sc = (pj.get("shortcode") or "").strip()
+                            if not platform_url and sc:
+                                platform_url = f"https://www.instagram.com/reel/{sc}/"
+                            if platform_url:
+                                break
+                    except Exception as _e:
+                        logger.warning(f"Instagram: permalink fetch for {media_id}: {_e}")
+                    if _ig_attempt == 0:
+                        await asyncio.sleep(1.5)
+                if not platform_url:
+                    logger.warning(
+                        "Instagram: no permalink after publish (media_id=%s last_http=%s)",
+                        media_id,
+                        last_http,
+                    )
 
-            logger.info(f"Instagram publish accepted: media_id={media_id}")
+            # First-comment hashtags: reel caption stays prose-only; tag block posted as /comments.
+            if media_id and _instagram_first_comment_mode(ctx):
+                tag_block = _get_hashtags(ctx, "instagram").strip()
+                cap_only = (_get_caption(ctx) or "").strip()
+                if tag_block and cap_only:
+                    await asyncio.sleep(1.0)
+                    ok_c, err_c = await _instagram_post_hashtag_first_comment(
+                        client, str(media_id), access_token, tag_block
+                    )
+                    if ok_c:
+                        logger.info("Instagram: posted hashtag block as first comment on media_id=%s", media_id)
+                    else:
+                        logger.warning(
+                            "Instagram: first-comment hashtags failed (media still live): %s",
+                            err_c,
+                        )
+
+            logger.info(f"Instagram publish accepted: media_id={media_id} url={platform_url}")
             return PlatformResult(
                 platform="instagram",
                 success=True,
@@ -1318,7 +1459,25 @@ async def publish_to_facebook(
                 )
 
             video_id = resp.json().get("id")
-            platform_url = f"https://www.facebook.com/video/{video_id}" if video_id else None
+            platform_url: Optional[str] = None
+            if video_id:
+                try:
+                    perm_resp = await client.get(
+                        f"https://graph.facebook.com/{META_API_VERSION}/{video_id}",
+                        params={
+                            "access_token": access_token,
+                            "fields": "permalink_url",
+                        },
+                    )
+                    if perm_resp.status_code == 200:
+                        platform_url = (perm_resp.json().get("permalink_url") or "").strip() or None
+                except Exception as _e:
+                    logger.warning(f"Facebook: could not fetch permalink_url for {video_id}: {_e}")
+                if not platform_url:
+                    if str(video_id).isdigit() and str(page_id).isdigit():
+                        platform_url = f"https://www.facebook.com/{page_id}/videos/{video_id}"
+                    else:
+                        platform_url = f"https://www.facebook.com/watch/?v={video_id}"
             logger.info(f"Facebook publish accepted: video_id={video_id}, url={platform_url}")
             # Push thumbnail to Facebook (non-fatal)
             thumb_path = _get_platform_thumbnail_path(ctx, "facebook")

@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Terms of Service - UploadM8</title>
@@ -39,7 +41,7 @@
         .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
         .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
         @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
-        .sidebar-toc { position: sticky; top: 80px; }
+        .sidebar-toc { position: sticky; top: 5.5rem; z-index: 1; }
         .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
         .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
         .toc-list { list-style: none; }
@@ -83,6 +85,12 @@
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: var(--bg-secondary); }
         ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+        @media (max-width: 480px) {
+            .hero { padding: 2.5rem 1.25rem 2rem; }
+            .hero h1 { font-size: 2rem; }
+            .nav { padding: 0.75rem 1rem; }
+            .content-wrapper { padding: 2rem 1.25rem 3rem; }
+        }
     </style>
 </head>
 <body>
@@ -90,7 +98,7 @@
 <nav class="nav">
     <div class="nav-container">
         <a href="index.html" class="nav-logo">
-            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            <img src="images/logo.svg" alt="UploadM8" style="height:32px;width:auto;">
             UploadM8
         </a>
         <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
@@ -103,7 +111,7 @@
         <h1>UploadM8 Terms of Service</h1>
         <div class="hero-meta">
             <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
-            <span><i class="fas fa-clock"></i> Last Updated: February 2026</span>
+            <span><i class="fas fa-clock"></i> Last updated: April 2026</span>
             <span><i class="fas fa-map-marker-alt"></i> Governing Law: Missouri, USA</span>
         </div>
     </div>
@@ -142,7 +150,7 @@
             <div class="section-header"><div class="section-num">2</div><h2>Eligibility & Account Registration</h2></div>
             <div class="prose">
                 <p>You must be at least 13 years of age to use UploadM8. Users between 13 and 17 must have verifiable parental or guardian consent. You represent that all information you provide during registration is accurate and complete.</p>
-                <p>You are responsible for maintaining the confidentiality of your account credentials. You must notify us immediately at <a href="/cdn-cgi/l/email-protection#ddb8bcafb19da8adb1b2bcb9b0e5f3beb2b0"><span class="__cf_email__" data-cfemail="177276657b5762677b7876737a2f3974787a">[email&#160;protected]</span></a> if you suspect unauthorized access to your account. We are not liable for losses arising from unauthorized use of your credentials.</p>
+                <p>You are responsible for maintaining the confidentiality of your account credentials. You must notify us immediately at <a href="mailto:security@uploadm8.com">security@uploadm8.com</a> if you suspect unauthorized access to your account. We are not liable for losses arising from unauthorized use of your credentials.</p>
                 <p>One person or legal entity may not maintain more than one free account. Multiple paid accounts are permitted. Account sharing or reselling access is prohibited.</p>
             </div>
         </div>
@@ -178,7 +186,7 @@
                 </thead>
                 <tbody>
                     <tr><td>Free</td><td>$0/month</td><td>Limited uploads, watermark required</td></tr>
-                    <tr><td>Launch</td><td>Monthly / Annual</td><td>Expanded uploads, no watermark</td></tr>
+                    <tr><td>Creator Lite</td><td>Monthly / Annual</td><td>Expanded uploads, no watermark, audio transcription</td></tr>
                     <tr><td>Creator Pro</td><td>Monthly / Annual</td><td>Full AI features, priority queue</td></tr>
                     <tr><td>Studio</td><td>Monthly / Annual</td><td>Multiple accounts, advanced analytics</td></tr>
                     <tr><td>Agency</td><td>Monthly / Annual</td><td>Client management, white-label options</td></tr>
@@ -188,8 +196,16 @@
             <div class="prose">
                 <h3>Billing Terms</h3>
                 <p>Subscriptions are billed in advance on a monthly or annual basis via Stripe. All prices are in USD. You authorize us to charge your payment method on the recurring billing date. Failed payments result in a grace period before service suspension.</p>
-                <h3>AIC Tokens</h3>
-                <p>AI Content (AIC) tokens are consumed when using AI-powered features (captions, titles, thumbnails). Tokens are non-refundable and non-transferable. Unused tokens do not roll over between billing periods unless your plan specifies otherwise. Additional token packs may be purchased at current pricing.</p>
+                <h3>AIC Tokens &amp; Upload credits (PUT)</h3>
+                <p><strong>AI Content (AIC)</strong> tokens are consumed when using AI-powered features in the upload pipeline (captions, titles, thumbnail briefs, vision stages, and similar). <strong>Upload / processing credits (PUT)</strong> meter general processing capacity. Some tools (for example <a href="thumbnail-studio.html">Thumbnail Studio</a> and Pikzels-backed routes) debit PUT and/or AIC per our pricing tables when you run them. Tokens and credits are non-refundable and non-transferable unless required by law. Unused balances may not roll over between billing periods unless your plan explicitly says otherwise. Top-up packs may be purchased at current pricing.</p>
+                <h3>AI Processing — pipeline &amp; third parties</h3>
+                <p>When AI features are enabled, your video may be processed by stages including:</p>
+                <ul>
+                    <li><strong>Frame extraction &amp; language/vision models:</strong> keyframes and prompts are sent to OpenAI (e.g. GPT-4o or GPT-4o-mini, configurable) to generate captions, titles, and hashtags. This step typically consumes AIC tokens.</li>
+                    <li><strong>Audio transcription (Whisper):</strong> if your video contains a speech/audio stream, a temporary audio extract is sent to OpenAI Whisper. This step is billed at the infrastructure level and does <em>not</em> consume AIC tokens. You may disable related options in <strong>Settings → Preferences</strong> (speech-to-text / audio context).</li>
+                    <li><strong>Optional vendors:</strong> depending on your plan and our deployment configuration, stages may also call Google Cloud (Vision / Video Intelligence), Twelve Labs, ACRCloud, Replicate, fal.ai, remove.bg, or <strong>Pikzels</strong> for thumbnails and analysis. Those subprocessors process data under their own terms — see <a href="subprocessors.html">Subprocessors</a>.</li>
+                </ul>
+                <p>We do not use your content to train UploadM8-owned models. Third-party retention and training rules are governed by each vendor’s terms; see <a href="subprocessors.html">Subprocessors</a> and our <a href="privacy.html">Privacy Policy</a>.</p>
                 <h3>Price Changes</h3>
                 <p>We will provide 30 days written notice before implementing price changes for existing subscriptions. Annual plan pricing is locked for the subscription year.</p>
             </div>
@@ -198,7 +214,7 @@
         <div class="section-block" id="content-ownership">
             <div class="section-header"><div class="section-num">5</div><h2>Content Ownership & License</h2></div>
             <div class="prose">
-                <p>You retain full ownership of all content you upload to UploadM8. By using the Service, you grant us a limited, non-exclusive, royalty-free license to host, store, process, transcode, and distribute your content solely for the purpose of delivering the Service to you.</p>
+                <p>You retain full ownership of all content you upload to UploadM8. By using the Service, you grant us a limited, non-exclusive, royalty-free license to host, store, process, transcode, extract audio from, and distribute your content solely for the purpose of delivering the Service to you. This includes temporary extraction of audio streams for AI-powered transcription (see Section 4 — AI Processing).</p>
                 <p>This license is revoked upon account deletion and file purge (within 30 days per our retention policy). We do not claim any ownership interest in your content and will not use your content for advertising, training AI models, or any purpose beyond service delivery without your explicit consent.</p>
                 <p>You represent and warrant that you own or have all necessary rights, licenses, and permissions to upload, publish, and authorize us to distribute your content on the connected platforms.</p>
             </div>
@@ -229,7 +245,7 @@
         <div class="section-block" id="service-availability">
             <div class="section-header"><div class="section-num">7</div><h2>Service Availability & Disclaimers</h2></div>
             <div class="prose">
-                <p>We strive for maximum uptime but do not guarantee uninterrupted service availability. Planned maintenance will be communicated in advance. Unplanned outages will be addressed as quickly as possible.</p>
+                <p>We strive for maximum uptime but do not guarantee uninterrupted service availability. Planned maintenance will be communicated in advance when practicable (email, in-app messaging, and/or our <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a> community). <strong>We do not operate a separate public status page today;</strong> for widespread incidents we post to those channels and our <a href="blog.html">Blog</a> when we have confirmed information. For account-specific errors, use the <a href="queue.html">Queue</a> and job detail screens, then <a href="support.html">Support</a>.</p>
                 <p>UploadM8 depends on third-party platform APIs (TikTok, YouTube, Instagram, Facebook). We are not responsible for failures, rate limits, policy changes, or API outages that affect publishing. We will endeavor to notify you of known platform issues.</p>
                 <p><strong>THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE" WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.</strong></p>
             </div>
@@ -267,7 +283,7 @@
             <div class="section-header"><div class="section-num">11</div><h2>Dispute Resolution & Arbitration</h2></div>
             <div class="prose">
                 <h3>Informal Resolution</h3>
-                <p>Before initiating formal proceedings, you agree to attempt to resolve any dispute informally by contacting us at <a href="/cdn-cgi/l/email-protection#325e5755535e7247425e5d53565f0a1c515d5f"><span class="__cf_email__" data-cfemail="18747d7f7974586d687477797c7520367b7775">[email&#160;protected]</span></a>. We will work in good faith to resolve the matter within 30 days.</p>
+                <p>Before initiating formal proceedings, you agree to attempt to resolve any dispute informally by contacting us at <a href="mailto:legal@uploadm8.com">legal@uploadm8.com</a>. We will work in good faith to resolve the matter within 30 days.</p>
                 <h3>Binding Arbitration</h3>
                 <p>Any dispute not resolved informally shall be settled by binding arbitration administered under the American Arbitration Association (AAA) Commercial Arbitration Rules. Arbitration shall take place in Jackson County, Missouri.</p>
                 <h3>Class Action Waiver</h3>
@@ -287,8 +303,8 @@
         <div class="section-block" id="contact">
             <div class="section-header"><div class="section-num">13</div><h2>Contact</h2></div>
             <div class="prose">
-                <p><strong>Legal Inquiries:</strong> <a href="/cdn-cgi/l/email-protection#9ef2fbf9fff2deebeef2f1fffaf3a6b0fdf1f3"><span class="__cf_email__" data-cfemail="177b7270767b5762677b7876737a2f3974787a">[email&#160;protected]</span></a><br>
-                <strong>General Support:</strong> <a href="/cdn-cgi/l/email-protection#bfdadecdd3ffcacfd3d0dedbd28791dcd0d2"><span class="__cf_email__" data-cfemail="cfaaaebda38fbabfa3a0aeaba2f7e1aca0a2">[email&#160;protected]</span></a><br>
+                <p><strong>Legal Inquiries:</strong> <a href="mailto:legal@uploadm8.com">legal@uploadm8.com</a><br>
+                <strong>General Support:</strong> <a href="mailto:support@uploadm8.com">support@uploadm8.com</a><br>
                 <strong>Address:</strong> UploadM8, Kansas City, Missouri, USA</p>
             </div>
         </div>
@@ -321,6 +337,8 @@
     <div class="footer-inner">
         <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
         <div class="footer-links">
+            <a href="how-it-works.html">How it works</a>
+            <a href="contact.html">Contact</a>
             <a href="privacy.html">Privacy</a>
             <a href="terms.html" class="active">Terms</a>
             <a href="security.html">Security</a>
@@ -328,9 +346,29 @@
             <a href="subprocessors.html">Subprocessors</a>
             <a href="refunds.html">Refunds</a>
             <a href="dmca.html">DMCA</a>
+            <a href="contact.html">Contact</a>
             <a href="support.html">Support</a>
+            <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
         </div>
     </div>
 </footer>
 
-<script data-cfasync=
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script>
+    const sections = document.querySelectorAll('.section-block[id]');
+    const tocLinks = document.querySelectorAll('.toc-list a');
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                tocLinks.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+            }
+        });
+    }, { rootMargin: '-20% 0% -60% 0%' });
+    sections.forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

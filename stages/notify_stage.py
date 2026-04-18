@@ -11,14 +11,17 @@ Notifications:
 
 import os
 import json
+import re
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import httpx
 
-from .context import JobContext
-from .errors import StageError, SkipStage
+from core.helpers import sanitize_hashtag_body
+
+from .context import JobContext, PlatformResult
 from . import db as db_stage
+from .publish_stage import resolve_privacy_level
 
 logger = logging.getLogger("uploadm8-worker")
 
@@ -34,6 +37,172 @@ MAILGUN_DOMAIN = os.environ.get("MAILGUN_DOMAIN", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
 
+_PLATFORM_LABELS = {
+    "tiktok": "TikTok",
+    "youtube": "YouTube",
+    "instagram": "Instagram",
+    "facebook": "Facebook",
+}
+
+
+def _platform_label(slug: str) -> str:
+    k = (slug or "").lower()
+    return _PLATFORM_LABELS.get(k, (slug or "Platform").title())
+
+
+def _flatten_hashtag_raw(raw: Any) -> List[str]:
+    """Turn stored hashtag payloads (list, JSON string, junk strings) into token strings without '#'."""
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        candidates: List[Any] = list(raw)
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return []
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    candidates = parsed
+                else:
+                    candidates = [s]
+            except json.JSONDecodeError:
+                candidates = [s]
+        else:
+            candidates = [s]
+    else:
+        candidates = [raw]
+
+    out: List[str] = []
+    for item in candidates:
+        piece = str(item).strip()
+        if not piece:
+            continue
+        # Pull word-like tokens from messy strings (e.g. #"[\"tester\" #"qwe"]")
+        for m in re.finditer(r"#?([A-Za-z0-9_]{2,50})", piece):
+            body = sanitize_hashtag_body(m.group(1))
+            if body:
+                out.append(body)
+    # De-dupe preserving order
+    seen: set = set()
+    uniq: List[str] = []
+    for b in out:
+        if b.lower() in seen:
+            continue
+        seen.add(b.lower())
+        uniq.append(b)
+    return uniq
+
+
+def _hashtags_for_discord_line(tokens: List[str]) -> str:
+    return " ".join(f"#{t}" for t in tokens if t)
+
+
+def _build_hashtags_by_platform_block(ctx: JobContext) -> str:
+    """Effective caption hashtags per target platform (matches publish merge order)."""
+    plat_sources = [r.platform for r in (ctx.platform_results or []) if r.success]
+    if not plat_sources:
+        plat_sources = list(ctx.platforms or [])
+    seen: set = set()
+    lines: List[str] = []
+    for pl in plat_sources:
+        key = (pl or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        tags = ctx.get_effective_hashtags(key)
+        if not tags:
+            continue
+        line = f"**{_platform_label(key)}:** {' '.join(tags)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _build_m8_ai_hashtags_block(ctx: JobContext) -> str:
+    """Per-platform AI hashtag variants from M8 (when they differ from a single global list)."""
+    m8 = getattr(ctx, "m8_platform_hashtags", None) or {}
+    if not isinstance(m8, dict) or not m8:
+        return ""
+    lines: List[str] = []
+    for pl in sorted(m8.keys()):
+        raw = m8.get(pl) or []
+        if not isinstance(raw, list) or not raw:
+            continue
+        flat = _flatten_hashtag_raw(raw)
+        if not flat:
+            continue
+        lines.append(f"**{_platform_label(str(pl))}:** {_hashtags_for_discord_line(flat)}")
+    return "\n".join(lines)
+
+
+def _canonical_privacy(ctx: JobContext) -> str:
+    p = (getattr(ctx, "privacy", None) or "public").strip().lower()
+    if p not in ("public", "unlisted", "private"):
+        return "public"
+    return p
+
+
+def _tiktok_status_lines(ctx: JobContext, result: PlatformResult) -> List[str]:
+    lines: List[str] = []
+    payload = result.response_payload or {}
+    level = payload.get("tiktok_privacy_level") or resolve_privacy_level(_canonical_privacy(ctx), "tiktok")
+    canon = (payload.get("upload_privacy") or _canonical_privacy(ctx) or "public").strip().lower()
+
+    if not result.platform_url and not result.platform_video_id:
+        lines.append(
+            "TikTok is still processing this upload. If it is not on your profile yet, open the TikTok app and check **Inbox** or **Drafts**."
+        )
+
+    if level == "SELF_ONLY":
+        if canon == "unlisted":
+            lines.append(
+                "You chose **unlisted** — TikTok received **Only you**. It may appear in **Drafts** or **Inbox** until you post publicly from the app; links may not work for others until then."
+            )
+        else:
+            lines.append(
+                "Posted as **Only you** on TikTok — check **Drafts** or **Inbox** if it is not on your profile yet. A share link may not work for others until you publish publicly."
+            )
+    elif level == "MUTUAL_FOLLOW_FRIENDS":
+        lines.append(
+            "Posted with **friends / mutual followers** visibility on TikTok — links may not work for everyone."
+        )
+    elif canon in ("unlisted", "private") and level == "PUBLIC_TO_EVERYONE":
+        lines.append(
+            f"Upload privacy was **{canon}** — confirm visibility in the TikTok app if the link behaves unexpectedly."
+        )
+    return lines
+
+
+def _normalize_post_url(result: PlatformResult) -> Optional[str]:
+    u = (result.platform_url or "").strip()
+    if u.startswith("http"):
+        plat = (result.platform or "").lower()
+        if plat == "facebook" and "facebook.com/video/" in u and "/watch/" not in u:
+            vid = getattr(result, "platform_video_id", None)
+            if vid:
+                return f"https://www.facebook.com/watch/?v={vid}"
+        return u
+    return None
+
+
+def _fallback_post_url(result: PlatformResult) -> Optional[str]:
+    vid = getattr(result, "platform_video_id", None)
+    if not vid:
+        return None
+    plat = (result.platform or "").lower()
+    if plat == "tiktok":
+        handle = getattr(result, "account_username", None) or ""
+        h = str(handle).strip().lstrip("@")
+        if h:
+            return f"https://www.tiktok.com/@{h}/video/{vid}"
+        return f"https://www.tiktok.com/video/{vid}"
+    if plat == "youtube":
+        return f"https://www.youtube.com/shorts/{vid}"
+    if plat == "facebook":
+        return f"https://www.facebook.com/watch/?v={vid}"
+    return None
+
 
 async def run_notify_stage(ctx: JobContext) -> JobContext:
     """
@@ -45,9 +214,13 @@ async def run_notify_stage(ctx: JobContext) -> JobContext:
     """
     ctx.mark_stage("notify")
     
-    # Get user's Discord webhook
-    user_webhook = (ctx.user_settings or {}).get("discord_webhook")
-    
+    # Prefer snake_case; settings JSON may only have discordWebhook while user_settings
+    # row still exposes discord_webhook=NULL as a present key.
+    us = ctx.user_settings or {}
+    user_webhook = us.get("discord_webhook") or us.get("discordWebhook")
+    if isinstance(user_webhook, str):
+        user_webhook = user_webhook.strip() or None
+
     if user_webhook:
         await send_user_upload_notification(user_webhook, ctx)
     
@@ -90,19 +263,15 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
             or getattr(ctx, "caption", None)
             or ""
         )
-        raw_tags = (
-            getattr(ctx, "ai_hashtags", None)
-            or getattr(ctx, "hashtags", None)
-            or []
-        )
-        # Guard: never iterate a bare string character-by-character
-        if isinstance(raw_tags, str):
-            raw_tags = [raw_tags] if raw_tags.strip() else []
-        hashtag_str = " ".join(
-            (str(t) if str(t).startswith("#") else f"#{t}")
-            for t in raw_tags
-            if str(t).strip()
-        )
+        raw_tags = getattr(ctx, "ai_hashtags", None)
+        if raw_tags is None:
+            raw_tags = getattr(ctx, "hashtags", None) or []
+        flat_ai = _flatten_hashtag_raw(raw_tags)
+        hashtag_str = _hashtags_for_discord_line(flat_ai)
+
+        by_plat = _build_hashtags_by_platform_block(ctx)
+        if not by_plat and hashtag_str:
+            by_plat = ""
 
         # ── Build fields ─────────────────────────────────────────────────────
         fields: List[dict] = [
@@ -117,10 +286,24 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
                 "inline": False,
             })
 
-        if hashtag_str:
+        if by_plat:
+            fields.append({
+                "name": "🏷️ Hashtags (by platform)",
+                "value": by_plat[:1020],
+                "inline": False,
+            })
+        elif hashtag_str:
             fields.append({
                 "name": "🏷️ Hashtags",
-                "value": hashtag_str[:500],
+                "value": hashtag_str[:1020],
+                "inline": False,
+            })
+
+        m8_block = _build_m8_ai_hashtags_block(ctx)
+        if m8_block:
+            fields.append({
+                "name": "🧠 AI hashtag variants (M8)",
+                "value": m8_block[:1020],
                 "inline": False,
             })
 
@@ -144,24 +327,27 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext):
                 field_name = f"{icon} {plat_name}"
 
             if result.success:
-                url = result.platform_url
-                if not url and getattr(result, "platform_video_id", None):
-                    plat = (result.platform or "").lower()
-                    vid = result.platform_video_id
-                    if plat == "tiktok":
-                        handle = getattr(result, "account_username", None) or "_"
-                        url = f"https://www.tiktok.com/@{handle}/video/{vid}"
-                    elif plat == "youtube":
-                        url = f"https://www.youtube.com/shorts/{vid}"
-                    elif plat == "facebook":
-                        url = f"https://www.facebook.com/watch/?v={vid}"
-                    # Instagram needs shortcode (from platform_url); media_id alone won't work
-                if url and str(url).startswith("http"):
-                    value = f"[View Post]({url})"
+                url = _normalize_post_url(result) or _fallback_post_url(result)
+                chunks: List[str] = []
+                if url:
+                    chunks.append(f"[View post]({url})")
                 elif result.publish_id:
-                    value = f"Accepted — publish_id: `{result.publish_id}`"
+                    chunks.append(f"Accepted — publish_id: `{result.publish_id}`")
                 else:
-                    value = "Published ✓"
+                    chunks.append("Published ✓")
+
+                plat_lc = (result.platform or "").lower()
+                if plat_lc == "tiktok":
+                    for line in _tiktok_status_lines(ctx, result):
+                        if line:
+                            chunks.append(line)
+
+                if plat_lc == "instagram" and not url:
+                    chunks.append(
+                        "Instagram link not available yet — open Instagram or wait for queue sync to refresh the permalink."
+                    )
+
+                value = "\n".join(chunks)[:1020]
             else:
                 raw_err = result.error_message or result.error_code or "Unknown error"
                 value = str(raw_err)[:256]
@@ -261,18 +447,36 @@ async def notify_admin_mrr_collected(amount: float, customer_email: str, plan: s
 
 
 async def notify_admin_error(error_type: str, details: dict, db_pool=None):
-    """Notify admin of system error."""
+    """Notify admin of system error — DB incident row + email, then Discord embed."""
+    if db_pool:
+        try:
+            from services.ops_incidents import record_operational_incident
+
+            await record_operational_incident(
+                db_pool,
+                source="worker",
+                incident_type=str(error_type)[:120],
+                subject=f"Worker: {error_type}",
+                body=str(details.get("error") or details.get("message") or "")[:8000],
+                details=dict(details) if isinstance(details, dict) else {"raw": str(details)},
+                user_id=details.get("user_id"),
+                upload_id=details.get("upload_id"),
+                alert_discord=False,
+            )
+        except Exception as ex:
+            logger.warning("notify_admin_error incident log failed: %s", ex)
+
     webhook = ERROR_DISCORD_WEBHOOK_URL or (await _get_admin_webhook(db_pool))
     if not webhook:
         return
-    
+
     embed = {
         "title": f"🚨 Error: {error_type}",
-        "color": 0xef4444,
+        "color": 0xEF4444,
         "description": f"```json\n{json.dumps(details, indent=2, default=str)[:1500]}\n```",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    
+
     await _send_discord_webhook(webhook, embeds=[embed])
 
 

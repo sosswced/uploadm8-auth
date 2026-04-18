@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Subprocessors - UploadM8</title>
@@ -23,7 +25,6 @@
         .nav { position: sticky; top: 0; z-index: 100; padding: 1rem 2rem; background: rgba(10,10,15,0.97); backdrop-filter: blur(20px); border-bottom: 1px solid var(--border-color); }
         .nav-container { max-width: 1280px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; }
         .nav-logo { display: flex; align-items: center; gap: 0.75rem; font-size: 1.25rem; font-weight: 700; color: white; text-decoration: none; }
-        .nav-logo-icon { width: 32px; height: 32px; background: linear-gradient(135deg, var(--accent-orange), var(--accent-purple)); border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center; font-size: 1rem; }
         .back-btn { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); text-decoration: none; font-size: 0.9rem; font-weight: 500; padding: 0.5rem 1rem; border: 1px solid var(--border-color); border-radius: var(--radius-md); transition: all 0.2s; }
         .back-btn:hover { color: var(--text-primary); border-color: var(--border-hover); background: var(--bg-hover); }
         .hero { padding: 4rem 2rem 3rem; background: linear-gradient(180deg, rgba(139,92,246,0.06) 0%, transparent 100%); border-bottom: 1px solid var(--border-color); }
@@ -37,8 +38,18 @@
         .legal-nav a { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--text-secondary); font-size: 0.85rem; font-weight: 500; text-decoration: none; border-bottom: 2px solid transparent; white-space: nowrap; transition: all 0.2s; }
         .legal-nav a:hover { color: var(--text-primary); }
         .legal-nav a.active { color: var(--accent-orange); border-bottom-color: var(--accent-orange); }
-        .content-wrapper { max-width: 1100px; margin: 0 auto; padding: 3rem 2rem; }
+        .content-wrapper { max-width: 1280px; margin: 0 auto; padding: 3rem 2rem; display: grid; grid-template-columns: 1fr 260px; gap: 3rem; align-items: start; }
+        @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
+        .article { min-width: 0; }
+        .sidebar-toc { position: sticky; top: 5.5rem; z-index: 1; }
+        .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
+        .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
+        .toc-list { list-style: none; }
+        .toc-list li { margin-bottom: 0.125rem; }
+        .toc-list a { display: block; padding: 0.4rem 0.75rem; color: var(--text-secondary); font-size: 0.85rem; border-radius: var(--radius-sm); border-left: 2px solid transparent; transition: all 0.2s; text-decoration: none; }
+        .toc-list a:hover, .toc-list a.active { color: var(--accent-orange); border-left-color: var(--accent-orange); background: rgba(249,115,22,0.07); }
         .section-block { margin-bottom: 3rem; }
+        .section-block:last-child { margin-bottom: 0; }
         .section-header-plain { margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border-color); }
         .section-header-plain h2 { font-size: 1.35rem; font-weight: 700; display: flex; align-items: center; gap: 0.75rem; }
         .section-header-plain h2 i { color: var(--accent-orange); font-size: 1rem; }
@@ -68,6 +79,7 @@
         .footer-links a { color: var(--text-muted); font-size: 0.85rem; text-decoration: none; transition: color 0.2s; }
         .footer-links a:hover, .footer-links a.active { color: var(--accent-orange); }
         ::-webkit-scrollbar { width: 6px; height: 6px; } ::-webkit-scrollbar-track { background: var(--bg-secondary); } ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
+        @media (max-width: 480px) { .hero { padding: 2.5rem 1.25rem 2rem; } .hero h1 { font-size: 2rem; } .nav { padding: 0.75rem 1rem; } .content-wrapper { padding: 2rem 1.25rem 3rem; } }
     </style>
 </head>
 <body>
@@ -75,7 +87,7 @@
 <nav class="nav">
     <div class="nav-container">
         <a href="index.html" class="nav-logo">
-            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            <img src="images/logo.svg" alt="UploadM8" style="height:32px;width:auto;">
             UploadM8
         </a>
         <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
@@ -87,8 +99,9 @@
         <div class="hero-badge"><i class="fas fa-server"></i> Legal</div>
         <h1>Subprocessors</h1>
         <div class="hero-meta">
-            <span><i class="fas fa-calendar"></i> Last Updated: February 2026</span>
-            <span><i class="fas fa-bell"></i> Notify: privacy@uploadm8.com for updates</span>
+            <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
+            <span><i class="fas fa-clock"></i> Last updated: April 2026</span>
+            <span><i class="fas fa-bell"></i> Questions: <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a></span>
         </div>
     </div>
 </div>
@@ -108,147 +121,397 @@
 
 <div class="content-wrapper">
 
-    <div class="callout callout-blue">
-        <i class="fas fa-info-circle"></i>
-        <div>UploadM8 uses a select set of third-party service providers ("subprocessors") to operate our platform. All subprocessors are bound by data processing agreements that require them to maintain appropriate data protection standards. We notify users of material subprocessor changes with 30 days advance notice.</div>
+<article class="article">
+
+    <div class="section-block" id="overview">
+        <div class="callout callout-blue">
+            <i class="fas fa-info-circle"></i>
+            <div>Third-party <strong>subprocessors</strong> help us run UploadM8. Core stack: API and worker on <strong>Render</strong>, <strong>PostgreSQL</strong>, <strong>Redis</strong>, <strong>Cloudflare R2</strong>, email <strong>Mailgun</strong>, payments <strong>Stripe</strong>, and AI/analysis via <strong>OpenAI</strong>. Depending on feature flags and keys, we may also call <strong>Google Cloud</strong> (Vision, Video Intelligence), <strong>Twelve Labs</strong>, <strong>ACRCloud</strong>, <strong>Replicate</strong>, <strong>fal.ai</strong>, <strong>remove.bg</strong>, <strong>Pikzels</strong> (<code>api.pikzels.com</code>), <strong>SerpAPI</strong> / <strong>YouTube Data API</strong> (trend intel), and <strong>Sentry</strong> (errors/tracing when configured). Public API host: <strong>auth.uploadm8.com</strong>; web app: <strong>app.uploadm8.com</strong> (see deployment <code style="background:rgba(255,255,255,.08);padding:2px 6px;border-radius:4px;">BASE_URL</code> / <code style="background:rgba(255,255,255,.08);padding:2px 6px;border-radius:4px;">FRONTEND_URL</code>). We give at least <strong>30 days</strong> notice of material subprocessor changes where required.</div>
+        </div>
     </div>
 
-    <div class="section-block">
+    <div class="section-block" id="core-infrastructure">
         <div class="section-header-plain">
-            <h2><i class="fas fa-cloud"></i> Core Infrastructure</h2>
+            <h2><i class="fas fa-cloud"></i> Core infrastructure</h2>
         </div>
         <table class="data-table">
             <thead>
-                <tr><th>Provider</th><th>Service</th><th>Data Processed</th><th>Location</th><th>Privacy Policy</th></tr>
+                <tr><th>Provider</th><th>Role</th><th>Data processed</th><th>Notes</th><th>Privacy</th></tr>
             </thead>
             <tbody>
                 <tr>
                     <td>Render</td>
-                    <td>Application Hosting & PostgreSQL</td>
-                    <td>All application data, database storage</td>
-                    <td>USA (Oregon)</td>
+                    <td>Web services &amp; worker containers</td>
+                    <td>Application runtime, request/response handling, background jobs</td>
+                    <td>API <code>uvicorn</code>; worker runs FFmpeg, Playwright, ML stages</td>
+                    <td><a href="https://render.com/privacy" target="_blank" rel="noopener">render.com/privacy</a></td>
+                </tr>
+                <tr>
+                    <td>PostgreSQL</td>
+                    <td>Primary database</td>
+                    <td>Accounts, jobs, encrypted OAuth tokens, billing references, logs metadata</td>
+                    <td>Hosted with Render (or equivalent managed Postgres)</td>
+                    <td><a href="https://render.com/privacy" target="_blank" rel="noopener">render.com/privacy</a></td>
+                </tr>
+                <tr>
+                    <td>Redis</td>
+                    <td>Queues &amp; cache</td>
+                    <td>Job queue payloads, cache keys, ephemeral coordination</td>
+                    <td><code>REDIS_URL</code> — not used for long-term PII storage</td>
                     <td><a href="https://render.com/privacy" target="_blank" rel="noopener">render.com/privacy</a></td>
                 </tr>
                 <tr>
                     <td>Cloudflare R2</td>
-                    <td>Video & Asset Storage</td>
-                    <td>Uploaded videos, thumbnails, transcoded files</td>
-                    <td>USA (multi-region)</td>
-                    <td><a href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noopener">cloudflare.com/privacypolicy</a></td>
-                </tr>
-                <tr>
-                    <td>Redis (Render)</td>
-                    <td>Job Queue</td>
-                    <td>Job metadata, queue state, temporary data</td>
-                    <td>USA (Oregon)</td>
-                    <td><a href="https://render.com/privacy" target="_blank" rel="noopener">render.com/privacy</a></td>
+                    <td>Object storage (S3-compatible)</td>
+                    <td>Uploaded videos, thumbnails, transcoded assets</td>
+                    <td>Server-side encryption; signed access patterns</td>
+                    <td><a href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noopener">cloudflare.com/privacy</a></td>
                 </tr>
             </tbody>
         </table>
     </div>
 
-    <div class="section-block">
+    <div class="section-block" id="communications">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-envelope"></i> Email</h2>
+        </div>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Role</th><th>Data processed</th><th>Privacy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Mailgun</td>
+                    <td>Transactional email (HTTP API)</td>
+                    <td>Recipient address, subject, HTML/text body for auth, billing, and system messages</td>
+                    <td><a href="https://www.mailgun.com/privacy-policy/" target="_blank" rel="noopener">mailgun.com/privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="payments">
         <div class="section-header-plain">
             <h2><i class="fas fa-credit-card"></i> Payments</h2>
         </div>
         <table class="data-table">
             <thead>
-                <tr><th>Provider</th><th>Service</th><th>Data Processed</th><th>Location</th><th>Privacy Policy</th></tr>
+                <tr><th>Provider</th><th>Role</th><th>Data processed</th><th>Privacy</th></tr>
             </thead>
             <tbody>
                 <tr>
                     <td>Stripe</td>
-                    <td>Payment Processing & Billing</td>
-                    <td>Payment method tokens, billing history, subscription data. UploadM8 never stores raw card numbers.</td>
-                    <td>USA / Global</td>
+                    <td>Payments &amp; Customer Portal</td>
+                    <td>Payment method tokens, subscription state, invoices. UploadM8 never stores raw card numbers.</td>
                     <td><a href="https://stripe.com/privacy" target="_blank" rel="noopener">stripe.com/privacy</a></td>
                 </tr>
             </tbody>
         </table>
     </div>
 
-    <div class="section-block">
+    <div class="section-block" id="platform-apis">
         <div class="section-header-plain">
-            <h2><i class="fas fa-share-alt"></i> Platform Integrations</h2>
+            <h2><i class="fas fa-share-alt"></i> Social platform APIs</h2>
         </div>
         <div class="callout callout-orange">
             <i class="fas fa-exclamation-triangle"></i>
-            <div>Platform integrations only receive data you explicitly authorize via OAuth and only for the purpose of publishing your content. UploadM8 does not control these platforms' privacy practices for content after it is published.</div>
+            <div>You authorize each connection via OAuth. We only use data needed to publish and show status in your dashboard. Content on those platforms is governed by each platform’s policies.</div>
         </div>
         <table class="data-table">
             <thead>
-                <tr><th>Platform</th><th>API Used</th><th>Data Shared</th><th>Location</th><th>Privacy Policy</th></tr>
+                <tr><th>Platform</th><th>API</th><th>Data shared</th><th>Privacy</th></tr>
             </thead>
             <tbody>
                 <tr>
                     <td><i class="fab fa-tiktok"></i> TikTok</td>
-                    <td>Content Posting API v2</td>
-                    <td>Video files, titles, captions, hashtags, cover image, OAuth tokens</td>
-                    <td>Global</td>
-                    <td><a href="https://www.tiktok.com/legal/page/us/privacy-policy/en" target="_blank" rel="noopener">tiktok.com privacy</a></td>
+                    <td>Content Posting API</td>
+                    <td>Video, metadata, OAuth tokens</td>
+                    <td><a href="https://www.tiktok.com/legal/page/us/privacy-policy/en" target="_blank" rel="noopener">TikTok privacy</a></td>
                 </tr>
                 <tr>
                     <td><i class="fab fa-youtube" style="color:#FF0000"></i> YouTube</td>
                     <td>YouTube Data API v3</td>
-                    <td>Video files, title, description, tags, thumbnail, OAuth tokens</td>
-                    <td>USA / Global</td>
-                    <td><a href="https://policies.google.com/privacy" target="_blank" rel="noopener">policies.google.com/privacy</a></td>
+                    <td>Video, metadata, OAuth tokens</td>
+                    <td><a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google privacy</a></td>
                 </tr>
                 <tr>
                     <td><i class="fab fa-instagram" style="color:#E1306C"></i> Instagram</td>
-                    <td>Meta Graph API v21.0</td>
-                    <td>Video files, caption, cover image, OAuth tokens</td>
-                    <td>USA / Global</td>
-                    <td><a href="https://www.facebook.com/privacy/policy/" target="_blank" rel="noopener">facebook.com/privacy/policy</a></td>
+                    <td>Meta Graph API</td>
+                    <td>Video, metadata, OAuth tokens</td>
+                    <td><a href="https://www.facebook.com/privacy/policy/" target="_blank" rel="noopener">Meta privacy</a></td>
                 </tr>
                 <tr>
                     <td><i class="fab fa-facebook" style="color:#1877F2"></i> Facebook</td>
-                    <td>Meta Graph API v21.0</td>
-                    <td>Video files, title, description, cover image, OAuth tokens</td>
-                    <td>USA / Global</td>
-                    <td><a href="https://www.facebook.com/privacy/policy/" target="_blank" rel="noopener">facebook.com/privacy/policy</a></td>
+                    <td>Meta Graph API</td>
+                    <td>Video, metadata, OAuth tokens</td>
+                    <td><a href="https://www.facebook.com/privacy/policy/" target="_blank" rel="noopener">Meta privacy</a></td>
                 </tr>
             </tbody>
         </table>
     </div>
 
-    <div class="section-block">
+    <div class="section-block" id="openai-ai">
         <div class="section-header-plain">
-            <h2><i class="fas fa-robot"></i> AI & Optional Services</h2>
+            <h2><i class="fas fa-robot"></i> OpenAI (captions, vision, Whisper)</h2>
         </div>
+        <p class="prose" style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:1rem;">Default caption model is configurable (e.g. <strong>GPT-4o-mini</strong>); vision and text completions use the OpenAI API. <strong>Whisper</strong> transcribes audio clips extracted in the worker. API endpoint: <code style="background:rgba(255,255,255,.07);padding:2px 6px;border-radius:4px;">api.openai.com</code>.</p>
         <table class="data-table">
             <thead>
-                <tr><th>Provider</th><th>Service</th><th>Data Processed</th><th>Retention</th><th>Privacy Policy</th></tr>
+                <tr><th>API</th><th>Purpose</th><th>Data sent</th><th>Retention</th><th>Privacy</th></tr>
             </thead>
             <tbody>
                 <tr>
-                    <td>Anthropic</td>
-                    <td>Claude API (AIC Token AI Features)</td>
-                    <td>Video frames, transcripts, metadata for generating captions, titles, and thumbnails. Only processed when you use AIC token features.</td>
-                    <td>Not retained by Anthropic beyond request</td>
-                    <td><a href="https://www.anthropic.com/privacy" target="_blank" rel="noopener">anthropic.com/privacy</a></td>
+                    <td>Chat Completions / vision</td>
+                    <td>Titles, captions, hashtags, thumbnail briefs</td>
+                    <td>Keyframes and/or text prompts; consumes AIC tokens where applicable</td>
+                    <td>Not retained for model training (API terms)</td>
+                    <td><a href="https://openai.com/policies/privacy-policy" target="_blank" rel="noopener">openai.com/privacy</a></td>
                 </tr>
                 <tr>
+                    <td>Audio transcriptions (Whisper)</td>
+                    <td>Speech-to-text for better captions</td>
+                    <td>Temporary audio extract (e.g. WAV) from your video</td>
+                    <td>Deleted after request; does not use AIC balance</td>
+                    <td><a href="https://openai.com/policies/privacy-policy" target="_blank" rel="noopener">openai.com/privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="google-cloud">
+        <div class="section-header-plain">
+            <h2><i class="fab fa-google"></i> Google Cloud (Vision &amp; Video Intelligence)</h2>
+        </div>
+        <p class="prose" style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:1rem;">When <code style="background:rgba(255,255,255,.07);padding:2px 6px;border-radius:4px;">VISION_STAGE_ENABLED</code> / Video Intelligence flags and a service account are configured, still frames or full clips may be sent to Google APIs for labels, OCR, face detection, or shot analysis.</p>
+        <table class="data-table">
+            <thead>
+                <tr><th>API</th><th>Purpose</th><th>Data</th><th>Privacy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Cloud Vision</td>
+                    <td>Frame understanding (labels, text, faces)</td>
+                    <td>JPEG/PNG frames from your video</td>
+                    <td><a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google privacy</a></td>
+                </tr>
+                <tr>
+                    <td>Video Intelligence</td>
+                    <td>Full-clip labels / shots (optional stage)</td>
+                    <td>Video bytes via GCP API</td>
+                    <td><a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="thumbnail-vendors">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-paint-brush"></i> Thumbnail &amp; image generation (optional)</h2>
+        </div>
+        <p class="prose" style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:1rem;">Worker thumbnail stages may call these when tokens/keys and flags are set (<code style="background:rgba(255,255,255,.07);padding:2px 6px;border-radius:4px;">REPLICATE_API_TOKEN</code>, <code style="background:rgba(255,255,255,.07);padding:2px 6px;border-radius:4px;">FAL_KEY</code>, <code style="background:rgba(255,255,255,.07);padding:2px 6px;border-radius:4px;">REMOVE_BG_API_KEY</code>, etc.).</p>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Role</th><th>Data</th><th>Privacy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Replicate</td>
+                    <td>Hosted image models (e.g. FLUX)</td>
+                    <td>Prompts, reference images, masks as required by the model</td>
+                    <td><a href="https://replicate.com/privacy" target="_blank" rel="noopener">replicate.com/privacy</a></td>
+                </tr>
+                <tr>
+                    <td>fal.ai</td>
+                    <td>Fast image inference</td>
+                    <td>Same class as above when routed to fal</td>
+                    <td><a href="https://fal.ai/privacy" target="_blank" rel="noopener">fal.ai/privacy</a></td>
+                </tr>
+                <tr>
+                    <td>remove.bg</td>
+                    <td>Background removal</td>
+                    <td>Thumbnail or subject image</td>
+                    <td><a href="https://www.remove.bg/privacy" target="_blank" rel="noopener">remove.bg/privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="pikzels">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-wand-magic-sparkles"></i> Pikzels (Thumbnail Studio)</h2>
+        </div>
+        <p class="prose" style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:1rem;">When a Pikzels API key is configured on our servers, Thumbnail Studio sends your prompts and images to Pikzels (<strong>https://api.pikzels.com</strong>) for generation, edits, scoring, titles, and persona or style helpers. Your browser stays on UploadM8; we forward the request so your key is not exposed client-side.</p>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Role</th><th>Data</th><th>Privacy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Pikzels</td>
+                    <td>Thumbnail Studio proxy (API v2)</td>
+                    <td>Images, prompts, and parameters you submit in the Studio UI or API</td>
+                    <td><a href="https://pikzels.com/" target="_blank" rel="noopener">pikzels.com</a> · <a href="https://docs.pikzels.com/llms.txt" target="_blank" rel="noopener">docs</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="sentry">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-bug"></i> Sentry (optional observability)</h2>
+        </div>
+        <p class="prose" style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:1rem;">When <code style="background:rgba(255,255,255,.07);padding:2px 6px;border-radius:4px;">SENTRY_DSN</code> is set on the API or worker, error reports and performance spans may be sent to <strong>Sentry</strong>. Events can include stack traces, request metadata, and sampled traces — not your full video files.</p>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Role</th><th>Data</th><th>Privacy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Sentry</td>
+                    <td>Error tracking &amp; tracing</td>
+                    <td>Exceptions, breadcrumbs, performance spans (configurable sampling)</td>
+                    <td><a href="https://sentry.io/privacy/" target="_blank" rel="noopener">sentry.io/privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="trend-intel">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-magnifying-glass-chart"></i> Trend &amp; search APIs (optional)</h2>
+        </div>
+        <p class="prose" style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:1rem;">When trend-intel or related flags are enabled, the worker may query <strong>SerpAPI</strong> and/or the <strong>YouTube Data API</strong> for research-style signals. These are optional and not required for core upload/publish.</p>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Role</th><th>Data</th><th>Privacy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>SerpAPI</td>
+                    <td>Search results / trend-style queries</td>
+                    <td>Query strings you or the feature supply</td>
+                    <td><a href="https://serpapi.com/privacy" target="_blank" rel="noopener">serpapi.com/privacy</a></td>
+                </tr>
+                <tr>
+                    <td>Google / YouTube Data API</td>
+                    <td>YouTube metadata or thumbnails (when enabled)</td>
+                    <td>API queries (e.g. video IDs, search terms)</td>
+                    <td><a href="https://policies.google.com/privacy" target="_blank" rel="noopener">Google privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="optional-ai">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-flask"></i> Optional AI services</h2>
+        </div>
+        <p class="prose" style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:1rem;">These run <strong>only when you turn them on</strong> in account upload settings and the worker has the matching API keys (e.g. Twelve Labs, Google Video Intelligence). Optional music fingerprinting uses ACRCloud keys when configured.</p>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Role</th><th>Data</th><th>Privacy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Twelve Labs</td>
+                    <td>Optional deep video understanding (Pegasus)</td>
+                    <td>Video uploaded to Twelve Labs indexing when enabled</td>
+                    <td><a href="https://twelvelabs.io/privacy" target="_blank" rel="noopener">twelvelabs.io/privacy</a></td>
+                </tr>
+                <tr>
+                    <td>ACRCloud</td>
+                    <td>Optional music / content recognition</td>
+                    <td>Audio fingerprinting when keys configured</td>
+                    <td><a href="https://www.acrcloud.com/privacy-policy/" target="_blank" rel="noopener">acrcloud.com/privacy</a></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="worker-local">
+        <div class="section-header-plain">
+            <h2><i class="fas fa-microchip"></i> Worker: local ML &amp; browser automation</h2>
+        </div>
+        <table class="data-table">
+            <thead>
+                <tr><th>Component</th><th>Role</th><th>Data</th><th>Notes</th></tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>YAMNet (TensorFlow Hub)</td>
+                    <td>Local audio event labels</td>
+                    <td>Audio processed on worker only</td>
+                    <td>Model loaded from Google TensorFlow Hub; no account upload of labels to Google</td>
+                </tr>
+                <tr>
+                    <td>OpenStreetMap Nominatim (telemetry)</td>
+                    <td>Reverse geocoding for Trill / map telemetry</td>
+                    <td>Coordinates derived from your .map / telemetry file</td>
+                    <td>Public geocoding API — see <a href="https://operations.osmfoundation.org/policies/nominatim/" target="_blank" rel="noopener">Nominatim usage policy</a></td>
+                </tr>
+                <tr>
+                    <td>Playwright / Chromium</td>
+                    <td>Browser-based publishing where required</td>
+                    <td>Session automation for supported flows</td>
+                    <td>Runs inside our worker container</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="section-block" id="discord-webhooks">
+        <div class="section-header-plain">
+            <h2><i class="fab fa-discord"></i> Discord (your webhooks)</h2>
+        </div>
+        <p class="prose" style="color:var(--text-secondary);font-size:0.95rem;margin-bottom:1rem;">If you configure a Discord webhook URL in the product, we <strong>POST</strong> job status / notification payloads to <strong>your</strong> Discord endpoint. Content may include titles, status, and error summaries relevant to the job.</p>
+        <table class="data-table">
+            <thead>
+                <tr><th>Provider</th><th>Role</th><th>Data</th><th>Privacy</th></tr>
+            </thead>
+            <tbody>
+                <tr>
                     <td>Discord</td>
-                    <td>Internal Webhook Notifications</td>
-                    <td>Operational alerts (job status, error notifications). Internal admin use only. No user PII transmitted.</td>
-                    <td>Standard Discord retention</td>
+                    <td>User-supplied incoming webhooks</td>
+                    <td>Payloads you opt into</td>
                     <td><a href="https://discord.com/privacy" target="_blank" rel="noopener">discord.com/privacy</a></td>
                 </tr>
             </tbody>
         </table>
     </div>
 
-    <div class="section-block">
+    <div class="section-block" id="transfers">
         <div class="section-header-plain">
-            <h2><i class="fas fa-globe"></i> International Data Transfers</h2>
+            <h2><i class="fas fa-globe"></i> International transfers</h2>
         </div>
         <div class="prose">
-            <p>Some of our subprocessors are located outside your country. When processing personal data from the European Economic Area, UK, or Switzerland, we rely on appropriate legal transfer mechanisms including Standard Contractual Clauses (SCCs) and adequacy decisions where applicable.</p>
-            <p>All subprocessors contractually commit to maintaining data protection standards equivalent to those we apply to data processed within the US.</p>
-            <p>To request our Data Processing Agreements (DPAs) with any subprocessor, contact <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a>.</p>
+            <p>Some providers process data in the United States or globally. For EEA/UK/CH data, we rely on appropriate safeguards (e.g. SCCs) where required. For DPA requests: <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a>.</p>
         </div>
     </div>
+
+</article>
+
+<aside class="sidebar-toc" aria-label="On this page">
+    <div class="toc-card">
+        <div class="toc-title">On This Page</div>
+        <ul class="toc-list">
+            <li><a href="#overview">Overview</a></li>
+            <li><a href="#core-infrastructure">Core infrastructure</a></li>
+            <li><a href="#communications">Email (Mailgun)</a></li>
+            <li><a href="#payments">Payments (Stripe)</a></li>
+            <li><a href="#platform-apis">Social platform APIs</a></li>
+            <li><a href="#openai-ai">OpenAI</a></li>
+            <li><a href="#google-cloud">Google Cloud</a></li>
+            <li><a href="#thumbnail-vendors">Thumbnail vendors</a></li>
+            <li><a href="#pikzels">Pikzels</a></li>
+            <li><a href="#sentry">Sentry</a></li>
+            <li><a href="#trend-intel">Trend APIs</a></li>
+            <li><a href="#optional-ai">Optional AI</a></li>
+            <li><a href="#worker-local">Worker &amp; automation</a></li>
+            <li><a href="#discord-webhooks">Discord webhooks</a></li>
+            <li><a href="#transfers">International transfers</a></li>
+        </ul>
+    </div>
+</aside>
 
 </div>
 
@@ -256,6 +519,8 @@
     <div class="footer-inner">
         <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
         <div class="footer-links">
+            <a href="how-it-works.html">How it works</a>
+            <a href="contact.html">Contact</a>
             <a href="privacy.html">Privacy</a>
             <a href="terms.html">Terms</a>
             <a href="security.html">Security</a>
@@ -264,9 +529,27 @@
             <a href="refunds.html">Refunds</a>
             <a href="dmca.html">DMCA</a>
             <a href="support.html">Support</a>
+            <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
         </div>
     </div>
 </footer>
 
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script>
+    const sections = document.querySelectorAll('.section-block[id]');
+    const tocLinks = document.querySelectorAll('.toc-list a');
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                tocLinks.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+            }
+        });
+    }, { rootMargin: '-20% 0% -60% 0%' });
+    sections.forEach(s => observer.observe(s));
+</script>
 </body>
 </html>

@@ -14,6 +14,15 @@ from typing import Optional, Dict, Any, List
 
 import asyncpg
 
+from core.helpers import _safe_col, merge_platform_hashtag_overlay
+from core.sql_allowlist import (
+    OAUTH_TOKEN_STORAGE_TABLES,
+    OAUTH_TOKEN_STORAGE_TABLES_ORDERED,
+    UPLOADS_AI_GENERATED_METADATA_COLUMNS,
+    assert_relation_name,
+    assert_set_fragments_columns,
+)
+
 from .context import JobContext
 
 logger = logging.getLogger("uploadm8-worker")
@@ -75,12 +84,14 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                 if not result:
                     result = prefs_d
                 else:
-                    # Merge preference columns so POST /api/settings/preferences is respected
-                    for k in ("styled_thumbnails", "auto_thumbnails", "auto_captions", "thumbnail_interval",
-                              "default_privacy", "ai_hashtags_enabled", "ai_hashtag_count", "always_hashtags",
-                              "blocked_hashtags", "platform_hashtags", "email_notifications", "discord_webhook"):
-                        if k in prefs_d and prefs_d[k] is not None:
-                            result[k] = prefs_d[k]
+                    # Merge all preference columns from user_preferences (authoritative for upload prefs).
+                    _skip_prefs_merge = frozenset(
+                        {"user_id", "created_at", "updated_at", "id"}
+                    )
+                    for k, v in prefs_d.items():
+                        if k in _skip_prefs_merge or v is None:
+                            continue
+                        result[k] = v
                     result.setdefault("styled_thumbnails", True)
                     result.setdefault("styledThumbnails", result.get("styled_thumbnails", True))
         except asyncpg.exceptions.UndefinedTableError:
@@ -114,21 +125,57 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "autoCaptions":     "auto_captions",
                         "autoThumbnails":   "auto_thumbnails",
                         "styledThumbnails": "styled_thumbnails",
+                        "thumbnailInterval": "thumbnail_interval",
                         "captionStyle":     "caption_style",
                         "captionTone":      "caption_tone",
                         "captionVoice":     "caption_voice",
                         "captionFrameCount":"caption_frame_count",
                         "maxHashtags":      "max_hashtags",
+                        "hashtagPosition":  "hashtag_position",
                         "trillOpenaiModel": "openai_model",
+                        "useAudioContext":  "use_audio_context",
+                        "audioTranscription": "audio_transcription",
+                        "thumbnailStudioEnabled": "thumbnail_studio_enabled",
+                        "thumbnailStudioEngineEnabled": "thumbnail_studio_engine_enabled",
+                        "thumbnailPersonaEnabled": "thumbnail_persona_enabled",
+                        "thumbnailDefaultPersonaId": "thumbnail_default_persona_id",
+                        "thumbnailPersonaStrength": "thumbnail_persona_strength",
+                        "thumbnailSelectionMode": "thumbnail_selection_mode",
+                        "thumbnailRenderPipeline": "thumbnail_render_pipeline",
+                        "aiServiceTelemetry": "ai_service_telemetry",
+                        "aiServiceAudioSignals": "ai_service_audio_signals",
+                        "aiServiceMusicDetection": "ai_service_music_detection",
+                        "aiServiceAudioSummary": "ai_service_audio_summary",
+                        "aiServiceEmotionSignals": "ai_service_emotion_signals",
+                        "aiServiceCaptionWriter": "ai_service_caption_writer",
+                        "aiServiceThumbnailDesigner": "ai_service_thumbnail_designer",
+                        "aiServiceFrameInspector": "ai_service_frame_inspector",
+                        "aiServiceSpeechToText": "ai_service_speech_to_text",
+                        "aiServiceVideoAnalyzer": "ai_service_video_analyzer",
+                        "aiServiceSceneUnderstanding": "ai_service_scene_understanding",
+                        # Settings UI saves webhook under discordWebhook in users.preferences;
+                        # user_settings row may still carry discord_webhook=NULL, which would
+                        # block the generic "if k not in result" merge from copying camelCase.
+                        "discordWebhook": "discord_webhook",
                     }
                     for camel, snake in FIELD_MAP.items():
                         val = prefs.get(camel)
                         if val is None:
                             val = prefs.get(snake)
-                        if val is not None:
-                            # Frontend values override worker-side settings rows
-                            result[camel] = val
-                            result[snake] = val
+                        if val is None:
+                            continue
+                        # platformHashtags: merge, never replace a rich row with bare {}.
+                        if camel == "platformHashtags":
+                            base_ph = result.get("platformHashtags") or result.get(
+                                "platform_hashtags"
+                            )
+                            merged_ph = merge_platform_hashtag_overlay(base_ph, val)
+                            result["platformHashtags"] = merged_ph
+                            result["platform_hashtags"] = merged_ph
+                            continue
+                        # Frontend values override worker-side settings rows
+                        result[camel] = val
+                        result[snake] = val
 
                     # Merge any remaining keys that weren't in our map
                     for k, v in prefs.items():
@@ -139,6 +186,60 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
             logger.debug(f"Could not read users.preferences for {user_id} (non-fatal): {e}")
 
     return result
+
+
+async def merge_pikzels_thumbnail_persona_id(
+    pool: asyncpg.Pool, user_id: str, settings: Dict[str, Any]
+) -> None:
+    """
+    Inject ``thumbnail_pikzels_persona_id`` / ``thumbnailPikzelsPersonaId`` from
+    ``creator_personas.profile_json`` when the user picked a default persona UUID.
+    Pikzels /v2/thumbnail/* expects the **Pikzonality** id, not our internal persona row id.
+    """
+    pid = settings.get("thumbnail_default_persona_id") or settings.get("thumbnailDefaultPersonaId")
+    if not pid or not str(pid).strip():
+        settings.pop("thumbnail_pikzels_persona_id", None)
+        settings.pop("thumbnailPikzelsPersonaId", None)
+        return
+    uid = str(user_id).strip()
+    if not uid:
+        return
+    try:
+        persona_uuid = uuid.UUID(str(pid).strip())
+    except (ValueError, TypeError, AttributeError):
+        return
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT profile_json FROM creator_personas
+                WHERE id = $1::uuid AND user_id = $2::uuid
+                """,
+                persona_uuid,
+                uid,
+            )
+    except asyncpg.exceptions.UndefinedTableError:
+        return
+    except Exception as e:
+        logger.debug("merge_pikzels_thumbnail_persona_id: %s", e)
+        return
+    if not row:
+        return
+    prof = row.get("profile_json")
+    if isinstance(prof, str):
+        try:
+            prof = json.loads(prof)
+        except Exception:
+            prof = {}
+    if not isinstance(prof, dict):
+        return
+    pkz = str(prof.get("pikzels_pikzonality_id") or "").strip()
+    if pkz:
+        settings["thumbnail_pikzels_persona_id"] = pkz
+        settings["thumbnailPikzelsPersonaId"] = pkz
+    else:
+        settings.pop("thumbnail_pikzels_persona_id", None)
+        settings.pop("thumbnailPikzelsPersonaId", None)
 
 
 async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
@@ -334,23 +435,26 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
     params = [ctx.upload_id]
     idx = 1
 
+    _ai_cols = UPLOADS_AI_GENERATED_METADATA_COLUMNS
     if ctx.ai_title:
         idx += 1
-        updates.append(f"ai_generated_title = ${idx}")
+        updates.append(f"{_safe_col('ai_generated_title', _ai_cols)} = ${idx}")
         params.append(ctx.ai_title)
 
     if ctx.ai_caption:
         idx += 1
-        updates.append(f"ai_generated_caption = ${idx}")
+        updates.append(f"{_safe_col('ai_generated_caption', _ai_cols)} = ${idx}")
         params.append(ctx.ai_caption)
 
     if ctx.ai_hashtags:
         idx += 1
-        updates.append(f"ai_generated_hashtags = ${idx}")
+        updates.append(f"{_safe_col('ai_generated_hashtags', _ai_cols)} = ${idx}")
         params.append(ctx.ai_hashtags)
 
     if not updates:
         return
+
+    assert_set_fragments_columns(updates, UPLOADS_AI_GENERATED_METADATA_COLUMNS)
 
     async with pool.acquire() as conn:
         try:
@@ -446,6 +550,129 @@ async def insert_caption_memory(
         pass
     except Exception as e:
         logger.debug(f"insert_caption_memory: {e}")
+
+
+async def merge_job_output_artifacts_strings(pool: asyncpg.Pool, upload_id: str, artifacts: Dict[str, str]) -> None:
+    """Merge string-keyed worker artifacts into uploads.output_artifacts (jsonb)."""
+    if not artifacts:
+        return
+    try:
+        from stages import pipeline_checkpoint as _pchk
+
+        await _pchk.merge_output_artifacts_patch(pool, upload_id, dict(artifacts))
+    except Exception as e:
+        logger.debug(f"merge_job_output_artifacts_strings: {e}")
+
+
+async def fetch_m8_historical_signals(
+    pool: asyncpg.Pool,
+    user_id: str,
+    category: str,
+    platforms: List[str],
+) -> Dict[str, Any]:
+    """
+    Pattern snippets (caption memory) + engagement priors (upload_quality_scores_daily)
+    for M8 prompt conditioning.
+    """
+    pattern_corpus: List[Dict[str, Any]] = []
+    pri_top: List[Dict[str, Any]] = []
+    plats = [str(p).strip().lower() for p in (platforms or []) if str(p).strip()]
+    if not plats:
+        plats = ["tiktok"]
+    lookback_days = 120
+
+    try:
+        async with pool.acquire() as conn:
+            try:
+                mem_rows = await conn.fetch(
+                    """
+                    SELECT platforms, ai_caption, caption_style, caption_tone, caption_voice
+                      FROM upload_caption_memory
+                     WHERE user_id = $1::uuid AND category = $2
+                     ORDER BY created_at DESC
+                     LIMIT 8
+                    """,
+                    user_id,
+                    (category or "general").lower(),
+                )
+                for r in mem_rows or []:
+                    plat = ""
+                    rawp = r["platforms"]
+                    if isinstance(rawp, str):
+                        try:
+                            rawp = json.loads(rawp)
+                        except Exception:
+                            rawp = []
+                    if isinstance(rawp, list) and rawp:
+                        plat = str(rawp[0]).lower().strip()
+                    snip = (r["ai_caption"] or "").strip().replace("\n", " ")
+                    if len(snip) < 12:
+                        continue
+                    pattern_corpus.append(
+                        {
+                            "platform": plat or "unknown",
+                            "snippet": snip[:400],
+                            "caption_style": (r["caption_style"] or "") or "",
+                            "caption_tone": (r["caption_tone"] or "") or "",
+                            "caption_voice": (r["caption_voice"] or "") or "",
+                        }
+                    )
+            except asyncpg.exceptions.UndefinedTableError:
+                pass
+            except Exception as e:
+                logger.debug(f"fetch_m8_historical_signals memory: {e}")
+
+            try:
+                pri_rows = await conn.fetch(
+                    """
+                    WITH agg AS (
+                        SELECT strategy_key,
+                               SUM(samples)::bigint AS samples,
+                               CASE WHEN SUM(samples) > 0 THEN
+                                 SUM(mean_engagement * samples::double precision) / SUM(samples::double precision)
+                               ELSE 0.0 END AS weighted_mean_engagement,
+                               MAX(ci95_high)::double precision AS max_ci95_high
+                          FROM upload_quality_scores_daily
+                         WHERE user_id = $1::uuid
+                           AND day >= (CURRENT_DATE - $3::int)
+                           AND (platform = 'all' OR platform = ANY($2::text[]))
+                         GROUP BY strategy_key
+                        HAVING SUM(samples) >= 2
+                    )
+                    SELECT * FROM agg
+                    ORDER BY weighted_mean_engagement DESC NULLS LAST
+                    LIMIT 8
+                    """,
+                    user_id,
+                    plats,
+                    lookback_days,
+                )
+                for r in pri_rows or []:
+                    pri_top.append(
+                        {
+                            "strategy_key": str(r["strategy_key"] or ""),
+                            "samples": int(r["samples"] or 0),
+                            "weighted_mean_engagement": float(r["weighted_mean_engagement"] or 0.0),
+                            "max_ci95_high": float(r["max_ci95_high"] or 0.0),
+                        }
+                    )
+            except asyncpg.exceptions.UndefinedTableError:
+                pass
+            except Exception as e:
+                logger.debug(f"fetch_m8_historical_signals priors: {e}")
+
+    except Exception as e:
+        logger.debug(f"fetch_m8_historical_signals: {e}")
+
+    return {
+        "__pattern_corpus__": pattern_corpus,
+        "__strategy_priors__": {"top": pri_top, "lookback_days": lookback_days},
+        "__meta__": {
+            "ok": True,
+            "pattern_n": len(pattern_corpus),
+            "prior_n": len(pri_top),
+        },
+    }
 
 
 async def increment_upload_count(pool: asyncpg.Pool, user_id: str):
@@ -971,6 +1198,7 @@ async def save_refreshed_token(
     access_token: str,
     refresh_token: Optional[str] = None,
     open_id: Optional[str] = None,
+    token_row_id: Optional[str] = None,
 ) -> None:
     """
     Persist a refreshed platform OAuth token back to the database.
@@ -993,57 +1221,32 @@ async def save_refreshed_token(
         return
 
     try:
-        # Import encrypt/decrypt from publish_stage (same module that reads tokens)
-        # We do a lazy import to avoid circular dependency
-        from .publish_stage import decrypt_token_blob, init_enc_keys
+        # Same encryption contract as the API: require TOKEN_ENC_KEYS; never persist plaintext.
+        from core.auth import decrypt_blob, encrypt_blob, init_enc_keys
 
-        # Also need encrypt_blob — import from app context via env-based reimplementation
-        import os, base64, secrets as _secrets
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
-
-        TOKEN_ENC_KEYS_RAW = os.environ.get("TOKEN_ENC_KEYS", "")
-        _enc_keys: Dict[str, bytes] = {}
-        _current_kid = "v1"
-
-        if TOKEN_ENC_KEYS_RAW:
-            clean = TOKEN_ENC_KEYS_RAW.strip().strip('"').replace("\n", "")
-            for part in [p.strip() for p in clean.split(",") if p.strip()]:
-                if ":" not in part:
-                    continue
-                kid, b64key = part.split(":", 1)
-                try:
-                    raw = base64.b64decode(b64key.strip())
-                    if len(raw) == 32:
-                        _enc_keys[kid.strip()] = raw
-                        _current_kid = kid.strip()
-                except Exception:
-                    pass
-
-        def _encrypt(data: dict) -> str:
-            """Re-encrypt a token dict and return json.dumps of the encrypted blob."""
-            if not _enc_keys:
-                return json.dumps(data)  # no keys — store plaintext (dev mode)
-            key = _enc_keys[_current_kid]
-            aesgcm = _AESGCM(key)
-            nonce = _secrets.token_bytes(12)
-            ct = aesgcm.encrypt(nonce, json.dumps(data).encode(), None)
-            blob = {
-                "kid": _current_kid,
-                "nonce": base64.b64encode(nonce).decode(),
-                "ciphertext": base64.b64encode(ct).decode(),
-            }
-            return json.dumps(blob)
+        init_enc_keys()
 
         async with pool.acquire() as conn:
             # ── Try platform_tokens ───────────────────────────────────────
-            for table in ("platform_tokens", "connected_accounts"):
+            for raw_table in OAUTH_TOKEN_STORAGE_TABLES_ORDERED:
+                table = assert_relation_name(raw_table, OAUTH_TOKEN_STORAGE_TABLES)
                 try:
-                    row = await conn.fetchrow(
-                        f"SELECT id, token_blob FROM {table} "
-                        f"WHERE user_id = $1 AND platform = $2 "
-                        f"ORDER BY updated_at DESC LIMIT 1",
-                        user_id, platform,
-                    )
+                    if token_row_id:
+                        row = await conn.fetchrow(
+                            f"SELECT id, token_blob FROM {table} "
+                            f"WHERE id = $1::uuid AND user_id = $2::uuid AND platform = $3",
+                            token_row_id,
+                            user_id,
+                            platform,
+                        )
+                    else:
+                        row = await conn.fetchrow(
+                            f"SELECT id, token_blob FROM {table} "
+                            f"WHERE user_id = $1 AND platform = $2 "
+                            f"ORDER BY updated_at DESC LIMIT 1",
+                            user_id,
+                            platform,
+                        )
                 except asyncpg.exceptions.UndefinedTableError:
                     continue
                 except Exception:
@@ -1074,8 +1277,7 @@ async def save_refreshed_token(
                 current_plain: dict = {}
                 if current_encrypted:
                     try:
-                        init_enc_keys()
-                        current_plain = decrypt_token_blob(current_encrypted) or {}
+                        current_plain = decrypt_blob(current_encrypted) or {}
                     except Exception:
                         # If decrypt fails, start fresh with just the new token
                         current_plain = {}
@@ -1088,7 +1290,7 @@ async def save_refreshed_token(
                     current_plain["open_id"] = open_id
 
                 # Re-encrypt and write back as clean TEXT
-                new_blob_str = _encrypt(current_plain)
+                new_blob_str = json.dumps(encrypt_blob(current_plain))
 
                 try:
                     await conn.execute(
@@ -1103,7 +1305,12 @@ async def save_refreshed_token(
                     logger.warning(f"save_refreshed_token: write failed on {table}: {write_err}")
                     continue
 
-            logger.warning(f"save_refreshed_token: no row found for {platform} user={user_id}")
+            if token_row_id:
+                logger.warning(
+                    f"save_refreshed_token: no row id={token_row_id} for {platform} user={user_id}"
+                )
+            else:
+                logger.warning(f"save_refreshed_token: no row found for {platform} user={user_id}")
 
     except Exception as e:
         logger.warning(f"save_refreshed_token failed (non-fatal) for {platform} user={user_id}: {e}")

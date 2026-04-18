@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+    <script src="js/html-safe.js"></script>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 http://127.0.0.1:8001 http://localhost:8001 http://127.0.0.1:8002 http://localhost:8002;">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Thumbnail Studio - UploadM8</title>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link href="styles.css" rel="stylesheet" />
+  <style>
+    .studio-grid { display:grid; gap:1rem; grid-template-columns: 1fr; }
+    .studio-card { background: var(--bg-card); border:1px solid var(--border-color); border-radius: var(--radius-lg); padding:1rem; }
+    .studio-step { font-size:0.82rem; color:var(--text-secondary); margin-bottom:0.45rem; text-transform:uppercase; letter-spacing:.05em; }
+    .studio-row { display:grid; gap:.75rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .format-chip { border:1px solid var(--border-color); border-radius: 999px; padding:.45rem .75rem; cursor:pointer; display:inline-flex; align-items:center; gap:.45rem; margin:.2rem; }
+    .format-chip.active { border-color: var(--accent-orange); background: rgba(249, 115, 22, 0.1); }
+    .variant-grid { display:grid; gap:.75rem; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    .variant-card { border:1px solid var(--border-color); border-radius: var(--radius-md); padding:.85rem; background: var(--bg-input); }
+    .score-pill { padding:.2rem .45rem; border-radius: 999px; font-size:.72rem; border:1px solid var(--border-color); }
+    .muted { color: var(--text-secondary); font-size:.88rem; }
+    .thumb-studio-admin-strip { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center; margin-top: 0.85rem; padding: 0.65rem 0.85rem; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius-md); font-size: 0.82rem; }
+    .thumb-studio-admin-strip .strip-label { color: var(--text-muted); margin-right: 0.35rem; font-weight: 600; }
+
+    /* ── Mobile overrides ── */
+    @media (max-width: 640px) {
+        .studio-row { grid-template-columns: 1fr; }
+        .variant-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-layout">
+    <aside class="sidebar" id="sidebar"></aside>
+    <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+
+    <header class="top-bar">
+      <button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button>
+      <div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8" /><span>UploadM8</span></div>
+      <div class="top-bar-actions">
+        <div data-wt-pills></div>
+        <button type="button" class="theme-toggle" id="themeToggle" data-um8-fn="toggleTheme" title="Toggle theme"><i class="fas fa-moon" id="themeToggleIconMobile"></i></button>
+      </div>
+    </header>
+
+    <main class="main-content">
+      <div class="page-header">
+        <h1 class="page-title">Thumbnail Studio</h1>
+        <p class="page-subtitle">Start from a video that performs well, match its thumbnail style to your channel, add your on-camera look, then generate options you can compare side by side. Runs on the <strong>UploadM8 engine</strong> (layout heuristics + optional Pikzels v2 AI renders and scores); each job is logged for our ML pipeline so future suggestions improve.</p>
+        <div class="admin-only hidden thumb-studio-admin-strip" id="thumbStudioAdminStrip" aria-label="Admin shortcuts">
+          <span class="strip-label"><i class="fas fa-shield-alt"></i> Admin</span>
+          <a href="admin.html" class="btn btn-ghost btn-sm">Admin Panel</a>
+          <a href="account-management.html" class="btn btn-ghost btn-sm">Account Mgmt</a>
+          <a href="admin-kpi.html" class="btn btn-ghost btn-sm">Admin KPIs</a>
+          <a href="admin-marketing.html" class="btn btn-ghost btn-sm">Marketing Ops</a>
+          <a href="admin-calculator.html" class="btn btn-ghost btn-sm">Biz Calculator</a>
+          <a href="admin-wallet.html" class="btn btn-ghost btn-sm">Wallet Manager</a>
+        </div>
+      </div>
+
+      <div class="card mb-4" style="border-color:rgba(139,92,246,.35);background:rgba(139,92,246,.05);">
+        <div class="card-header" style="padding-bottom:6px;">
+          <h3 class="card-title" style="font-size:1rem;"><i class="fas fa-wand-magic-sparkles" style="color:#a78bfa;"></i> Personalized tips for thumbnails</h3>
+        </div>
+        <div class="card-body" style="padding-top:6px;">
+          <div data-ai-coach="1" class="text-secondary" style="font-size:.85rem;line-height:1.45;">Loading personalized tips…</div>
+        </div>
+      </div>
+
+      <div class="studio-grid">
+        <section class="studio-card">
+          <div class="studio-step">Saved analyses</div>
+          <p class="muted" style="font-size:0.85rem;margin-bottom:0.65rem;line-height:1.45;">Reload a past run without generating again (no new token charge). Preview links are refreshed when you open a job.</p>
+          <div class="studio-row">
+            <div>
+              <label class="form-label">Recent jobs</label>
+              <select id="savedJobSelect" class="form-input">
+                <option value="">— Pick a saved job —</option>
+              </select>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:flex-end;">
+              <button class="btn btn-secondary" id="loadSavedJobBtn" type="button">Load selected</button>
+              <button class="btn btn-ghost btn-sm" id="refreshSavedJobsBtn" type="button">Refresh list</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="studio-card">
+          <div class="studio-step">Step 1 · Choose your reference video</div>
+          <div class="studio-row">
+            <div>
+              <label class="form-label">YouTube URL</label>
+              <input id="youtubeUrl" class="form-input" placeholder="https://www.youtube.com/watch?v=..." />
+            </div>
+            <div>
+              <label class="form-label">Topic</label>
+              <input id="topicInput" class="form-input" placeholder="Optional — focus the topic" />
+            </div>
+            <div>
+              <label class="form-label">Niche</label>
+              <select id="nicheInput" class="form-input">
+                <option value="general">General</option>
+                <option value="gaming">Gaming</option>
+                <option value="finance">Finance</option>
+                <option value="education">Education</option>
+                <option value="automotive">Automotive</option>
+                <option value="lifestyle">Lifestyle</option>
+              </select>
+            </div>
+          </div>
+        </section>
+
+        <section class="studio-card">
+          <div class="studio-step">Step 2 · Your on-camera look</div>
+          <div class="studio-row">
+            <div>
+              <label class="form-label">Persona Name</label>
+              <input id="personaName" class="form-input" placeholder="My Default Persona" />
+            </div>
+            <div>
+              <label class="form-label">Reference photos</label>
+              <input id="personaFiles" type="file" class="form-input" accept="image/*" multiple />
+              <p class="muted">Add 3–20 clear photos of your face (similar lighting helps). These are saved with your account and used when you pick this persona for thumbnails.</p>
+            </div>
+            <div>
+              <label class="form-label">Saved Personas</label>
+              <select id="personaSelect" class="form-input"></select>
+              <button class="btn btn-secondary mt-2" id="savePersonaBtn" type="button">Save Persona</button>
+              <button class="btn btn-secondary mt-2" id="linkPersonaPikzelsBtn" type="button">Link selected persona to Pikzels</button>
+              <p class="muted mt-2" style="font-size:0.8rem;line-height:1.4;">If a persona shows &quot;Pikzels not linked&quot;, choose it here and click the link button. We send your saved reference photos to Pikzels (this can take up to a few minutes).</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="studio-card">
+          <div class="studio-step">Step 3 · Layout and how close to match</div>
+          <div id="formatChips"></div>
+          <div class="studio-row mt-3">
+            <div>
+              <label class="form-label">How close to original style</label>
+              <input id="closeness" type="range" min="0" max="100" value="55" />
+              <div class="muted"><span id="closenessLabel">55</span>/100</div>
+            </div>
+            <div>
+              <label class="form-label">Variants</label>
+              <select id="variantCount" class="form-input">
+                <option value="4">4</option>
+                <option value="5">5</option>
+                <option value="6" selected>6</option>
+                <option value="7">7</option>
+                <option value="8">8</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">Stand out in your niche</label>
+              <label style="display:flex;gap:.5rem;align-items:center;"><input type="checkbox" id="gapMode" /> Push ideas past what others in this niche are doing</label>
+            </div>
+          </div>
+          <div class="mt-3" style="display:flex; gap:.5rem; flex-wrap:wrap;">
+            <button class="btn btn-secondary" id="estimateBtn" type="button">Estimate Cost</button>
+            <button class="btn btn-primary" id="generateBtn" type="button">Generate Variants</button>
+            <button class="btn btn-secondary" id="abExportBtn" type="button" disabled>Export comparison pack</button>
+          </div>
+          <p class="muted mt-2" id="costEstimateText"></p>
+        </section>
+
+        <section class="studio-card">
+          <div class="studio-step">Step 4 · Scores and suggestions</div>
+          <div id="variants" class="variant-grid"></div>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+  <script src="js/api-base.js"></script>
+  <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+  <script src="js/session-user-hydrate.js"></script>
+  <script src="js/public-shell-hydrate.js"></script>
+  <script src="shared-sidebar.js"></script>
+  <script src="js/helpers-formatting.js"></script>
+  <script src="js/upload-utils.js"></script>
+  <script src="app.js"></script>
+  <script src="js/ai-coach.js"></script>
+  <script src="wallet-tokens.js"></script>
+  <script src="js/thumbnail-studio.js"></script>
+</body>
+</html>

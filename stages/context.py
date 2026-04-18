@@ -6,10 +6,13 @@ Carries all state through the processing pipeline.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional, Sequence
+
+from core.helpers import coerce_hashtag_list, sanitize_hashtag_body
 
 from .entitlements import Entitlements
 
@@ -37,6 +40,8 @@ class TelemetryData:
     location_country: Optional[str] = None
     location_display: Optional[str] = None  # e.g. "Kansas City, MO" or "Los Angeles, CA"
     location_road: Optional[str] = None     # road/highway name if available
+    # When route start is far from midpoint, second Nominatim lookup at start GPS
+    location_start_display: Optional[str] = None
 
     # -------------------------
     # Back-compat aliases used by older stages
@@ -196,6 +201,15 @@ class JobContext:
     ai_title: Optional[str] = None
     ai_caption: Optional[str] = None
     ai_hashtags: List[str] = field(default_factory=list)
+    # M8 caption engine: per-platform AI hashtag variants (tiktok, instagram, …)
+    m8_platform_hashtags: Dict[str, List[str]] = field(default_factory=dict)
+    # Populated by audio_stage (Whisper) when enabled — injected into caption prompts.
+    ai_transcript: Optional[str] = None
+    audio_path: Optional[Path] = None
+    audio_context: Dict[str, Any] = field(default_factory=dict)
+    vision_context: Dict[str, Any] = field(default_factory=dict)
+    video_understanding: Dict[str, Any] = field(default_factory=dict)
+    video_intelligence_context: Dict[str, Any] = field(default_factory=dict)
     # Few-shot examples from upload_caption_memory (set by caption_stage when db_pool provided)
     caption_memory_examples: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -265,79 +279,122 @@ class JobContext:
         return self.local_video_path
 
     def get_effective_title(self) -> str:
-        return self.ai_title or self.title or self.filename
+        # Upload form / DB title wins over AI so explicit user copy is never replaced.
+        t = (self.title or "").strip()
+        if t:
+            return t
+        if (self.ai_title or "").strip():
+            return (self.ai_title or "").strip()
+        return (self.filename or "").strip() or ""
 
     def get_effective_caption(self) -> str:
-        return self.ai_caption or self.caption or ""
+        c = (self.caption or "").strip()
+        if c:
+            return c
+        return (self.ai_caption or "").strip()
 
     def get_effective_hashtags(self, platform: str = "") -> List[str]:
         """
         Build the final hashtag list for publishing.
 
-        Merge order: always_hashtags (FIRST) → platform_hashtags for this platform →
-        base upload hashtags → AI additions.
+        Merge order: always_hashtags (FIRST) → user platform_hashtags for this platform →
+        base upload hashtags (explicit per-upload intent) → M8 per-platform AI hashtags →
+        generic AI list. Under ``maxHashtags``, earlier buckets win so manual upload tags
+        are not starved by model output.
         blocked_hashtags are filtered out at every level.
 
-        Uses the same pipeline for always_hashtags and platform_hashtags so both
-        are applied consistently. platform_hashtags keys: tiktok, youtube, instagram, facebook.
+        platform_hashtags keys are usually tiktok / youtube / instagram / facebook (any casing).
         """
         us = self.user_settings or {}
 
         # ── Always-on hashtags from settings page ────────────────────────
         raw_always = us.get("alwaysHashtags") or us.get("always_hashtags") or []
-        if isinstance(raw_always, str):
-            raw_always = [
-                t.strip() for t in raw_always.replace(",", " ").split() if t.strip()
-            ]
-        always_tags: List[str] = list(raw_always) if isinstance(raw_always, list) else []
+        always_tags: List[str] = coerce_hashtag_list(raw_always)
 
-        # ── Platform-specific hashtags (same logic as always_hashtags) ────
-        # Case-insensitive key lookup: frontend may send "TikTok", "Instagram", etc.
+        # ── User platform-specific hashtags (settings / preferences) ───────
         platform_tags: List[str] = []
-        if platform:
+        pl = (platform or "").strip().lower()
+        if pl:
             ph = us.get("platformHashtags") or us.get("platform_hashtags") or {}
             if isinstance(ph, str):
                 try:
                     import json as _j
+
                     ph = _j.loads(ph)
                 except Exception:
                     ph = {}
             if isinstance(ph, dict):
-                raw = ph.get(platform) or ph.get((platform or "").lower()) or ph.get((platform or "").title()) or []
-                if not raw:
-                    key_lower = (platform or "").lower()
+                raw = None
+                for key in (
+                    platform,
+                    pl,
+                    (platform or "").strip().title(),
+                    pl.title() if pl else "",
+                ):
+                    if key and key in ph and ph[key]:
+                        raw = ph[key]
+                        break
+                if raw is None:
+                    alias = {"youtube": ("google",), "instagram": ("ig",), "facebook": ("fb",)}.get(pl, ())
+                    for a in alias:
+                        if a in ph and ph[a]:
+                            raw = ph[a]
+                            break
+                if raw is None:
                     for k, v in ph.items():
-                        if str(k).lower() == key_lower:
+                        if str(k).strip().lower() == pl and v:
                             raw = v
                             break
-                if isinstance(raw, str):
-                    raw = [t.strip() for t in raw.replace(",", " ").split() if t.strip()]
-                platform_tags = list(raw) if isinstance(raw, list) else []
+                if raw is None:
+                    raw = []
+                platform_tags = coerce_hashtag_list(raw)
+
+        # ── M8 caption engine: per-platform AI hashtag variants ────────────
+        m8_tags: List[str] = []
+        if pl:
+            m8_map = getattr(self, "m8_platform_hashtags", None) or {}
+            if isinstance(m8_map, dict) and m8_map:
+                m8_raw = m8_map.get(pl) or m8_map.get(platform or "")
+                if m8_raw is None:
+                    for mk, mv in m8_map.items():
+                        if str(mk).strip().lower() == pl:
+                            m8_raw = mv
+                            break
+                m8_tags = coerce_hashtag_list(m8_raw or [])
 
         # ── Blocked hashtags from settings page ──────────────────────────
         raw_blocked = us.get("blockedHashtags") or us.get("blocked_hashtags") or []
-        if isinstance(raw_blocked, str):
-            raw_blocked = [
-                t.strip() for t in raw_blocked.replace(",", " ").split() if t.strip()
-            ]
-        blocked_set = {
-            str(t).strip().lstrip("#").lower()
-            for t in (raw_blocked if isinstance(raw_blocked, list) else [])
-        }
+        blocked_set: set = set()
+        for t in coerce_hashtag_list(raw_blocked):
+            b = sanitize_hashtag_body(str(t))
+            if b:
+                blocked_set.add(b)
 
-        # ── Merge: always → platform → base → AI (same pipeline for all) ─
-        base = list(self.hashtags or [])
-        ai   = list(self.ai_hashtags or [])
+        # ── Merge: always → user platform → base (upload) → M8 → generic AI ──
+        base = coerce_hashtag_list(self.hashtags)
+        ai = coerce_hashtag_list(self.ai_hashtags)
 
         seen: set = set()
         merged: List[str] = []
 
-        for tag in always_tags + platform_tags + base + ai:
-            t = str(tag).strip().lstrip("#").lower()
-            if not t or t in seen or t in blocked_set:
+        for tag in always_tags + platform_tags + base + m8_tags + ai:
+            body = sanitize_hashtag_body(tag)
+            if not body or body in seen or body in blocked_set:
                 continue
-            seen.add(t)
-            merged.append(tag if str(tag).startswith("#") else f"#{tag}")
+            seen.add(body)
+            merged.append(f"#{body}")
+
+        # "Max total hashtags" — cap final merged list (merge order preserved: always → platform → …).
+        try:
+            raw_cap = us.get("maxHashtags")
+            if raw_cap is None:
+                raw_cap = us.get("max_hashtags")
+            cap = int(raw_cap) if raw_cap is not None and str(raw_cap).strip() != "" else 50
+        except (TypeError, ValueError):
+            cap = 50
+        cap = max(1, min(cap, 50))
+        if len(merged) > cap:
+            merged = merged[:cap]
 
         return merged
 
@@ -459,6 +516,11 @@ OUTPUT SCHEMA
 """
 
 
+def _normalize_upload_hashtags_field(raw: Any) -> List[str]:
+    """Coerce uploads.hashtags (jsonb list, JSON string, or broken string) to flat tokens."""
+    return [str(t) for t in coerce_hashtag_list(raw) if str(t).strip()]
+
+
 def create_context(job_data: dict, upload_record: dict, user_settings: dict, entitlements: Entitlements) -> JobContext:
     # Resolve reframe_mode: job payload > upload record > user setting > "auto"
     reframe_mode = (
@@ -481,9 +543,319 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
         target_accounts=upload_record.get("target_accounts", []) or [],
         title=upload_record.get("title", ""),
         caption=upload_record.get("caption", ""),
-        hashtags=upload_record.get("hashtags", []) or [],
+        hashtags=_normalize_upload_hashtags_field(upload_record.get("hashtags")),
         privacy=upload_record.get("privacy", "public") or "public",
         reframe_mode=reframe_mode,
         user_settings=user_settings or {},
         entitlements=entitlements,
     )
+
+
+# ============================================================
+# Multimodal fusion — M8 caption engine + scene graph
+# ============================================================
+# These helpers must stay importable from this module (see stages/m8_engine.py).
+# They turn late-stage ctx fields into one prioritized digest so captions track
+# the *current* upload instead of filename/category templates alone.
+
+_LANDMARK_SUBSTRINGS: tuple[str, ...] = (
+    "stadium",
+    "arena",
+    "downtown",
+    "skyline",
+    "bridge",
+    "monument",
+    "museum",
+    "airport",
+    "station",
+    "plaza",
+    "tower",
+    "beach",
+    "raceway",
+    "racetrack",
+    "speedway",
+    "circuit",
+    "highway",
+    "interstate",
+    "mile marker",
+    "national park",
+    "state park",
+    "campus",
+    "historic",
+    "landmark",
+)
+
+
+def extract_landmark_hints(
+    labels: Sequence[Any],
+    ocr_text: str,
+    gcv_landmark_names: Optional[Sequence[Any]] = None,
+) -> List[str]:
+    """
+    Pull short venue / place cues from vision labels + OCR for caption grounding.
+    Conservative: only labels whose text suggests a place, plus a few OCR lines.
+    ``gcv_landmark_names`` comes from Google Cloud Vision LANDMARK_DETECTION when present.
+    """
+    hints: List[str] = []
+    seen: set[str] = set()
+
+    for raw in gcv_landmark_names or []:
+        s = str(raw).strip()
+        if len(s) < 2:
+            continue
+        low = s.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        hints.append(s[:160])
+        if len(hints) >= 8:
+            break
+
+    for raw in labels or []:
+        s = str(raw).strip()
+        if len(s) < 3:
+            continue
+        low = s.lower()
+        if not any(k in low for k in _LANDMARK_SUBSTRINGS):
+            continue
+        key = low[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        hints.append(s[:160])
+        if len(hints) >= 10:
+            break
+
+    for line in (ocr_text or "").splitlines():
+        t = re.sub(r"\s+", " ", line.strip())
+        if len(t) < 4 or len(t) > 100:
+            continue
+        low = t.lower()
+        if low in seen:
+            continue
+        # Likely signage / venue names (not full paragraphs)
+        if len(t.split()) > 14:
+            continue
+        seen.add(low)
+        hints.append(t)
+        if len(hints) >= 14:
+            break
+
+    return hints[:14]
+
+
+def _trim_text(text: str, max_chars: int) -> str:
+    t = (text or "").strip()
+    if max_chars <= 0 or not t:
+        return ""
+    if len(t) <= max_chars:
+        return t
+    return t[: max(1, max_chars - 1)].rstrip() + "…"
+
+
+def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) -> str:
+    """
+    Single narrative digest for M8: **full-clip signals first**, then sampled frame
+    vision, then audio/transcript, then drive telemetry. Ordering reduces
+    “stale template” captions that overweight filename or sparse early cues.
+    """
+    max_chars = max(500, min(int(max_chars or 10000), 50000))
+    parts: List[str] = []
+    budget = max_chars
+
+    def push(header: str, body: str, share: float) -> None:
+        nonlocal budget
+        if budget < 80:
+            return
+        slice_n = max(120, int(max_chars * share))
+        slice_n = min(slice_n, budget - len(header) - 4)
+        chunk = _trim_text(body, slice_n)
+        if not chunk:
+            return
+        block = f"{header}\n{chunk}\n"
+        parts.append(block)
+        budget -= len(block)
+
+    vu = ctx.video_understanding or {}
+    if isinstance(vu, dict):
+        scene = str(vu.get("scene_description") or vu.get("description") or "").strip()
+        tsug = str(vu.get("title_suggestion") or "").strip()
+        body = scene
+        if tsug:
+            body = (body + "\nSuggested title angle: " + tsug).strip()
+        push("=== FULL VIDEO (scene understanding) ===", body, 0.34)
+
+    vi = ctx.video_intelligence_context or {}
+    if isinstance(vi, dict) and not vi.get("error"):
+        tl = vi.get("top_labels") or []
+        if isinstance(tl, list) and tl:
+            push(
+                "=== VIDEO INTELLIGENCE (Google — full clip labels) ===",
+                "\n".join(str(x) for x in tl[:22]),
+                0.14,
+            )
+        elif (vi.get("summary_text") or "").strip():
+            push(
+                "=== VIDEO INTELLIGENCE (Google — full clip labels) ===",
+                str(vi.get("summary_text") or ""),
+                0.12,
+            )
+
+    vc = ctx.vision_context or {}
+    if isinstance(vc, dict) and vc and not vc.get("skipped"):
+        lines: List[str] = []
+        labels = vc.get("label_names") or []
+        if isinstance(labels, list) and labels:
+            lines.append("Frame labels: " + ", ".join(str(x) for x in labels[:28]))
+        ocr = (vc.get("ocr_text") or "").strip()
+        if ocr:
+            lines.append("OCR / on-screen text: " + ocr[:2400])
+        fc = vc.get("face_count")
+        if fc is not None:
+            lines.append(f"Faces (sampled frame): {fc}")
+        lm = vc.get("landmark_names") or []
+        if isinstance(lm, list) and lm:
+            lines.append("Detected landmarks: " + ", ".join(str(x) for x in lm[:10]))
+        lg = vc.get("logo_names") or []
+        if isinstance(lg, list) and lg:
+            lines.append("Detected logos / brands: " + ", ".join(str(x) for x in lg[:10]))
+        if lines:
+            push("=== SAMPLE FRAME (Google Vision — one key frame) ===", "\n".join(lines), 0.16)
+
+    ac = ctx.audio_context or {}
+    if isinstance(ac, dict):
+        lines_a: List[str] = []
+        tx = (ctx.ai_transcript or ac.get("transcript") or "").strip()
+        if tx:
+            role = str(ac.get("transcript_role") or "").strip()
+            lang = str(ac.get("language") or "").strip()
+            head = "Transcript"
+            if role or lang:
+                head += f" (role={role or 'unknown'}, lang={lang or 'unknown'})"
+            lines_a.append(head + ":\n" + tx[:7000])
+        gas = (ac.get("gpt_audio_summary") or "").strip()
+        if gas:
+            lines_a.append("Audio summary: " + gas[:900])
+        mus = []
+        if ac.get("music_title"):
+            mus.append(f"track={ac.get('music_title')}")
+        if ac.get("music_artist"):
+            mus.append(f"artist={ac.get('music_artist')}")
+        if ac.get("music_genre"):
+            mus.append(f"genre={ac.get('music_genre')}")
+        if mus:
+            lines_a.append("Music ID: " + ", ".join(mus))
+        yev = ac.get("yamnet_events")
+        if isinstance(yev, list) and yev:
+            lines_a.append("Ambient sound events: " + ", ".join(str(x) for x in yev[:20]))
+        he = ac.get("hume_emotions")
+        if isinstance(he, dict) and he.get("dominant_emotion"):
+            lines_a.append(
+                f"Dominant speech emotion: {he.get('dominant_emotion')} "
+                f"(intensity {he.get('emotional_intensity', '')})"
+            )
+        if lines_a:
+            push("=== AUDIO & SPEECH ===", "\n\n".join(lines_a), 0.22)
+
+    tel = ctx.telemetry or ctx.telemetry_data
+    if tel:
+        loc_bits: List[str] = []
+        for attr, label in (
+            ("location_display", "Location (mid-route)"),
+            ("location_start_display", "Route start"),
+            ("location_road", "Road"),
+            ("location_city", "City"),
+            ("location_state", "Region"),
+        ):
+            v = getattr(tel, attr, None)
+            if v:
+                loc_bits.append(f"{label}: {v}")
+        tr = ctx.trill or ctx.trill_score
+        if tr:
+            loc_bits.append(f"Trill: score={getattr(tr, 'score', '')} bucket={getattr(tr, 'bucket', '')}")
+        mph = getattr(tel, "max_speed_mph", None)
+        if mph:
+            loc_bits.append(f"Peak speed: {mph} mph")
+        dist = getattr(tel, "total_distance_miles", None)
+        if dist:
+            loc_bits.append(f"Distance: {dist} mi")
+        dur = getattr(tel, "duration_seconds", None)
+        if dur is not None and float(dur or 0) > 0:
+            loc_bits.append(f"Route duration (from .map): {float(dur):.0f}s")
+        npts = len(getattr(tel, "points", None) or [])
+        if npts:
+            loc_bits.append(f"GPS samples in .map: {npts}")
+        alt = getattr(tel, "max_altitude_ft", None)
+        if alt is not None and float(alt or 0) > 0:
+            loc_bits.append(f"Max altitude (from .map): {float(alt):.0f} ft")
+        sp = getattr(tel, "speeding_seconds", None)
+        if sp is not None and float(sp or 0) > 1:
+            loc_bits.append(f"Time above speeding threshold: {float(sp):.0f}s")
+        if loc_bits:
+            push("=== DRIVE / TELEMETRY (.map + reverse geocode) ===", "\n".join(loc_bits), 0.12)
+
+    out = "\n".join(parts).strip()
+    return _trim_text(out, max_chars)
+
+
+def build_fusion_summary_text(ctx: JobContext) -> str:
+    """2–4 sentence executive summary for the scene graph JSON."""
+    digest = build_multimodal_scene_digest(ctx, max_chars=4500)
+    if not digest:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?])\s+", digest.replace("\n", " "))
+    picked: List[str] = []
+    for s in sentences:
+        t = s.strip()
+        if len(t) < 40:
+            continue
+        picked.append(t)
+        if len(picked) >= 4:
+            break
+    if not picked:
+        picked = [_trim_text(digest, 900)]
+
+    out = " ".join(picked).strip()
+    return _trim_text(out, 4000)
+
+
+def build_fusion_caption_rules(ctx: JobContext) -> str:
+    """Hard prompt constraints derived from fused evidence (anti-stale / anti-wrong)."""
+    lines: List[str] = [
+        "FUSION RULES (obey all that apply):",
+        "- Anchor the hook in the **newest, most specific** facts below (scene understanding > video labels > frame OCR > transcript).",
+        "- If transcript and visuals disagree, trust **visuals + scene understanding** for on-screen facts; use transcript for quoted speech only.",
+        "- Do not recycle generic automotive / lifestyle templates unless telemetry or labels explicitly support them.",
+        "- When **landmarks**, **logos**, or **.map / GPS** fields are present, cite at least one of them explicitly (place name, brand, or route statistic) — do not ignore them.",
+    ]
+    ac = ctx.audio_context or {}
+    if isinstance(ac, dict):
+        role = str(ac.get("transcript_role") or "").strip().lower()
+        if role in ("third_party_lyrics", "third_party_music", "song"):
+            lines.append(
+                "- Audio role is third-party lyrics/music: never claim the creator wrote, produced, or performed the track."
+            )
+
+    vu = ctx.video_understanding or {}
+    if isinstance(vu, dict) and (vu.get("scene_description") or vu.get("description")):
+        lines.append("- Scene understanding is present: the caption must reflect at least one concrete detail from it.")
+
+    vc = ctx.vision_context or {}
+    if isinstance(vc, dict) and (vc.get("ocr_text") or "").strip():
+        lines.append("- OCR text is present: mention a specific on-screen word/phrase when it helps accuracy (scores, brands, place names).")
+    if isinstance(vc, dict) and (vc.get("landmark_names") or vc.get("logo_names")):
+        lines.append(
+            "- Google Vision reported landmark(s) and/or logo(s): treat those as high-confidence on-screen entities."
+        )
+
+    tel = ctx.telemetry or ctx.telemetry_data
+    if tel and (getattr(tel, "max_speed_mph", 0) or 0) > 1:
+        lines.append("- Telemetry shows meaningful speed: reference mph, road, or place when writing automotive beats.")
+    if tel and getattr(tel, "location_start_display", None) and getattr(tel, "location_display", None):
+        if str(tel.location_start_display).strip() != str(tel.location_display).strip():
+            lines.append(
+                "- Route start and mid-route geocodes differ: you may contrast where the drive began vs where this clip sits on the route."
+            )
+
+    return "\n".join(lines) + "\n"

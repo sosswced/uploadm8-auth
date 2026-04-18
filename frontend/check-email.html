@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+    <script src="js/html-safe.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Check Your Email – UploadM8</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: #0f0f0f;
+            color: #ffffff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* ── Header ── */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1.25rem 2rem;
+            border-bottom: 1px solid rgba(255,255,255,0.07);
+            background: rgba(15,15,15,0.95);
+            backdrop-filter: blur(10px);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-decoration: none;
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #ffffff;
+            letter-spacing: -0.3px;
+        }
+        .logo img { height: 28px; width: auto; }
+        .logo span { color: #f97316; }
+        .home-btn {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: #9ca3af;
+            text-decoration: none;
+            font-size: 0.875rem;
+            padding: 0.5rem 0.875rem;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 8px;
+            transition: all 0.2s;
+        }
+        .home-btn:hover { color: #ffffff; border-color: rgba(255,255,255,0.25); }
+
+        /* ── Main ── */
+        .main {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 3rem 1.5rem;
+        }
+        .card {
+            background: #1a1a1a;
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 2.75rem 2.5rem;
+            width: 100%;
+            max-width: 460px;
+            text-align: center;
+        }
+
+        /* ── Icon ── */
+        .icon-ring {
+            width: 80px;
+            height: 80px;
+            background: rgba(249,115,22,0.1);
+            border: 1px solid rgba(249,115,22,0.25);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 1.75rem;
+            font-size: 2rem;
+            color: #f97316;
+            animation: pulse-ring 2s ease-in-out infinite;
+        }
+        @keyframes pulse-ring {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(249,115,22,0.0); }
+            50%       { box-shadow: 0 0 0 8px rgba(249,115,22,0.0); }
+        }
+
+        /* ── Content ── */
+        .card h1 {
+            margin: 0 0 0.75rem;
+            font-size: 1.75rem;
+            font-weight: 700;
+            letter-spacing: -0.4px;
+        }
+        .card p {
+            margin: 0 0 1rem;
+            color: #9ca3af;
+            font-size: 0.95rem;
+            line-height: 1.65;
+        }
+        .email-display {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(249,115,22,0.08);
+            border: 1px solid rgba(249,115,22,0.2);
+            border-radius: 8px;
+            padding: 0.625rem 1rem;
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #f97316;
+            margin: 0.5rem 0 1.5rem;
+            word-break: break-all;
+        }
+        .email-display i { flex-shrink: 0; }
+
+        /* ── Checklist ── */
+        .checklist {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 10px;
+            padding: 1.25rem 1.5rem;
+            text-align: left;
+            margin-bottom: 1.75rem;
+        }
+        .checklist-title {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #6b7280;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.875rem;
+        }
+        .checklist-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.625rem;
+            font-size: 0.875rem;
+            color: #9ca3af;
+            line-height: 1.5;
+            padding: 0.3rem 0;
+        }
+        .checklist-item i {
+            color: #f97316;
+            margin-top: 0.15rem;
+            flex-shrink: 0;
+            font-size: 0.8rem;
+        }
+
+        /* ── Actions ── */
+        .action-row {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 1.25rem;
+        }
+        .btn-primary {
+            flex: 1;
+            padding: 0.875rem;
+            background: #f97316;
+            border: none;
+            border-radius: 10px;
+            color: white;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            text-decoration: none;
+        }
+        .btn-primary:hover { background: #ea6c10; transform: translateY(-1px); }
+        .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .btn-secondary {
+            flex: 1;
+            padding: 0.875rem;
+            background: transparent;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 10px;
+            color: #9ca3af;
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        .btn-secondary:hover { color: #ffffff; border-color: rgba(255,255,255,0.25); }
+
+        /* ── Resend feedback ── */
+        .resend-msg {
+            display: none;
+            font-size: 0.85rem;
+            color: #22c55e;
+            margin-bottom: 1rem;
+            align-items: center;
+            justify-content: center;
+            gap: 0.4rem;
+        }
+        .resend-msg.show { display: flex; }
+        .resend-countdown {
+            font-size: 0.85rem;
+            color: #6b7280;
+            margin-bottom: 1rem;
+        }
+
+        /* ── Wrong email ── */
+        .wrong-email {
+            font-size: 0.85rem;
+            color: #6b7280;
+        }
+        .wrong-email a { color: #f97316; text-decoration: none; }
+        .wrong-email a:hover { text-decoration: underline; }
+        .wrong-email-edit {
+            margin-top: 0.75rem;
+            display: flex;
+            gap: 0.5rem;
+        }
+        .wrong-email-edit input {
+            flex: 1;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 8px;
+            color: #fff;
+            padding: 0.6rem 0.75rem;
+            font-size: 0.9rem;
+        }
+        .wrong-email-edit button {
+            padding: 0.6rem 0.85rem;
+            border: 1px solid rgba(249,115,22,0.35);
+            background: rgba(249,115,22,0.12);
+            color: #f97316;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+        .wrong-email-edit button:disabled {
+            opacity: 0.65;
+            cursor: not-allowed;
+        }
+
+        /* ── Footer ── */
+        .footer {
+            padding: 1.5rem 2rem;
+            border-top: 1px solid rgba(255,255,255,0.06);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 1.5rem;
+            font-size: 0.8rem;
+            color: #4b5563;
+        }
+        .footer a { color: #6b7280; text-decoration: none; }
+        .footer a:hover { color: #9ca3af; }
+
+        /* ── Mobile overrides ── */
+        @media (max-width: 520px) {
+            body { padding: 0; }
+            .card { padding: 2rem 1.25rem; border-radius: 14px; margin: 1rem; }
+        }
+    </style>
+</head>
+<body>
+
+    <header class="header">
+        <a href="index.html" class="logo">
+            <img src="images/logo.svg" alt="UploadM8" onerror="this.style.display='none'">
+            Upload<span>M8</span>
+        </a>
+        <a href="index.html" class="home-btn">
+            <i class="fas fa-home"></i> Home
+        </a>
+    </header>
+
+    <main class="main">
+        <div class="card">
+
+            <div class="icon-ring">
+                <i class="fas fa-envelope-open-text"></i>
+            </div>
+
+            <h1>Check your email</h1>
+            <p>We sent a confirmation link to</p>
+
+            <div class="email-display" id="emailDisplay">
+                <i class="fas fa-at"></i>
+                <span id="emailAddress">your email address</span>
+            </div>
+
+            <div class="checklist">
+                <div class="checklist-title">Can't find it?</div>
+                <div class="checklist-item">
+                    <i class="fas fa-circle-dot"></i>
+                    <span>Check your <strong>Spam</strong> or <strong>Junk</strong> folder</span>
+                </div>
+                <div class="checklist-item">
+                    <i class="fas fa-circle-dot"></i>
+                    <span>The subject line is <strong>"Confirm your UploadM8 email address"</strong></span>
+                </div>
+                <div class="checklist-item">
+                    <i class="fas fa-circle-dot"></i>
+                    <span>The link expires in <strong>24 hours</strong></span>
+                </div>
+            </div>
+
+            <div class="resend-msg" id="resendMsg">
+                <i class="fas fa-check-circle"></i> Confirmation email resent!
+            </div>
+            <div class="resend-countdown" id="resendCountdown" style="display:none;"></div>
+
+            <div class="action-row">
+                <button class="btn-primary" id="resendBtn" data-um8-fn="resendEmail">
+                    <i class="fas fa-paper-plane"></i> Resend email
+                </button>
+                <a href="login.html" class="btn-secondary">
+                    <i class="fas fa-arrow-right"></i> Go to login
+                </a>
+            </div>
+
+            <div class="wrong-email">
+                Wrong email? Update it here and keep this signup session.
+                <div class="wrong-email-edit">
+                    <input type="email" id="emailEditInput" placeholder="new@email.com" aria-label="New email">
+                    <button id="emailEditBtn" type="button" data-um8-fn="updatePendingEmail">Update email</button>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span>© 2025 UploadM8</span>
+        <a href="dashboard.html">Dashboard</a>
+        <a href="settings.html#billing-panel">Token balance</a>
+        <a href="contact.html">Contact</a>
+        <a href="terms.html">Terms</a>
+        <a href="privacy.html">Privacy</a>
+        <a href="support.html">Support</a>
+        <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
+    </footer>
+
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script>
+        // ── Read email from query param ──
+        const params = new URLSearchParams(window.location.search);
+        let email = (params.get('email') || '').trim().toLowerCase();
+
+        document.getElementById('emailAddress').textContent = email || 'your email address';
+
+        // ── Resend logic ──
+        let cooldown = 0;
+
+        async function resendEmail() {
+            if (!email) {
+                alert('No email address found. Please sign up again.');
+                return;
+            }
+            if (cooldown > 0) return;
+
+            const btn = document.getElementById('resendBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Sending...';
+
+            try {
+                const resp = await window.apiFetch('/api/auth/resend-confirmation', {
+                    method: 'POST',
+                    body: JSON.stringify({ email }),
+                    authRedirectOn401: false,
+                });
+
+                if (resp.ok) {
+                    showResendSuccess();
+                } else {
+                    const data = await resp.json().catch(() => ({}));
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-paper-plane"></i> Resend email';
+                    alert(
+                        (typeof window.uploadM8ApiErrorMessage === 'function' && window.uploadM8ApiErrorMessage(data)) ||
+                        'Failed to resend. Please try again.'
+                    );
+                }
+            } catch (err) {
+                console.error('Resend error:', err);
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-paper-plane"></i> Resend email';
+                alert('Connection error. Please try again.');
+            }
+        }
+
+        async function updatePendingEmail() {
+            if (!email) {
+                alert('No current email found. Please sign up again.');
+                return;
+            }
+            const input = document.getElementById('emailEditInput');
+            const btn = document.getElementById('emailEditBtn');
+            const newEmail = (input.value || '').trim().toLowerCase();
+            if (!newEmail) {
+                alert('Enter the new email address first.');
+                return;
+            }
+            if (newEmail === email) {
+                alert('That is already your current email.');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Updating...';
+            try {
+                const resp = await window.apiFetch('/api/auth/update-pending-email', {
+                    method: 'POST',
+                    body: JSON.stringify({ current_email: email, new_email: newEmail }),
+                    authRedirectOn401: false,
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    alert(
+                        (typeof window.uploadM8ApiErrorMessage === 'function' && window.uploadM8ApiErrorMessage(data)) ||
+                        'Could not update email.'
+                    );
+                    return;
+                }
+
+                email = (data.email || newEmail).toLowerCase();
+                document.getElementById('emailAddress').textContent = email;
+                input.value = '';
+                const nextParams = new URLSearchParams(window.location.search);
+                nextParams.set('email', email);
+                window.history.replaceState({}, '', `${window.location.pathname}?${nextParams.toString()}`);
+                alert('Email updated. We sent a new verification link to your new address.');
+            } catch (err) {
+                console.error('Update pending email error:', err);
+                alert('Connection error. Please try again.');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Update email';
+            }
+        }
+
+        function showResendSuccess() {
+            document.getElementById('resendMsg').classList.add('show');
+            cooldown = 60;
+            startCooldown();
+        }
+
+        function startCooldown() {
+            const btn = document.getElementById('resendBtn');
+            const countdown = document.getElementById('resendCountdown');
+            countdown.style.display = 'block';
+
+            const tick = () => {
+                if (cooldown <= 0) {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-paper-plane"></i> Resend email';
+                    countdown.style.display = 'none';
+                    return;
+                }
+                countdown.textContent = `You can resend again in ${cooldown}s`;
+                cooldown--;
+                setTimeout(tick, 1000);
+            };
+            tick();
+        }
+    </script>
+
+</body>
+</html>

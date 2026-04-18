@@ -1,0 +1,46 @@
+.git
+.gitignore
+.cursor
+.vscode
+.idea
+
+# Python env/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# Local env/secrets
+.env
+.env.*
+*.pem
+*.key
+*credentials*.json
+*credential*.json
+*service-account*.json
+*service_account*.json
+*secret*.json
+
+# Virtualenvs
+.venv/
+.venv*/
+venv/
+venv*/
+env/
+env*/
+
+# Tests/artifacts (not needed in worker/runtime image)
+tests/
+tools/
+locustfile.py
+run_tests.py
+run_hardened.py
+tests/screenshots/
+tests/.playwright-auth-state.json
+*.log
+
+# Dev docs / scratch (not needed at runtime)
+*.md
+!README.md
+!SECURITY.md

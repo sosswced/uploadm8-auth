@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Privacy Policy - UploadM8</title>
@@ -62,7 +64,7 @@
         @media (max-width: 1024px) { .content-wrapper { grid-template-columns: 1fr; } .sidebar-toc { display: none; } }
 
         /* SIDEBAR TOC */
-        .sidebar-toc { position: sticky; top: 80px; }
+        .sidebar-toc { position: sticky; top: 5.5rem; z-index: 1; }
         .toc-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-lg); padding: 1.5rem; }
         .toc-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 1rem; }
         .toc-list { list-style: none; }
@@ -123,6 +125,12 @@
         ::-webkit-scrollbar-track { background: var(--bg-secondary); }
         ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
+        @media (max-width: 480px) {
+            .hero { padding: 2.5rem 1.25rem 2rem; }
+            .hero h1 { font-size: 2rem; }
+            .nav { padding: 0.75rem 1rem; }
+            .content-wrapper { padding: 2rem 1.25rem 3rem; }
+        }
     </style>
 </head>
 <body>
@@ -130,7 +138,7 @@
 <nav class="nav">
     <div class="nav-container">
         <a href="index.html" class="nav-logo">
-            <img src="../../images/logo.png" alt="UploadM8" style="height:32px;width:auto;">
+            <img src="images/logo.svg" alt="UploadM8" style="height:32px;width:auto;">
             UploadM8
         </a>
         <a href="index.html" class="back-btn"><i class="fas fa-arrow-left"></i> Back to Home</a>
@@ -143,7 +151,7 @@
         <h1>UploadM8 Privacy Policy</h1>
         <div class="hero-meta">
             <span><i class="fas fa-calendar"></i> Effective: January 1, 2026</span>
-            <span><i class="fas fa-clock"></i> Last Updated: February 2026</span>
+            <span><i class="fas fa-clock"></i> Last updated: April 2026</span>
             <span><i class="fas fa-map-marker-alt"></i> Governing Law: Missouri, USA</span>
         </div>
     </div>
@@ -181,7 +189,7 @@
                 <p>When you create an UploadM8 account, we collect your name, email address, password (stored as a cryptographic hash), and billing information (processed by Stripe — we never store raw card data).</p>
 
                 <h3>Content You Upload</h3>
-                <p>Videos, thumbnails, titles, captions, hashtags, and other metadata you submit through our platform. This content is temporarily stored in Cloudflare R2 storage during processing and publishing. Original uploads are retained for 30 days after publication unless you delete them sooner.</p>
+                <p>Videos, thumbnails, titles, captions, hashtags, and other metadata you submit through our platform. This content is stored in <strong>Cloudflare R2</strong> during processing, publishing, and for a limited period afterward so you can re-download, troubleshoot, or re-run parts of the pipeline. <strong>Retention targets:</strong> we aim to remove source and derivative objects within about <strong>30 days after publication</strong> (sooner if you delete the upload or your account). Intermediate transcoded files may be removed on a shorter schedule. Actual timing can vary slightly with operational load, retries, and legal holds.</p>
 
                 <h3>Platform Integration Data</h3>
                 <p>When you connect social media accounts (TikTok, YouTube, Instagram, Facebook), we receive and store OAuth access tokens and refresh tokens necessary to publish on your behalf. We also receive basic profile information (username, channel/page name, profile photo URL) to display in your dashboard.</p>
@@ -190,7 +198,18 @@
                 <p>Log data (IP addresses, browser type, pages visited, timestamps), device information, and platform-specific analytics (views, engagement metrics) when available through platform APIs.</p>
 
                 <h3>AI Feature Data</h3>
-                <p>When you use AIC token-powered features, your video frames, transcripts, and metadata may be processed by third-party AI providers (Anthropic Claude API) solely to generate captions, titles, and thumbnails. This content is not retained by the AI provider beyond the processing request.</p>
+                <p>When you use AIC- or PUT-metered features, we process your video (and sometimes still images) through a pipeline that may include:</p>
+                <ul>
+                    <li><strong>Frame extraction &amp; language/vision models:</strong> keyframes and prompts are sent to <strong>OpenAI</strong> (configurable models such as GPT-4o / GPT-4o-mini) to generate captions, titles, hashtags, and related text.</li>
+                    <li><strong>Audio transcription (Whisper):</strong> if your video contains speech, we extract a temporary audio clip (e.g. WAV) via FFmpeg and send it to <strong>OpenAI Whisper</strong>. The transcript improves caption quality; it is not kept as a separate long-term record beyond what is needed for the job and your saved caption metadata. You may opt out in <a href="settings.html">Settings → Preferences</a> (speech-to-text / audio context options).</li>
+                    <li><strong>Google Cloud (when enabled):</strong> still frames may be analyzed with <strong>Cloud Vision</strong> (faces, labels, text); full clips may be analyzed with <strong>Video Intelligence</strong> (labels, shots) when that stage is on.</li>
+                    <li><strong>Thumbnail &amp; image generation (when enabled):</strong> our worker may call <strong>Replicate</strong>, <strong>fal.ai</strong>, and/or <strong>remove.bg</strong> for image generation or background removal as part of thumbnail composition.</li>
+                    <li><strong>Pikzels (Thumbnail Studio):</strong> when you use <a href="thumbnail-studio.html">Thumbnail Studio</a> and the feature is configured for your environment, still images, prompts, and related inputs are sent to <strong>Pikzels</strong> (<code>api.pikzels.com</code>) under their terms. Usage is metered against your wallet where applicable.</li>
+                    <li><strong>Optional stages (when enabled in our environment):</strong> <strong>Twelve Labs</strong> for deep video understanding; <strong>ACRCloud</strong> for optional music recognition.</li>
+                    <li><strong>On-worker processing:</strong> <strong>YAMNet</strong> (TensorFlow Hub) may classify audio events locally on our worker. <strong>Playwright</strong> may render HTML thumbnails inside our containers.</li>
+                    <li><strong>Trend / search helpers (when enabled):</strong> optional queries may go to <strong>SerpAPI</strong> and/or the <strong>YouTube Data API</strong> for research-style features — not required for core publishing.</li>
+                </ul>
+                <p>Third-party AI providers process inputs to return outputs to us. We do not use your content to train UploadM8-owned models. Whether a vendor may retain or train on API inputs is governed by <em>their</em> terms and product tier — see each provider’s policy linked from <a href="subprocessors.html">Subprocessors</a>.</p>
             </div>
         </div>
 
@@ -257,7 +276,7 @@
             <div class="prose">
                 <p>We use the data we collect exclusively for the following purposes:</p>
                 <ul>
-                    <li><strong>Service Delivery:</strong> Processing and publishing your videos to connected platforms, generating AI-enhanced metadata, delivering scheduling and queue management.</li>
+                    <li><strong>Service Delivery:</strong> Processing and publishing your videos to connected platforms, generating AI-enhanced metadata (including optional speech transcription via Whisper), delivering scheduling and queue management.</li>
                     <li><strong>Account Management:</strong> Authentication, subscription billing, plan enforcement, usage quota tracking.</li>
                     <li><strong>Analytics & Reporting:</strong> Providing your Trill telemetry dashboard with cross-platform performance data pulled from platform APIs.</li>
                     <li><strong>Platform Communications:</strong> Transactional emails (upload confirmations, failed job alerts, billing receipts, security notifications).</li>
@@ -312,9 +331,9 @@
                         <td>Legal requirement (tax compliance)</td>
                     </tr>
                     <tr>
-                        <td>Audit Logs</td>
-                        <td>12 months</td>
-                        <td>Rolling purge</td>
+                        <td>Admin / system event logs</td>
+                        <td>Rolling window (typically about 6 months)</td>
+                        <td>Automatic purge of older rows</td>
                     </tr>
                     <tr>
                         <td>Database Backups</td>
@@ -338,7 +357,7 @@
                 <h3>Method 2: Platform Disconnect</h3>
                 <p>Navigate to <strong>Settings → Platforms → Disconnect</strong>. OAuth tokens for that platform are revoked and deleted within 24 hours. This does not delete your UploadM8 account.</p>
                 <h3>Method 3: Direct Request</h3>
-                <p>Email <a href="/cdn-cgi/l/email-protection#6515170c1304061c251015090a0401085d4b060a08"><span class="__cf_email__" data-cfemail="6d1d1f041b0c0e142d181d01020c090055430e0200">[email&#160;protected]</span></a> with subject line "Data Deletion Request." We acknowledge within 5 business days and complete deletion within 30 days, providing written confirmation upon completion.</p>
+                <p>Email <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a> with subject line "Data Deletion Request." We acknowledge within 5 business days and complete deletion within 30 days, providing written confirmation upon completion.</p>
                 <div class="callout callout-blue">
                     <i class="fas fa-info-circle"></i>
                     <div>UploadM8 also maintains a dedicated data deletion page at <a href="data-deletion.html">uploadm8.com/data-deletion</a> to comply with TikTok, Meta, and YouTube platform review requirements.</div>
@@ -355,10 +374,12 @@
             <div class="prose">
                 <p>We share your data only with the following categories of service providers (subprocessors) strictly necessary to deliver our service:</p>
                 <ul>
-                    <li><strong>Infrastructure:</strong> Render (hosting), PostgreSQL (database), Redis (job queue), Cloudflare R2 (file storage)</li>
+                    <li><strong>Infrastructure:</strong> Render (hosting), PostgreSQL (database), Redis (job queue), Cloudflare R2 (object storage)</li>
                     <li><strong>Payments:</strong> Stripe (billing — PCI DSS Level 1 compliant)</li>
-                    <li><strong>AI Processing:</strong> Anthropic (Claude API — for AIC token AI features, no data retained)</li>
-                    <li><strong>Platform APIs:</strong> TikTok, YouTube/Google, Meta (for publishing only)</li>
+                    <li><strong>Email:</strong> Mailgun (transactional email)</li>
+                    <li><strong>AI &amp; media analysis:</strong> OpenAI (language, vision, Whisper); optionally Google Cloud (Vision, Video Intelligence), Twelve Labs, ACRCloud, Replicate, fal.ai, remove.bg, and Pikzels when those integrations are enabled</li>
+                    <li><strong>Reliability (optional):</strong> Sentry (error and performance telemetry when <code>SENTRY_DSN</code> is configured — may include request paths, stack traces, and limited context)</li>
+                    <li><strong>Platform APIs:</strong> TikTok, YouTube/Google, Meta (for publishing and analytics you request)</li>
                 </ul>
                 <p>All subprocessors are bound by data processing agreements. See our full <a href="subprocessors.html">Subprocessors List</a> for complete details including data locations and privacy policy links.</p>
                 <p>We may disclose your data if legally required by court order, government request, or to protect our rights, property, or safety. We will notify you of any such disclosure to the extent permitted by law.</p>
@@ -386,7 +407,7 @@
                     <tr>
                         <td>Access</td>
                         <td>Request a copy of all personal data we hold about you</td>
-                        <td>Email <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="8cfcfee5faedeff5ccf9fce0e3ede8e1b4a2efe3e1">[email&#160;protected]</a></td>
+                        <td>Email <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a></td>
                     </tr>
                     <tr>
                         <td>Correction</td>
@@ -401,12 +422,12 @@
                     <tr>
                         <td>Portability</td>
                         <td>Receive your data in a machine-readable format</td>
-                        <td>Email <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="7505071c0314160c350005191a1411184d5b161a18">[email&#160;protected]</a></td>
+                        <td>Email <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a></td>
                     </tr>
                     <tr>
                         <td>Objection</td>
                         <td>Object to processing for direct marketing</td>
-                        <td>Email <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="1666647f6077756f5663667a7977727b2e3875797b">[email&#160;protected]</a></td>
+                        <td>Email <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a></td>
                     </tr>
                     <tr>
                         <td>Opt-Out (CCPA)</td>
@@ -431,7 +452,7 @@
                     <i class="fas fa-exclamation-circle"></i>
                     <div>UploadM8 is not intended for children under 13 years of age. We do not knowingly collect personal information from children under 13. If you are between 13 and 17, you may use UploadM8 only with verified parental or guardian consent.</div>
                 </div>
-                <p>If we discover that we have inadvertently collected data from a child under 13, we will delete that information immediately. If you believe we have collected data from a minor without appropriate consent, contact us at <a href="/cdn-cgi/l/email-protection#b2c2c0dbc4d3d1cbf2c7c2deddd3d6df8a9cd1dddf"><span class="__cf_email__" data-cfemail="fb8b89928d9a9882bb8e8b97949a9f96c3d5989496">[email&#160;protected]</span></a> immediately.</p>
+                <p>If we discover that we have inadvertently collected data from a child under 13, we will delete that information immediately. If you believe we have collected data from a minor without appropriate consent, contact us at <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a> immediately.</p>
             </div>
         </div>
 
@@ -449,7 +470,7 @@
                     <li>Bcrypt password hashing with appropriate cost factor</li>
                     <li>Role-based access control with principle of least privilege</li>
                     <li>Automated 30-day database backup rotation</li>
-                    <li>Comprehensive audit logging of all data access and modifications</li>
+                    <li>Operational and security logging (admin/system logs kept for a rolling window, typically about six months)</li>
                     <li>Security incident response with 72-hour breach notification target</li>
                 </ul>
                 <p>For complete details, see our <a href="security.html">Security Overview</a>.</p>
@@ -487,7 +508,7 @@
             </div>
             <div class="prose">
                 <p>For privacy-related inquiries, data requests, or to exercise your rights:</p>
-                <p><strong>Email:</strong> <a href="/cdn-cgi/l/email-protection#deaeacb7a8bfbda79eabaeb2b1bfbab3e6f0bdb1b3"><span class="__cf_email__" data-cfemail="abdbd9c2ddcac8d2ebdedbc7c4cacfc69385c8c4c6">[email&#160;protected]</span></a><br>
+                <p><strong>Email:</strong> <a href="mailto:privacy@uploadm8.com">privacy@uploadm8.com</a><br>
                 <strong>Response Time:</strong> Within 5 business days<br>
                 <strong>Mailing Address:</strong> UploadM8, Kansas City, Missouri, USA</p>
             </div>
@@ -520,9 +541,37 @@
     <div class="footer-inner">
         <div class="footer-copy">© 2026 UploadM8. All rights reserved.</div>
         <div class="footer-links">
+            <a href="how-it-works.html">How it works</a>
+            <a href="contact.html">Contact</a>
             <a href="privacy.html" class="active">Privacy</a>
             <a href="terms.html">Terms</a>
             <a href="security.html">Security</a>
             <a href="cookies.html">Cookies</a>
             <a href="subprocessors.html">Subprocessors</a>
-            <a href="re
+            <a href="refunds.html">Refunds</a>
+            <a href="dmca.html">DMCA</a>
+            <a href="support.html">Support</a>
+            <a href="https://discord.gg/TVDAc8fnwu" target="_blank" rel="noopener">Discord</a>
+        </div>
+    </div>
+</footer>
+
+<script src="js/api-base.js"></script>
+<script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+<script src="js/session-user-hydrate.js"></script>
+<script src="js/public-shell-hydrate.js"></script>
+<script>
+    const sections = document.querySelectorAll('.section-block[id]');
+    const tocLinks = document.querySelectorAll('.toc-list a');
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                tocLinks.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+            }
+        });
+    }, { rootMargin: '-20% 0% -60% 0%' });
+    sections.forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

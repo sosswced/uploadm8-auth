@@ -1,16 +1,18 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+
+    <script src="js/html-safe.js"></script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000;">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; img-src 'self' data: https:; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; connect-src 'self' https://auth.uploadm8.com http://127.0.0.1:8000 http://localhost:8000 http://127.0.0.1:8001 http://localhost:8001 https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://cdn.sheetjs.com;">
     <title>Admin Dashboard - UploadM8</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
-    <link rel="icon" type="image/png" sizes="32x32" href="images/logo.png">
+    <link rel="icon" type="image/svg+xml" href="images/logo.svg">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="styles.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js" integrity="sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <style>
         .admin-header{background:linear-gradient(135deg,rgba(239,68,68,0.1) 0%,rgba(249,115,22,0.1) 100%);border:1px solid rgba(239,68,68,0.2);border-radius:16px;padding:1.5rem;margin-bottom:2rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem}
         .admin-header-left h1{font-size:1.5rem;font-weight:700;margin:0 0 0.25rem 0;display:flex;align-items:center;gap:0.5rem}
@@ -29,11 +31,13 @@
         .action-card-icon{width:48px;height:48px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:1.25rem;flex-shrink:0}
         .action-card.users .action-card-icon{background:rgba(59,130,246,0.15);color:#3b82f6}
         .action-card.kpi .action-card-icon{background:rgba(139,92,246,0.15);color:#8b5cf6}
+        .action-card.marketing .action-card-icon{background:rgba(249,115,22,0.15);color:#f97316}
         .action-card.stripe .action-card-icon{background:rgba(99,102,241,0.15);color:#6366f1}
         .action-card.announce .action-card-icon{background:rgba(249,115,22,0.15);color:#f97316}
         .action-card-content{flex:1;min-width:0}
         .action-card-title{font-weight:600;font-size:0.95rem;margin-bottom:0.25rem}
         .action-card-desc{font-size:0.8rem;color:var(--text-muted)}
+        .integrity-badge{display:inline-flex;align-items:center;gap:.3rem;margin-left:.45rem;padding:.08rem .45rem;border-radius:999px;border:1px solid rgba(239,68,68,.35);color:#ef4444;font-size:.68rem;font-weight:700;vertical-align:middle}
         .summary-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:1rem;margin-bottom:2rem}
         @media(max-width:1400px){.summary-grid{grid-template-columns:repeat(3,1fr)}}
         @media(max-width:900px){.summary-grid{grid-template-columns:repeat(2,1fr)}}
@@ -99,7 +103,7 @@
         .loading-state{display:flex;align-items:center;justify-content:center;padding:3rem;flex-direction:column;gap:1rem}
         .loading-spinner{width:40px;height:40px;border:3px solid var(--border-color);border-top-color:var(--accent-orange);border-radius:50%;animation:spin 1s linear infinite}
         @keyframes spin{to{transform:rotate(360deg)}}
-        .access-denied{display:flex;align-items:center;justify-content:center;min-height:60vh;flex-direction:column;gap:1rem;text-align:center}
+        .access-denied{display:flex;align-items:center;justify-content:min-height:60vh;flex-direction:column;gap:1rem;text-align:center}
         .access-denied-icon{width:64px;height:64px;background:rgba(239,68,68,0.1);border-radius:50%;display:flex;align-items:center;justify-content:center;color:#ef4444;font-size:1.5rem}
         .empty-state{text-align:center;padding:2rem;color:var(--text-muted)}
         .refresh-indicator{font-size:0.75rem;color:var(--text-muted);display:flex;align-items:center;gap:0.375rem}
@@ -146,6 +150,20 @@
         .btn-send:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(249,115,22,0.3)}
         .btn-send:disabled{opacity:0.6;cursor:not-allowed;transform:none;box-shadow:none}
         .btn-cancel{padding:0.75rem 1.25rem;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-secondary);font-weight:500;font-size:0.875rem;cursor:pointer;transition:all 0.2s}
+
+        /* ── Mobile overrides for Admin page ── */
+        @media(max-width:768px){
+            .users-table{min-width:600px;}
+            .users-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+            .section-grid{grid-template-columns:1fr;}
+            .modal-footer{flex-direction:column;align-items:stretch;}
+            .modal-footer .btn-send,.modal-footer .btn-cancel{width:100%;justify-content:center;text-align:center;}
+        }
+        @media(max-width:640px){
+            .admin-header{flex-direction:column;align-items:flex-start;}
+            .admin-badge{align-self:flex-start;}
+            .activity-list{max-height:200px;}
+        }
         .btn-cancel:hover{background:var(--bg-hover);color:var(--text-primary)}
         .sending-progress{display:none;text-align:center;padding:2rem}
         .sending-progress.active{display:block}
@@ -210,42 +228,19 @@
         .billing-date-item label{display:block;font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;margin-bottom:0.375rem}
         .billing-date-item input{width:100%;padding:0.5rem;background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;color:var(--text-primary);font-size:0.8rem}
         .billing-date-item input:focus{outline:none;border-color:var(--accent-orange)}
+        .email-job-grid{display:grid;grid-template-columns:repeat(2,minmax(200px,1fr));gap:0.5rem;margin-top:0.75rem}
+        @media(max-width:768px){.email-job-grid{grid-template-columns:1fr}}
+        .email-job-btn{padding:0.625rem 0.875rem;background:var(--bg-input);border:1px solid var(--border-color);border-radius:8px;color:var(--text-secondary);font-size:0.8rem;font-weight:600;cursor:pointer;transition:all 0.2s;text-align:left}
+        .email-job-btn:hover{border-color:var(--accent-orange);color:var(--text-primary);background:var(--bg-hover)}
+        .email-job-btn.primary{background:rgba(249,115,22,0.14);border-color:rgba(249,115,22,0.45);color:#f97316}
+        .email-job-btn:disabled{opacity:0.6;cursor:not-allowed}
     </style>
 </head>
 <body>
     <div class="app-layout">
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header"><a href="dashboard.html" class="sidebar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></a></div>
-            <nav class="sidebar-nav">
-                <div class="nav-section"><div class="nav-section-title">Main</div>
-                    <a href="dashboard.html" class="nav-link"><i class="fas fa-home"></i><span>Dashboard</span></a>
-                    <a href="upload.html" class="nav-link"><i class="fas fa-cloud-upload-alt"></i><span>Upload</span></a>
-                    <a href="queue.html" class="nav-link"><i class="fas fa-list"></i><span>Queue</span></a>
-                    <a href="scheduled.html" class="nav-link"><i class="fas fa-calendar-alt"></i><span>Scheduled</span></a>
-                </div>
-                <div class="nav-section"><div class="nav-section-title">Platforms</div>
-                    <a href="platforms.html" class="nav-link"><i class="fas fa-plug"></i><span>Connected Accounts</span></a>
-                    <a href="groups.html" class="nav-link"><i class="fas fa-layer-group"></i><span>Account Groups</span></a>
-                </div>
-                <div class="nav-section"><div class="nav-section-title">Insights</div>
-                    <a href="analytics.html" class="nav-link"><i class="fas fa-chart-line"></i><span>Analytics</span></a>
-                </div>
-                <div class="nav-section admin-only" id="adminSection" style="display:none;"><div class="nav-section-title">Admin</div>
-                    <a href="admin.html" class="nav-link active"><i class="fas fa-shield-alt"></i><span>Admin Panel</span></a>
-                    <a href="account-management.html" class="nav-link"><i class="fas fa-users-cog"></i><span>Account Mgmt</span></a>
-                    <a href="admin-kpi.html" class="nav-link"><i class="fas fa-chart-pie"></i><span>KPI Dashboard</span></a>
-                    <a href="admin-calculator.html" class="nav-link"> <i class="fas fa-calculator"></i> <span>Biz Calculator</span> </a>
-                    <a href="admin-wallet.html" class="nav-link"><i class="fas fa-coins"></i><span>Wallet Manager</span></a>
-                </div>
-                <div class="nav-section"><div class="nav-section-title">Account</div>
-                    <a href="settings.html" class="nav-link"><i class="fas fa-sliders-h"></i><span>Settings</span></a>
-                    <a href="guide.html" class="nav-link"><i class="fas fa-book-open"></i><span>Feature Guide</span></a>
-                </div>
-            </nav>
-            <div class="sidebar-footer"><div class="user-info"><div class="user-avatar" id="userAvatar">U</div><div class="user-details"><div class="user-name" id="userName">Loading...</div><div class="user-tier" id="userTier">-</div></div><button class="btn btn-ghost btn-icon" onclick="logout()" title="Sign Out"><i class="fas fa-sign-out-alt"></i></button></div></div>
-        </aside>
-        <div class="sidebar-overlay hidden" id="sidebarOverlay" onclick="toggleSidebar()"></div>
-        <header class="top-bar"><button class="menu-toggle" id="menuToggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button><div class="top-bar-logo"><img src="images/logo.png" alt="UploadM8"><span>UploadM8</span></div><div class="top-bar-actions"><button class="theme-toggle" onclick="toggleTheme()"><i class="fas fa-moon"></i></button></div></header>
+        <aside class="sidebar" id="sidebar"></aside>
+        <div class="sidebar-overlay hidden" id="sidebarOverlay"></div>
+        <header class="top-bar"><button type="button" class="menu-toggle" id="menuToggle" aria-label="Open menu"><i class="fas fa-bars"></i></button><div class="top-bar-logo"><img src="images/logo.svg" alt="UploadM8"><span>UploadM8</span></div><div class="top-bar-actions"><div data-wt-pills></div><button class="theme-toggle" data-um8-fn="toggleTheme"><i class="fas fa-moon"></i></button></div></header>
         
         <main class="main-content">
             <div id="loadingState" class="loading-state"><div class="loading-spinner"></div><div>Verifying admin access...</div></div>
@@ -254,7 +249,8 @@
             <div id="adminContent" style="display:none;">
                 <div class="admin-header">
                     <div class="admin-header-left"><h1><i class="fas fa-shield-alt"></i> Admin Dashboard</h1><p>Overview of key metrics and quick actions</p></div>
-                    <div style="display:flex;align-items:center;gap:1rem;">
+                    <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;">
+                        <div data-wt-pills class="desktop-pills"></div>
                         <div class="refresh-indicator" id="refreshIndicator"><i class="fas fa-sync-alt"></i><span id="lastUpdated">Updating...</span></div>
                         <div class="admin-badge"><i class="fas fa-crown"></i><span id="adminRoleBadge">ADMIN</span></div>
                     </div>
@@ -263,14 +259,21 @@
                 <div class="admin-nav">
                     <a href="admin.html" class="admin-nav-btn active">Overview</a>
                     <a href="account-management.html" class="admin-nav-btn">Users</a>
-                    <a href="admin-kpi.html" class="admin-nav-btn">KPI Dashboard</a>
+                    <a href="admin-kpi.html" class="admin-nav-btn">Admin KPIs</a>
+                    <a href="admin-marketing.html" class="admin-nav-btn">Marketing Ops</a>
+                    <a href="admin-data-integrity.html" class="admin-nav-btn">Data Integrity Audit</a>
+                    <a href="admin-incidents.html" class="admin-nav-btn">Ops incidents</a>
                 </div>
                 
                 <div class="actions-grid">
                     <a href="account-management.html" class="action-card users"><div class="action-card-icon"><i class="fas fa-users-cog"></i></div><div class="action-card-content"><div class="action-card-title">Manage Users</div><div class="action-card-desc">View, edit, or ban users</div></div></a>
-                    <a href="admin-kpi.html" class="action-card kpi"><div class="action-card-icon"><i class="fas fa-chart-bar"></i></div><div class="action-card-content"><div class="action-card-title">KPI Dashboard</div><div class="action-card-desc">Detailed analytics</div></div></a>
-                    <div class="action-card stripe" onclick="window.open('https://dashboard.stripe.com','_blank')"><div class="action-card-icon"><i class="fab fa-stripe-s"></i></div><div class="action-card-content"><div class="action-card-title">Stripe Dashboard</div><div class="action-card-desc">Payments & invoices</div></div></div>
-                    <div class="action-card announce" onclick="openAnnouncementModal()"><div class="action-card-icon"><i class="fas fa-bullhorn"></i></div><div class="action-card-content"><div class="action-card-title">Send Announcement</div><div class="action-card-desc">Email & Discord</div></div></div>
+                    <a href="admin-kpi.html" class="action-card kpi"><div class="action-card-icon"><i class="fas fa-chart-pie"></i></div><div class="action-card-content"><div class="action-card-title">Admin KPIs</div><div class="action-card-desc">Business-wide metrics</div></div></a>
+                    <a href="kpi.html" class="action-card users"><div class="action-card-icon"><i class="fas fa-chart-bar"></i></div><div class="action-card-content"><div class="action-card-title">Upload KPIs</div><div class="action-card-desc">Your account throughput &amp; ML scores</div></div></a>
+                    <a href="admin-marketing.html" class="action-card marketing"><div class="action-card-icon"><i class="fas fa-bullhorn"></i></div><div class="action-card-content"><div class="action-card-title">Marketing Ops</div><div class="action-card-desc">AI campaigns, truth metrics, outreach</div></div></a>
+                    <a href="admin-data-integrity.html?severity=ERROR&hours=72" class="action-card kpi"><div class="action-card-icon"><i class="fas fa-shield-check"></i></div><div class="action-card-content"><div class="action-card-title">Data Integrity Audit <span id="integrityErrBadge" class="integrity-badge" style="display:none;">0 errors/72h</span></div><div class="action-card-desc">Rollup failures, missing data, corrections</div></div></a>
+                    <a href="admin-incidents.html" class="action-card users"><div class="action-card-icon"><i class="fas fa-ambulance"></i></div><div class="action-card-content"><div class="action-card-title">Ops incidents</div><div class="action-card-desc">Failures, bug reports, client errors</div></div></a>
+                    <div class="action-card stripe" data-um8-open-blank="1" data-um8-href="https://dashboard.stripe.com" role="link" tabindex="0"><div class="action-card-icon"><i class="fab fa-stripe-s"></i></div><div class="action-card-content"><div class="action-card-title">Stripe Dashboard</div><div class="action-card-desc">Payments & invoices</div></div></div>
+                    <div class="action-card announce" data-um8-fn="openAnnouncementModal"><div class="action-card-icon"><i class="fas fa-bullhorn"></i></div><div class="action-card-content"><div class="action-card-title">Send Announcement</div><div class="action-card-desc">Email & Discord</div></div></div>
                 </div>
                 
                 <div class="summary-grid">
@@ -530,6 +533,31 @@
                                     <span class="toggle-slider"></span>
                                 </label>
                             </div>
+                            <div class="toggle-item">
+                                <div class="toggle-item-icon cyan"><i class="fas fa-chart-bar"></i></div>
+                                <div class="toggle-item-content">
+                                    <h4>Weekly digest — platform KPI rollups</h4>
+                                    <p>On Monday, rebuild the platform_kpi_rollups_daily table from uploads for the reporting window and include the per-platform breakdown in the admin KPI email. Turn off to skip DB work and omit that section (the email still sends if the weekly report toggle above is on).</p>
+                                    <div class="toggle-item-meta">
+                                        <span class="meta-tag">per-platform</span>
+                                        <span class="meta-tag">views / likes</span>
+                                        <span class="meta-tag">upload counts</span>
+                                    </div>
+                                    <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                                        <button type="button" class="btn-test" id="btnRebuildPlatformRollups" data-um8-fn="rebuildPlatformKpiRollups">
+                                            <i class="fas fa-sync-alt"></i> Rebuild rollups now
+                                        </button>
+                                        <label style="font-size:12px;color:#9ca3af;display:flex;align-items:center;gap:6px;">
+                                            Days
+                                            <input type="number" id="platformRollupsRefreshDays" min="1" max="90" value="7" style="width:56px;padding:4px 8px;border-radius:6px;border:1px solid #374151;background:#111827;color:#e5e7eb;">
+                                        </label>
+                                    </div>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="toggleWeeklyPlatformRollups" data-setting="weekly_digest_platform_kpi_rollups">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
                         </div>
                     </div>
                     
@@ -627,7 +655,7 @@
                             <label>Admin Alerts Webhook (Revenue, Costs, Billing)</label>
                             <div class="webhook-row">
                                 <input type="text" class="webhook-input" id="adminWebhookUrl" placeholder="https://discord.com/api/webhooks/...">
-                                <button class="btn-test" id="testWebhookBtn" onclick="testWebhook()"><i class="fab fa-discord"></i> Test</button>
+                                <button class="btn-test" id="testWebhookBtn" data-um8-fn="testWebhook"><i class="fab fa-discord"></i> Test</button>
                             </div>
                         </div>
                     </div>
@@ -636,9 +664,28 @@
                         <div class="notif-status">
                             <span id="saveStatusText"></span>
                         </div>
-                        <button class="btn-save-notif" id="saveNotifBtn" onclick="saveNotificationSettings()">
+                        <button class="btn-save-notif" id="saveNotifBtn" data-um8-fn="saveNotificationSettings">
                             <i class="fas fa-save"></i> Save Settings
                         </button>
+                    </div>
+                    <div class="notif-section" style="margin-top:1rem;">
+                        <div class="notif-section-header">
+                            <div class="notif-section-icon orange"><i class="fas fa-bolt"></i></div>
+                            <div class="notif-section-info">
+                                <h3 class="notif-section-title">Email Job Smoke Tests</h3>
+                                <p class="notif-section-desc">Force-run backend cron email jobs for live verification (master admin only)</p>
+                            </div>
+                        </div>
+                        <div class="email-job-grid">
+                            <button class="email-job-btn" id="runTrialReminderBtn" data-um8-fn="runEmailJob" data-um8-args='["trial_reminders"]'><i class="fas fa-hourglass-half"></i> Run Trial Reminders</button>
+                            <button class="email-job-btn" id="runUserDigestBtn" data-um8-fn="runEmailJob" data-um8-args='["monthly_user_digest"]'><i class="fas fa-chart-line"></i> Run Monthly User Digest</button>
+                            <button class="email-job-btn" id="runAdminDigestBtn" data-um8-fn="runEmailJob" data-um8-args='["weekly_admin_digest"]'><i class="fas fa-user-shield"></i> Run Weekly Admin Digest</button>
+                            <button class="email-job-btn" id="runScheduleAlertBtn" data-um8-fn="runEmailJob" data-um8-args='["scheduled_publish_alerts"]'><i class="fas fa-calendar-exclamation"></i> Run Scheduled Alerts</button>
+                            <button class="email-job-btn primary" id="runAllEmailJobsBtn" data-um8-fn="runEmailJob" data-um8-args='["all"]'><i class="fas fa-play-circle"></i> Run All Email Jobs</button>
+                        </div>
+                        <div class="notif-status" style="margin-top:0.85rem;">
+                            <span id="emailJobsStatus">No email job runs yet.</span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -649,7 +696,7 @@
         <div class="modal">
             <div class="modal-header">
                 <h2 class="modal-title"><i class="fas fa-bullhorn"></i> Send Announcement</h2>
-                <button class="modal-close" onclick="closeAnnouncementModal()"><i class="fas fa-times"></i></button>
+                <button class="modal-close" data-um8-fn="closeAnnouncementModal"><i class="fas fa-times"></i></button>
             </div>
             <div class="modal-body" id="announcementForm">
                 <div class="form-group">
@@ -681,10 +728,11 @@
                     <div class="tier-select" id="tierSelection">
                         <label class="form-label" style="margin-top:0.75rem;">Select Tiers</label>
                         <div class="checkbox-group">
-                            <div class="checkbox-item"><input type="checkbox" id="tierLaunch"><label for="tierLaunch">Launch</label></div>
-                            <div class="checkbox-item"><input type="checkbox" id="tierPro"><label for="tierPro">Creator Pro</label></div>
+                            <div class="checkbox-item"><input type="checkbox" id="tierCreatorLite"><label for="tierCreatorLite">Creator Lite</label></div>
+                            <div class="checkbox-item"><input type="checkbox" id="tierCreatorPro"><label for="tierCreatorPro">Creator Pro</label></div>
                             <div class="checkbox-item"><input type="checkbox" id="tierStudio"><label for="tierStudio">Studio</label></div>
                             <div class="checkbox-item"><input type="checkbox" id="tierAgency"><label for="tierAgency">Agency</label></div>
+                            <div class="checkbox-item"><input type="checkbox" id="tierFriendsFamily"><label for="tierFriendsFamily">Friends &amp; Family</label></div>
                         </div>
                     </div>
                     <div class="user-search" id="userSearchContainer">
@@ -697,27 +745,52 @@
             </div>
             <div class="sending-progress" id="sendingProgress"><div class="loading-spinner" style="margin:0 auto 1rem;"></div><h4>Sending Announcement...</h4><p id="sendingStatus">Preparing...</p></div>
             <div class="modal-footer" id="announcementFooter">
-                <button class="btn-cancel" onclick="closeAnnouncementModal()">Cancel</button>
-                <button class="btn-send" onclick="sendAnnouncement()"><i class="fas fa-paper-plane"></i> Send</button>
+                <button class="btn-cancel" data-um8-fn="closeAnnouncementModal">Cancel</button>
+                <button class="btn-send" data-um8-fn="sendAnnouncement"><i class="fas fa-paper-plane"></i> Send</button>
             </div>
         </div>
     </div>
     
     <div id="toastContainer"></div>
-    <script src="wallet-tokens.js"></script>
+    <script src="js/api-base.js"></script>
+    <script src="js/auth-stack.js"></script>
+<script src="js/delegated-ui.js"></script>
+    <script src="js/session-user-hydrate.js"></script>
+    <script src="js/public-shell-hydrate.js"></script>
+    <script src="shared-sidebar.js"></script>
+    <script src="js/helpers-formatting.js"></script>
+    <script src="js/upload-utils.js"></script>
     <script src="app.js"></script>
+    <script src="wallet-tokens.js"></script>
     <script>
     (function(){
         'use strict';
-        const API_BASE = window.API_BASE || (typeof location !== 'undefined' && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(location.origin) ? 'http://127.0.0.1:8000' : 'https://auth.uploadm8.com');
         const TOKEN_KEY = 'uploadm8_access_token';
         let revenueChart = null, userGrowthChart = null, allUsers = [], selectedUserIds = [];
         
-        function getToken(){ return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY); }
-        function clearTokensAndRedirect(msg){ localStorage.removeItem(TOKEN_KEY); localStorage.removeItem('uploadm8_refresh_token'); sessionStorage.removeItem(TOKEN_KEY); if(msg) sessionStorage.setItem('uploadm8_auth_message', msg); window.location.href = 'login.html'; }
-        function showToast(msg, type='info'){ const c=document.getElementById('toastContainer'); if(!c) return; const t=document.createElement('div'); t.className=`toast toast-${type}`; t.innerHTML=`<i class="fas fa-${type==='success'?'check-circle':type==='error'?'exclamation-circle':'info-circle'}"></i><span>${msg}</span>`; c.appendChild(t); setTimeout(()=>t.classList.add('show'),10); setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},4000); }
+        function escapeHtml(s) {
+            return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+        function getToken(){ return (typeof window.getAccessToken === 'function' && window.getAccessToken()) || sessionStorage.getItem(TOKEN_KEY) || ''; }
+        function clearTokensAndRedirect(msg){
+            if (typeof window.clearTokens === 'function') window.clearTokens();
+            else {
+                try { sessionStorage.removeItem(TOKEN_KEY); sessionStorage.removeItem('uploadm8_refresh_token'); } catch (e) {}
+                try { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem('uploadm8_refresh_token'); } catch (e) {}
+            }
+            if (msg) sessionStorage.setItem('uploadm8_auth_message', msg);
+            window.location.href = 'login.html';
+        }
+        function showToast(msg, type='info'){ const c=document.getElementById('toastContainer'); if(!c) return; const t=document.createElement('div'); t.className=`toast toast-${type}`; const safe=(typeof escapeHtml==='function')?escapeHtml(String(msg??'')):String(msg??''); t.innerHTML=`<i class="fas fa-${type==='success'?'check-circle':type==='error'?'exclamation-circle':'info-circle'}"></i><span>${safe}</span>`; c.appendChild(t); setTimeout(()=>t.classList.add('show'),10); setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.remove(),300);},4000); }
         
-        async function fetchAPI(endpoint){ const token=getToken(); try{ const r=await fetch(`${API_BASE}${endpoint}`,{headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'}}); if(r.ok) return await r.json(); return null; }catch(e){ console.error(`Error fetching ${endpoint}:`,e); return null; } }
+        async function fetchAPI(endpoint){
+            try {
+                return await window.apiCall(endpoint);
+            } catch (e) {
+                console.error('Error fetching ' + endpoint + ':', e);
+                return null;
+            }
+        }
         
         async function authenticateUser(){
             // Use canonical auth flow from app.js so currentUser + refresh logic stay consistent across all pages.
@@ -726,20 +799,40 @@
                 clearTokensAndRedirect('Please log in.');
                 return null;
             }
-            const user = await checkAuth({ redirectOnFail: true, silent: false });
+            // Reuse checkAuth in-memory cache when fresh (e.g. just left dashboard) so the shell
+            // appears immediately; a background /api/me confirms role for demotion edge cases.
+            const user = await checkAuth({ redirectOnFail: true, silent: false, forceRefresh: false });
             if(!user) return null;
+            void checkAuth({ redirectOnFail: false, silent: true, forceRefresh: true }).then(function (fresh) {
+                if (!fresh) return;
+                var role = String(fresh.role || '').toLowerCase();
+                var tier = String(fresh.tier || fresh.subscription_tier || '').toLowerCase();
+                var isMaster = role === 'master_admin' || tier === 'master_admin';
+                var isAdmin = isMaster || role === 'admin';
+                if (isAdmin) return;
+                var deny = document.getElementById('accessDenied');
+                var content = document.getElementById('adminContent');
+                var load = document.getElementById('loadingState');
+                if (load) load.style.display = 'none';
+                if (content) content.style.display = 'none';
+                if (deny) deny.style.display = 'flex';
+            });
             return user;
         }
         
         function initAdminPage(user){
             document.getElementById('loadingState').style.display='none';
-            const isAdmin = user.role==='admin'||user.role==='master_admin';
+            const role = String(user.role || '').toLowerCase();
+            const tier = String(user.tier || user.subscription_tier || '').toLowerCase();
+            const isMaster = role === 'master_admin' || tier === 'master_admin';
+            const isAdmin = isMaster || role === 'admin';
             if(!isAdmin){ document.getElementById('accessDenied').style.display='flex'; return; }
 
-            // Show admin UI
-            document.getElementById('adminSection').style.display='block';
+            // Show admin UI (guard adminSection — must exist after shared-sidebar inject)
+            var _navAdm = document.getElementById('adminSection');
+            if (_navAdm) _navAdm.style.display = 'block';
             document.getElementById('adminContent').style.display='block';
-            document.getElementById('adminRoleBadge').textContent=user.role==='master_admin'?'MASTER ADMIN':'ADMIN';
+            document.getElementById('adminRoleBadge').textContent=isMaster?'MASTER ADMIN':'ADMIN';
 
             // Delegate sidebar identity (name/tier/avatar) to app.js for consistency across all pages.
             try{
@@ -749,13 +842,14 @@
                     // Minimal fallback if app.js isn't loaded for some reason
                     const name=user.name||user.email?.split('@')[0]||'Admin';
                     document.getElementById('userName').textContent=name;
-                    document.getElementById('userTier').textContent=user.role==='master_admin'?'Master Admin':'Admin';
+                    document.getElementById('userTier').textContent=isMaster?'Master Admin':'Admin';
                     document.getElementById('userAvatar').textContent=(user.name||user.email||'U').charAt(0).toUpperCase();
                 }
             }catch(e){ console.error('updateUserUI failed:', e); }
 
             loadAllData();
             setupEventListeners();
+            setTimeout(consumeCampaignHandoff, 250);
         }
         
         (async function(){ const user=await authenticateUser(); if(user) initAdminPage(user); })();
@@ -763,18 +857,39 @@
         async function loadAllData(){
             document.getElementById('refreshIndicator').classList.add('loading');
             document.getElementById('lastUpdated').textContent='Updating...';
-            await Promise.all([loadSummaryKPIs(),loadCharts(),loadActivity(),loadTopUsers(),loadAllUsers()]);
+            await Promise.all([loadSummaryKPIs(),loadCharts(),loadActivity(),loadTopUsers(),loadIntegrityErrorBadge72h()]);
             document.getElementById('refreshIndicator').classList.remove('loading');
             document.getElementById('lastUpdated').textContent='Updated '+new Date().toLocaleTimeString();
+            const runUsers = function(){ loadAllUsers().catch(function(e){ console.error('loadAllUsers', e); }); };
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(runUsers, { timeout: 8000 });
+            } else {
+                setTimeout(runUsers, 400);
+            }
+        }
+
+        async function loadIntegrityErrorBadge72h(){
+            const badge = document.getElementById('integrityErrBadge');
+            if(!badge) return;
+            try{
+                const data = await fetchAPI('/api/admin/audit/data-integrity?severity=ERROR&since_hours=72&limit=1');
+                const count = Number(data?.summary?.errors || 0);
+                badge.textContent = `${count} errors/72h`;
+                badge.style.display = 'inline-flex';
+            }catch(_){
+                badge.textContent = 'audit n/a';
+                badge.style.display = 'inline-flex';
+            }
         }
         
         async function loadSummaryKPIs(){
-            const [rev,costs,margins,growth,reliability] = await Promise.all([
+            const [rev,costs,margins,growth,reliability,usage] = await Promise.all([
                 fetchAPI('/api/admin/kpi/revenue'),
                 fetchAPI('/api/admin/kpi/costs'),
                 fetchAPI('/api/admin/kpi/margins'),
                 fetchAPI('/api/admin/kpi/growth'),
-                fetchAPI('/api/admin/kpi/reliability')
+                fetchAPI('/api/admin/kpi/reliability'),
+                fetchAPI('/api/admin/kpi/usage')
             ]);
             
             if(rev){ document.getElementById('summaryMRR').textContent = fmtCurrency(rev.total_mrr||0); updateChangeEl('summaryMRRChange', rev.mrr_change||0); }
@@ -782,8 +897,6 @@
             if(margins){ document.getElementById('summaryGrossMargin').textContent = fmtPercent(margins.gross_margin||0); updateChangeEl('summaryMarginChange', margins.margin_change||0); }
             if(growth){ document.getElementById('summaryConversion').textContent = fmtPercent(growth.free_to_paid_rate||0); updateChangeEl('summaryConversionChange', growth.conversion_change||0); }
             if(reliability){ document.getElementById('summarySuccessRate').textContent = fmtPercent(reliability.success_rate||0); updateChangeEl('summaryReliabilityChange', reliability.reliability_change||0); }
-            
-            const usage = await fetchAPI('/api/admin/kpi/usage');
             if(usage){ document.getElementById('summaryActiveUsers').textContent = fmtNumber(usage.active_users||0); updateChangeEl('summaryUsageChange', usage.active_users_change||0); }
         }
         
@@ -803,8 +916,8 @@
         function renderRevenueChart(d){ const ctx=document.getElementById('revenueChart')?.getContext('2d'); if(!ctx)return; if(revenueChart)revenueChart.destroy(); revenueChart=new Chart(ctx,{type:'line',data:{labels:d.labels||[],datasets:[{data:d.values||[],borderColor:'#22c55e',backgroundColor:'rgba(34,197,94,0.1)',fill:true,tension:0.4,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(255,255,255,0.5)',maxTicksLimit:8}},y:{grid:{color:'rgba(255,255,255,0.05)'},ticks:{color:'rgba(255,255,255,0.5)',callback:v=>'$'+v.toLocaleString()}}}}}); }
         function renderUserGrowthChart(d){ const ctx=document.getElementById('userGrowthChart')?.getContext('2d'); if(!ctx)return; if(userGrowthChart)userGrowthChart.destroy(); userGrowthChart=new Chart(ctx,{type:'line',data:{labels:d.labels||[],datasets:[{data:d.values||[],borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.1)',fill:true,tension:0.4,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{color:'rgba(255,255,255,0.5)',maxTicksLimit:8}},y:{grid:{color:'rgba(255,255,255,0.05)'},ticks:{color:'rgba(255,255,255,0.5)'}}}}}); }
         
-        async function loadActivity(){ const d=await fetchAPI('/api/admin/activity?limit=10'); const c=document.getElementById('activityList'); if(!d||!d.length){ c.innerHTML='<div class="empty-state"><i class="fas fa-clock"></i><p>No recent activity</p></div>'; return; } const icons={signup:{i:'fa-user-plus',c:'signup'},upgrade:{i:'fa-arrow-up',c:'upgrade'},downgrade:{i:'fa-arrow-down',c:'downgrade'},payment:{i:'fa-dollar-sign',c:'payment'},upload:{i:'fa-cloud-upload-alt',c:'upload'}}; c.innerHTML=d.map(a=>{const ic=icons[a.type]||{i:'fa-circle',c:''};return`<div class="activity-item"><div class="activity-icon ${ic.c}"><i class="fas ${ic.i}"></i></div><div class="activity-content"><div class="activity-text">${a.description||a.message||''}</div><div class="activity-time">${fmtRelTime(a.created_at)}</div></div></div>`;}).join(''); }
-        async function loadTopUsers(){ const d=await fetchAPI('/api/admin/top-users?limit=5&sort=revenue'); const tb=document.getElementById('topUsersTable'); if(!d||!d.length){ tb.innerHTML='<tr><td colspan="4" class="empty-state">No data</td></tr>'; return; } tb.innerHTML=d.map(u=>{const n=u.name||u.email?.split('@')[0]||'User';const t=u.tier||u.subscription_tier||'free';return`<tr><td><div class="user-cell"><div class="user-avatar-sm">${n.charAt(0).toUpperCase()}</div><div>${n}</div></div></td><td><span class="tier-badge ${t.toLowerCase().replace(' ','_')}">${t}</span></td><td>${fmtNumber(u.uploads||0)}</td><td>${fmtCurrency(u.revenue||0)}</td></tr>`;}).join(''); }
+        async function loadActivity(){ const d=await fetchAPI('/api/admin/activity?limit=10'); const c=document.getElementById('activityList'); if(!d||!d.length){ c.innerHTML='<div class="empty-state"><i class="fas fa-clock"></i><p>No recent activity</p></div>'; return; } const icons={signup:{i:'fa-user-plus',c:'signup'},upgrade:{i:'fa-arrow-up',c:'upgrade'},downgrade:{i:'fa-arrow-down',c:'downgrade'},payment:{i:'fa-dollar-sign',c:'payment'},upload:{i:'fa-cloud-upload-alt',c:'upload'}}; c.innerHTML=d.map(a=>{const ic=icons[a.type]||{i:'fa-circle',c:''};return`<div class="activity-item"><div class="activity-icon ${ic.c}"><i class="fas ${ic.i}"></i></div><div class="activity-content"><div class="activity-text">${escapeHtml(a.description||a.message||'')}</div><div class="activity-time">${escapeHtml(fmtRelTime(a.created_at))}</div></div></div>`;}).join(''); }
+        async function loadTopUsers(){ const d=await fetchAPI('/api/admin/top-users?limit=5&sort=revenue'); const tb=document.getElementById('topUsersTable'); if(!d||!d.length){ tb.innerHTML='<tr><td colspan="4" class="empty-state">No data</td></tr>'; return; } tb.innerHTML=d.map(u=>{const n=u.name||u.email?.split('@')[0]||'User';const t=u.tier||u.subscription_tier||'free';const tClass=String(t).toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'')||'free';return`<tr><td><div class="user-cell"><div class="user-avatar-sm">${escapeHtml(n.charAt(0).toUpperCase())}</div><div>${escapeHtml(n)}</div></div></td><td><span class="tier-badge ${tClass}">${escapeHtml(t)}</span></td><td>${fmtNumber(u.uploads||0)}</td><td>${fmtCurrency(u.revenue||0)}</td></tr>`;}).join(''); }
         async function loadAllUsers(){ const d=await fetchAPI('/api/admin/users?limit=1000'); allUsers=d?.users||d||[]; }
         
         window.openAnnouncementModal=function(){ document.getElementById('announcementModal').classList.add('active'); document.getElementById('announcementTitle').value=''; document.getElementById('announcementBody').value=''; document.getElementById('channelEmail').checked=true; document.getElementById('channelDiscordCommunity').checked=false; document.getElementById('channelDiscordWebhooks').checked=false; document.querySelector('input[name="audience"][value="all"]').checked=true; document.getElementById('tierSelection').classList.remove('active'); document.getElementById('userSearchContainer').classList.remove('active'); selectedUserIds=[]; renderSelectedUsers(); document.getElementById('sendingProgress').classList.remove('active'); document.getElementById('announcementForm').style.display='block'; document.getElementById('announcementFooter').style.display='flex'; };
@@ -814,14 +927,38 @@
             const title=document.getElementById('announcementTitle').value.trim();
             const body=document.getElementById('announcementBody').value.trim();
             if(!title||!body){ showToast('Please enter title and message','error'); return; }
-            const channels=[]; if(document.getElementById('channelEmail').checked) channels.push('email'); if(document.getElementById('channelDiscordCommunity').checked) channels.push('discord_community'); if(document.getElementById('channelDiscordWebhooks').checked) channels.push('discord_webhooks');
+            const channels=[];
+            if(document.getElementById('channelEmail').checked) channels.push('email');
+            if(document.getElementById('channelDiscordCommunity').checked) channels.push('discord_community');
+            if(document.getElementById('channelDiscordWebhooks').checked) channels.push('discord_webhooks');
             if(channels.length===0){ showToast('Select at least one channel','error'); return; }
             const audienceType=document.querySelector('input[name="audience"]:checked').value;
             let audience={type:audienceType};
-            if(audienceType==='tier'){ const tiers=[]; ['Launch','Pro','Studio','Agency'].forEach(t=>{if(document.getElementById('tier'+t)?.checked) tiers.push(t.toLowerCase());}); if(tiers.length===0){showToast('Select at least one tier','error');return;} audience.tiers=tiers; }
-            else if(audienceType==='specific'){ if(selectedUserIds.length===0){showToast('Select at least one user','error');return;} audience.userIds=selectedUserIds; }
+            if(audienceType==='tier'){
+                const tierPairs=[['tierCreatorLite','creator_lite'],['tierCreatorPro','creator_pro'],['tierStudio','studio'],['tierAgency','agency'],['tierFriendsFamily','friends_family']];
+                const tiers=[];
+                tierPairs.forEach(function(pair){ const el=document.getElementById(pair[0]); if(el&&el.checked) tiers.push(pair[1]); });
+                if(tiers.length===0){ showToast('Select at least one tier','error'); return; }
+                audience.tiers=tiers;
+            } else if(audienceType==='specific'){
+                if(selectedUserIds.length===0){ showToast('Select at least one user','error'); return; }
+                audience.userIds=selectedUserIds.slice();
+            }
             document.getElementById('announcementForm').style.display='none'; document.getElementById('announcementFooter').style.display='none'; document.getElementById('sendingProgress').classList.add('active'); document.getElementById('sendingStatus').textContent='Sending to '+channels.join(', ')+'...';
-            try{ const r=await fetch(`${API_BASE}/api/admin/announcements`,{method:'POST',headers:{'Authorization':`Bearer ${getToken()}`,'Content-Type':'application/json'},body:JSON.stringify({title,body,channels,audience})}); if(r.ok){ const res=await r.json(); showToast(`Sent! ${res.delivered||0} recipients`,'success'); closeAnnouncementModal(); }else{ throw new Error((await r.json().catch(()=>({}))).message||'Failed'); } }catch(e){ showToast(e.message||'Failed to send','error'); document.getElementById('sendingProgress').classList.remove('active'); document.getElementById('announcementForm').style.display='block'; document.getElementById('announcementFooter').style.display='flex'; }
+            try{
+                const res = await window.apiCall('/api/admin/announcements', {
+                    method: 'POST',
+                    body: JSON.stringify({ title, body, channels, audience }),
+                });
+                const n = res.recipients != null ? res.recipients : (res.delivered != null ? res.delivered : 0);
+                showToast('Queued: ' + n + ' recipient(s) matched. Delivery runs in the background.', 'success');
+                closeAnnouncementModal();
+            } catch(e){
+                showToast(e.message||'Failed to send','error');
+                document.getElementById('sendingProgress').classList.remove('active');
+                document.getElementById('announcementForm').style.display='block';
+                document.getElementById('announcementFooter').style.display='flex';
+            }
         };
         
         function searchUsers(q){
@@ -919,6 +1056,32 @@
             document.getElementById('userSearchInput')?.addEventListener('input',e=>searchUsers(e.target.value));
             document.getElementById('announcementModal')?.addEventListener('click',e=>{if(e.target.id==='announcementModal')closeAnnouncementModal();});
         }
+
+        function consumeCampaignHandoff() {
+            try {
+                const raw = sessionStorage.getItem('uploadm8_campaign_handoff');
+                if (!raw) return;
+                sessionStorage.removeItem('uploadm8_campaign_handoff');
+                const h = JSON.parse(raw || '{}');
+                if (!h || !h.title) return;
+                window.openAnnouncementModal();
+                const t = document.getElementById('announcementTitle');
+                const b = document.getElementById('announcementBody');
+                if (t) t.value = h.title || '';
+                if (b) b.value = h.body || '';
+                const audSpecific = document.querySelector('input[name="audience"][value="specific"]');
+                if (audSpecific && Array.isArray(h.selected_user_ids) && h.selected_user_ids.length) {
+                    audSpecific.checked = true;
+                    document.getElementById('tierSelection').classList.remove('active');
+                    document.getElementById('userSearchContainer').classList.add('active');
+                    selectedUserIds = h.selected_user_ids.slice(0, 500);
+                    renderSelectedUsers();
+                }
+                const em = document.getElementById('channelEmail');
+                if (em) em.checked = true;
+                if (window.showToast) window.showToast('Campaign handoff loaded. Review and send when ready.', 'success');
+            } catch (_) {}
+        }
         
         function fmtCurrency(v){if(v==null)return'$--';return'$'+Number(v).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0});}
         function fmtNumber(v){if(v==null)return'--';if(v>=1e6)return(v/1e6).toFixed(1)+'M';if(v>=1e3)return(v/1e3).toFixed(1)+'K';return Number(v).toLocaleString('en-US');}
@@ -958,6 +1121,7 @@
             const el8 = document.getElementById('toggleStorageCost'); if(el8) el8.checked = s.notify_storage_cost || false;
             const el9 = document.getElementById('toggleComputeCost'); if(el9) el9.checked = s.notify_compute_cost || false;
             const el10 = document.getElementById('toggleWeeklyReport'); if(el10) el10.checked = s.notify_weekly_report || false;
+            const el10b = document.getElementById('toggleWeeklyPlatformRollups'); if(el10b) el10b.checked = (s.weekly_digest_platform_kpi_rollups !== false);
             
             // Calendar toggles
             const el11 = document.getElementById('toggleStripePayout'); if(el11) el11.checked = s.notify_stripe_payout || false;
@@ -978,7 +1142,7 @@
         
         function updateMasterToggles(){
             const revenueToggles = ['toggleMrrCharge','toggleTopup','toggleUpgrade','toggleDowngrade','toggleCancel','toggleRefund'];
-            const costsToggles = ['toggleOpenaiCost','toggleStorageCost','toggleComputeCost','toggleWeeklyReport'];
+            const costsToggles = ['toggleOpenaiCost','toggleStorageCost','toggleComputeCost','toggleWeeklyReport','toggleWeeklyPlatformRollups'];
             const calendarToggles = ['toggleStripePayout','toggleCloudBilling','toggleRenderRenewal'];
             
             const allRevenueOn = revenueToggles.every(id => document.getElementById(id)?.checked);
@@ -993,7 +1157,7 @@
         window.toggleSection = function(section, enabled){
             let toggleIds = [];
             if(section === 'revenue') toggleIds = ['toggleMrrCharge','toggleTopup','toggleUpgrade','toggleDowngrade','toggleCancel','toggleRefund'];
-            else if(section === 'costs') toggleIds = ['toggleOpenaiCost','toggleStorageCost','toggleComputeCost','toggleWeeklyReport'];
+            else if(section === 'costs') toggleIds = ['toggleOpenaiCost','toggleStorageCost','toggleComputeCost','toggleWeeklyReport','toggleWeeklyPlatformRollups'];
             else if(section === 'calendar') toggleIds = ['toggleStripePayout','toggleCloudBilling','toggleRenderRenewal'];
             
             toggleIds.forEach(id => {
@@ -1034,6 +1198,7 @@
                 notify_storage_cost: document.getElementById('toggleStorageCost')?.checked || false,
                 notify_compute_cost: document.getElementById('toggleComputeCost')?.checked || false,
                 notify_weekly_report: document.getElementById('toggleWeeklyReport')?.checked || false,
+                weekly_digest_platform_kpi_rollups: document.getElementById('toggleWeeklyPlatformRollups')?.checked ?? true,
                 notify_stripe_payout: document.getElementById('toggleStripePayout')?.checked || false,
                 notify_cloud_billing: document.getElementById('toggleCloudBilling')?.checked || false,
                 notify_render_renewal: document.getElementById('toggleRenderRenewal')?.checked || false,
@@ -1044,19 +1209,14 @@
             };
             
             try{
-                const r = await fetch(`${API_BASE}/api/admin/notification-settings`, {
+                await window.apiCall('/api/admin/notification-settings', {
                     method: 'PUT',
-                    headers: {'Authorization': `Bearer ${getToken()}`, 'Content-Type': 'application/json'},
-                    body: JSON.stringify(settings)
+                    body: JSON.stringify(settings),
                 });
-                if(r.ok){
-                    notifSettings = settings;
-                    showToast('Notification settings saved!', 'success');
-                    if(statusText) statusText.textContent = 'Saved just now';
-                    updateNotifStatus(!!settings.admin_webhook_url);
-                }else{
-                    throw new Error('Failed to save');
-                }
+                notifSettings = settings;
+                showToast('Notification settings saved!', 'success');
+                if(statusText) statusText.textContent = 'Saved just now';
+                updateNotifStatus(!!settings.admin_webhook_url);
             }catch(e){
                 showToast('Failed to save settings', 'error');
                 if(statusText) statusText.textContent = 'Save failed';
@@ -1066,6 +1226,28 @@
             }
         };
         
+        window.rebuildPlatformKpiRollups = async function(){
+            const btn = document.getElementById('btnRebuildPlatformRollups');
+            const days = Math.min(90, Math.max(1, parseInt(document.getElementById('platformRollupsRefreshDays')?.value, 10) || 7));
+            if(btn){
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Rebuilding...';
+            }
+            try{
+                await window.apiCall('/api/admin/platform-kpi-rollups/refresh?days=' + days, {
+                    method: 'POST',
+                });
+                showToast('Platform KPI rollups rebuilt for last ' + days + ' day(s).', 'success');
+            }catch(e){
+                showToast(e.message || 'Rebuild failed', 'error');
+            }finally{
+                if(btn){
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-sync-alt"></i> Rebuild rollups now';
+                }
+            }
+        };
+
         window.testWebhook = async function(){
             const urlEl = document.getElementById('adminWebhookUrl');
             const url = urlEl?.value?.trim();
@@ -1080,22 +1262,52 @@
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Testing...';
             
             try{
-                const r = await fetch(`${API_BASE}/api/admin/test-webhook`, {
+                await window.apiCall('/api/admin/test-webhook', {
                     method: 'POST',
-                    headers: {'Authorization': `Bearer ${getToken()}`, 'Content-Type': 'application/json'},
-                    body: JSON.stringify({ webhook_url: url })
+                    body: JSON.stringify({ webhook_url: url }),
                 });
-                if(r.ok){
-                    showToast('Test message sent! Check your Discord', 'success');
-                }else{
-                    const err = await r.json().catch(()=>({}));
-                    throw new Error(err.detail || 'Webhook test failed');
-                }
+                showToast('Test message sent! Check your Discord', 'success');
             }catch(e){
                 showToast(e.message || 'Webhook test failed', 'error');
             }finally{
                 btn.disabled = false;
                 btn.innerHTML = '<i class="fab fa-discord"></i> Test';
+            }
+        };
+
+        window.runEmailJob = async function(evOrJob, jobOrBtn){
+            let job, btnEl;
+            if (evOrJob && typeof evOrJob === 'object' && evOrJob.currentTarget) {
+                btnEl = evOrJob.currentTarget;
+                job = jobOrBtn;
+            } else {
+                job = evOrJob;
+                btnEl = jobOrBtn || null;
+            }
+            const statusEl = document.getElementById('emailJobsStatus');
+            const btn = btnEl || null;
+            const original = btn ? btn.innerHTML : '';
+            if (btn) {
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Running...';
+            }
+            if (statusEl) statusEl.textContent = 'Running "' + job + '"...';
+            try{
+                const data = await window.apiCall('/api/admin/email-jobs/run', {
+                    method: 'POST',
+                    body: JSON.stringify({ job: job }),
+                });
+                const ran = Array.isArray(data.ran) && data.ran.length ? data.ran.join(', ') : 'none';
+                if (statusEl) statusEl.textContent = 'Last run: ' + ran + ' at ' + new Date().toLocaleTimeString();
+                showToast('Email job run complete: ' + ran, 'success');
+            }catch(e){
+                if (statusEl) statusEl.textContent = 'Run failed: ' + (e.message || 'unknown error');
+                showToast(e.message || 'Failed to run email job', 'error');
+            }finally{
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = original;
+                }
             }
         };
         

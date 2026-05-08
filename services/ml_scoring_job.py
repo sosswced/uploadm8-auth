@@ -11,12 +11,14 @@ from typing import Optional
 
 import asyncpg
 
+from services.ml_observability import OptionalTrackioRun
+
 logger = logging.getLogger("uploadm8.ml_scoring_job")
 
 
 async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180) -> int:
     """
-    Recompute daily quality score rows from uploads + persisted feature events.
+    Recompute daily quality score rows from uploads + output_artifacts attribution keys.
     Returns number of rows inserted/updated (best effort).
     """
     lookback_days = max(7, min(int(lookback_days or 180), 3650))
@@ -29,7 +31,7 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
             lookback_days,
         )
 
-        # all-platform rollup per user/day/strategy
+        # all-platform rollup per user/day/strategy (attribution from uploads.output_artifacts)
         await conn.execute(
             """
             WITH base AS (
@@ -37,9 +39,13 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                     u.user_id,
                     DATE(u.created_at) AS day,
                     COALESCE(
-                        NULLIF(fe.output_artifacts->>'thumbnail_selection_method', ''),
-                        NULLIF(fe.output_artifacts->>'thumbnail_render_method', ''),
-                        'default'
+                        NULLIF(u.output_artifacts->>'content_attribution_key', ''),
+                        CONCAT(
+                            'legacy|tsel=',
+                            COALESCE(NULLIF(u.output_artifacts->>'thumbnail_selection_method', ''), 'na'),
+                            '|trend=',
+                            COALESCE(NULLIF(u.output_artifacts->>'thumbnail_render_method', ''), 'na')
+                        )
                     ) AS strategy_key,
                     GREATEST(COALESCE(u.views, 0), 0)::double precision AS views,
                     CASE
@@ -48,8 +54,6 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                         ELSE 0.0
                     END AS engagement
                 FROM uploads u
-                LEFT JOIN upload_feature_events fe
-                  ON fe.upload_id = u.id
                 WHERE u.created_at >= (NOW() - ($1::int || ' days')::interval)
                   AND u.status IN ('completed', 'succeeded', 'partial')
             ),
@@ -100,9 +104,13 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                     DATE(u.created_at) AS day,
                     LOWER(p.platform)::varchar(50) AS platform,
                     COALESCE(
-                        NULLIF(fe.output_artifacts->>'thumbnail_selection_method', ''),
-                        NULLIF(fe.output_artifacts->>'thumbnail_render_method', ''),
-                        'default'
+                        NULLIF(u.output_artifacts->>'content_attribution_key', ''),
+                        CONCAT(
+                            'legacy|tsel=',
+                            COALESCE(NULLIF(u.output_artifacts->>'thumbnail_selection_method', ''), 'na'),
+                            '|trend=',
+                            COALESCE(NULLIF(u.output_artifacts->>'thumbnail_render_method', ''), 'na')
+                        )
                     ) AS strategy_key,
                     GREATEST(COALESCE(u.views, 0), 0)::double precision AS views,
                     CASE
@@ -111,8 +119,6 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                         ELSE 0.0
                     END AS engagement
                 FROM uploads u
-                LEFT JOIN upload_feature_events fe
-                  ON fe.upload_id = u.id
                 CROSS JOIN LATERAL unnest(COALESCE(u.platforms, ARRAY[]::text[])) AS p(platform)
                 WHERE u.created_at >= (NOW() - ($1::int || ' days')::interval)
                   AND u.status IN ('completed', 'succeeded', 'partial')
@@ -167,11 +173,17 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
 
 
 async def run_ml_scoring_cycle(pool: asyncpg.Pool, lookback_days: int = 180) -> Optional[int]:
+    track = OptionalTrackioRun("ml_quality_scoring_cycle")
+    track.start(config={"lookback_days": int(lookback_days)})
     try:
         n = await recompute_quality_scores(pool, lookback_days=lookback_days)
         logger.info("[ml-scoring] recompute complete | rows=%s lookback_days=%s", n, lookback_days)
+        track.log({"rows_recomputed": int(n or 0), "lookback_days": int(lookback_days), "status": 1})
         return n
     except Exception as e:
         logger.warning("[ml-scoring] cycle failed: %s", e)
+        track.log({"status": 0, "error": str(e)[:300], "lookback_days": int(lookback_days)})
         return None
+    finally:
+        track.finish()
 

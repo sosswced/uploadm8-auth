@@ -7,9 +7,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+logger = logging.getLogger("uploadm8.wallet_marketing")
+
 from stages.entitlements import TIER_CONFIG, get_next_public_upgrade_tier, normalize_tier
+from services.growth_intelligence import fetch_user_engagement_snapshot
 
 
 def _now_utc() -> datetime:
@@ -89,7 +93,11 @@ async def _platform_spare_slots(conn, user_id: str, per_platform_cap: int) -> in
         return 0
     try:
         rows = await conn.fetch(
-            "SELECT platform, COUNT(*)::int AS c FROM platform_tokens WHERE user_id = $1::uuid GROUP BY platform",
+            """
+            SELECT platform, COUNT(*)::int AS c FROM platform_tokens
+            WHERE user_id = $1::uuid AND revoked_at IS NULL
+            GROUP BY platform
+            """,
             user_id,
         )
     except Exception:
@@ -103,7 +111,7 @@ async def _platform_spare_slots(conn, user_id: str, per_platform_cap: int) -> in
 async def _platform_connection_count(conn, user_id: str) -> int:
     try:
         return _i(await conn.fetchval(
-            "SELECT COUNT(*)::int FROM platform_tokens WHERE user_id = $1::uuid",
+            "SELECT COUNT(*)::int FROM platform_tokens WHERE user_id = $1::uuid AND revoked_at IS NULL",
             user_id,
         ))
     except Exception:
@@ -200,7 +208,7 @@ async def _user_campaign_features(conn, user_id: str, range_key: str) -> Dict[st
         pf AS (
           SELECT user_id, COUNT(*)::int AS connected_accounts
           FROM platform_tokens
-          WHERE user_id = $1::uuid
+          WHERE user_id = $1::uuid AND revoked_at IS NULL
           GROUP BY user_id
         )
         SELECT
@@ -581,6 +589,51 @@ async def build_wallet_marketing_payload(
             cta_link=links["pricing"],
         )
 
+    max_ac_plan = _i(plan.get("max_accounts"))
+    per_pf_cap = _i(plan.get("max_accounts_per_platform"))
+    spare_pf_slots = await _platform_spare_slots(conn, user_id, per_pf_cap) if per_pf_cap > 0 else 0
+    if (
+        tier in ("creator_pro", "studio", "agency", "friends_family", "lifetime")
+        and max_ac_plan > 0
+        and n_conn < max_ac_plan
+    ):
+        headroom = max_ac_plan - n_conn
+        high_tier = tier in ("studio", "agency", "friends_family", "lifetime")
+        if headroom >= 2 or (high_tier and headroom >= 1 and n_conn >= 2):
+            sev = "promo" if tier in ("studio", "agency") and headroom >= 3 else "info"
+            spare_hint = (
+                f" You also have about {spare_pf_slots} spare per-platform connection slot(s) — link another account where you still have room."
+                if spare_pf_slots > 0
+                else ""
+            )
+            _append_opportunity(
+                opps,
+                type_="high_tier_platform_headroom",
+                severity=sev,
+                title="Use your plan's extra channel slots",
+                body=(
+                    f"Your plan supports up to {max_ac_plan} connected channels ({n_conn} linked; only active logins count). "
+                    "Add another YouTube, TikTok, Instagram, or Facebook login to widen reach without upgrading."
+                )
+                + spare_hint,
+                cta_label="Connect platforms",
+                cta_link=links["platforms"],
+                metadata={
+                    "max_accounts": max_ac_plan,
+                    "max_accounts_per_platform": per_pf_cap,
+                    "connected": n_conn,
+                    "headroom": headroom,
+                    "per_platform_spare_slots": spare_pf_slots,
+                },
+            )
+
+    try:
+        from services.marketing_touchpoint_runner import pending_in_app_as_opportunities
+
+        opps.extend(await pending_in_app_as_opportunities(conn, user_id, links))
+    except Exception as e:
+        logger.warning("pending_in_app touchpoints skipped user=%s: %s", user_id, e)
+
     # Runtime activation: when a campaign is active/scheduled and this user matches
     # targeting filters, surface it as an in-app nudge opportunity.
     live_campaign = await _live_campaign_for_user(conn, user_id, tier)
@@ -621,6 +674,7 @@ async def build_wallet_marketing_payload(
     if recently_converted:
         # Suppress low-intent/promotional nudges right after a purchase/upgrade.
         opps = [o for o in opps if o.get("severity") in ("blocking", "urgent", "warning")]
+    engagement_snapshot = await fetch_user_engagement_snapshot(conn, user_id)
     sales_opportunities = [
         {
             **b,
@@ -629,6 +683,8 @@ async def build_wallet_marketing_payload(
                 "burn_aic_pct": round(burn_aic, 4),
                 "tier": tier,
                 "next_tier": next_slug,
+                "engagement_rate_pct_30d": engagement_snapshot.get("engagement_rate_pct"),
+                "avg_views_30d": engagement_snapshot.get("avg_views"),
             },
         }
         for b in opps
@@ -653,4 +709,5 @@ async def build_wallet_marketing_payload(
             "recently_converted_7d": bool(recently_converted),
             "suppressed_low_intent_nudges": bool(recently_converted),
         },
+        "engagement_snapshot": engagement_snapshot,
     }

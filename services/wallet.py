@@ -6,7 +6,7 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from stages.entitlements import get_entitlements_for_tier
+from stages.entitlements import get_entitlements_for_tier, wallet_bypass_for_user_record
 
 
 def _now_utc() -> datetime:
@@ -50,11 +50,11 @@ async def ledger_entry(
 
 async def reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str) -> bool:
     async with conn.transaction():
-        urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
-        tier = (urow.get("subscription_tier") if urow else "free") or "free"
-        ent = get_entitlements_for_tier(str(tier))
-        # Internal tiers (master_admin/friends_family/lifetime) are unlimited.
-        if getattr(ent, "is_internal", False):
+        urow = await conn.fetchrow(
+            "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+            user_id,
+        )
+        if wallet_bypass_for_user_record(dict(urow) if urow else None):
             return True
         wallet = await get_wallet(conn, user_id)
         available_put = wallet["put_balance"] - wallet["put_reserved"]
@@ -73,10 +73,11 @@ async def reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upl
 
 async def spend_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str, platforms: Optional[list] = None):
     async with conn.transaction():
-        urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
-        tier = (urow.get("subscription_tier") if urow else "free") or "free"
-        ent = get_entitlements_for_tier(str(tier))
-        if getattr(ent, "is_internal", False):
+        urow = await conn.fetchrow(
+            "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+            user_id,
+        )
+        if wallet_bypass_for_user_record(dict(urow) if urow else None):
             return
         await conn.execute(
             "UPDATE wallets SET put_balance = put_balance - $1, aic_balance = aic_balance - $2, put_reserved = put_reserved - $1, aic_reserved = aic_reserved - $2 WHERE user_id = $3",
@@ -92,10 +93,11 @@ async def spend_tokens(conn, user_id: str, put_count: int, aic_count: int, uploa
 
 async def refund_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str):
     async with conn.transaction():
-        urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
-        tier = (urow.get("subscription_tier") if urow else "free") or "free"
-        ent = get_entitlements_for_tier(str(tier))
-        if getattr(ent, "is_internal", False):
+        urow = await conn.fetchrow(
+            "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+            user_id,
+        )
+        if wallet_bypass_for_user_record(dict(urow) if urow else None):
             return
         await conn.execute(
             "UPDATE wallets SET put_reserved = put_reserved - $1, aic_reserved = aic_reserved - $2 WHERE user_id = $3",
@@ -134,10 +136,11 @@ async def partial_refund_upload_partial_success(
     if put_refund <= 0 and aic_refund <= 0:
         return
 
-    urow = await conn.fetchrow("SELECT subscription_tier FROM users WHERE id = $1", user_id)
-    tier = (urow.get("subscription_tier") if urow else "free") or "free"
-    ent = get_entitlements_for_tier(str(tier))
-    if getattr(ent, "is_internal", False):
+    urow = await conn.fetchrow(
+        "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+        user_id,
+    )
+    if wallet_bypass_for_user_record(dict(urow) if urow else None):
         return
 
     await conn.execute(
@@ -179,16 +182,43 @@ async def transfer_tokens(
         user = await conn.fetchrow("SELECT subscription_tier, flex_enabled FROM users WHERE id = $1", user_id)
         if not user or not user.get("flex_enabled"):
             return False
-        wallet = await get_wallet(conn, user_id)
-        if wallet["put_balance"] - wallet["put_reserved"] < amount:
+        amount = int(amount)
+        if amount <= 0:
             return False
         burn = int(amount * burn_pct)
         net = amount - burn
+        if burn > 0:
+            row = await conn.fetchrow(
+                """
+                UPDATE wallets
+                SET put_balance = put_balance - $1,
+                    updated_at = NOW()
+                WHERE user_id = $2
+                  AND (put_balance - put_reserved) >= $3
+                RETURNING put_balance
+                """,
+                burn,
+                user_id,
+                amount,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                UPDATE wallets
+                SET updated_at = NOW()
+                WHERE user_id = $1
+                  AND (put_balance - put_reserved) >= $2
+                RETURNING put_balance
+                """,
+                user_id,
+                amount,
+            )
+        if row is None:
+            return False
         await ledger_entry(conn, user_id, "put", -amount, "transfer_out", platform=from_platform)
         await ledger_entry(conn, user_id, "put", net, "transfer_in", platform=to_platform)
         if burn > 0:
             await ledger_entry(conn, user_id, "put", -burn, "transfer_burn")
-            await conn.execute("UPDATE wallets SET put_balance = put_balance - $1 WHERE user_id = $2", burn, user_id)
         return True
 
 

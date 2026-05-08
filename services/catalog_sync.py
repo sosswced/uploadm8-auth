@@ -1188,12 +1188,19 @@ async def sync_catalog_for_user(
         # Try token refresh
         try:
             from stages.publish_stage import _refresh_tiktok_token, _refresh_youtube_token, _refresh_meta_token
+            row_pk = str(row.get("id") or "")
             if plat == "tiktok":
-                token = await _refresh_tiktok_token(token, db_pool=pool, user_id=uid)
+                token = await _refresh_tiktok_token(
+                    token, db_pool=pool, user_id=uid, token_row_id=row_pk or None
+                )
             elif plat == "youtube":
-                token = await _refresh_youtube_token(token, db_pool=pool, user_id=uid)
+                token = await _refresh_youtube_token(
+                    token, db_pool=pool, user_id=uid, token_row_id=row_pk or None
+                )
             elif plat in ("instagram", "facebook"):
-                token = await _refresh_meta_token(token, platform=plat, db_pool=pool, user_id=uid)
+                token = await _refresh_meta_token(
+                    token, platform=plat, db_pool=pool, user_id=uid, token_row_id=row_pk or None
+                )
         except Exception as e:
             logger.debug(f"[catalog-sync] token refresh {plat}: {e}")
 
@@ -1359,9 +1366,7 @@ async def get_catalog_aggregate(
         LEFT JOIN uploads u ON u.id = pci.upload_id AND u.user_id = pci.user_id
     """
 
-    async with pool.acquire() as conn:
-        total_row = await conn.fetchrow(
-            f"""
+    total_sql = f"""
             SELECT
                 COUNT(*) as total_videos,
                 COALESCE(SUM({_merge_views}), 0)    as views,
@@ -1370,12 +1375,8 @@ async def get_catalog_aggregate(
                 COALESCE(SUM({_merge_shares}), 0)   as shares
             FROM {_from}
             WHERE {where}
-            """,
-            *params,
-        )
-
-        platform_rows = await conn.fetch(
-            f"""
+            """
+    platform_sql = f"""
             SELECT
                 pci.platform as platform,
                 COUNT(*) as video_count,
@@ -1387,12 +1388,8 @@ async def get_catalog_aggregate(
             WHERE {where}
             GROUP BY pci.platform
             ORDER BY views DESC
-            """,
-            *params,
-        )
-
-        source_rows = await conn.fetch(
-            f"""
+            """
+    source_sql = f"""
             SELECT
                 pci.source as source,
                 COUNT(*) as video_count,
@@ -1400,19 +1397,35 @@ async def get_catalog_aggregate(
             FROM {_from}
             WHERE {where}
             GROUP BY pci.source
-            """,
-            *params,
-        )
-
-        sync_rows = await conn.fetch(
             """
+    sync_sql = """
             SELECT platform, status, last_synced_at, total_discovered, total_linked
             FROM platform_content_sync_state
             WHERE user_id = $1
             ORDER BY last_synced_at DESC NULLS LAST
-            """,
-            uid,
-        )
+            """
+
+    q_params = tuple(params)
+
+    async def _load_total():
+        async with pool.acquire() as conn:
+            return await conn.fetchrow(total_sql, *q_params)
+
+    async def _load_platform():
+        async with pool.acquire() as conn:
+            return await conn.fetch(platform_sql, *q_params)
+
+    async def _load_source():
+        async with pool.acquire() as conn:
+            return await conn.fetch(source_sql, *q_params)
+
+    async def _load_sync():
+        async with pool.acquire() as conn:
+            return await conn.fetch(sync_sql, uid)
+
+    total_row, platform_rows, source_rows, sync_rows = await asyncio.gather(
+        _load_total(), _load_platform(), _load_source(), _load_sync()
+    )
 
     total_views = int(total_row["views"] or 0)
     total_likes = int(total_row["likes"] or 0)

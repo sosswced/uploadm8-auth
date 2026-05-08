@@ -3,6 +3,8 @@ Pikzels public API v2 — canonical endpoint map for UploadM8 integration.
 
 Official docs index: https://docs.pikzels.com/llms.txt
 OpenAPI: https://docs.pikzels.com/openapi.json
+Errors: https://docs.pikzels.com/errors
+Rate limits: https://docs.pikzels.com/rate-limits
 Base URL: https://api.pikzels.com
 Auth: header X-Api-Key: pkz_...
 
@@ -29,7 +31,11 @@ def resolve_public_api_key() -> str:
     Fallback: THUMB_RENDER_API_KEY — same secret in many deployments; avoids breaking
     envs that only set the legacy name.
     """
-    return (os.environ.get("PIKZELS_API_KEY") or os.environ.get("THUMB_RENDER_API_KEY") or "").strip()
+    return (
+        (os.environ.get("PIKZELS_API_KEY") or "").strip()
+        or (os.environ.get("THUMB_RENDER_API_KEY") or "").strip()
+        or (os.environ.get("PIKZELS_PUBLIC_API_KEY") or "").strip()
+    )
 
 
 def public_api_key_source() -> Optional[str]:
@@ -38,6 +44,8 @@ def public_api_key_source() -> Optional[str]:
         return "PIKZELS_API_KEY"
     if (os.environ.get("THUMB_RENDER_API_KEY") or "").strip():
         return "THUMB_RENDER_API_KEY"
+    if (os.environ.get("PIKZELS_PUBLIC_API_KEY") or "").strip():
+        return "PIKZELS_PUBLIC_API_KEY"
     return None
 
 # Endpoints (paths only; join with PUBLIC_BASE)

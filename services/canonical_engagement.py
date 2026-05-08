@@ -67,7 +67,7 @@ def _clamp_nonneg(n: int) -> int:
         return _MAX_METRIC
     return x
 
-# Must match GET /api/analytics ``minutes_map`` in app.py.
+# Must match GET /api/analytics ``minutes_map`` in ``routers/analytics``.
 ANALYTICS_RANGE_MINUTES: Dict[str, int] = {
     "30m": 30,
     "1h": 60,

@@ -16,10 +16,10 @@ logger = logging.getLogger(__name__)
 TIKTOK_USER_INFO_URL = "https://open.tiktokapis.com/v2/user/info/"
 # Stats fields require user.info.stats; if a token lacks it, retry with basic-only.
 TIKTOK_USER_INFO_FIELDS_BASIC = (
-    "open_id,union_id,display_name,avatar_url,avatar_url_100,avatar_large_url"
+    "open_id,union_id,username,display_name,avatar_url,avatar_url_100,avatar_large_url"
 )
 TIKTOK_USER_INFO_FIELDS_FULL = TIKTOK_USER_INFO_FIELDS_BASIC + (
-    ",follower_count,following_count,likes_count"
+    ",unique_id,follower_count,following_count,likes_count"
 )
 
 # Single list used by catalog sync and any caller of ``tiktok_video_list_url`` — no short/long split;

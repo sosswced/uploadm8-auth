@@ -3,7 +3,7 @@ Account-level platform metrics → platform_metrics_cache.
 
 Used by:
   - Worker (scheduled refresh, no HTTP / no user session)
-  - app.py (optional background refresh after per-upload sync)
+  - API / routers (optional background refresh after per-upload sync)
 
 Token decryption uses stages.publish_stage.decrypt_token so this module does not
 require FastAPI lifespan (init_enc_keys).
@@ -210,7 +210,7 @@ async def refresh_platform_metrics_for_user(pool: asyncpg.Pool, user_id: Any) ->
     Recompute live TikTok/YouTube/Instagram/Facebook metrics for one user and
     upsert platform_metrics_cache. Returns True if a row was written.
 
-    Does not update app.py in-memory _platform_metrics_cache (API process only).
+    Does not update any in-process API cache (cache lives only in this job's caller if present).
     """
     uid = str(user_id)
     try:

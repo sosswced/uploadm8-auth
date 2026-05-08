@@ -1,3 +1,5 @@
+# Docker/worker install list (same constraints as requirements.txt).
+# For strict pins, replace this file with output of: pip freeze (from a clean env).
 # UploadM8 Backend Requirements
 # Using flexible versions with pre-built wheels (no Rust compilation needed)
 # Install:  pip install -r requirements.txt
@@ -74,7 +76,7 @@ Pillow>=12.0.0,<13.0.0
 # WORKER PIPELINE — extra services
 # =============================================================================
 
-# ── Google Cloud Vision (stages/vision_stage.py — Frame Inspector) ──────────
+# ── Google Cloud Vision (stages/vision_stage.py — always-on hydration) ──────
 google-cloud-vision>=3.7.0,<4.0.0
 
 # ── Google Cloud Video Intelligence (stages/video_intelligence_stage.py) ────

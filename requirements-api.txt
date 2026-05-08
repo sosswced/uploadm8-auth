@@ -1,0 +1,67 @@
+# API + static frontend + tests — omits worker-only ML stack (TensorFlow, rembg, ONNX, YAMNet).
+#
+# asyncpg: allow 0.31+ for Python 3.14 Windows wheels (0.30 was source-only on cp314).
+# Full stack on 3.14 still blocked by TensorFlow — use 3.11 + requirements.txt for the worker.
+# Full stack / worker: Python 3.11 + requirements.txt (matches Dockerfile).
+
+# Web Framework
+fastapi>=0.109.0,<0.116.0
+uvicorn[standard]>=0.27.0,<0.35.0
+
+# Database
+asyncpg>=0.29.0,<0.32.0
+python-multipart==0.0.9
+
+# Redis
+redis>=5.0.0,<6.0.0
+
+# Authentication & Security
+bcrypt>=4.1.0,<5.0.0
+PyJWT>=2.8.0,<3.0.0
+cryptography>=42.0.0,<45.0.0
+
+# AWS S3 / Cloudflare R2
+boto3>=1.34.0,<2.0.0
+
+# HTTP Client
+httpx>=0.26.0,<1.0.0
+
+# Stripe Billing
+stripe>=7.0.0,<12.0.0
+
+# Validation
+pydantic>=2.5.0,<3.0.0
+email-validator>=2.1.0,<3.0.0
+
+# Excel Export
+openpyxl>=3.1.0,<4.0.0
+
+# Error Tracking
+sentry-sdk[fastapi]>=2.0.0,<3.0.0
+
+# Environment
+python-dotenv>=1.0.0,<2.0.0
+
+# Async utilities
+aiofiles>=23.2.0,<25.0.0
+
+# Date/Time
+python-dateutil>=2.8.0,<3.0.0
+
+openai>=1.0.0,<2.0.0
+requests>=2.31.0,<3.0.0
+
+# geopandas/shapely/pandas omitted here: they drag GDAL/fiona on Windows; not imported by app.py.
+numpy>=1.24.0,<3.0.0
+
+Pillow>=10.0.0,<13.0.0
+
+pytest>=7.0.0,<9.0.0
+
+locust>=2.20.0,<3.0.0
+
+# Cloud / external APIs (API code paths; worker uses these too)
+replicate>=0.25.0,<2.0.0
+fal-client>=0.4.0,<1.0.0
+google-cloud-vision>=3.5.0,<4.0.0
+google-cloud-videointelligence>=2.11.0,<3.0.0

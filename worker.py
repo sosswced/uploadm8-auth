@@ -3,16 +3,21 @@ UploadM8 Worker Service v3 — Deferred Processing + Concurrent Jobs
 
 Pipeline order (critical — DO NOT REORDER):
   1.  Download        — Fetch original video + telemetry from R2
-  2.  Telemetry       — Parse .map file, calculate Trill score, reverse-geocode
+  2.  Telemetry       — Parse .map file, calculate Trill score, reverse-geocode + PADUS/gazetteer
   3.  HUD             — Burn speed overlay onto raw video (before transcode!)
   4.  Watermark       — Burn text watermark (before transcode!)
-  5.  Transcode       — Deduplicated per-platform MP4s
-  6.  Thumbnail       — Extract frame from FINAL processed video
-  7.  Caption         — AI title/caption/hashtags (vision + telemetry)
-  8.  Upload          — Per-platform R2 keys
-  9.  Publish         — Send to each platform API
-  10. Verify          — Delivery verification loop (background)
-  11. Notify          — Discord webhooks
+  5.  Transcode       — Deduplicated per-platform MP4s (+ ffprobe → ctx.video_info)
+  6.  Audio context   — Whisper / ACR / YAMNet / GPT summary (feeds M8)
+  7.  Vision          — Google Cloud Vision on sampled frames (labels/OCR/landmarks)
+  8.  Twelve Labs     — Optional full-video scene understanding
+  9.  Video Intel     — Always-on GCP Video Intelligence hydration (when credentials/limits allow)
+  10. Dashcam OSD     — Burned-in HUD OCR (always when pref on; .map unchanged); backfill only without .map
+  11. Thumbnail       — Extract frame from FINAL processed video
+  12. Caption         — M8 / LLM title+caption+hashtags (uses steps 2–10)
+  13. Upload          — Per-platform R2 keys
+  14. Publish         — Send to each platform API
+  15. Verify          — Delivery verification loop (background)
+  16. Notify          — Discord webhooks
 
 NEW IN v3: DEFERRED PROCESSING (Staged Upload Flow)
 ═══════════════════════════════════════════════════
@@ -63,6 +68,11 @@ NEW IN v3: DEFERRED PROCESSING (Staged Upload Flow)
 CONCURRENCY:
   WORKER_CONCURRENCY=3 (default) — 3 jobs process simultaneously.
   Scheduler loop runs as a separate asyncio task, not a job slot.
+
+WATERMARK (free tier — full-file FFmpeg re-encode before transcode):
+  WATERMARK_X264_PRESET (default: veryfast) and WATERMARK_X264_CRF (default: 23)
+  tune CPU time; intermediate file is re-encoded again in transcode. For long
+  clips, try preset=faster or ultrafast if the worker is queue-bound.
 """
 
 import os
@@ -79,6 +89,7 @@ from typing import Optional, Dict, List, Tuple
 import asyncpg
 import redis.asyncio as redis
 
+from core.helpers import coerce_jsonb_dict, coerce_jsonb_list, merge_platform_hashtag_overlay
 from stages.errors import StageError, SkipStage, CancelRequested
 from stages.context import JobContext, create_context
 from stages.entitlements import get_entitlements_from_user
@@ -90,6 +101,12 @@ from stages.transcode_stage import (
     get_video_info, needs_transcode, build_ffmpeg_command,
     resolve_reframe_action,
 )
+from stages.audio_stage import run_audio_context_stage
+from stages.vision_stage import run_vision_stage
+from stages.twelvelabs_stage import run_twelvelabs_stage
+from stages.video_intelligence_stage import run_video_intelligence_stage
+from stages.dashcam_osd_stage import backfill_telemetry_from_vision_osd, run_dashcam_osd_stage
+from stages.hydration_payload_stage import run_hydration_payload_stage
 from stages.thumbnail_stage import run_thumbnail_stage
 from stages.caption_stage import run_caption_stage
 from stages.hud_stage import run_hud_stage
@@ -106,7 +123,9 @@ from stages.emails import (
     send_upload_completed_email,
     send_upload_failed_email,
     send_low_token_warning_email,
+    build_upload_completed_email_extensions,
 )
+from services.pipeline_ai_trace import emit_ai_pipeline_summary, record_ai_pipeline_trace
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -218,28 +237,28 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
             user_row = await conn.fetchrow(
                 "SELECT email, name FROM users WHERE id = $1", user_id
             )
-            wants_email = prefs["email_notifications"] if prefs else True
+            wants_email = True
+            if prefs and prefs.get("email_notifications") is not None:
+                wants_email = bool(prefs["email_notifications"])
             if wants_email and user_row and user_row.get("email"):
                 put_bal = int(wallet.get("put_balance") or 0)
                 aic_bal = int(wallet.get("aic_balance") or 0)
                 if put_bal <= LOW_THRESHOLD and put_cost > 0:
-                    import asyncio as _aio
-                    _aio.ensure_future(send_low_token_warning_email(
+                    await send_low_token_warning_email(
                         user_row["email"],
                         user_row.get("name") or "there",
                         "put",
                         put_bal,
                         LOW_THRESHOLD,
-                    ))
+                    )
                 elif aic_bal <= LOW_THRESHOLD and aic_cost > 0:
-                    import asyncio as _aio
-                    _aio.ensure_future(send_low_token_warning_email(
+                    await send_low_token_warning_email(
                         user_row["email"],
                         user_row.get("name") or "there",
                         "aic",
                         aic_bal,
                         LOW_THRESHOLD,
-                    ))
+                    )
 
 
 async def _release_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost: int, reason: str = "release"):
@@ -396,7 +415,12 @@ STAGE_PROGRESS = {
     "telemetry":  18,
     "hud":        26,
     "watermark":  32,
-    "transcode":  58,
+    "transcode":  48,
+    "audio":      52,
+    "vision":     55,
+    "twelvelabs": 57,
+    "video_intelligence": 58,
+    "dashcam_osd": 60,
     "thumbnail":  65,
     "caption":    75,
     "upload":     87,
@@ -518,6 +542,46 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
 # Settings helpers
 # ---------------------------------------------------------------------------
 
+def _settings_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off", ""):
+            return False
+    return bool(value)
+
+
+def _merge_job_preferences(ctx: JobContext, job_data: dict) -> None:
+    """Overlay per-job upload preference snapshot without wiping richer DB prefs."""
+    raw = (job_data or {}).get("preferences")
+    if not raw:
+        return
+    prefs = coerce_jsonb_dict(raw, default={})
+    if not prefs:
+        return
+    for key, val in prefs.items():
+        if val is None:
+            continue
+        if key in ("platformHashtags", "platform_hashtags"):
+            merged = merge_platform_hashtag_overlay(
+                ctx.user_settings.get("platformHashtags") or ctx.user_settings.get("platform_hashtags"),
+                val,
+            )
+            ctx.user_settings["platformHashtags"] = merged
+            ctx.user_settings["platform_hashtags"] = merged
+            continue
+        if key in ("alwaysHashtags", "always_hashtags", "blockedHashtags", "blocked_hashtags"):
+            val = coerce_jsonb_list(val)
+        ctx.user_settings[key] = val
+
+
 def _should_run_trill(ctx: JobContext) -> bool:
     has_file = (
         ctx.local_telemetry_path is not None
@@ -525,19 +589,17 @@ def _should_run_trill(ctx: JobContext) -> bool:
     )
     if not has_file:
         return False
-    setting = ctx.user_settings.get("telemetry_enabled", True)
-    if isinstance(setting, str):
-        setting = setting.lower() not in ("false", "0", "no", "off")
-    return bool(setting)
+    us = ctx.user_settings or {}
+    telemetry_on = _settings_bool(us.get("telemetry_enabled"), True)
+    trill_on = _settings_bool(us.get("trill_enabled", us.get("trillEnabled")), telemetry_on)
+    return bool(telemetry_on and trill_on)
 
 
 def _should_run_hud(ctx: JobContext) -> bool:
     if not _should_run_trill(ctx):
         return False
-    hud = ctx.user_settings.get("hud_enabled", True)
-    if isinstance(hud, str):
-        hud = hud.lower() not in ("false", "0", "no", "off")
-    if not bool(hud):
+    hud = _settings_bool(ctx.user_settings.get("hud_enabled"), True)
+    if not hud:
         return False
     if ctx.entitlements and not ctx.entitlements.can_burn_hud:
         return False
@@ -558,9 +620,49 @@ def _apply_trill_caption_settings(ctx: JobContext) -> None:
         return
     min_score = _trill_min_score(ctx)
     if trill.score < min_score:
-        logger.info(f"[{ctx.upload_id}] Trill score {trill.score} < threshold {min_score} — suppressing Trill content")
-        ctx.trill_score = None
-        ctx.trill = None
+        logger.info(
+            f"[{ctx.upload_id}] Trill score {trill.score} < threshold {min_score} — suppressing Trill hype tags only"
+        )
+        trill.title_modifier = ""
+        trill.hashtags = []
+        ctx.trill_score = trill
+        ctx.trill = trill
+
+
+def _log_multimodal_pipeline_survey(upload_id: str, ctx: JobContext) -> None:
+    """Single INFO line after vision/audio/Twelve Labs/VI so operators can spot
+    skipped credentials, tier gates, or prefs that leave captions thin.
+    """
+    vis = getattr(ctx, "vision_context", None) or {}
+    n_vis = len(vis.get("label_names") or []) if isinstance(vis, dict) else 0
+    ac = getattr(ctx, "audio_context", None) or {}
+    whisper_chars = 0
+    if isinstance(ac, dict):
+        whisper_chars = int(ac.get("transcript_chars") or 0)
+    whisper_chars = max(whisper_chars, len((getattr(ctx, "ai_transcript", None) or "").strip()))
+    vit = getattr(ctx, "video_intelligence", None) or {}
+    vic = getattr(ctx, "video_intelligence_context", None) or {}
+    n_vi_obj = len(vit.get("object_tracks") or []) if isinstance(vit, dict) else 0
+    if not n_vi_obj and isinstance(vic, dict):
+        n_vi_obj = len(vic.get("object_tracks") or [])
+    vu = getattr(ctx, "video_understanding", None) or {}
+    tl_chars = len(str(vu.get("scene_description") or "")) if isinstance(vu, dict) else 0
+    vi_err = bool(isinstance(vic, dict) and vic.get("error"))
+    logger.info(
+        "[%s] multimodal survey: vision_labels=%d whisper_chars=%d vi_objects=%d "
+        "twelve_labs_scene_chars=%d vi_ctx_error=%s",
+        upload_id,
+        n_vis,
+        whisper_chars,
+        n_vi_obj,
+        tl_chars,
+        vi_err,
+    )
+
+
+def _ai_trace(ctx: Optional[JobContext], upload_id: str, stage: str, payload: Dict[str, object]) -> None:
+    """Structured AI diagnostics: accumulates under ctx + optional per-line `[ai-trace]`."""
+    record_ai_pipeline_trace(ctx, upload_id, stage, payload, log=logger)
 
 
 # ---------------------------------------------------------------------------
@@ -585,23 +687,55 @@ async def run_processing_pipeline(job_data: dict) -> bool:
     temp_dir = None
 
     try:
+        async def _persist_diag_artifacts_now(*keys: str) -> None:
+            """Persist selected in-memory artifacts immediately (best-effort)."""
+            if not ctx or not isinstance(getattr(ctx, "output_artifacts", None), dict):
+                return
+            patch: Dict[str, str] = {}
+            for k in keys:
+                v = ctx.output_artifacts.get(k)
+                if v is None:
+                    continue
+                if isinstance(v, str):
+                    if v.strip():
+                        patch[k] = v
+                    continue
+                try:
+                    patch[k] = json.dumps(v, default=str)
+                except Exception:
+                    continue
+            if not patch:
+                return
+            try:
+                await db_stage.merge_job_output_artifacts_strings(db_pool, str(upload_id), patch)
+            except Exception as _e:
+                logger.debug(f"[{upload_id}] immediate artifact persist skipped: {_e}")
+
         upload_record = await db_stage.load_upload_record(db_pool, upload_id)
         user_record = await db_stage.load_user(db_pool, user_id)
         if not upload_record or not user_record:
             logger.error(f"[{upload_id}] Records not found")
             return False
-        if (upload_record.get("status") or "").lower() == "cancelled":
-            logger.info(f"[{upload_id}] Skipping — already cancelled")
-            return False
 
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
+        await db_stage.merge_pikzels_thumbnail_persona_id(db_pool, user_id, user_settings)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
         entitlements = get_entitlements_from_user(user_record, overrides)
 
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
+        _merge_job_preferences(ctx, job_data)
         ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
+        # Stash db_pool on ctx so producer stages can self-persist diag artifacts
+        # (hydration_payload / studio_render_report / thumbnail_trace / hydration_report
+        # / pikzels_prompt_by_platform). Without this they only land in DB if the
+        # orchestrator finishes save_generated_metadata, which silently drops them
+        # whenever caption_stage exits early or an older worker is deployed.
+        try:
+            setattr(ctx, "_db_pool", db_pool)
+        except Exception:
+            pass
         ctx.user_settings["_openai_model_override"] = (
             ctx.user_settings.get("trillOpenaiModel")
             or ctx.user_settings.get("trill_openai_model")
@@ -629,10 +763,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             if not ent.can_burn_hud and hasattr(ctx, "hud_enabled"):
                 ctx.hud_enabled = False
 
-            # Enforce watermark — if can_watermark=True (free tier), force it on
-            if ent.can_watermark and hasattr(ctx, "watermark_text"):
-                if not ctx.watermark_text:
-                    ctx.watermark_text = "UploadM8"
+            # Free tier: burn-in text from admin_settings (master-editable), DB each job.
+            if ent.can_watermark:
+                ctx.watermark_text = await db_stage.load_watermark_burn_text(db_pool)
 
             # Enforce AI depth
             if not ent.can_ai and hasattr(ctx, "use_ai"):
@@ -684,12 +817,21 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             try:
                 ctx = await run_telemetry_stage(ctx)
                 _apply_trill_caption_settings(ctx)
+                tel = ctx.telemetry or ctx.telemetry_data
+                _ai_trace(ctx, upload_id, "telemetry", {
+                    "status": "ok",
+                    "points": len((getattr(tel, "points", None) or [])) if tel else 0,
+                    "location": getattr(tel, "location_display", None) if tel else None,
+                    "trill_bucket": getattr((ctx.trill or ctx.trill_score), "bucket", None),
+                })
             except SkipStage as e:
                 logger.info(f"[{upload_id}] Telemetry skipped: {e.reason}")
+                _ai_trace(ctx, upload_id, "telemetry", {"status": "skipped", "reason": e.reason})
                 trill_active = False
                 hud_active = False
             except StageError as e:
                 logger.warning(f"[{upload_id}] Telemetry error: {e.message}")
+                _ai_trace(ctx, upload_id, "telemetry", {"status": "error", "reason": e.message})
                 trill_active = False
                 hud_active = False
         else:
@@ -709,6 +851,10 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 logger.info(f"[{upload_id}] HUD skipped: {e.reason}")
             except StageError as e:
                 logger.warning(f"[{upload_id}] HUD error: {e.message}")
+        try:
+            await db_stage.save_trill_metadata(db_pool, ctx)
+        except Exception as e:
+            logger.debug(f"[{upload_id}] Trill metadata persist skipped: {e}")
         await maybe_cancel(ctx, "hud")
 
         # ============================================================
@@ -737,14 +883,160 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         await maybe_cancel(ctx, "transcode")
 
         # ============================================================
-        # STAGE 6: Thumbnail — extract frame then immediately upload to R2
+        # STAGE 6–10: Multimodal context (audio, vision, TL, VI, HUD — feeds M8/captions)
+        # ============================================================
+        try:
+            ctx = await run_audio_context_stage(ctx)
+            ac = ctx.audio_context or {}
+            _ai_trace(ctx, upload_id, "audio", {
+                "status": "ok",
+                "transcript_chars": len((ctx.ai_transcript or ac.get("transcript") or "").strip()),
+                "music_detected": bool(ac.get("music_detected")),
+                "yamnet_events": len(ac.get("yamnet_events") or []),
+            })
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Audio context skipped: {e.reason}")
+            _ai_trace(ctx, upload_id, "audio", {"status": "skipped", "reason": e.reason})
+        except StageError as e:
+            logger.warning(f"[{upload_id}] Audio context error: {e.message}")
+            _ai_trace(ctx, upload_id, "audio", {"status": "error", "reason": e.message})
+        await maybe_cancel(ctx, "audio")
+
+        try:
+            ctx = await run_vision_stage(ctx)
+            vis = ctx.vision_context or {}
+            _ai_trace(ctx, upload_id, "vision", {
+                "status": "ok",
+                "labels": len(vis.get("label_names") or []) if isinstance(vis, dict) else 0,
+                "ocr_chars": len((vis.get("ocr_text") or "").strip()) if isinstance(vis, dict) else 0,
+                "landmarks": len(vis.get("landmark_names") or []) if isinstance(vis, dict) else 0,
+            })
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Vision skipped: {e.reason}")
+            _ai_trace(ctx, upload_id, "vision", {"status": "skipped", "reason": e.reason})
+        except StageError as e:
+            logger.warning(f"[{upload_id}] Vision error: {e.message}")
+            _ai_trace(ctx, upload_id, "vision", {"status": "error", "reason": e.message})
+        await maybe_cancel(ctx, "vision")
+
+        try:
+            ctx = await run_twelvelabs_stage(ctx)
+            vu = ctx.video_understanding or {}
+            _ai_trace(ctx, upload_id, "twelvelabs", {
+                "status": "ok",
+                "scene_chars": len((vu.get("scene_description") or "").strip()) if isinstance(vu, dict) else 0,
+                "title_suggestion": (vu.get("title_suggestion") or "") if isinstance(vu, dict) else "",
+            })
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Twelve Labs skipped: {e.reason}")
+            _ai_trace(ctx, upload_id, "twelvelabs", {"status": "skipped", "reason": e.reason})
+        except StageError as e:
+            logger.warning(f"[{upload_id}] Twelve Labs error: {e.message}")
+            _ai_trace(ctx, upload_id, "twelvelabs", {"status": "error", "reason": e.message})
+        await maybe_cancel(ctx, "twelvelabs")
+
+        try:
+            ctx = await run_video_intelligence_stage(ctx)
+            vi = getattr(ctx, "video_intelligence", None) or {}
+            _ai_trace(ctx, upload_id, "video_intelligence", {
+                "status": "ok",
+                "objects": len(vi.get("object_tracks") or []) if isinstance(vi, dict) else 0,
+                "logos": len(vi.get("logos") or []) if isinstance(vi, dict) else 0,
+                "text": len(vi.get("on_screen_text") or []) if isinstance(vi, dict) else 0,
+            })
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Video intelligence skipped: {e.reason}")
+            _ai_trace(ctx, upload_id, "video_intelligence", {"status": "skipped", "reason": e.reason})
+        except StageError as e:
+            logger.warning(f"[{upload_id}] Video intelligence error: {e.message}")
+            _ai_trace(ctx, upload_id, "video_intelligence", {"status": "error", "reason": e.message})
+
+        try:
+            from services.recognition_engine import persist_recognition
+            vi_payload = getattr(ctx, "video_intelligence", None) or {}
+            if vi_payload and not vi_payload.get("error"):
+                summary = await persist_recognition(
+                    db_pool,
+                    upload_id=str(ctx.upload_id),
+                    user_id=str(ctx.user_id),
+                    vi_payload=vi_payload,
+                )
+                if summary:
+                    setattr(ctx, "recognition_summary", summary)
+        except Exception as rec_e:
+            logger.warning(f"[{upload_id}] recognition persist non-fatal: {rec_e}")
+
+        await maybe_cancel(ctx, "video_intelligence")
+
+        _log_multimodal_pipeline_survey(upload_id, ctx)
+
+        try:
+            ctx = await run_dashcam_osd_stage(ctx)
+            osd = ctx.dashcam_osd_context or {}
+            _ai_trace(ctx, upload_id, "dashcam_osd", {
+                "status": "ok",
+                "frames_sampled": osd.get("frames_sampled") if isinstance(osd, dict) else None,
+                "gps_fix_count": len(osd.get("gps_path") or []) if isinstance(osd, dict) else 0,
+                "telemetry_backfilled": bool(osd.get("telemetry_backfilled")) if isinstance(osd, dict) else False,
+            })
+        except SkipStage as e:
+            logger.info(f"[{upload_id}] Dashcam OSD skipped: {e.reason}")
+            _ai_trace(ctx, upload_id, "dashcam_osd", {"status": "skipped", "reason": e.reason})
+        except StageError as e:
+            logger.warning(f"[{upload_id}] Dashcam OSD error: {e.message}")
+            _ai_trace(ctx, upload_id, "dashcam_osd", {"status": "error", "reason": e.message})
+        try:
+            await backfill_telemetry_from_vision_osd(ctx)
+        except Exception as e:
+            logger.warning(f"[{upload_id}] Vision OSD fallback skipped: {e}")
+
+        # Design note: dashcam OSD intentionally runs AFTER HUD (stage 3) because HUD
+        # needs the processed video, not the original. If OSD backfills telemetry from
+        # burned-in GPS/speed, HUD has already rendered without that data. When
+        # dashcam GPS enrichment is important, set DASHCAM_OSD_SKIP_WHEN_MAP_TELEMETRY=false
+        # and ensure a companion .map file is present so telemetry feeds HUD correctly.
+        if (ctx.telemetry or ctx.telemetry_data) and not hud_active:
+            logger.info(
+                f"[{upload_id}] Dashcam OSD backfilled telemetry after HUD stage — "
+                "HUD overlay ran without location/speed data. "
+                "Upload a .map companion file to get HUD overlays with OSD-sourced GPS."
+            )
+        try:
+            await db_stage.save_trill_metadata(db_pool, ctx)
+        except Exception as e:
+            logger.debug(f"[{upload_id}] OSD Trill metadata persist skipped: {e}")
+        await maybe_cancel(ctx, "dashcam_osd")
+
+        # Canonical hydration snapshot (thumb + caption + `output_artifacts`).
+        try:
+            ctx = await run_hydration_payload_stage(ctx)
+            await _persist_diag_artifacts_now("hydration_payload")
+        except Exception as hp_e:
+            logger.warning(f"[{upload_id}] hydration_payload_stage failed (non-fatal): {hp_e}")
+
+        # ============================================================
+        # STAGE 11: Thumbnail — extract frame then immediately upload to R2
         # ============================================================
         try:
             ctx = await run_thumbnail_stage(ctx)
+            _ai_trace(ctx, upload_id, "thumbnail", {
+                "status": "ok",
+                "thumbnail_path": str(ctx.thumbnail_path or ""),
+                "candidate_count": len(ctx.thumbnail_paths or []),
+            })
         except SkipStage as e:
             logger.info(f"[{upload_id}] Thumbnail skipped: {e.reason}")
+            _ai_trace(ctx, upload_id, "thumbnail", {"status": "skipped", "reason": e.reason})
         except StageError as e:
             logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
+            _ai_trace(ctx, upload_id, "thumbnail", {"status": "error", "reason": e.message})
+
+        if not ctx.thumbnail_path or not Path(ctx.thumbnail_path).exists():
+            logger.warning(
+                f"[{upload_id}] No thumbnail produced — "
+                "caption frames and publish previews will lack visual context. "
+                "Check thumbnail_stage for ffmpeg/entitlement errors."
+            )
 
         # ── Upload the best thumbnail to R2 and record its key ─────────────
         # thumbnail_stage sets ctx.thumbnail_path but never uploads it.
@@ -771,9 +1063,10 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except Exception as e:
                 logger.warning(f"[{upload_id}] Thumbnail R2 upload failed (non-fatal): {e}")
 
-        # ── Upload platform-specific styled thumbnails to R2 (for publish + deferred) ──
-        # platform_thumbnail_map has local paths per platform (youtube, instagram, facebook).
-        # Upload each so publish_stage can use platform-specific cover for IG/FB (9:16).
+        # ── Upload platform-specific styled thumbnails to R2 (for publish + deferred + UI) ──
+        # platform_thumbnail_map has local paths per platform. Upload each so publish_stage
+        # can use supported custom covers and queue/detail UI can display previews for all
+        # selected platforms, including TikTok even when publish falls back to thumb_offset.
         platform_thumb_r2: Dict[str, str] = {}
         pm_json = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
         try:
@@ -812,22 +1105,128 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             if candidate_keys:
                 ctx.output_artifacts["thumbnail_r2_candidates"] = json.dumps(candidate_keys)
 
+        # Persist thumbnail diagnostics immediately so admin trace and rescue checks
+        # can see persona/Pikzels evidence even if later stages are skipped/fail.
+        await _persist_diag_artifacts_now(
+            "thumbnail_trace",
+            "pikzels_prompt_by_platform",
+            "platform_thumbnail_map",
+            "platform_thumbnail_r2_keys",
+            "thumbnail_render_method",
+            "thumbnail_selection_method",
+            "thumbnail_brief_json",
+            "studio_render_report",
+            "thumbnail_r2_candidates",
+        )
+
+        # ML / ops: log styled thumbnail renders from the upload pipeline (Pikzels v2 or GPT image edit)
+        # so training data is not limited to the standalone Thumbnail Studio tool.
+        _thumb_render = str(ctx.output_artifacts.get("thumbnail_render_method") or "").strip()
+        if _thumb_render in ("studio_renderer", "ai_edit") and getattr(ctx, "user_id", None):
+            try:
+                from services.growth_intelligence import m8_engine_identity_payload, record_studio_usage_event
+                from services.ml_marketing import record_thumbnail_studio_engine_ml_batch
+
+                _engine_mode = (
+                    "uploadm8_pikzels_v2_pipeline"
+                    if _thumb_render == "studio_renderer"
+                    else "uploadm8_gpt_image_edit_pipeline"
+                )
+                _variants = [
+                    {
+                        "index": 1,
+                        "ctr_score": None,
+                        "engine_status": "ok",
+                        "pikzels_main_score": None,
+                        "pikzels_recreate_http_status": None,
+                    }
+                ]
+                async with db_pool.acquire() as conn:
+                    await record_thumbnail_studio_engine_ml_batch(
+                        conn,
+                        user_id=str(ctx.user_id),
+                        job_id=str(upload_id),
+                        engine_mode=_engine_mode,
+                        variants=_variants,
+                        youtube_video_id=None,
+                        upload_id=str(upload_id),
+                    )
+                    _m8 = m8_engine_identity_payload()
+                    await record_studio_usage_event(
+                        conn,
+                        str(ctx.user_id),
+                        "thumbnail_upload_pipeline_render",
+                        200,
+                        {
+                            "upload_id": str(upload_id),
+                            "thumbnail_render_method": _thumb_render,
+                            "m8_engine_ai_slug": _m8.get("ai_slug"),
+                        },
+                    )
+            except Exception:
+                logger.debug(
+                    "[%s] upload thumbnail studio ML telemetry failed",
+                    upload_id,
+                    exc_info=True,
+                )
+
         await maybe_cancel(ctx, "thumbnail")
 
         # ============================================================
-        # STAGE 7: Caption
+        # STAGE 12: Caption + deterministic signal hashtags (geo / vision / ACR)
         # ============================================================
         try:
             ctx = await run_caption_stage(ctx, db_pool)
-            await db_stage.save_generated_metadata(db_pool, ctx)
+            _ai_trace(ctx, upload_id, "caption", {
+                "status": "ok",
+                "ai_title": str(ctx.ai_title or ""),
+                "ai_caption": str(ctx.ai_caption or ""),
+                "ai_hashtag_count": len(ctx.ai_hashtags or []),
+                "m8_platforms": list((ctx.m8_platform_captions or {}).keys()),
+            })
         except SkipStage as e:
             logger.info(f"[{upload_id}] Caption skipped: {e.reason}")
+            _ai_trace(ctx, upload_id, "caption", {"status": "skipped", "reason": e.reason})
         except StageError as e:
             logger.warning(f"[{upload_id}] Caption error: {e.message}")
+            _ai_trace(ctx, upload_id, "caption", {"status": "error", "reason": e.message})
+
+        # Signal hashtags and hydration always run after caption — even when the
+        # caption stage was skipped — so geo/vision signals appear in the final
+        # hashtag list regardless of the autoCaptions setting.
+        try:
+            from services.hydration_payload import sync_hydration_payload_signal_hashtags
+            from services.signal_hashtags import merge_signal_hashtags_into_ctx
+
+            _sig_extras = merge_signal_hashtags_into_ctx(ctx)
+            sync_hydration_payload_signal_hashtags(ctx, _sig_extras)
+        except Exception as sig_e:
+            logger.warning(f"[{upload_id}] signal_hashtags merge failed (non-fatal): {sig_e}")
+        try:
+            from services.hydration_enforcer import enforce_hydration
+
+            enforce_hydration(ctx)
+            await _persist_diag_artifacts_now("hydration_report")
+        except Exception as hy_e:
+            logger.warning(f"[{upload_id}] hydration_enforcer failed (non-fatal): {hy_e}")
+            if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                ctx.output_artifacts.setdefault(
+                    "hydration_report",
+                    {
+                        "ok": False,
+                        "error": str(hy_e)[:500],
+                        "source": "worker_fallback",
+                    },
+                )
+            await _persist_diag_artifacts_now("hydration_report")
+        try:
+            await db_stage.save_generated_metadata(db_pool, ctx)
+        except Exception as save_e:
+            logger.warning(f"[{upload_id}] save_generated_metadata failed (non-fatal): {save_e}")
         await maybe_cancel(ctx, "caption")
 
         # ============================================================
-        # STAGE 8: Upload processed files to R2
+        # STAGE 13: Upload processed files to R2
         # ============================================================
         ctx.mark_stage("upload")
         processed_assets: Dict[str, str] = {}
@@ -908,23 +1307,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
     except CancelRequested:
         logger.info(f"[{upload_id}] Pipeline cancelled")
-        # ── Remove video and assets from R2 ───────────────────────────────────
-        try:
-            async with db_pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT r2_key, telemetry_r2_key, processed_r2_key, thumbnail_r2_key FROM uploads WHERE id = $1",
-                    upload_id,
-                )
-                if row:
-                    for col in ("r2_key", "telemetry_r2_key", "processed_r2_key", "thumbnail_r2_key"):
-                        k = row.get(col)
-                        if k:
-                            try:
-                                await r2_stage.delete_file(k)
-                            except Exception as del_err:
-                                logger.warning(f"[{upload_id}] R2 delete {col} failed: {del_err}")
-        except Exception as r2_err:
-            logger.warning(f"[{upload_id}] R2 cleanup on cancel failed: {r2_err}")
         # ── Release wallet hold on failure ───────────────────────────────────
         try:
             put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
@@ -940,17 +1322,22 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             ctx.mark_error("INTERNAL", str(e))
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
         # ── Release wallet hold on failure ───────────────────────────────────
-        _uid_for_release = str(ctx.user_id) if ctx else user_id
-        _upid_for_release = ctx.upload_id if ctx else upload_id
         try:
-            put_cost, aic_cost = await _get_upload_costs(_upid_for_release)
-            if _uid_for_release and (put_cost > 0 or aic_cost > 0):
-                await _release_tokens(_upid_for_release, _uid_for_release, put_cost, aic_cost, reason="upload_failed_refund")
+            put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
+            user_id_str = str(ctx.user_id) if ctx.user_id else None
+            if user_id_str and (put_cost > 0 or aic_cost > 0):
+                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
         except Exception as wallet_err:
-            logger.error(f"[{upload_id}] Wallet release failed: {wallet_err}")
+            logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
         await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
         return False
     finally:
+        uid = upload_id or (str(ctx.upload_id) if ctx else "")
+        if ctx:
+            try:
+                await emit_ai_pipeline_summary(ctx, uid, logger, db_pool)
+            except Exception:
+                logger.debug("[%s] ai-pipeline-summary emission failed", uid, exc_info=True)
         if temp_dir:
             try:
                 temp_dir.cleanup()
@@ -974,7 +1361,7 @@ async def run_publish_and_notify(
         ctx.mark_error(e.code.value, e.message)
 
     try:
-        ctx = await run_notify_stage(ctx)
+        ctx = await run_notify_stage(ctx, db_pool)
     except Exception as e:
         logger.warning(f"[{upload_id}] Notify error: {e}")
 
@@ -987,47 +1374,6 @@ async def run_publish_and_notify(
         ctx.state = "failed"
 
     await db_stage.mark_processing_completed(db_pool, ctx)
-
-    # ── Upload email notification (respects user_preferences.email_notifications) ──
-    try:
-        _u = ctx.user_record
-        _user_email = _u.get("email") if _u else None
-        _user_name  = (_u.get("name") if _u else None) or "there"
-        if _user_email:
-            async with db_pool.acquire() as _pconn:
-                _prefs = await _pconn.fetchrow(
-                    "SELECT email_notifications FROM user_preferences WHERE user_id = $1",
-                    ctx.user_id,
-                )
-            _wants_email = _prefs["email_notifications"] if _prefs else True
-            if _wants_email:
-                import asyncio as _aio
-                _platforms = ctx.platforms or []
-                _put_cost, _aic_cost = await _get_upload_costs(ctx.upload_id)
-                if ctx.state in ("succeeded", "partial"):
-                    _aio.ensure_future(send_upload_completed_email(
-                        _user_email,
-                        _user_name,
-                        ctx.filename or upload_id,
-                        ctx.get_success_platforms() or _platforms,
-                        int(_put_cost or 0),
-                        int(_aic_cost or 0),
-                        str(upload_id),
-                    ))
-                elif ctx.state == "failed":
-                    _err_reason = getattr(ctx, "error_message", "") or ""
-                    _err_stage  = getattr(ctx, "current_stage", "") or ""
-                    _aio.ensure_future(send_upload_failed_email(
-                        _user_email,
-                        _user_name,
-                        ctx.filename or upload_id,
-                        _platforms,
-                        _err_reason,
-                        str(upload_id),
-                        _err_stage,
-                    ))
-    except Exception as _email_err:
-        logger.warning(f"[{upload_id}] Upload email notification failed (non-fatal): {_email_err}")
 
     # ── Finalize wallet hold (capture on success/partial, release on failure) ──
     try:
@@ -1063,6 +1409,80 @@ async def run_publish_and_notify(
         # Never let wallet accounting crash the job finalization
         logger.error(f"[{ctx.upload_id}] Wallet finalize failed (non-fatal): {wallet_err}")
 
+    # ── Upload email (after wallet so balances reflect capture / refund) ───────
+    try:
+        _u = ctx.user_record
+        _user_email = _u.get("email") if _u else None
+        _user_name = (_u.get("name") if _u else None) or "there"
+        if _user_email:
+            async with db_pool.acquire() as _pconn:
+                _prefs = await _pconn.fetchrow(
+                    "SELECT email_notifications FROM user_preferences WHERE user_id = $1",
+                    ctx.user_id,
+                )
+            _wants_email = True
+            if _prefs and _prefs.get("email_notifications") is not None:
+                _wants_email = bool(_prefs["email_notifications"])
+            if _wants_email:
+                _platforms = ctx.platforms or []
+                _put_cost, _aic_cost = await _get_upload_costs(ctx.upload_id)
+                if ctx.state in ("succeeded", "partial"):
+                    _put_bal = _aic_bal = None
+                    try:
+                        async with db_pool.acquire() as _wconn:
+                            _wrow = await _wconn.fetchrow(
+                                "SELECT put_balance, aic_balance FROM wallets WHERE user_id = $1::uuid",
+                                ctx.user_id,
+                            )
+                        if _wrow:
+                            _put_bal = int(_wrow["put_balance"] or 0)
+                            _aic_bal = int(_wrow["aic_balance"] or 0)
+                    except Exception:
+                        pass
+                    _extras = build_upload_completed_email_extensions(
+                        ctx,
+                        put_balance=_put_bal,
+                        aic_balance=_aic_bal,
+                    )
+                    try:
+                        from services.upload_notification_preview import (
+                            resolve_upload_notification_preview_https_url,
+                        )
+
+                        _preview_u = await resolve_upload_notification_preview_https_url(
+                            db_pool, ctx
+                        )
+                        if _preview_u:
+                            _extras["preview_image_url"] = _preview_u
+                    except Exception:
+                        pass
+                    _dur = int(_extras.pop("duration_seconds", 0) or 0)
+                    await send_upload_completed_email(
+                        _user_email,
+                        _user_name,
+                        ctx.filename or upload_id,
+                        ctx.get_success_platforms() or _platforms,
+                        int(_put_cost or 0),
+                        int(_aic_cost or 0),
+                        str(upload_id),
+                        _dur,
+                        **_extras,
+                    )
+                elif ctx.state == "failed":
+                    _err_reason = getattr(ctx, "error_message", "") or ""
+                    _err_stage = getattr(ctx, "current_stage", "") or ""
+                    await send_upload_failed_email(
+                        _user_email,
+                        _user_name,
+                        ctx.filename or upload_id,
+                        _platforms,
+                        _err_reason,
+                        str(upload_id),
+                        _err_stage,
+                    )
+    except Exception as _email_err:
+        logger.warning(f"[{upload_id}] Upload email notification failed (non-fatal): {_email_err}")
+
     if ctx.is_success():
         await db_stage.increment_upload_count(db_pool, user_id)
 
@@ -1095,6 +1515,7 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             return False
 
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
+        await db_stage.merge_pikzels_thumbnail_persona_id(db_pool, user_id, user_settings)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
         entitlements = get_entitlements_from_user(user_record, overrides)
 
@@ -1105,6 +1526,8 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             "job_id": f"deferred-publish-{upload_id}",
         }
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
+        _merge_job_preferences(ctx, job_data)
+        ctx.user_record = user_record
         ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
@@ -1129,11 +1552,6 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             # Enforce HUD — if can_burn_hud is False, skip HUD stage
             if not ent.can_burn_hud and hasattr(ctx, "hud_enabled"):
                 ctx.hud_enabled = False
-
-            # Enforce watermark — if can_watermark=True (free tier), force it on
-            if ent.can_watermark and hasattr(ctx, "watermark_text"):
-                if not ctx.watermark_text:
-                    ctx.watermark_text = "UploadM8"
 
             # Enforce AI depth
             if not ent.can_ai and hasattr(ctx, "use_ai"):
@@ -1256,21 +1674,16 @@ async def _sync_one_upload_analytics(
     user_id: str,
     pr_list: list,
     token_map: dict,
-    token_map_by_platform: dict = None,
 ) -> dict:
     """
     Pull engagement stats for one completed upload from each platform API.
     Returns totals dict and writes them + analytics_synced_at to DB.
-
-    token_map: by token_id (account_id) for multi-account — use correct token per result
-    token_map_by_platform: fallback when account_id not in platform_results (legacy)
     """
     import httpx as _httpx
     from stages.publish_stage import decrypt_token
 
     total_views = total_likes = total_comments = total_shares = 0
     platform_stats = {}
-    platform_fallback = token_map_by_platform or {}
 
     async with _httpx.AsyncClient(timeout=15) as client:
         for pr in pr_list:
@@ -1282,11 +1695,7 @@ async def _sync_one_upload_analytics(
             if not ok:
                 continue
 
-            # Multi-account: use token for this specific account; fallback to platform
-            account_id = pr.get("account_id")
-            tok = token_map.get(str(account_id), {}) if account_id else {}
-            if not tok:
-                tok = platform_fallback.get(plat, {})
+            tok = token_map.get(plat, {})
             access_token = tok.get("access_token", "")
             if not access_token:
                 continue
@@ -1474,7 +1883,7 @@ async def run_analytics_sync_loop() -> None:
                     """
                     SELECT u.id AS upload_id, u.user_id, u.platform_results, u.platforms
                       FROM uploads u
-                     WHERE u.status IN ('completed','succeeded','partial')
+                     WHERE u.status = 'completed'
                        AND u.created_at >= $1
                        AND (u.analytics_synced_at IS NULL OR u.analytics_synced_at < $2)
                      ORDER BY u.analytics_synced_at ASC NULLS FIRST, u.created_at DESC
@@ -1523,23 +1932,21 @@ async def run_analytics_sync_loop() -> None:
                         # No platform results to query — stamp and skip
                         async with db_pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id = $1",
+                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
                                 row["upload_id"],
                             )
                         continue
 
-                    # Fetch active tokens for this user (include id for multi-account lookup)
+                    # Fetch active tokens for this user
                     async with db_pool.acquire() as conn:
                         token_rows = await conn.fetch(
-                            """SELECT id, platform, token_blob, account_id
+                            """SELECT platform, token_blob, account_id
                                   FROM platform_tokens
-                                 WHERE user_id = $1 AND revoked_at IS NULL""",
+                                 WHERE user_id= AND revoked_at IS NULL""",
                             row["user_id"],
                         )
 
-                    # token_map: by token_id for multi-account; fallback by platform
                     token_map = {}
-                    token_map_by_platform = {}
                     for tr in token_rows:
                         try:
                             blob = tr["token_blob"]
@@ -1551,9 +1958,7 @@ async def run_analytics_sync_loop() -> None:
                                     dec["ig_user_id"] = str(tr["account_id"])
                                 if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
                                     dec["page_id"] = str(tr["account_id"])
-                                token_id = str(tr["id"])
-                                token_map[token_id] = dec
-                                token_map_by_platform[tr["platform"]] = dec
+                                token_map[tr["platform"]] = dec
                         except Exception:
                             pass
 
@@ -1561,7 +1966,7 @@ async def run_analytics_sync_loop() -> None:
                         # User has no active tokens — stamp and skip
                         async with db_pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id = $1",
+                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
                                 row["upload_id"],
                             )
                         continue
@@ -1569,7 +1974,7 @@ async def run_analytics_sync_loop() -> None:
                     try:
                         async with db_pool.acquire() as conn:
                             result = await _sync_one_upload_analytics(
-                                conn, upload_id, user_id, pr_list, token_map, token_map_by_platform
+                                conn, upload_id, user_id, pr_list, token_map
                             )
                         synced += 1
                         logger.debug(
@@ -1694,13 +2099,10 @@ async def run_scheduler_loop() -> None:
                 # Only pull as many staged jobs as there are free process slots.
                 # This prevents dispatching 500-job batches into memory when
                 # workers are already saturated.
-                if _process_semaphore is not None:
-                    try:
-                        free_slots = _process_semaphore._value
-                    except AttributeError:
-                        free_slots = WORKER_CONCURRENCY
-                else:
-                    free_slots = 0
+                free_slots = WORKER_CONCURRENCY - (
+                    WORKER_CONCURRENCY - _process_semaphore._value
+                    if _process_semaphore else WORKER_CONCURRENCY
+                )
                 dispatch_limit = max(1, free_slots)
 
                 staged_jobs = await conn.fetch(

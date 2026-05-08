@@ -1,12 +1,38 @@
 """
-UploadM8 API Server - Production Build v4
-Slim entrypoint: lifespan, migrations, middleware, router wiring.
-All route handlers live in routers/, shared logic in core/.
+UploadM8 API Server — production entrypoint (intentionally small).
+
+Architecture (for audits / onboarding)
+----------------------------------------
+**This file is not a route monolith.** HTTP surface area lives in ``routers/*.py``.
+Each module defines an ``APIRouter`` (with its own ``prefix`` where needed) and is
+registered here with ``app.include_router(...)``. New endpoints belong in an existing router or a new
+``routers/<domain>.py`` — do not grow this file with business handlers.
+
+**Where complexity still concentrates**
+- **Schema migrations** live in ``migrations/runtime_migrations.py`` (single source
+  of truth). ``lifespan`` calls ``run_migrations(db_pool)`` after the pool exists.
+- **Fat routers** (e.g. ``routers/admin.py``, ``routers/me.py``): the next
+  decomposition target is *thin handlers +* ``services/``, not splitting ``app.py``.
+
+**Contracts**
+- Routers: validate input, call services, map errors, return responses.
+- ``services/`` and ``core/``: orchestration, DB patterns, shared helpers.
+- **Static UI:** when ``frontend/`` exists and ``SERVE_FRONTEND`` is not disabled, the app
+  mounts it at ``/`` after all API routes so pages load from the same origin as ``/api/*``
+  (see ``core.config.FRONTEND_STATIC_DIR``). HTML still uses ``js/api-base.js`` + ``auth-stack.js``
+  to call the routers; browsers do not import Python ``routers/`` or ``core/`` directly.
+
+``routers.domain`` is mounted last: ``populate_domain_router()`` then
+``domain_router`` for backward‑compatible paths; real routes should live on the
+focused routers above. See ``routers/README.md`` for mount order.
 """
 
 import json
 import logging
+import os
 import pathlib
+import hashlib
+import zipfile
 
 # Load .env before any config reads (needed for local dev when running via uvicorn)
 try:
@@ -16,23 +42,232 @@ except ImportError:
     pass
 
 import asyncpg
+import boto3
 import stripe
 import redis.asyncio as aioredis
+from botocore.config import Config
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+logger = logging.getLogger("uploadm8-api")
+
+# ============================================================
+# Static data startup download (PADUS + Gazetteer)
+# ============================================================
+PADUS_R2_KEY = os.environ.get("PADUS_R2_KEY", "static/padus.zip")
+PADUS_LOCAL_PATH = os.environ.get("PADUS_LOCAL_PATH", "/tmp/padus")
+PADUS_SHA256 = os.environ.get("PADUS_SHA256", "").strip().lower()
+PADUS_LAYER = os.environ.get(
+    "PADUS_LAYER",
+    "PADUS4_1Combined_Proclamation_Marine_Fee_Designation_Easement",
+)
+
+GAZETTEER_R2_KEY = os.environ.get("GAZETTEER_R2_KEY", "static/gazetteer.zip")
+GAZETTEER_LOCAL_PATH = os.environ.get("GAZETTEER_LOCAL_PATH", "/tmp/gazetteer")
+GAZETTEER_SHA256 = os.environ.get("GAZETTEER_SHA256", "").strip().lower()
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def _fmt_bytes(num: int) -> str:
+    size = float(max(int(num), 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def _dir_stats(path: str) -> tuple[int, int]:
+    total_files = 0
+    total_bytes = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            fp = os.path.join(root, name)
+            try:
+                total_files += 1
+                total_bytes += os.path.getsize(fp)
+            except OSError:
+                continue
+    return total_files, total_bytes
+
+
+def _get_static_s3_client():
+    account_id = (os.environ.get("R2_ACCOUNT_ID", "") or "").strip()
+    endpoint = (os.environ.get("R2_ENDPOINT_URL", "") or "").strip() or (
+        f"https://{account_id}.r2.cloudflarestorage.com" if account_id else ""
+    )
+    access_key = (os.environ.get("R2_ACCESS_KEY_ID", "") or "").strip()
+    secret_key = (os.environ.get("R2_SECRET_ACCESS_KEY", "") or "").strip()
+    if not endpoint or not access_key or not secret_key:
+        return None
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+
+
+def _download_and_unzip(r2_key: str, local_dir: str, expected_sha: str, label: str):
+    sentinel = os.path.join(local_dir, ".ready")
+    if os.path.exists(sentinel):
+        logger.info("%s: already extracted at %s, skipping", label, local_dir)
+        return
+    if not r2_key:
+        logger.warning("%s: R2 key not set, skipping", label)
+        return
+
+    bucket = (os.environ.get("R2_BUCKET_NAME", "") or "").strip()
+    if not bucket:
+        logger.warning("%s: R2_BUCKET_NAME not set, skipping", label)
+        return
+
+    s3 = _get_static_s3_client()
+    if s3 is None:
+        logger.warning("%s: R2 client not configured, skipping", label)
+        return
+
+    os.makedirs(local_dir, exist_ok=True)
+    zip_tmp = local_dir + ".zip"
+    remote_size = None
+    try:
+        head = s3.head_object(Bucket=bucket, Key=r2_key)
+        remote_size = int(head.get("ContentLength", 0))
+        logger.info(
+            "%s: remote object size=%s (%d bytes)",
+            label,
+            _fmt_bytes(remote_size),
+            remote_size,
+        )
+    except Exception as e:
+        logger.warning("%s: could not read remote object metadata: %s", label, e)
+    logger.info("%s: downloading s3://%s/%s", label, bucket, r2_key)
+    try:
+        s3.download_file(bucket, r2_key, zip_tmp)
+    except Exception as e:
+        logger.error("%s: download failed: %s", label, e)
+        raise
+
+    local_zip_size = os.path.getsize(zip_tmp) if os.path.exists(zip_tmp) else 0
+    logger.info(
+        "%s: downloaded zip size=%s (%d bytes)",
+        label,
+        _fmt_bytes(local_zip_size),
+        local_zip_size,
+    )
+    if remote_size is not None and local_zip_size != remote_size:
+        os.remove(zip_tmp)
+        raise RuntimeError(
+            f"{label}: downloaded size mismatch! expected={remote_size} got={local_zip_size}"
+        )
+
+    if expected_sha:
+        actual = _sha256_file(zip_tmp)
+        if actual != expected_sha:
+            os.remove(zip_tmp)
+            raise RuntimeError(
+                f"{label}: checksum mismatch! expected={expected_sha} got={actual}"
+            )
+        logger.info("%s: checksum OK", label)
+
+    logger.info("%s: extracting to %s", label, local_dir)
+    with zipfile.ZipFile(zip_tmp, "r") as zf:
+        zf.extractall(local_dir)
+    os.remove(zip_tmp)
+
+    files, total_bytes = _dir_stats(local_dir)
+    logger.info(
+        "%s: extracted files=%d total_size=%s",
+        label,
+        files,
+        _fmt_bytes(total_bytes),
+    )
+
+    with open(sentinel, "w", encoding="utf-8") as f:
+        f.write("ok")
+    logger.info("%s: ready", label)
+
+
+def _maybe_set_resolved_static_paths() -> None:
+    padus_gdb = os.path.join(
+        PADUS_LOCAL_PATH, "PADUS4_1Geodatabase", "PADUS4_1Geodatabase.gdb"
+    )
+    if os.path.exists(padus_gdb):
+        os.environ["PADUS_PATH"] = padus_gdb
+
+    gaz_candidates = (
+        os.path.join(GAZETTEER_LOCAL_PATH, "2024_gaz_places_national.txt"),
+        os.path.join(GAZETTEER_LOCAL_PATH, "2024_gaz_places_national"),
+        os.path.join(GAZETTEER_LOCAL_PATH, "2024_gaz_place_06.txt"),
+        os.path.join(GAZETTEER_LOCAL_PATH, "2024_gaz_place_06"),
+    )
+    for candidate in gaz_candidates:
+        if os.path.exists(candidate):
+            os.environ["GAZETTEER_PLACES_PATH"] = candidate
+            break
+
+    if os.environ.get("PADUS_LAYER", "").strip() == "":
+        os.environ["PADUS_LAYER"] = PADUS_LAYER
+
+
+def ensure_static_data() -> None:
+    _download_and_unzip(PADUS_R2_KEY, PADUS_LOCAL_PATH, PADUS_SHA256, "PADUS")
+    _download_and_unzip(
+        GAZETTEER_R2_KEY, GAZETTEER_LOCAL_PATH, GAZETTEER_SHA256, "Gazetteer"
+    )
+    _maybe_set_resolved_static_paths()
+    logger.info(
+        "Static data resolved: PADUS_PATH=%s exists=%s",
+        os.environ.get("PADUS_PATH", ""),
+        os.path.exists(os.environ.get("PADUS_PATH", "")),
+    )
+    logger.info(
+        "Static data resolved: GAZETTEER_PLACES_PATH=%s exists=%s",
+        os.environ.get("GAZETTEER_PLACES_PATH", ""),
+        os.path.exists(os.environ.get("GAZETTEER_PLACES_PATH", "")),
+    )
+
+
+try:
+    ensure_static_data()
+except Exception as e:
+    logger.error("Static data bootstrap failed: %s", e)
+    raise
 
 # ── Core imports ─────────────────────────────────────────────────────────────
 import core.state
 from core.config import (
-    DATABASE_URL, REDIS_URL, STRIPE_SECRET_KEY,
-    ALLOWED_ORIGINS_LIST, BOOTSTRAP_ADMIN_EMAIL,
+    DATABASE_URL,
+    DB_POOL_MAX,
+    DB_POOL_MIN,
+    REDIS_URL,
+    STRIPE_SECRET_KEY,
+    ALLOWED_ORIGINS_LIST,
+    BOOTSTRAP_ADMIN_EMAIL,
+    FRONTEND_STATIC_DIR,
+    SERVE_FRONTEND_STATIC,
 )
 from core.helpers import _init_asyncpg_codecs, _load_uploads_columns, _now_utc, _req_id
 from core.auth import init_enc_keys
 from core.security import install_rate_limit_middleware
+from core.sentry_init import init_sentry_for_api
+from migrations.runtime_migrations import run_migrations
 
 # ── Router imports ───────────────────────────────────────────────────────────
 from routers.auth import router as auth_router
@@ -42,16 +277,30 @@ from routers.scheduled import router as scheduled_router
 from routers.preferences import router as preferences_router
 from routers.groups import router as groups_router
 from routers.platforms import router as platforms_router
+from routers.platform_avatar_redirect import router as platform_avatar_redirect_router
 from routers.billing import router as billing_router
 from routers.webhooks import router as webhooks_router
 from routers.analytics import router as analytics_router
 from routers.admin import router as admin_router
+from routers.admin_contract import (
+    admin_compat_router,
+    marketing_router as admin_marketing_contract_router,
+    ml_router as admin_ml_contract_router,
+    public_marketing_router,
+)
 from routers.dashboard import router as dashboard_router
+from routers.shell_bootstrap import router as shell_bootstrap_router
 from routers.trill import router as trill_router, seed_trill_places
 from routers.entitlements import router as entitlements_router
 from routers.support import router as support_router
+from routers.catalog import router as catalog_router
+from routers.ops import router as ops_router
+from routers.oauth import router as oauth_router
+from routers.api_keys import router as api_keys_router
+from routers.thumbnail_studio_api import router as thumbnail_studio_router
+from routers.domain import populate_domain_router, router as domain_router
 
-logger = logging.getLogger("uploadm8-api")
+init_sentry_for_api()
 
 # ============================================================
 # App Lifespan
@@ -63,16 +312,36 @@ async def lifespan(app: FastAPI):
         stripe.api_key = STRIPE_SECRET_KEY
 
     core.state.db_pool = await asyncpg.create_pool(
-        DATABASE_URL, min_size=2, max_size=10, init=_init_asyncpg_codecs
+        DATABASE_URL, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX, init=_init_asyncpg_codecs
     )
     await _load_uploads_columns(core.state.db_pool)
     logger.info("Database connected")
 
-    await run_migrations()
+    await run_migrations(core.state.db_pool)
 
     if REDIS_URL:
         try:
-            core.state.redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+            # Resilience tuning — fixes Windows WinError 10054 ("connection
+            # forcibly closed") on enqueue_job after the socket goes idle:
+            #   * health_check_interval pings idle conns so we discover a
+            #     half-open socket BEFORE the next lpush.
+            #   * socket_keepalive lets the OS reap dead peers quickly.
+            #   * retry_on_error transparently reconnects + replays the command
+            #     once when the underlying socket has been reset.
+            from redis.asyncio.retry import Retry
+            from redis.backoff import ExponentialBackoff
+            from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
+
+            core.state.redis_client = aioredis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                socket_keepalive=True,
+                socket_timeout=5.0,
+                socket_connect_timeout=5.0,
+                health_check_interval=30,
+                retry_on_error=[RedisConnectionError, RedisTimeoutError],
+                retry=Retry(ExponentialBackoff(cap=2, base=0.1), retries=3),
+            )
             await core.state.redis_client.ping()
             logger.info("Redis connected")
         except Exception as e:
@@ -103,404 +372,19 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Shutdown: pool/redis close can race with Ctrl+C / reload — never let teardown
+    # exceptions escape lifespan (uvicorn already logs its own CancelledError on the
+    # lifespan receive task; that is normal asyncio behaviour, not an app bug).
     if core.state.db_pool:
-        await core.state.db_pool.close()
+        try:
+            await core.state.db_pool.close()
+        except BaseException as e:
+            logger.debug("lifespan: db_pool.close: %s", e)
     if core.state.redis_client:
-        await core.state.redis_client.close()
-
-
-# ============================================================
-# Migrations
-# ============================================================
-async def run_migrations():
-    async with core.state.db_pool.acquire() as conn:
-        await conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INT PRIMARY KEY, applied_at TIMESTAMPTZ DEFAULT NOW())")
-        applied = {r["version"] for r in await conn.fetch("SELECT version FROM schema_migrations")}
-
-        migrations = [
-            (1, """CREATE TABLE IF NOT EXISTS users (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(), email VARCHAR(255) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL,
-                name VARCHAR(255) NOT NULL, role VARCHAR(50) DEFAULT 'user', subscription_tier VARCHAR(50) DEFAULT 'free',
-                stripe_customer_id VARCHAR(255), stripe_subscription_id VARCHAR(255), subscription_status VARCHAR(50),
-                current_period_end TIMESTAMPTZ, flex_enabled BOOLEAN DEFAULT FALSE, timezone VARCHAR(100) DEFAULT 'UTC',
-                avatar_url VARCHAR(512), status VARCHAR(50) DEFAULT 'active', last_active_at TIMESTAMPTZ DEFAULT NOW(),
-                created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"""),
-            (2, "CREATE TABLE IF NOT EXISTS refresh_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, token_hash VARCHAR(255) UNIQUE NOT NULL, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW())"),
-            (3, "CREATE TABLE IF NOT EXISTS platform_tokens (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, platform VARCHAR(50) NOT NULL, account_id VARCHAR(255), account_name VARCHAR(255), account_username VARCHAR(255), account_avatar VARCHAR(512), token_blob JSONB NOT NULL, is_primary BOOLEAN DEFAULT FALSE, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"),
-            (31, """
-                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
-                CREATE INDEX IF NOT EXISTS idx_platform_tokens_user_platform_active ON platform_tokens(user_id, platform) WHERE revoked_at IS NULL;
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_platform_tokens_active_identity ON platform_tokens(user_id, platform, account_id)
-                    WHERE revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '';
-            """),
-
-            (4, """CREATE TABLE IF NOT EXISTS uploads (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-                r2_key VARCHAR(512) NOT NULL, telemetry_r2_key VARCHAR(512), processed_r2_key VARCHAR(512), thumbnail_r2_key VARCHAR(512),
-                filename VARCHAR(255) NOT NULL, file_size BIGINT, platforms VARCHAR(50)[] DEFAULT '{}',
-                title VARCHAR(512), caption TEXT, hashtags TEXT[], privacy VARCHAR(50) DEFAULT 'public',
-                status VARCHAR(50) DEFAULT 'pending', cancel_requested BOOLEAN DEFAULT FALSE,
-                scheduled_time TIMESTAMPTZ, schedule_mode VARCHAR(50) DEFAULT 'immediate',
-                processing_started_at TIMESTAMPTZ, processing_finished_at TIMESTAMPTZ, completed_at TIMESTAMPTZ,
-                error_code VARCHAR(100), error_detail TEXT, platform_results JSONB,
-                put_reserved INT DEFAULT 0, put_spent INT DEFAULT 0, aic_reserved INT DEFAULT 0, aic_spent INT DEFAULT 0,
-                compute_seconds FLOAT DEFAULT 0, storage_bytes BIGINT DEFAULT 0, cost_attributed DECIMAL(10,4) DEFAULT 0,
-                views BIGINT DEFAULT 0, likes BIGINT DEFAULT 0,
-                created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())"""),
-            (5, "CREATE TABLE IF NOT EXISTS user_settings (user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, discord_webhook VARCHAR(512), telemetry_enabled BOOLEAN DEFAULT TRUE, hud_enabled BOOLEAN DEFAULT TRUE, hud_position VARCHAR(50) DEFAULT 'bottom-left', speeding_mph INT DEFAULT 80, euphoria_mph INT DEFAULT 100, hud_speed_unit VARCHAR(10) DEFAULT 'mph', hud_color VARCHAR(20) DEFAULT '#FFFFFF', updated_at TIMESTAMPTZ DEFAULT NOW())"),
-            (6, """CREATE TABLE IF NOT EXISTS wallets (
-                user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                put_balance INT DEFAULT 0, aic_balance INT DEFAULT 0,
-                put_reserved INT DEFAULT 0, aic_reserved INT DEFAULT 0,
-                last_refill_date DATE, created_at TIMESTAMPTZ DEFAULT NOW())"""),
-            (7, """CREATE TABLE IF NOT EXISTS token_ledger (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-                token_type VARCHAR(10) NOT NULL, platform VARCHAR(50), delta INT NOT NULL,
-                reason VARCHAR(50) NOT NULL, upload_id UUID, stripe_event_id VARCHAR(255),
-                meta JSONB, created_at TIMESTAMPTZ DEFAULT NOW())"""),
-            (8, """CREATE TABLE IF NOT EXISTS announcements (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(), title VARCHAR(500) NOT NULL, body TEXT NOT NULL,
-                channels JSONB, target VARCHAR(50), target_tiers TEXT[],
-                email_sent INT DEFAULT 0, discord_sent INT DEFAULT 0, webhook_sent INT DEFAULT 0,
-                created_by UUID REFERENCES users(id), created_at TIMESTAMPTZ DEFAULT NOW())"""),
-            (9, "CREATE TABLE IF NOT EXISTS admin_settings (id INT PRIMARY KEY DEFAULT 1, settings_json JSONB DEFAULT '{}', updated_at TIMESTAMPTZ DEFAULT NOW())"),
-            (10, "CREATE TABLE IF NOT EXISTS cost_tracking (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID, category VARCHAR(100) NOT NULL, operation VARCHAR(255), tokens INT, cost_usd DECIMAL(10,6), created_at TIMESTAMPTZ DEFAULT NOW())"),
-            (11, "CREATE TABLE IF NOT EXISTS revenue_tracking (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID, amount DECIMAL(10,2) NOT NULL, source VARCHAR(100), stripe_event_id VARCHAR(255), plan VARCHAR(100), created_at TIMESTAMPTZ DEFAULT NOW())"),
-            (12, "CREATE TABLE IF NOT EXISTS account_groups (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID REFERENCES users(id) ON DELETE CASCADE, name VARCHAR(100) NOT NULL, account_ids TEXT[] DEFAULT '{}', color VARCHAR(20) DEFAULT '#3b82f6', created_at TIMESTAMPTZ DEFAULT NOW())"),
-            (13, "CREATE TABLE IF NOT EXISTS white_label_settings (user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, enabled BOOLEAN DEFAULT FALSE, logo_url VARCHAR(512), company_name VARCHAR(255), primary_color VARCHAR(20), created_at TIMESTAMPTZ DEFAULT NOW())"),
-            (14, "INSERT INTO admin_settings (id, settings_json) VALUES (1, '{}') ON CONFLICT DO NOTHING"),
-            (15, "CREATE INDEX IF NOT EXISTS idx_uploads_user_status ON uploads(user_id, status)"),
-            (16, "CREATE INDEX IF NOT EXISTS idx_ledger_user ON token_ledger(user_id, created_at)"),
-            (17, "CREATE INDEX IF NOT EXISTS idx_cost_tracking_date ON cost_tracking(created_at)"),
-            (18, """CREATE TABLE IF NOT EXISTS user_color_preferences (
-                user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                tiktok_color VARCHAR(20) DEFAULT '#000000',
-                youtube_color VARCHAR(20) DEFAULT '#FF0000',
-                instagram_color VARCHAR(20) DEFAULT '#E4405F',
-                facebook_color VARCHAR(20) DEFAULT '#1877F2',
-                accent_color VARCHAR(20) DEFAULT '#F97316',
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW())"""),
-            (19, "CREATE INDEX IF NOT EXISTS idx_uploads_scheduled ON uploads(user_id, scheduled_time) WHERE scheduled_time IS NOT NULL"),
-            (20, "CREATE INDEX IF NOT EXISTS idx_uploads_user_scheduled_status ON uploads(user_id, status, scheduled_time)"),
-            (21, "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(255)"),
-            (22, "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(255)"),
-            (23, "ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS preferences_json JSONB DEFAULT '{}'"),
-            (24, """CREATE TABLE IF NOT EXISTS user_preferences (
-                user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                auto_captions BOOLEAN DEFAULT FALSE,
-                auto_thumbnails BOOLEAN DEFAULT FALSE,
-                thumbnail_interval INT DEFAULT 5,
-                default_privacy VARCHAR(50) DEFAULT 'public',
-                ai_hashtags_enabled BOOLEAN DEFAULT FALSE,
-                ai_hashtag_count INT DEFAULT 5,
-                ai_hashtag_style VARCHAR(50) DEFAULT 'mixed',
-                hashtag_position VARCHAR(50) DEFAULT 'end',
-                max_hashtags INT DEFAULT 15,
-                always_hashtags JSONB DEFAULT '[]'::jsonb,
-                blocked_hashtags JSONB DEFAULT '[]'::jsonb,
-                platform_hashtags JSONB DEFAULT '{"tiktok":[],"youtube":[],"instagram":[],"facebook":[]}'::jsonb,
-                email_notifications BOOLEAN DEFAULT TRUE,
-                discord_webhook VARCHAR(512),
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW())"""),
-            (25, """DO $$
-                BEGIN
-                    -- Convert always_hashtags from TEXT[] to JSONB if it exists
-                    IF EXISTS (SELECT 1 FROM information_schema.columns
-                              WHERE table_name = 'user_preferences'
-                              AND column_name = 'always_hashtags'
-                              AND data_type = 'ARRAY') THEN
-                        ALTER TABLE user_preferences
-                        ALTER COLUMN always_hashtags TYPE JSONB
-                        USING array_to_json(always_hashtags)::jsonb;
-                    END IF;
-
-                    -- Convert blocked_hashtags from TEXT[] to JSONB if it exists
-                    IF EXISTS (SELECT 1 FROM information_schema.columns
-                              WHERE table_name = 'user_preferences'
-                              AND column_name = 'blocked_hashtags'
-                              AND data_type = 'ARRAY') THEN
-                        ALTER TABLE user_preferences
-                        ALTER COLUMN blocked_hashtags TYPE JSONB
-                        USING array_to_json(blocked_hashtags)::jsonb;
-                    END IF;
-                END $$;"""),
-            (26, """-- Clean up corrupted hashtag data
-                UPDATE user_preferences
-                SET always_hashtags = '[]'::jsonb,
-                    blocked_hashtags = '[]'::jsonb
-                WHERE
-                    (always_hashtags::text LIKE '%\\\\%' OR always_hashtags::text LIKE '%["%')
-                    OR (blocked_hashtags::text LIKE '%\\\\%' OR blocked_hashtags::text LIKE '%["%');"""),
-            # Trill Telemetry Migrations
-            (100, """
-                -- Trill analysis results
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS trill_score DECIMAL(5,2);
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS speed_bucket VARCHAR(50);
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS trill_metadata JSONB;
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS ai_generated_title TEXT;
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS ai_generated_caption TEXT;
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS ai_generated_hashtags TEXT[];
-            """),
-            (101, """
-                -- Trill places (popular locations for geo-targeting)
-                CREATE TABLE IF NOT EXISTS trill_places (
-                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    name VARCHAR(255) NOT NULL,
-                    state VARCHAR(2) NOT NULL,
-                    lat DECIMAL(10,7) NOT NULL,
-                    lon DECIMAL(10,7) NOT NULL,
-                    popularity_score INT DEFAULT 0,
-                    hashtags TEXT[] DEFAULT '{}',
-                    is_protected BOOLEAN DEFAULT FALSE,
-                    protected_name VARCHAR(255),
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE(name, state)
-                );
-                CREATE INDEX IF NOT EXISTS idx_trill_places_state ON trill_places(state);
-                CREATE INDEX IF NOT EXISTS idx_trill_places_popularity ON trill_places(popularity_score DESC);
-            """),
-            (102, """
-                -- User trill preferences
-                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_enabled BOOLEAN DEFAULT FALSE;
-                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_min_score INT DEFAULT 60;
-                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_hud_enabled BOOLEAN DEFAULT FALSE;
-                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_ai_enhance BOOLEAN DEFAULT TRUE;
-                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_openai_model VARCHAR(50) DEFAULT 'gpt-4o-mini';
-            """),
-
-            (103, """CREATE TABLE IF NOT EXISTS support_messages (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-                name VARCHAR(255),
-                email VARCHAR(255),
-                subject VARCHAR(255),
-                message TEXT NOT NULL,
-                status VARCHAR(50) DEFAULT 'open',
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )"""),
-
-            (104, """CREATE TABLE IF NOT EXISTS admin_audit_log (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                admin_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                admin_email TEXT,
-                action TEXT NOT NULL,
-                details JSONB DEFAULT '{}'::jsonb,
-                ip_address TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_admin_audit_log_user ON admin_audit_log(user_id);
-            CREATE INDEX IF NOT EXISTS idx_admin_audit_log_created ON admin_audit_log(created_at);
-
-            CREATE TABLE IF NOT EXISTS email_changes (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                old_email TEXT NOT NULL,
-                new_email TEXT NOT NULL,
-                changed_by_admin_id UUID REFERENCES users(id) ON DELETE SET NULL,
-                verification_token TEXT,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );
-
-            CREATE TABLE IF NOT EXISTS password_resets (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                reset_by_admin_id UUID REFERENCES users(id) ON DELETE SET NULL,
-                temp_password_hash TEXT NOT NULL,
-                force_change BOOLEAN DEFAULT TRUE,
-                expires_at TIMESTAMPTZ,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            );"""),
-
-            (105, """
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS processing_stage    VARCHAR(100);
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS processing_progress  INT DEFAULT 0;
-            """),
-
-            (510, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS description TEXT"),
-            (511, "ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()"),
-            (512, "UPDATE account_groups SET updated_at = NOW() WHERE updated_at IS NULL"),
-
-            # ── Self-serve deletion audit trail ──────────────────────────────────
-            (600, """
-                CREATE TABLE IF NOT EXISTS account_deletion_log (
-                    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    user_id             TEXT NOT NULL,
-                    user_email          TEXT NOT NULL,
-                    user_name           TEXT,
-                    requested_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    completed_at        TIMESTAMPTZ,
-                    r2_keys_deleted     INT DEFAULT 0,
-                    tokens_revoked      INT DEFAULT 0,
-                    stripe_cancelled    BOOLEAN DEFAULT FALSE,
-                    rows_deleted        JSONB DEFAULT '{}'::jsonb,
-                    initiated_by        TEXT DEFAULT 'self',
-                    ip_address          TEXT,
-                    notes               TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_deletion_log_user  ON account_deletion_log(user_id);
-                CREATE INDEX IF NOT EXISTS idx_deletion_log_reqat ON account_deletion_log(requested_at);
-            """),
-
-            (601, """
-                CREATE TABLE IF NOT EXISTS platform_disconnect_log (
-                    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    user_id                 TEXT NOT NULL,
-                    platform                TEXT NOT NULL,
-                    account_id              TEXT,
-                    account_name            TEXT,
-                    revoked_at_provider     BOOLEAN DEFAULT FALSE,
-                    provider_revoke_error   TEXT,
-                    purged_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    initiated_by            TEXT DEFAULT 'self',
-                    ip_address              TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_disconnect_log_user ON platform_disconnect_log(user_id);
-            """),
-
-            (602, """
-                CREATE TABLE IF NOT EXISTS tiktok_webhook_events (
-                    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                    client_key      TEXT,
-                    event           TEXT NOT NULL,
-                    create_time     BIGINT,
-                    user_openid     TEXT,
-                    content         JSONB,
-                    raw_body        TEXT,
-                    processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    sig_verified    BOOLEAN NOT NULL DEFAULT FALSE,
-                    handling_notes  TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_tt_webhook_event   ON tiktok_webhook_events(event);
-                CREATE INDEX IF NOT EXISTS idx_tt_webhook_openid  ON tiktok_webhook_events(user_openid);
-                CREATE INDEX IF NOT EXISTS idx_tt_webhook_created ON tiktok_webhook_events(processed_at);
-            """),
-            (603, """
-                CREATE TABLE IF NOT EXISTS platform_metrics_cache (
-                    user_id   UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    data      JSONB NOT NULL DEFAULT '{}'::jsonb
-                );
-            """),
-
-            # ── Per-upload engagement metrics (comments + shares) ────────────────
-            (604, """
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS comments BIGINT DEFAULT 0;
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS shares   BIGINT DEFAULT 0;
-            """),
-
-            # ── Analytics auto-sync tracking ─────────────────────────────────────
-            (605, """
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS analytics_synced_at TIMESTAMPTZ;
-                CREATE INDEX IF NOT EXISTS idx_uploads_analytics_sync
-                    ON uploads(status, analytics_synced_at)
-                    WHERE status IN ('completed', 'succeeded', 'partial');
-            """),
-
-            # ── Comprehensive audit system ───────────────────────────────────────
-            (700, """
-                ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS event_category  VARCHAR(50)  DEFAULT 'ADMIN';
-                ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS actor_user_id   UUID         REFERENCES users(id) ON DELETE SET NULL;
-                ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS resource_type   VARCHAR(100);
-                ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS resource_id     TEXT;
-                ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS session_id      TEXT;
-                ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS user_agent      TEXT;
-                ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS severity        VARCHAR(20)  DEFAULT 'INFO';
-                ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS outcome         VARCHAR(20)  DEFAULT 'SUCCESS';
-
-                CREATE INDEX IF NOT EXISTS idx_audit_category   ON admin_audit_log(event_category);
-                CREATE INDEX IF NOT EXISTS idx_audit_actor      ON admin_audit_log(actor_user_id);
-                CREATE INDEX IF NOT EXISTS idx_audit_resource   ON admin_audit_log(resource_type, resource_id);
-                CREATE INDEX IF NOT EXISTS idx_audit_severity   ON admin_audit_log(severity);
-
-                CREATE TABLE IF NOT EXISTS system_event_log (
-                    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-                    user_id         UUID        REFERENCES users(id) ON DELETE SET NULL,
-                    event_category  VARCHAR(50) NOT NULL,
-                    action          TEXT        NOT NULL,
-                    resource_type   VARCHAR(100),
-                    resource_id     TEXT,
-                    details         JSONB       DEFAULT '{}'::jsonb,
-                    ip_address      TEXT,
-                    user_agent      TEXT,
-                    session_id      TEXT,
-                    severity        VARCHAR(20) DEFAULT 'INFO',
-                    outcome         VARCHAR(20) DEFAULT 'SUCCESS',
-                    created_at      TIMESTAMPTZ DEFAULT NOW()
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_syslog_user       ON system_event_log(user_id);
-                CREATE INDEX IF NOT EXISTS idx_syslog_category   ON system_event_log(event_category);
-                CREATE INDEX IF NOT EXISTS idx_syslog_action     ON system_event_log(action);
-                CREATE INDEX IF NOT EXISTS idx_syslog_created    ON system_event_log(created_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_syslog_resource   ON system_event_log(resource_type, resource_id);
-            """),
-
-            # ── Country column for geo-analytics ─────────────────────────────────
-            (701, """
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS country VARCHAR(2);
-                CREATE INDEX IF NOT EXISTS idx_users_country ON users(country) WHERE country IS NOT NULL;
-            """),
-
-            (702, """
-                ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS token_hash TEXT;
-                ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS used_at TIMESTAMPTZ;
-                CREATE INDEX IF NOT EXISTS idx_password_resets_token_hash ON password_resets(token_hash)
-                    WHERE token_hash IS NOT NULL;
-                CREATE INDEX IF NOT EXISTS idx_password_resets_user_unused ON password_resets(user_id)
-                    WHERE used_at IS NULL;
-            """),
-
-            (703, """
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS target_accounts TEXT[] DEFAULT '{}';
-            """),
-            (704, """
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS deletion_requested_at TIMESTAMPTZ;
-                CREATE INDEX IF NOT EXISTS idx_users_deletion_requested ON users(deletion_requested_at) WHERE deletion_requested_at IS NOT NULL;
-            """),
-            (705, """
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS schedule_metadata JSONB;
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS timezone VARCHAR(100) DEFAULT 'UTC';
-                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS user_preferences JSONB;
-            """),
-            (706, """
-                CREATE TABLE IF NOT EXISTS kpi_sync_state (
-                    id INT PRIMARY KEY DEFAULT 1,
-                    last_stripe_sync_at TIMESTAMPTZ,
-                    last_mailgun_sync_at TIMESTAMPTZ,
-                    last_openai_sync_at TIMESTAMPTZ,
-                    last_cf_sync_at TIMESTAMPTZ,
-                    last_upstash_sync_at TIMESTAMPTZ,
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                );
-                INSERT INTO kpi_sync_state (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
-            """),
-            (707, """
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}';
-                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_font_family VARCHAR(100) DEFAULT 'Arial';
-                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS hud_font_size INT DEFAULT 24;
-                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS ffmpeg_screenshot_interval INT DEFAULT 5;
-                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS auto_generate_thumbnails BOOLEAN DEFAULT TRUE;
-                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS auto_generate_captions BOOLEAN DEFAULT TRUE;
-                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS auto_generate_hashtags BOOLEAN DEFAULT TRUE;
-                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS default_hashtag_count INT DEFAULT 5;
-                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS always_use_hashtags BOOLEAN DEFAULT FALSE;
-            """),
-            (1030, "ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS styled_thumbnails BOOLEAN DEFAULT TRUE"),
-            (1031, "ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'"),
-        ]
-
-        for version, sql in migrations:
-            if version not in applied:
-                try:
-                    await conn.execute(sql)
-                    await conn.execute("INSERT INTO schema_migrations (version) VALUES ($1)", version)
-                    logger.info(f"Migration v{version} applied")
-                except Exception as e:
-                    logger.error(f"Migration v{version} failed: {e}")
+        try:
+            await core.state.redis_client.close()
+        except BaseException as e:
+            logger.debug("lifespan: redis close: %s", e)
 
 
 # ============================================================
@@ -521,7 +405,19 @@ app.add_middleware(
 # responses when an unhandled exception propagates — the browser then reports
 # a CORS error instead of the real HTTP 500.
 @app.exception_handler(Exception)
-async def _cors_safe_500_handler(request: Request, exc: Exception) -> JSONResponse:
+async def _cors_safe_500_handler(request: Request, exc: Exception):
+    """
+    CORS-safe fallback for *unexpected* errors.
+
+    Must not swallow Starlette ``HTTPException`` (401/403/429/503 from routes/deps) or
+    ``RequestValidationError`` (422) — registering ``Exception`` matches those subclasses
+    too, which previously turned every ``HTTPException`` into a misleading 500.
+    """
+    if isinstance(exc, StarletteHTTPException):
+        return await http_exception_handler(request, exc)
+    if isinstance(exc, RequestValidationError):
+        return await request_validation_exception_handler(request, exc)
+
     origin = request.headers.get("origin", "")
     allowed = ALLOWED_ORIGINS_LIST
     cors_origin = origin if origin in allowed else (allowed[0] if allowed else "*")
@@ -531,6 +427,50 @@ async def _cors_safe_500_handler(request: Request, exc: Exception) -> JSONRespon
         f"{type(exc).__name__}: {exc}",
         exc_info=True,
     )
+
+    # Best-effort: record this 500 as an operational incident so the admin
+    # incidents page surfaces every unhandled API failure. DB-only — no email
+    # / Discord spam (worker errors and explicit notify_admin_error already
+    # send those).
+    try:
+        if core.state.db_pool is not None:
+            import traceback as _tb
+            from services.ops_incidents import record_operational_incident
+
+            uid = None
+            try:
+                state_user = getattr(request.state, "user", None)
+                if isinstance(state_user, dict):
+                    uid = state_user.get("id")
+            except Exception:
+                uid = None
+
+            await record_operational_incident(
+                core.state.db_pool,
+                source="api",
+                incident_type=f"api_500:{type(exc).__name__}"[:120],
+                subject=f"{request.method} {request.url.path} → 500",
+                body=f"{type(exc).__name__}: {exc}\n\n{_tb.format_exc()}"[:8000],
+                details={
+                    "method": request.method,
+                    "path": str(request.url.path),
+                    "query": str(request.url.query)[:1000],
+                    "request_id": getattr(request.state, "request_id", None),
+                    "user_agent": request.headers.get("user-agent", "")[:512],
+                    "origin": origin[:200],
+                },
+                user_id=uid,
+                # Alerts are rate-limited inside record_operational_incident
+                # (one alert per source+incident_type per OPS_ALERT_DEDUPE_SECONDS,
+                # default 15min) so an API outage producing thousands of 500s
+                # only sends one Discord+email per error class per window.
+                # Dedupe key bundles method+path so different broken endpoints
+                # each get their own slot.
+                dedupe_key=f"api_500:{type(exc).__name__}:{request.method}:{request.url.path}",
+            )
+    except Exception:
+        pass
+
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error", "type": type(exc).__name__},
@@ -563,11 +503,15 @@ async def security_headers(request: Request, call_next):
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "img-src 'self' data: https:; "
+        "media-src 'self' blob: data: https:; "
+        "img-src 'self' data: https: blob:; "
+        "font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com data:; "
         "style-src 'self' 'unsafe-inline' https:; "
         "script-src 'self' 'unsafe-inline' https:; "
         "connect-src 'self' https://api.stripe.com https://js.stripe.com "
-        "https://uploadm8.com https://*.uploadm8.com;"
+        "https://uploadm8.com https://*.uploadm8.com "
+        "https://cdn.jsdelivr.net https://cdn.sheetjs.com https://cdnjs.cloudflare.com "
+        "https://*.r2.cloudflarestorage.com https://*.r2.dev;"
     )
     return resp
 
@@ -581,16 +525,29 @@ app.include_router(uploads_router)
 app.include_router(scheduled_router)
 app.include_router(preferences_router)
 app.include_router(groups_router)
+app.include_router(oauth_router)
 app.include_router(platforms_router)
+app.include_router(platform_avatar_redirect_router)
 app.include_router(billing_router)
 app.include_router(webhooks_router)
 app.include_router(analytics_router)
 app.include_router(admin_router)
+app.include_router(admin_marketing_contract_router)
+app.include_router(admin_ml_contract_router)
+app.include_router(admin_compat_router)
+app.include_router(public_marketing_router)
 app.include_router(dashboard_router)
+app.include_router(shell_bootstrap_router)
 app.include_router(trill_router)
 app.include_router(entitlements_router)
 app.include_router(support_router)
+app.include_router(api_keys_router)
+app.include_router(catalog_router)
+app.include_router(ops_router)
+app.include_router(thumbnail_studio_router)
 
+populate_domain_router()
+app.include_router(domain_router)
 
 # ============================================================
 # Health
@@ -598,3 +555,12 @@ app.include_router(support_router)
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": _now_utc().isoformat()}
+
+
+# Static HTML/JS/CSS — same process as API (cookie auth, no cross-origin for local dev).
+if SERVE_FRONTEND_STATIC and FRONTEND_STATIC_DIR.is_dir():
+    app.mount(
+        "/",
+        StaticFiles(directory=str(FRONTEND_STATIC_DIR), html=True),
+        name="frontend",
+    )

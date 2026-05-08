@@ -96,5 +96,23 @@ async def rotate_refresh_token(conn, old_token: str):
         await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL", row["user_id"])
         raise HTTPException(401, "Reuse detected")
     if row["expires_at"] < _now_utc(): raise HTTPException(401, "Expired")
+    u = await conn.fetchrow(
+        "SELECT email_verified, status FROM users WHERE id = $1",
+        row["user_id"],
+    )
+    if not u or u["status"] == "banned":
+        await conn.execute(
+            "UPDATE refresh_tokens SET revoked_at=NOW() WHERE user_id=$1 AND revoked_at IS NULL",
+            row["user_id"],
+        )
+        raise HTTPException(401, "Invalid")
+    if u.get("email_verified") is False:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Please verify your email to continue.",
+                "code": "email_not_verified",
+            },
+        )
     await conn.execute("UPDATE refresh_tokens SET revoked_at=NOW() WHERE id=$1", row["id"])
     return create_access_jwt(str(row["user_id"])), await create_refresh_token(conn, row["user_id"])

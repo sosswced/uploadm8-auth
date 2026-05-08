@@ -7,13 +7,16 @@ import json
 import re
 import uuid
 import logging
+from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 import stripe
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, BackgroundTasks
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
 from core.config import (
-    BILLING_MODE,
     R2_BUCKET_NAME,
     STRIPE_SECRET_KEY,
     STRIPE_SUCCESS_URL,
@@ -21,8 +24,14 @@ from core.config import (
     TIKTOK_CLIENT_KEY,
     TIKTOK_CLIENT_SECRET,
 )
-from core.state import db_pool
-from core.deps import get_current_user
+import core.state
+from core.upload_preference_dependencies import normalize_preferences_dict
+from core.cookie_auth import clear_auth_cookies
+from core.deps import (
+    get_current_user,
+    get_current_user_readonly,
+    get_verified_user_id,
+)
 from core.auth import hash_password, verify_password, encrypt_blob, decrypt_blob
 from core.wallet import get_wallet, credit_wallet, transfer_tokens
 from core.r2 import (
@@ -33,6 +42,7 @@ from core.r2 import (
     _delete_r2_objects,
 )
 from core.helpers import _now_utc, _safe_json, get_plan, _safe_col
+from core.sql_allowlist import ACCOUNT_DELETION_COUNT_TABLES, assert_set_fragments_columns
 from core.models import (
     ProfileUpdate,
     ProfileUpdateSettings,
@@ -42,13 +52,23 @@ from core.models import (
     TransferRequest,
     CheckoutRequest,
 )
+from pydantic import BaseModel, Field
 from core.oauth import _revoke_platform_token
 from stages.emails import send_account_deleted_email, send_password_changed_email
-from stages.entitlements import (
-    TOPUP_PRODUCTS,
-    get_entitlements_from_user,
-    entitlements_to_dict,
+from stages.entitlements import TOPUP_PRODUCTS
+from services.me_profile import (
+    apply_me_profile_update,
+    apply_settings_profile_update,
+    build_me_response,
 )
+from services.growth_intelligence import (
+    build_user_coach_payload,
+    coach_endpoint_fallback,
+    m8_engine_identity_payload,
+)
+from services.content_insights import build_user_content_insights, merge_preferences_patch_for_apply
+from services.user_preferences_persist import save_user_content_preferences
+from services.wallet_page_response import fetch_me_wallet_endpoint_data
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -59,90 +79,134 @@ router = APIRouter(tags=["me"])
 # User Profile & Wallet
 # ============================================================
 @router.get("/api/me")
-async def get_me(user: dict = Depends(get_current_user)):
-    raw_tier = user.get("subscription_tier", "free")
-    ent = get_entitlements_from_user(dict(user))
-    plan = entitlements_to_dict(ent)  # plan = entitlements (single source)
-    wallet = user.get("wallet", {})
-    role = user.get("role", "user")
-
-    # Avatar: single source of truth = users.avatar_r2_key (private bucket -> signed URL)
-    avatar_r2_key = user.get("avatar_r2_key")
-    avatar_signed_url = None
-    if avatar_r2_key:
+async def get_me(user: dict = Depends(get_current_user_readonly)):
+    """Read-only auth: skips ``last_active_at`` + ``daily_refill`` (hot path; see Sentry consecutive-query notes)."""
+    payload = build_me_response(user)
+    pool = core.state.db_pool
+    if pool:
         try:
-            avatar_signed_url = generate_presigned_download_url(avatar_r2_key)
-        except Exception as e:
-            logger.warning(f"Failed to presign avatar for user {user.get('id')}: {e}")
+            from services.thumbnail_personas_list import list_thumbnail_studio_personas
 
-    # Display name: prefer name, then first_name+last_name, then email prefix
-    raw_name = user.get("name")
-    first = (user.get("first_name") or "").strip()
-    last = (user.get("last_name") or "").strip()
-    combined = f"{first} {last}".strip() if (first or last) else None
-    email_prefix = (user.get("email") or "").split("@")[0] if user.get("email") else None
-    display_name = raw_name or combined or email_prefix or "User"
+            async with pool.acquire() as conn:
+                payload["thumbnail_personas"] = await list_thumbnail_studio_personas(conn, user["id"])
+        except Exception:
+            logger.debug("GET /api/me thumbnail_personas skipped", exc_info=True)
+            payload["thumbnail_personas"] = []
+    else:
+        payload.setdefault("thumbnail_personas", [])
+    return payload
 
-    # Stabilization window: return both snake_case + camelCase keys
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "name": display_name,
-        "role": role,
-        "timezone": user.get("timezone") or "America/Chicago",
 
-        # Avatar outputs (private, signed)
-        "avatar_r2_key": avatar_r2_key,
-        "avatar_url": avatar_signed_url,
-        "avatarUrl": avatar_signed_url,
-        "avatar_signed_url": avatar_signed_url,
-        "avatarSignedUrl": avatar_signed_url,
+class ApplyContentInsightsBody(BaseModel):
+    """Apply ML-recommended caption-related preferences (requires explicit confirm)."""
 
-        "subscription_tier":      raw_tier,
-        "tier":                  ent.tier,           # canonical slug (launch->creator_lite)
-        "tier_display":          ent.tier_display,   # human-readable name
-        "subscription_status":     user.get("subscription_status"),
-        "current_period_end":      user.get("current_period_end").isoformat() if user.get("current_period_end") else None,
-        "trial_end":               user.get("trial_end").isoformat() if user.get("trial_end") else None,
-        "stripe_subscription_id":  user.get("stripe_subscription_id"),
-        "billing_mode":            BILLING_MODE,   # "test" | "live"
-        "wallet": {
-            "put_balance":  float(wallet.get("put_balance", 0.0) or 0.0),
-            "aic_balance":  float(wallet.get("aic_balance", 0.0) or 0.0),
-            "put_reserved": float(wallet.get("put_reserved", 0.0) or 0.0),
-            "aic_reserved": float(wallet.get("aic_reserved", 0.0) or 0.0),
-            "updated_at":   wallet.get("updated_at"),
-        },
-        "plan": plan,
-        "features": {
-            "uploads":     plan.get("put_monthly", 0) > 0,
-            "scheduler":   plan.get("can_schedule", False),
-            "analytics":   bool(plan.get("analytics") and plan.get("analytics") != "basic"),
-            "watermark":   plan.get("can_watermark", True),
-            "white_label": plan.get("can_white_label", False),
-            "support":     True,
-        },
-        # Full entitlements dict — used by hasEntitlement() in app.js
-        "entitlements": entitlements_to_dict(
-            get_entitlements_from_user(dict(user))
-        ),
-    }
+    confirm: bool = Field(False, description="Must be true to write preferences")
+    strategy_key: str | None = Field(
+        None, description="Optional override; default is current top-ranked attribution key"
+    )
+
+
+@router.get("/api/me/content-insights")
+async def get_me_content_insights(user: dict = Depends(get_current_user)):
+    """Ranked settings buckets vs engagement + anomaly hints (from attributed uploads)."""
+    async with core.state.db_pool.acquire() as conn:
+        return await build_user_content_insights(conn, user["id"])
+
+
+@router.post("/api/me/content-insights/apply-optimized")
+async def post_me_content_insights_apply(
+    body: ApplyContentInsightsBody,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Writes recommended caption/voice/hashtag/frame preferences to user_preferences /
+    users.preferences (same path as Settings). Requires confirm=true.
+    """
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to apply optimized settings")
+    async with core.state.db_pool.acquire() as conn:
+        insights = await build_user_content_insights(conn, user["id"])
+    rec = insights.get("recommended") if isinstance(insights, dict) else None
+    try:
+        patch = merge_preferences_patch_for_apply(rec or {}, body.strategy_key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not patch:
+        raise HTTPException(status_code=400, detail="No preference fields to apply for this strategy")
+    async with core.state.db_pool.acquire() as conn:
+        await save_user_content_preferences(conn, user, patch)
+    return {"ok": True, "applied": patch}
+
+
+@router.get("/api/me/coach")
+async def get_me_coach(user: dict = Depends(get_current_user)):
+    """Personalized upload, thumbnail, and wallet suggestions (your history plus broad averages)."""
+    pool = core.state.db_pool
+    if pool is None:
+        return coach_endpoint_fallback(user.get("subscription_tier"))
+    try:
+        return await build_user_coach_payload(pool, user["id"])
+    except Exception:
+        logger.exception("GET /api/me/coach failed user_id=%s", user.get("id"))
+        try:
+            return coach_endpoint_fallback(user.get("subscription_tier"))
+        except Exception:
+            logger.exception("GET /api/me/coach fallback failed user_id=%s", user.get("id"))
+            return {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "baselines": {},
+                "engagement_snapshot": {"samples_30d": 0},
+                "smart_offer": None,
+                "suggestions": [],
+                "tier": "free",
+                "m8_engine": m8_engine_identity_payload(),
+                "content_attribution_insights": None,
+            }
+
+
+@router.post("/api/me/touchpoints/{delivery_id}/dismiss")
+async def dismiss_marketing_touchpoint(delivery_id: str, user: dict = Depends(get_current_user)):
+    """Dismiss an in-app AI marketing touchpoint surfaced via wallet opportunities."""
+    try:
+        did = uuid.UUID(delivery_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Touchpoint not found")
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE marketing_touchpoint_deliveries
+            SET status = 'dismissed',
+                meta = COALESCE(meta, '{}'::jsonb) || $3::jsonb
+            WHERE id = $1::uuid AND user_id = $2::uuid
+              AND channel = 'in_app' AND status = 'pending'
+            RETURNING id
+            """,
+            did,
+            user["id"],
+            json.dumps({"dismissed": True, "dismissed_via": "api"}),
+        )
+        if row:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO marketing_events (user_id, event_type, payload)
+                    VALUES ($1::uuid, 'touchpoint_dismissed', $2::jsonb)
+                    """,
+                    user["id"],
+                    json.dumps({"delivery_id": str(did), "channel": "in_app"}),
+                )
+            except Exception:
+                pass
+    if not row:
+        raise HTTPException(status_code=404, detail="Touchpoint not found")
+    return {"ok": True, "id": str(row["id"])}
 
 
 @router.put("/api/me")
 async def update_me(data: ProfileUpdate, user: dict = Depends(get_current_user)):
     """Update user profile"""
-    _ME_COLS = frozenset({"name", "timezone"})
-    updates, params = [], [user["id"]]
-    if data.name:
-        updates.append(f"{_safe_col('name', _ME_COLS)} = ${len(params)+1}")
-        params.append(data.name)
-    if data.timezone:
-        updates.append(f"{_safe_col('timezone', _ME_COLS)} = ${len(params)+1}")
-        params.append(data.timezone)
-    if updates:
-        async with db_pool.acquire() as conn:
-            await conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", *params)
+    async with core.state.db_pool.acquire() as conn:
+        await apply_me_profile_update(conn, str(user["id"]), data)
     return {"status": "updated"}
 
 
@@ -152,40 +216,14 @@ async def update_me(data: ProfileUpdate, user: dict = Depends(get_current_user))
 @router.put("/api/settings/profile")
 async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depends(get_current_user)):
     """Update user profile (first name, last name)"""
-    _PROFILE_COLS = frozenset({"first_name", "last_name", "name"})
-    updates, params = [], [user["id"]]
-
-    if data.first_name is not None:
-        updates.append(f"{_safe_col('first_name', _PROFILE_COLS)} = ${len(params)+1}")
-        params.append(data.first_name.strip())
-
-    if data.last_name is not None:
-        updates.append(f"{_safe_col('last_name', _PROFILE_COLS)} = ${len(params)+1}")
-        params.append(data.last_name.strip())
-
-    # Also update the combined name field for backwards compatibility
-    if data.first_name is not None or data.last_name is not None:
-        first = data.first_name.strip() if data.first_name else user.get("first_name", "")
-        last = data.last_name.strip() if data.last_name else user.get("last_name", "")
-        full_name = f"{first} {last}".strip() or user.get("name", "User")
-        updates.append(f"{_safe_col('name', _PROFILE_COLS)} = ${len(params)+1}")
-        params.append(full_name)
-
-    if updates:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1",
-                *params
-            )
-        logger.info(f"Profile updated for user {user['id']}")
-        return {"status": "success", "message": "Profile updated successfully"}
-
-    return {"status": "success", "message": "No changes made"}
+    async with core.state.db_pool.acquire() as conn:
+        _did, message = await apply_settings_profile_update(conn, str(user["id"]), data, dict(user))
+    return {"status": "success", "message": message}
 
 @router.put("/api/settings/preferences/legacy")
 async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depends(get_current_user)):
     """Update user preferences (notifications, theme, hashtags, etc.)"""
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         # Ensure user_settings row exists
         await conn.execute(
             "INSERT INTO user_settings (user_id, preferences_json) VALUES ($1, '{}') ON CONFLICT (user_id) DO NOTHING",
@@ -249,10 +287,11 @@ async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depend
         if data.platformHashtags is not None:
             prefs["platformHashtags"] = data.platformHashtags
 
-        # Save back to database
+        # Pass dict directly — codec encodes once for the JSONB column.
+        # See note in `update_me_preferences` about the double-encoding bug.
         await conn.execute(
             "UPDATE user_settings SET preferences_json = $1, updated_at = NOW() WHERE user_id = $2",
-            json.dumps(prefs),
+            prefs,
             user["id"]
         )
 
@@ -263,7 +302,7 @@ async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depend
 @router.put("/api/settings/password")
 async def update_password_settings(data: PasswordChange, user: dict = Depends(get_current_user)):
     """Change user password (settings endpoint version)"""
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         # Verify current password
         user_row = await conn.fetchrow("SELECT password_hash FROM users WHERE id = $1", user["id"])
         if not user_row or not verify_password(data.current_password, user_row["password_hash"]):
@@ -277,7 +316,9 @@ async def update_password_settings(data: PasswordChange, user: dict = Depends(ge
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
 
     logger.info(f"Password changed via settings for user {user['id']}")
-    return {"status": "success", "message": "Password changed successfully"}
+    resp = JSONResponse(content={"status": "success", "message": "Password changed successfully"})
+    clear_auth_cookies(resp)
+    return resp
 
 @router.post("/api/settings/avatar")
 async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
@@ -308,7 +349,7 @@ async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_c
         )
 
         # Store single source of truth in DB
-        async with db_pool.acquire() as conn:
+        async with core.state.db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE users SET avatar_r2_key = $1, updated_at = NOW() WHERE id = $2",
                 r2_key,
@@ -331,7 +372,14 @@ async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_c
 # Account deletion helper (TOS: paid users keep access until period end)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def _execute_account_deletion(conn, user: dict, ip_addr: str = None, initiated_by: str = "self") -> dict:
+async def _execute_account_deletion(
+    conn,
+    user: dict,
+    ip_addr: str = None,
+    initiated_by: str = "self",
+    *,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> dict:
     """
     Performs full account deletion: revoke platform tokens, delete DB rows, purge R2.
     Called from DELETE /api/me (immediate) or customer.subscription.deleted (deferred).
@@ -377,25 +425,24 @@ async def _execute_account_deletion(conn, user: dict, ip_addr: str = None, initi
             ip_addr,
         )
 
-    _DELETION_TABLES = frozenset({
-        "uploads", "platform_tokens", "token_ledger", "wallets",
-        "user_settings", "user_preferences", "refresh_tokens",
-        "user_color_preferences", "account_groups", "white_label_settings",
-    })
     rows_deleted = {}
-    for tbl in _DELETION_TABLES:
+    for tbl in ACCOUNT_DELETION_COUNT_TABLES:
         try:
-            n = await conn.fetchval(f"SELECT COUNT(*) FROM {_safe_col(tbl, _DELETION_TABLES)} WHERE user_id = $1", user["id"])
+            n = await conn.fetchval(
+                f"SELECT COUNT(*) FROM {_safe_col(tbl, ACCOUNT_DELETION_COUNT_TABLES)} WHERE user_id = $1",
+                user["id"],
+            )
             rows_deleted[tbl] = int(n)
         except Exception:
             pass
     rows_deleted["users"] = 1
 
-    import asyncio as _aio
-    _aio.ensure_future(send_account_deleted_email(
-        user.get("email", ""),
-        user.get("name") or "there",
-    ))
+    # Goodbye email: use BackgroundTasks when provided (HTTP) so the coroutine is not
+    # orphaned on shutdown (avoids "Task was destroyed but it is pending" from ensure_future).
+    _del_email = user.get("email", "")
+    _del_name = user.get("name") or "there"
+    if background_tasks is not None:
+        background_tasks.add_task(send_account_deleted_email, _del_email, _del_name)
 
     await conn.execute("DELETE FROM refresh_tokens          WHERE user_id = $1", user["id"])
     await conn.execute("DELETE FROM token_ledger             WHERE user_id = $1", user["id"])
@@ -427,7 +474,11 @@ async def _execute_account_deletion(conn, user: dict, ip_addr: str = None, initi
 # ──────────────────────────────────────────────────────────────────────────────
 
 @router.delete("/api/me")
-async def delete_account(request: Request, user: dict = Depends(get_current_user)):
+async def delete_account(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
     """
     Self-serve account deletion. TOS-aligned:
       - Free users: deletion is immediate.
@@ -440,7 +491,7 @@ async def delete_account(request: Request, user: dict = Depends(get_current_user
     if user.get("role") == "master_admin":
         raise HTTPException(403, "Master admin accounts cannot be deleted via this endpoint.")
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         deletion_log_id = await conn.fetchval(
             """
             INSERT INTO account_deletion_log
@@ -489,7 +540,13 @@ async def delete_account(request: Request, user: dict = Depends(get_current_user
             }
         else:
             # Free user or no active subscription: delete immediately
-            result = await _execute_account_deletion(conn, user, ip_addr=ip_addr, initiated_by="account_deletion")
+            result = await _execute_account_deletion(
+                conn,
+                user,
+                ip_addr=ip_addr,
+                initiated_by="account_deletion",
+                background_tasks=background_tasks,
+            )
             await conn.execute(
                 """
                 UPDATE account_deletion_log
@@ -504,35 +561,65 @@ async def delete_account(request: Request, user: dict = Depends(get_current_user
                 json.dumps(result["rows_deleted"]),
             )
             logger.info(f"[DELETION COMPLETE] user={user_id} r2={result['r2_deleted']} tokens={result['tokens_revoked']}")
-            return {
-                "status": "account_deleted",
-                "summary": {
-                    "r2_objects_deleted": result["r2_deleted"],
-                    "platform_tokens_revoked": result["tokens_revoked"],
-                    "rows_deleted": result["rows_deleted"],
-                },
-            }
+            resp = JSONResponse(
+                content={
+                    "status": "account_deleted",
+                    "summary": {
+                        "r2_objects_deleted": result["r2_deleted"],
+                        "platform_tokens_revoked": result["tokens_revoked"],
+                        "rows_deleted": result["rows_deleted"],
+                    },
+                }
+            )
+            clear_auth_cookies(resp)
+            return resp
 
 # ============================================================
 # Wallet
 # ============================================================
 @router.get("/api/wallet")
-async def get_wallet_endpoint(user: dict = Depends(get_current_user)):
-    wallet = user.get("wallet", {})
-    plan = get_plan(user.get("subscription_tier", "free"))
-    async with db_pool.acquire() as conn:
-        ledger = await conn.fetch("SELECT * FROM token_ledger WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50", user["id"])
-    return {
-        "wallet": wallet, "plan_limits": {"put_daily": plan.get("put_daily", 1), "put_monthly": plan.get("put_monthly", 30), "aic_monthly": plan.get("aic_monthly", 0)},
-        "ledger": [dict(l) for l in ledger],
-    }
+async def get_wallet_endpoint(user_id: str = Depends(get_verified_user_id)):
+    """
+    Wallet balances, plan limits, and recent ledger rows.
+
+    Uses ``get_verified_user_id`` plus ``fetch_me_wallet_endpoint_data`` so users + wallets +
+    ledger share **one** pooled connection (avoids duplicate ``pg_advisory_unlock_all`` from a
+    separate ledger-only checkout).
+    """
+    pool = core.state.db_pool
+    empty_wallet = {"put_balance": 0, "aic_balance": 0, "put_reserved": 0, "aic_reserved": 0}
+    plan_limits_fallback = {"put_daily": 1, "put_monthly": 30, "aic_monthly": 0}
+    if pool is None:
+        return JSONResponse(
+            content=jsonable_encoder(
+                {"wallet": empty_wallet, "plan_limits": plan_limits_fallback, "ledger": []}
+            )
+        )
+    try:
+        wallet, plan_limits, ledger = await fetch_me_wallet_endpoint_data(pool, user_id)
+        payload = {
+            "wallet": wallet,
+            "plan_limits": plan_limits,
+            "ledger": [jsonable_encoder(dict(l)) for l in ledger],
+        }
+        return JSONResponse(content=jsonable_encoder(payload))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("/api/wallet failed user=%s: %s", user_id, e)
+        fallback = {
+            "wallet": empty_wallet,
+            "plan_limits": plan_limits_fallback,
+            "ledger": [],
+        }
+        return JSONResponse(content=jsonable_encoder(fallback))
 
 @router.post("/api/wallet/topup")
 async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_user)):
     product = TOPUP_PRODUCTS.get(data.lookup_key)
     if not product: raise HTTPException(400, "Invalid product")
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         customer_id = user.get("stripe_customer_id")
         if not customer_id:
             customer = stripe.Customer.create(email=user["email"], name=user["name"])
@@ -556,7 +643,7 @@ async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_u
 async def wallet_transfer(data: TransferRequest, user: dict = Depends(get_current_user)):
     if not user.get("flex_enabled"):
         raise HTTPException(403, "Flex add-on required for transfers")
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         success = await transfer_tokens(conn, user["id"], data.from_platform, data.to_platform, data.amount)
     if not success: raise HTTPException(400, "Transfer failed - insufficient balance")
     return {"status": "transferred", "amount": data.amount, "burn": int(data.amount * 0.02)}
@@ -586,7 +673,7 @@ _SETTINGS_DEFAULTS = {
 @router.get("/api/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
     """Get user settings including Trill preferences"""
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         try:
             settings = await conn.fetchrow("""
                 SELECT
@@ -649,7 +736,9 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
     if not updates:
         return {"status": "updated"}
 
-    async with db_pool.acquire() as conn:
+    assert_set_fragments_columns(updates, _ALLOWED_SETTINGS)
+
+    async with core.state.db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO user_settings (user_id)
             VALUES ($1)
@@ -671,6 +760,7 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
                     base_updates.append(f"{_safe_col(field, _BASE_ALLOWED)} = ${len(base_params)+1}")
                     base_params.append(val)
             if base_updates:
+                assert_set_fragments_columns(base_updates, _BASE_ALLOWED)
                 await conn.execute(
                     f"UPDATE user_settings SET {', '.join(base_updates)}, updated_at = NOW() WHERE user_id = $1",
                     *base_params
@@ -690,7 +780,7 @@ async def test_user_discord_webhook(data: dict, user: dict = Depends(get_current
     The same saved URL is used when admin sends via 'Send to user webhooks'."""
     webhook_url = (data.get("webhookUrl") or data.get("webhook_url") or "").strip()
     if not webhook_url:
-        async with db_pool.acquire() as conn:
+        async with core.state.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT COALESCE(
@@ -741,11 +831,37 @@ async def test_user_discord_webhook(data: dict, user: dict = Depends(get_current
 @router.get("/api/me/preferences")
 async def get_preferences(user: dict = Depends(get_current_user)):
     """Get user preferences including hashtag settings"""
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         prefs = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
     if prefs and prefs["preferences"]:
         return json.loads(prefs["preferences"]) if isinstance(prefs["preferences"], str) else prefs["preferences"]
     return {}
+
+async def _validate_thumbnail_default_persona_row(conn, merged: dict, user_id) -> None:
+    """Strip invalid UUIDs or personas that belong to another user (prevents bad defaults)."""
+    camel, snake = "thumbnailDefaultPersonaId", "thumbnail_default_persona_id"
+    if camel not in merged and snake not in merged:
+        return
+    raw = merged.get(camel) if camel in merged else merged.get(snake)
+    if raw is None or str(raw).strip() == "":
+        merged[camel] = merged[snake] = None
+        return
+    try:
+        pid = uuid.UUID(str(raw).strip())
+    except (ValueError, AttributeError, TypeError):
+        merged[camel] = merged[snake] = None
+        return
+    row = await conn.fetchrow(
+        "SELECT id::text FROM creator_personas WHERE id = $1 AND user_id = $2",
+        pid,
+        user_id,
+    )
+    if not row:
+        merged[camel] = merged[snake] = None
+    else:
+        sid = str(row["id"])
+        merged[camel] = merged[snake] = sid
+
 
 @router.put("/api/me/preferences")
 async def update_preferences(request: Request, user: dict = Depends(get_current_user)):
@@ -868,7 +984,30 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
             v = "default"
         prefs["captionVoice"] = prefs["caption_voice"] = v
 
-    async with db_pool.acquire() as conn:
+    _THUMB_SELECTION = ("ai", "sharpness")
+    _THUMB_PIPELINE = frozenset(
+        ("auto", "studio_renderer", "ai_edit", "template", "none")
+    )
+    if "thumbnailSelectionMode" in prefs or "thumbnail_selection_mode" in prefs:
+        v = str(
+            prefs.get("thumbnailSelectionMode")
+            or prefs.get("thumbnail_selection_mode")
+            or "ai"
+        ).strip().lower()
+        if v not in _THUMB_SELECTION:
+            v = "ai"
+        prefs["thumbnailSelectionMode"] = prefs["thumbnail_selection_mode"] = v
+    if "thumbnailRenderPipeline" in prefs or "thumbnail_render_pipeline" in prefs:
+        v = str(
+            prefs.get("thumbnailRenderPipeline")
+            or prefs.get("thumbnail_render_pipeline")
+            or "auto"
+        ).strip().lower()
+        if v not in _THUMB_PIPELINE:
+            v = "auto"
+        prefs["thumbnailRenderPipeline"] = prefs["thumbnail_render_pipeline"] = v
+
+    async with core.state.db_pool.acquire() as conn:
         # MERGE with existing preferences — never replace entirely (frontend may send partial updates)
         existing_row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
         existing = {}
@@ -882,9 +1021,15 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
             elif isinstance(raw, dict):
                 existing = dict(raw)
         merged = {**existing, **prefs}
+        await _validate_thumbnail_default_persona_row(conn, merged, user["id"])
+        normalize_preferences_dict(merged)
+        # Pass the dict directly — the asyncpg pool registers a JSONB codec
+        # (core.helpers._init_asyncpg_codecs). Calling json.dumps() here used to
+        # double-encode through the codec, producing JSONB *string* rows like
+        # `'"["tester","qwe"]"'` that fed the bad `#"["tester" #"qwe"]"` token.
         await conn.execute(
             "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
-            json.dumps(merged), user["id"]
+            merged, user["id"]
         )
         # Sync discord_webhook to user_settings and user_preferences so:
         # - Admin "Send to user webhooks" finds it (announcement query reads from these tables)

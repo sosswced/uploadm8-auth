@@ -3,9 +3,12 @@ UploadM8 job queue — push jobs to Redis priority/normal lanes.
 Extracted from app.py; uses core.state for Redis client.
 """
 
+import asyncio
 import json
 import uuid
 import logging
+
+from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
 
 import core.state
 from core.config import (
@@ -18,6 +21,11 @@ from core.helpers import _now_utc
 from stages.entitlements import PRIORITY_QUEUE_CLASSES
 
 logger = logging.getLogger("uploadm8-api")
+
+# Errors that indicate a stale TCP socket (Windows WinError 10054, broken
+# pipe, idle-reaped server side, etc). Worth one explicit retry — the redis-py
+# client will reconnect on the next call.
+_TRANSIENT_REDIS_ERRORS = (RedisConnectionError, RedisTimeoutError, OSError)
 
 
 async def enqueue_job(
@@ -56,13 +64,33 @@ async def enqueue_job(
     job_data["lane"]           = lane
     job_data["priority_class"] = priority_class
 
-    try:
-        await core.state.redis_client.lpush(queue, json.dumps(job_data))
-        logger.debug(
-            f"[{job_data.get('upload_id', '?')}] Enqueued -> {queue} "
-            f"(lane={lane} priority_class={priority_class})"
-        )
-        return True
-    except Exception as e:
-        logger.error(f"enqueue_job failed: {e}")
-        return False
+    payload = json.dumps(job_data)
+    upload_id = job_data.get("upload_id", "?")
+
+    # One extra retry on transient socket errors. The Retry policy on the
+    # client itself handles in-flight reconnects, but if the connection was
+    # already closed by the peer between requests (Windows WinError 10054,
+    # idle Redis client kill) the FIRST write can still fail before the
+    # client-level retry kicks in. A second attempt forces a fresh connection.
+    for attempt in (1, 2):
+        try:
+            await core.state.redis_client.lpush(queue, payload)
+            logger.debug(
+                f"[{upload_id}] Enqueued -> {queue} "
+                f"(lane={lane} priority_class={priority_class})"
+            )
+            return True
+        except _TRANSIENT_REDIS_ERRORS as e:
+            if attempt == 1:
+                logger.warning(
+                    f"[{upload_id}] enqueue_job transient redis error "
+                    f"(attempt 1/2, will retry): {e!r}"
+                )
+                await asyncio.sleep(0.1)
+                continue
+            logger.error(f"[{upload_id}] enqueue_job failed after retry: {e!r}")
+            return False
+        except Exception as e:
+            logger.error(f"[{upload_id}] enqueue_job failed: {e!r}")
+            return False
+    return False

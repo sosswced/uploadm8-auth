@@ -14,13 +14,15 @@ from io import BytesIO
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse, Response
 
 import core.state
-from core.deps import get_current_user
+from core.deps import get_current_user, get_current_user_readonly
 from core.auth import decrypt_blob
 from core.helpers import _now_utc, _safe_json, get_plan
+from services.growth_intelligence import fetch_user_pikzels_studio_usage, parse_range_since_until
+from services.tiktok_api import tiktok_video_list_url
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -72,13 +74,10 @@ async def _fetch_tiktok_metrics(access_token: str) -> dict:
         async with httpx.AsyncClient(timeout=20) as client:
             # 1) Video list (requires video.list)
             resp = await client.post(
-                "https://open.tiktokapis.com/v2/video/list/",
+                tiktok_video_list_url(),
                 headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                # fields is REQUIRED — without it TikTok returns videos with every stat = 0
-                json={
-                    "max_count": 20,
-                    "fields": ["id","title","view_count","like_count","comment_count","share_count","duration","create_time"],
-                },
+                # TikTok requires fields in the query string, not the JSON body.
+                json={"max_count": 20},
             )
             if resp.status_code != 200:
                 logger.warning(f"TikTok video list HTTP {resp.status_code}: {resp.text[:200]}")
@@ -476,13 +475,19 @@ async def _platform_metrics_db_cache_set(conn, user_id: str, output: dict) -> No
 # ============================================================
 
 @router.get("/api/analytics")
-async def get_analytics(range: str = "30d", user: dict = Depends(get_current_user)):
+async def get_analytics(range: str = "30d", user: dict = Depends(get_current_user_readonly)):
     # 'all' maps to 1y (largest supported window). 'partial' = at least one platform succeeded.
     minutes = {"30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440,
                "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600, "all": 525600}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
+    uid = user["id"]
+    pool = core.state.db_pool
 
-    async with core.state.db_pool.acquire() as conn:
+    # Single connection: previously asyncio.gather ran four acquire()s in parallel per request,
+    # which could exhaust the small asyncpg pool (max 10) alongside /api/dashboard/stats and
+    # /api/wallet — leaving all three fetches pending in the browser. Dashboard stats now also
+    # uses one connection per request.
+    async with pool.acquire() as conn:
         try:
             stats = await conn.fetchrow("""
             SELECT COUNT(*)::int AS total,
@@ -492,7 +497,7 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
                    COALESCE(SUM(put_spent), 0)::int AS put_used,
                    COALESCE(SUM(aic_spent), 0)::int AS aic_used
             FROM uploads WHERE user_id = $1 AND created_at >= $2
-            """, user["id"], since)
+            """, uid, since)
         except Exception as e:
             if e.__class__.__name__ != "UndefinedColumnError":
                 raise
@@ -502,25 +507,23 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
                    0::bigint AS views, 0::bigint AS likes,
                    0::int AS put_used, 0::int AS aic_used
             FROM uploads WHERE user_id = $1 AND created_at >= $2
-            """, user["id"], since)
+            """, uid, since)
 
         daily = await conn.fetch(
             "SELECT DATE(created_at) AS date, COUNT(*)::int AS uploads "
             "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
             "GROUP BY DATE(created_at) ORDER BY date",
-            user["id"], since
+            uid, since,
         )
+
         platforms = await conn.fetch(
             "SELECT unnest(platforms) AS platform, COUNT(*)::int AS count "
             "FROM uploads WHERE user_id = $1 AND created_at >= $2 "
             "AND status IN ('completed','succeeded','partial') "
             "GROUP BY platform",
-            user["id"], since
+            uid, since,
         )
 
-        # ================================================================
-        # TRILL TELEMETRY STATS
-        # ================================================================
         trill_stats = None
         try:
             trill_data = await conn.fetchrow("""
@@ -534,7 +537,7 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
                 WHERE user_id = $1
                 AND created_at >= $2
                 AND trill_score IS NOT NULL
-            """, user["id"], since)
+            """, uid, since)
 
             if trill_data and trill_data["trill_uploads"] > 0:
                 speed_buckets = await conn.fetch("""
@@ -544,14 +547,14 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
                     AND created_at >= $2
                     AND speed_bucket IS NOT NULL
                     GROUP BY speed_bucket
-                """, user["id"], since)
+                """, uid, since)
 
                 bucket_counts = {
                     "gloryBoy": 0,
                     "euphoric": 0,
                     "sendIt": 0,
                     "spirited": 0,
-                    "chill": 0
+                    "chill": 0,
                 }
 
                 for bucket in speed_buckets:
@@ -564,11 +567,11 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
                     "max_score": float(trill_data["max_score"]),
                     "max_speed_mph": float(trill_data["max_speed_mph"]),
                     "total_distance_miles": float(trill_data["total_distance_miles"]),
-                    "speed_buckets": bucket_counts
+                    "speed_buckets": bucket_counts,
                 }
         except Exception as e:
-            logger.warning(f"Trill stats unavailable: {e}")
-        # ================================================================
+            logger.warning("Trill stats unavailable: %s", e)
+            trill_stats = None
 
     result = {
         "total_uploads": stats["total"] if stats else 0,
@@ -587,36 +590,63 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
     return result
 
 
-@router.get("/api/analytics/platform-metrics")
-async def get_platform_metrics(force: bool = False, user: dict = Depends(get_current_user)):
+@router.get("/api/analytics/pikzels-v2-usage")
+async def analytics_pikzels_v2_usage(range: str = Query("30d"), user: dict = Depends(get_current_user)):
+    """Thumbnail Studio (Pikzels API v2) action counts for the signed-in user (mirrors admin KPI shape)."""
+    since, until = parse_range_since_until(range)
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            data = await fetch_user_pikzels_studio_usage(conn, str(user["id"]), since, until)
+        return {"range": range, **data}
+    except Exception as e:
+        logger.warning("analytics pikzels-v2-usage: %s", e)
+        return {"range": range, "total_calls": 0, "by_operation": []}
+
+
+@router.get("/api/analytics/upload-counts-by-token")
+async def analytics_upload_counts_by_token(user: dict = Depends(get_current_user)):
     """
-    Fetch live engagement metrics from all connected platform APIs.
-    Cached 3 hours per user (memory + DB). Pass ?force=true to bypass cache.
+    Completed uploads explicitly targeted at platform_tokens rows, keyed for CRM deep-dive:
+    { by_platform: { tiktok: { "<token_uuid>": n, ... }, ... } }.
+    Uploads with empty target_accounts are omitted (not attributed per connection).
     """
+    uid = user["id"]
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT lower(t.platform) AS platform, t.id::text AS token_id, COUNT(*)::int AS cnt
+                FROM uploads u
+                CROSS JOIN LATERAL unnest(COALESCE(u.target_accounts, ARRAY[]::text[])) AS ta(token_id)
+                INNER JOIN platform_tokens t
+                  ON t.user_id = u.user_id AND t.id = ta.token_id::uuid
+                WHERE u.user_id = $1
+                  AND u.status IN ('completed', 'succeeded', 'partial')
+                  AND COALESCE(cardinality(u.target_accounts), 0) > 0
+                GROUP BY t.platform, t.id
+                """,
+                uid,
+            )
+    except Exception as e:
+        logger.warning("upload-counts-by-token: %s", e)
+        return {"by_platform": {}}
+
+    by_platform: dict = {}
+    for r in rows:
+        p = (r["platform"] or "").strip().lower()
+        if not p:
+            continue
+        by_platform.setdefault(p, {})[r["token_id"]] = int(r["cnt"] or 0)
+    return {"by_platform": by_platform}
+
+
+async def _compute_live_platform_metrics(user: dict) -> dict:
+    """Live platform API fetch; updates in-memory + DB cache."""
     user_id = str(user["id"])
     now = _time.time()
-
-    # 1) in-memory cache
-    cached = _platform_metrics_cache.get(user_id)
-    if cached and not force:
-        age = now - cached["fetched_at"]
-        if age < _PLATFORM_CACHE_TTL:
-            result = dict(cached["data"])
-            result["cached"] = True
-            result["cache_source"] = "memory"
-            result["cache_age_minutes"] = int(age / 60)
-            result["next_refresh_minutes"] = int((_PLATFORM_CACHE_TTL - age) / 60)
-            return result
-
-    # 2) DB cache (survives restarts)
     async with core.state.db_pool.acquire() as conn:
-        db_cached = await _platform_metrics_db_cache_get(conn, user_id)
-        if db_cached and not force:
-            _platform_metrics_cache[user_id] = {"fetched_at": now, "data": db_cached}
-            return db_cached
-
         token_rows = await conn.fetch(
-            "SELECT platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            "SELECT id, platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
             user["id"],
         )
         upload_counts = await conn.fetch(
@@ -628,6 +658,8 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
         )
 
     upload_map = {r["platform"]: r["cnt"] for r in upload_counts}
+
+    from services.platform_oauth_refresh import refresh_decrypted_token_for_row
 
     token_map: dict = {}
     for row in token_rows:
@@ -644,6 +676,13 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
                 decrypted["ig_user_id"] = str(row["account_id"])
             if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
                 decrypted["page_id"] = str(row["account_id"])
+            decrypted = await refresh_decrypted_token_for_row(
+                plat,
+                decrypted,
+                db_pool=core.state.db_pool,
+                user_id=user_id,
+                token_row_id=str(row["id"]),
+            )
             token_map[plat] = decrypted
 
     async def run_tiktok():
@@ -698,6 +737,58 @@ async def get_platform_metrics(force: bool = False, user: dict = Depends(get_cur
         await _platform_metrics_db_cache_set(conn, user_id, output)
 
     return output
+
+
+@router.get("/api/analytics/platform-metrics")
+async def get_platform_metrics(force: bool = False, user: dict = Depends(get_current_user)):
+    """
+    Fetch live engagement metrics from all connected platform APIs.
+    Cached 3 hours per user (memory + DB). Pass ?force=true to bypass cache.
+    """
+    user_id = str(user["id"])
+    now = _time.time()
+
+    # 1) in-memory cache
+    cached = _platform_metrics_cache.get(user_id)
+    if cached and not force:
+        age = now - cached["fetched_at"]
+        if age < _PLATFORM_CACHE_TTL:
+            result = dict(cached["data"])
+            result["cached"] = True
+            result["cache_source"] = "memory"
+            result["cache_age_minutes"] = int(age / 60)
+            result["next_refresh_minutes"] = int((_PLATFORM_CACHE_TTL - age) / 60)
+            return result
+
+    # 2) DB cache (survives restarts)
+    async with core.state.db_pool.acquire() as conn:
+        db_cached = await _platform_metrics_db_cache_get(conn, user_id)
+        if db_cached and not force:
+            _platform_metrics_cache[user_id] = {"fetched_at": now, "data": db_cached}
+            return db_cached
+
+    return await _compute_live_platform_metrics(user)
+
+
+@router.post("/api/analytics/refresh-all")
+async def analytics_refresh_all(
+    background_tasks: BackgroundTasks,
+    async_mode: bool = Query(True),
+    user: dict = Depends(get_current_user),
+):
+    """Invalidate platform-metrics caches and optionally re-fetch in the background."""
+    user_id = str(user["id"])
+    _platform_metrics_cache.pop(user_id, None)
+    async with core.state.db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM platform_metrics_cache WHERE user_id = $1", user["id"])
+
+    if async_mode:
+        ucopy = {**user}
+        background_tasks.add_task(_compute_live_platform_metrics, ucopy)
+        return {"ok": True, "async_mode": True}
+
+    await _compute_live_platform_metrics(user)
+    return {"ok": True, "async_mode": False}
 
 
 @router.get("/api/analytics/platform-metrics/cached")
@@ -811,6 +902,93 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
             "revenue_total": revenue_total,
         },
     }
+
+
+def _normalize_quality_scores_platform(platform: str) -> Optional[str]:
+    """Match kpi.html platform filter; None means all platforms."""
+    s = (platform or "all").strip().lower()
+    if not s or s == "all":
+        return None
+    if s == "instagram_reels":
+        s = "instagram"
+    if s == "facebook_reels":
+        s = "facebook"
+    if s in ("tiktok", "youtube", "instagram", "facebook"):
+        return s
+    return None
+
+
+@router.get("/api/analytics/quality-scores")
+async def analytics_quality_scores(
+    days: int = Query(30, ge=1, le=3650),
+    platform: str = Query("all"),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Per-strategy engagement rollups from ``upload_quality_scores_daily`` (ML scoring job).
+    Used by kpi.html for the “ML strategy” strip; shape: ``{ rows: [...], days, platform }``.
+    """
+    uid = user["id"]
+    lookback = max(1, min(int(days), 3650))
+    pf = _normalize_quality_scores_platform(platform)
+
+    sql_all = """
+        SELECT strategy_key,
+               SUM(samples)::bigint AS samples,
+               CASE WHEN SUM(samples) > 0 THEN
+                 SUM(COALESCE(mean_engagement, 0) * samples::double precision)
+                 / SUM(samples::double precision)
+               ELSE 0.0 END AS mean_engagement,
+               MAX(ci95_high)::double precision AS ci95_high
+          FROM upload_quality_scores_daily
+         WHERE user_id = $1::uuid
+           AND day >= (CURRENT_DATE - $2::int)
+         GROUP BY strategy_key
+        HAVING SUM(samples) > 0
+         ORDER BY MAX(ci95_high) DESC NULLS LAST
+         LIMIT 80
+    """
+    sql_pf = """
+        SELECT strategy_key,
+               SUM(samples)::bigint AS samples,
+               CASE WHEN SUM(samples) > 0 THEN
+                 SUM(COALESCE(mean_engagement, 0) * samples::double precision)
+                 / SUM(samples::double precision)
+               ELSE 0.0 END AS mean_engagement,
+               MAX(ci95_high)::double precision AS ci95_high
+          FROM upload_quality_scores_daily
+         WHERE user_id = $1::uuid
+           AND day >= (CURRENT_DATE - $2::int)
+           AND platform = $3
+         GROUP BY strategy_key
+        HAVING SUM(samples) > 0
+         ORDER BY MAX(ci95_high) DESC NULLS LAST
+         LIMIT 80
+    """
+
+    async with core.state.db_pool.acquire() as conn:
+        try:
+            if pf is None:
+                rows = await conn.fetch(sql_all, uid, lookback)
+            else:
+                rows = await conn.fetch(sql_pf, uid, lookback, pf)
+        except Exception as e:
+            if e.__class__.__name__ == "UndefinedTableError":
+                return {"rows": [], "days": lookback, "platform": platform}
+            raise
+
+    out = []
+    for r in rows or []:
+        out.append(
+            {
+                "strategy_key": str(r["strategy_key"] or ""),
+                "samples": int(r["samples"] or 0),
+                "mean_engagement": float(r["mean_engagement"] or 0),
+                "ci95_high": float(r["ci95_high"] or 0),
+            }
+        )
+    return {"rows": out, "days": lookback, "platform": platform}
+
 
 @router.get("/api/analytics/my-avg-processing")
 async def my_avg_processing(user: dict = Depends(get_current_user)):

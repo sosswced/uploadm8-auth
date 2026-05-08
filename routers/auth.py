@@ -3,99 +3,134 @@ UploadM8 Auth routes — extracted from app.py.
 Registration, login, token refresh, logout, password reset/change.
 """
 
-import uuid
 import secrets
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request, Query
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 import core.state
-from core.auth import (
-    hash_password,
-    verify_password,
-    create_access_jwt,
-    create_refresh_token,
-    rotate_refresh_token,
-)
-from core.helpers import _now_utc, _sha256_hex
+from core.cookie_auth import clear_auth_cookies, refresh_token_from_cookie, set_auth_cookies
+from core.auth import hash_password, verify_password, create_access_jwt, create_refresh_token
 from core.notifications import notify_signup
-from core.audit import log_system_event
-from core.wallet import get_wallet, daily_refill, credit_wallet, ledger_entry
 from core.deps import get_current_user
-from core.config import FRONTEND_URL
+from core.config import FRONTEND_URL, SIGNUP_EMAIL_VERIFICATION
+from core.helpers import _sha256_hex
 from core.models import (
     UserCreate,
     UserLogin,
-    RefreshRequest,
     ForgotPasswordRequest,
     ResetPasswordRequest,
     PasswordChange,
 )
 from stages.emails import (
     send_welcome_email,
+    send_signup_confirmation_email,
+    send_post_verification_welcome_email,
     send_password_reset_email,
     send_password_changed_email,
 )
-from stages.entitlements import get_entitlements_for_tier
+from services.auth_credentials import login_user, refresh_session, register_user
 
 logger = logging.getLogger("uploadm8-api")
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
+class ResendConfirmationBody(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+
+
+class UpdatePendingEmailBody(BaseModel):
+    current_email: str = Field(..., min_length=3, max_length=320)
+    new_email: str = Field(..., min_length=3, max_length=320)
+
+
 @router.post("/register")
 async def register(data: UserCreate, background_tasks: BackgroundTasks, request: Request):
+    country_code = (request.headers.get("CF-IPCountry") or "")[:2].upper() or None
+    email_lc = data.email.lower().strip()
     async with core.state.db_pool.acquire() as conn:
-        if await conn.fetchrow("SELECT id FROM users WHERE LOWER(email) = $1", data.email.lower()):
-            raise HTTPException(409, "Email already registered")
-        user_id = str(uuid.uuid4())
-        # Capture country from Cloudflare header if present
-        country_code = (request.headers.get("CF-IPCountry") or "")[:2].upper() or None
-        if country_code in ("XX", "T1", ""):
-            country_code = None
-        await conn.execute(
-            "INSERT INTO users (id, email, password_hash, name, country) VALUES ($1, $2, $3, $4, $5)",
-            user_id, data.email.lower(), hash_password(data.password), data.name, country_code
+        access, refresh = await register_user(
+            conn,
+            data,
+            country_code,
+            issue_tokens=not SIGNUP_EMAIL_VERIFICATION,
         )
-        await conn.execute("INSERT INTO user_settings (user_id) VALUES ($1)", user_id)
-        # Default credits from free tier entitlements — enough to try uploads + AI features
-        ent = get_entitlements_for_tier("free")
-        signup_put = max(ent.put_monthly, 80)   # full free monthly or 80 min
-        signup_aic = max(ent.aic_monthly, 50)  # full free monthly or 50 min
-        await conn.execute(
-            "INSERT INTO wallets (user_id, put_balance, aic_balance) VALUES ($1, $2, $3)",
-            user_id, signup_put, signup_aic
-        )
-        await ledger_entry(conn, user_id, "put", signup_put, "signup_bonus")
-        await ledger_entry(conn, user_id, "aic", signup_aic, "signup_bonus")
-        access = create_access_jwt(user_id)
-        refresh = await create_refresh_token(conn, user_id)
-    background_tasks.add_task(notify_signup, data.email, data.name)
-    background_tasks.add_task(send_welcome_email, data.email, data.name)
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+        if SIGNUP_EMAIL_VERIFICATION:
+            uid = await conn.fetchval("SELECT id FROM users WHERE LOWER(email)=$1", email_lc)
+            raw = secrets.token_urlsafe(32)
+            token_hash = hashlib.sha256(raw.encode()).hexdigest()
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
+            await conn.execute("DELETE FROM signup_verifications WHERE user_id = $1", uid)
+            await conn.execute(
+                """
+                INSERT INTO signup_verifications (user_id, token_hash, expires_at)
+                VALUES ($1, $2, $3)
+                """,
+                uid,
+                token_hash,
+                expires_at,
+            )
+            await conn.execute("UPDATE users SET email_verified = false WHERE id = $1", uid)
+            confirm_link = f"{FRONTEND_URL.rstrip('/')}/confirm-email.html?token={quote(raw)}"
+            background_tasks.add_task(send_signup_confirmation_email, email_lc, data.name, confirm_link)
+        else:
+            background_tasks.add_task(send_welcome_email, email_lc, data.name)
+    background_tasks.add_task(notify_signup, email_lc, data.name)
+    if SIGNUP_EMAIL_VERIFICATION:
+        return JSONResponse(content={"status": "pending_verification", "email": email_lc})
+    resp = JSONResponse(
+        content={"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+    )
+    set_auth_cookies(resp, access, refresh)
+    return resp
 
 @router.post("/login")
 async def login(data: UserLogin):
     async with core.state.db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT id, password_hash, status FROM users WHERE LOWER(email) = $1", data.email.lower())
-        if not user or not verify_password(data.password, user["password_hash"]): raise HTTPException(401, "Invalid credentials")
-        if user["status"] == "banned": raise HTTPException(403, "Account suspended")
-        return {"access_token": create_access_jwt(str(user["id"])), "refresh_token": await create_refresh_token(conn, str(user["id"])), "token_type": "bearer"}
+        access, refresh = await login_user(conn, data)
+    resp = JSONResponse(
+        content={"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+    )
+    set_auth_cookies(resp, access, refresh)
+    return resp
 
 @router.post("/refresh")
-async def refresh(data: RefreshRequest):
+async def refresh(request: Request):
+    """Rotate session. Refresh token from JSON body or HttpOnly cookie."""
+    body: dict = {}
+    try:
+        raw = await request.json()
+        if isinstance(raw, dict):
+            body = raw
+    except Exception:
+        pass
+    rt = (
+        (body.get("refresh_token") or body.get("refreshToken") or "").strip()
+        or refresh_token_from_cookie(request.cookies)
+    )
+    if not rt:
+        raise HTTPException(401, "Missing refresh token")
     async with core.state.db_pool.acquire() as conn:
-        access, refresh = await rotate_refresh_token(conn, data.refresh_token)
-    return {"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+        access, new_refresh = await refresh_session(conn, rt)
+    resp = JSONResponse(
+        content={"access_token": access, "refresh_token": new_refresh, "token_type": "bearer"}
+    )
+    set_auth_cookies(resp, access, new_refresh)
+    return resp
 
 @router.post("/logout")
 async def logout(user: dict = Depends(get_current_user)):
     async with core.state.db_pool.acquire() as conn:
         await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", user["id"])
-    return {"status": "logged_out"}
+    resp = JSONResponse(content={"status": "logged_out"})
+    clear_auth_cookies(resp)
+    return resp
 
 @router.post("/logout-all")
 async def logout_all(user: dict = Depends(get_current_user)):
@@ -105,8 +140,57 @@ async def logout_all(user: dict = Depends(get_current_user)):
             "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
             user["id"],
         )
-    return {"status": "logged_out_all"}
+    resp = JSONResponse(content={"status": "logged_out_all"})
+    clear_auth_cookies(resp)
+    return resp
 
+
+@router.post("/logout-other-sessions")
+async def logout_other_sessions(request: Request, user: dict = Depends(get_current_user)):
+    """
+    Revoke every refresh token for this user except the one used on this request.
+    Keeps the current browser/session signed in; use this for Settings → “other devices”.
+    """
+    rt = (refresh_token_from_cookie(request.cookies) or "").strip()
+    if not rt:
+        body: dict = {}
+        try:
+            raw = await request.json()
+            if isinstance(raw, dict):
+                body = raw
+        except Exception:
+            pass
+        rt = (body.get("refresh_token") or body.get("refreshToken") or "").strip()
+    if not rt:
+        raise HTTPException(
+            400,
+            "No refresh token available (cookie or JSON). Sign out and sign in again, or use full Log out.",
+        )
+    h = _sha256_hex(rt)
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id FROM refresh_tokens
+            WHERE token_hash = $1 AND user_id = $2 AND revoked_at IS NULL
+            """,
+            h,
+            user["id"],
+        )
+        if not row:
+            raise HTTPException(
+                401,
+                "This session's refresh token is invalid or expired. Sign out completely and sign in again.",
+            )
+        revoked_rows = await conn.fetch(
+            """
+            UPDATE refresh_tokens SET revoked_at = NOW()
+            WHERE user_id = $1 AND revoked_at IS NULL AND id <> $2
+            RETURNING id
+            """,
+            user["id"],
+            row["id"],
+        )
+    return {"status": "other_sessions_revoked", "sessions_revoked": len(revoked_rows)}
 
 
 @router.post("/forgot-password")
@@ -191,4 +275,183 @@ async def change_password(data: PasswordChange, background: BackgroundTasks, use
 
     logger.info(f"Password changed for user {user['id']}")
     background.add_task(send_password_changed_email, user["email"], user.get("name") or "there")
-    return {"status": "password_changed"}
+    resp = JSONResponse(content={"status": "password_changed"})
+    clear_auth_cookies(resp)
+    return resp
+
+
+async def _issue_auth_pair(conn, user_id: str) -> tuple[str, str]:
+    access = create_access_jwt(user_id)
+    refresh = await create_refresh_token(conn, user_id)
+    return access, refresh
+
+
+@router.get("/confirm-email")
+async def confirm_email(
+    background_tasks: BackgroundTasks,
+    token: str = Query(..., min_length=8),
+):
+    """Consume signup_verifications token; returns session tokens on success."""
+    now = datetime.now(timezone.utc)
+    th = hashlib.sha256(token.encode()).hexdigest()
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, user_id, expires_at, used_at FROM signup_verifications WHERE token_hash = $1",
+            th,
+        )
+        if not row:
+            raise HTTPException(status_code=400, detail="Invalid confirmation link")
+        if row["expires_at"] < now:
+            raise HTTPException(status_code=400, detail="Confirmation link expired")
+        uid = str(row["user_id"])
+        if row["used_at"] is not None:
+            u = await conn.fetchrow(
+                "SELECT email_verified FROM users WHERE id = $1",
+                row["user_id"],
+            )
+            if u and u["email_verified"] is True:
+                access, refresh = await _issue_auth_pair(conn, uid)
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "detail": "Email already confirmed",
+                        "access_token": access,
+                        "refresh_token": refresh,
+                        "token_type": "bearer",
+                    },
+                )
+            raise HTTPException(status_code=400, detail="Invalid confirmation link")
+
+        await conn.execute("UPDATE signup_verifications SET used_at = NOW() WHERE id = $1", row["id"])
+        await conn.execute(
+            "UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1",
+            row["user_id"],
+        )
+        urow = await conn.fetchrow(
+            "SELECT email, name FROM users WHERE id = $1",
+            row["user_id"],
+        )
+        access, refresh = await _issue_auth_pair(conn, uid)
+
+    if urow:
+        background_tasks.add_task(
+            send_post_verification_welcome_email,
+            urow["email"],
+            (urow["name"] or "there"),
+        )
+    return {
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "bearer",
+    }
+
+
+@router.get("/verify-email")
+async def verify_email_change(token: str = Query(..., min_length=8)):
+    """Complete admin-initiated email change using plaintext token in email_changes."""
+    async with core.state.db_pool.acquire() as conn:
+        ec = await conn.fetchrow(
+            """
+            SELECT id, user_id, new_email
+            FROM email_changes
+            WHERE verification_token = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            token,
+        )
+        if not ec:
+            raise HTTPException(status_code=404, detail="Invalid or expired verification link")
+        await conn.execute(
+            "UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1",
+            ec["user_id"],
+        )
+        await conn.execute("UPDATE email_changes SET verification_token = NULL WHERE id = $1", ec["id"])
+        email = ec["new_email"]
+    return {"email": email, "new_email": email}
+
+
+@router.post("/resend-confirmation")
+async def resend_confirmation(body: ResendConfirmationBody, background_tasks: BackgroundTasks):
+    """Resend signup confirmation (no account enumeration)."""
+    email = body.email.lower().strip()
+    async with core.state.db_pool.acquire() as conn:
+        u = await conn.fetchrow(
+            "SELECT id, name, email_verified FROM users WHERE LOWER(email) = $1",
+            email,
+        )
+        if not u or u["email_verified"] is not False:
+            return {"ok": True}
+        uid = u["id"]
+        raw = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw.encode()).hexdigest()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
+        await conn.execute("DELETE FROM signup_verifications WHERE user_id = $1", uid)
+        await conn.execute(
+            """
+            INSERT INTO signup_verifications (user_id, token_hash, expires_at)
+            VALUES ($1, $2, $3)
+            """,
+            uid,
+            token_hash,
+            expires_at,
+        )
+    confirm_link = f"{FRONTEND_URL.rstrip('/')}/confirm-email.html?token={quote(raw)}"
+    background_tasks.add_task(
+        send_signup_confirmation_email,
+        email,
+        (u["name"] or "there"),
+        confirm_link,
+    )
+    return {"ok": True}
+
+
+@router.post("/update-pending-email")
+async def update_pending_email(body: UpdatePendingEmailBody, background_tasks: BackgroundTasks):
+    """While signup verification is pending, switch the email on the account and re-send confirm."""
+    cur = body.current_email.lower().strip()
+    new_email = body.new_email.lower().strip()
+    if cur == new_email:
+        raise HTTPException(400, "New email must differ from current")
+    async with core.state.db_pool.acquire() as conn:
+        u = await conn.fetchrow(
+            "SELECT id, name, email_verified FROM users WHERE LOWER(email) = $1",
+            cur,
+        )
+        if not u:
+            raise HTTPException(404, "User not found")
+        if u["email_verified"] is not False:
+            raise HTTPException(400, "Email is not pending verification")
+        taken = await conn.fetchval(
+            "SELECT 1 FROM users WHERE LOWER(email) = $1 AND id <> $2",
+            new_email,
+            u["id"],
+        )
+        if taken:
+            raise HTTPException(409, "Email already in use")
+        await conn.execute(
+            "UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2",
+            new_email,
+            u["id"],
+        )
+        await conn.execute("DELETE FROM signup_verifications WHERE user_id = $1", u["id"])
+        raw = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw.encode()).hexdigest()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
+        await conn.execute(
+            """
+            INSERT INTO signup_verifications (user_id, token_hash, expires_at)
+            VALUES ($1, $2, $3)
+            """,
+            u["id"],
+            token_hash,
+            expires_at,
+        )
+    confirm_link = f"{FRONTEND_URL.rstrip('/')}/confirm-email.html?token={quote(raw)}"
+    background_tasks.add_task(
+        send_signup_confirmation_email,
+        new_email,
+        (u["name"] or "there"),
+        confirm_link,
+    )
+    return {"ok": True, "email": new_email}

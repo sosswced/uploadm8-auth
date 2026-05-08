@@ -25,7 +25,7 @@ class UserPreferencesUpdate(BaseModel):
     ai_hashtags_enabled: bool = Field(False, alias="aiHashtagsEnabled")
     ai_hashtag_count: int = Field(5, ge=1, le=30, alias="aiHashtagCount")
     ai_hashtag_style: Literal["lowercase", "capitalized", "camelcase", "mixed"] = Field("mixed", alias="aiHashtagStyle")
-    hashtag_position: Literal["start", "end", "caption"] = Field("end", alias="hashtagPosition")
+    hashtag_position: Literal["start", "end", "caption", "comment"] = Field("end", alias="hashtagPosition")
 
     max_hashtags: int = Field(15, ge=1, le=50, alias="maxHashtags")
     always_hashtags: List[str] = Field(default_factory=list, alias="alwaysHashtags")
@@ -38,6 +38,33 @@ class UserPreferencesUpdate(BaseModel):
     caption_tone: Literal["hype", "calm", "cinematic", "authentic"] = Field("authentic", alias="captionTone")
     caption_voice: Literal["default", "mentor", "hypebeast", "best_friend", "teacher", "cinematic_narrator"] = Field("default", alias="captionVoice")
     caption_frame_count: int = Field(6, ge=2, le=12, alias="captionFrameCount")
+    # Thumbnail ML / pipeline (stored in users.preferences; worker thumbnail_stage reads these)
+    thumbnail_selection_mode: Optional[Literal["ai", "sharpness"]] = Field(
+        None, alias="thumbnailSelectionMode"
+    )
+    thumbnail_render_pipeline: Optional[
+        Literal["auto", "studio_renderer", "ai_edit", "template", "none"]
+    ] = Field(None, alias="thumbnailRenderPipeline")
+    use_audio_context: bool = Field(True, alias="useAudioContext")
+    youtube_shorts_copyright_trim: bool = Field(False, alias="youtubeShortsCopyrightTrim")
+    audio_transcription: bool = Field(True, alias="audioTranscription")
+    ai_service_telemetry: bool = Field(True, alias="aiServiceTelemetry")
+    ai_service_dashcam_osd: bool = Field(True, alias="aiServiceDashcamOSD")
+    ai_service_audio_signals: bool = Field(True, alias="aiServiceAudioSignals")
+    ai_service_music_detection: bool = Field(True, alias="aiServiceMusicDetection")
+    ai_service_audio_summary: bool = Field(True, alias="aiServiceAudioSummary")
+    ai_service_emotion_signals: bool = Field(False, alias="aiServiceEmotionSignals")
+    ai_service_caption_writer: bool = Field(True, alias="aiServiceCaptionWriter")
+    ai_service_thumbnail_designer: bool = Field(True, alias="aiServiceThumbnailDesigner")
+    ai_service_frame_inspector: bool = Field(True, alias="aiServiceFrameInspector")
+    ai_service_speech_to_text: bool = Field(True, alias="aiServiceSpeechToText")
+    ai_service_video_analyzer: bool = Field(True, alias="aiServiceVideoAnalyzer")
+    ai_service_scene_understanding: bool = Field(True, alias="aiServiceSceneUnderstanding")
+    thumbnail_studio_enabled: bool = Field(True, alias="thumbnailStudioEnabled")
+    thumbnail_studio_engine_enabled: bool = Field(True, alias="thumbnailStudioEngineEnabled")
+    thumbnail_persona_enabled: bool = Field(False, alias="thumbnailPersonaEnabled")
+    thumbnail_default_persona_id: Optional[str] = Field(None, alias="thumbnailDefaultPersonaId")
+    thumbnail_persona_strength: int = Field(70, ge=0, le=100, alias="thumbnailPersonaStrength")
 
     class Config:
         populate_by_name = True
@@ -57,7 +84,9 @@ class UserLogin(BaseModel):
     password: str
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    """Optional when the browser sends the HttpOnly refresh cookie (see POST /api/auth/refresh)."""
+
+    refresh_token: Optional[str] = None
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -83,6 +112,13 @@ class UploadInit(BaseModel):
     has_telemetry: bool = False
     use_ai: bool = False
     smart_schedule_days: int = 7  # How many days to spread uploads across
+    # Per-upload thumbnail studio / Pikzels / persona (mirrors upload.html presign body)
+    thumbnail_count: Optional[int] = None
+    thumbnail_use_studio_engine: Optional[bool] = None
+    thumbnail_use_pikzels: Optional[bool] = None
+    thumbnail_use_persona: Optional[bool] = None
+    thumbnail_persona_id: Optional[str] = None
+    thumbnail_persona_strength: Optional[int] = Field(default=None, ge=0, le=100)
 
 class SettingsUpdate(BaseModel):
     discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
@@ -254,6 +290,15 @@ class SupportContactRequest(BaseModel):
     email: Optional[str] = None
     subject: str
     message: str
+
+
+class ClientErrorIn(BaseModel):
+    """Browser-reported error for ops triage (optional upload / page context)."""
+
+    message: str = Field(..., max_length=4000)
+    stack: Optional[str] = Field(None, max_length=12000)
+    page_url: Optional[str] = Field(None, max_length=2000)
+    upload_id: Optional[str] = Field(None, max_length=80)
 
 
 # ============================================================

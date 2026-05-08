@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 import core.state
 from core.deps import get_current_user
 from core.helpers import _safe_col
+from core.sql_allowlist import ACCOUNT_GROUPS_UPDATE_COLUMNS, assert_set_fragments_columns
 from core.models import AccountGroupIn, AccountGroupUpdate, GroupUpsert
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
@@ -95,7 +96,7 @@ async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_us
 
 @router.put("/{group_id}")
 async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends(get_current_user)):
-    _GROUP_COLS = frozenset({"name", "description", "color", "account_ids", "updated_at"})
+    _GROUP_COLS = ACCOUNT_GROUPS_UPDATE_COLUMNS
     updates = []
     params = [group_id, user["id"]]
 
@@ -129,6 +130,7 @@ async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends
             raise HTTPException(404, "Group not found")
 
         if updates:
+            assert_set_fragments_columns(updates, ACCOUNT_GROUPS_UPDATE_COLUMNS)
             await conn.execute(
                 f"UPDATE account_groups SET {', '.join(updates)} WHERE id = $1 AND user_id = $2",
                 *params,

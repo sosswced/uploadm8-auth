@@ -1,28 +1,36 @@
 """
 UploadM8 Admin Router — all /api/admin/* endpoints.
-Extracted from the monolith app.py; business logic is unchanged.
+Admin HTTP surface; prefer thin handlers and ``services/`` for new logic.
 """
 
 import json
+import os
 import re
 import uuid
 import secrets
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+import asyncpg
 import bcrypt
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 import core.state
-from core.state import db_pool, admin_settings_cache
+from core.state import admin_settings_cache
 from core.deps import get_current_user, require_admin, require_master_admin
 from core.wallet import get_wallet
 from core.notifications import discord_notify, notify_weekly_costs
 from core.audit import log_admin_audit
 from core.helpers import _now_utc, get_plan, _tier_is_upgrade, _valid_uuid, _safe_json, _safe_col
+from core.sql_allowlist import (
+    USERS_UPDATE_COLUMNS_ADMIN,
+    assert_set_fragments_columns,
+    assert_wallet_balance_column,
+)
 from core.config import (
     FRONTEND_URL,
     ADMIN_DISCORD_WEBHOOK_URL,
@@ -41,7 +49,9 @@ from stages.entitlements import (
     TOPUP_PRODUCTS,
     get_entitlements_for_tier,
     entitlements_to_dict,
+    normalize_tier,
 )
+from services.admin_kpi_finance import fetch_stripe_refunds_window
 from stages.emails import (
     send_email_change_email,
     send_admin_reset_password_email,
@@ -56,6 +66,188 @@ from stages.emails import (
 logger = logging.getLogger("uploadm8-api")
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+
+def _tier_json_key(tier: Any) -> str:
+    """JSON object keys must be strings; DB subscription_tier can be NULL."""
+    s = tier if tier is not None else ""
+    s = str(s).strip() if s else ""
+    return s if s else "free"
+
+
+def _platform_upload_mix_sql() -> str:
+    """Per-platform upload counts — valid on PostgreSQL (unnest + GROUP BY column)."""
+    return """
+        SELECT p AS platform, COUNT(*)::int AS uploads
+        FROM uploads u,
+             LATERAL unnest(COALESCE(u.platforms, ARRAY[]::text[])) AS u_p(p)
+        WHERE u.created_at >= $1
+        GROUP BY p
+    """
+
+
+def _tier_list_price_usd(tier: Any) -> float:
+    """Monthly list price from TIER_CONFIG (get_plan / entitlements_to_dict omit price)."""
+    slug = normalize_tier(str(tier) if tier is not None else "free")
+    return float((TIER_CONFIG.get(slug) or {}).get("price", 0) or 0)
+
+
+@router.get("/ml/observability-overview")
+async def ml_observability_overview(user: dict = Depends(require_admin)):
+    """
+    Single-pane status for local ML artifacts + HF + Trackio wiring.
+    No secrets are returned; only boolean/config health and local paths.
+    """
+    root = Path(__file__).resolve().parents[1]
+    dataset_path = root / "data" / "ml" / "promo_targeting_train_v1.parquet"
+    baseline_report_path = root / "data" / "ml" / "promo_targeting_baseline_report.json"
+
+    hf_token = (os.environ.get("HF_TOKEN") or "").strip()
+    trackio_project = (os.environ.get("TRACKIO_PROJECT") or "").strip()
+    trackio_space = (os.environ.get("TRACKIO_SPACE_ID") or "").strip()
+
+    summary: Dict[str, Any] = {
+        "local": {
+            "repo_root": str(root),
+            "dataset_path": str(dataset_path),
+            "dataset_exists": dataset_path.exists(),
+            "baseline_report_path": str(baseline_report_path),
+            "baseline_report_exists": baseline_report_path.exists(),
+        },
+        "huggingface": {
+            "token_configured": bool(hf_token),
+            "dataset_repo": "cedy243/uploadm8-promo-targeting-v1",
+            "dataset_url": "https://huggingface.co/datasets/cedy243/uploadm8-promo-targeting-v1",
+            "trackio_space_url": "https://huggingface.co/spaces/cedy243/uploadm8-trackio",
+        },
+        "trackio": {
+            "project_configured": bool(trackio_project),
+            "project": trackio_project,
+            "space_configured": bool(trackio_space),
+            "space_id": trackio_space,
+        },
+    }
+
+    db: Dict[str, Any] = {}
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            db["uploads_count"] = int(await conn.fetchval("SELECT COUNT(*)::int FROM uploads") or 0)
+            db["ml_outcome_labels_count"] = int(
+                await conn.fetchval("SELECT COUNT(*)::int FROM ml_outcome_labels") or 0
+            )
+            db["marketing_touchpoint_deliveries_count"] = int(
+                await conn.fetchval("SELECT COUNT(*)::int FROM marketing_touchpoint_deliveries") or 0
+            )
+            db["m8_model_runs_count"] = int(
+                await conn.fetchval("SELECT COUNT(*)::int FROM m8_model_runs") or 0
+            )
+            db["upload_quality_scores_daily_count"] = int(
+                await conn.fetchval("SELECT COUNT(*)::int FROM upload_quality_scores_daily") or 0
+            )
+            db["latest_m8_model_run"] = await conn.fetchrow(
+                """
+                SELECT id::text AS id, trained_at, model_version, train_row_count, val_mae_log1p_views
+                FROM m8_model_runs
+                ORDER BY trained_at DESC
+                LIMIT 1
+                """
+            )
+    except Exception as e:
+        db["error"] = str(e)
+
+    summary["database"] = db
+    return summary
+
+
+@router.get("/ml/observability-trends")
+async def ml_observability_trends(days: int = Query(30, ge=7, le=90), user: dict = Depends(require_admin)):
+    """
+    Daily trend snapshots for ML observability page.
+    """
+    out: Dict[str, Any] = {"days": int(days), "series": {}}
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            outcome = await conn.fetch(
+                """
+                WITH d AS (
+                    SELECT generate_series(
+                        (CURRENT_DATE - ($1::int - 1)),
+                        CURRENT_DATE,
+                        INTERVAL '1 day'
+                    )::date AS day
+                )
+                SELECT
+                    d.day,
+                    COALESCE(x.n, 0)::int AS count
+                FROM d
+                LEFT JOIN (
+                    SELECT DATE(created_at) AS day, COUNT(*)::int AS n
+                    FROM ml_outcome_labels
+                    WHERE created_at >= (CURRENT_DATE - ($1::int - 1))
+                    GROUP BY DATE(created_at)
+                ) x ON x.day = d.day
+                ORDER BY d.day
+                """,
+                int(days),
+            )
+            touchpoints = await conn.fetch(
+                """
+                WITH d AS (
+                    SELECT generate_series(
+                        (CURRENT_DATE - ($1::int - 1)),
+                        CURRENT_DATE,
+                        INTERVAL '1 day'
+                    )::date AS day
+                )
+                SELECT
+                    d.day,
+                    COALESCE(x.n, 0)::int AS count
+                FROM d
+                LEFT JOIN (
+                    SELECT DATE(created_at) AS day, COUNT(*)::int AS n
+                    FROM marketing_touchpoint_deliveries
+                    WHERE created_at >= (CURRENT_DATE - ($1::int - 1))
+                    GROUP BY DATE(created_at)
+                ) x ON x.day = d.day
+                ORDER BY d.day
+                """,
+                int(days),
+            )
+            runs = await conn.fetch(
+                """
+                WITH d AS (
+                    SELECT generate_series(
+                        (CURRENT_DATE - ($1::int - 1)),
+                        CURRENT_DATE,
+                        INTERVAL '1 day'
+                    )::date AS day
+                )
+                SELECT
+                    d.day,
+                    COALESCE(x.n, 0)::int AS count
+                FROM d
+                LEFT JOIN (
+                    SELECT DATE(trained_at) AS day, COUNT(*)::int AS n
+                    FROM m8_model_runs
+                    WHERE trained_at >= (CURRENT_DATE - ($1::int - 1))
+                    GROUP BY DATE(trained_at)
+                ) x ON x.day = d.day
+                ORDER BY d.day
+                """,
+                int(days),
+            )
+
+            def _pack(rows: List[Any]) -> List[Dict[str, Any]]:
+                return [{"day": str(r["day"]), "count": int(r["count"] or 0)} for r in rows]
+
+            out["series"] = {
+                "ml_outcome_labels": _pack(outcome),
+                "marketing_touchpoint_deliveries": _pack(touchpoints),
+                "m8_model_runs": _pack(runs),
+            }
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 # ============================================================
@@ -376,7 +568,7 @@ async def send_announcement(data: AnnouncementRequest, background_tasks: Backgro
     if not title or not body:
         raise HTTPException(status_code=400, detail="title and body are required")
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         # ----------------------------
         # Resolve recipients (banned excluded)
         # ----------------------------
@@ -453,7 +645,7 @@ async def send_announcement(data: AnnouncementRequest, background_tasks: Backgro
         # Execute fanout (background). For debugging, you can run inline.
         # ----------------------------
         async def _run():
-            async with db_pool.acquire() as c2:
+            async with core.state.db_pool.acquire() as c2:
                 return await _execute_announcement_deliveries(c2, ann_id, title, body)
 
         background_tasks.add_task(_run)
@@ -478,14 +670,29 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
     params.extend([limit, offset])
     query += f" ORDER BY created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}"
 
-    async with db_pool.acquire() as conn:
+    async with core.state.require_pool().acquire() as conn:
         users = await conn.fetch(query, *params)
         total = await conn.fetchval("SELECT COUNT(*) FROM users")
-    return {"users": [dict(u) for u in users], "total": total}
+    rows = []
+    for u in users:
+        rows.append(
+            {
+                "id": str(u["id"]),
+                "email": u["email"],
+                "name": u["name"],
+                "role": u["role"],
+                "subscription_tier": u["subscription_tier"],
+                "subscription_status": u["subscription_status"],
+                "status": u["status"],
+                "created_at": u["created_at"].isoformat() if u.get("created_at") else None,
+                "last_active_at": u["last_active_at"].isoformat() if u.get("last_active_at") else None,
+            }
+        )
+    return {"users": rows, "total": total}
 
 @router.put("/users/{user_id}")
 async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Request, background_tasks: BackgroundTasks, user: dict = Depends(require_admin)):
-    _ADMIN_USER_COLS = frozenset({"subscription_tier", "role", "status", "flex_enabled"})
+    _ADMIN_USER_COLS = USERS_UPDATE_COLUMNS_ADMIN
     updates, params = [], [user_id]
     changes = {}
     if data.subscription_tier:
@@ -505,7 +712,8 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
         params.append(data.flex_enabled)
         changes["flex_enabled"] = data.flex_enabled
     if updates:
-        async with db_pool.acquire() as conn:
+        assert_set_fragments_columns(updates, USERS_UPDATE_COLUMNS_ADMIN)
+        async with core.state.db_pool.acquire() as conn:
             # Fetch target before updating so we have old tier
             _target = await conn.fetchrow("SELECT email, name, subscription_tier FROM users WHERE id = $1", user_id)
             await conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = NOW() WHERE id = $1", *params)
@@ -536,7 +744,7 @@ async def admin_update_user(user_id: str, data: AdminUserUpdate, request: Reques
 
 @router.post("/users/{user_id}/ban")
 async def admin_ban_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         target = await conn.fetchrow("SELECT email FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET status = 'banned' WHERE id = $1", user_id)
         await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_BAN_USER",
@@ -547,7 +755,7 @@ async def admin_ban_user(user_id: str, request: Request, user: dict = Depends(re
 
 @router.post("/users/{user_id}/unban")
 async def admin_unban_user(user_id: str, request: Request, user: dict = Depends(require_admin)):
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         target = await conn.fetchrow("SELECT email FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET status = 'active' WHERE id = $1", user_id)
         await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_UNBAN_USER",
@@ -561,7 +769,7 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
     require_admin(user)
     new_email = payload.email.lower().strip()
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         exists = await conn.fetchval(
             "SELECT 1 FROM users WHERE LOWER(email)=LOWER($1) AND id <> $2",
             new_email,
@@ -620,7 +828,7 @@ async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, requ
     temp = payload.temp_password
     pw_hash = bcrypt.hashpw(temp.encode("utf-8"), bcrypt.gensalt(12)).decode("utf-8")
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         target = await conn.fetchrow("SELECT id, role FROM users WHERE id=$1", user_id)
         if not target:
             raise HTTPException(status_code=404, detail="User not found")
@@ -659,7 +867,7 @@ async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, requ
         )
 
     # Email the user their temporary password
-    async with db_pool.acquire() as _ec:
+    async with core.state.db_pool.acquire() as _ec:
         _tgt = await _ec.fetchrow("SELECT email, name FROM users WHERE id=$1", user_id)
     if _tgt:
         background_tasks.add_task(send_admin_reset_password_email, _tgt["email"], _tgt["name"] or "there", payload.temp_password)
@@ -671,7 +879,7 @@ async def admin_reset_password(user_id: str, payload: AdminResetPasswordIn, requ
 async def admin_assign_tier(user_id: str = Query(...), tier: str = Query(...), request: Request = None, background_tasks: BackgroundTasks = None, user: dict = Depends(require_master_admin)):
     if tier not in TIER_CONFIG:
         raise HTTPException(400, "Invalid tier")
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         old = await conn.fetchrow("SELECT subscription_tier, email, name FROM users WHERE id = $1", user_id)
         await conn.execute("UPDATE users SET subscription_tier = $1 WHERE id = $2", tier, user_id)
         await log_admin_audit(conn, user_id=user_id, admin=user, action="ADMIN_ASSIGN_TIER",
@@ -736,7 +944,7 @@ async def admin_audit(
         return {k: _ser(v) for k, v in r.items()}
 
     try:
-        async with db_pool.acquire() as conn:
+        async with core.state.db_pool.acquire() as conn:
             # -- Background purge (rolling 6-month window) --
             try:
                 await conn.execute(
@@ -864,6 +1072,79 @@ async def admin_audit(
         raise HTTPException(status_code=500, detail=f"Audit log error: {str(e)}")
 
 
+_DATA_INTEGRITY_SQL_FILTER = """
+    created_at >= $1
+    AND (
+        UPPER(COALESCE(event_category, '')) LIKE '%INTEGRITY%'
+        OR UPPER(COALESCE(action, '')) LIKE '%INTEGRITY%'
+        OR UPPER(COALESCE(action, '')) LIKE '%ROLLUP%'
+        OR UPPER(COALESCE(action, '')) LIKE '%RECONCILE%'
+        OR UPPER(COALESCE(action, '')) LIKE '%DATA_QUALITY%'
+    )
+"""
+
+
+@router.get("/audit/data-integrity")
+async def admin_audit_data_integrity(
+    severity: Optional[str] = Query(None),
+    since_hours: int = Query(72, ge=1, le=720),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    user: dict = Depends(require_admin),
+):
+    """Data-integrity style events for admin-data-integrity.html and dashboard badge."""
+    since = _now_utc() - timedelta(hours=since_hours)
+    sev = (severity or "").strip().upper() or None
+    cap = min(2500, max(limit + offset, 500) * 5)
+    merged: List[Dict[str, Any]] = []
+
+    async with core.state.db_pool.acquire() as conn:
+        for table in ("admin_audit_log", "system_event_log"):
+            try:
+                q = f"""
+                    SELECT action, details,
+                           COALESCE(severity, 'INFO') AS severity,
+                           COALESCE(outcome, 'SUCCESS') AS outcome,
+                           user_id, created_at
+                    FROM {table}
+                    WHERE {_DATA_INTEGRITY_SQL_FILTER}
+                """
+                args: List[Any] = [since]
+                if sev:
+                    args.append(sev)
+                    q += f" AND UPPER(COALESCE(severity, 'INFO')) = ${len(args)}"
+                q += f" ORDER BY created_at DESC LIMIT {cap}"
+                for r in await conn.fetch(q, *args):
+                    d = _safe_json(dict(r).get("details"), {})
+                    merged.append(
+                        {
+                            "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                            "severity": r.get("severity"),
+                            "action": r.get("action"),
+                            "outcome": r.get("outcome"),
+                            "user_id": str(r["user_id"]) if r.get("user_id") else None,
+                            "details": d if isinstance(d, dict) else {"raw": d},
+                        }
+                    )
+            except Exception as e:
+                logger.warning("data-integrity %s: %s", table, e)
+
+    merged.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+
+    def _cnt(pred):
+        return sum(1 for x in merged if pred(x))
+
+    summary = {
+        "total": len(merged),
+        "failed": _cnt(lambda x: str(x.get("outcome") or "").upper() != "SUCCESS"),
+        "corrected": _cnt(lambda x: "CORRECT" in str(x.get("action") or "").upper()),
+        "errors": _cnt(lambda x: str(x.get("severity") or "").upper() == "ERROR"),
+        "warnings": _cnt(lambda x: str(x.get("severity") or "").upper() == "WARNING"),
+    }
+    page = merged[offset : offset + limit]
+    return {"summary": summary, "items": page}
+
+
 # ============================================================
 # ANALYTICS
 # ============================================================
@@ -872,7 +1153,7 @@ async def admin_audit(
 async def admin_analytics_users(user: dict = Depends(get_current_user)):
     require_admin(user)
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         active_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='active'")
         banned_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE status='banned'")
@@ -896,7 +1177,7 @@ async def admin_analytics_users(user: dict = Depends(get_current_user)):
 async def admin_analytics_revenue(user: dict = Depends(get_current_user)):
     require_admin(user)
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         launch_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='launch'")
         creator_lite_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='creator_lite'")
         creator_pro_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier='creator_pro'")
@@ -965,7 +1246,7 @@ async def admin_analytics_overview(
     # Instead, derive paid_users + mrr_estimate from users.subscription_tier + users.subscription_status.
     paid_tiers = ["launch", "creator_pro", "studio", "agency"]
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
 
         new_users = await conn.fetchval(
@@ -990,8 +1271,7 @@ async def admin_analytics_overview(
     # MRR estimate based on PLAN_CONFIG prices
     mrr_estimate = 0.0
     for tier, c in counts.items():
-        price = float(get_plan(tier).get("price", 0) or 0)
-        mrr_estimate += price * c
+        mrr_estimate += _tier_list_price_usd(tier) * c
 
     return {
         "total_users": int(total_users or 0),
@@ -1011,7 +1291,7 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
     minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family')")
@@ -1026,7 +1306,7 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
         revenue = await conn.fetchrow("SELECT COALESCE(SUM(amount), 0)::decimal AS total, COALESCE(SUM(CASE WHEN source = 'subscription' THEN amount ELSE 0 END), 0)::decimal AS subscriptions, COALESCE(SUM(CASE WHEN source = 'topup' THEN amount ELSE 0 END), 0)::decimal AS topups FROM revenue_tracking WHERE created_at >= $1", since)
 
         mrr_data = await conn.fetch("SELECT subscription_tier, COUNT(*) AS count FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active' GROUP BY subscription_tier")
-        mrr = sum(get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data)
+        mrr = sum(_tier_list_price_usd(r["subscription_tier"]) * r["count"] for r in mrr_data)
 
         tiers = await conn.fetch("SELECT subscription_tier, COUNT(*)::int AS count FROM users GROUP BY subscription_tier")
 
@@ -1035,18 +1315,18 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
         "uploads": {"total": upload_stats["total"] if upload_stats else 0, "completed": upload_stats["completed"] if upload_stats else 0, "failed": upload_stats["failed"] if upload_stats else 0, "success_rate": ((upload_stats["completed"] or 0) / max(upload_stats["total"] or 1, 1)) * 100},
         "engagement": {"views": upload_stats["views"] if upload_stats else 0, "likes": upload_stats["likes"] if upload_stats else 0},
         "revenue": {"total": float(revenue["total"]) if revenue else 0, "subscriptions": float(revenue["subscriptions"]) if revenue else 0, "topups": float(revenue["topups"]) if revenue else 0, "mrr": mrr},
-        "tiers": {t["subscription_tier"]: t["count"] for t in tiers},
+        "tiers": {_tier_json_key(t["subscription_tier"]): t["count"] for t in tiers},
     }
 
 
 @router.get("/kpis")
 async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require_admin)):
     """Combined KPI endpoint that returns all metrics in one call"""
-    minutes = {"24h": 1440, "7d": 10080, "30d": 43200, "90d": 129600, "6m": 259200, "365d": 525600, "1y": 525600}.get(range, 43200)
+    minutes = _range_to_minutes(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
     prev_since = since - timedelta(minutes=minutes)
 
-    async with db_pool.acquire() as conn:
+    async with core.state.require_pool().acquire() as conn:
         # Users
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
@@ -1062,19 +1342,29 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
             WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime')
             AND subscription_status = 'active' GROUP BY subscription_tier
         """)
-        total_mrr = sum(get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data)
-        mrr_by_tier = {r["subscription_tier"]: get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data}
+        total_mrr = sum(_tier_list_price_usd(r["subscription_tier"]) * r["count"] for r in mrr_data)
+        mrr_by_tier = {
+            _tier_json_key(r["subscription_tier"]): _tier_list_price_usd(r["subscription_tier"]) * r["count"]
+            for r in mrr_data
+        }
 
         # Tier breakdown
-        tier_data = await conn.fetch("SELECT COALESCE(subscription_tier, 'free') as tier, COUNT(*)::int AS count FROM users GROUP BY subscription_tier")
-        tier_breakdown = {t["tier"] or "free": t["count"] for t in tier_data}
+        tier_data = await conn.fetch(
+            "SELECT COALESCE(subscription_tier, 'free') AS tier, COUNT(*)::int AS count "
+            "FROM users GROUP BY COALESCE(subscription_tier, 'free')"
+        )
+        tier_breakdown = {str(t["tier"] or "free"): t["count"] for t in tier_data}
 
         # Revenue
-        revenue = await conn.fetchrow("""
+        revenue = await conn.fetchrow(
+            """
             SELECT COALESCE(SUM(amount), 0)::decimal AS total,
-            COALESCE(SUM(CASE WHEN source = 'topup' THEN amount ELSE 0 END), 0)::decimal AS topups
+                COALESCE(SUM(CASE WHEN source = 'topup' THEN amount ELSE 0 END), 0)::decimal AS topups,
+                COUNT(*) FILTER (WHERE source = 'topup')::int AS topup_cnt
             FROM revenue_tracking WHERE created_at >= $1
-        """, since)
+            """,
+            since,
+        )
 
         # Costs (openai, storage, compute, stripe_fees, mailgun, bandwidth, postgres, redis)
         costs = await conn.fetchrow("""
@@ -1116,9 +1406,15 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         uploads_change = ((total_uploads - prev_uploads) / max(prev_uploads, 1)) * 100 if prev_uploads > 0 else 0
         cost_per_upload = total_costs / max(successful_uploads, 1)
 
+        w_min = float(os.environ.get("KPI_WHISPER_ASSUMED_MINUTES_PER_UPLOAD", "0.5") or 0.5)
+        w_usd = float(os.environ.get("KPI_WHISPER_USD_PER_MINUTE", "0.006") or 0.006)
+        whisper_cost_estimate_usd = float(successful_uploads or 0) * w_min * w_usd
+
         # Platform distribution
-        platform_data = await conn.fetch("SELECT unnest(platforms) AS platform, COUNT(*)::int AS uploads FROM uploads WHERE created_at >= $1 GROUP BY platform", since)
-        platform_distribution = {p["platform"]: p["uploads"] for p in platform_data}
+        platform_data = await conn.fetch(_platform_upload_mix_sql(), since)
+        platform_distribution = {
+            str(p["platform"] or "unknown").lower(): p["uploads"] for p in platform_data if p["platform"]
+        }
 
         queue_depth = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
 
@@ -1134,9 +1430,12 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": mrr_by_tier,
         "mrr_launch": mrr_by_tier.get("launch", 0), "mrr_creator_pro": mrr_by_tier.get("creator_pro", 0),
         "mrr_studio": mrr_by_tier.get("studio", 0), "mrr_agency": mrr_by_tier.get("agency", 0),
-        "launch_users": tier_breakdown.get("launch", 0), "creator_pro_users": tier_breakdown.get("creator_pro", 0),
+        "launch_users": int(tier_breakdown.get("creator_lite") or tier_breakdown.get("launch") or 0),
+        "creator_lite_users": int(tier_breakdown.get("creator_lite") or tier_breakdown.get("launch") or 0),
+        "creator_pro_users": tier_breakdown.get("creator_pro", 0),
         "studio_users": tier_breakdown.get("studio", 0), "agency_users": tier_breakdown.get("agency", 0),
-        "topup_revenue": float(revenue["topups"]) if revenue else 0, "topup_count": 0,
+        "topup_revenue": float(revenue["topups"]) if revenue else 0,
+        "topup_count": int(revenue["topup_cnt"] or 0) if revenue else 0,
         "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
         "refunds": 0, "refund_count": 0,
         "openai_cost": openai_cost, "storage_cost": storage_cost, "compute_cost": compute_cost,
@@ -1157,6 +1456,11 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "total_likes": upload_stats["likes"] if upload_stats else 0,
         "avg_uploads_per_user": round(total_uploads / max(active_users or 1, 1), 1),
         "tier_breakdown": tier_breakdown, "platform_distribution": platform_distribution,
+        "whisper_cost_estimate_usd": round(whisper_cost_estimate_usd, 4),
+        "whisper_estimate": {
+            "effective_minutes_per_upload": w_min,
+            "usd_per_minute": w_usd,
+        },
     }
 
 
@@ -1165,7 +1469,7 @@ async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
     minutes = {"7d": 10080, "30d": 43200, "6m": 262800}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         costs = await conn.fetchrow("""
             SELECT
                 COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
@@ -1182,10 +1486,16 @@ async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
             GROUP BY u.subscription_tier
         """, since)
 
-        platform_data = await conn.fetch("""
-            SELECT unnest(platforms) AS platform, COUNT(*)::int AS uploads, 0::decimal AS cost
-            FROM uploads WHERE created_at >= $1 GROUP BY platform
-        """, since)
+        platform_data = await conn.fetch(
+            """
+            SELECT p AS platform, COUNT(*)::int AS uploads, 0::decimal AS cost
+            FROM uploads u,
+                 LATERAL unnest(COALESCE(u.platforms, ARRAY[]::text[])) AS u_p(p)
+            WHERE u.created_at >= $1
+            GROUP BY p
+            """,
+            since,
+        )
 
     total_cost = float(costs["openai"] or 0) + float(costs["storage"] or 0) + float(costs["compute"] or 0) + float(costs.get("other") or 0)
     gross_margin = float(revenue or 0) - total_cost
@@ -1195,8 +1505,15 @@ async def kpi_margins(range: str = "30d", user: dict = Depends(require_admin)):
         "revenue": float(revenue or 0),
         "gross_margin": gross_margin,
         "margin_pct": (gross_margin / max(float(revenue or 1), 1)) * 100,
-        "by_tier": {t["subscription_tier"]: {"uploads": t["uploads"], "cost": float(t["cost"])} for t in tier_data},
-        "by_platform": {p["platform"]: {"uploads": p["uploads"], "cost": float(p["cost"])} for p in platform_data},
+        "by_tier": {
+            _tier_json_key(t["subscription_tier"]): {"uploads": t["uploads"], "cost": float(t["cost"])}
+            for t in tier_data
+        },
+        "by_platform": {
+            str(p["platform"] or "unknown").lower(): {"uploads": p["uploads"], "cost": float(p["cost"])}
+            for p in platform_data
+            if p["platform"]
+        },
     }
 
 @router.get("/kpi/burn")
@@ -1204,7 +1521,7 @@ async def kpi_burn(range: str = "30d", user: dict = Depends(require_admin)):
     minutes = {"7d": 10080, "30d": 43200}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         token_stats = await conn.fetchrow("""
             SELECT COALESCE(SUM(CASE WHEN token_type = 'put' AND delta < 0 THEN ABS(delta) ELSE 0 END), 0)::int AS put_spent,
             COALESCE(SUM(CASE WHEN token_type = 'aic' AND delta < 0 THEN ABS(delta) ELSE 0 END), 0)::int AS aic_spent,
@@ -1231,7 +1548,7 @@ async def kpi_burn(range: str = "30d", user: dict = Depends(require_admin)):
 
 @router.get("/kpi/funnels")
 async def kpi_funnels(user: dict = Depends(require_admin)):
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         signups_24h = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")
         first_uploads_24h = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE user_id IN (SELECT id FROM users WHERE created_at >= NOW() - INTERVAL '24 hours')")
 
@@ -1256,23 +1573,41 @@ async def kpi_funnels(user: dict = Depends(require_admin)):
 
 
 @router.get("/kpi/revenue")
-async def get_kpi_revenue(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
-    async with db_pool.acquire() as conn:
+async def get_kpi_revenue(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+    until = _now_utc()
+    async with core.state.require_pool().acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active'") or 1
         mrr_data = await conn.fetch("SELECT subscription_tier, COUNT(*) AS count FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active' GROUP BY subscription_tier")
-        total_mrr = sum(get_plan(r["subscription_tier"]).get("price", 0) * r["count"] for r in mrr_data)
+        total_mrr = sum(_tier_list_price_usd(r["subscription_tier"]) * r["count"] for r in mrr_data)
         topup = await conn.fetchval("SELECT COALESCE(SUM(amount), 0) FROM revenue_tracking WHERE source = 'topup' AND created_at >= $1", since)
-    return {"total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": {}, "topup_total": float(topup or 0),
-            "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
-            "ltv": round((total_mrr / max(paid_users, 1)) * 12, 2), "refunds_total": 0, "refunds_count": 0, "refunds_change": 0}
+        topup_n = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM revenue_tracking WHERE source = 'topup' AND created_at >= $1",
+            since,
+        )
+    refunds_total, refunds_count = await fetch_stripe_refunds_window(since, until)
+    return {
+        "total_mrr": total_mrr,
+        "mrr_change": 0,
+        "mrr_by_tier": {},
+        "topup_total": float(topup or 0),
+        "topup_count": int(topup_n or 0),
+        "arpu": round(total_mrr / max(total_users, 1), 2),
+        "arpa": round(total_mrr / max(paid_users, 1), 2),
+        "ltv": round((total_mrr / max(paid_users, 1)) * 12, 2),
+        "refunds_total": refunds_total,
+        "refunds_count": refunds_count,
+        "refunds_change": 0,
+    }
 
 
 @router.get("/kpi/costs")
-async def get_kpi_costs(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
-    async with db_pool.acquire() as conn:
+async def get_kpi_costs(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+    async with core.state.db_pool.acquire() as conn:
         costs = await conn.fetchrow("""
             SELECT
                 COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
@@ -1301,9 +1636,10 @@ async def get_kpi_costs(user: dict = Depends(require_admin)):
 
 
 @router.get("/kpi/growth")
-async def get_kpi_growth(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
-    async with db_pool.acquire() as conn:
+async def get_kpi_growth(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+    async with core.state.db_pool.acquire() as conn:
         signups = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
         connected = await conn.fetchval("SELECT COUNT(DISTINCT u.id) FROM users u JOIN platform_tokens pt ON u.id = pt.user_id WHERE u.created_at >= $1", since)
         uploaded = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
@@ -1317,9 +1653,10 @@ async def get_kpi_growth(user: dict = Depends(require_admin)):
 
 
 @router.get("/kpi/reliability")
-async def get_kpi_reliability(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
-    async with db_pool.acquire() as conn:
+async def get_kpi_reliability(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+    async with core.state.require_pool().acquire() as conn:
         stats = await conn.fetchrow("SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed FROM uploads WHERE created_at >= $1", since)
         queue = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
     total, completed = (stats["total"] or 0, stats["completed"] or 0) if stats else (0, 0)
@@ -1338,7 +1675,7 @@ async def trigger_kpi_refresh(background_tasks: BackgroundTasks, user: dict = De
     from stages.kpi_collector import run_kpi_collect
     async def _run():
         try:
-            summary = await run_kpi_collect(db_pool)
+            summary = await run_kpi_collect(core.state.db_pool)
             logger.info(f"KPI refresh complete: {summary}")
         except Exception as e:
             logger.warning(f"KPI refresh failed: {e}")
@@ -1346,11 +1683,140 @@ async def trigger_kpi_refresh(background_tasks: BackgroundTasks, user: dict = De
     return {"status": "started", "message": "KPI collection running in background"}
 
 
+@router.get("/kpi/recognition")
+async def get_kpi_recognition(
+    range: str = Query("30d"),
+    limit: int = Query(20, ge=1, le=100),
+    user: dict = Depends(require_admin),
+):
+    """Recognition KPIs powered by upload_recognition_summary + video_recognition.
+
+    Returns:
+      - ``hydration_avg`` / ``hydration_p50`` / ``hydration_p90`` —
+        deterministic-evidence quality of recent uploads (0..1).
+      - ``coverage_pct`` — fraction of recent uploads that have any
+        recognition summary at all (good for ops health checks).
+      - ``top_objects`` / ``top_logos`` / ``top_text`` — most-detected items
+        across the platform in the window (drives the "what content lives
+        here" widget on the admin dashboard).
+      - ``with_people_pct`` — share of clips with at least one person segment.
+    """
+    minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+
+    async with core.state.require_pool().acquire() as conn:
+        # Health: how many uploads in window vs how many got a summary
+        upload_total = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM uploads WHERE created_at >= $1",
+            since,
+        )
+        summary_total = await conn.fetchval(
+            """
+            SELECT COUNT(*)::int
+              FROM upload_recognition_summary rs
+              JOIN uploads u ON u.id = rs.upload_id
+             WHERE u.created_at >= $1
+            """,
+            since,
+        )
+
+        stats = await conn.fetchrow(
+            """
+            SELECT
+                COALESCE(AVG(rs.hydration_score), 0)::double precision  AS hydration_avg,
+                COALESCE(percentile_cont(0.5)  WITHIN GROUP (ORDER BY rs.hydration_score), 0)::double precision AS hydration_p50,
+                COALESCE(percentile_cont(0.9)  WITHIN GROUP (ORDER BY rs.hydration_score), 0)::double precision AS hydration_p90,
+                COALESCE(SUM(CASE WHEN rs.has_people THEN 1 ELSE 0 END), 0)::int AS with_people,
+                COALESCE(SUM(rs.object_track_count), 0)::bigint   AS object_total,
+                COALESCE(SUM(rs.logo_count), 0)::bigint           AS logo_total,
+                COALESCE(SUM(rs.text_detection_count), 0)::bigint AS text_total,
+                COALESCE(AVG(rs.coverage_seconds), 0)::double precision AS avg_coverage_seconds
+              FROM upload_recognition_summary rs
+              JOIN uploads u ON u.id = rs.upload_id
+             WHERE u.created_at >= $1
+            """,
+            since,
+        )
+
+        # Top descriptions across all per-detection rows in the window.
+        top_objects = await conn.fetch(
+            """
+            SELECT lower(description) AS d, COUNT(*)::bigint AS n
+              FROM video_recognition vr
+              JOIN uploads u ON u.id = vr.upload_id
+             WHERE vr.kind = 'object'
+               AND u.created_at >= $1
+               AND length(description) > 0
+             GROUP BY lower(description)
+             ORDER BY n DESC
+             LIMIT $2
+            """,
+            since,
+            limit,
+        )
+        top_logos = await conn.fetch(
+            """
+            SELECT lower(description) AS d, COUNT(*)::bigint AS n
+              FROM video_recognition vr
+              JOIN uploads u ON u.id = vr.upload_id
+             WHERE vr.kind = 'logo'
+               AND u.created_at >= $1
+               AND length(description) > 0
+             GROUP BY lower(description)
+             ORDER BY n DESC
+             LIMIT $2
+            """,
+            since,
+            limit,
+        )
+        top_text = await conn.fetch(
+            """
+            SELECT lower(description) AS d, COUNT(*)::bigint AS n
+              FROM video_recognition vr
+              JOIN uploads u ON u.id = vr.upload_id
+             WHERE vr.kind = 'text'
+               AND u.created_at >= $1
+               AND length(description) > 0
+             GROUP BY lower(description)
+             ORDER BY n DESC
+             LIMIT $2
+            """,
+            since,
+            limit,
+        )
+
+    coverage_pct = (
+        (summary_total or 0) / max(upload_total or 1, 1) * 100.0
+    ) if upload_total else 0.0
+    with_people_pct = (
+        (stats["with_people"] or 0) / max(summary_total or 1, 1) * 100.0
+    ) if summary_total else 0.0
+
+    return {
+        "range": range,
+        "uploads_in_window": int(upload_total or 0),
+        "uploads_with_recognition": int(summary_total or 0),
+        "coverage_pct": round(coverage_pct, 2),
+        "hydration_avg": round(float(stats["hydration_avg"] or 0), 4),
+        "hydration_p50": round(float(stats["hydration_p50"] or 0), 4),
+        "hydration_p90": round(float(stats["hydration_p90"] or 0), 4),
+        "with_people_pct": round(with_people_pct, 2),
+        "object_total": int(stats["object_total"] or 0),
+        "logo_total": int(stats["logo_total"] or 0),
+        "text_total": int(stats["text_total"] or 0),
+        "avg_coverage_seconds": round(float(stats["avg_coverage_seconds"] or 0), 2),
+        "top_objects": [{"label": r["d"], "count": int(r["n"])} for r in top_objects],
+        "top_logos": [{"label": r["d"], "count": int(r["n"])} for r in top_logos],
+        "top_text": [{"label": r["d"], "count": int(r["n"])} for r in top_text],
+    }
+
+
 @router.get("/kpi/usage")
-async def get_kpi_usage(user: dict = Depends(require_admin)):
-    since = _now_utc() - timedelta(days=30)
-    prev_since = since - timedelta(days=30)
-    async with db_pool.acquire() as conn:
+async def get_kpi_usage(range: str = Query("30d"), user: dict = Depends(require_admin)):
+    minutes = _range_to_minutes(range, 43200)
+    since = _now_utc() - timedelta(minutes=minutes)
+    prev_since = since - timedelta(minutes=minutes)
+    async with core.state.db_pool.acquire() as conn:
         active = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since)
         new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
@@ -1370,7 +1836,7 @@ async def get_kpi_usage(user: dict = Depends(require_admin)):
 async def get_chart_revenue(period: str = Query("30d"), user: dict = Depends(require_admin)):
     days = int(period.replace("d", "")) if period.endswith("d") and period[:-1].isdigit() else 30
     since = _now_utc() - timedelta(days=days)
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT DATE(created_at) as date, COALESCE(SUM(amount), 0)::decimal as revenue FROM revenue_tracking WHERE created_at >= $1 GROUP BY DATE(created_at) ORDER BY date", since)
     data = {r["date"]: float(r["revenue"]) for r in rows}
     labels, values, current, end = [], [], since.date(), _now_utc().date()
@@ -1385,7 +1851,7 @@ async def get_chart_revenue(period: str = Query("30d"), user: dict = Depends(req
 async def get_chart_users(period: str = Query("30d"), user: dict = Depends(require_admin)):
     days = int(period.replace("d", "")) if period.endswith("d") and period[:-1].isdigit() else 30
     since = _now_utc() - timedelta(days=days)
-    async with db_pool.acquire() as conn:
+    async with core.state.require_pool().acquire() as conn:
         rows = await conn.fetch("SELECT DATE(created_at) as date, COUNT(*)::int as users FROM users WHERE created_at >= $1 GROUP BY DATE(created_at) ORDER BY date", since)
     data = {r["date"]: r["users"] for r in rows}
     labels, values, current, end = [], [], since.date(), _now_utc().date()
@@ -1407,8 +1873,15 @@ async def get_admin_settings(user: dict = Depends(require_master_admin)):
 
 @router.put("/settings")
 async def update_admin_settings(settings: dict, user: dict = Depends(require_master_admin)):
+    if "watermark_burn_text" in settings:
+        from stages.db import sanitize_watermark_burn_text
+
+        settings = dict(settings)
+        settings["watermark_burn_text"] = sanitize_watermark_burn_text(
+            settings.get("watermark_burn_text")
+        )
     core.state.admin_settings_cache.update(settings)
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         await conn.execute("UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1", json.dumps(core.state.admin_settings_cache))
     return {"status": "updated", "settings": core.state.admin_settings_cache}
 
@@ -1474,7 +1947,7 @@ async def get_admin_calculator_pricing(user: dict = Depends(require_master_admin
 @router.post("/weekly-report")
 async def trigger_weekly_report(user: dict = Depends(require_master_admin)):
     since = _now_utc() - timedelta(days=7)
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         costs = await conn.fetchrow("""
             SELECT COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
             COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
@@ -1499,7 +1972,7 @@ async def _announcements_send(data: AnnouncementRequest, background_tasks: Backg
 
 @router.get("/announcements")
 async def get_announcements(limit: int = 20, user: dict = Depends(require_admin)):
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         anns = await conn.fetch("SELECT * FROM announcements ORDER BY created_at DESC LIMIT $1", limit)
     return [dict(a) for a in anns]
 
@@ -1562,7 +2035,7 @@ async def update_notification_settings(settings: NotificationSettings, user: dic
         "admin_webhook_url": settings.admin_webhook_url,
     }
     core.state.admin_settings_cache["notifications"] = notif_settings
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         await conn.execute("UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1", json.dumps(core.state.admin_settings_cache))
     return {"status": "updated", "settings": notif_settings}
 
@@ -1635,7 +2108,7 @@ async def admin_get_user_wallet(
     """Return the wallet + recent ledger for any user (admin only)."""
     if not _valid_uuid(user_id):
         raise HTTPException(400, "Invalid user ID")
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         target = await conn.fetchrow(
             "SELECT id, email, name, subscription_tier FROM users WHERE id = $1",
             user_id,
@@ -1694,6 +2167,7 @@ async def admin_adjust_wallet(
     user_id:  str,
     payload:  AdminWalletAdjust,
     request:  Request,
+    background_tasks: BackgroundTasks,
     admin:    dict = Depends(require_admin),
 ):
     """
@@ -1708,7 +2182,7 @@ async def admin_adjust_wallet(
     """
     if not _valid_uuid(user_id):
         raise HTTPException(400, "Invalid user ID")
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         target = await conn.fetchrow(
             "SELECT id, email, name FROM users WHERE id = $1", user_id
         )
@@ -1716,8 +2190,8 @@ async def admin_adjust_wallet(
             raise HTTPException(404, "User not found")
 
         wallet = await get_wallet(conn, target["id"])
-        _WALLET_COLS = frozenset({"put_balance", "aic_balance"})
-        col    = _safe_col("put_balance" if payload.wallet == "put" else "aic_balance", _WALLET_COLS)
+        col_name = assert_wallet_balance_column("put_balance" if payload.wallet == "put" else "aic_balance")
+        col = col_name
         before = int(wallet.get(col, 0) or 0)
 
         if payload.mode == "set":
@@ -1786,15 +2260,15 @@ async def admin_adjust_wallet(
 
     # Send notification email to user for grants (add/set with positive delta only)
     if delta > 0 and payload.mode in ("add", "set"):
-        import asyncio as _aio
-        _aio.ensure_future(send_admin_wallet_topup_email(
+        background_tasks.add_task(
+            send_admin_wallet_topup_email,
             target["email"],
             target["name"] or "there",
             payload.wallet,
             int(delta),
             new_val,
             payload.reason or "Tokens credited to your account by the UploadM8 team.",
-        ))
+        )
 
     return {
         "ok":     True,
@@ -1814,7 +2288,7 @@ async def admin_adjust_wallet(
 async def get_leaderboard(range: str = Query("30d"), sort: str = Query("uploads"), user: dict = Depends(require_admin)):
     minutes = {"7d": 10080, "30d": 43200, "90d": 129600}.get(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
-    async with db_pool.acquire() as conn:
+    async with core.state.require_pool().acquire() as conn:
         if sort == "revenue":
             rows = await conn.fetch("SELECT u.id, u.name, u.email, u.subscription_tier, COALESCE(SUM(r.amount), 0)::decimal AS revenue, COUNT(DISTINCT up.id)::int AS uploads FROM users u LEFT JOIN revenue_tracking r ON u.id = r.user_id AND r.created_at >= $1 LEFT JOIN uploads up ON u.id = up.user_id AND up.created_at >= $1 GROUP BY u.id ORDER BY revenue DESC LIMIT 10", since)
         else:
@@ -1828,7 +2302,7 @@ async def get_countries(range: str = Query("30d"), user: dict = Depends(require_
     days = int(range.replace("d", "")) if range.endswith("d") and range[:-1].isdigit() else 30
     since = _now_utc() - timedelta(days=days)
     try:
-        async with db_pool.acquire() as conn:
+        async with core.state.db_pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT country, COUNT(*) AS users
@@ -1848,7 +2322,7 @@ async def get_countries(range: str = Query("30d"), user: dict = Depends(require_
 
 @router.get("/activity")
 async def get_admin_activity(limit: int = Query(10), user: dict = Depends(require_admin)):
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         signups = await conn.fetch("SELECT 'signup' as type, id as user_id, name, email, created_at FROM users ORDER BY created_at DESC LIMIT $1", limit // 2)
         uploads = await conn.fetch("SELECT 'upload' as type, user_id, filename, status, created_at FROM uploads ORDER BY created_at DESC LIMIT $1", limit // 2)
         payments = await conn.fetch("SELECT 'payment' as type, user_id, amount, source, created_at FROM revenue_tracking ORDER BY created_at DESC LIMIT $1", limit // 2)
@@ -1865,12 +2339,680 @@ async def get_admin_activity(limit: int = Query(10), user: dict = Depends(requir
 
 @router.get("/top-users")
 async def get_admin_top_users(limit: int = Query(5), sort: str = Query("revenue"), user: dict = Depends(require_admin)):
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         if sort == "revenue":
             rows = await conn.fetch("SELECT u.id, u.name, u.email, u.subscription_tier, COALESCE(SUM(r.amount), 0)::decimal AS revenue, COUNT(DISTINCT up.id)::int AS uploads FROM users u LEFT JOIN revenue_tracking r ON u.id = r.user_id LEFT JOIN uploads up ON u.id = up.user_id GROUP BY u.id ORDER BY revenue DESC LIMIT $1", limit)
         else:
             rows = await conn.fetch("SELECT u.id, u.name, u.email, u.subscription_tier, 0::decimal AS revenue, COUNT(up.id)::int AS uploads FROM users u LEFT JOIN uploads up ON u.id = up.user_id GROUP BY u.id ORDER BY uploads DESC LIMIT $1", limit)
     return [{"id": str(r["id"]), "name": r["name"] or "Unknown", "email": r["email"], "tier": r["subscription_tier"] or "free", "subscription_tier": r["subscription_tier"] or "free", "revenue": float(r["revenue"] or 0), "uploads": r["uploads"] or 0} for r in rows]
+
+
+@router.get("/operational-incidents")
+async def admin_operational_incidents(
+    limit: int = Query(80, le=500),
+    offset: int = Query(0, ge=0),
+    source: Optional[str] = Query(None, description="Filter by source (worker|web|api|...)"),
+    incident_type: Optional[str] = Query(None, description="Filter by incident_type"),
+    since_hours: Optional[int] = Query(None, ge=1, le=24 * 90, description="Only return incidents in the last N hours"),
+    user_id: Optional[str] = Query(None, description="Filter by user_id (UUID)"),
+    upload_id: Optional[str] = Query(None, description="Filter by upload_id (UUID)"),
+    q: Optional[str] = Query(None, description="Substring search across subject/body"),
+    user: dict = Depends(get_current_user),
+):
+    """Operational incident log (upload failures, bug reports, client errors).
+
+    Supports filtering by source/type/time/user/upload/search. Returns the rows
+    plus aggregate counts so the admin UI can render summary cards.
+    """
+    if user.get("role") not in ("admin", "master_admin"):
+        raise HTTPException(403, "Admin only")
+
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database not ready")
+
+    where: List[str] = []
+    params: List[Any] = []
+
+    def _add(clause: str, value: Any) -> None:
+        params.append(value)
+        where.append(clause.replace("$$", f"${len(params)}"))
+
+    if source:
+        _add("source = $$", source[:50])
+    if incident_type:
+        _add("incident_type = $$", incident_type[:120])
+    if since_hours:
+        _add("created_at >= NOW() - ($$ || ' hours')::interval", str(int(since_hours)))
+    if user_id:
+        try:
+            uuid.UUID(user_id)
+            _add("user_id = $$::uuid", user_id)
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid user_id") from exc
+    if upload_id:
+        try:
+            uuid.UUID(upload_id)
+            _add("upload_id = $$::uuid", upload_id)
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid upload_id") from exc
+    if q:
+        like = f"%{q[:200]}%"
+        params.append(like)
+        idx_a = len(params)
+        params.append(like)
+        idx_b = len(params)
+        where.append(f"(subject ILIKE ${idx_a} OR COALESCE(body,'') ILIKE ${idx_b})")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    rows: List[Any] = []
+    summary: Dict[str, Any] = {"total": 0, "by_source": {}, "by_type": {}, "last_24h": 0}
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            limit_idx = len(params) + 1
+            offset_idx = len(params) + 2
+            rows = await conn.fetch(
+                f"""
+                SELECT i.id, i.source, i.incident_type, i.user_id, i.upload_id, i.subject,
+                       LEFT(COALESCE(i.body, ''), 800) AS body_preview,
+                       i.details, i.screenshot_r2_key,
+                       i.email_sent_at, i.discord_sent_at, i.created_at,
+                       u.email AS user_email
+                FROM operational_incidents i
+                LEFT JOIN users u ON u.id = i.user_id
+                {where_sql}
+                ORDER BY i.created_at DESC
+                LIMIT ${limit_idx} OFFSET ${offset_idx}
+                """,
+                *params,
+                limit,
+                offset,
+            )
+
+            total_row = await conn.fetchrow(
+                f"SELECT COUNT(*)::int AS n FROM operational_incidents i {where_sql}",
+                *params,
+            )
+            summary["total"] = int(total_row["n"]) if total_row else 0
+
+            agg_source = await conn.fetch(
+                f"""
+                SELECT source, COUNT(*)::int AS n
+                FROM operational_incidents i {where_sql}
+                GROUP BY source ORDER BY n DESC LIMIT 20
+                """,
+                *params,
+            )
+            summary["by_source"] = {r["source"]: int(r["n"]) for r in agg_source}
+
+            agg_type = await conn.fetch(
+                f"""
+                SELECT incident_type, COUNT(*)::int AS n
+                FROM operational_incidents i {where_sql}
+                GROUP BY incident_type ORDER BY n DESC LIMIT 25
+                """,
+                *params,
+            )
+            summary["by_type"] = {r["incident_type"]: int(r["n"]) for r in agg_type}
+
+            last24 = await conn.fetchrow(
+                f"""
+                SELECT COUNT(*)::int AS n
+                FROM operational_incidents i
+                {where_sql + (' AND ' if where else 'WHERE ')}created_at >= NOW() - INTERVAL '24 hours'
+                """,
+                *params,
+            )
+            summary["last_24h"] = int(last24["n"]) if last24 else 0
+    except asyncpg.exceptions.UndefinedTableError:
+        logger.warning("operational_incidents: table missing (run migrations)")
+        return {"incidents": [], "summary": summary, "limit": limit, "offset": offset}
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        d["id"] = str(d["id"])
+        d["user_id"] = str(d["user_id"]) if d.get("user_id") else None
+        d["upload_id"] = str(d["upload_id"]) if d.get("upload_id") else None
+        d["details"] = _safe_json(d.get("details"), {})
+        d["created_at"] = d["created_at"].isoformat() if d.get("created_at") else None
+        d["email_sent_at"] = d["email_sent_at"].isoformat() if d.get("email_sent_at") else None
+        d["discord_sent_at"] = d["discord_sent_at"].isoformat() if d.get("discord_sent_at") else None
+        out.append(d)
+    return {
+        "incidents": out,
+        "summary": summary,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/all-failures")
+async def admin_all_failures(
+    limit: int = Query(150, le=500),
+    since_hours: int = Query(24, ge=1, le=24 * 30),
+    source_filter: Optional[str] = Query(None, description="incident|upload|event"),
+    user: dict = Depends(get_current_user),
+):
+    """Unified failure feed merging three sources into one timeline:
+
+    1. ``operational_incidents`` rows (worker errors, bug reports, JS errors,
+       API 500s).
+    2. ``uploads`` rows where ``status='failed'`` (in case the worker failed
+       to record an incident).
+    3. ``system_event_log`` rows where ``severity='ERROR'`` or
+       ``outcome='FAILURE'`` (OAuth failures, webhook failures, etc).
+
+    De-duplicated by ``upload_id`` where applicable (incidents win over upload
+    rows for the same upload_id). Returned newest-first.
+    """
+    if user.get("role") not in ("admin", "master_admin"):
+        raise HTTPException(403, "Admin only")
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database not ready")
+
+    show_inc = source_filter in (None, "", "incident")
+    show_up = source_filter in (None, "", "upload")
+    show_evt = source_filter in (None, "", "event")
+
+    incidents: List[Dict[str, Any]] = []
+    failed_uploads: List[Dict[str, Any]] = []
+    failure_events: List[Dict[str, Any]] = []
+    seen_upload_ids: set = set()
+
+    async with core.state.db_pool.acquire() as conn:
+        if show_inc:
+            try:
+                rows = await conn.fetch(
+                    """
+                    SELECT i.id, i.source, i.incident_type, i.user_id, i.upload_id,
+                           i.subject, LEFT(COALESCE(i.body,''), 400) AS body_preview,
+                           i.details, i.created_at, u.email AS user_email
+                    FROM operational_incidents i
+                    LEFT JOIN users u ON u.id = i.user_id
+                    WHERE i.created_at >= NOW() - ($1 || ' hours')::interval
+                    ORDER BY i.created_at DESC
+                    LIMIT $2
+                    """,
+                    str(since_hours),
+                    limit,
+                )
+                for r in rows:
+                    uid = str(r["upload_id"]) if r["upload_id"] else None
+                    if uid:
+                        seen_upload_ids.add(uid)
+                    incidents.append({
+                        "kind": "incident",
+                        "id": str(r["id"]),
+                        "source": r["source"],
+                        "incident_type": r["incident_type"],
+                        "user_id": str(r["user_id"]) if r["user_id"] else None,
+                        "user_email": r["user_email"],
+                        "upload_id": uid,
+                        "subject": r["subject"],
+                        "body_preview": r["body_preview"],
+                        "details": _safe_json(r["details"], {}),
+                        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    })
+            except asyncpg.exceptions.UndefinedTableError:
+                pass
+
+        if show_up:
+            try:
+                rows = await conn.fetch(
+                    """
+                    SELECT up.id, up.user_id, up.filename, up.error_code, up.error_detail,
+                           up.platforms, up.status,
+                           COALESCE(up.processing_finished_at, up.updated_at, up.created_at) AS ts,
+                           u.email AS user_email
+                    FROM uploads up
+                    LEFT JOIN users u ON u.id = up.user_id
+                    WHERE up.status = 'failed'
+                      AND COALESCE(up.processing_finished_at, up.updated_at, up.created_at)
+                          >= NOW() - ($1 || ' hours')::interval
+                    ORDER BY ts DESC
+                    LIMIT $2
+                    """,
+                    str(since_hours),
+                    limit,
+                )
+                for r in rows:
+                    uid = str(r["id"])
+                    if uid in seen_upload_ids:
+                        continue
+                    failed_uploads.append({
+                        "kind": "upload",
+                        "id": uid,
+                        "source": "upload",
+                        "incident_type": (r["error_code"] or "upload_failed")[:120],
+                        "user_id": str(r["user_id"]) if r["user_id"] else None,
+                        "user_email": r["user_email"],
+                        "upload_id": uid,
+                        "subject": f"Upload failed: {r['filename'] or uid}",
+                        "body_preview": (r["error_detail"] or "")[:400],
+                        "details": {
+                            "filename": r["filename"],
+                            "platforms": list(r["platforms"] or []),
+                            "error_code": r["error_code"],
+                        },
+                        "created_at": r["ts"].isoformat() if r["ts"] else None,
+                    })
+            except asyncpg.exceptions.UndefinedTableError:
+                pass
+
+        if show_evt:
+            try:
+                rows = await conn.fetch(
+                    """
+                    SELECT e.id, e.user_id, e.event_category, e.action, e.resource_type,
+                           e.resource_id, e.details, e.severity, e.outcome, e.created_at,
+                           u.email AS user_email
+                    FROM system_event_log e
+                    LEFT JOIN users u ON u.id = e.user_id
+                    WHERE (e.severity = 'ERROR' OR e.outcome = 'FAILURE')
+                      AND e.created_at >= NOW() - ($1 || ' hours')::interval
+                    ORDER BY e.created_at DESC
+                    LIMIT $2
+                    """,
+                    str(since_hours),
+                    limit,
+                )
+                for r in rows:
+                    failure_events.append({
+                        "kind": "event",
+                        "id": str(r["id"]),
+                        "source": (r["event_category"] or "event").lower()[:50],
+                        "incident_type": (r["action"] or "event")[:120],
+                        "user_id": str(r["user_id"]) if r["user_id"] else None,
+                        "user_email": r["user_email"],
+                        "upload_id": r["resource_id"] if r["resource_type"] == "upload" else None,
+                        "subject": f"{r['event_category']}: {r['action']}",
+                        "body_preview": "",
+                        "details": {
+                            **(_safe_json(r["details"], {}) or {}),
+                            "severity": r["severity"],
+                            "outcome": r["outcome"],
+                            "resource_type": r["resource_type"],
+                            "resource_id": r["resource_id"],
+                        },
+                        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    })
+            except asyncpg.exceptions.UndefinedTableError:
+                pass
+
+    merged = incidents + failed_uploads + failure_events
+    merged.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    merged = merged[:limit]
+
+    summary = {
+        "total": len(merged),
+        "incidents": len(incidents),
+        "failed_uploads": len(failed_uploads),
+        "failure_events": len(failure_events),
+        "since_hours": since_hours,
+    }
+    return {"failures": merged, "summary": summary}
+
+
+def _clip_text(v: Any, *, max_chars: int = 16_000) -> str:
+    s = "" if v is None else str(v)
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - len("...[truncated]")] + "...[truncated]"
+
+
+def _extract_ai_artifact_subset(output_artifacts: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only AI/hydration-relevant artifact keys to keep payload focused."""
+    if not isinstance(output_artifacts, dict):
+        return {}
+    keep: Dict[str, Any] = {}
+    for k, raw in output_artifacts.items():
+        key = str(k or "").strip()
+        if not key:
+            continue
+        low = key.lower()
+        if not (
+            low.startswith("m8_")
+            or "hydration" in low
+            or "caption" in low
+            or "content_attribution" in low
+            or "ai_pipeline_trace" in low
+            or "prompt" in low
+            or "thumbnail" in low
+            or "pikzels" in low
+            or "provider_error" in low
+            or low == "error"
+        ):
+            continue
+        val = raw
+        if isinstance(raw, str):
+            parsed = _safe_json(raw, None)
+            val = parsed if parsed is not None else _clip_text(raw, max_chars=20_000)
+        keep[key] = val
+    return keep
+
+
+def _parse_artifact_json_with_error(output_artifacts: Dict[str, Any], key: str) -> tuple[Any, Optional[str]]:
+    """Parse output_artifacts[key] and return (value, error_message)."""
+    if not isinstance(output_artifacts, dict):
+        return None, "output_artifacts_not_dict"
+    if key not in output_artifacts:
+        return None, "missing_key"
+    raw = output_artifacts.get(key)
+    if raw is None:
+        return None, "null_value"
+    if isinstance(raw, (dict, list)):
+        return raw, None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None, "empty_string"
+        try:
+            return json.loads(s), None
+        except Exception as exc:
+            return None, f"json_parse_error: {exc}"
+    return None, f"unsupported_type:{type(raw).__name__}"
+
+
+def _normalize_platform_results(raw: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    if isinstance(raw, dict):
+        out: List[Dict[str, Any]] = []
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                row = dict(v)
+                row.setdefault("platform", str(k))
+                out.append(row)
+        return out
+    return []
+
+
+def _looks_like_http_url(v: Any) -> bool:
+    s = str(v or "").strip().lower()
+    return s.startswith("http://") or s.startswith("https://")
+
+
+def _collect_upload_diagnostics(
+    *,
+    output_artifacts: Dict[str, Any],
+    hydration_payload: Any,
+    ai_trace_blob: Any,
+    thumbnail_trace: Any,
+    pikzels_prompt_by_platform: Any,
+    platform_results: List[Dict[str, Any]],
+    error_code: Optional[str],
+    error_detail: Optional[str],
+) -> Dict[str, Any]:
+    expected = [
+        "hydration_payload",
+        "thumbnail_trace",
+        "pikzels_prompt_by_platform",
+        "ai_pipeline_trace_v1",
+        "provider_error_trace",
+    ]
+    parse_errors: Dict[str, str] = {}
+    missing_artifacts: List[str] = []
+    for k in expected:
+        _, err = _parse_artifact_json_with_error(output_artifacts, k)
+        if err == "missing_key":
+            missing_artifacts.append(k)
+        elif err:
+            parse_errors[k] = err
+
+    hp = hydration_payload if isinstance(hydration_payload, dict) else {}
+    ev = hp.get("evidence") if isinstance(hp.get("evidence"), dict) else {}
+    hydration_missing: List[str] = []
+    for k in ("category", "anchor_phrase", "evidence", "signal_hashtags", "fusion_summary", "hydration_story", "trace_id"):
+        val = hp.get(k)
+        if k == "signal_hashtags":
+            if not isinstance(val, list):
+                hydration_missing.append(k)
+        elif val is None or str(val).strip() == "":
+            hydration_missing.append(k)
+    for lane in ("geo", "osd", "music", "speech", "vision", "trill"):
+        if not isinstance(ev.get(lane), dict):
+            hydration_missing.append(f"evidence.{lane}")
+
+    broken_links: List[Dict[str, Any]] = []
+    for pr in platform_results:
+        ok = bool(pr.get("success"))
+        if not ok:
+            continue
+        candidates = [
+            pr.get("platform_url"),
+            pr.get("url"),
+            pr.get("video_url"),
+            pr.get("post_url"),
+            pr.get("share_url"),
+            pr.get("permalink"),
+        ]
+        present = [str(x).strip() for x in candidates if str(x or "").strip()]
+        valid = [u for u in present if _looks_like_http_url(u)]
+        if not valid:
+            broken_links.append(
+                {
+                    "platform": str(pr.get("platform") or ""),
+                    "reason": "successful_publish_missing_valid_url",
+                    "url_candidates": present[:6],
+                    "platform_video_id": pr.get("platform_video_id"),
+                }
+            )
+
+    ai_events = len((ai_trace_blob.get("events") or [])) if isinstance(ai_trace_blob, dict) else 0
+    thumb_events = len(thumbnail_trace) if isinstance(thumbnail_trace, list) else 0
+    pikzels_platforms = len(pikzels_prompt_by_platform) if isinstance(pikzels_prompt_by_platform, dict) else 0
+
+    return {
+        "error_code_present": bool(error_code),
+        "error_detail_present": bool(str(error_detail or "").strip()),
+        "missing_artifacts": missing_artifacts,
+        "artifact_parse_errors": parse_errors,
+        "hydration_missing_keys": hydration_missing,
+        "ai_event_count": ai_events,
+        "thumbnail_event_count": thumb_events,
+        "pikzels_prompt_platform_count": pikzels_platforms,
+        "platform_results_count": len(platform_results),
+        "broken_links": broken_links,
+        "broken_links_count": len(broken_links),
+    }
+
+
+def _serialize_upload_ai_trace_row(
+    row: Dict[str, Any],
+    *,
+    include_events: bool,
+    include_raw_artifacts: bool,
+) -> Dict[str, Any]:
+    output_artifacts = _safe_json(row.get("output_artifacts"), {}) or {}
+    ai_trace_blob, _ = _parse_artifact_json_with_error(output_artifacts, "ai_pipeline_trace_v1")
+    hydration_payload, _ = _parse_artifact_json_with_error(output_artifacts, "hydration_payload")
+    thumbnail_trace, _ = _parse_artifact_json_with_error(output_artifacts, "thumbnail_trace")
+    pikzels_prompt_by_platform, _ = _parse_artifact_json_with_error(output_artifacts, "pikzels_prompt_by_platform")
+    provider_error_trace, _ = _parse_artifact_json_with_error(output_artifacts, "provider_error_trace")
+    events = list(ai_trace_blob.get("events") or []) if isinstance(ai_trace_blob, dict) else []
+    if not isinstance(thumbnail_trace, list):
+        thumbnail_trace = []
+    if not isinstance(pikzels_prompt_by_platform, dict):
+        pikzels_prompt_by_platform = {}
+    if not isinstance(provider_error_trace, list):
+        provider_error_trace = []
+    platform_results = _normalize_platform_results(row.get("platform_results"))
+    diagnostics = _collect_upload_diagnostics(
+        output_artifacts=output_artifacts,
+        hydration_payload=hydration_payload,
+        ai_trace_blob=ai_trace_blob,
+        thumbnail_trace=thumbnail_trace,
+        pikzels_prompt_by_platform=pikzels_prompt_by_platform,
+        platform_results=platform_results,
+        error_code=row.get("error_code"),
+        error_detail=row.get("error_detail"),
+    )
+    diagnostics["provider_error_count"] = len(provider_error_trace)
+
+    raw_artifacts = None
+    if include_raw_artifacts:
+        raw_artifacts = {}
+        for k, raw in (output_artifacts or {}).items():
+            key = str(k or "").strip()
+            if not key:
+                continue
+            val = raw
+            if isinstance(raw, str):
+                parsed = _safe_json(raw, None)
+                val = parsed if parsed is not None else _clip_text(raw, max_chars=40_000)
+            raw_artifacts[key] = val
+
+    return {
+        "upload_id": str(row.get("id") or ""),
+        "user_id": str(row.get("user_id") or "") if row.get("user_id") else None,
+        "user_email": row.get("user_email"),
+        "filename": row.get("filename"),
+        "status": row.get("status"),
+        "platforms": list(row.get("platforms") or []),
+        "processing_stage": row.get("processing_stage"),
+        "processing_progress": row.get("processing_progress"),
+        "error_code": row.get("error_code"),
+        "error_detail": _clip_text(row.get("error_detail"), max_chars=2000) if row.get("error_detail") else None,
+        "created_at": row.get("created_at").isoformat() if row.get("created_at") else None,
+        "updated_at": row.get("updated_at").isoformat() if row.get("updated_at") else None,
+        "processing_started_at": row.get("processing_started_at").isoformat() if row.get("processing_started_at") else None,
+        "processing_finished_at": row.get("processing_finished_at").isoformat() if row.get("processing_finished_at") else None,
+        "ai_title": row.get("ai_title"),
+        "ai_caption": row.get("ai_caption"),
+        "ai_generated_title": row.get("ai_generated_title"),
+        "ai_generated_caption": row.get("ai_generated_caption"),
+        "ai_generated_hashtags": list(row.get("ai_generated_hashtags") or []),
+        "hydration_payload": hydration_payload,
+        "thumbnail_trace": thumbnail_trace,
+        "pikzels_prompt_by_platform": pikzels_prompt_by_platform,
+        "provider_error_trace": provider_error_trace,
+        "platform_results": platform_results,
+        "diagnostics": diagnostics,
+        "artifact_keys": sorted(list((output_artifacts or {}).keys())),
+        "ai_artifacts": _extract_ai_artifact_subset(output_artifacts),
+        "raw_artifacts": raw_artifacts,
+        "ai_trace": {
+            "event_count": int((ai_trace_blob or {}).get("event_count") or len(events)),
+            "by_stage": (ai_trace_blob or {}).get("by_stage") if isinstance(ai_trace_blob, dict) else {},
+            "events": events if include_events else [],
+        },
+    }
+
+
+@router.get("/upload-ai-trace")
+async def admin_upload_ai_trace(
+    upload_id: Optional[str] = Query(None),
+    upload_ids: Optional[str] = Query(None, description="Comma/newline/space-separated upload UUIDs"),
+    q: Optional[str] = Query(None, description="Search by upload id, filename, or user email"),
+    status: Optional[str] = Query(None),
+    since_hours: int = Query(72, ge=1, le=24 * 3650),
+    include_success: bool = Query(True),
+    include_events: bool = Query(False, description="Include full ai_trace events array"),
+    include_raw_artifacts: bool = Query(False, description="Include all output_artifacts keys/values"),
+    limit: int = Query(50, ge=1, le=300),
+    offset: int = Query(0, ge=0),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Admin diagnostics feed for upload AI flow.
+    Returns hydration payload, ai trace summary/events, and relevant prompt artifacts.
+    """
+    if user.get("role") not in ("admin", "master_admin"):
+        raise HTTPException(403, "Admin only")
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database not ready")
+
+    if upload_id and not _valid_uuid(upload_id):
+        raise HTTPException(400, "Invalid upload_id")
+    raw_ids: List[str] = []
+    if upload_ids:
+        raw_ids = [s for s in re.split(r"[\s,;]+", str(upload_ids).strip()) if s]
+        raw_ids = [s.strip().strip('"').strip("'") for s in raw_ids]
+        raw_ids = [s for s in raw_ids if s]
+        # Allow pasted snippets like: data-id="uuid"
+        cleaned: List[str] = []
+        for s in raw_ids:
+            if "data-id=" in s.lower():
+                m = re.search(r'data-id=["\']([0-9a-fA-F-]{36})["\']', s)
+                if m:
+                    cleaned.append(m.group(1))
+                continue
+            cleaned.append(s)
+        raw_ids = cleaned
+        # Be tolerant: drop malformed IDs instead of failing the whole request.
+        raw_ids = [s for s in raw_ids if _valid_uuid(s)]
+
+    where_parts: List[str] = []
+    params: List[Any] = []
+
+    if upload_id:
+        params.append(upload_id)
+        where_parts.append(f"up.id = ${len(params)}::uuid")
+    elif raw_ids:
+        placeholders = []
+        for uid in raw_ids[:500]:
+            params.append(uid)
+            placeholders.append(f"${len(params)}::uuid")
+        where_parts.append(f"up.id IN ({', '.join(placeholders)})")
+    else:
+        params.append(str(since_hours))
+        where_parts.append(
+            f"COALESCE(up.processing_finished_at, up.updated_at, up.created_at) >= NOW() - (${len(params)} || ' hours')::interval"
+        )
+        if not include_success:
+            where_parts.append("up.status <> 'completed'")
+        if status:
+            params.append(str(status))
+            where_parts.append(f"up.status = ${len(params)}")
+        if q:
+            params.append(f"%{str(q).strip()}%")
+            p = len(params)
+            where_parts.append(
+                f"(CAST(up.id AS text) ILIKE ${p} OR COALESCE(up.filename,'') ILIKE ${p} OR COALESCE(u.email,'') ILIKE ${p})"
+            )
+
+    where_sql = " AND ".join(where_parts) if where_parts else "TRUE"
+
+    query = f"""
+        SELECT
+            up.id, up.user_id, up.filename, up.status, up.platforms,
+            up.processing_stage, up.processing_progress,
+            up.error_code, up.error_detail,
+            up.created_at, up.updated_at, up.processing_started_at, up.processing_finished_at,
+            up.ai_title, up.ai_caption, up.ai_generated_title, up.ai_generated_caption,
+            up.ai_generated_hashtags, up.output_artifacts, up.platform_results,
+            u.email AS user_email
+        FROM uploads up
+        LEFT JOIN users u ON u.id = up.user_id
+        WHERE {where_sql}
+        ORDER BY COALESCE(up.processing_finished_at, up.updated_at, up.created_at) DESC
+        LIMIT ${len(params) + 1}
+        OFFSET ${len(params) + 2}
+    """
+    run_params = list(params) + [limit, offset]
+
+    async with core.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(query, *run_params)
+
+    items = [
+        _serialize_upload_ai_trace_row(
+            dict(r),
+            include_events=bool(include_events or upload_id),
+            include_raw_artifacts=bool(include_raw_artifacts or upload_id),
+        )
+        for r in rows
+    ]
+    return {
+        "count": len(items),
+        "limit": limit,
+        "offset": offset,
+        "since_hours": since_hours,
+        "include_success": bool(include_success),
+        "include_events": bool(include_events or upload_id),
+        "include_raw_artifacts": bool(include_raw_artifacts or upload_id),
+        "items": items,
+    }
 
 
 @router.get("/tiktok-webhook-log")
@@ -1884,7 +3026,7 @@ async def admin_tiktok_webhook_log(
     if user.get("role") not in ("admin", "master_admin"):
         raise HTTPException(403, "Admin only")
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         where = "WHERE event = $3" if event else ""
         params = [limit, offset] + ([event] if event else [])
         rows = await conn.fetch(

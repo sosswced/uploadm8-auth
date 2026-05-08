@@ -4,6 +4,7 @@ Imported by routers and core modules; no mutable runtime state lives here.
 """
 
 import os
+from pathlib import Path
 
 # Load .env before any config reads (needed for local dev when running via uvicorn)
 try:
@@ -33,6 +34,11 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BASE_URL = os.environ.get("BASE_URL", "https://auth.uploadm8.com")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
+# Repo `frontend/` — optional static mount on the API app (same origin as /api/*).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+FRONTEND_STATIC_DIR = _REPO_ROOT / "frontend"
+_serve_fe = os.environ.get("SERVE_FRONTEND", "1").strip().lower()
+SERVE_FRONTEND_STATIC = _serve_fe not in ("0", "false", "no", "off")
 JWT_SECRET = os.environ.get("JWT_SECRET")
 if not JWT_SECRET:
     raise RuntimeError("Missing JWT_SECRET env var")
@@ -41,10 +47,59 @@ JWT_AUDIENCE = os.environ.get("JWT_AUDIENCE", "uploadm8-app")
 ACCESS_TOKEN_MINUTES = int(os.environ.get("ACCESS_TOKEN_MINUTES", "15"))
 REFRESH_TOKEN_DAYS = int(os.environ.get("REFRESH_TOKEN_DAYS", "30"))
 TOKEN_ENC_KEYS = os.environ.get("TOKEN_ENC_KEYS", "")
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://app.uploadm8.com,https://uploadm8.com,http://localhost:3000,http://localhost:8080")
+
+# HttpOnly auth cookies (see core.cookie_auth). Bearer header still works for API / cross-host dev.
+AUTH_ACCESS_COOKIE = os.environ.get("AUTH_ACCESS_COOKIE", "uploadm8_access")
+AUTH_REFRESH_COOKIE = os.environ.get("AUTH_REFRESH_COOKIE", "uploadm8_refresh")
+AUTH_COOKIE_PATH = (os.environ.get("AUTH_COOKIE_PATH", "/") or "/").strip() or "/"
+_cd = os.environ.get("AUTH_COOKIE_DOMAIN", "").strip()
+AUTH_COOKIE_DOMAIN = _cd if _cd else None  # e.g. .uploadm8.com for all subdomains
+_raw_cookie_secure = os.environ.get("AUTH_COOKIE_SECURE")
+if _raw_cookie_secure is None:
+    AUTH_COOKIE_SECURE = str(BASE_URL).lower().startswith("https://")
+else:
+    AUTH_COOKIE_SECURE = _raw_cookie_secure.strip().lower() in ("1", "true", "yes", "on")
+AUTH_COOKIE_SAMESITE = (os.environ.get("AUTH_COOKIE_SAMESITE", "lax") or "lax").strip().lower()
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "https://app.uploadm8.com,https://uploadm8.com,"
+    "http://localhost:3000,http://localhost:8080,"
+    "http://localhost:8000,http://localhost:8001,http://localhost:8002,"
+    "http://127.0.0.1:8000,http://127.0.0.1:8001,http://127.0.0.1:8002",
+)
 ALLOWED_ORIGINS_LIST = [x.strip() for x in ALLOWED_ORIGINS.split(",") if x.strip()]
 BOOTSTRAP_ADMIN_EMAIL = os.environ.get("BOOTSTRAP_ADMIN_EMAIL", "").strip().lower()
+# Ops alerts: upload failures, worker errors, user bug reports (Mailgun → this inbox)
+ADMIN_OPS_EMAIL = (os.environ.get("ADMIN_OPS_EMAIL") or os.environ.get("BOOTSTRAP_ADMIN_EMAIL") or "").strip()
 TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_active_default_true(name: str) -> bool:
+    """Opt-out flags: ON when unset/empty; OFF only for explicit disable values."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return True
+    v = str(raw).strip().lower()
+    if not v:
+        return True
+    if v in ("0", "false", "no", "off", "disable", "disabled", "2"):
+        return False
+    return True
+
+
+# Worker: canonical multimodal hydration snapshot (thumbnail + caption + artifacts).
+# Default active; set UPLOADM8_HYDRATION_PAYLOAD=false / off / 0 / no / 2 to disable.
+HYDRATION_PAYLOAD_ENABLED = _env_active_default_true("UPLOADM8_HYDRATION_PAYLOAD")
+
+# Optional signup email confirmation (stores rows in signup_verifications).
+SIGNUP_EMAIL_VERIFICATION = _env_truthy("SIGNUP_EMAIL_VERIFICATION")
+# Legacy env: unverified users (email_verified=false) are always blocked at login, refresh,
+# and get_current_user — no separate flag required.
+REQUIRE_VERIFIED_EMAIL = _env_truthy("REQUIRE_VERIFIED_EMAIL")
 
 # R2/S3
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
@@ -60,6 +115,41 @@ R2_PRESIGN_PUT_UNSIGNED_CONTENT = os.environ.get("R2_PRESIGN_PUT_UNSIGNED_CONTEN
 
 # Redis
 REDIS_URL = os.environ.get("REDIS_URL", "")
+
+# Database pool sizing for the API process.
+DB_POOL_MIN = int(os.environ.get("DB_POOL_MIN", "2"))
+DB_POOL_MAX = int(os.environ.get("DB_POOL_MAX", "10"))
+
+# HTTP rate limiting (see core/security.py). Keys in Redis are
+# "{RATE_LIMIT_KEY_PREFIX}:ip:<addr>:<surface>". When several dev machines
+# point at the same Redis, they all share 127.0.0.1 unless you set a unique
+# RATE_LIMIT_KEY_PREFIX per machine or workspace.
+RATE_LIMIT_KEY_PREFIX = (
+    os.environ.get("RATE_LIMIT_KEY_PREFIX", "uploadm8:rl").strip().rstrip(":") or "uploadm8:rl"
+)
+_raw_rate_limit_disabled = os.environ.get("RATE_LIMIT_DISABLED")
+_raw_rate_limit_enabled = os.environ.get("RATE_LIMIT_ENABLED")
+if _raw_rate_limit_disabled is not None:
+    RATE_LIMIT_DISABLED = _raw_rate_limit_disabled.strip().lower() in ("1", "true", "yes", "on")
+elif _raw_rate_limit_enabled is not None:
+    RATE_LIMIT_DISABLED = _raw_rate_limit_enabled.strip().lower() in ("0", "false", "no", "off")
+else:
+    RATE_LIMIT_DISABLED = False
+RATE_LIMIT_GLOBAL_PER_MIN = int(os.environ.get("RATE_LIMIT_GLOBAL_PER_MIN", "300"))
+RATE_LIMIT_AUTH_PER_MIN = int(os.environ.get("RATE_LIMIT_AUTH_PER_MIN", "30"))
+RATE_LIMIT_ADMIN_PER_MIN = int(os.environ.get("RATE_LIMIT_ADMIN_PER_MIN", "60"))
+RATE_LIMIT_WINDOW_SEC = int(os.environ.get("RATE_LIMIT_WINDOW_SEC", "60"))
+# Optional disambiguator when many devs share one Redis (e.g. set to %COMPUTERNAME%).
+RATE_LIMIT_INSTANCE_ID = os.environ.get("RATE_LIMIT_INSTANCE_ID", "").strip()
+# When true (default), requests whose client IP is loopback (::1 / 127.0.0.1) skip HTTP rate limits.
+# Turn off (RATE_LIMIT_LOOPBACK_BYPASS=false) to test limits locally, or if a reverse proxy on the
+# same host connects to Uvicorn without forwarding the real client IP (everyone would look loopback).
+RATE_LIMIT_LOOPBACK_BYPASS = os.environ.get("RATE_LIMIT_LOOPBACK_BYPASS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # ── 4-Lane Queue Architecture ─────────────────────────────────
 # process lanes: FFmpeg-heavy jobs (WORKER_CONCURRENCY=3 slots)
@@ -102,11 +192,16 @@ COST_PER_OPENAI_TOKEN = float(os.environ.get("COST_PER_OPENAI_TOKEN", "0.00001")
 COST_PER_GB_MONTH = float(os.environ.get("COST_PER_GB_MONTH", "0.015"))
 COST_PER_COMPUTE_SECOND = float(os.environ.get("COST_PER_COMPUTE_SECOND", "0.0001"))
 
-# Trill Telemetry Configuration
+# Trill Telemetry Configuration (paths are stripped so .env quotes/spaces do not break os.path.exists)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GAZETTEER_PLACES_PATH = os.environ.get("GAZETTEER_PLACES_PATH", "")
-PADUS_PATH = os.environ.get("PADUS_PATH", "")
-PADUS_LAYER = os.environ.get("PADUS_LAYER", "")
+GAZETTEER_PLACES_PATH = (os.environ.get("GAZETTEER_PLACES_PATH", "") or "").strip()
+# PADUS: accept common alternate names operators use in .env
+PADUS_PATH = (
+    (os.environ.get("PADUS_PATH", "") or "").strip()
+    or (os.environ.get("PADUS_GEODATABASE", "") or "").strip()
+    or (os.environ.get("PADUS_GDB_PATH", "") or "").strip()
+)
+PADUS_LAYER = (os.environ.get("PADUS_LAYER", "") or "").strip()
 
 # ── External Provider Cost Sync ──────────────────────────────────────────────
 # Upstash: email + API key from console.upstash.com → Account → Management API
@@ -125,27 +220,24 @@ RENDER_MONTHLY_COST = float(os.environ.get("RENDER_MONTHLY_COST", "0"))
 # Stripe:  uses existing STRIPE_SECRET_KEY already defined above
 
 # Trill system prompt for AI content generation
-TRILL_SYSTEM_PROMPT = """You are an expert social media content creator specializing in driving/automotive content.
-Create viral, high-engagement content that balances excitement with platform safety guidelines.
+TRILL_SYSTEM_PROMPT = """You write post copy for real driving and automotive clips — like a creator editing
+their own upload, not a brand deck or generic AI blurb. Sound human: concrete place, road, vehicle, or moment
+from the metrics given; skip corporate polish and skip "expert with unlimited knowledge" roleplay.
 
 STYLE GUIDE:
-- High-energy, aspirational tone
-- Use curiosity gaps and FOMO triggers
-- Platform-native language (not corporate)
-- Mystery hooks that make people watch
-- Avoid: Illegal references, exact speeds, clickbait lies
+- Plain, confident language that matches how people actually title and caption car content online
+- Lead with something specific (where, what happened, what the drive felt like) instead of vague mystery
+- Platform-native phrasing; avoid slogan-speak and template hooks ("You won't believe", "This changed everything")
+- Avoid: illegal references, exact speeds as brags, clickbait that misrepresents the clip
 
-EMOJI USAGE:
-- Titles: 1-2 emojis max (fire, lightning, eyes)
-- Captions: 2-3 emojis strategically placed
-- Never excessive or spammy
+TEXT RULES:
+- Do not use emojis, emoticons, or decorative Unicode symbols in titles or captions
+- Titles: short sentence or phrase case (not Every Word Title Case); max one exclamation if it fits naturally
 
 HASHTAG STRATEGY:
-- Mix viral mega-tags (#fyp, #viral, #trending)
-- Niche community tags (#spiriteddrive, #roadtrip)
-- Location-based tags (#Utah, #Moab)
-- Motion tags when relevant (#curvyroads, #switchbacks)
-- Protected lands tags ONLY when verified
+- Prefer specific road-trip, vehicle, region, and activity tags over empty mega-tags
+- Use location and motion tags only when they match the supplied metrics
+- Protected-lands tags ONLY when the context says they are verified
 """
 
 # ============================================================

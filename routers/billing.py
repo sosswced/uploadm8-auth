@@ -6,10 +6,12 @@ Stripe checkout, portal, session retrieval, and webhook handling.
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Any, Dict, List
 
 import stripe
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 
+from api.schemas.billing import BillingSubscriptionActionRequest, UploadCostEstimateRequest
 from core.config import (
     BILLING_MODE,
     FRONTEND_URL,
@@ -22,8 +24,10 @@ from core.deps import get_current_user
 from core.helpers import _now_utc, _tier_is_upgrade
 from core.models import CheckoutRequest
 from core.notifications import notify_mrr, notify_topup
-from core.state import db_pool
+import core.state
 from core.wallet import credit_wallet, ledger_entry
+from routers.preferences import get_user_prefs_for_upload
+from stages.ai_service_costs import compute_presign_put_aic_costs
 from stages.entitlements import (
     STRIPE_LOOKUP_TO_TIER,
     TIER_CONFIG,
@@ -56,7 +60,7 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing not configured")
 
-    async with db_pool.acquire() as conn:
+    async with core.state.db_pool.acquire() as conn:
         # ── Double-subscribe guard ────────────────────────────────────
         if data.kind == "subscription":
             existing_sub_id  = user.get("stripe_subscription_id")
@@ -229,6 +233,154 @@ async def get_billing_session(
     }
 
 
+def _stripe_obj_to_dict(obj: Any) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, (dict, list, str, int, float, bool)):
+        return obj
+    try:
+        return dict(obj)
+    except Exception:
+        try:
+            return json.loads(str(obj))
+        except Exception:
+            return None
+
+
+@router.get("/overview")
+async def billing_overview(user: dict = Depends(get_current_user)):
+    """Stripe subscription snapshot + recent invoices for settings billing UI."""
+    empty: Dict[str, Any] = {"subscription": None, "invoices": [], "default_payment_method": None}
+    if not STRIPE_SECRET_KEY:
+        return empty
+    cid = user.get("stripe_customer_id")
+    if not cid:
+        return empty
+    try:
+        cust = stripe.Customer.retrieve(cid, expand=["invoice_settings.default_payment_method"])
+        dpm = None
+        inv_set = cust.get("invoice_settings") or {}
+        if inv_set.get("default_payment_method"):
+            dpm = _stripe_obj_to_dict(inv_set["default_payment_method"])
+        sub_obj = None
+        sid = user.get("stripe_subscription_id")
+        if sid:
+            try:
+                sub_obj = stripe.Subscription.retrieve(sid, expand=["default_payment_method"])
+            except Exception:
+                sub_obj = None
+        inv_list: List[Dict[str, Any]] = []
+        try:
+            invs = stripe.Invoice.list(customer=cid, limit=12)
+            for inv in getattr(invs, "data", []) or []:
+                inv_list.append(
+                    {
+                        "id": getattr(inv, "id", None),
+                        "status": getattr(inv, "status", None),
+                        "created": getattr(inv, "created", None),
+                        "amount_due": getattr(inv, "amount_due", None),
+                        "amount_paid": getattr(inv, "amount_paid", None),
+                        "currency": getattr(inv, "currency", None),
+                        "invoice_pdf": getattr(inv, "invoice_pdf", None),
+                        "hosted_invoice_url": getattr(inv, "hosted_invoice_url", None),
+                    }
+                )
+        except Exception:
+            pass
+        return {
+            "subscription": _stripe_obj_to_dict(sub_obj),
+            "invoices": inv_list,
+            "default_payment_method": dpm,
+        }
+    except Exception as e:
+        logger.warning("billing overview stripe error: %s", e)
+        return empty
+
+
+@router.post("/upload-estimate")
+async def billing_upload_estimate(body: UploadCostEstimateRequest, user: dict = Depends(get_current_user)):
+    """PUT/AIC estimate for billing settings calculator (same model as upload presign)."""
+    tier = user.get("subscription_tier") or "free"
+    ent = get_entitlements_for_tier(tier)
+    async with core.state.db_pool.acquire() as conn:
+        user_prefs = await get_user_prefs_for_upload(conn, user["id"])
+    use_hud = bool(body.use_hud) and ent.can_burn_hud
+    put, aic = compute_presign_put_aic_costs(
+        ent,
+        num_publish_targets=body.num_publish_targets,
+        file_size=body.file_size,
+        duration_hint=body.duration_seconds,
+        has_telemetry=body.has_telemetry,
+        use_ai_checkbox=body.use_ai,
+        hud_enabled_effective=use_hud,
+        user_prefs=user_prefs,
+        num_thumbnails_override=body.num_thumbnails,
+    )
+    return {"put_cost": put, "aic_cost": aic}
+
+
+@router.get("/subscription/actions")
+async def billing_subscription_actions(user: dict = Depends(get_current_user)):
+    st = str(user.get("subscription_status") or "").lower()
+    sid = user.get("stripe_subscription_id")
+    can = bool(sid and st in ("active", "trialing", "past_due"))
+    return {"can_manage_subscription": can}
+
+
+@router.post("/subscription/action")
+async def billing_subscription_action(
+    body: BillingSubscriptionActionRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Stripe Customer Portal flows + subscription maintenance (best-effort)."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Billing not configured")
+    cid = user.get("stripe_customer_id")
+    sub_id = user.get("stripe_subscription_id")
+    if not cid:
+        raise HTTPException(400, "No Stripe customer on file")
+    action = body.action
+    try:
+        if action == "share_payment_update_link":
+            sess = stripe.billing_portal.Session.create(
+                customer=cid,
+                return_url=f"{FRONTEND_URL}/settings.html#billing",
+                flow_data={"type": "payment_method_update"},
+            )
+            return {"share_url": sess.url, "ok": True}
+        if not sub_id:
+            raise HTTPException(400, "No active subscription to modify")
+        if action == "cancel_subscription":
+            stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+            return {"ok": True}
+        if action == "pause_payment_collection":
+            stripe.Subscription.modify(
+                sub_id,
+                pause_collection={"behavior": "mark_uncollectible"},
+            )
+            return {"ok": True}
+        if action == "create_one_time_invoice":
+            if not body.amount_cents:
+                raise HTTPException(400, "amount_cents required (min 100)")
+            desc = (body.description or "One-time invoice").strip() or "One-time invoice"
+            stripe.InvoiceItem.create(
+                customer=cid,
+                amount=int(body.amount_cents),
+                currency=(body.currency or "usd").lower(),
+                description=desc,
+            )
+            inv = stripe.Invoice.create(
+                customer=cid,
+                collection_method="charge_automatically",
+                auto_advance=True,
+            )
+            fin = stripe.Invoice.finalize_invoice(inv.id)
+            return {"ok": True, "invoice_id": getattr(fin, "id", None) or inv.id}
+    except stripe.error.StripeError as e:
+        raise HTTPException(400, str(e.user_message or e)) from e
+    raise HTTPException(400, "Unsupported action")
+
+
 @router.post("/webhook")
 async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     """Stripe billing webhook — idempotent, signature-verified."""
@@ -248,7 +400,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
         if not user_id:
             return {"status": "no_user_id"}
 
-        async with db_pool.acquire() as conn:
+        async with core.state.db_pool.acquire() as conn:
             user_row = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", user_id)
             email = user_row["email"] if user_row else ""
             uname = (user_row["name"] if user_row else None) or "there"
@@ -334,7 +486,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
         if not sub_id:
             return {"status": "no_subscription"}
 
-        async with db_pool.acquire() as conn:
+        async with core.state.db_pool.acquire() as conn:
             user_row = await conn.fetchrow(
                 "SELECT id, email, name, subscription_tier FROM users WHERE stripe_subscription_id = $1", sub_id
             )
@@ -384,7 +536,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     # ── subscription.updated — status changes, upgrades, downgrades ────
     elif etype == "customer.subscription.updated":
         sub = event.data.object
-        async with db_pool.acquire() as conn:
+        async with core.state.db_pool.acquire() as conn:
             lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
             new_tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
             period_end = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
@@ -427,7 +579,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
         inv = event.data.object
         sub_id = inv.get("subscription")
         if sub_id:
-            async with db_pool.acquire() as conn:
+            async with core.state.db_pool.acquire() as conn:
                 user_row = await conn.fetchrow(
                     "SELECT email, name, subscription_tier FROM users WHERE stripe_subscription_id = $1",
                     sub_id,
@@ -458,7 +610,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     # ── subscription.deleted — downgrade to free OR execute deferred account deletion ─
     elif etype == "customer.subscription.deleted":
         sub = event.data.object
-        async with db_pool.acquire() as conn:
+        async with core.state.db_pool.acquire() as conn:
             user_row = await conn.fetchrow(
                 "SELECT * FROM users WHERE stripe_subscription_id = $1", sub.id
             )
@@ -475,7 +627,12 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     "SELECT id FROM account_deletion_log WHERE user_id = $1 AND completed_at IS NULL ORDER BY requested_at DESC LIMIT 1",
                     str(user_row["id"]),
                 )
-                result = await _execute_account_deletion(conn, user_dict, initiated_by="account_deletion")
+                result = await _execute_account_deletion(
+                    conn,
+                    user_dict,
+                    initiated_by="account_deletion",
+                    background_tasks=background_tasks,
+                )
                 if deletion_log:
                     await conn.execute(
                         """

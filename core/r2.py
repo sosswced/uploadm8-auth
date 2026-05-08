@@ -3,6 +3,8 @@ UploadM8 R2/S3 helpers — presigned URLs, object management.
 Extracted from app.py; uses core.config for all R2 credentials.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 
@@ -22,6 +24,22 @@ from core.config import (
 logger = logging.getLogger("uploadm8-api")
 
 
+def ensure_r2_presign_configured() -> None:
+    """
+    Fail fast with a clear message when local/dev env cannot presign PUT URLs.
+    Without this, boto3 often raises opaque errors after the upload row is already inserted.
+    """
+    if not (R2_BUCKET_NAME or "").strip():
+        raise RuntimeError("R2_BUCKET_NAME is empty; cannot presign uploads.")
+    if not (R2_ACCOUNT_ID or "").strip():
+        raise RuntimeError("R2_ACCOUNT_ID is not set; cannot presign uploads.")
+    if not (R2_ACCESS_KEY_ID or "").strip() or not (R2_SECRET_ACCESS_KEY or "").strip():
+        raise RuntimeError(
+            "R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are not set; cannot presign uploads. "
+            "Add R2 API tokens to .env (see Cloudflare R2 S3 API credentials)."
+        )
+
+
 def _normalize_r2_key(key: str) -> str:
     """Normalize object keys to prevent bucket/bucket/... poisoning and signature mismatches."""
     if not key:
@@ -37,6 +55,31 @@ def _normalize_r2_key(key: str) -> str:
     while "//" in k:
         k = k.replace("//", "/")
     return k
+
+
+def resolve_stored_account_avatar_url(stored: str | None, *, ttl: int = 86_400) -> str:
+    """
+    platform_tokens.account_avatar may be:
+      - https?://... (provider CDN — return as-is)
+      - R2 object key (e.g. platform-avatars/{user_id}/{platform}/{id}.jpg) — presign for <img src>
+
+    Without presigning, browsers request same-origin /platform-avatars/... and get 404.
+    """
+    if stored is None:
+        return ""
+    s = str(stored).strip()
+    if not s:
+        return ""
+    if s.startswith("//"):
+        s = "https:" + s
+    low = s.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return s
+    try:
+        return generate_presigned_download_url(s, ttl=int(ttl)) or ""
+    except Exception as e:
+        logger.debug("resolve_stored_account_avatar_url: presign failed for key=%s err=%s", s[:120], e)
+        return ""
 
 
 def generate_presigned_download_url(key: str, ttl: int = 3600) -> str:
@@ -65,6 +108,7 @@ def r2_presign_get_url(r2_key: str, expires_in: int = 3600) -> str:
 
 
 def generate_presigned_upload_url(key: str, content_type: str, ttl: int = None) -> str:
+    ensure_r2_presign_configured()
     ttl = int(ttl) if ttl is not None else R2_PRESIGN_UPLOAD_TTL
     key = _normalize_r2_key(key)
     s3 = get_s3_client()
@@ -77,6 +121,48 @@ def generate_presigned_upload_url(key: str, content_type: str, ttl: int = None) 
         logger.info(f"Presigned upload URL generated for key={key[:80]}{'...' if len(key) > 80 else ''} ttl={ttl}s content_type={content_type}")
     url = s3.generate_presigned_url("put_object", Params=params, ExpiresIn=ttl)
     return url
+
+
+def copy_r2_object_within_bucket(src_key: str, dest_key: str) -> str:
+    """
+    Server-side copy within ``R2_BUCKET_NAME`` (no download/re-upload).
+
+    Used for durable notification preview keys (e.g. ``notifications/upload-previews/…``)
+    so presigned GET URLs stay stable while marketing the same logical object.
+    """
+    sk = _normalize_r2_key(src_key)
+    dk = _normalize_r2_key(dest_key)
+    if not sk or not dk:
+        raise ValueError("copy_r2_object_within_bucket: empty key")
+    if sk == dk:
+        return dk
+    if not R2_BUCKET_NAME:
+        raise RuntimeError("Missing R2_BUCKET_NAME env var")
+    s3 = get_s3_client()
+    s3.copy_object(
+        Bucket=R2_BUCKET_NAME,
+        CopySource={"Bucket": R2_BUCKET_NAME, "Key": sk},
+        Key=dk,
+        MetadataDirective="COPY",
+    )
+    return dk
+
+
+def put_object_bytes(key: str, body: bytes, content_type: str) -> str:
+    """Server-side upload of small objects (e.g. bug-report screenshots). Returns normalized key."""
+    if not R2_BUCKET_NAME:
+        raise RuntimeError("Missing R2_BUCKET_NAME env var")
+    k = _normalize_r2_key(key)
+    if not k:
+        raise ValueError("empty R2 key")
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=k,
+        Body=body,
+        ContentType=content_type or "application/octet-stream",
+    )
+    return k
 
 
 async def _delete_r2_objects(keys: list[str]) -> int:

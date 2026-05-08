@@ -7,7 +7,7 @@ import json
 import logging
 
 from core.helpers import _now_utc
-from stages.entitlements import get_entitlements_for_tier
+from stages.entitlements import get_entitlements_for_tier, wallet_bypass_for_user_record
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -27,7 +27,18 @@ async def ledger_entry(conn, user_id: str, token_type: str, delta: int, reason: 
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     """, user_id, token_type, platform, delta, reason, upload_id, stripe_event_id, json.dumps(meta) if meta else None)
 
+def _wallet_bypass_tokens(user_record: dict | None) -> bool:
+    """PUT/AIC wallet bypass — see ``wallet_bypass_for_user_record``."""
+    return wallet_bypass_for_user_record(user_record)
+
+
 async def reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str) -> bool:
+    urow = await conn.fetchrow(
+        "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+        user_id,
+    )
+    if _wallet_bypass_tokens(dict(urow) if urow else None):
+        return True
     wallet = await get_wallet(conn, user_id)
     available_put = wallet["put_balance"] - wallet["put_reserved"]
     available_aic = wallet["aic_balance"] - wallet["aic_reserved"]
@@ -44,6 +55,12 @@ async def atomic_reserve_tokens(conn, user_id: str, put_count: int, aic_count: i
     """Atomically check-and-reserve tokens in a single UPDATE.
     Returns True if reserved, False if insufficient balance.
     Prevents race conditions where concurrent presign calls share the same balance."""
+    urow = await conn.fetchrow(
+        "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+        user_id,
+    )
+    if _wallet_bypass_tokens(dict(urow) if urow else None):
+        return True
     row = await conn.fetchrow(
         """UPDATE wallets
            SET put_reserved = put_reserved + $1,
@@ -62,6 +79,52 @@ async def atomic_reserve_tokens(conn, user_id: str, put_count: int, aic_count: i
         await ledger_entry(conn, user_id, "aic", -aic_count, "reserve", upload_id)
     return True
 
+async def atomic_debit_tokens(
+    conn,
+    user_id: str,
+    put_count: int,
+    aic_count: int,
+    ref_id: str,
+    *,
+    reason: str = "debit",
+) -> bool:
+    """Debit PUT/AIC from available balance in one UPDATE (respects reserved amounts).
+
+    Internal tiers and admin roles bypass the wallet (same rule as ``atomic_reserve_tokens``)
+    so Thumbnail Studio and other direct debits do not 429 while the UI shows unlimited tokens.
+    """
+    put_count = int(put_count or 0)
+    aic_count = int(aic_count or 0)
+    if put_count <= 0 and aic_count <= 0:
+        return True
+    urow = await conn.fetchrow(
+        "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+        user_id,
+    )
+    if _wallet_bypass_tokens(dict(urow) if urow else None):
+        return True
+    row = await conn.fetchrow(
+        """UPDATE wallets
+           SET put_balance = put_balance - $1,
+               aic_balance = aic_balance - $2,
+               updated_at = NOW()
+           WHERE user_id = $3
+             AND (put_balance - put_reserved) >= $1
+             AND (aic_balance - aic_reserved) >= $2
+           RETURNING put_balance, aic_balance""",
+        put_count,
+        aic_count,
+        user_id,
+    )
+    if row is None:
+        return False
+    if put_count > 0:
+        await ledger_entry(conn, user_id, "put", -put_count, reason, ref_id)
+    if aic_count > 0:
+        await ledger_entry(conn, user_id, "aic", -aic_count, reason, ref_id)
+    return True
+
+
 async def spend_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str, platforms: list = None):
     await conn.execute("UPDATE wallets SET put_balance = put_balance - $1, aic_balance = aic_balance - $2, put_reserved = put_reserved - $1, aic_reserved = aic_reserved - $2 WHERE user_id = $3", put_count, aic_count, user_id)
     if put_count > 0:
@@ -70,6 +133,12 @@ async def spend_tokens(conn, user_id: str, put_count: int, aic_count: int, uploa
         await ledger_entry(conn, user_id, "aic", -aic_count, "spend", upload_id)
 
 async def refund_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str):
+    urow = await conn.fetchrow(
+        "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+        user_id,
+    )
+    if _wallet_bypass_tokens(dict(urow) if urow else None):
+        return
     await conn.execute("UPDATE wallets SET put_reserved = put_reserved - $1, aic_reserved = aic_reserved - $2 WHERE user_id = $3", put_count, aic_count, user_id)
     if put_count > 0:
         await ledger_entry(conn, user_id, "put", put_count, "refund", upload_id)
@@ -88,32 +157,97 @@ async def transfer_tokens(conn, user_id: str, from_platform: str, to_platform: s
     user = await conn.fetchrow("SELECT subscription_tier, flex_enabled FROM users WHERE id = $1", user_id)
     if not user or not user.get("flex_enabled"):
         return False
-    wallet = await get_wallet(conn, user_id)
-    if wallet["put_balance"] - wallet["put_reserved"] < amount:
+    amount = int(amount)
+    if amount <= 0:
         return False
     burn = int(amount * burn_pct)
     net = amount - burn
+    # Single conditional UPDATE: require full available PUT for the transfer size, then apply burn atomically.
+    if burn > 0:
+        row = await conn.fetchrow(
+            """
+            UPDATE wallets
+            SET put_balance = put_balance - $1,
+                updated_at = NOW()
+            WHERE user_id = $2
+              AND (put_balance - put_reserved) >= $3
+            RETURNING put_balance
+            """,
+            burn,
+            user_id,
+            amount,
+        )
+    else:
+        row = await conn.fetchrow(
+            """
+            UPDATE wallets
+            SET updated_at = NOW()
+            WHERE user_id = $1
+              AND (put_balance - put_reserved) >= $2
+            RETURNING put_balance
+            """,
+            user_id,
+            amount,
+        )
+    if row is None:
+        return False
     await ledger_entry(conn, user_id, "put", -amount, "transfer_out", platform=from_platform)
     await ledger_entry(conn, user_id, "put", net, "transfer_in", platform=to_platform)
     if burn > 0:
         await ledger_entry(conn, user_id, "put", -burn, "transfer_burn")
-        await conn.execute("UPDATE wallets SET put_balance = put_balance - $1 WHERE user_id = $2", burn, user_id)
     return True
 
-async def daily_refill(conn, user_id: str, tier: str):
+async def daily_refill(conn, user_id: str, tier: str, wallet: dict | None = None) -> dict | None:
+    """Drip the user's daily token allowance.
+
+    Hot path: called from ``get_current_user`` on every authenticated request.
+    Returns the (possibly updated) wallet dict so callers can avoid a second
+    ``SELECT * FROM wallets``. Returns ``None`` only when the caller did not
+    provide a wallet AND we short-circuited before fetching one (paid/internal
+    tiers) — the caller is then expected to fetch the wallet itself if needed.
+
+    Optimisations vs. the original implementation:
+      * Skip the entire wallet read + UPDATE for non-free / internal tiers
+        (these tiers never drip — see ``services/wallet.py`` for parity).
+      * Accept a pre-fetched ``wallet`` to avoid the redundant
+        ``SELECT * FROM wallets`` flagged by Sentry "Consecutive DB Queries".
+      * No transaction wrapper — a single conditional UPDATE is atomic on its
+        own and the daily-once guard makes idempotency trivial.
+    """
     ent = get_entitlements_for_tier(tier)
-    daily = ent.put_daily * 4  # 4 platforms
-    wallet = await get_wallet(conn, user_id)
+    if getattr(ent, "is_internal", False) or str(getattr(ent, "tier", "")) != "free":
+        return wallet
+
+    if wallet is None:
+        wallet = await get_wallet(conn, user_id)
+
     last_refill = wallet.get("last_refill_date")
     today = _now_utc().date()
     if last_refill and last_refill >= today:
-        return
+        return wallet
+
+    daily = ent.put_daily * 4  # 4 platforms
     monthly_cap = ent.put_monthly
     current = wallet["put_balance"]
-    if current < monthly_cap:
-        add = min(daily, monthly_cap - current)
-        await conn.execute("UPDATE wallets SET put_balance = put_balance + $1, last_refill_date = $2 WHERE user_id = $3", add, today, user_id)
-        await ledger_entry(conn, user_id, "put", add, "daily_refill")
+    if current >= monthly_cap:
+        # Still mark today as "refilled" so we don't re-enter this branch on
+        # every subsequent request today (was a hidden hot-path SELECT before).
+        await conn.execute(
+            "UPDATE wallets SET last_refill_date = $1 WHERE user_id = $2",
+            today, user_id,
+        )
+        wallet["last_refill_date"] = today
+        return wallet
+
+    add = min(daily, monthly_cap - current)
+    await conn.execute(
+        "UPDATE wallets SET put_balance = put_balance + $1, last_refill_date = $2 WHERE user_id = $3",
+        add, today, user_id,
+    )
+    await ledger_entry(conn, user_id, "put", add, "daily_refill")
+    wallet["put_balance"] = current + add
+    wallet["last_refill_date"] = today
+    return wallet
 
 async def partial_refund_tokens(
     conn,
@@ -141,6 +275,12 @@ async def partial_refund_tokens(
     Only runs when there is at least one success AND at least one failure.
     On full failure the worker calls release/unreserve instead.
     """
+    urow = await conn.fetchrow(
+        "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+        user_id,
+    )
+    if _wallet_bypass_tokens(dict(urow) if urow else None):
+        return
     n_failed = len(failed_platforms or [])
     if n_failed == 0 or not (succeeded_platforms or []):
         return  # nothing to refund

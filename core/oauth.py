@@ -3,9 +3,13 @@ UploadM8 OAuth helpers — token revocation, state storage, redirect URIs.
 Extracted from app.py; uses core.state for Redis, core.config for credentials.
 """
 
+import base64
+import hashlib
 import json
 import logging
+import secrets
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
@@ -121,3 +125,45 @@ async def _pop_oauth_state(state: str) -> Optional[dict]:
 
 def get_oauth_redirect_uri(platform: str) -> str:
     return f"{BASE_URL}/api/oauth/{platform}/callback"
+
+
+def sanitize_oauth_parent_origin(origin: Optional[str]) -> str:
+    """postMessage target: must match opener origin. Defaults to FRONTEND_URL."""
+    from core.config import FRONTEND_URL
+
+    default = FRONTEND_URL.rstrip("/")
+    if not origin or not str(origin).strip():
+        return default
+    try:
+        p = urlparse(str(origin).strip())
+    except Exception:
+        return default
+    if p.scheme not in ("http", "https") or not p.netloc:
+        return default
+    host = (p.hostname or "").lower()
+    if not host:
+        return default
+    fe = urlparse(FRONTEND_URL)
+    fe_host = (fe.hostname or "").lower()
+    if host in ("localhost", "127.0.0.1") or host.endswith(".localhost"):
+        return f"{p.scheme}://{p.netloc.split('/')[0]}"
+    if fe_host and (host == fe_host or host.endswith("." + fe_host) or fe_host.endswith("." + host)):
+        return f"{p.scheme}://{p.netloc.split('/')[0]}"
+    if host.endswith(".uploadm8.com") or host == "uploadm8.com":
+        return f"{p.scheme}://{p.netloc.split('/')[0]}"
+    return default
+
+
+def tiktok_pkce_verifier_and_challenge() -> tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .decode("ascii")
+        .rstrip("=")
+    )
+    return verifier, challenge
+
+
+async def mirror_oauth_profile_image_to_r2(user_id: str, platform: str, avatar_url: str) -> Optional[str]:
+    """Optional: copy provider CDN avatar into R2 for stable hotlinking. Not implemented yet."""
+    return None

@@ -257,6 +257,24 @@ async def _handle_tiktok_event(event_type: str, payload: dict, user_openid: str)
     except Exception as exc:
         notes += f" ERROR:{exc}"
         logger.error(f"[tiktok-webhook] background handler error: {exc}", exc_info=True)
+        try:
+            if core.state.db_pool is not None:
+                from services.ops_incidents import record_operational_incident
+
+                await record_operational_incident(
+                    core.state.db_pool,
+                    source="webhook",
+                    incident_type=f"tiktok_webhook_handler_failed:{event_type or 'unknown'}"[:120],
+                    subject=f"TikTok webhook handler error: {type(exc).__name__}",
+                    body=str(exc)[:8000],
+                    details={
+                        "event": event_type,
+                        "user_openid": user_openid,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+        except Exception as _ix:
+            logger.debug("tiktok webhook incident record failed: %s", _ix)
 
     return notes
 

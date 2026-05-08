@@ -2,6 +2,22 @@
 UploadM8 Trill Telemetry routes -- extracted from app.py.
 
 Handles trill analysis, places lookup, and AI content preview generation.
+
+**Architecture (important):**
+
+- **Full upload jobs (worker.py)** — Authoritative path for publish-ready titles,
+  captions, and hashtags: runs audio (Whisper/ACR/YAMNet), Google Vision, Twelve Labs,
+  Video Intelligence, dashcam OSD (burned-in HUD read; GPS backfill only without .map),
+  telemetry + PADUS/gazetteer on .map routes,
+  then ``run_caption_stage`` (M8 scene graph) and ``merge_signal_hashtags_into_ctx``.
+
+- **Trill HTTP API (this router)** — Fast preview for Drive / map + video: uses
+  ``telemetry_trill.safe_analyze_video`` (Trill score + **US Census gazetteer + PADUS**
+  when ``GAZETTEER_PLACES_PATH`` / ``PADUS_PATH`` are set on the server) and optional
+  ``generate_trill_content`` (OpenAI from those metrics only). It does **not** run
+  Vision, Whisper, Twelve Labs, or Video Intelligence (avoid duplicate cost and long
+  requests on a preview endpoint). For full multimodal copy, process the upload through
+  the worker so captions use M8 + all signals.
 """
 
 import json
@@ -38,10 +54,15 @@ router = APIRouter(prefix="/api/trill", tags=["trill"])
 
 def generate_trill_content(trill_metadata: dict, user_prefs: dict = None) -> dict:
     """
-    Use OpenAI to generate viral titles, captions, and hashtags based on trill metrics.
+    Use OpenAI to generate titles, captions, and hashtags from **Trill telemetry analysis**.
+
+    ``trill_metadata`` comes from ``telemetry_trill.safe_analyze_video`` (includes
+    Census nearest place, PADUS protected-lands hit, speed, curvature, etc. when
+    server paths/keys are configured). This is **not** the full upload worker pipeline
+    (no Vision / audio stack / M8). See module docstring above.
 
     Args:
-        trill_metadata: Output from telemetry_trill.analyze_video()
+        trill_metadata: ``telemetry_trill.safe_analyze_video(...)["data"]`` dict
         user_prefs: User preferences for generation style
 
     Returns:
@@ -71,9 +92,16 @@ def generate_trill_content(trill_metadata: dict, user_prefs: dict = None) -> dic
     dyn_score = trill_metadata.get("dyn_score", 0)
     turny = trill_metadata.get("turny", False)
     spirited = trill_metadata.get("spirited", False)
+    state_usps = (trill_metadata.get("state_usps") or "").strip()
+    max_mph = trill_metadata.get("max_speed_mph")
+    avg_mph = trill_metadata.get("avg_speed_mph")
+    dist_mi = trill_metadata.get("distance_miles")
+    dur_s = trill_metadata.get("duration_seconds")
 
-    # Build context
+    # Build context (place_name = US Census gazetteer nearest place when gazetteer path was used)
     location = f"near {place}, {state}" if place and state else state if state else "the open road"
+    if state_usps and state_usps not in location:
+        location = f"{location} (USPS {state_usps})".strip()
     scene = f"{protected_name} (verified protected lands)" if near_protected and protected_name else "public lands" if near_protected else "backroads"
 
     # User preferences
@@ -81,12 +109,16 @@ def generate_trill_content(trill_metadata: dict, user_prefs: dict = None) -> dic
     model = prefs.get("trill_openai_model", "gpt-4o-mini")
 
     # Build prompt
-    user_prompt = f"""Generate viral social media content for a driving video with these metrics:
+    user_prompt = f"""Write title, caption, and hashtags for a driving clip using only these facts (do not invent
+scenes or stunts). Sound like a real person posting their footage — no emojis anywhere.
 
 TRILL SCORE: {score}/100 (higher = more thrilling)
 SPEED BUCKET: {bucket}
-LOCATION: {location}
-SCENE: {scene}
+CENSUS NEAREST PLACE (when gazetteer configured on server): {place or "(not resolved)"}
+STATE / REGION: {state or "(unknown)"}
+LOCATION LINE: {location}
+PADUS / PROTECTED LANDS: {scene} (near_protected={near_protected})
+ROUTE STATS: peak_speed_mph={max_mph} avg_speed_mph={avg_mph} distance_miles={dist_mi} duration_s={dur_s}
 ELEVATION GAIN: {elev_gain}m
 CURVATURE: {curv_score}/10 (higher = more twisty/switchbacks)
 DYNAMICS: {dyn_score}/10 (higher = more spirited cornering)
@@ -94,16 +126,12 @@ MOTION FLAGS: {"Turny roads" if turny else ""} {"Spirited driving" if spirited e
 
 GENERATE:
 1. TITLE (max 80 chars)
-   - Create mystery/curiosity gap
-   - Use 1-2 emojis strategically
-   - Make it stop-the-scroll worthy
-   - Examples: "This road changed my perspective 🔥" or "POV: You find the perfect line ⚡"
+   - Specific to location/scene/motion flags above; avoid generic AI patterns ("POV:", "Wait for it", "Nobody talks about")
+   - No emojis or emoticons; normal capitalization (not Title Case Every Word)
 
 2. CAPTION (max 200 chars)
-   - First-person, conversational
-   - Create FOMO/aspiration
-   - Ask a question or prompt engagement
-   - 2-3 emojis max
+   - First-person or direct address only if it fits the tone; conversational, not salesy
+   - Optional one short question; no FOMO clichés; no emojis
 
 3. HASHTAGS (exactly 15 tags)
    - 3-4 mega viral: #fyp #foryou #viral #trending
@@ -248,9 +276,9 @@ async def process_telemetry(conn, upload_id: str, user_id: str, video_path: str,
         result = tt.safe_analyze_video(
             video_path,
             map_path,
-            gaz_places_path=GAZETTEER_PLACES_PATH if os.path.exists(GAZETTEER_PLACES_PATH) else None,
-            padus_path=PADUS_PATH if os.path.exists(PADUS_PATH) else None,
-            padus_layer=PADUS_LAYER,
+            gaz_places_path=GAZETTEER_PLACES_PATH if (GAZETTEER_PLACES_PATH and os.path.exists(GAZETTEER_PLACES_PATH)) else None,
+            padus_path=PADUS_PATH if (PADUS_PATH and os.path.exists(PADUS_PATH)) else None,
+            padus_layer=PADUS_LAYER or None,
             hud_enabled=user_prefs.get("trill_hud_enabled", False)
         )
 

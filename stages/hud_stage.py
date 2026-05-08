@@ -7,18 +7,71 @@ Generate speed HUD overlay on videos using FFmpeg.
 import os
 import logging
 import subprocess
-import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .errors import HUDError, SkipStage, ErrorCode
 from .context import JobContext
+from .ffmpeg_env import resolve_ffmpeg_executable
 
 
 logger = logging.getLogger("uploadm8-worker")
 
 
 JOB_TIMEOUT_SECONDS = int(os.environ.get("JOB_TIMEOUT_SECONDS", "600"))
+
+
+def _point_timestamp(point: dict, fallback: float) -> float:
+    """Return a numeric telemetry timestamp, tolerating OSD backfill keys."""
+    raw = point.get("timestamp", point.get("t_s", fallback))
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def _relative_srt_times(points: list[dict]) -> list[tuple[float, float]]:
+    """Convert absolute .map timestamps into clip-relative subtitle times."""
+    raw_times: list[float] = []
+    fallback = 0.0
+    for point in points:
+        ts = _point_timestamp(point, fallback)
+        raw_times.append(ts)
+        fallback = ts + 1.0
+
+    if not raw_times:
+        return []
+
+    origin = raw_times[0]
+    rel = [max(0.0, ts - origin) for ts in raw_times]
+    times: list[tuple[float, float]] = []
+    for i, start_time in enumerate(rel):
+        if i + 1 < len(rel):
+            end_time = rel[i + 1]
+            if end_time <= start_time:
+                end_time = start_time + 0.5
+        else:
+            end_time = start_time + 0.5
+        times.append((start_time, end_time))
+    return times
+
+
+def _escape_subtitles_filter_path(path: Path) -> str:
+    """Escape an SRT path for FFmpeg's subtitles filter, including Windows drives."""
+    s = str(path.resolve()).replace("\\", "/")
+    s = s.replace("'", r"\'")
+    s = s.replace(":", r"\:")
+    return s
+
+
+def _settings_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
@@ -52,9 +105,9 @@ def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
     
     with open(output_path, 'w') as f:
         data_points = points
+        subtitle_times = _relative_srt_times(data_points)
         for i, point in enumerate(data_points):
-            start_time = point['timestamp']
-            end_time = data_points[i + 1]['timestamp'] if i + 1 < len(data_points) else start_time + 0.5
+            start_time, end_time = subtitle_times[i]
             
             speed = point['speed_mph']
             if speed_unit == 'kmh':
@@ -67,6 +120,7 @@ def generate_srt_file(ctx: JobContext, output_path: Path) -> Path:
             f.write(f"{format_srt_time(start_time)} --> {format_srt_time(end_time)}\n")
             f.write(f"{int(speed)} {unit_label}\n\n")
     
+    logger.info("HUD SRT generated: %s cues=%d start=0.000s", output_path, len(points))
     return output_path
 
 
@@ -117,10 +171,11 @@ def build_ffmpeg_command(
         f"Shadow=1"
     )
     
+    exe = resolve_ffmpeg_executable() or "ffmpeg"
     return [
-        'ffmpeg', '-y',
+        exe, '-y',
         '-i', str(input_path),
-        '-vf', f"subtitles={str(srt_path)}:force_style='{force_style}'",
+        '-vf', f"subtitles='{_escape_subtitles_filter_path(srt_path)}':force_style='{force_style}'",
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
@@ -144,7 +199,7 @@ async def run_hud_stage(ctx: JobContext) -> JobContext:
         HUDError: If FFmpeg fails
     """
     # Check if HUD is enabled
-    if not (ctx.user_settings or {}).get("hud_enabled", True):
+    if not _settings_bool((ctx.user_settings or {}).get("hud_enabled"), True):
         raise SkipStage("HUD disabled in user settings")
     
     # Check tier entitlements

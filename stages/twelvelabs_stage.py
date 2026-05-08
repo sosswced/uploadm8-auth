@@ -8,7 +8,8 @@ narrative arc, action sequences, and scene context of the entire video.
 Output: Rich scene description injected into caption + thumbnail prompts.
 
 Free tier: 600 cumulative minutes. Then $0.12/min for Pegasus.
-Only runs if TWELVELABS_ENABLED=true (off by default to preserve free credits).
+Runs when the user enables Scene Understanding in upload preferences and
+``TWELVE_LABS_API_KEY`` is set.
 
 Flow:
   1. Check if video is already indexed (cache by upload_id)
@@ -29,12 +30,31 @@ import httpx
 
 from .context import JobContext
 from .errors import SkipStage
+from .ai_service_costs import user_pref_ai_service_enabled
+from services.provider_error_trace import append_provider_error
 
 logger = logging.getLogger("uploadm8-worker")
 
-TWELVE_LABS_API_KEY  = os.environ.get("TWELVE_LABS_API_KEY", "")
-TWELVELABS_ENABLED   = os.environ.get("TWELVELABS_ENABLED", "false").lower() == "true"
-TWELVELABS_INDEX_ID  = os.environ.get("TWELVELABS_INDEX_ID", "")  # Pre-created index
+TWELVE_LABS_API_KEY = os.environ.get("TWELVE_LABS_API_KEY", "")
+TWELVELABS_INDEX_ID = os.environ.get("TWELVELABS_INDEX_ID", "")  # Pre-created index
+
+# When Video Intelligence already produced rich object/text/logo/person tracks
+# Twelve Labs is largely redundant — every TL call costs ~$0.10/min indexed.
+# This flag lets ops auto-skip TL for clips that already have evidence floor.
+# Default ON (skip TL when VI gives us enough). Set to "false" to keep both
+# services running every time.
+TWELVELABS_SKIP_WHEN_VI_RICH = (
+    os.environ.get("TWELVELABS_SKIP_WHEN_VI_RICH", "true").lower() == "true"
+)
+TWELVELABS_VI_RICH_OBJECT_MIN = int(os.environ.get("TWELVELABS_VI_RICH_OBJECT_MIN", "3") or 3)
+TWELVELABS_VI_RICH_LOGO_MIN = int(os.environ.get("TWELVELABS_VI_RICH_LOGO_MIN", "1") or 1)
+
+# Optional comma-separated custom prompts. Each one runs a single
+# /analyze call and stores the returned text under
+# ``video_understanding["custom_queries"][query_label]``. Disabled when blank.
+# Example:
+#   TWELVELABS_CUSTOM_QUERIES="brands_visible:list every brand or product visible|memorable_quote:transcribe the single most memorable quote spoken"
+TWELVELABS_CUSTOM_QUERIES = (os.environ.get("TWELVELABS_CUSTOM_QUERIES") or "").strip()
 TL_BASE_URL          = "https://api.twelvelabs.io/v1.3"
 INDEX_POLL_INTERVAL  = float(os.environ.get("TWELVELABS_POLL_INTERVAL_SEC", "10"))  # seconds
 INDEX_MAX_POLLS      = int(os.environ.get("TWELVELABS_MAX_POLLS", "30"))            # legacy floor
@@ -63,32 +83,56 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
     """
     ctx.mark_stage("twelvelabs")
 
-    if not TWELVELABS_ENABLED:
-        raise SkipStage("Twelve Labs stage disabled (TWELVELABS_ENABLED=false)")
+    if not user_pref_ai_service_enabled(ctx.user_settings or {}, "twelvelabs", default=True):
+        raise SkipStage("Scene Understanding disabled in upload preferences (aiServiceSceneUnderstanding)")
 
     if not TWELVE_LABS_API_KEY:
         raise SkipStage("TWELVE_LABS_API_KEY not configured")
 
-    if not ctx.local_video_path or not ctx.local_video_path.exists():
+    # Cost gate: if Video Intelligence already produced rich tracks the
+    # additional TL spend rarely improves caption accuracy. Skip unless the
+    # user explicitly forces TL on or this gate is disabled by env.
+    if TWELVELABS_SKIP_WHEN_VI_RICH:
+        vi = getattr(ctx, "video_intelligence", None) or getattr(
+            ctx, "video_intelligence_context", None
+        ) or {}
+        if isinstance(vi, dict) and not vi.get("error"):
+            n_obj = len(vi.get("object_tracks") or [])
+            n_logo = len(vi.get("logos") or [])
+            us = ctx.user_settings or {}
+            force_tl = bool(us.get("force_twelvelabs") or us.get("forceTwelveLabs"))
+            if (n_obj >= TWELVELABS_VI_RICH_OBJECT_MIN or n_logo >= TWELVELABS_VI_RICH_LOGO_MIN) and not force_tl:
+                raise SkipStage(
+                    f"Video Intelligence already rich (objects={n_obj}, logos={n_logo}) — "
+                    "skipping Twelve Labs to control cost. "
+                    "Set forceTwelveLabs=true or TWELVELABS_SKIP_WHEN_VI_RICH=false to override."
+                )
+
+    video_path = None
+    for candidate in (ctx.processed_video_path, ctx.local_video_path):
+        if candidate and Path(candidate).exists():
+            video_path = Path(candidate)
+            break
+    if not video_path:
         raise SkipStage("No local video file for Twelve Labs")
 
     try:
-        index_id = TWELVELABS_INDEX_ID or await _get_or_create_index()
+        index_id = TWELVELABS_INDEX_ID or await _get_or_create_index(ctx=ctx)
         if not index_id:
             raise SkipStage("Could not get/create Twelve Labs index")
 
         # Upload and index the video
-        video_id = await _upload_and_index(ctx.local_video_path, index_id, ctx.upload_id)
+        video_id = await _upload_and_index(video_path, index_id, ctx.upload_id, ctx=ctx)
         if not video_id:
             raise SkipStage("Video indexing failed")
 
         # Generate scene description
-        description = await _generate_description(video_id)
+        description = await _generate_description(video_id, ctx=ctx)
         if not description:
             raise SkipStage("Description generation failed")
 
         # Generate title suggestion
-        title_suggestion = await _generate_title(video_id)
+        title_suggestion = await _generate_title(video_id, ctx=ctx)
 
         ctx.video_understanding = {
             "scene_description": description,
@@ -96,6 +140,30 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
             "video_id":          video_id,
             "index_id":          index_id,
         }
+
+        # Custom queries — domain-specific prompts (brands, quotes, locations,
+        # etc.) parsed from TWELVELABS_CUSTOM_QUERIES. Each result is stored
+        # under ``video_understanding["custom_queries"][label]`` and surfaced
+        # to the M8 prompt + hydration enforcer via build_scene_graph.
+        if TWELVELABS_CUSTOM_QUERIES:
+            cq_specs = _parse_custom_queries(TWELVELABS_CUSTOM_QUERIES)
+            if cq_specs:
+                cq_results: Dict[str, str] = {}
+                for label, prompt_text in cq_specs:
+                    try:
+                        ans = await _generate_custom(video_id, prompt_text, ctx=ctx)
+                        if ans:
+                            cq_results[label] = ans
+                    except Exception as cq_e:
+                        logger.warning(
+                            "[twelvelabs] custom query %r failed: %s", label, cq_e
+                        )
+                if cq_results:
+                    ctx.video_understanding["custom_queries"] = cq_results
+                    logger.info(
+                        "[twelvelabs] custom_queries succeeded: %s",
+                        ",".join(cq_results.keys()),
+                    )
 
         logger.info(
             f"[twelvelabs]  video_id={video_id} "
@@ -117,11 +185,19 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
         OSError,
     ) as e:
         logger.warning("[twelvelabs] Non-fatal error: %s", e)
+        append_provider_error(
+            ctx,
+            provider="twelvelabs",
+            stage="twelvelabs_stage",
+            operation="index_or_generate",
+            message=str(e),
+            exception_type=type(e).__name__,
+        )
         ctx.video_understanding = {}
         return ctx
 
 
-async def _get_or_create_index() -> Optional[str]:
+async def _get_or_create_index(*, ctx: Optional[JobContext] = None) -> Optional[str]:
     """Get existing uploadm8 index or create one with Pegasus + Marengo."""
     headers = {"x-api-key": TWELVE_LABS_API_KEY, "Content-Type": "application/json"}
 
@@ -154,10 +230,26 @@ async def _get_or_create_index() -> Optional[str]:
             return index_id
 
         logger.warning(f"[twelvelabs] Index creation failed: {resp.status_code} {resp.text[:200]}")
+        if ctx is not None:
+            append_provider_error(
+                ctx,
+                provider="twelvelabs",
+                stage="twelvelabs_stage",
+                operation="create_index",
+                message="index creation failed",
+                http_status=resp.status_code,
+                response_body_snippet=resp.text[:1200],
+            )
         return None
 
 
-async def _upload_and_index(video_path: Path, index_id: str, upload_id: str) -> Optional[str]:
+async def _upload_and_index(
+    video_path: Path,
+    index_id: str,
+    upload_id: str,
+    *,
+    ctx: Optional[JobContext] = None,
+) -> Optional[str]:
     """Upload video file to Twelve Labs and wait for indexing to complete."""
     headers = {"x-api-key": TWELVE_LABS_API_KEY}
 
@@ -188,6 +280,16 @@ async def _upload_and_index(video_path: Path, index_id: str, upload_id: str) -> 
 
         if resp.status_code not in (200, 201):
             logger.warning(f"[twelvelabs] Upload failed: {resp.status_code} {resp.text[:300]}")
+            if ctx is not None:
+                append_provider_error(
+                    ctx,
+                    provider="twelvelabs",
+                    stage="twelvelabs_stage",
+                    operation="upload_task",
+                    message="task upload failed",
+                    http_status=resp.status_code,
+                    response_body_snippet=resp.text[:1200],
+                )
             return None
 
         task_id = resp.json().get("_id") or resp.json().get("id")
@@ -236,6 +338,15 @@ async def _upload_and_index(video_path: Path, index_id: str, upload_id: str) -> 
 
             elif status in ("failed", "error"):
                 logger.warning(f"[twelvelabs] Indexing failed: {data}")
+                if ctx is not None:
+                    append_provider_error(
+                        ctx,
+                        provider="twelvelabs",
+                        stage="twelvelabs_stage",
+                        operation="poll_task",
+                        message=f"task status={status}",
+                        response_body_snippet=json.dumps(data, default=str)[:1200],
+                    )
                 return None
 
             logger.debug(f"[twelvelabs] Polling attempt {attempt + 1}/{poll_budget}: status={status}")
@@ -248,7 +359,7 @@ async def _upload_and_index(video_path: Path, index_id: str, upload_id: str) -> 
         return None
 
 
-async def _generate_description(video_id: str) -> Optional[str]:
+async def _generate_description(video_id: str, *, ctx: Optional[JobContext] = None) -> Optional[str]:
     """Generate a detailed scene description using Pegasus generate endpoint."""
     headers = {"x-api-key": TWELVE_LABS_API_KEY, "Content-Type": "application/json"}
 
@@ -274,10 +385,20 @@ async def _generate_description(video_id: str) -> Optional[str]:
             return _extract_analyze_text(resp.text)
 
         logger.warning(f"[twelvelabs] Generate failed: {resp.status_code} {resp.text[:200]}")
+        if ctx is not None:
+            append_provider_error(
+                ctx,
+                provider="twelvelabs",
+                stage="twelvelabs_stage",
+                operation="generate_description",
+                message="analyze failed",
+                http_status=resp.status_code,
+                response_body_snippet=resp.text[:1200],
+            )
         return None
 
 
-async def _generate_title(video_id: str) -> Optional[str]:
+async def _generate_title(video_id: str, *, ctx: Optional[JobContext] = None) -> Optional[str]:
     """Generate a viral title suggestion."""
     headers = {"x-api-key": TWELVE_LABS_API_KEY, "Content-Type": "application/json"}
 
@@ -295,6 +416,73 @@ async def _generate_title(video_id: str) -> Optional[str]:
         if resp.status_code == 200:
             return _extract_analyze_text(resp.text).strip()
 
+        if ctx is not None:
+            append_provider_error(
+                ctx,
+                provider="twelvelabs",
+                stage="twelvelabs_stage",
+                operation="generate_title",
+                message="analyze title failed",
+                http_status=resp.status_code,
+                response_body_snippet=resp.text[:1200],
+            )
+        return None
+
+
+def _parse_custom_queries(env_value: str) -> List[tuple]:
+    """Parse ``label1:prompt1|label2:prompt2`` env spec into [(label, prompt), ...].
+
+    Labels are slugified: lowercase, alphanumeric + underscore. Empty
+    labels and malformed pairs are silently dropped. Useful for niche-
+    specific prompts the user wants on every clip (e.g. "list_brands",
+    "memorable_quote", "location_clue").
+    """
+    out: List[tuple] = []
+    for chunk in env_value.split("|"):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        label, _, prompt = chunk.partition(":")
+        label_slug = "".join(
+            ch if ch.isalnum() or ch == "_" else "_"
+            for ch in label.strip().lower()
+        )
+        prompt = prompt.strip()
+        if not label_slug or not prompt:
+            continue
+        out.append((label_slug, prompt))
+    return out[:6]
+
+
+async def _generate_custom(video_id: str, prompt_text: str, *, ctx: Optional[JobContext] = None) -> Optional[str]:
+    """Run a single Twelve Labs analyze with a user-supplied prompt."""
+    if not prompt_text or not video_id:
+        return None
+    headers = {"x-api-key": TWELVE_LABS_API_KEY, "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{TL_BASE_URL}/analyze",
+            headers=headers,
+            json={
+                "video_id": video_id,
+                "prompt": prompt_text,
+                "temperature": 0.2,
+            },
+        )
+        if resp.status_code == 200:
+            txt = _extract_analyze_text(resp.text).strip()
+            return txt or None
+        logger.warning("[twelvelabs] custom analyze failed %s: %s", resp.status_code, resp.text[:200])
+        if ctx is not None:
+            append_provider_error(
+                ctx,
+                provider="twelvelabs",
+                stage="twelvelabs_stage",
+                operation="generate_custom",
+                message=f"custom analyze failed: {prompt_text[:120]}",
+                http_status=resp.status_code,
+                response_body_snippet=resp.text[:1200],
+            )
         return None
 
 

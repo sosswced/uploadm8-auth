@@ -14,7 +14,6 @@ OUTBOUND_RL_PROFILE
 
 Per-provider overrides (optional integers):
     OUTBOUND_OPENAI_MAX_CONCURRENT, OUTBOUND_OPENAI_MIN_INTERVAL_MS
-    OUTBOUND_PLAYWRIGHT_MAX_CONCURRENT, OUTBOUND_PLAYWRIGHT_MIN_INTERVAL_MS
     OUTBOUND_META_MAX_CONCURRENT, OUTBOUND_META_MIN_INTERVAL_MS
     OUTBOUND_TIKTOK_MAX_CONCURRENT, OUTBOUND_TIKTOK_MIN_INTERVAL_MS
 
@@ -53,7 +52,6 @@ _PROFILE = os.environ.get("OUTBOUND_RL_PROFILE", "standard").strip().lower()
 _PRESETS: Dict[str, Dict[str, tuple]] = {
     "strict": {
         "openai": (2, 400),
-        "playwright": (1, 200),
         "meta": (2, 300),
         "tiktok": (2, 300),
         "serpapi": (2, 400),
@@ -61,7 +59,6 @@ _PRESETS: Dict[str, Dict[str, tuple]] = {
     },
     "standard": {
         "openai": (4, 0),
-        "playwright": (2, 0),
         "meta": (4, 0),
         "tiktok": (4, 0),
         "serpapi": (4, 0),
@@ -69,7 +66,6 @@ _PRESETS: Dict[str, Dict[str, tuple]] = {
     },
     "relaxed": {
         "openai": (8, 0),
-        "playwright": (4, 0),
         "meta": (8, 0),
         "tiktok": (8, 0),
         "serpapi": (8, 0),
@@ -77,7 +73,6 @@ _PRESETS: Dict[str, Dict[str, tuple]] = {
     },
     "enterprise": {
         "openai": (16, 0),
-        "playwright": (8, 0),
         "meta": (16, 0),
         "tiktok": (16, 0),
         "serpapi": (16, 0),
@@ -150,14 +145,14 @@ def _get_gate(name: str) -> _Gate:
 @asynccontextmanager
 async def outbound_slot(provider: str):
     """
-    Gate outbound calls: openai (Whisper + GPT + image API), playwright, meta, tiktok,
+    Gate outbound calls: openai (Whisper + GPT + image API), meta, tiktok,
     serpapi, youtube_data (trend intel).
     """
     if not _OUTBOUND_ENABLED:
         yield
         return
     p = (provider or "").strip().lower()
-    if p not in ("openai", "playwright", "meta", "tiktok", "serpapi", "youtube_data"):
+    if p not in ("openai", "meta", "tiktok", "serpapi", "youtube_data"):
         yield
         return
     async with _get_gate(p).acquire():
@@ -168,7 +163,7 @@ def startup_log_line() -> str:
     if not _OUTBOUND_ENABLED:
         return "outbound_rl: disabled (OUTBOUND_RL_ENABLED=0)"
     parts = [f"profile={_PROFILE}"]
-    for k in ("openai", "playwright", "meta", "tiktok", "serpapi", "youtube_data"):
+    for k in ("openai", "meta", "tiktok", "serpapi", "youtube_data"):
         mc, mi = _resolved_limits(k)
         parts.append(f"{k}=conc:{mc},space_ms:{int(mi)}")
     return "outbound_rl: " + " ".join(parts)

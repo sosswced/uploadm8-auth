@@ -30,12 +30,9 @@ def init_pipeline_diag(ctx: JobContext, upload_record: dict, *, is_deferred: boo
         "aiServiceAudioSignals",
         "aiServiceMusicDetection",
         "aiServiceAudioSummary",
-        "aiServiceEmotionSignals",
         "aiServiceCaptionWriter",
         "aiServiceThumbnailDesigner",
-        "aiServiceFrameInspector",
         "aiServiceSpeechToText",
-        "aiServiceVideoAnalyzer",
         "aiServiceSceneUnderstanding",
     )
     toggles: Dict[str, bool] = {}
@@ -71,8 +68,7 @@ def init_pipeline_diag(ctx: JobContext, upload_record: dict, *, is_deferred: boo
                 "WORKER_HEAVY_PIPELINE_SLOTS": int(os.environ.get("WORKER_HEAVY_PIPELINE_SLOTS", "1") or 1),
                 "PUBLISH_CONCURRENCY": int(os.environ.get("PUBLISH_CONCURRENCY", "5") or 5),
                 "PUBLISH_PARALLEL": _bool_env("PUBLISH_PARALLEL"),
-                "VIDEO_INTELLIGENCE_ENABLED": _bool_env("VIDEO_INTELLIGENCE_ENABLED"),
-                "TWELVELABS_ENABLED": _bool_env("TWELVELABS_ENABLED"),
+                "TWELVE_LABS_API_KEY_SET": bool((os.environ.get("TWELVE_LABS_API_KEY") or "").strip()),
                 "RENDER_SERVICE_ID": os.environ.get("RENDER_SERVICE_ID") or None,
                 "RENDER_INSTANCE_ID": os.environ.get("RENDER_INSTANCE_ID") or None,
             },

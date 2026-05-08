@@ -25,12 +25,13 @@ import json
 import logging
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
 
 from .context import JobContext
 from .errors import StageError, SkipStage, ErrorCode
+from .ffmpeg_env import resolve_ffmpeg_executable
 
 logger = logging.getLogger("uploadm8-worker.transcode")
 
@@ -151,7 +152,7 @@ class VideoInfo:
 async def get_video_info(video_path: Path) -> VideoInfo:
     """Use ffprobe to get video metadata"""
     cmd = [
-        "ffprobe",
+        resolve_ffmpeg_executable("ffprobe") or "ffprobe",
         "-v", "quiet",
         "-print_format", "json",
         "-show_format",
@@ -335,14 +336,17 @@ def build_ffmpeg_command(
     info: VideoInfo,
     platform: str,
     reframe_action: str,
+    *,
+    force_duration_trim_sec: Optional[float] = None,
 ) -> list:
     """Build platform-specific FFmpeg command"""
     spec = PLATFORM_SPECS.get(platform, PLATFORM_SPECS["tiktok"])
 
     needs_silent_audio = not info.audio_codec
 
+    ff = resolve_ffmpeg_executable() or "ffmpeg"
     cmd = [
-        "ffmpeg",
+        ff,
         "-y",                           # Overwrite output
         "-i", str(input_path),
     ]
@@ -423,9 +427,12 @@ def build_ffmpeg_command(
         cmd.extend(["-r", str(spec["max_fps"])])
 
     # -- Duration trimming --
-    if spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
-        # Trim 0.5s before max to avoid edge-case frame overrun
+    trim_to: Optional[float] = None
+    if force_duration_trim_sec and force_duration_trim_sec > 0 and info.duration > force_duration_trim_sec:
+        trim_to = max(1.0, force_duration_trim_sec - 0.5)
+    elif spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
         trim_to = max(1.0, spec["max_duration"] - 0.5)
+    if trim_to is not None:
         cmd.extend(["-t", f"{trim_to:.3f}"])
 
     # -- Audio settings --
@@ -472,6 +479,8 @@ async def transcode_video(
     reframe_action: str,
     db_pool=None,
     upload_id: str = None,
+    *,
+    force_duration_trim_sec: Optional[float] = None,
 ) -> Path:
     """Transcode a video to a platform-specific format.
     
@@ -479,7 +488,14 @@ async def transcode_video(
     and writes progress (0-100) to the uploads table every ~2 seconds so the
     frontend can display a live progress bar.
     """
-    cmd = build_ffmpeg_command(input_path, output_path, info, platform, reframe_action)
+    cmd = build_ffmpeg_command(
+        input_path,
+        output_path,
+        info,
+        platform,
+        reframe_action,
+        force_duration_trim_sec=force_duration_trim_sec,
+    )
 
     cmd_preview = " ".join(cmd[:15]) + "..."
     logger.info(
@@ -707,9 +723,10 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
 # -------------------------------------------------------------------------
 async def check_ffmpeg_available() -> bool:
     """Check if FFmpeg is installed and accessible"""
+    exe = resolve_ffmpeg_executable() or "ffmpeg"
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-version",
+            exe, "-version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )

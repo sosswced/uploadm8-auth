@@ -9,16 +9,16 @@ Use cases:
   - Shot change timestamps for editing / highlight detection
   - Feed into caption/thumbnail brief via ctx.video_intelligence_context
 
-Input: inline bytes (local file) when size <= VIDEO_INTELLIGENCE_MAX_BYTES (default 10MB),
+Input: inline bytes (local file) when size <= VIDEO_INTELLIGENCE_MAX_BYTES (default 100 MiB),
        OR gs:// URI when VIDEO_INTELLIGENCE_INPUT_URI is set.
 
 Env:
-  VIDEO_INTELLIGENCE_ENABLED   (default false — costs apply)
-  VIDEO_INTELLIGENCE_MAX_BYTES (default 10485760)
-  VIDEO_INTELLIGENCE_TIMEOUT_SEC (default 600)
-  VIDEO_INTELLIGENCE_INPUT_URI  Optional gs://... (skips local read)
-  VIDEO_INTELLIGENCE_MAX_DURATION_SEC  If >0, skip when video duration (from ffprobe) exceeds this
-                                       (long clips make the Google API wait very long).
+  VIDEO_INTELLIGENCE_MAX_BYTES (default 104857600 = 100 MiB; clamped 10 MiB - 1 GiB; loads full file into RAM)
+  VIDEO_INTELLIGENCE_TIMEOUT_SEC (default 1800)  LRO wait for annotate_video result()
+  VIDEO_INTELLIGENCE_INPUT_URI  Optional gs://... (skips local read; best for huge files)
+  VIDEO_INTELLIGENCE_MAX_DURATION_SEC  If >0, skip when ffprobe duration exceeds this seconds.
+                                       Default 0 = never skip on our side. Google still documents ~3h max
+                                       per annotate request; longer clips may fail or need gs:// input.
   VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE  If false, label detection only (often faster than +shots).
 """
 
@@ -33,17 +33,79 @@ from typing import Any, Dict, List, Optional
 
 from .errors import SkipStage
 from .context import JobContext
+from services.provider_error_trace import append_provider_error
 
 logger = logging.getLogger("uploadm8-worker")
 
-VIDEO_INTELLIGENCE_ENABLED = os.environ.get("VIDEO_INTELLIGENCE_ENABLED", "false").lower() == "true"
-VIDEO_INTELLIGENCE_MAX_BYTES = int(os.environ.get("VIDEO_INTELLIGENCE_MAX_BYTES", str(10 * 1024 * 1024)))
-VIDEO_INTELLIGENCE_TIMEOUT_SEC = int(os.environ.get("VIDEO_INTELLIGENCE_TIMEOUT_SEC", "600"))
+# Caption-accuracy defaults: fewer inline rejects, long enough LRO wait to match worker stage budget.
+_VI_DEFAULT_MAX_BYTES = 100 * 1024 * 1024  # 100 MiB
+_VI_MIN_MAX_BYTES = 10 * 1024 * 1024  # env floor
+_VI_ABS_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB ceiling (RAM / safety)
+_VI_DEFAULT_TIMEOUT_SEC = 1800  # 30 min
+_GOOGLE_VI_ANNOTATE_MAX_DURATION_SEC = 3 * 3600  # Google documents ~3h per annotate (label/shots)
+
+
+def _parse_vi_max_bytes() -> int:
+    raw = (os.environ.get("VIDEO_INTELLIGENCE_MAX_BYTES") or "").strip()
+    if not raw:
+        return _VI_DEFAULT_MAX_BYTES
+    try:
+        v = int(raw, 10)
+    except ValueError:
+        return _VI_DEFAULT_MAX_BYTES
+    return max(_VI_MIN_MAX_BYTES, min(v, _VI_ABS_MAX_BYTES))
+
+
+def _parse_vi_timeout_sec() -> int:
+    raw = (os.environ.get("VIDEO_INTELLIGENCE_TIMEOUT_SEC") or "").strip()
+    if not raw:
+        return _VI_DEFAULT_TIMEOUT_SEC
+    try:
+        v = int(raw, 10)
+    except ValueError:
+        return _VI_DEFAULT_TIMEOUT_SEC
+    return max(120, min(v, 7200))
+
+
+def _parse_vi_max_duration_sec() -> float:
+    """0 = do not skip by duration (maximize VI coverage). Negative treated as 0."""
+    raw = (os.environ.get("VIDEO_INTELLIGENCE_MAX_DURATION_SEC") or "0").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, v)
+
+
+VIDEO_INTELLIGENCE_MAX_BYTES = _parse_vi_max_bytes()
+VIDEO_INTELLIGENCE_TIMEOUT_SEC = _parse_vi_timeout_sec()
 VIDEO_INTELLIGENCE_INPUT_URI = (os.environ.get("VIDEO_INTELLIGENCE_INPUT_URI") or "").strip()
-VIDEO_INTELLIGENCE_MAX_DURATION_SEC = float(os.environ.get("VIDEO_INTELLIGENCE_MAX_DURATION_SEC", "0") or 0)
+VIDEO_INTELLIGENCE_MAX_DURATION_SEC = _parse_vi_max_duration_sec()
 VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE = (
     os.environ.get("VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE", "true").lower() == "true"
 )
+
+# ---------------------------------------------------------------------------
+# Phase-3 features (default ON — moves us from "labels only" to full coverage).
+# Each one can still be disabled per-deployment via env to control GCP spend.
+# ---------------------------------------------------------------------------
+VIDEO_INTELLIGENCE_INCLUDE_OBJECT_TRACKING = (
+    os.environ.get("VIDEO_INTELLIGENCE_INCLUDE_OBJECT_TRACKING", "true").lower() == "true"
+)
+VIDEO_INTELLIGENCE_INCLUDE_TEXT_DETECTION = (
+    os.environ.get("VIDEO_INTELLIGENCE_INCLUDE_TEXT_DETECTION", "true").lower() == "true"
+)
+VIDEO_INTELLIGENCE_INCLUDE_PERSON_DETECTION = (
+    os.environ.get("VIDEO_INTELLIGENCE_INCLUDE_PERSON_DETECTION", "true").lower() == "true"
+)
+VIDEO_INTELLIGENCE_INCLUDE_LOGO_RECOGNITION = (
+    os.environ.get("VIDEO_INTELLIGENCE_INCLUDE_LOGO_RECOGNITION", "true").lower() == "true"
+)
+# Confidence floors prevent low-quality noise from dominating downstream copy.
+VI_OBJECT_CONF_MIN = float(os.environ.get("VIDEO_INTELLIGENCE_OBJECT_CONF_MIN", "0.55") or 0.55)
+VI_LOGO_CONF_MIN = float(os.environ.get("VIDEO_INTELLIGENCE_LOGO_CONF_MIN", "0.50") or 0.50)
+VI_TEXT_CONF_MIN = float(os.environ.get("VIDEO_INTELLIGENCE_TEXT_CONF_MIN", "0.55") or 0.55)
+VI_PERSON_CONF_MIN = float(os.environ.get("VIDEO_INTELLIGENCE_PERSON_CONF_MIN", "0.55") or 0.55)
 
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gvi")
 
@@ -84,12 +146,39 @@ def _offset_to_seconds(ts: Any) -> float:
         return 0.0
 
 
+def _normalized_to_pct(box: Any) -> Optional[Dict[str, float]]:
+    """Convert a NormalizedBoundingBox to a {left,top,right,bottom} 0..1 dict."""
+    if box is None:
+        return None
+    try:
+        return {
+            "left": round(float(getattr(box, "left", 0.0) or 0.0), 4),
+            "top": round(float(getattr(box, "top", 0.0) or 0.0), 4),
+            "right": round(float(getattr(box, "right", 0.0) or 0.0), 4),
+            "bottom": round(float(getattr(box, "bottom", 0.0) or 0.0), 4),
+        }
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _parse_annotation_result(result: Any) -> Dict[str, Any]:
-    """Parse AnnotateVideoResponse into a compact JSON-friendly dict."""
+    """Parse AnnotateVideoResponse into a compact JSON-friendly dict.
+
+    Output keys:
+      - segment_labels / shot_labels / shots / top_labels / summary_text (legacy)
+      - object_tracks         (OBJECT_TRACKING)
+      - on_screen_text        (TEXT_DETECTION across full video, not just sampled frames)
+      - person_segments       (PERSON_DETECTION timeline + pose hints when available)
+      - logos                 (LOGO_RECOGNITION brand callouts: Tesla, In-N-Out, etc.)
+    """
     out: Dict[str, Any] = {
         "segment_labels": [],
         "shot_labels": [],
         "shots": [],
+        "object_tracks": [],
+        "on_screen_text": [],
+        "person_segments": [],
+        "logos": [],
         "summary_text": "",
     }
     try:
@@ -126,11 +215,124 @@ def _parse_annotation_result(result: Any) -> Dict[str, Any]:
                     "start_s": round(_offset_to_seconds(st), 3),
                     "end_s": round(_offset_to_seconds(en), 3),
                 })
+
+            # ── OBJECT TRACKING ─────────────────────────────────────────────
+            for ot in getattr(ar, "object_annotations", None) or []:
+                ent = getattr(ot, "entity", None)
+                desc = (getattr(ent, "description", None) or "").strip()
+                conf = float(getattr(ot, "confidence", None) or 0.0)
+                if conf < VI_OBJECT_CONF_MIN:
+                    continue
+                seg = getattr(ot, "segment", None)
+                start_s = _offset_to_seconds(getattr(seg, "start_time_offset", None)) if seg else 0.0
+                end_s = _offset_to_seconds(getattr(seg, "end_time_offset", None)) if seg else 0.0
+                # Sample first/middle/last frame boxes for thumbnail keyframe selection.
+                frames = getattr(ot, "frames", None) or []
+                if frames:
+                    sample_idx = sorted({0, len(frames) // 2, max(0, len(frames) - 1)})
+                    frame_samples = []
+                    for i in sample_idx:
+                        try:
+                            f = frames[i]
+                            ts = _offset_to_seconds(getattr(f, "time_offset", None))
+                            box = _normalized_to_pct(getattr(f, "normalized_bounding_box", None))
+                            frame_samples.append({"t_s": round(ts, 3), "box": box})
+                        except (IndexError, AttributeError):
+                            continue
+                else:
+                    frame_samples = []
+                out["object_tracks"].append({
+                    "description": desc,
+                    "confidence": round(conf, 4),
+                    "start_s": round(start_s, 3),
+                    "end_s": round(end_s, 3),
+                    "frames": frame_samples,
+                })
+
+            # ── TEXT DETECTION (full-clip OCR) ──────────────────────────────
+            for td in getattr(ar, "text_annotations", None) or []:
+                text_val = (getattr(td, "text", None) or "").strip()
+                if not text_val:
+                    continue
+                segments = getattr(td, "segments", None) or []
+                best_seg = None
+                for s in segments:
+                    conf = float(getattr(s, "confidence", None) or 0.0)
+                    if best_seg is None or conf > best_seg["conf"]:
+                        seg_obj = getattr(s, "segment", None)
+                        st = getattr(seg_obj, "start_time_offset", None) if seg_obj else None
+                        en = getattr(seg_obj, "end_time_offset", None) if seg_obj else None
+                        best_seg = {
+                            "conf": conf,
+                            "start_s": round(_offset_to_seconds(st), 3),
+                            "end_s": round(_offset_to_seconds(en), 3),
+                        }
+                if best_seg and best_seg["conf"] < VI_TEXT_CONF_MIN:
+                    continue
+                out["on_screen_text"].append({
+                    "text": text_val,
+                    "confidence": round((best_seg or {"conf": 0.0})["conf"], 4),
+                    "start_s": (best_seg or {}).get("start_s", 0.0),
+                    "end_s": (best_seg or {}).get("end_s", 0.0),
+                })
+
+            # ── PERSON DETECTION (timeline + pose hints) ────────────────────
+            for pd in getattr(ar, "person_detection_annotations", None) or []:
+                tracks = getattr(pd, "tracks", None) or []
+                for tr in tracks:
+                    seg = getattr(tr, "segment", None)
+                    start_s = _offset_to_seconds(getattr(seg, "start_time_offset", None)) if seg else 0.0
+                    end_s = _offset_to_seconds(getattr(seg, "end_time_offset", None)) if seg else 0.0
+                    conf = float(getattr(tr, "confidence", None) or 0.0)
+                    if conf and conf < VI_PERSON_CONF_MIN:
+                        continue
+                    # Collect attribute / landmark hints (pose, clothing) when present.
+                    attributes: List[str] = []
+                    timestamped_objects = getattr(tr, "timestamped_objects", None) or []
+                    for tso in timestamped_objects[:8]:
+                        for attr in getattr(tso, "attributes", None) or []:
+                            name = (getattr(attr, "name", None) or "").strip()
+                            val = (getattr(attr, "value", None) or "").strip()
+                            if name and val and len(attributes) < 6:
+                                attributes.append(f"{name}={val}")
+                    out["person_segments"].append({
+                        "confidence": round(conf, 4),
+                        "start_s": round(start_s, 3),
+                        "end_s": round(end_s, 3),
+                        "attributes": attributes,
+                    })
+
+            # ── LOGO RECOGNITION (brand callouts) ───────────────────────────
+            for lr in getattr(ar, "logo_recognition_annotations", None) or []:
+                ent = getattr(lr, "entity", None)
+                desc = (getattr(ent, "description", None) or "").strip()
+                if not desc:
+                    continue
+                tracks = getattr(lr, "tracks", None) or []
+                best_conf = 0.0
+                start_s = 0.0
+                end_s = 0.0
+                for tr in tracks:
+                    conf = float(getattr(tr, "confidence", None) or 0.0)
+                    if conf >= best_conf:
+                        best_conf = conf
+                        seg = getattr(tr, "segment", None)
+                        if seg is not None:
+                            start_s = _offset_to_seconds(getattr(seg, "start_time_offset", None))
+                            end_s = _offset_to_seconds(getattr(seg, "end_time_offset", None))
+                if best_conf < VI_LOGO_CONF_MIN:
+                    continue
+                out["logos"].append({
+                    "description": desc,
+                    "confidence": round(best_conf, 4),
+                    "start_s": round(start_s, 3),
+                    "end_s": round(end_s, 3),
+                })
     except (TypeError, ValueError, AttributeError) as e:
         logger.warning("[video_intelligence] parse failed: %s", e)
         out["parse_error"] = str(e)
 
-    # Dedupe segment labels by description, keep highest confidence
+    # ── Top-N rollups for downstream consumers ──────────────────────────────
     best: Dict[str, float] = {}
     for row in out["segment_labels"]:
         d = row.get("description") or ""
@@ -139,12 +341,77 @@ def _parse_annotation_result(result: Any) -> Dict[str, Any]:
             best[d] = c
     top = sorted(best.items(), key=lambda x: -x[1])[:24]
     out["top_labels"] = [f"{d} ({c:.2f})" for d, c in top]
-    out["summary_text"] = (
-        "Video Intelligence labels: " + ", ".join(d for d, _ in top[:15])
-        if top
-        else ""
-    )
+
+    out["object_tracks"].sort(key=lambda x: -float(x.get("confidence") or 0))
+    out["object_tracks"] = out["object_tracks"][:24]
+    out["on_screen_text"].sort(key=lambda x: -float(x.get("confidence") or 0))
+    out["on_screen_text"] = out["on_screen_text"][:32]
+    out["person_segments"].sort(key=lambda x: -float(x.get("confidence") or 0))
+    out["person_segments"] = out["person_segments"][:16]
+    out["logos"].sort(key=lambda x: -float(x.get("confidence") or 0))
+    out["logos"] = out["logos"][:16]
+
+    summary_bits = []
+    if top:
+        summary_bits.append("labels: " + ", ".join(d for d, _ in top[:10]))
+    if out["object_tracks"]:
+        summary_bits.append(
+            "objects: "
+            + ", ".join(
+                f"{o['description']} ({o['start_s']:.0f}-{o['end_s']:.0f}s)"
+                for o in out["object_tracks"][:5]
+            )
+        )
+    if out["logos"]:
+        summary_bits.append("logos: " + ", ".join(l["description"] for l in out["logos"][:5]))
+    if out["on_screen_text"]:
+        summary_bits.append(
+            "OCR: "
+            + ", ".join(
+                (t["text"][:40] + ("…" if len(t["text"]) > 40 else ""))
+                for t in out["on_screen_text"][:4]
+            )
+        )
+    if out["person_segments"]:
+        summary_bits.append(f"people: {len(out['person_segments'])} segment(s)")
+    out["summary_text"] = "Video Intelligence — " + " | ".join(summary_bits) if summary_bits else ""
     return out
+
+
+def _build_vi_features(vi_module: Any) -> List[Any]:
+    """Compose the features list for an annotate_video request.
+
+    Each feature is gated by an env flag so deployments can opt out of the
+    pricier ones (object/text/person/logo). Defaults to ALL ON because the
+    user explicitly requested full coverage.
+    """
+    features: List[Any] = [vi_module.Feature.LABEL_DETECTION]
+    if VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE:
+        try:
+            features.append(vi_module.Feature.SHOT_CHANGE_DETECTION)
+        except AttributeError as e:
+            logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable: %s", e)
+    if VIDEO_INTELLIGENCE_INCLUDE_OBJECT_TRACKING:
+        try:
+            features.append(vi_module.Feature.OBJECT_TRACKING)
+        except AttributeError as e:
+            logger.debug("video_intelligence: OBJECT_TRACKING unavailable: %s", e)
+    if VIDEO_INTELLIGENCE_INCLUDE_TEXT_DETECTION:
+        try:
+            features.append(vi_module.Feature.TEXT_DETECTION)
+        except AttributeError as e:
+            logger.debug("video_intelligence: TEXT_DETECTION unavailable: %s", e)
+    if VIDEO_INTELLIGENCE_INCLUDE_PERSON_DETECTION:
+        try:
+            features.append(vi_module.Feature.PERSON_DETECTION)
+        except AttributeError as e:
+            logger.debug("video_intelligence: PERSON_DETECTION unavailable: %s", e)
+    if VIDEO_INTELLIGENCE_INCLUDE_LOGO_RECOGNITION:
+        try:
+            features.append(vi_module.Feature.LOGO_RECOGNITION)
+        except AttributeError as e:
+            logger.debug("video_intelligence: LOGO_RECOGNITION unavailable: %s", e)
+    return features
 
 
 def _analyze_sync_inline(video_bytes: bytes, creds: Any = None) -> Dict[str, Any]:
@@ -155,12 +422,7 @@ def _analyze_sync_inline(video_bytes: bytes, creds: Any = None) -> Dict[str, Any
         if creds is not None
         else vi.VideoIntelligenceServiceClient()
     )
-    features = [vi.Feature.LABEL_DETECTION]
-    if VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE:
-        try:
-            features.append(vi.Feature.SHOT_CHANGE_DETECTION)
-        except AttributeError as e:
-            logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable, labels only: %s", e)
+    features = _build_vi_features(vi)
     request = vi.AnnotateVideoRequest(
         input_content=video_bytes,
         features=features,
@@ -178,12 +440,7 @@ def _analyze_sync_gcs(uri: str, creds: Any = None) -> Dict[str, Any]:
         if creds is not None
         else vi.VideoIntelligenceServiceClient()
     )
-    features = [vi.Feature.LABEL_DETECTION]
-    if VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE:
-        try:
-            features.append(vi.Feature.SHOT_CHANGE_DETECTION)
-        except AttributeError as e:
-            logger.debug("video_intelligence: SHOT_CHANGE_DETECTION unavailable (GCS path), labels only: %s", e)
+    features = _build_vi_features(vi)
     request = vi.AnnotateVideoRequest(
         input_uri=uri,
         features=features,
@@ -199,16 +456,20 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
     """
     ctx.mark_stage("video_intelligence")
 
-    if not VIDEO_INTELLIGENCE_ENABLED:
-        raise SkipStage("Video Intelligence disabled (VIDEO_INTELLIGENCE_ENABLED=false)")
-
+    dur = _ctx_duration_sec(ctx)
     if VIDEO_INTELLIGENCE_MAX_DURATION_SEC > 0:
-        dur = _ctx_duration_sec(ctx)
         if dur is not None and dur > VIDEO_INTELLIGENCE_MAX_DURATION_SEC:
             raise SkipStage(
                 f"Video Intelligence skipped (duration {dur:.0f}s > "
                 f"{VIDEO_INTELLIGENCE_MAX_DURATION_SEC:.0f}s VIDEO_INTELLIGENCE_MAX_DURATION_SEC)"
             )
+    if dur is not None and dur > _GOOGLE_VI_ANNOTATE_MAX_DURATION_SEC:
+        logger.warning(
+            "[video_intelligence] duration=%.0fs exceeds Google annotate ~%ds limit; "
+            "request may fail. Use VIDEO_INTELLIGENCE_INPUT_URI=gs://bucket/object for large/long assets.",
+            dur,
+            _GOOGLE_VI_ANNOTATE_MAX_DURATION_SEC,
+        )
 
     creds_obj = _gcp_creds_for_vi()
     creds_path = _resolve_gcp_credentials_path()
@@ -230,16 +491,29 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
                 lambda: _analyze_sync_gcs(VIDEO_INTELLIGENCE_INPUT_URI, creds_obj),
             )
             ctx.video_intelligence_context = data
+            _publish_recognition_to_ctx(ctx, data)
             logger.info(
-                "[video_intelligence]  GCS uri labels=%d shots=%d",
+                "[video_intelligence] GCS labels=%d shots=%d objects=%d text=%d persons=%d logos=%d",
                 len(data.get("segment_labels") or []),
                 len(data.get("shots") or []),
+                len(data.get("object_tracks") or []),
+                len(data.get("on_screen_text") or []),
+                len(data.get("person_segments") or []),
+                len(data.get("logos") or []),
             )
             return ctx
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning("[video_intelligence] GCS analyze failed: %s", e)
+            append_provider_error(
+                ctx,
+                provider="google_video_intelligence",
+                stage="video_intelligence_stage",
+                operation="annotate_video_gcs",
+                message=str(e),
+                exception_type=type(e).__name__,
+            )
             ctx.video_intelligence_context = {"error": str(e)}
             return ctx
 
@@ -269,15 +543,52 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
             lambda: _analyze_sync_inline(video_bytes, creds_obj),
         )
         ctx.video_intelligence_context = data
+        _publish_recognition_to_ctx(ctx, data)
         logger.info(
-            "[video_intelligence]  inline labels=%d shots=%d",
+            "[video_intelligence] inline labels=%d shots=%d objects=%d text=%d persons=%d logos=%d",
             len(data.get("segment_labels") or []),
             len(data.get("shots") or []),
+            len(data.get("object_tracks") or []),
+            len(data.get("on_screen_text") or []),
+            len(data.get("person_segments") or []),
+            len(data.get("logos") or []),
         )
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.warning("[video_intelligence] Non-fatal error: %s", e)
+        append_provider_error(
+            ctx,
+            provider="google_video_intelligence",
+            stage="video_intelligence_stage",
+            operation="annotate_video_inline",
+            message=str(e),
+            exception_type=type(e).__name__,
+        )
         ctx.video_intelligence_context = {"error": str(e)}
 
     return ctx
+
+
+def _publish_recognition_to_ctx(ctx: JobContext, data: Dict[str, Any]) -> None:
+    """Mirror VI structured tracks onto ``ctx.video_intelligence`` for the
+    recognition aggregator + hydration enforcer.
+
+    The legacy ``video_intelligence_context`` keeps the full payload (we
+    don't want to break callers); ``video_intelligence`` is a smaller view
+    optimized for the must_use shortlist and hashtag generation.
+    """
+    if not isinstance(data, dict):
+        return
+    flat = {
+        "top_labels": list(data.get("top_labels") or []),
+        "segment_labels": list(data.get("segment_labels") or []),
+        "shot_labels": list(data.get("shot_labels") or []),
+        "object_tracks": list(data.get("object_tracks") or []),
+        "on_screen_text": list(data.get("on_screen_text") or []),
+        "person_segments": list(data.get("person_segments") or []),
+        "logos": list(data.get("logos") or []),
+        "shots": list(data.get("shots") or []),
+        "summary_text": data.get("summary_text") or "",
+    }
+    setattr(ctx, "video_intelligence", flat)

@@ -13,7 +13,8 @@ Flow:
   5. Detect content category (3-layer: user hint → filename → general)
   6. AI selection pass — send all candidates to GPT-4o-mini with
      category-specific selection criteria (picks the most ENGAGING frame
-     for the content type, not just the sharpest)
+     for the content type, not just the sharpest). Skipped when Thumbnail
+     Studio + Pikzels will render first (sharpest frame is enough as compositor input).
   7. Set ctx.thumbnail_path  = AI-selected (or sharpest as fallback)
      Set ctx.thumbnail_paths = all candidates in chronological order
      Set ctx.thumbnail_scores = {str(path): score} for all candidates
@@ -54,12 +55,34 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from core.content_attribution import (
+    normalize_thumbnail_render_pipeline,
+    normalize_thumbnail_selection_mode,
+)
+from core.thumbnail_text import (
+    CATEGORY_HEADLINE_FALLBACKS,
+    clean_thumbnail_headline,
+    is_generic_thumbnail_headline,
+)
+
 from .context import JobContext, THUMBNAIL_BRIEF_PROMPT
-from .errors import SkipStage
+from .errors import SkipStage, ThumbnailError
+from .ai_service_costs import user_pref_ai_service_enabled
+from .ffmpeg_env import resolve_ffmpeg_executable
+from services.hydration_payload import apply_hydration_payload_to_thumbnail_brief
+from services.thumbnail_studio import closeness_to_pikzels_image_weight
+from services.thumbnail_trace import trace_append
+
+from .pikzels_api import (
+    generate_pikzels_text_brief,
+    refine_thumbnail_with_pikzels_edit,
+    render_thumbnail_with_studio_renderer,
+    studio_renderer_enabled,
+)
 
 logger = logging.getLogger("uploadm8-worker.thumbnail")
 
@@ -69,6 +92,7 @@ MAX_THUMBNAIL_OFFSET     = 300.0
 MIN_THUMB_SIZE           = 2048          # bytes — smaller = rejected
 OPENAI_API_KEY           = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_THUMB_MODEL       = os.environ.get("OPENAI_THUMB_MODEL", "gpt-4o-mini")
+STRICT_STUDIO_ENV        = os.environ.get("UPLOADM8_THUMBNAIL_STRICT_STUDIO", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ============================================================
@@ -347,10 +371,11 @@ _CATEGORY_PRIORITY = [
 
 def _detect_category(ctx: JobContext) -> str:
     """
-    3-layer content category detection.
+    Multi-signal content category detection.
     Layer 1: user-provided caption/title hints
     Layer 2: filename keyword scan
-    Layer 3: fall back to 'general' (GPT identifies from frames in the prompt)
+    Layer 3: vision/audio/video-understanding/telemetry signals
+    Layer 4: fall back to 'general' (GPT identifies from frames in the prompt)
     """
     def _scan(text: str) -> Optional[str]:
         if not text:
@@ -375,8 +400,210 @@ def _detect_category(ctx: JobContext) -> str:
         logger.debug(f"Thumbnail category from filename: {result}")
         return result
 
+    evidence: List[str] = []
+    vu = ctx.video_understanding or {}
+    if isinstance(vu, dict):
+        for key in ("scene_description", "description", "title_suggestion", "summary"):
+            value = vu.get(key)
+            if isinstance(value, str) and value.strip():
+                evidence.append(value)
+
+    vi = ctx.video_intelligence_context or {}
+    if isinstance(vi, dict):
+        for key in ("labels", "label_names", "shot_labels", "objects", "ocr_text"):
+            value = vi.get(key)
+            if isinstance(value, list):
+                evidence.extend(str(x.get("description") if isinstance(x, dict) else x) for x in value[:24])
+            elif isinstance(value, str):
+                evidence.append(value)
+
+    vc = ctx.vision_context or {}
+    if isinstance(vc, dict):
+        for key in ("label_names", "landmark_names", "logo_names", "ocr_text"):
+            value = vc.get(key)
+            if isinstance(value, list):
+                evidence.extend(str(x) for x in value[:24])
+            elif isinstance(value, str):
+                evidence.append(value)
+
+    ac = ctx.audio_context or {}
+    if isinstance(ac, dict):
+        for key in ("suggested_keywords", "yamnet_events", "top_sound_class", "sound_profile", "music_title", "music_artist", "music_genre", "fusion_narrative"):
+            value = ac.get(key)
+            if isinstance(value, list):
+                evidence.extend(str(x) for x in value[:24])
+            elif isinstance(value, str):
+                evidence.append(value)
+
+    tel = ctx.telemetry_data or ctx.telemetry
+    if tel and ((getattr(tel, "max_speed_mph", 0) or 0) > 0 or getattr(tel, "location_road", None)):
+        evidence.append("dashcam road drive speed automotive route")
+
+    result = _scan(" ".join(x for x in evidence if x))
+    if result:
+        logger.debug(f"Thumbnail category from fused context: {result}")
+        return result
+
     logger.debug("Thumbnail category: general (GPT will identify from frames)")
     return "general"
+
+
+# ============================================================
+# Thumbnail Brief Guardrails
+# ============================================================
+
+def _first_list_value(data: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+                if isinstance(item, dict):
+                    for nested_key in ("name", "description", "text", "label"):
+                        nested = item.get(nested_key)
+                        if isinstance(nested, str) and nested.strip():
+                            return nested.strip()
+        elif isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _concrete_thumbnail_headline(ctx: JobContext, category: str) -> str:
+    """Build a truthful fallback headline from known context, never generic hype."""
+    cat = (category or "general").strip().lower()
+    tel = ctx.telemetry_data or ctx.telemetry
+    if tel:
+        mph = getattr(tel, "max_speed_mph", 0) or 0
+        if cat in {"automotive", "travel", "sports"} and mph and float(mph) >= 10:
+            return f"{float(mph):.0f} MPH RUN"
+        road = (getattr(tel, "location_road", None) or "").strip()
+        if cat in {"automotive", "travel"} and road:
+            cleaned = clean_thumbnail_headline(f"{road} drive", max_words=4)
+            if cleaned:
+                return cleaned
+
+    osd = ctx.dashcam_osd_context or {}
+    if isinstance(osd, dict):
+        mph = osd.get("max_speed_mph") or osd.get("peak_speed_mph")
+        try:
+            if cat in {"automotive", "travel", "sports"} and mph and float(mph) >= 10:
+                return f"{float(mph):.0f} MPH RUN"
+        except (TypeError, ValueError):
+            pass
+
+    vc = ctx.vision_context or {}
+    if isinstance(vc, dict):
+        concrete = _first_list_value(vc, "landmark_names", "logo_names", "labels", "label_names", "objects")
+        if concrete:
+            cleaned = clean_thumbnail_headline(concrete, max_words=4)
+            if cleaned and not is_generic_thumbnail_headline(cleaned):
+                return cleaned
+        ocr = str(vc.get("ocr_text") or "").strip()
+        if ocr:
+            cleaned = clean_thumbnail_headline(ocr, max_words=4)
+            if cleaned and not is_generic_thumbnail_headline(cleaned):
+                return cleaned
+
+    ac = ctx.audio_context or {}
+    if isinstance(ac, dict):
+        music = ac.get("music_title") or ac.get("track_title") or ac.get("title")
+        artist = ac.get("music_artist") or ac.get("artist")
+        if music or artist:
+            cleaned = clean_thumbnail_headline(" ".join(str(x) for x in (artist, music) if x), max_words=4)
+            if cleaned and not is_generic_thumbnail_headline(cleaned):
+                return cleaned
+
+    for source in (ctx.get_effective_title(), ctx.get_effective_caption(), ctx.filename):
+        cleaned = clean_thumbnail_headline(source, max_words=5)
+        if cleaned and not is_generic_thumbnail_headline(cleaned):
+            return cleaned
+
+    return CATEGORY_HEADLINE_FALLBACKS.get(category, CATEGORY_HEADLINE_FALLBACKS["general"])
+
+
+def _default_platform_plan() -> Dict[str, Dict[str, Any]]:
+    return {
+        "youtube": {"enabled": True, "canvas": "16:9"},
+        "instagram": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+        "facebook": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
+        "tiktok": {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5},
+    }
+
+
+def _sanitize_thumbnail_brief(ctx: JobContext, brief: Optional[Dict[str, Any]], category: str, *, note: str = "") -> Dict[str, Any]:
+    out: Dict[str, Any] = dict(brief or {})
+    brief_vars = ctx.get_thumbnail_brief_vars(category=category)
+    for src, dst in (
+        ("geo_context", "geo_context"),
+        ("osd_context", "osd_context"),
+        ("trill_context", "trill_context"),
+        ("music_context", "music_context"),
+        ("speech_context", "speech_context"),
+        ("signal_hashtags", "signal_hashtags"),
+        ("fusion_summary", "fusion_summary"),
+        ("hydration_story", "hydration_story"),
+    ):
+        v = str(brief_vars.get(src) or "").strip()
+        if v and not str(out.get(dst) or "").strip():
+            out[dst] = v
+
+    fallback = _concrete_thumbnail_headline(ctx, category)
+    selected = clean_thumbnail_headline(out.get("selected_headline"), max_words=5)
+    if is_generic_thumbnail_headline(selected):
+        selected = fallback
+    out["selected_headline"] = selected
+
+    options: List[str] = []
+    raw_options = out.get("headline_options") or []
+    if isinstance(raw_options, list):
+        for item in raw_options:
+            candidate = item.get("text") if isinstance(item, dict) else item
+            cleaned = clean_thumbnail_headline(candidate, max_words=5)
+            if cleaned and not is_generic_thumbnail_headline(cleaned) and cleaned not in options:
+                options.append(cleaned)
+    for candidate in (selected, fallback, CATEGORY_HEADLINE_FALLBACKS.get(category, "VIDEO HIGHLIGHT")):
+        cleaned = clean_thumbnail_headline(candidate, max_words=5)
+        if cleaned and cleaned not in options:
+            options.append(cleaned)
+    out["headline_options"] = options[:3]
+
+    badge = clean_thumbnail_headline(out.get("badge_text"), max_words=2)[:14]
+    tel = ctx.telemetry_data or ctx.telemetry
+    osd = ctx.dashcam_osd_context or {}
+    osd_speed = 0.0
+    if isinstance(osd, dict):
+        try:
+            osd_speed = float(osd.get("max_speed_mph") or osd.get("peak_speed_mph") or 0)
+        except (TypeError, ValueError):
+            osd_speed = 0.0
+    has_speed = bool((tel and (getattr(tel, "max_speed_mph", 0) or 0) > 0) or osd_speed > 0)
+    if badge in {"NEW", "FAST", "SPEED"} and not has_speed:
+        badge = ""
+    out["badge_text"] = badge
+    if out.get("badge_style") not in {"red", "yellow", "white", "black"}:
+        out["badge_style"] = "red"
+    if out.get("directional_element") not in {"arrow_up", "arrow_right", "circle", "glow_box"}:
+        out["directional_element"] = "circle"
+    if out.get("emotion_cue") not in {"shocked", "excited", "serious", "laughing"}:
+        out["emotion_cue"] = "serious"
+    if out.get("color_mood") not in {"red_black", "blue_black", "gold_black", "neon"}:
+        out["color_mood"] = "red_black"
+    if not isinstance(out.get("props"), list):
+        out["props"] = []
+
+    plan = _default_platform_plan()
+    raw_plan = out.get("platform_plan")
+    if isinstance(raw_plan, dict):
+        for platform, defaults in plan.items():
+            if isinstance(raw_plan.get(platform), dict):
+                merged = dict(defaults)
+                merged.update(raw_plan[platform])
+                plan[platform] = merged
+    out["platform_plan"] = plan
+    if note:
+        out["notes"] = note
+    return out
 
 
 # ============================================================
@@ -562,11 +789,7 @@ async def _generate_thumbnail_brief(ctx: JobContext, category: str) -> Optional[
         elif "```" in answer:
             answer = answer.split("```")[1].split("```")[0]
         brief = json.loads(answer)
-        # Ensure platform_plan exists with defaults
-        brief.setdefault("platform_plan", {})
-        for plat in ("youtube", "instagram", "facebook", "tiktok"):
-            brief["platform_plan"].setdefault(plat, {"enabled": True, "canvas": "16:9"})
-        return brief
+        return _sanitize_thumbnail_brief(ctx, brief, category)
     except (json.JSONDecodeError, KeyError) as e:
         logger.warning(f"Thumbnail brief parse failed: {e}")
         return None
@@ -640,7 +863,13 @@ def _render_template_thumbnail(
         font_large = ImageFont.load_default()
         font_badge = font_large
 
-    headline = (brief.get("selected_headline") or brief.get("headline_options", [""])[0] or "").upper()[:30]
+    headline = clean_thumbnail_headline(
+        brief.get("selected_headline") or brief.get("headline_options", [""])[0],
+        max_words=5,
+        max_chars=30,
+    )
+    if is_generic_thumbnail_headline(headline):
+        headline = ""
     badge_text = (brief.get("badge_text") or "").upper()[:12]
 
     # Badge colors
@@ -703,8 +932,16 @@ async def _ai_edit_thumbnail(
     """
     if not OPENAI_API_KEY:
         return False
+    headline = clean_thumbnail_headline(brief.get("selected_headline"), max_words=5, max_chars=34)
+    if is_generic_thumbnail_headline(headline):
+        headline = ""
+    text_instruction = (
+        f"Headline text (ALL CAPS): {headline}. "
+        if headline
+        else "Do not add headline text; no generic overlay phrases. "
+    )
     instruction = (
-        f"Add these elements to the image. Headline text (ALL CAPS): {brief.get('selected_headline', '')}. "
+        f"Add these elements to the image. {text_instruction}"
         f"Badge: {brief.get('badge_text', '')}. "
         f"Add a {brief.get('directional_element', 'circle')} highlight. "
         "No new objects except: arrow, badge, simple prop icons. "
@@ -757,7 +994,7 @@ async def _ai_edit_thumbnail(
 async def _get_video_duration(video_path: Path) -> float:
     """Return video duration in seconds via ffprobe. Returns 30.0 on failure."""
     cmd = [
-        "ffprobe", "-v", "quiet",
+        resolve_ffmpeg_executable("ffprobe") or "ffprobe", "-v", "quiet",
         "-print_format", "json",
         "-show_streams",
         str(video_path),
@@ -786,8 +1023,9 @@ async def _get_video_duration(video_path: Path) -> float:
 
 async def _extract_frame(video_path: Path, output_path: Path, offset: float) -> bool:
     """Extract a single JPEG frame at `offset` seconds. Returns True on success."""
+    _ffmpeg = resolve_ffmpeg_executable() or "ffmpeg"
     cmd = [
-        "ffmpeg", "-y",
+        _ffmpeg, "-y",
         "-ss", f"{offset:.3f}",
         "-i", str(video_path),
         "-vframes", "1",
@@ -825,8 +1063,9 @@ async def _score_sharpness(image_path: Path) -> float:
     Run FFmpeg blurdetect on a JPEG. Returns sharpness score (0–1, higher = sharper).
     Returns 0.0 on failure (triggers file-size fallback in caller).
     """
+    _ffmpeg = resolve_ffmpeg_executable() or "ffmpeg"
     cmd = [
-        "ffmpeg", "-i", str(image_path),
+        _ffmpeg, "-i", str(image_path),
         "-vf", "blurdetect=high=0.1",
         "-f", "null", "-",
     ]
@@ -858,14 +1097,16 @@ def _distribute_offsets(
     duration: float,
     n: int,
     user_offset: Optional[float] = None,
+    min_gap_seconds: Optional[float] = None,
 ) -> List[float]:
     """
-    Generate N evenly-spaced offsets across the video duration.
+    Generate N offsets across the video duration.
 
-    Anchors: first frame at 5% (avoids black intros), last at 90% (avoids fade-outs).
-    Middle N-2 frames distributed evenly between anchors.
-    n==1 uses user_offset if provided, else 30%.
-    All values clamped to [0.5, duration-0.5].
+    When ``min_gap_seconds`` is set (>0) and n>1, place frames starting near 5% duration
+    stepping by that many seconds (clamped), matching Upload Preferences "Thumbnail interval".
+
+    Otherwise: evenly-spaced anchors (5% … 90%) with distributed middles.
+    n==1 uses user_offset if provided, else 30%. All values clamped to [0.5, duration-0.5].
     """
     if duration <= 0:
         duration = 30.0
@@ -878,16 +1119,355 @@ def _distribute_offsets(
     if n == 1:
         return [clamp(user_offset if user_offset is not None else duration * 0.30)]
 
+    gap = float(min_gap_seconds) if min_gap_seconds is not None else 0.0
+    if gap > 0 and n > 1:
+        start = clamp(duration * 0.05)
+        end_limit = clamp(duration * 0.95)
+        pts: List[float] = []
+        t = start
+        while len(pts) < n and t <= end_limit + 1e-6:
+            pts.append(clamp(t))
+            t += gap
+        if len(pts) >= n:
+            return pts[:n]
+
     if n == 2:
         return [clamp(duration * 0.05), clamp(duration * 0.90)]
 
-    start  = clamp(duration * 0.05)
-    end    = clamp(duration * 0.90)
+    start = clamp(duration * 0.05)
+    end = clamp(duration * 0.90)
     middle_count = n - 2
-    step   = (end - start) / (middle_count + 1)
+    step = (end - start) / (middle_count + 1)
     middle = [clamp(start + step * (i + 1)) for i in range(middle_count)]
 
     return [start] + middle + [end]
+
+
+def _thumbnail_styled_render_order(
+    pipeline_pref: str,
+    *,
+    studio_ok: bool,
+    ai_edit_ok: bool,
+) -> List[str]:
+    """
+    Per-platform compositing attempts. Values: studio | ai_edit | template.
+    Mirrors ML attribution keys (thumbnailRenderPipeline).
+    """
+    p = (pipeline_pref or "auto").lower().strip()
+    if p not in ("auto", "studio_renderer", "ai_edit", "template", "none"):
+        p = "auto"
+    if p == "none":
+        return []
+    # When Pikzels/Studio is available we ALWAYS try it first, but we MUST keep
+    # ai_edit/template behind it so that a transient Pikzels failure (network
+    # blip, 4xx, empty response) still produces a styled cover instead of
+    # leaving the raw extracted frame as the published thumbnail. The previous
+    # behaviour of returning ["studio"] alone is what caused dashcam frames
+    # with burned-in OSD overlays to ship as final thumbnails.
+    if studio_ok:
+        chain: List[str] = ["studio"]
+        if ai_edit_ok:
+            chain.append("ai_edit")
+        chain.append("template")
+        return chain
+    if p == "template":
+        return ["template"]
+    if p == "ai_edit":
+        order: List[str] = []
+        if ai_edit_ok:
+            order.append("ai_edit")
+        order.append("template")
+        return order
+    out: List[str] = []
+    if ai_edit_ok:
+        out.append("ai_edit")
+    out.append("template")
+    return out
+
+
+def pikzels_studio_eligible_for_styled_thumbnail(
+    us: Dict[str, Any],
+    entitlements: Any,
+    *,
+    require_auto_thumbnails: bool = True,
+) -> bool:
+    """
+    Whether the Pikzels v2 studio renderer should run for styled thumbnails.
+
+    ``require_auto_thumbnails=False`` is for explicit user actions (e.g. API
+    "generate thumbnail") where auto-thumbnail scheduling prefs must not block Pikzels.
+    """
+    if require_auto_thumbnails and not (us.get("auto_thumbnails") or us.get("autoThumbnails")):
+        return False
+    render_pipeline_pref = normalize_thumbnail_render_pipeline(us)
+    if render_pipeline_pref == "none":
+        return False
+    can_custom = bool(getattr(entitlements, "can_custom_thumbnails", False) if entitlements else False)
+    styled_enabled = us.get("styled_thumbnails", us.get("styledThumbnails", True))
+    if not (can_custom and styled_enabled):
+        return False
+    designer_on = user_pref_ai_service_enabled(us, "thumbnail_ai", default=True)
+    ready = studio_renderer_enabled()
+
+    def _opt_in_default_true(*keys: str) -> bool:
+        for k in keys:
+            if k in us:
+                return bool(us.get(k))
+        return ready
+
+    studio_flow = _opt_in_default_true("thumbnail_studio_enabled", "thumbnailStudioEnabled")
+    use_studio_engine = _opt_in_default_true(
+        "thumbnail_studio_engine_enabled",
+        "thumbnailStudioEngineEnabled",
+        "thumbnail_pikzels_enabled",
+        "thumbnailPikzelsEnabled",
+    )
+    return bool(designer_on and studio_flow and use_studio_engine and ready)
+
+
+def _studio_persona_for_request(us: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
+    """Return Pikzels persona/style payload plus prompt options for the studio API.
+
+    Persona/style auto-enable rule:
+      A persona or style UUID being saved on the user is itself an *implicit*
+      opt-in to use it for this render. We only honor an explicit opt-out
+      (``thumbnail_persona_enabled = False``). This stops the silent failure
+      mode where users save a default persona but never flip the toggle, and
+      every published thumbnail comes back unstyled.
+    """
+    try:
+        strength = int(us.get("thumbnail_persona_strength") or us.get("thumbnailPersonaStrength") or 70)
+    except (TypeError, ValueError):
+        strength = 70
+    strength = max(0, min(100, strength))
+    opts: Dict[str, Any] = {"persona_strength": strength}
+
+    style_hint = (
+        us.get("thumbnail_style")
+        or us.get("thumbnailStyle")
+        or us.get("thumbnail_style_prompt")
+        or us.get("thumbnailStylePrompt")
+        or ""
+    )
+    if str(style_hint or "").strip():
+        opts["style_hint"] = str(style_hint).strip()[:180]
+
+    strategy = _thumbnail_default_strategy(us)
+    if strategy:
+        parts: List[str] = []
+        if strategy.get("layout_name") or strategy.get("layout_pattern"):
+            parts.append(
+                f"{str(strategy.get('layout_name') or '').strip()} {str(strategy.get('layout_pattern') or '').strip()}".strip()
+            )
+        if strategy.get("audience_niche"):
+            parts.append(f"audience {str(strategy.get('audience_niche')).replace('_', ' ')}")
+        if strategy.get("competitor_gap_mode"):
+            parts.append("competitor-gap variation")
+        if parts:
+            merged_hint = "; ".join(parts)
+            if opts.get("style_hint"):
+                merged_hint = f"{opts['style_hint']}; {merged_hint}"
+            opts["style_hint"] = merged_hint[:180]
+        rs = strategy.get("reference_strength")
+        if isinstance(rs, (int, float)):
+            try:
+                opts["image_weight"] = closeness_to_pikzels_image_weight(int(rs))
+            except (TypeError, ValueError):
+                pass
+
+    pkz_persona = str(
+        us.get("thumbnail_pikzels_persona_id")
+        or us.get("thumbnailPikzelsPersonaId")
+        or ""
+    ).strip()
+
+    # Loud warning for the silent-fail mode: user saved a default persona in
+    # Settings but ``merge_pikzels_thumbnail_persona_id`` couldn't resolve a
+    # linked Pikzels Pikzonality UUID for it (no ``pikzels_user_assets`` row,
+    # status != linked, or NULL ``pikzels_pikzonality_id``). Without this log
+    # the persona simply never gets applied and thumbnails keep returning
+    # unstyled — exactly the experience the user reported.
+    default_pid = str(
+        us.get("thumbnail_default_persona_id")
+        or us.get("thumbnailDefaultPersonaId")
+        or ""
+    ).strip()
+    if default_pid and not pkz_persona:
+        logger.warning(
+            "[thumb-renderer] user has thumbnail_default_persona_id=%s but no linked "
+            "Pikzels Pikzonality UUID was resolved (merge_pikzels_thumbnail_persona_id "
+            "found no row with status='linked' in pikzels_user_assets). Pikzels render "
+            "will run WITHOUT the user's saved persona. Re-link the persona in the "
+            "Thumbnail Studio or call /api/thumbnail-studio/personas/<id>/sync-pikzels.",
+            default_pid,
+        )
+
+    persona_pref_explicit = (
+        "thumbnail_persona_enabled" in us
+        or "thumbnailPersonaEnabled" in us
+    )
+    persona_explicit_disable = persona_pref_explicit and not bool(
+        us.get("thumbnail_persona_enabled")
+        if "thumbnail_persona_enabled" in us
+        else us.get("thumbnailPersonaEnabled")
+    )
+    if pkz_persona and not persona_explicit_disable:
+        return {"id": pkz_persona, "kind": "persona"}, opts
+
+    style_pkz = str(
+        us.get("thumbnail_pikzels_style_id")
+        or us.get("thumbnailPikzelsStyleId")
+        or us.get("thumbnail_style_pikzels_id")
+        or us.get("thumbnailStylePikzelsId")
+        or ""
+    ).strip()
+    style_pref_explicit = (
+        "thumbnail_style_enabled" in us
+        or "thumbnailStyleEnabled" in us
+        or "thumbnail_pikzels_style_enabled" in us
+        or "thumbnailPikzelsStyleEnabled" in us
+    )
+    style_explicit_disable = False
+    if style_pref_explicit:
+        for k in (
+            "thumbnail_style_enabled",
+            "thumbnailStyleEnabled",
+            "thumbnail_pikzels_style_enabled",
+            "thumbnailPikzelsStyleEnabled",
+        ):
+            if k in us:
+                style_explicit_disable = not bool(us.get(k))
+                break
+    if style_pkz and not style_explicit_disable:
+        return {"id": style_pkz, "kind": "style"}, opts
+
+    return None, opts
+
+
+def _thumbnail_default_strategy(us: Dict[str, Any]) -> Dict[str, Any]:
+    raw = us.get("thumbnail_studio_default_strategy")
+    if raw is None:
+        raw = us.get("thumbnailStudioDefaultStrategy")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _apply_thumbnail_default_strategy(
+    brief: Dict[str, Any],
+    us: Dict[str, Any],
+    *,
+    category: str,
+) -> Dict[str, Any]:
+    """
+    Apply the user's selected Studio variation as a durable upload-time strategy.
+
+    The strategy supplies layout/audience/reference rules. Hydration from the current
+    upload still fills speech/music/geo/vision details, so outputs stay consistent in
+    structure but adapt to each video.
+    """
+    strategy = _thumbnail_default_strategy(us)
+    if not strategy:
+        return brief
+    b = dict(brief or {})
+    bits: List[str] = []
+    layout_name = str(strategy.get("layout_name") or "").strip()
+    layout_pattern = str(strategy.get("layout_pattern") or "").strip()
+    if layout_name or layout_pattern:
+        bits.append(
+            f"Default layout strategy: {layout_name} {layout_pattern}".strip()[:260]
+        )
+    audience = str(strategy.get("audience_niche") or category or "").strip()
+    if audience:
+        bits.append(f"Audience/niche: {audience.replace('_', ' ')}."[:160])
+    if strategy.get("competitor_gap_mode"):
+        bits.append("Differentiate from common competitor thumbnails while preserving the selected layout family.")
+    pos = str(strategy.get("text_position") or "").strip()
+    contrast = str(strategy.get("contrast_profile") or "").replace("_", " ").strip()
+    emotion = str(strategy.get("emotion") or "").strip()
+    visual_bits = [x for x in (emotion and f"{emotion} emotion", pos and f"{pos} text", contrast and f"{contrast} contrast") if x]
+    if visual_bits:
+        bits.append("Visual style: " + ", ".join(visual_bits) + ".")
+    if bits:
+        existing = str(b.get("notes") or "").strip()
+        joined = " ".join(bits)
+        b["notes"] = (existing + " " + joined).strip()[:700]
+        b["default_strategy"] = strategy
+    return b
+
+
+def _strict_studio_mode_enabled(us: Dict[str, Any]) -> bool:
+    """Fail fast when Studio isn't available or cannot render a platform cover."""
+    if STRICT_STUDIO_ENV:
+        return True
+    raw = us.get("thumbnail_studio_strict")
+    if raw is None:
+        raw = us.get("thumbnailStudioStrict")
+    if raw is None:
+        raw = us.get("thumbnail_pikzels_strict")
+    if raw is None:
+        raw = us.get("thumbnailPikzelsStrict")
+    return bool(raw)
+
+
+def _hydration_pikzels_edit_enabled() -> bool:
+    v = (os.environ.get("THUMBNAIL_HYDRATION_PIKZELS_EDIT") or "1").strip().lower()
+    return v not in ("0", "false", "off", "no", "disabled")
+
+
+def _upload_requests_thumbnail_render(us: Dict[str, Any]) -> bool:
+    """
+    True when upload-scoped prefs explicitly request thumbnail rendering.
+
+    Presign can snapshot per-upload overrides like ``thumbnail_use_pikzels`` /
+    ``thumbnail_use_studio_engine`` into ``uploads.user_preferences``. Those
+    jobs should still render thumbnails even if account-level auto_thumbnails is
+    disabled.
+    """
+    for key in (
+        "thumbnail_pikzels_enabled",
+        "thumbnailPikzelsEnabled",
+        "thumbnail_studio_engine_enabled",
+        "thumbnailStudioEngineEnabled",
+        "thumbnail_studio_enabled",
+        "thumbnailStudioEnabled",
+    ):
+        if bool(us.get(key)):
+            return True
+    return False
+
+
+def _thumbnail_hydration_edit_prompt(brief: Dict[str, Any]) -> str:
+    """Short edit prompt when the brief already carries fused geo/speech/music/OSD signals."""
+    if not isinstance(brief, dict):
+        return ""
+    pairs: List[str] = []
+    for key, label in (
+        ("fusion_summary", "Scene intelligence"),
+        ("geo_context", "Location / route"),
+        ("speech_context", "Speech transcript"),
+        ("music_context", "Recognized audio"),
+        ("osd_context", "Dashcam HUD"),
+        ("trill_context", "Driving energy"),
+        ("signal_hashtags", "Evidence tags"),
+    ):
+        v = str(brief.get(key) or "").strip()
+        if v:
+            pairs.append(f"{label}: {v[:220]}")
+    mass = sum(len(p) for p in pairs)
+    if mass < 72:
+        return ""
+    body = " ".join(pairs)[:900]
+    return (
+        "Light editorial pass on this existing thumbnail image only. "
+        "Preserve overall layout, subject framing, and strict headline / no-text rules from the base. "
+        "Subtly tighten realism, colour truth, and environmental cues implied by: "
+        f"{body}"
+    )[:980]
 
 
 # ============================================================
@@ -932,20 +1512,71 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     if not ctx.temp_dir:
         raise SkipStage("No temp directory available")
 
+    us = ctx.user_settings or {}
+    render_pipeline_pref = normalize_thumbnail_render_pipeline(us)
+    auto_thumbnails_on = bool(us.get("auto_thumbnails") or us.get("autoThumbnails"))
+    upload_forced_thumbnail_render = _upload_requests_thumbnail_render(us)
+    if not auto_thumbnails_on and upload_forced_thumbnail_render:
+        logger.info(
+            "Thumbnail stage: auto_thumbnails disabled but upload-level studio/pikzels override is enabled"
+        )
+    elif not auto_thumbnails_on:
+        logger.info(
+            "Thumbnail stage: auto_thumbnails disabled; generating algorithm-selected raw frame only"
+        )
+
     # ── Tier gates ──────────────────────────────────────────────────────────
     max_thumbnails = 1
     if ctx.entitlements:
         max_thumbnails = max(1, int(getattr(ctx.entitlements, "max_thumbnails", 1) or 1))
 
+    designer_on = user_pref_ai_service_enabled(us, "thumbnail_ai", default=True)
     ai_key_present = bool(OPENAI_API_KEY)
     can_ai = ai_key_present and bool(getattr(ctx.entitlements, "can_ai", False) if ctx.entitlements else False)
+    can_ai_designer = can_ai and designer_on
 
-    # When AI is active, extract at least 4 frames so it has meaningful choices.
-    # On free tier (can_ai=False), extraction_count == max_thumbnails.
-    extraction_count = max(max_thumbnails, 4 if can_ai else 1)
+    # When PIKZELS_API_KEY is configured the studio pipeline is the default. Users can still
+    # opt-out explicitly by setting either flag to False; we only treat the *absence* of the
+    # toggle as "enabled". This matches user expectation that "thumbnails should generate" once
+    # the platform integration is wired up — the previous gate required two undocumented
+    # user-pref toggles, which is why the Pikzels render path was never reached.
+    _renderer_ready_early = studio_renderer_enabled()
+
+    def _opt_in_default_true(*keys: str) -> bool:
+        for k in keys:
+            if k in us:
+                return bool(us.get(k))
+        return _renderer_ready_early
+
+    studio_flow_early = _opt_in_default_true("thumbnail_studio_enabled", "thumbnailStudioEnabled")
+    use_studio_engine_early = _opt_in_default_true(
+        "thumbnail_studio_engine_enabled",
+        "thumbnailStudioEngineEnabled",
+        "thumbnail_pikzels_enabled",
+        "thumbnailPikzelsEnabled",
+    )
+    pikzels_studio_pipeline = bool(
+        designer_on
+        and studio_flow_early
+        and use_studio_engine_early
+        and _renderer_ready_early
+    )
+    can_custom_thumbs = bool(
+        getattr(ctx.entitlements, "can_custom_thumbnails", False) if ctx.entitlements else False
+    )
+    styled_enabled_early = us.get("styled_thumbnails", us.get("styledThumbnails", True))
+    pikzels_overrides_frame_selection = bool(
+        pikzels_studio_pipeline
+        and can_custom_thumbs
+        and styled_enabled_early
+        and render_pipeline_pref != "none"
+    )
+
+    # When thumbnail designer (AI) is on, extract at least 4 frames for selection.
+    extraction_count = max(max_thumbnails, 4 if can_ai_designer else 1)
 
     # User-specified manual offset (single-thumbnail mode only)
-    raw_offset = (ctx.user_settings or {}).get("thumbnail_offset", DEFAULT_THUMBNAIL_OFFSET)
+    raw_offset = us.get("thumbnail_offset", DEFAULT_THUMBNAIL_OFFSET)
     try:
         user_offset = float(raw_offset)
         user_offset = max(0.0, min(user_offset, MAX_THUMBNAIL_OFFSET))
@@ -953,29 +1584,96 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         user_offset = DEFAULT_THUMBNAIL_OFFSET
 
     # ── Category detection ──────────────────────────────────────────────────
-    category = _detect_category(ctx)
+    hp_cat = getattr(ctx, "hydration_payload", None)
+    if isinstance(hp_cat, dict) and str(hp_cat.get("category") or "").strip():
+        category = str(hp_cat["category"]).strip().lower()
+        category_source = str(hp_cat.get("category_source") or "payload")
+    else:
+        category = _detect_category(ctx)
+        category_source = "thumbnail_detector"
+
+    logger.info(
+        "Thumbnail stage: category=%r source=%s upload_id=%s",
+        category,
+        category_source,
+        str(getattr(ctx, "upload_id", "") or ""),
+    )
+
+    trace_append(
+        ctx,
+        "thumbnail_category_detected",
+        {
+            "category": category,
+            "category_source": category_source,
+            "hydration_payload": bool(hp_cat),
+        },
+    )
 
     logger.info(
         f"Thumbnail stage: video={video_path.name}, "
         f"max_thumbnails={max_thumbnails}, extraction_count={extraction_count}, "
         f"category={category}, "
-        f"ai={'enabled' if can_ai else ('no-key' if not ai_key_present else 'plan-gate')}"
+        f"ai_designer={'on' if can_ai_designer else 'off'} "
+        f"(plan={'ok' if can_ai else ('no-key' if not ai_key_present else 'gate')})"
     )
 
     # ── Duration probe ──────────────────────────────────────────────────────
     duration = await _get_video_duration(video_path)
     logger.debug(f"Video duration: {duration:.1f}s")
 
+    raw_interval = us.get("thumbnail_interval", us.get("thumbnailInterval"))
+    min_gap: Optional[float] = None
+    if raw_interval is not None:
+        try:
+            g = float(raw_interval)
+            if g > 0:
+                min_gap = g
+        except (TypeError, ValueError):
+            min_gap = None
+
     # ── Distribute offsets ──────────────────────────────────────────────────
     offsets = _distribute_offsets(
         duration=duration,
         n=extraction_count,
         user_offset=user_offset if extraction_count == 1 else None,
+        min_gap_seconds=min_gap,
     )
+
+    # ── VI-derived keyframe offset (Phase #7) ───────────────────────────────
+    # When Video Intelligence captured object/logo/person tracks, the most
+    # interesting moment in the clip is almost always the midpoint of the
+    # highest-confidence non-generic track. We pre-pend that offset so the
+    # downstream sharpness + AI-pick pass evaluates it against the evenly
+    # distributed candidates. Often it wins outright; if not, the styled
+    # render pipeline still gets a high-quality option to feed Pikzels.
+    vi_keyframe_offset: Optional[float] = None
+    try:
+        from services.recognition_engine import select_thumbnail_keyframe_offset
+        vi_payload = (
+            getattr(ctx, "video_intelligence", None)
+            or getattr(ctx, "video_intelligence_context", None)
+            or {}
+        )
+        if isinstance(vi_payload, dict) and not vi_payload.get("error"):
+            vi_keyframe_offset = select_thumbnail_keyframe_offset(
+                vi_payload, duration_seconds=duration
+            )
+    except Exception as vi_e:
+        logger.debug("Thumbnail: VI keyframe selection failed (non-fatal): %s", vi_e)
+    if vi_keyframe_offset is not None and vi_keyframe_offset > 0:
+        existing = [round(o, 2) for o in offsets]
+        if round(vi_keyframe_offset, 2) not in existing:
+            offsets = [vi_keyframe_offset] + offsets
+            logger.info(
+                "Thumbnail: prepending VI keyframe at %.2fs (object/logo/person peak)",
+                vi_keyframe_offset,
+            )
+
     logger.debug(f"Thumbnail offsets: {[f'{o:.1f}s' for o in offsets]}")
 
     # ── Extract and score all frames ────────────────────────────────────────
     candidates: List[Tuple[Path, float]] = []
+    vi_candidate_path: Optional[Path] = None
 
     for idx, offset in enumerate(offsets):
         out_path = ctx.temp_dir / f"thumb_{ctx.upload_id}_{idx:02d}.jpg"
@@ -988,7 +1686,12 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         if success:
             score = await _score_sharpness(out_path)
             if score == 0.0:
-                score = out_path.stat().st_size / 1_000_000  # file-size proxy
+                score = out_path.stat().st_size / 1_000_000
+            # VI keyframe gets a small bonus so the deterministic best moment
+            # only loses to a *much* sharper alternative.
+            if vi_keyframe_offset is not None and abs(offset - vi_keyframe_offset) < 0.05:
+                vi_candidate_path = out_path
+                score = score * 1.15 + 0.05
             candidates.append((out_path, score))
             logger.debug(
                 f"  Frame {idx}: {out_path.name} @ {offset:.1f}s — "
@@ -1007,8 +1710,28 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     # ── AI selection pass ───────────────────────────────────────────────────
     ai_selected_path: Optional[Path] = None
     selection_method = "sharpness"
+    selection_mode = normalize_thumbnail_selection_mode(us)
+    # Do not skip when pipeline is "ai_edit" — that path runs GPT image edit first,
+    # which still benefits from GPT frame selection before any Pikzels step.
+    pipeline_studio_first = render_pipeline_pref in ("auto", "studio_renderer") or (
+        render_pipeline_pref == "template" and pikzels_studio_pipeline
+    )
+    skip_ai_frame_pick = bool(
+        pikzels_overrides_frame_selection and selection_mode == "ai" and pipeline_studio_first
+    )
+    if skip_ai_frame_pick:
+        logger.info(
+            "Thumbnail frame selection: Pikzels/studio pipeline active — "
+            "using sharpest frame as compositor input (skipping GPT frame pick)"
+        )
+        selection_method = "sharpness_pikzels_input"
 
-    if can_ai and len(candidates) > 1:
+    if selection_mode == "sharpness" or skip_ai_frame_pick:
+        if selection_mode == "sharpness" and not skip_ai_frame_pick:
+            logger.debug(
+                "Thumbnail frame selection: user pref thumbnailSelectionMode=sharpness — AI pick skipped"
+            )
+    elif can_ai_designer and len(candidates) > 1:
         try:
             ai_selected_path = await _ai_select_best_frame(candidates, category, ctx)
         except Exception as e:
@@ -1023,9 +1746,16 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                 f"{sharpness_best_path.name}"
             )
     else:
-        reason = "no API key" if not ai_key_present else (
-            "plan gate" if not can_ai else "only 1 candidate"
-        )
+        if selection_mode != "sharpness" and not designer_on:
+            reason = "thumbnail designer disabled (pref or aiServiceThumbnailDesigner)"
+        elif selection_mode != "sharpness" and not ai_key_present:
+            reason = "no API key"
+        elif selection_mode != "sharpness" and not can_ai:
+            reason = "plan gate"
+        elif len(candidates) <= 1:
+            reason = "only 1 candidate"
+        else:
+            reason = "pref sharpness"
         logger.debug(f"AI thumbnail selection skipped: {reason}")
 
     # ── Final best frame ────────────────────────────────────────────────────
@@ -1047,6 +1777,7 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         ctx.thumbnail_paths.insert(0, best_path)
 
     ctx.thumbnail_path = best_path
+    ctx.thumbnail_category = category
 
     # Artifacts — picked up by worker.py for R2 upload and DB save
     ctx.output_artifacts["thumbnail"]                   = str(best_path)
@@ -1058,83 +1789,316 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
     ctx.output_artifacts["thumbnail_scores"]            = json.dumps(
         {str(p): round(s, 4) for p, s in candidates}
     )
+    if render_pipeline_pref == "none":
+        ctx.output_artifacts["thumbnail_render_method"] = "none"
+    raw_frame_only = True
 
     # ── Styled thumbnails (MrBeast-style composite) — Trill + non-Trill, every upload ──
     # Gated by: can_custom_thumbnails + user pref styled_thumbnails (default True)
     can_custom = bool(getattr(ctx.entitlements, "can_custom_thumbnails", False) if ctx.entitlements else False)
     can_ai_style = bool(getattr(ctx.entitlements, "can_ai_thumbnail_styling", False) if ctx.entitlements else False)
-    us = ctx.user_settings or {}
     styled_enabled = us.get("styled_thumbnails", us.get("styledThumbnails", True))
-    if can_custom and styled_enabled and ctx.temp_dir:
-        brief: Optional[Dict] = None
-        if can_ai:
-            brief = await _generate_thumbnail_brief(ctx, category)
-        if not brief and can_ai:
-            # Fallback brief when GPT fails — minimal defaults
-            brief = {
-                "selected_headline": (ctx.get_effective_title() or "WATCH")[:20].upper(),
-                "headline_options": [],
-                "badge_text": "NEW",
-                "badge_style": "red",
-                "directional_element": "circle",
-                "props": [],
-                "emotion_cue": "excited",
-                "color_mood": "red_black",
-                "platform_plan": {
-                    "youtube": {"enabled": True, "canvas": "16:9"},
-                    "instagram": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
-                    "facebook": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
-                    "tiktok": {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5},
-                },
-                "notes": "Fallback brief",
-            }
-        elif not brief:
-            brief = {
-                "selected_headline": (ctx.get_effective_title() or "WATCH")[:20].upper(),
-                "headline_options": [],
-                "badge_text": "",
-                "badge_style": "red",
-                "directional_element": "circle",
-                "props": [],
-                "emotion_cue": "excited",
-                "color_mood": "red_black",
-                "platform_plan": {
-                    "youtube": {"enabled": True, "canvas": "16:9"},
-                    "instagram": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
-                    "facebook": {"enabled": True, "canvas": "9:16", "safe_center_pct": 60},
-                    "tiktok": {"enabled": True, "canvas": "9:16", "thumb_offset_seconds": 1.5},
-                },
-                "notes": "No AI — minimal brief",
-            }
-        ctx.output_artifacts["thumbnail_brief_json"] = json.dumps(brief)
 
-        # TikTok: no custom thumbnail via API — store thumb_offset for worker
+    # Diagnostic: log every gate decision so we can see why Pikzels did/didn't run.
+    studio_render_report: Dict[str, Any] = {
+        "pikzels_api_key_configured": studio_renderer_enabled(),
+        "can_custom_thumbnails": can_custom,
+        "can_ai_thumbnail_styling": can_ai_style,
+        "styled_thumbnails_pref": bool(styled_enabled),
+        "render_pipeline_pref": render_pipeline_pref,
+        "auto_thumbnails_pref": bool(us.get("auto_thumbnails") or us.get("autoThumbnails")),
+        "studio_eligible": False,
+        "persona_kind": None,
+        "persona_uuid": None,
+        "render_steps": [],
+        "platform_render_methods": {},
+        "hydration_pikzels_edit": {},
+        "evidence_anchor": None,
+        "skip_reason": None,
+        "raw_frame_only": True,
+    }
+    styled_generation_enabled = bool(can_ai_designer or pikzels_studio_pipeline)
+    if not (
+        can_custom
+        and styled_enabled
+        and ctx.temp_dir
+        and render_pipeline_pref != "none"
+        and styled_generation_enabled
+    ):
+        if not can_custom:
+            studio_render_report["skip_reason"] = "tier lacks can_custom_thumbnails"
+        elif not styled_enabled:
+            studio_render_report["skip_reason"] = "user pref styled_thumbnails=false"
+        elif not ctx.temp_dir:
+            studio_render_report["skip_reason"] = "no temp dir"
+        elif render_pipeline_pref == "none":
+            studio_render_report["skip_reason"] = "thumbnailRenderPipeline=none"
+        elif not styled_generation_enabled:
+            studio_render_report["skip_reason"] = "ai/pikzels disabled -> raw frame only"
+        ctx.output_artifacts["studio_render_report"] = json.dumps(studio_render_report)
+        try:
+            from services.diag_persist import schedule_persist_artifact_now
+
+            schedule_persist_artifact_now(ctx, "studio_render_report")
+        except Exception:
+            pass
+        logger.info(
+            "[thumb-renderer] styled-thumbnail block skipped reason=%s upload=%s",
+            studio_render_report["skip_reason"],
+            ctx.upload_id,
+        )
+
+    if (
+        can_custom
+        and styled_enabled
+        and ctx.temp_dir
+        and render_pipeline_pref != "none"
+        and styled_generation_enabled
+    ):
+        brief: Optional[Dict] = None
+        if can_ai_designer:
+            brief = await _generate_thumbnail_brief(ctx, category)
+        if not brief and can_ai_designer:
+            brief = _sanitize_thumbnail_brief(ctx, None, category, note="")
+        elif not brief:
+            raw_brief: Dict[str, Any] = {}
+            if pikzels_studio_eligible_for_styled_thumbnail(us, ctx.entitlements, require_auto_thumbnails=False):
+                text_brief = await generate_pikzels_text_brief(
+                    source_title=ctx.get_effective_title() or ctx.filename or "UploadM8 video",
+                    niche=category,
+                    context_summary=ctx.get_thumbnail_brief_vars(category=category).get("fusion_summary", ""),
+                )
+                if text_brief:
+                    raw_brief["pikzels_text_brief"] = text_brief
+            # Do not set ``notes`` to a placeholder here — it blocked evidence hydration
+            # (anchor phrase) from ever reaching ``notes`` and then the Pikzels prompt.
+            brief = _sanitize_thumbnail_brief(ctx, raw_brief, category, note="")
+        else:
+            brief = _sanitize_thumbnail_brief(ctx, brief, category)
+
+        trace_append(
+            ctx,
+            "thumbnail_brief_pre_strategy",
+            {
+                "can_ai_designer": bool(can_ai_designer),
+                "selected_headline": str((brief or {}).get("selected_headline") or "")[:80],
+                "has_fusion_summary": bool(str((brief or {}).get("fusion_summary") or "").strip()),
+                "has_hydration_story": bool(str((brief or {}).get("hydration_story") or "").strip()),
+                "has_pikzels_text_brief": bool(str((brief or {}).get("pikzels_text_brief") or "").strip()),
+            },
+        )
+
+        brief = _apply_thumbnail_default_strategy(brief, us, category=category)
+
+        # Hydrate the brief with deterministic evidence pulled from every analyzed
+        # signal on ctx (vision labels, OSD speed, geo, ACR music, Whisper).
+        # When a field is already set on the brief we keep it; we only fill gaps.
+        # Without this, the brief depends entirely on the GPT brief writer; if
+        # GPT was off or skipped, Pikzels rendered with a thin brief and the
+        # output looked just as generic as the model captions.
+        try:
+            from services.hydration_enforcer import (
+                build_anchor_phrase,
+                build_evidence_hashtags,
+                collect_evidence,
+            )
+
+            brief = apply_hydration_payload_to_thumbnail_brief(ctx, brief)
+            hp_ctx = getattr(ctx, "hydration_payload", None)
+            if isinstance(hp_ctx, dict) and str(hp_ctx.get("anchor_phrase") or "").strip():
+                studio_render_report["evidence_anchor"] = str(hp_ctx["anchor_phrase"])[:500]
+            else:
+                pool = collect_evidence(ctx)
+                anchor = build_anchor_phrase(pool, ctx)
+                studio_render_report["evidence_anchor"] = anchor or None
+                if anchor:
+                    _ph_notes = frozenset({"No AI — evidence-based brief", "Fallback brief"})
+                    _cur_notes = str(brief.get("notes") or "").strip()
+                    if not _cur_notes or _cur_notes in _ph_notes:
+                        brief["notes"] = anchor[:200]
+                    if not str(brief.get("speech_context") or "").strip() and pool.transcript_phrase:
+                        brief["speech_context"] = pool.transcript_phrase[:260]
+                    if not str(brief.get("music_context") or "").strip() and (
+                        pool.music_artist or pool.music_title
+                    ):
+                        parts = [p for p in (pool.music_artist, pool.music_title) if p]
+                        brief["music_context"] = " — ".join(parts)[:220]
+                    if not str(brief.get("geo_context") or "").strip():
+                        geo_bits_fb: List[str] = []
+                        if pool.road:
+                            geo_bits_fb.append(pool.road)
+                        if pool.gazetteer_place and pool.state_abbr:
+                            geo_bits_fb.append(f"{pool.gazetteer_place}, {pool.state_abbr}")
+                        elif pool.city and pool.state_abbr:
+                            geo_bits_fb.append(f"{pool.city}, {pool.state_abbr}")
+                        elif pool.protected_area:
+                            geo_bits_fb.append(pool.protected_area)
+                        if geo_bits_fb:
+                            brief["geo_context"] = "; ".join(geo_bits_fb)[:260]
+                    if not str(brief.get("osd_context") or "").strip() and (
+                        pool.max_speed_mph or pool.driver_name
+                    ):
+                        osd_bits_fb: List[str] = []
+                        if pool.max_speed_mph:
+                            osd_bits_fb.append(f"max {int(round(pool.max_speed_mph))} MPH")
+                        if pool.driver_name:
+                            osd_bits_fb.append(f"driver {pool.driver_name}")
+                        brief["osd_context"] = "; ".join(osd_bits_fb)[:220]
+                    if not str(brief.get("trill_context") or "").strip() and pool.trill_bucket:
+                        brief["trill_context"] = (
+                            f"Trill bucket {pool.trill_bucket} (score {pool.trill_score:.0f})"
+                        )[:220]
+                    evidence_tags = build_evidence_hashtags(pool, max_extra=8)
+                    if evidence_tags and not str(brief.get("signal_hashtags") or "").strip():
+                        brief["signal_hashtags"] = ", ".join(evidence_tags[:8])[:180]
+        except Exception as e:
+            logger.debug("[thumb-renderer] hydration brief enrichment failed: %s", e)
+
+        trace_append(
+            ctx,
+            "thumbnail_brief_post_evidence",
+            {
+                "anchor": (studio_render_report.get("evidence_anchor") or "")[:120],
+                "selected_headline": str((brief or {}).get("selected_headline") or "")[:80],
+                "fusion_chars": len(str((brief or {}).get("fusion_summary") or "")),
+                "hydration_story_chars": len(str((brief or {}).get("hydration_story") or "")),
+            },
+        )
+
+        ctx.output_artifacts["thumbnail_brief_json"] = json.dumps(brief)
+        try:
+            from services.diag_persist import schedule_persist_artifact_now
+
+            schedule_persist_artifact_now(ctx, "thumbnail_brief_json")
+        except Exception:
+            pass
+
+        # TikTok publishing may still use a frame offset depending on API support, but
+        # UploadM8 should render/store a generated TikTok cover preview like every
+        # other selected platform so queue/detail UI can display a complete set.
         platform_map: Dict[str, str] = {}
         tiktok_plan = brief.get("platform_plan", {}).get("tiktok", {})
         ctx.output_artifacts["tiktok_thumb_offset_seconds"] = str(
             tiktok_plan.get("thumb_offset_seconds", 1.5)
         )
 
-        # Render per platform (YouTube, Instagram, Facebook)
-        platforms_to_render = [p for p in ("youtube", "instagram", "facebook")
-                              if (brief.get("platform_plan", {}).get(p, {}).get("enabled", True))
-                              and p in [pl.lower() for pl in (ctx.platforms or [])]]
+        # Render per selected platform (YouTube 16:9, Instagram/Facebook/TikTok 9:16).
+        _plat_lower = [str(pl).strip().lower() for pl in (ctx.platforms or []) if str(pl).strip()]
+        platforms_to_render = [
+            p
+            for p in ("youtube", "instagram", "facebook", "tiktok")
+            if (brief.get("platform_plan", {}).get(p, {}).get("enabled", True)) and p in _plat_lower
+        ]
         render_method = "none"
         primary_styled: Optional[Path] = None  # Prefer YouTube for primary
+        persona_api, studio_opts = _studio_persona_for_request(us)
+        if isinstance(persona_api, dict):
+            studio_render_report["persona_kind"] = persona_api.get("kind")
+            studio_render_report["persona_uuid"] = persona_api.get("id")
+
+        studio_ok = bool(
+            pikzels_studio_eligible_for_styled_thumbnail(
+                us, ctx.entitlements, require_auto_thumbnails=False
+            )
+            and isinstance(brief, dict)
+        )
+        ai_edit_ok = bool(can_ai_designer and can_ai_style and OPENAI_API_KEY)
+        strict_studio = _strict_studio_mode_enabled(us)
+        if strict_studio and not studio_ok:
+            raise ThumbnailError(
+                "Strict Pikzels mode enabled but Studio renderer is unavailable for this upload"
+            )
+        # Legacy "template only" pipeline would skip Pikzels entirely; when the studio
+        # engine is enabled, prefer auto ordering so the API render runs first.
+        effective_render_pipeline = render_pipeline_pref
+        if studio_ok and render_pipeline_pref == "template":
+            effective_render_pipeline = "auto"
+            logger.info(
+                "thumbnail_render_pipeline=template overridden to auto "
+                "(Pikzels/studio renderer active for this job)"
+            )
+        render_steps = _thumbnail_styled_render_order(
+            effective_render_pipeline,
+            studio_ok=studio_ok,
+            ai_edit_ok=ai_edit_ok,
+        )
+        studio_render_report["studio_eligible"] = studio_ok
+        studio_render_report["render_steps"] = list(render_steps)
+
+        trace_append(
+            ctx,
+            "thumbnail_render_pipeline",
+            {
+                "platforms": list(platforms_to_render),
+                "studio_eligible": bool(studio_ok),
+                "render_steps": list(render_steps),
+                "effective_render_pipeline": effective_render_pipeline,
+            },
+        )
+
+        if not platforms_to_render:
+            platforms_to_render = ["youtube"]
+            logger.info(
+                "Styled thumbnails: no recognized upload targets — rendering default 16:9 cover"
+            )
+
         for platform in platforms_to_render:
             out_name = f"thumb_styled_{platform}_{ctx.upload_id}.jpg"
             out_path = ctx.temp_dir / out_name
             ok = False
-            if can_ai_style and OPENAI_API_KEY:
-                ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=False)
-                if not ok:
-                    ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=True)
+            attempted_methods: List[str] = []
+            for step in render_steps:
+                if step == "studio" and studio_ok:
+                    attempted_methods.append("studio_renderer")
+                    trace_append(ctx, "thumbnail_pikzels_attempt", {"platform": platform})
+                    ok = await render_thumbnail_with_studio_renderer(
+                        best_path,
+                        brief,
+                        platform,
+                        out_path,
+                        upload_id=str(ctx.upload_id),
+                        category=category,
+                        persona=persona_api,
+                        options=studio_opts,
+                        job_context=ctx,
+                    )
+                    if ok:
+                        render_method = "studio_renderer"
+                        hp = _thumbnail_hydration_edit_prompt(brief or {})
+                        if hp and _hydration_pikzels_edit_enabled():
+                            he_ok = await refine_thumbnail_with_pikzels_edit(
+                                out_path,
+                                hp,
+                                platform=platform,
+                                upload_id=str(ctx.upload_id),
+                            )
+                            studio_render_report["hydration_pikzels_edit"][platform] = bool(
+                                he_ok
+                            )
+                    else:
+                        logger.warning(
+                            "[thumb-renderer] Pikzels studio render failed for %s upload=%s — "
+                            "falling back to next render step (was: %s)",
+                            platform, ctx.upload_id, render_steps,
+                        )
+                elif step == "ai_edit" and ai_edit_ok:
+                    attempted_methods.append("ai_edit")
+                    ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=False)
+                    if not ok:
+                        ok = await _ai_edit_thumbnail(best_path, brief, out_path, retry_reduce=True)
+                    if ok:
+                        render_method = "ai_edit"
+                elif step == "template":
+                    attempted_methods.append("template")
+                    ok = _render_template_thumbnail(best_path, brief, platform, out_path)
+                    if ok:
+                        render_method = "template"
                 if ok:
-                    render_method = "ai_edit"
-            if not ok:
-                ok = _render_template_thumbnail(best_path, brief, platform, out_path)
-                if ok:
-                    render_method = "template"
+                    break
+            studio_render_report["platform_render_methods"][platform] = {
+                "attempted": attempted_methods,
+                "succeeded_with": render_method if ok else None,
+            }
             if ok:
                 platform_map[platform] = str(out_path)
                 if primary_styled is None or platform == "youtube":
@@ -1142,9 +2106,70 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         if primary_styled and primary_styled.exists():
             ctx.thumbnail_path = primary_styled
             ctx.output_artifacts["thumbnail"] = str(primary_styled)
+            raw_frame_only = False
+            studio_render_report["raw_frame_only"] = False
+        elif strict_studio:
+            raise ThumbnailError(
+                "Strict Pikzels mode enabled and Studio renderer did not produce a styled thumbnail"
+            )
 
         ctx.output_artifacts["thumbnail_render_method"] = render_method
         ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_map)
+        ctx.output_artifacts["studio_render_report"] = json.dumps(studio_render_report)
+        try:
+            from services.diag_persist import schedule_persist_artifact_now
+
+            schedule_persist_artifact_now(
+                ctx,
+                "studio_render_report",
+                "thumbnail_render_method",
+                "platform_thumbnail_map",
+            )
+        except Exception:
+            pass
+        logger.info(
+            "[thumb-renderer] studio render report upload=%s eligible=%s steps=%s "
+            "persona=%s methods=%s anchor=%r",
+            ctx.upload_id,
+            studio_render_report["studio_eligible"],
+            studio_render_report["render_steps"],
+            studio_render_report.get("persona_kind"),
+            studio_render_report["platform_render_methods"],
+            studio_render_report.get("evidence_anchor"),
+        )
+
+        trace_append(
+            ctx,
+            "thumbnail_styled_block_complete",
+            {
+                "thumbnail_render_method": render_method,
+                "platform_map_keys": list(platform_map.keys()),
+                "raw_frame_only": bool(raw_frame_only),
+            },
+        )
+
+    if raw_frame_only:
+        trace_append(
+            ctx,
+            "thumbnail_raw_frame_only",
+            {
+                "reason": str(
+                    (studio_render_report.get("skip_reason") if isinstance(studio_render_report, dict) else "")
+                    or "styled render not produced"
+                )[:180],
+            },
+        )
+    ctx.output_artifacts["thumbnail_raw_frame_only"] = bool(raw_frame_only)
+
+    trace_append(
+        ctx,
+        "thumbnail_stage_complete",
+        {
+            "selection_method": selection_method,
+            "frames": len(candidates),
+            "best_frame": getattr(best_path, "name", str(best_path)),
+        },
+    )
 
     logger.info(
         f"Thumbnail stage complete: {len(candidates)} frames, "

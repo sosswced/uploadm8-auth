@@ -25,7 +25,7 @@ SERVICE_WEIGHTS: Dict[str, int] = {
     "audio_whisper": 18,  # OpenAI Whisper — $/minute; also in DURATION_SCALED
     "thumbnail_ai": 16,  # Playwright / rembg / gen stack (+12% per extra thumb in compute)
     "vision_google": 12,  # Cloud Vision — per-image, multi-feature on one frame
-    "audio_hume": 10,  # Hume voice emotion API
+    "dashcam_osd": 8,  # Cloud Vision OCR sweep over bottom-strip HUD across the clip
     "audio_gpt_classify": 7,  # GPT-4o-mini — small prompt; fixed cost (not duration-scaled)
     "audio_acr": 5,  # ACRCloud fingerprint (when configured)
     "thumbnail_recreate_ai": 14,  # URL-to-thumbnail recreate + prompt synthesis
@@ -34,13 +34,13 @@ SERVICE_WEIGHTS: Dict[str, int] = {
     "thumbnail_competitor_gap": 4,  # Competitor gap analysis mode
     "audio_yamnet": 2,  # Local AudioSet / YAMNet — CPU only
     "telemetry_trill": 1,  # .map parse + Nominatim geocode — negligible API $
+    "trend_intel": 2,  # SerpAPI / YouTube Data — one lightweight search per caption job
 }
 
 # Vendor cost scales with clip/audio length — apply duration_multiplier().
 DURATION_SCALED: FrozenSet[str] = frozenset(
     {
         "audio_whisper",
-        "audio_hume",
         "video_intelligence",
         "twelvelabs",
     }
@@ -52,13 +52,13 @@ SERVICE_PREF_KEYS: Dict[str, str] = {
     "audio_yamnet": "aiServiceAudioSignals",
     "audio_acr": "aiServiceMusicDetection",
     "audio_gpt_classify": "aiServiceAudioSummary",
-    "audio_hume": "aiServiceEmotionSignals",
     "caption_llm": "aiServiceCaptionWriter",
     "thumbnail_ai": "aiServiceThumbnailDesigner",
     "vision_google": "aiServiceFrameInspector",
     "audio_whisper": "aiServiceSpeechToText",
     "video_intelligence": "aiServiceVideoAnalyzer",
     "twelvelabs": "aiServiceSceneUnderstanding",
+    "dashcam_osd": "aiServiceDashcamOSD",
 }
 
 # User-facing, provider-agnostic labels/help text.
@@ -95,10 +95,6 @@ SERVICE_PUBLIC_META: Dict[str, Dict[str, str]] = {
         "label": "Audio Content Summary",
         "description": "Summarizes audio themes, pacing, and category signals for better outputs.",
     },
-    "audio_hume": {
-        "label": "Emotion Signals",
-        "description": "Estimates emotional tone from voice to refine caption tone and hooks.",
-    },
     "caption_llm": {
         "label": "Caption and Hashtag Writer",
         "description": "Generates titles, captions, and hashtag sets from video + context.",
@@ -111,6 +107,10 @@ SERVICE_PUBLIC_META: Dict[str, Dict[str, str]] = {
         "label": "Frame Inspector",
         "description": "Reads key visual details (faces/text/objects) from representative frames.",
     },
+    "dashcam_osd": {
+        "label": "Dashcam HUD Reader",
+        "description": "Reads burned-in date, time, GPS, speed and driver name from dashcam overlay across the whole clip.",
+    },
     "audio_whisper": {
         "label": "Speech-to-Text Transcript",
         "description": "Transcribes speech for accurate context and stronger caption quality.",
@@ -122,6 +122,10 @@ SERVICE_PUBLIC_META: Dict[str, Dict[str, str]] = {
     "twelvelabs": {
         "label": "Scene Understanding",
         "description": "Deep understanding of scenes and narrative flow across the whole clip.",
+    },
+    "trend_intel": {
+        "label": "Search Title Trends",
+        "description": "Pulls a short sample of recent YouTube-style titles for the niche so captions align with real search language.",
     },
 }
 
@@ -151,8 +155,34 @@ def _pref_true(prefs: Dict[str, Any], key: str, default: bool = True) -> bool:
     snake = key[0].lower()
     for ch in key[1:]:
         snake += ("_" + ch.lower()) if ch.isupper() else ch
-    raw = prefs.get(key, prefs.get(snake, default))
+    variants = [key, snake, snake.replace("_o_s_d", "_osd")]
+    raw = default
+    for variant in variants:
+        if variant in prefs:
+            raw = prefs[variant]
+            break
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("false", "0", "no", "off", "")
     return bool(raw)
+
+
+def user_pref_ai_service_enabled(
+    prefs: Dict[str, Any],
+    logical_service_id: str,
+    *,
+    default: bool = True,
+) -> bool:
+    """
+    Worker/runtime gate aligned with billing SERVICE_PREF_KEYS.
+
+    logical_service_id matches SERVICE_WEIGHTS / SERVICE_PREF_KEYS keys, e.g.
+    ``telemetry_trill``, ``caption_llm``, ``thumbnail_ai``, ``audio_whisper``,
+    ``vision_google`` (Frame Inspector in UI).
+    """
+    pref_key = SERVICE_PREF_KEYS.get(logical_service_id)
+    if not pref_key:
+        return default
+    return _pref_true(prefs, pref_key, default)
 
 
 def _env_bool(key: str, default: str = "false") -> bool:
@@ -164,12 +194,21 @@ def billing_env_from_os() -> Dict[str, bool]:
     return {
         "AUDIO_STAGE_ENABLED": _env_bool("AUDIO_STAGE_ENABLED", "true"),
         "YAMNET_ENABLED": _env_bool("YAMNET_ENABLED", "true"),
-        "HUME_ENABLED": _env_bool("HUME_ENABLED", "true"),
         "VISION_STAGE_ENABLED": _env_bool("VISION_STAGE_ENABLED", "true"),
-        "TWELVELABS_ENABLED": _env_bool("TWELVELABS_ENABLED", "false"),
-        "VIDEO_INTELLIGENCE_ENABLED": _env_bool("VIDEO_INTELLIGENCE_ENABLED", "false"),
         "ACRCLOUD_CONFIGURED": bool(
             (os.environ.get("ACRCLOUD_ACCESS_KEY") or os.environ.get("ACR_ACCESS_KEY") or "").strip()
+            and (
+                os.environ.get("ACRCLOUD_ACCESS_SECRET")
+                or os.environ.get("ACR_ACCESS_SECRET")
+                or os.environ.get("ACRCLOUD_SECRET_KEY")
+                or ""
+            ).strip()
+            and (os.environ.get("ACRCLOUD_HOST") or os.environ.get("ACR_HOST") or "").strip()
+        ),
+        "TREND_INTEL_AVAILABLE": bool(
+            ((os.environ.get("SERPAPI_API_KEY") or "").strip() or (os.environ.get("YOUTUBE_DATA_API_KEY") or "").strip())
+            and (os.environ.get("TREND_INTEL_DISABLED") or "").strip().lower()
+            not in ("1", "true", "yes", "on")
         ),
     }
 
@@ -234,10 +273,16 @@ def resolve_enabled_ai_services(
 
     want_caption = bool(
         user_prefs.get("auto_captions")
+        or user_prefs.get("autoCaptions")
         or user_prefs.get("ai_hashtags_enabled")
+        or user_prefs.get("aiHashtagsEnabled")
         or use_ai_request
     )
-    want_thumb = bool(user_prefs.get("auto_thumbnails") or use_ai_request)
+    want_thumb = bool(
+        user_prefs.get("auto_thumbnails")
+        or user_prefs.get("autoThumbnails")
+        or use_ai_request
+    )
     use_audio = bool(user_prefs.get("use_audio_context", user_prefs.get("useAudioContext", True)))
     transcribe = bool(user_prefs.get("audio_transcription", user_prefs.get("audioTranscription", True)))
 
@@ -250,8 +295,6 @@ def resolve_enabled_ai_services(
             out.add("audio_gpt_classify")
         if env.get("YAMNET_ENABLED", True) and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_yamnet", ""), True):
             out.add("audio_yamnet")
-        if env.get("HUME_ENABLED", True) and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_hume", ""), True):
-            out.add("audio_hume")
         if transcribe and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_whisper", ""), True):
             out.add("audio_whisper")
         if env.get("ACRCLOUD_CONFIGURED") and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_acr", ""), True):
@@ -261,10 +304,12 @@ def resolve_enabled_ai_services(
     if vision_on and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("vision_google", ""), True):
         out.add("vision_google")
 
-    if env.get("TWELVELABS_ENABLED") and want_caption and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("twelvelabs", ""), True):
+    if want_caption and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("twelvelabs", ""), True):
         out.add("twelvelabs")
 
-    if env.get("VIDEO_INTELLIGENCE_ENABLED") and (want_caption or want_thumb) and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("video_intelligence", ""), True):
+    if (want_caption or want_thumb) and _pref_true(
+        user_prefs, SERVICE_PREF_KEYS.get("video_intelligence", ""), True
+    ):
         out.add("video_intelligence")
 
     if want_thumb and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("thumbnail_ai", ""), True):
@@ -272,6 +317,9 @@ def resolve_enabled_ai_services(
 
     if want_caption and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("caption_llm", ""), True):
         out.add("caption_llm")
+        # SerpAPI / YouTube title sample for M8 — same user gate as caption writer.
+        if env.get("TREND_INTEL_AVAILABLE", False):
+            out.add("trend_intel")
 
     return out
 
@@ -286,7 +334,7 @@ def effective_num_thumbnails(
     cap = max(1, int(ent_max_thumbnails or 1))
     if thumbnail_count is not None:
         return max(1, min(int(thumbnail_count), cap))
-    if use_ai_request or user_prefs.get("auto_thumbnails"):
+    if use_ai_request or user_prefs.get("auto_thumbnails") or user_prefs.get("autoThumbnails"):
         return cap
     return 1
 
@@ -387,3 +435,69 @@ def compute_aic_breakdown(
         "service_catalog": service_catalog(),
     }
     return aic, debug
+
+
+def compute_presign_put_aic_costs(
+    ent: Any,
+    *,
+    num_publish_targets: int,
+    file_size: Optional[int],
+    duration_hint: Optional[float],
+    has_telemetry: bool,
+    use_ai_checkbox: bool,
+    hud_enabled_effective: bool,
+    user_prefs: Dict[str, Any],
+    num_thumbnails_override: Optional[int] = None,
+) -> Tuple[int, int]:
+    """
+    PUT + AIC reservation for upload presign / wallet (aligned with pipeline prefs).
+
+    ``hud_enabled_effective`` should already include plan entitlement (e.g. can_burn_hud).
+    """
+    from stages.entitlements import PRIORITY_QUEUE_CLASSES, compute_put_cost
+
+    cap = max(1, int(getattr(ent, "max_thumbnails", 1) or 1))
+    if num_thumbnails_override is not None:
+        num_thumbs = max(1, min(int(num_thumbnails_override), cap))
+    else:
+        num_thumbs = effective_num_thumbnails(
+            getattr(ent, "max_thumbnails", 1) or 1,
+            user_prefs,
+            use_ai_checkbox,
+            None,
+        )
+
+    is_priority = getattr(ent, "priority_class", "") in PRIORITY_QUEUE_CLASSES
+    put = compute_put_cost(
+        num_platforms=num_publish_targets,
+        hud_enabled=bool(hud_enabled_effective),
+        is_priority=is_priority,
+        num_thumbnails=num_thumbs,
+    )
+
+    if not getattr(ent, "can_ai", False):
+        return put, 0
+
+    try:
+        emax = int(getattr(ent, "max_caption_frames", 6) or 6)
+    except (TypeError, ValueError):
+        emax = 6
+    ufc = user_prefs.get("captionFrameCount") or user_prefs.get("caption_frame_count") or emax
+    try:
+        user_fc_int = int(ufc)
+    except (TypeError, ValueError):
+        user_fc_int = emax
+    eff_caption_frames = max(2, min(user_fc_int, emax, 12))
+
+    aic, _dbg = compute_aic_breakdown(
+        can_ai=True,
+        user_prefs=user_prefs,
+        use_ai_request=use_ai_checkbox,
+        has_telemetry=has_telemetry,
+        file_size=file_size,
+        duration_hint=duration_hint,
+        max_caption_frames=eff_caption_frames,
+        num_thumbnails=num_thumbs,
+        env=billing_env_from_os(),
+    )
+    return put, int(aic)

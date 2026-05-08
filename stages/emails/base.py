@@ -46,6 +46,8 @@ URL_SETTINGS     = f"{FRONTEND_URL}/settings.html"
 URL_BILLING      = f"{FRONTEND_URL}/billing.html"
 URL_PRICING      = f"{FRONTEND_URL}/index.html#pricing"
 URL_UNSUBSCRIBE  = f"{FRONTEND_URL}/unsubscribe.html"
+URL_SUPPORT      = f"{FRONTEND_URL}/support.html"
+URL_LOGIN        = f"{FRONTEND_URL}/login.html"
 
 # ── Tier display names ────────────────────────────────────────────────────────
 TIER_NAMES: dict = {
@@ -79,7 +81,12 @@ def mailgun_ready() -> bool:
 
 
 async def send_email(to: str, subject: str, html: str, from_addr: str = None, reply_to: str = None) -> None:
-    """Low-level Mailgun sender. All email modules call this."""
+    """Low-level Mailgun sender. All email modules call this.
+
+    On failure (non-200 response or network exception) records an
+    ``operational_incidents`` row so the admin incidents page surfaces email
+    delivery problems. The send_email contract (never raise) is preserved.
+    """
     sender = from_addr or MAIL_FROM
     data = {"from": sender, "to": to, "subject": subject, "html": html}
     if reply_to:
@@ -87,6 +94,9 @@ async def send_email(to: str, subject: str, html: str, from_addr: str = None, re
     if not mailgun_ready():
         logger.info(f"Email skipped (Mailgun not configured): {to} | {subject}")
         return
+
+    fail_kind: str | None = None
+    fail_body: str = ""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -96,10 +106,44 @@ async def send_email(to: str, subject: str, html: str, from_addr: str = None, re
             )
         if resp.status_code != 200:
             logger.warning(f"Mailgun failed ({resp.status_code}): {to} | {subject}")
+            fail_kind = f"mailgun_http_{resp.status_code}"
+            try:
+                fail_body = resp.text[:1000]
+            except Exception:
+                fail_body = ""
         else:
             logger.info(f"Email sent → {to}: {subject}")
     except Exception as e:
         logger.warning(f"Mailgun error: {e}")
+        fail_kind = f"mailgun_exception_{type(e).__name__}"
+        fail_body = str(e)[:1000]
+
+    if fail_kind:
+        try:
+            import core.state as _state
+
+            pool = getattr(_state, "db_pool", None)
+            if pool is not None:
+                from services.ops_incidents import record_operational_incident
+
+                await record_operational_incident(
+                    pool,
+                    source="email",
+                    incident_type=fail_kind[:120],
+                    subject=f"Email send failed → {to}: {subject}"[:2000],
+                    body=fail_body,
+                    details={
+                        "to": to,
+                        "from": sender,
+                        "mail_subject": subject,
+                        "mailgun_domain": MAILGUN_DOMAIN,
+                    },
+                    # Disable email alerting on email-system failures to avoid
+                    # infinite recursion (this very function is what's broken).
+                    alert_email=False,
+                )
+        except Exception as _ix:
+            logger.debug("email incident record failed: %s", _ix)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

@@ -93,6 +93,8 @@ FRONTEND PAGES NEEDED (now created):
 # ── Phase 1: Auth ─────────────────────────────────────────────────────────────
 from .auth import (
     send_welcome_email,
+    send_signup_confirmation_email,
+    send_post_verification_welcome_email,
     send_password_reset_email,
     send_password_changed_email,
     send_account_deleted_email,
@@ -120,6 +122,15 @@ from .billing_changes import (
 from .uploads import (
     send_upload_completed_email,
     send_upload_failed_email,
+    send_scheduled_publish_alert_email,
+    build_upload_completed_email_extensions,
+)
+
+# ── Phase 4c: Digests (admin + user) ──────────────────────────────────────────
+from .digests import (
+    send_monthly_user_kpi_digest_email,
+    send_admin_weekly_kpi_digest_email,
+    send_report_ready_email,
 )
 
 # ── Phase 4b: Admin Actions ───────────────────────────────────────────────────
@@ -149,6 +160,8 @@ from .lifecycle import (
 __all__ = [
     # Auth
     "send_welcome_email",
+    "send_signup_confirmation_email",
+    "send_post_verification_welcome_email",
     "send_password_reset_email",
     "send_password_changed_email",
     "send_account_deleted_email",
@@ -166,7 +179,13 @@ __all__ = [
     "send_topup_receipt_email",
     # Uploads
     "send_upload_completed_email",
+    "build_upload_completed_email_extensions",
     "send_upload_failed_email",
+    "send_scheduled_publish_alert_email",
+    # Digests
+    "send_monthly_user_kpi_digest_email",
+    "send_admin_weekly_kpi_digest_email",
+    "send_report_ready_email",
     # Admin actions
     "send_admin_wallet_topup_email",
     "send_admin_tier_switch_email",

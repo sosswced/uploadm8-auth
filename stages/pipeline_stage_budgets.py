@@ -31,7 +31,8 @@ def stage_timeout_twelvelabs() -> float:
 
 
 def stage_timeout_video_intelligence() -> float:
-    return _sec("VIDEO_INTELLIGENCE", 360)
+    # Align with VIDEO_INTELLIGENCE_TIMEOUT_SEC default (1800): long clips need full LRO window.
+    return _sec("VIDEO_INTELLIGENCE", 1800)
 
 
 def stage_timeout_thumbnail() -> float:

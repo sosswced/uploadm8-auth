@@ -2,7 +2,7 @@
 UploadM8 Entitlements System v2
 ================================
 Single source of truth for ALL tier-based permissions.
-Both app.py (PLAN_CONFIG) and the worker pipeline read from here.
+API (via routers) and the worker pipeline read tier/cost data from here.
 
 PUBLIC TIERS:
   free          $0       validate the workflow
@@ -241,6 +241,20 @@ def normalize_tier(tier: str) -> str:
     return t if t in TIER_CONFIG else "free"
 
 
+_PUBLIC_UPGRADE_LADDER = ("free", "creator_lite", "creator_pro", "studio", "agency")
+
+
+def get_next_public_upgrade_tier(tier: str) -> Optional[str]:
+    """Next tier on the public pricing ladder, or None if already at the top or internal-only."""
+    t = normalize_tier(tier)
+    if t not in _PUBLIC_UPGRADE_LADDER:
+        return None
+    i = _PUBLIC_UPGRADE_LADDER.index(t)
+    if i + 1 >= len(_PUBLIC_UPGRADE_LADDER):
+        return None
+    return _PUBLIC_UPGRADE_LADDER[i + 1]
+
+
 def get_tier_display_name(tier: str) -> str:
     """Return human-readable tier name from TIER_CONFIG."""
     t = normalize_tier(tier)
@@ -262,7 +276,7 @@ ENTITLEMENT_KEYS = (
 def get_tiers_for_api() -> list:
     """Return tier metadata for /api/entitlements/tiers. Single source for frontend.
     Includes revenue tiers + internal (friends_family, lifetime, master_admin) + launch alias.
-    app.js, wallet-tokens.js, and settings.html all consume this for consistent PUT/AIC/names."""
+    Field names align with TIER_CONFIG and with ``frontend/js/tier-catalog.js`` ``mergeRow``."""
     all_slugs = ("free", "creator_lite", "creator_pro", "studio", "agency",
                  "friends_family", "lifetime", "master_admin", "launch")
     out = []
@@ -272,9 +286,27 @@ def get_tiers_for_api() -> list:
             "slug": slug,
             "name": cfg.get("name", slug.replace("_", " ").title()),
             "price": float(cfg.get("price", 0)),
+            "put_daily": cfg.get("put_daily", 2),
             "put_monthly": cfg.get("put_monthly", 0),
             "aic_monthly": cfg.get("aic_monthly", 0),
             "internal": cfg.get("internal", False),
+            "max_accounts": cfg.get("max_accounts", 4),
+            "max_accounts_per_platform": cfg.get("max_accounts_per_platform", 1),
+            "queue_depth": cfg.get("queue_depth", 25),
+            "lookahead_hours": cfg.get("lookahead_hours", 2),
+            "trial_days": cfg.get("trial_days", 0),
+            "team_seats": cfg.get("team_seats", 1),
+            "analytics": cfg.get("analytics", "basic"),
+            "ai_depth": cfg.get("ai_depth", "basic"),
+            "webhooks": bool(cfg.get("webhooks", False)),
+            "white_label": bool(cfg.get("white_label", False)),
+            "hud": bool(cfg.get("hud", False)),
+            "excel": bool(cfg.get("excel", False)),
+            "flex": bool(cfg.get("flex", False)),
+            "watermark": bool(cfg.get("watermark", True)),
+            "max_thumbnails": cfg.get("max_thumbnails", 1),
+            "max_caption_frames": cfg.get("max_caption_frames", 3),
+            "priority_class": cfg.get("priority_class", "p4"),
         })
     return out
 
@@ -391,16 +423,16 @@ def get_entitlements_from_user(
     Build Entitlements from a users table row + optional per-user admin overrides.
 
     Priority order (highest wins):
-      1. Role override: master_admin / admin role -> full admin entitlements
+      1. Role override: master_admin role -> full internal master_admin entitlements
       2. Per-user overrides from entitlement_overrides table
       3. Tier defaults from TIER_CONFIG
     """
-    # Role override - admin accounts always get full access regardless of subscription_tier
-    role = (user_record.get("role") or "user").lower()
-    if role in ("admin", "master_admin"):
+    # Role override — only master_admin (staff "admin" keeps subscription_tier quotas).
+    role = str(user_record.get("role") or "user").strip().lower()
+    if role == "master_admin":
         return get_entitlements_for_tier("master_admin")
 
-    raw_tier = (user_record.get("subscription_tier") or "free").lower()
+    raw_tier = str(user_record.get("subscription_tier") or "free").strip().lower()
     tier = normalize_tier(raw_tier)
     ent = get_entitlements_for_tier(tier)
 
@@ -430,6 +462,23 @@ def get_entitlements_from_user(
         ent.can_flex = True
 
     return ent
+
+
+def wallet_bypass_for_user_record(user_record: dict | None) -> bool:
+    """
+    True when PUT/AIC reservations, debits, and refunds should not touch wallet balances.
+
+    Staff roles (admin, master_admin) are exempt regardless of subscription_tier so
+    support accounts are not blocked by test-wallet balances. Internal tiers
+    (friends_family, lifetime, master_admin slug) remain exempt via ``is_internal``.
+    """
+    if not user_record:
+        return False
+    role = str(user_record.get("role") or "user").strip().lower()
+    if role in ("admin", "master_admin"):
+        return True
+    ent = get_entitlements_from_user(user_record)
+    return bool(getattr(ent, "is_internal", False))
 
 
 def _ov(ent: Entitlements, overrides: dict, key: str, cast) -> None:
@@ -546,7 +595,7 @@ def get_tier_from_lookup_key(lookup_key: str) -> str:
 
 
 # ============================================================
-# PUT/AIC Cost Formula — canonical, imported by app.py + worker.py
+# PUT/AIC Cost Formula — canonical, imported by API services/routers + worker.py
 # ============================================================
 
 # AIC base by ai_depth string

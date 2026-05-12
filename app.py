@@ -29,12 +29,8 @@ focused routers above. See ``routers/README.md`` for mount order.
 
 import json
 import logging
-import os
-import pathlib
-import hashlib
-import zipfile
 
-# Load .env before any config reads (needed for local dev when running via uvicorn)
+# Load .env before any config reads (needed for local dev when running via uvicorn) (needed for local dev when running via uvicorn)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -42,10 +38,8 @@ except ImportError:
     pass
 
 import asyncpg
-import boto3
 import stripe
 import redis.asyncio as aioredis
-from botocore.config import Config
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -59,196 +53,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 logger = logging.getLogger("uploadm8-api")
 
 # ============================================================
-# Static data startup download (PADUS + Gazetteer)
+# PADUS + Gazetteer now live in PostgreSQL tables:
+#   - padus_protected_areas  (656,986 rows, geometry+GIST index)
+#   - gazetteer_places       (32,333 rows)
+# Loaded once from local files via scripts/load_padus.py + load_gaz.py.
+# No runtime download required.
 # ============================================================
-PADUS_R2_KEY = os.environ.get("PADUS_R2_KEY", "static/padus.zip")
-PADUS_LOCAL_PATH = os.environ.get("PADUS_LOCAL_PATH", "/tmp/padus")
-PADUS_SHA256 = os.environ.get("PADUS_SHA256", "").strip().lower()
-PADUS_LAYER = os.environ.get(
-    "PADUS_LAYER",
-    "PADUS4_1Combined_Proclamation_Marine_Fee_Designation_Easement",
-)
-
-GAZETTEER_R2_KEY = os.environ.get("GAZETTEER_R2_KEY", "static/gazetteer.zip")
-GAZETTEER_LOCAL_PATH = os.environ.get("GAZETTEER_LOCAL_PATH", "/tmp/gazetteer")
-GAZETTEER_SHA256 = os.environ.get("GAZETTEER_SHA256", "").strip().lower()
-
-
-def _sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest().lower()
-
-
-def _fmt_bytes(num: int) -> str:
-    size = float(max(int(num), 0))
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024.0 or unit == "TB":
-            return f"{size:.2f} {unit}"
-        size /= 1024.0
-    return f"{size:.2f} TB"
-
-
-def _dir_stats(path: str) -> tuple[int, int]:
-    total_files = 0
-    total_bytes = 0
-    for root, _, files in os.walk(path):
-        for name in files:
-            fp = os.path.join(root, name)
-            try:
-                total_files += 1
-                total_bytes += os.path.getsize(fp)
-            except OSError:
-                continue
-    return total_files, total_bytes
-
-
-def _get_static_s3_client():
-    account_id = (os.environ.get("R2_ACCOUNT_ID", "") or "").strip()
-    endpoint = (os.environ.get("R2_ENDPOINT_URL", "") or "").strip() or (
-        f"https://{account_id}.r2.cloudflarestorage.com" if account_id else ""
-    )
-    access_key = (os.environ.get("R2_ACCESS_KEY_ID", "") or "").strip()
-    secret_key = (os.environ.get("R2_SECRET_ACCESS_KEY", "") or "").strip()
-    if not endpoint or not access_key or not secret_key:
-        return None
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        config=Config(signature_version="s3v4"),
-        region_name="auto",
-    )
-
-
-def _download_and_unzip(r2_key: str, local_dir: str, expected_sha: str, label: str):
-    sentinel = os.path.join(local_dir, ".ready")
-    if os.path.exists(sentinel):
-        logger.info("%s: already extracted at %s, skipping", label, local_dir)
-        return
-    if not r2_key:
-        logger.warning("%s: R2 key not set, skipping", label)
-        return
-
-    bucket = (os.environ.get("R2_BUCKET_NAME", "") or "").strip()
-    if not bucket:
-        logger.warning("%s: R2_BUCKET_NAME not set, skipping", label)
-        return
-
-    s3 = _get_static_s3_client()
-    if s3 is None:
-        logger.warning("%s: R2 client not configured, skipping", label)
-        return
-
-    os.makedirs(local_dir, exist_ok=True)
-    zip_tmp = local_dir + ".zip"
-    remote_size = None
-    try:
-        head = s3.head_object(Bucket=bucket, Key=r2_key)
-        remote_size = int(head.get("ContentLength", 0))
-        logger.info(
-            "%s: remote object size=%s (%d bytes)",
-            label,
-            _fmt_bytes(remote_size),
-            remote_size,
-        )
-    except Exception as e:
-        logger.warning("%s: could not read remote object metadata: %s", label, e)
-    logger.info("%s: downloading s3://%s/%s", label, bucket, r2_key)
-    try:
-        s3.download_file(bucket, r2_key, zip_tmp)
-    except Exception as e:
-        logger.error("%s: download failed: %s", label, e)
-        raise
-
-    local_zip_size = os.path.getsize(zip_tmp) if os.path.exists(zip_tmp) else 0
-    logger.info(
-        "%s: downloaded zip size=%s (%d bytes)",
-        label,
-        _fmt_bytes(local_zip_size),
-        local_zip_size,
-    )
-    if remote_size is not None and local_zip_size != remote_size:
-        os.remove(zip_tmp)
-        raise RuntimeError(
-            f"{label}: downloaded size mismatch! expected={remote_size} got={local_zip_size}"
-        )
-
-    if expected_sha:
-        actual = _sha256_file(zip_tmp)
-        if actual != expected_sha:
-            os.remove(zip_tmp)
-            raise RuntimeError(
-                f"{label}: checksum mismatch! expected={expected_sha} got={actual}"
-            )
-        logger.info("%s: checksum OK", label)
-
-    logger.info("%s: extracting to %s", label, local_dir)
-    with zipfile.ZipFile(zip_tmp, "r") as zf:
-        zf.extractall(local_dir)
-    os.remove(zip_tmp)
-
-    files, total_bytes = _dir_stats(local_dir)
-    logger.info(
-        "%s: extracted files=%d total_size=%s",
-        label,
-        files,
-        _fmt_bytes(total_bytes),
-    )
-
-    with open(sentinel, "w", encoding="utf-8") as f:
-        f.write("ok")
-    logger.info("%s: ready", label)
-
-
-def _maybe_set_resolved_static_paths() -> None:
-    padus_gdb = os.path.join(
-        PADUS_LOCAL_PATH, "PADUS4_1Geodatabase", "PADUS4_1Geodatabase.gdb"
-    )
-    if os.path.exists(padus_gdb):
-        os.environ["PADUS_PATH"] = padus_gdb
-
-    gaz_candidates = (
-        os.path.join(GAZETTEER_LOCAL_PATH, "2024_gaz_places_national.txt"),
-        os.path.join(GAZETTEER_LOCAL_PATH, "2024_gaz_places_national"),
-        os.path.join(GAZETTEER_LOCAL_PATH, "2024_gaz_place_06.txt"),
-        os.path.join(GAZETTEER_LOCAL_PATH, "2024_gaz_place_06"),
-    )
-    for candidate in gaz_candidates:
-        if os.path.exists(candidate):
-            os.environ["GAZETTEER_PLACES_PATH"] = candidate
-            break
-
-    if os.environ.get("PADUS_LAYER", "").strip() == "":
-        os.environ["PADUS_LAYER"] = PADUS_LAYER
-
-
-def ensure_static_data() -> None:
-    _download_and_unzip(PADUS_R2_KEY, PADUS_LOCAL_PATH, PADUS_SHA256, "PADUS")
-    _download_and_unzip(
-        GAZETTEER_R2_KEY, GAZETTEER_LOCAL_PATH, GAZETTEER_SHA256, "Gazetteer"
-    )
-    _maybe_set_resolved_static_paths()
-    logger.info(
-        "Static data resolved: PADUS_PATH=%s exists=%s",
-        os.environ.get("PADUS_PATH", ""),
-        os.path.exists(os.environ.get("PADUS_PATH", "")),
-    )
-    logger.info(
-        "Static data resolved: GAZETTEER_PLACES_PATH=%s exists=%s",
-        os.environ.get("GAZETTEER_PLACES_PATH", ""),
-        os.path.exists(os.environ.get("GAZETTEER_PLACES_PATH", "")),
-    )
-
-
-try:
-    ensure_static_data()
-except Exception as e:
-    logger.error("Static data bootstrap failed: %s", e)
-    raise
 
 # ── Core imports ─────────────────────────────────────────────────────────────
 import core.state

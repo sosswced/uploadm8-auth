@@ -279,6 +279,10 @@ def safe_analyze_video(
         data.update(extra)
         if extra.get("gazetteer_place_name"):
             data.setdefault("place_name", extra["gazetteer_place_name"])
+        if extra.get("near_padus"):
+            data["near_protected"] = bool(extra["near_padus"])
+        if extra.get("padus_unit_name"):
+            data["protected_name"] = str(extra["padus_unit_name"]).strip()
         return {"ok": True, "data": data}
     except Exception as e:
         return {"ok": False, "error": str(e)}

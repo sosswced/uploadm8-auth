@@ -10,6 +10,7 @@ import logging
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from core.config import (
     R2_ACCOUNT_ID,
@@ -146,6 +147,32 @@ def copy_r2_object_within_bucket(src_key: str, dest_key: str) -> str:
         MetadataDirective="COPY",
     )
     return dk
+
+
+def r2_object_exists(key: str) -> bool:
+    """
+    Return True if an object exists at ``key`` in ``R2_BUCKET_NAME`` (S3 HeadObject).
+
+    Used to avoid returning presigned URLs for keys that were deleted from R2 while the
+    database row still references them.
+    """
+    k = _normalize_r2_key(key or "")
+    if not k or not R2_BUCKET_NAME:
+        return False
+    s3 = get_s3_client()
+    try:
+        s3.head_object(Bucket=R2_BUCKET_NAME, Key=k)
+        return True
+    except ClientError as e:
+        err = (e.response or {}).get("Error") or {}
+        code = str(err.get("Code") or "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        logger.debug("r2_object_exists: head_object failed key=%s code=%s", k[:120], code)
+        return False
+    except Exception as e:
+        logger.debug("r2_object_exists: unexpected error key=%s err=%s", k[:120], e)
+        return False
 
 
 def put_object_bytes(key: str, body: bytes, content_type: str) -> str:

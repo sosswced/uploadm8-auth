@@ -31,6 +31,7 @@ from core.r2 import (
     generate_presigned_download_url,
     generate_presigned_upload_url,
     get_s3_client,
+    r2_object_exists,
 )
 from services.smart_schedule_insights import calculate_smart_schedule_data_driven
 from core.wallet import partial_refund_tokens, refund_tokens
@@ -537,16 +538,18 @@ async def generate_thumbnail_for_upload(
         raise HTTPException(404, "Upload not found")
 
     if should_skip_regenerate(thumbnail_r2_key=row.get("thumbnail_r2_key"), force=force):
-        try:
-            s3 = get_s3_client()
-            url = s3.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(row["thumbnail_r2_key"])},
-                ExpiresIn=3600,
-            )
-            return {"thumbnail_url": url, "r2_key": row["thumbnail_r2_key"], "generated": False}
-        except Exception:
-            pass
+        tk = row.get("thumbnail_r2_key")
+        if tk and await asyncio.to_thread(r2_object_exists, str(tk)):
+            try:
+                s3 = get_s3_client()
+                url = s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(row["thumbnail_r2_key"])},
+                    ExpiresIn=3600,
+                )
+                return {"thumbnail_url": url, "r2_key": row["thumbnail_r2_key"], "generated": False}
+            except Exception:
+                pass
 
     upload_dict = {
         "id": row["id"],

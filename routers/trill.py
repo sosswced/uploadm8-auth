@@ -12,8 +12,9 @@ Handles trill analysis, places lookup, and AI content preview generation.
   then ``run_caption_stage`` (M8 scene graph) and ``merge_signal_hashtags_into_ctx``.
 
 - **Trill HTTP API (this router)** — Fast preview for Drive / map + video: uses
-  ``telemetry_trill.safe_analyze_video`` (Trill score + **US Census gazetteer + PADUS**
-  when ``GAZETTEER_PLACES_PATH`` / ``PADUS_PATH`` are set on the server) and optional
+  ``telemetry_trill.safe_analyze_video`` (Trill score + **US Census gazetteer** when
+  ``GAZETTEER_PLACES_PATH`` exists, plus **PAD-US** from PostGIS when the DB has
+  ``padus_protected_areas``) and optional
   ``generate_trill_content`` (OpenAI from those metrics only). It does **not** run
   Vision, Whisper, Twelve Labs, or Video Intelligence (avoid duplicate cost and long
   requests on a preview endpoint). For full multimodal copy, process the upload through
@@ -35,8 +36,6 @@ from core.config import (
     COST_PER_OPENAI_TOKEN,
     GAZETTEER_PLACES_PATH,
     OPENAI_API_KEY,
-    PADUS_LAYER,
-    PADUS_PATH,
     R2_BUCKET_NAME,
     TRILL_SYSTEM_PROMPT,
 )
@@ -57,8 +56,8 @@ def generate_trill_content(trill_metadata: dict, user_prefs: dict = None) -> dic
     Use OpenAI to generate titles, captions, and hashtags from **Trill telemetry analysis**.
 
     ``trill_metadata`` comes from ``telemetry_trill.safe_analyze_video`` (includes
-    Census nearest place, PADUS protected-lands hit, speed, curvature, etc. when
-    server paths/keys are configured). This is **not** the full upload worker pipeline
+    Census nearest place, PAD-US protected-lands hit (PostGIS), speed, curvature, etc.
+    when configured). This is **not** the full upload worker pipeline
     (no Vision / audio stack / M8). See module docstring above.
 
     Args:
@@ -277,8 +276,8 @@ async def process_telemetry(conn, upload_id: str, user_id: str, video_path: str,
             video_path,
             map_path,
             gaz_places_path=GAZETTEER_PLACES_PATH if (GAZETTEER_PLACES_PATH and os.path.exists(GAZETTEER_PLACES_PATH)) else None,
-            padus_path=PADUS_PATH if (PADUS_PATH and os.path.exists(PADUS_PATH)) else None,
-            padus_layer=PADUS_LAYER or None,
+            padus_path=None,
+            padus_layer=None,
             hud_enabled=user_prefs.get("trill_hud_enabled", False)
         )
 
@@ -287,14 +286,23 @@ async def process_telemetry(conn, upload_id: str, user_id: str, video_path: str,
 
         trill_data = result["data"]
 
+        mid_lat = trill_data.get("place_lat")
+        mid_lon = trill_data.get("place_lon")
+        if mid_lat is not None and mid_lon is not None:
+            from services.padus_db import merge_padus_enrichment_into_mapping, padus_hit_dict_from_db
+
+            try:
+                pad_extra = await padus_hit_dict_from_db(conn, float(mid_lat), float(mid_lon))
+                merge_padus_enrichment_into_mapping(trill_data, pad_extra)
+            except Exception as e:
+                logger.debug("Trill PADUS DB enrichment skipped: %s", e)
+
         # Check if score meets minimum threshold
         trill_score = trill_data.get("trill_score", 0)
         min_score = user_prefs.get("trill_min_score", 60)
 
         # Enrich with nearby trill place if available
-        mid_lat = trill_data.get("place_lat")
-        mid_lon = trill_data.get("place_lon")
-        if mid_lat and mid_lon:
+        if mid_lat is not None and mid_lon is not None:
             trill_place = await get_nearby_trill_place(conn, mid_lat, mid_lon)
             if trill_place:
                 trill_data["trill_place"] = trill_place["name"]

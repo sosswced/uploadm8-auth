@@ -195,13 +195,6 @@ COST_PER_COMPUTE_SECOND = float(os.environ.get("COST_PER_COMPUTE_SECOND", "0.000
 # Trill Telemetry Configuration (paths are stripped so .env quotes/spaces do not break os.path.exists)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GAZETTEER_PLACES_PATH = (os.environ.get("GAZETTEER_PLACES_PATH", "") or "").strip()
-# PADUS: accept common alternate names operators use in .env
-PADUS_PATH = (
-    (os.environ.get("PADUS_PATH", "") or "").strip()
-    or (os.environ.get("PADUS_GEODATABASE", "") or "").strip()
-    or (os.environ.get("PADUS_GDB_PATH", "") or "").strip()
-)
-PADUS_LAYER = (os.environ.get("PADUS_LAYER", "") or "").strip()
 
 # ── External Provider Cost Sync ──────────────────────────────────────────────
 # Upstash: email + API key from console.upstash.com → Account → Management API

@@ -778,7 +778,9 @@ async def _enrich_backfilled_telemetry_with_geocode(ctx: JobContext) -> None:
                     tel.location_start_display,
                 )
 
-    await apply_padus_gazetteer_to_telemetry(tel)
+    await apply_padus_gazetteer_to_telemetry(
+        tel, db_pool=getattr(ctx, "_db_pool", None)
+    )
     ctx.telemetry = tel
     ctx.telemetry_data = tel
 

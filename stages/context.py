@@ -113,7 +113,7 @@ class TelemetryData:
     # When route start is far from midpoint, second Nominatim lookup at start GPS
     location_start_display: Optional[str] = None
 
-    # US Census gazetteer + PADUS (worker: telemetry_stage + local data files)
+    # US Census gazetteer + PAD-US (worker: telemetry_stage; gazetteer file + PostGIS)
     gazetteer_place_name: Optional[str] = None
     gazetteer_state_usps: Optional[str] = None
     near_padus: bool = False

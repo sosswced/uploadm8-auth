@@ -12,11 +12,11 @@ import math
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from core.config import GAZETTEER_PLACES_PATH, PADUS_LAYER, PADUS_PATH
+from core.config import GAZETTEER_PLACES_PATH
 
 from .errors import TelemetryError, SkipStage, ErrorCode
 from .context import JobContext, TelemetryData, TrillScore
@@ -440,19 +440,26 @@ def get_trill_modifiers(score: int, max_speed: float, bucket: str) -> tuple:
         return " 🚗", ["TrillScore", "CruiseControl", "DashCam"]
 
 
-async def apply_padus_gazetteer_to_telemetry(telemetry: TelemetryData) -> None:
-    """US Census gazetteer + PADUS enrichment when ``GAZETTEER_PLACES_PATH`` / ``PADUS_PATH`` exist.
+async def apply_padus_gazetteer_to_telemetry(
+    telemetry: TelemetryData,
+    *,
+    db_pool: Any = None,
+) -> None:
+    """US Census gazetteer (local file) + PAD-US (PostGIS via ``db_pool``).
 
-    Mutates ``telemetry`` in place. Safe no-op when paths are missing or there are
-    no route points. Uses ``asyncio.to_thread`` for GeoPandas / pandas work.
+    Mutates ``telemetry`` in place. Safe no-op when there are no route points and
+    no representative coordinates, or when neither gazetteer nor DB pool is
+    available. Gazetteer work runs in ``asyncio.to_thread``; PAD-US uses
+    ``ST_Contains`` on ``padus_protected_areas`` (see ``services.padus_db``).
 
     Called after **both** ``.map`` parse (``run_telemetry_stage``) and HUD backfill
     (``dashcam_osd_stage``) so captions see the same geo signals whether GPS came
     from a companion map file or burned-in OSD.
     """
     gaz = GAZETTEER_PLACES_PATH if (GAZETTEER_PLACES_PATH and os.path.isfile(GAZETTEER_PLACES_PATH)) else None
-    pad_p = PADUS_PATH if (PADUS_PATH and os.path.exists(PADUS_PATH)) else None
-    if not telemetry.points or not (gaz or pad_p):
+    if not telemetry.points and not (telemetry.mid_lat is not None and telemetry.mid_lon is not None):
+        return
+    if not (gaz or db_pool):
         return
     try:
         from telemetry_trill import enrich_route_padus_gazetteer
@@ -463,18 +470,41 @@ async def apply_padus_gazetteer_to_telemetry(telemetry: TelemetryData) -> None:
             telemetry.mid_lat,
             telemetry.mid_lon,
             gaz_places_path=gaz,
-            padus_path=pad_p,
-            padus_layer=(PADUS_LAYER or None) or None,
+            padus_path=None,
+            padus_layer=None,
         )
         if not isinstance(extra, dict):
-            return
+            extra = {}
         if extra.get("gazetteer_place_name"):
             telemetry.gazetteer_place_name = str(extra["gazetteer_place_name"]).strip() or None
         if extra.get("gazetteer_state_usps"):
             telemetry.gazetteer_state_usps = str(extra["gazetteer_state_usps"]).strip() or None
+
+        if db_pool is not None:
+            from services.padus_db import padus_hit_dict_from_db
+
+            async with db_pool.acquire() as conn:
+                lat_f: Optional[float] = None
+                lon_f: Optional[float] = None
+                if telemetry.mid_lat is not None and telemetry.mid_lon is not None:
+                    try:
+                        lat_f = float(telemetry.mid_lat)
+                        lon_f = float(telemetry.mid_lon)
+                    except (TypeError, ValueError):
+                        lat_f, lon_f = None, None
+                if lat_f is None or lon_f is None:
+                    mid = get_representative_coords(telemetry.points)
+                    if mid:
+                        lat_f, lon_f = float(mid[0]), float(mid[1])
+                if lat_f is not None and lon_f is not None:
+                    db_extra = await padus_hit_dict_from_db(conn, lat_f, lon_f)
+                    extra.update(db_extra)
+
         telemetry.near_padus = bool(extra.get("near_padus"))
         if extra.get("padus_unit_name"):
             telemetry.padus_unit_name = str(extra["padus_unit_name"]).strip() or None
+        elif not telemetry.near_padus:
+            telemetry.padus_unit_name = None
         logger.info(
             "Geo enrichment: gazetteer=%s padus=%s",
             telemetry.gazetteer_place_name or "—",
@@ -620,7 +650,9 @@ async def run_telemetry_stage(ctx: JobContext) -> JobContext:
     ctx.telemetry_data = telemetry
     ctx.telemetry = telemetry
 
-    await apply_padus_gazetteer_to_telemetry(telemetry)
+    await apply_padus_gazetteer_to_telemetry(
+        telemetry, db_pool=getattr(ctx, "_db_pool", None)
+    )
     ctx.telemetry_data = telemetry
     ctx.telemetry = telemetry
 

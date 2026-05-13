@@ -129,7 +129,7 @@ async def merge_output_artifacts_patch(pool, upload_id: str, patch: dict) -> Non
                 WHERE id = $1
                 """,
                 upload_id,
-                patch,
+                json.dumps(patch),
             )
     except asyncpg.exceptions.UndefinedColumnError:
         logger.warning("output_artifacts column missing — pipeline checkpoint not persisted")

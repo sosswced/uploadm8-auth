@@ -6,6 +6,7 @@ Routers keep HTTP wiring (cookies, Request, presigned URL generation, enqueue, a
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
@@ -23,13 +24,35 @@ from core.helpers import (
     sanitize_hashtag_body,
 )
 from core.models import UploadInit
-from core.r2 import _normalize_r2_key, get_s3_client
+from core.r2 import _normalize_r2_key, get_s3_client, r2_object_exists
 from core.scheduling import get_existing_scheduled_days
 from services.smart_schedule_insights import calculate_smart_schedule_data_driven
 from core.sql_allowlist import UPLOADS_COMPLETE_BODY_COLUMNS, assert_set_fragments_columns
 from core.wallet import atomic_reserve_tokens, get_wallet
 from routers.preferences import get_user_prefs_for_upload
+from services.thumbnail_regenerate import ensure_upload_thumbnail_resident
+from services.uploads_api import enrich_platform_results_batch
+from stages.ai_service_costs import compute_presign_put_aic_costs
 from stages.context import is_placeholder_upload_caption, is_placeholder_upload_title
+from stages.entitlements import entitlements_to_dict, get_entitlements_from_user
+
+# Parallel R2 HEAD checks for list payloads — sequential per-row checks dominated bootstrap latency.
+_THUMBNAIL_R2_EXISTS_MAX_CONCURRENCY = 32
+
+
+async def _batch_r2_object_exists(keys: List[str], *, concurrency: int = _THUMBNAIL_R2_EXISTS_MAX_CONCURRENCY) -> List[bool]:
+    if not keys:
+        return []
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(k: str) -> bool:
+        async with sem:
+            try:
+                return await asyncio.to_thread(r2_object_exists, k)
+            except Exception:
+                return False
+
+    return list(await asyncio.gather(*(one(k) for k in keys)))
 
 
 def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: Any) -> None:
@@ -97,9 +120,6 @@ def _schedule_slot_iso(v: Any) -> str:
         except Exception:
             return str(v)
     return str(v)
-from services.uploads_api import enrich_platform_results_batch
-from stages.ai_service_costs import compute_presign_put_aic_costs
-from stages.entitlements import entitlements_to_dict, get_entitlements_from_user
 
 
 def youtube_copyright_shorts_notice_from_artifacts(raw: Any) -> Optional[dict]:
@@ -602,6 +622,9 @@ async def fetch_user_uploads_list(
         "error_code",
         "error_detail",
         "thumbnail_r2_key",
+        "r2_key",
+        "processed_r2_key",
+        "user_preferences",
         "platform_results",
         "file_size",
         "processing_started_at",
@@ -684,14 +707,17 @@ async def fetch_user_uploads_list(
 
             hashtags = _normalize_hashtags_list(d.get("hashtags"))
 
+            # Generate presigned URL optimistically — no R2 HEAD check here; any missing object
+            # is surfaced by an image onerror on the client, which then triggers backfill.
             thumbnail_url = None
             thumb_key = d.get("thumbnail_r2_key")
-            if thumb_key:
+            sk = str(thumb_key).strip() if thumb_key else ""
+            if sk:
                 try:
                     s3 = s3 or get_s3_client()
                     thumbnail_url = s3.generate_presigned_url(
                         "get_object",
-                        Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(thumb_key)},
+                        Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(sk)},
                         ExpiresIn=3600,
                     )
                 except Exception:
@@ -721,6 +747,7 @@ async def fetch_user_uploads_list(
                 "error_code": d.get("error_code"),
                 "error": d.get("error_detail") or d.get("error_code") or None,
                 "thumbnail_url": thumbnail_url,
+                "thumbnail_storage_missing": not bool(thumbnail_url) and bool(sk),
                 "platform_thumbnail_urls": platform_thumbnail_urls_from_artifacts(d.get("output_artifacts")),
                 "platform_results": platform_results,
                 "file_size": d.get("file_size"),
@@ -920,6 +947,9 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
         "error_code",
         "error_detail",
         "thumbnail_r2_key",
+        "r2_key",
+        "processed_r2_key",
+        "user_preferences",
         "platform_results",
         "processing_started_at",
         "processing_finished_at",
@@ -940,9 +970,10 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
         "trill_metadata",
         "output_artifacts",
     ]
+    thumb_user: Optional[Dict[str, Any]] = None
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
-            "SELECT id, status, email_verified FROM users WHERE id = $1",
+            "SELECT id, status, email_verified, subscription_tier, role, flex_enabled FROM users WHERE id = $1",
             user_id,
         )
         if not user:
@@ -957,6 +988,12 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
                     "code": "email_not_verified",
                 },
             )
+
+        thumb_user = {
+            "subscription_tier": user.get("subscription_tier"),
+            "role": user.get("role"),
+            "flex_enabled": user.get("flex_enabled"),
+        }
 
         cols = await ensure_uploads_columns_loaded(conn)
         select_cols = _pick_cols(wanted, cols) or [
@@ -991,7 +1028,20 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="Upload not found")
 
-    payload = build_upload_detail_payload(dict(row))
+    row_d = dict(row)
+    payload = build_upload_detail_payload(row_d)
+    if thumb_user:
+        try:
+            thumb_url, _ = await ensure_upload_thumbnail_resident(
+                db_pool=pool,
+                user_id=user_id,
+                upload_row=row_d,
+                user_row=thumb_user,
+            )
+            if thumb_url:
+                payload["thumbnail_url"] = thumb_url
+        except Exception:
+            pass
     if recognition_row is not None:
         payload["recognition"] = {
             "object_track_count": int(recognition_row["object_track_count"] or 0),

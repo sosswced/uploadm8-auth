@@ -19,18 +19,29 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 from botocore.exceptions import ClientError
 
-from core.config import R2_BUCKET_NAME
+from core.config import OPENAI_API_KEY, R2_BUCKET_NAME
 from core.content_attribution import normalize_thumbnail_render_pipeline
 from core.helpers import coerce_jsonb_dict
 from core.thumbnail_text import clean_thumbnail_headline, is_generic_thumbnail_headline
-from core.r2 import _normalize_r2_key, get_s3_client
+from core.r2 import _normalize_r2_key, generate_presigned_download_url, get_s3_client, r2_object_exists
 from stages import db as db_stage
 from stages.ai_service_costs import user_pref_ai_service_enabled
 from stages.context import JobContext
 from stages.entitlements import get_entitlements_from_user
 from stages.pikzels_api import render_thumbnail_with_studio_renderer
+from stages.thumbnail_stage import (
+    _detect_category,
+    _render_template_thumbnail,
+    _sanitize_thumbnail_brief,
+    _studio_persona_for_request,
+    _thumbnail_styled_render_order,
+    pikzels_studio_eligible_for_styled_thumbnail,
+)
 
 logger = logging.getLogger(__name__)
+
+# Terminal-ish uploads: safe to re-extract a frame from stored video for thumbnail repair.
+_THUMB_REPAIR_STATUSES = frozenset({"completed", "partial", "succeeded"})
 
 
 def _overlay_upload_user_preferences(settings: Dict[str, Any], raw: Any) -> None:
@@ -152,8 +163,14 @@ async def regenerate_upload_thumbnail(
 
     Returns a dict suitable for JSON: thumbnail_url, r2_key, generated, method, offset_seconds.
     """
-    r2_key = upload_row.get("processed_r2_key") or upload_row.get("r2_key")
-    if not r2_key:
+    keys_to_try: List[str] = []
+    for cand in (upload_row.get("processed_r2_key"), upload_row.get("r2_key")):
+        if not cand:
+            continue
+        s = str(cand).strip()
+        if s and s not in keys_to_try:
+            keys_to_try.append(s)
+    if not keys_to_try:
         raise ValueError("no_video_key")
 
     settings = await db_stage.load_user_settings(db_pool, str(user_id))
@@ -176,17 +193,27 @@ async def regenerate_upload_thumbnail(
         base_frame = tmp_path / "base_frame.jpg"
 
         s3 = get_s3_client()
-        norm = _normalize_r2_key(str(r2_key))
-        try:
-            await asyncio.to_thread(s3.download_file, R2_BUCKET_NAME, norm, str(video_path))
-        except ClientError as e:
-            err = (e.response or {}).get("Error") or {}
-            code = str(err.get("Code") or "")
-            http = (e.response or {}).get("ResponseMetadata", {}) or {}
-            status = http.get("HTTPStatusCode")
-            if status == 404 or code in ("404", "NoSuchKey", "NotFound"):
-                raise ValueError("video_not_in_storage") from e
-            raise
+        last_miss: Optional[ClientError] = None
+        downloaded = False
+        for cand in keys_to_try:
+            norm = _normalize_r2_key(str(cand))
+            try:
+                await asyncio.to_thread(s3.download_file, R2_BUCKET_NAME, norm, str(video_path))
+                downloaded = True
+                break
+            except ClientError as e:
+                err = (e.response or {}).get("Error") or {}
+                code = str(err.get("Code") or "")
+                http = (e.response or {}).get("ResponseMetadata", {}) or {}
+                status = http.get("HTTPStatusCode")
+                if status == 404 or code in ("404", "NoSuchKey", "NotFound"):
+                    last_miss = e
+                    continue
+                raise
+        if not downloaded:
+            if last_miss:
+                raise ValueError("video_not_in_storage") from last_miss
+            raise ValueError("video_not_in_storage")
 
         offset, ok = await asyncio.to_thread(_ffmpeg_frame, video_path, base_frame)
         if not ok:
@@ -348,6 +375,55 @@ async def regenerate_upload_thumbnail(
             "offset_seconds": offset,
             "platforms_rendered": list(platform_files.keys()),
         }
+
+
+async def ensure_upload_thumbnail_resident(
+    *,
+    db_pool: asyncpg.Pool,
+    user_id: str,
+    upload_row: Dict[str, Any],
+    user_row: Dict[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Return ``(presigned_thumbnail_url, thumbnail_r2_key)`` for dashboard/detail views.
+
+    When ``thumbnail_r2_key`` is set but the object was removed from R2, regenerates from
+    the stored video for uploads in a terminal state (completed / partial / succeeded).
+    """
+    upload_id = str(upload_row.get("id") or "").strip()
+    if not upload_id:
+        return None, None
+
+    status = str(upload_row.get("status") or "")
+    thumb_key = upload_row.get("thumbnail_r2_key")
+    sk = str(thumb_key).strip() if thumb_key else ""
+
+    if sk:
+        exists = await asyncio.to_thread(r2_object_exists, sk)
+        if exists:
+            try:
+                url = await asyncio.to_thread(generate_presigned_download_url, sk, 3600)
+                return (url or None, sk)
+            except Exception:
+                return None, sk
+
+    if status not in _THUMB_REPAIR_STATUSES:
+        return None, sk or None
+
+    try:
+        out = await regenerate_upload_thumbnail(
+            db_pool=db_pool,
+            upload_id=upload_id,
+            user_id=user_id,
+            upload_row=upload_row,
+            user_row=user_row,
+            force=bool(sk),
+        )
+        rk = out.get("r2_key")
+        return out.get("thumbnail_url"), (str(rk) if rk else None)
+    except Exception as e:
+        logger.warning("ensure_upload_thumbnail_resident failed upload_id=%s: %s", upload_id, e)
+        return None, sk or None
 
 
 def should_skip_regenerate(*, thumbnail_r2_key: Optional[str], force: bool) -> bool:

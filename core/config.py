@@ -308,3 +308,34 @@ INSTAGRAM_CLIENT_SECRET = META_APP_SECRET
 # Facebook uses the main Meta App ID
 FACEBOOK_CLIENT_ID = os.environ.get("FACEBOOK_CLIENT_ID", "") or META_APP_ID
 FACEBOOK_CLIENT_SECRET = os.environ.get("FACEBOOK_CLIENT_SECRET", "") or META_APP_SECRET
+
+# ---------------------------------------------------------------------------
+# ML / Hugging Face Hub (admin UI links). The API never creates Hub repos;
+# use scripts/init_hf_ml_hub_repos.py or dataset_manager.py with HF_TOKEN (write).
+# ---------------------------------------------------------------------------
+UM8_HF_DATASET_REPO = (os.environ.get("UM8_HF_DATASET_REPO") or "").strip()
+UM8_HF_DATASET_URL = (os.environ.get("UM8_HF_DATASET_URL") or "").strip()
+UM8_TRACKIO_SPACE_PATH = (os.environ.get("UM8_TRACKIO_SPACE_PATH") or "").strip()
+UM8_TRACKIO_SPACE_URL = (os.environ.get("UM8_TRACKIO_SPACE_URL") or "").strip()
+
+
+def resolve_ml_hub_dataset_urls() -> tuple[str | None, str | None]:
+    """Return (dataset repo_id, canonical Hub page URL). Both None when unset."""
+    repo = UM8_HF_DATASET_REPO.strip() if UM8_HF_DATASET_REPO else ""
+    url = UM8_HF_DATASET_URL.strip() if UM8_HF_DATASET_URL else ""
+    if url:
+        return (repo or None, url)
+    if repo:
+        return (repo, f"https://huggingface.co/datasets/{repo}")
+    return (None, None)
+
+
+def resolve_ml_hub_trackio_space_urls() -> tuple[str | None, str | None]:
+    """Return (Space repo path org/name, canonical Hub Space URL). Both None when unset."""
+    path = UM8_TRACKIO_SPACE_PATH.strip().strip("/") if UM8_TRACKIO_SPACE_PATH else ""
+    url = UM8_TRACKIO_SPACE_URL.strip() if UM8_TRACKIO_SPACE_URL else ""
+    if url:
+        return (path or None, url)
+    if path:
+        return (path, f"https://huggingface.co/spaces/{path}")
+    return (None, None)

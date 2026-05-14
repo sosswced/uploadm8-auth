@@ -35,6 +35,8 @@ from core.config import (
     FRONTEND_URL,
     ADMIN_DISCORD_WEBHOOK_URL,
     COMMUNITY_DISCORD_WEBHOOK_URL,
+    resolve_ml_hub_dataset_urls,
+    resolve_ml_hub_trackio_space_urls,
 )
 from core.models import (
     AdminUserUpdate,
@@ -105,6 +107,8 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
     hf_token = (os.environ.get("HF_TOKEN") or "").strip()
     trackio_project = (os.environ.get("TRACKIO_PROJECT") or "").strip()
     trackio_space = (os.environ.get("TRACKIO_SPACE_ID") or "").strip()
+    dataset_repo, dataset_url = resolve_ml_hub_dataset_urls()
+    trackio_space_path, trackio_space_url = resolve_ml_hub_trackio_space_urls()
 
     summary: Dict[str, Any] = {
         "local": {
@@ -116,9 +120,11 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
         },
         "huggingface": {
             "token_configured": bool(hf_token),
-            "dataset_repo": "cedy243/uploadm8-promo-targeting-v1",
-            "dataset_url": "https://huggingface.co/datasets/cedy243/uploadm8-promo-targeting-v1",
-            "trackio_space_url": "https://huggingface.co/spaces/cedy243/uploadm8-trackio",
+            "dataset_repo": dataset_repo,
+            "dataset_url": dataset_url,
+            "trackio_space_path": trackio_space_path,
+            "trackio_space_url": trackio_space_url,
+            "hub_links_configured": bool(dataset_url or trackio_space_url),
         },
         "trackio": {
             "project_configured": bool(trackio_project),

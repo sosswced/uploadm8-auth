@@ -13,6 +13,7 @@ class UploadInit(BaseModel):
     content_type: str
     platforms: List[str]
     target_accounts: List[str] = []  # platform_tokens.id UUIDs — publish to specific accounts
+    group_ids: List[str] = []  # account_groups.id — server resolves to target_accounts
     title: str = ""
     caption: str = ""
     hashtags: List[str] = []
@@ -24,6 +25,8 @@ class UploadInit(BaseModel):
     smart_schedule_days: int = 7  # How many days to spread uploads across
     duration_seconds: Optional[float] = None
     thumbnail_count: Optional[int] = None
+    vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
+    vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
     thumbnail_use_studio_engine: Optional[bool] = None
     thumbnail_use_pikzels: Optional[bool] = None
     thumbnail_use_persona: Optional[bool] = None
@@ -45,6 +48,8 @@ class UploadUpdate(BaseModel):
     hashtags: Optional[List[str]] = None
     scheduled_time: Optional[datetime] = None
     smart_schedule: Optional[Dict[str, str]] = Field(None, description="Platform -> ISO datetime string")
+    vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
+    vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
 
 
 class CompleteUploadBody(BaseModel):
@@ -57,3 +62,5 @@ class CompleteUploadBody(BaseModel):
     privacy: Optional[str] = None
     target_accounts: Optional[List[str]] = None
     group_ids: Optional[List[str]] = None
+    vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
+    vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")

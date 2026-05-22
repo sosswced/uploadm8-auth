@@ -39,6 +39,9 @@ openpyxl>=3.1.0,<4.0.0
 # Error Tracking
 sentry-sdk[fastapi]>=2.0.0,<3.0.0
 
+# ML observability (admin quality-score paths use OptionalTrackioRun)
+trackio>=0.25.0,<1.0.0
+
 # Environment
 python-dotenv>=1.0.0,<2.0.0
 

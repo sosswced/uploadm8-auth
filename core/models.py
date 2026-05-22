@@ -16,7 +16,7 @@ class PlatformHashtags(BaseModel):
 class UserPreferencesUpdate(BaseModel):
     # Accept both snake_case (backend) and camelCase (frontend) keys.
     auto_captions: bool = Field(False, alias="autoCaptions")
-    auto_thumbnails: bool = Field(False, alias="autoThumbnails")
+    auto_thumbnails: bool = Field(True, alias="autoThumbnails")
     styled_thumbnails: bool = Field(True, alias="styledThumbnails")
     thumbnail_interval: int = Field(5, ge=1, le=60, alias="thumbnailInterval")
 
@@ -65,6 +65,9 @@ class UserPreferencesUpdate(BaseModel):
     thumbnail_persona_enabled: bool = Field(False, alias="thumbnailPersonaEnabled")
     thumbnail_default_persona_id: Optional[str] = Field(None, alias="thumbnailDefaultPersonaId")
     thumbnail_persona_strength: int = Field(70, ge=0, le=100, alias="thumbnailPersonaStrength")
+    trill_leaderboard_opt_in: bool = Field(False, alias="trillLeaderboardOptIn")
+    trill_map_sharing_opt_in: bool = Field(False, alias="trillMapSharingOptIn")
+    trill_welcome_modal_mark_seen: bool = Field(False, alias="trillWelcomeModalMarkSeen")
 
     class Config:
         populate_by_name = True
@@ -103,6 +106,7 @@ class UploadInit(BaseModel):
     content_type: str
     platforms: List[str]
     target_accounts: List[str] = []  # platform_tokens.id UUIDs — publish to specific accounts
+    group_ids: List[str] = []  # account_groups.id — server resolves to target_accounts
     title: str = ""
     caption: str = ""
     hashtags: List[str] = []
@@ -112,6 +116,8 @@ class UploadInit(BaseModel):
     has_telemetry: bool = False
     use_ai: bool = False
     smart_schedule_days: int = 7  # How many days to spread uploads across
+    vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
+    vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
     # Per-upload thumbnail studio / Pikzels / persona (mirrors upload.html presign body)
     thumbnail_count: Optional[int] = None
     thumbnail_use_studio_engine: Optional[bool] = None
@@ -120,17 +126,15 @@ class UploadInit(BaseModel):
     thumbnail_persona_id: Optional[str] = None
     thumbnail_persona_strength: Optional[int] = Field(default=None, ge=0, le=100)
 
+    class Config:
+        populate_by_name = True
+
+
 class SettingsUpdate(BaseModel):
     discord_webhook: Optional[str] = Field(None, alias="discordWebhook")
     telemetry_enabled: Optional[bool] = Field(None, alias="telemetryEnabled")
-    hud_enabled: Optional[bool] = Field(None, alias="hudEnabled")
-    hud_position: Optional[str] = Field(None, alias="hudPosition")
     speeding_mph: Optional[int] = Field(None, alias="speedingMph")
     euphoria_mph: Optional[int] = Field(None, alias="euphoriaMph")
-    hud_speed_unit: Optional[str] = None
-    hud_color: Optional[str] = None
-    hud_font_family: Optional[str] = None
-    hud_font_size: Optional[int] = None
     ffmpeg_screenshot_interval: Optional[int] = None
     auto_generate_thumbnails: Optional[bool] = None
     auto_generate_captions: Optional[bool] = None
@@ -192,6 +196,7 @@ class AnnouncementRequest(BaseModel):
     send_user_webhooks: bool = False
     target: str = "all"  # all | paid | trial | free | specific_tiers
     target_tiers: List[str] = []
+    promo_media: Optional[dict] = None
 
 class AdminUserUpdate(BaseModel):
     subscription_tier: Optional[str] = None
@@ -225,6 +230,11 @@ class UploadUpdate(BaseModel):
     hashtags: Optional[List[str]] = None
     scheduled_time: Optional[datetime] = None
     smart_schedule: Optional[Dict[str, str]] = Field(None, description="Platform -> ISO datetime string")
+    vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
+    vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
+
+    class Config:
+        populate_by_name = True
 
 class ColorPreferencesUpdate(BaseModel):
     tiktok_color: Optional[str] = None
@@ -256,6 +266,11 @@ class CompleteUploadBody(BaseModel):
     privacy: Optional[str] = None
     target_accounts: Optional[List[str]] = None
     group_ids: Optional[List[str]] = None
+    vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
+    vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
+
+    class Config:
+        populate_by_name = True
 
 
 # ============================================================
@@ -312,6 +327,25 @@ class ActivityLogIn(BaseModel):
     resource_id: Optional[str] = None
     details: Optional[dict] = None
     session_id: Optional[str] = None
+
+
+# ============================================================
+# Wallet dispute tickets (ledger line disputes)
+# ============================================================
+
+class WalletDisputeCreate(BaseModel):
+    """User-submitted wallet / ledger line dispute."""
+
+    ledger_id: str = Field(..., min_length=32, max_length=48)
+    note: str = Field(..., min_length=8, max_length=4000)
+
+
+class AdminWalletDisputePatch(BaseModel):
+    """Admin update for a wallet dispute ticket."""
+
+    status: Optional[Literal["open", "in_review", "resolved", "rejected"]] = None
+    admin_internal_note: Optional[str] = Field(None, max_length=8000)
+    resolution_message: Optional[str] = Field(None, max_length=8000)
 
 
 # ============================================================

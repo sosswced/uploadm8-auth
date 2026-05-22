@@ -29,7 +29,9 @@ async def _init_asyncpg_codecs(conn):
     try:
         await conn.set_type_codec(
             'json',
-            encoder=lambda v: json.dumps(v, separators=(',', ':'), ensure_ascii=False),
+            encoder=lambda v: json.dumps(
+                v, separators=(',', ':'), ensure_ascii=False, default=str
+            ),
             decoder=json.loads,
             schema='pg_catalog',
         )
@@ -38,7 +40,9 @@ async def _init_asyncpg_codecs(conn):
     try:
         await conn.set_type_codec(
             'jsonb',
-            encoder=lambda v: json.dumps(v, separators=(',', ':'), ensure_ascii=False),
+            encoder=lambda v: json.dumps(
+                v, separators=(',', ':'), ensure_ascii=False, default=str
+            ),
             decoder=json.loads,
             schema='pg_catalog',
         )

@@ -46,6 +46,9 @@ python-dotenv>=1.0.0,<2.0.0
 # ── Observability (Sentry — set SENTRY_DSN in host secret store) ────────────
 sentry-sdk>=2.0.0,<3.0.0
 
+# ── ML observability (Trackio — OptionalTrackioRun is a no-op without TRACKIO_PROJECT) ─
+trackio>=0.25.0,<1.0.0
+
 # ── Date / time ──────────────────────────────────────────────────────────────
 python-dateutil>=2.8.0,<3.0.0
 

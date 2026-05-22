@@ -4,20 +4,19 @@ UploadM8 Worker Service v3 — Deferred Processing + Concurrent Jobs
 Pipeline order (critical — DO NOT REORDER):
   1.  Download        — Fetch original video + telemetry from R2
   2.  Telemetry       — Parse .map file, calculate Trill score, reverse-geocode + PADUS/gazetteer
-  3.  HUD             — Burn speed overlay onto raw video (before transcode!)
-  4.  Watermark       — Burn text watermark (before transcode!)
-  5.  Transcode       — Deduplicated per-platform MP4s (+ ffprobe → ctx.video_info)
-  6.  Audio context   — Whisper / ACR / YAMNet / GPT summary (feeds M8)
-  7.  Vision          — Google Cloud Vision on sampled frames (labels/OCR/landmarks)
-  8.  Twelve Labs     — Optional full-video scene understanding
-  9.  Video Intel     — Always-on GCP Video Intelligence hydration (when credentials/limits allow)
-  10. Dashcam OSD     — Burned-in HUD OCR (always when pref on; .map unchanged); backfill only without .map
-  11. Thumbnail       — Extract frame from FINAL processed video
-  12. Caption         — M8 / LLM title+caption+hashtags (uses steps 2–10)
-  13. Upload          — Per-platform R2 keys
-  14. Publish         — Send to each platform API
-  15. Verify          — Delivery verification loop (background)
-  16. Notify          — Discord webhooks
+  3.  Watermark       — Burn text watermark (before transcode!)
+  4.  Transcode       — Deduplicated per-platform MP4s (+ ffprobe → ctx.video_info)
+  5.  Audio context   — Whisper / ACR / YAMNet / GPT summary (feeds M8)
+  6.  Vision          — Google Cloud Vision on sampled frames (labels/OCR/landmarks)
+  7.  Twelve Labs     — Optional full-video scene understanding
+  8.  Video Intel     — Always-on GCP Video Intelligence hydration (when credentials/limits allow)
+  9.  Dashcam OSD     — OCR of on-screen dashcam text (pref on); backfill telemetry when no .map
+  10. Thumbnail       — Extract frame from FINAL processed video
+  11. Caption         — M8 / LLM title+caption+hashtags (uses steps 2–9)
+  12. Upload          — Per-platform R2 keys
+  13. Publish         — Send to each platform API
+  14. Verify          — Delivery verification loop (background)
+  15. Notify          — Discord webhooks
 
 NEW IN v3: DEFERRED PROCESSING (Staged Upload Flow)
 ═══════════════════════════════════════════════════
@@ -67,34 +66,49 @@ NEW IN v3: DEFERRED PROCESSING (Staged Upload Flow)
 
 CONCURRENCY:
   WORKER_CONCURRENCY=3 (default) — 3 jobs process simultaneously.
+  WORKER_LANE=full|process|publish — optional split: process lane skips publish consumer; publish lane runs publish_jobs + scheduler (staged jobs enqueue to Redis for process fleet).
+  ASYNC_PUBLISH_QUEUE — when true, immediate jobs enqueue publish to Redis after encode (same or separate worker).
   Scheduler loop runs as a separate asyncio task, not a job slot.
 
 WATERMARK (free tier — full-file FFmpeg re-encode before transcode):
   WATERMARK_X264_PRESET (default: veryfast) and WATERMARK_X264_CRF (default: 23)
   tune CPU time; intermediate file is re-encoded again in transcode. For long
   clips, try preset=faster or ultrafast if the worker is queue-bound.
+
+TRANSCODE quality:
+  TRANSCODE_X264_CRF (default: 20), TRANSCODE_X264_PRESET (default: medium)
+  TRANSCODE_YOUTUBE_4K (default: false) — 2160x3840 + 40M cap for YouTube only
 """
 
 import os
+import re
 import sys
 import json
 import asyncio
 import logging
 import tempfile
 import signal
+import socket
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Callable, Awaitable, Any
 
 import asyncpg
 import redis.asyncio as redis
 
 from core.helpers import coerce_jsonb_dict, coerce_jsonb_list, merge_platform_hashtag_overlay
 from stages.errors import StageError, SkipStage, CancelRequested
-from stages.context import JobContext, create_context
-from stages.entitlements import get_entitlements_from_user
+from stages.context import (
+    JobContext,
+    build_hydration_story_text,
+    build_video_story_timeline,
+    create_context,
+)
+from stages.entitlements import get_entitlements_from_user, PRIORITY_QUEUE_CLASSES
 from stages import db as db_stage
 from stages import r2 as r2_stage
+from stages import pipeline_checkpoint
 from stages.telemetry_stage import run_telemetry_stage
 from stages.transcode_stage import (
     run_transcode_stage, PLATFORM_SPECS,
@@ -102,14 +116,20 @@ from stages.transcode_stage import (
     resolve_reframe_action,
 )
 from stages.audio_stage import run_audio_context_stage
-from stages.vision_stage import run_vision_stage
+from stages.vision_stage import run_vision_stage, VISION_STAGE_ENABLED
 from stages.twelvelabs_stage import run_twelvelabs_stage
-from stages.video_intelligence_stage import run_video_intelligence_stage
-from stages.dashcam_osd_stage import backfill_telemetry_from_vision_osd, run_dashcam_osd_stage
+from stages.video_intelligence_stage import (
+    run_video_intelligence_stage,
+    VIDEO_INTELLIGENCE_STAGE_ENABLED,
+)
+from stages.dashcam_osd_stage import (
+    backfill_telemetry_from_vision_osd,
+    run_dashcam_osd_stage,
+    DASHCAM_OSD_STAGE_ENABLED,
+)
 from stages.hydration_payload_stage import run_hydration_payload_stage
 from stages.thumbnail_stage import run_thumbnail_stage
 from stages.caption_stage import run_caption_stage
-from stages.hud_stage import run_hud_stage
 from stages.watermark_stage import run_watermark_stage
 from stages.publish_stage import run_publish_stage
 from stages.verify_stage import run_verification_loop
@@ -118,14 +138,19 @@ from stages.notify_stage import (
     notify_admin_worker_start,
     notify_admin_worker_stop,
     notify_admin_error,
+    notify_upload_terminal,
 )
 from stages.emails import (
-    send_upload_completed_email,
-    send_upload_failed_email,
     send_low_token_warning_email,
-    build_upload_completed_email_extensions,
 )
 from services.pipeline_ai_trace import emit_ai_pipeline_summary, record_ai_pipeline_trace
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -172,12 +197,150 @@ ANALYTICS_SYNC_BATCH    = int(os.environ.get("ANALYTICS_SYNC_BATCH_SIZE", "20"))
 # Only re-sync uploads whose analytics_synced_at is older than this many hours
 ANALYTICS_RESYNC_HOURS  = int(os.environ.get("ANALYTICS_RESYNC_HOURS", "6"))
 
+# ── Per-stage timeouts (seconds) ─────────────────────────────────
+# Each outer wrap is intentionally larger than the stage's own internal
+# subprocess/HTTP timeout, so the inner cleanup runs first and the outer
+# wait_for is the safety net against truly wedged stages.
+STAGE_TIMEOUT_WATERMARK = int(os.environ.get("STAGE_TIMEOUT_WATERMARK_SECONDS", "660"))   # 11 min
+STAGE_TIMEOUT_TRANSCODE = int(os.environ.get("STAGE_TIMEOUT_TRANSCODE_SECONDS", "1800"))  # 30 min across all platforms
+STAGE_TIMEOUT_THUMBNAIL = int(os.environ.get("STAGE_TIMEOUT_THUMBNAIL_SECONDS", "120"))   # 2 min
+STAGE_TIMEOUT_PUBLISH   = int(os.environ.get("STAGE_TIMEOUT_PUBLISH_SECONDS",   "900"))   # 15 min (Meta/TikTok large uploads)
+
+# ── Worker heartbeat ─────────────────────────────────────────────
+# Writes a liveness row every N seconds so admin can see if the worker
+# is actually doing work vs silently zombied. Self-creating schema.
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "10"))
+WORKER_ID = (
+    os.environ.get("WORKER_ID")
+    or os.environ.get("RENDER_INSTANCE_ID")
+    or socket.gethostname()
+    or "worker"
+)
+
+# Worker deployment lane: full (default) | process | publish
+# Use separate Render services: process workers run FFmpeg + consume process Redis
+# queues; publish workers consume publish Redis queues (when ASYNC_PUBLISH_QUEUE).
+WORKER_LANE = (os.environ.get("WORKER_LANE") or "full").strip().lower()
+
+# When true, immediate uploads enqueue a publish-lane job after process pipeline
+# instead of calling publish inline (requires publish consumer on this or another instance).
+ASYNC_PUBLISH_QUEUE = (os.environ.get("ASYNC_PUBLISH_QUEUE", "false").lower() in ("1", "true", "yes", "on"))
+
+# Stale job recovery (best-effort re-enqueue / visibility)
+STALE_JOB_RECOVERY_ENABLED = (os.environ.get("STALE_JOB_RECOVERY_ENABLED", "true").lower() in ("1", "true", "yes", "on"))
+STALE_JOB_RECOVERY_INTERVAL_SEC = max(60, int(os.environ.get("STALE_JOB_RECOVERY_INTERVAL_SEC", "300")))
+STALE_QUEUED_MINUTES = max(15, int(os.environ.get("STALE_QUEUED_MINUTES", "45")))
+STALE_PROCESSING_MINUTES = int(os.environ.get("STALE_PROCESSING_MINUTES", "0"))  # 0 = do not auto-fail processing
+STALE_PROCESSING_RECOVER_CHECKPOINT = (
+    os.environ.get("STALE_PROCESSING_RECOVER_CHECKPOINT", "true").lower() in ("1", "true", "yes", "on")
+)
+
 # Redis resilience
 REDIS_RETRY_DELAY = 5.0
 REDIS_MAX_RETRIES = 10
 
 db_pool: Optional[asyncpg.Pool] = None
 redis_client: Optional[redis.Redis] = None
+
+
+def _google_multimodal_strict_mode() -> str:
+    v = (os.environ.get("GOOGLE_MULTIMODAL_STRICT") or "").strip().lower()
+    if not v or v in ("0", "false", "no", "off"):
+        return "off"
+    if v in ("halt", "fail", "block", "abort", "hard"):
+        return "halt"
+    return "degrade"
+
+
+def _google_multimodal_strict_enabled() -> bool:
+    return _google_multimodal_strict_mode() != "off"
+
+
+def _strict_multimodal_gap_reason(reason: str) -> bool:
+    r = (reason or "").lower()
+    if "disabled via env" in r:
+        return False
+    return "credential" in r or "not configured" in r
+
+
+def _merge_telemetry_ingest_artifact(ctx: JobContext, patch: Dict[str, Any]) -> None:
+    """Merge diagnostics into ``output_artifacts.telemetry_ingest`` (JSON object)."""
+    if not isinstance(getattr(ctx, "output_artifacts", None), dict):
+        return
+    cur: Dict[str, Any] = {}
+    try:
+        raw = ctx.output_artifacts.get("telemetry_ingest")
+        if isinstance(raw, str) and raw.strip().startswith("{"):
+            cur = json.loads(raw)
+            if not isinstance(cur, dict):
+                cur = {}
+    except Exception:
+        cur = {}
+    for k, v in patch.items():
+        if v is not None:
+            cur[k] = v
+    try:
+        ctx.output_artifacts["telemetry_ingest"] = json.dumps(cur, default=str)[:8000]
+    except Exception:
+        pass
+
+
+def _bootstrap_policy_flags_from_upload_artifacts(ctx: JobContext) -> None:
+    """Rehydrate policy flags saved in ``output_artifacts`` for deferred publish-only runs."""
+
+    arts = getattr(ctx, "output_artifacts", None) or {}
+    if not isinstance(arts, dict):
+        return
+    viol = getattr(ctx, "google_multimodal_strict_violations", None)
+    if not viol:
+        raw_g = arts.get("google_multimodal_gaps")
+        if isinstance(raw_g, str) and raw_g.strip():
+            try:
+                blob = json.loads(raw_g)
+                gaps = blob.get("gaps") if isinstance(blob, dict) else None
+                if isinstance(gaps, list) and gaps:
+                    setattr(ctx, "google_multimodal_strict_violations", list(gaps))
+            except (json.JSONDecodeError, TypeError):
+                pass
+    mq_v = getattr(ctx, "metadata_quality_violations", None)
+    mq_ok_known = getattr(ctx, "metadata_quality_ok", None) is not None
+    if mq_v is None or not mq_ok_known:
+        raw_m = arts.get("metadata_quality_report")
+        if isinstance(raw_m, str) and raw_m.strip():
+            try:
+                j = json.loads(raw_m)
+                if isinstance(j, dict):
+                    if isinstance(j.get("violations"), list):
+                        setattr(ctx, "metadata_quality_violations", list(j["violations"]))
+                    if "ok" in j:
+                        setattr(ctx, "metadata_quality_ok", bool(j["ok"]))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+
+def _publish_policy_block_reason(ctx: JobContext) -> str:
+    """Human-readable blocker string, or ``\"\"`` when publishing is allowed."""
+
+    _bootstrap_policy_flags_from_upload_artifacts(ctx)
+    mode_g = _google_multimodal_strict_mode()
+    if mode_g == "halt":
+        v = getattr(ctx, "google_multimodal_strict_violations", None) or []
+        if v:
+            tail = "; ".join(str(x) for x in v[:24])
+            return f"MULTIMODAL_STRICT_HALT: {tail}"[:4000]
+    try:
+        from services.metadata_quality import metadata_quality_strict_mode
+
+        if metadata_quality_strict_mode() == "halt":
+            if getattr(ctx, "metadata_quality_ok", True) is False:
+                mv = getattr(ctx, "metadata_quality_violations", None) or []
+                tail = "; ".join(str(x) for x in mv[:40])
+                suf = tail if tail else "metadata_quality_fail"
+                return f"METADATA_QUALITY_HALT: {suf}"[:4000]
+    except Exception:
+        pass
+    return ""
+
 
 # ── Wallet helpers (worker-side) ─────────────────────────────────────────────
 async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost: int):
@@ -188,6 +351,40 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
     if not db_pool:
         return
     async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT u.platforms, u.compute_seconds, u.put_cost AS u_put, u.aic_cost AS u_aic,
+                   u.billing_breakdown,
+                   usr.subscription_tier
+            FROM uploads u
+            JOIN users usr ON usr.id = u.user_id
+            WHERE u.id = $1 AND u.user_id = $2::uuid
+            """,
+            upload_id,
+            user_id,
+        )
+        platforms = list(row["platforms"] or []) if row else []
+        n_pf = len(platforms)
+        tier = str(row["subscription_tier"] or "free") if row else "free"
+        compute_seconds = float(row["compute_seconds"] or 0) if row else 0.0
+        ai_services = []
+        if aic_cost > 0:
+            ai_services = ["captions", "hashtags", "thumbnails"]
+        bd = row.get("billing_breakdown") if row else None
+        if isinstance(bd, str):
+            try:
+                bd = json.loads(bd)
+            except Exception:
+                bd = None
+        meta_obj = {
+            "ai_services": ai_services,
+            "num_platforms": n_pf,
+            "subscription_tier": tier,
+            "compute_seconds": compute_seconds,
+            "put_cost_applied": put_cost,
+            "aic_cost_applied": aic_cost,
+            "billing_breakdown": bd,
+        }
         # Debit balance and clear reservation simultaneously
         await conn.execute("""
             UPDATE wallets SET
@@ -204,14 +401,14 @@ async def _capture_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
         # Ledger entries
         if put_cost > 0:
             await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'put', $2, 'upload_debit', $3, 'upload')
-            """, user_id, -put_cost, upload_id)
+                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type, meta)
+                VALUES ($1, 'put', $2, 'upload_debit', $3, 'upload', $4::jsonb)
+            """, user_id, -put_cost, upload_id, json.dumps(meta_obj))
         if aic_cost > 0:
             await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'aic', $2, 'upload_debit', $3, 'upload')
-            """, user_id, -aic_cost, upload_id)
+                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type, meta)
+                VALUES ($1, 'aic', $2, 'upload_debit', $3, 'upload', $4::jsonb)
+            """, user_id, -aic_cost, upload_id, json.dumps(meta_obj))
 
         # Update wallet_holds record
         await conn.execute("""
@@ -277,16 +474,17 @@ async def _release_tokens(upload_id: str, user_id: str, put_cost: int, aic_cost:
             WHERE user_id = $3
         """, put_cost, aic_cost, user_id)
 
+        rel_meta = json.dumps({"hold_release": True, "detail": reason}, default=str)
         if put_cost > 0:
             await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'put', $2, $3, $4, 'upload')
-            """, user_id, put_cost, reason, upload_id)  # positive delta = refund
+                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type, meta)
+                VALUES ($1, 'put', $2, $3, $4, 'upload', $5::jsonb)
+            """, user_id, put_cost, reason, upload_id, rel_meta)
         if aic_cost > 0:
             await conn.execute("""
-                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-                VALUES ($1, 'aic', $2, $3, $4, 'upload')
-            """, user_id, aic_cost, reason, upload_id)
+                INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type, meta)
+                VALUES ($1, 'aic', $2, $3, $4, 'upload', $5::jsonb)
+            """, user_id, aic_cost, reason, upload_id, rel_meta)
 
         await conn.execute("""
             UPDATE wallet_holds SET status = 'released', resolved_at = NOW()
@@ -360,14 +558,23 @@ async def partial_refund_tokens(
     )
 
     # Ledger entry — positive delta = credit back
+    pr_meta = json.dumps(
+        {
+            "failed_platforms": [str(x) for x in (failed_platforms or [])],
+            "succeeded_platforms": [str(x) for x in (succeeded_platforms or [])],
+            "original_put_cost": int(original_put_cost),
+        },
+        default=str,
+    )
     await conn.execute(
         """
-        INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type)
-        VALUES ($1, 'put', $2, 'partial_platform_refund', $3, 'upload')
+        INSERT INTO token_ledger (user_id, token_type, delta, reason, upload_id, ref_type, meta)
+        VALUES ($1, 'put', $2, 'partial_platform_refund', $3, 'upload', $4::jsonb)
         """,
         user_id,
         put_refund,
         upload_id,
+        pr_meta,
     )
 
 
@@ -413,8 +620,7 @@ STAGE_PROGRESS = {
     "init":       5,
     "download":   10,
     "telemetry":  18,
-    "hud":        26,
-    "watermark":  32,
+    "watermark":  28,
     "transcode":  48,
     "audio":      52,
     "vision":     55,
@@ -443,11 +649,13 @@ async def maybe_cancel(ctx: JobContext, stage: str):
 # ---------------------------------------------------------------------------
 
 def _platform_spec_fingerprint(platform: str) -> str:
-    spec = PLATFORM_SPECS.get(platform, {})
+    from stages.transcode_stage import get_platform_spec
+
+    spec = get_platform_spec(platform)
     return (
         f"{spec.get('video_codec', 'h264')}"
-        f"_{spec.get('max_width', 1080)}"
-        f"x{spec.get('max_height', 1920)}"
+        f"_{spec.get('target_width', 1080)}"
+        f"x{spec.get('target_height', 1920)}"
         f"_{spec.get('max_fps', 30)}fps"
         f"_{spec.get('max_duration', 9999)}s"
         f"_{spec.get('sample_rate', 44100)}hz"
@@ -460,6 +668,59 @@ def _group_platforms_by_spec(platforms: List[str]) -> Dict[str, List[str]]:
         fp = _platform_spec_fingerprint(p)
         groups.setdefault(fp, []).append(p)
     return groups
+
+
+async def _maybe_burn_tiktok_styled_cover(ctx: JobContext, upload_id: str) -> None:
+    """Composite TikTok styled thumbnail into platform MP4 at cover frame time."""
+    from pathlib import Path as _Path
+
+    from stages.tiktok_cover_burn import (
+        burn_tiktok_styled_cover,
+        resolve_tiktok_cover_offset_sec,
+        tiktok_burn_enabled,
+    )
+
+    platforms = [str(p).lower() for p in (ctx.platforms or [])]
+    if "tiktok" not in platforms:
+        return
+    if not tiktok_burn_enabled(getattr(ctx, "user_settings", None) or {}):
+        return
+
+    pm_json = (ctx.output_artifacts or {}).get("platform_thumbnail_map", "{}")
+    try:
+        platform_map = json.loads(pm_json) if isinstance(pm_json, str) else (pm_json or {})
+    except Exception:
+        platform_map = {}
+    thumb_raw = platform_map.get("tiktok") if isinstance(platform_map, dict) else None
+    if not thumb_raw:
+        return
+    thumb_path = _Path(str(thumb_raw))
+    if not thumb_path.exists():
+        return
+
+    video_raw = (ctx.platform_videos or {}).get("tiktok")
+    if not video_raw:
+        return
+    video_path = _Path(str(video_raw))
+    if not video_path.exists():
+        return
+
+    offset = resolve_tiktok_cover_offset_sec(ctx.output_artifacts)
+    out_path = ctx.temp_dir / f"tiktok_burn_{upload_id}.mp4"
+    ok = await burn_tiktok_styled_cover(video_path, thumb_path, out_path, offset)
+    if not ok:
+        return
+
+    ctx.platform_videos["tiktok"] = out_path
+    arts = ctx.output_artifacts
+    arts["tiktok_cover_burned"] = "true"
+    arts["tiktok_cover_burn_offset_seconds"] = str(offset)
+    logger.info(
+        "[%s] TikTok styled cover burned at %.2fs → %s",
+        upload_id,
+        offset,
+        out_path.name,
+    )
 
 
 async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
@@ -490,7 +751,6 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
     groups = _group_platforms_by_spec(platforms)
     reframe_mode = getattr(ctx, "reframe_mode", "auto") or "auto"
     ctx.platform_videos = {}
-
     for fingerprint, group_platforms in groups.items():
         canonical = group_platforms[0]
         reframe_action = resolve_reframe_action(info, reframe_mode, canonical)
@@ -500,7 +760,13 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
             logger.info(f"[{ctx.upload_id}] Transcode [{canonical}] shared by {group_platforms}: {', '.join(reasons)}")
             output_path = ctx.temp_dir / f"transcoded_{canonical}.mp4"
             try:
-                cmd = build_ffmpeg_command(source_video, output_path, info, canonical, reframe_action)
+                cmd = build_ffmpeg_command(
+                    source_video,
+                    output_path,
+                    info,
+                    canonical,
+                    reframe_action,
+                )
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -595,17 +861,6 @@ def _should_run_trill(ctx: JobContext) -> bool:
     return bool(telemetry_on and trill_on)
 
 
-def _should_run_hud(ctx: JobContext) -> bool:
-    if not _should_run_trill(ctx):
-        return False
-    hud = _settings_bool(ctx.user_settings.get("hud_enabled"), True)
-    if not hud:
-        return False
-    if ctx.entitlements and not ctx.entitlements.can_burn_hud:
-        return False
-    return True
-
-
 def _trill_min_score(ctx: JobContext) -> int:
     raw = ctx.user_settings.get("trill_min_score") or ctx.user_settings.get("trillMinScore") or 0
     try:
@@ -685,6 +940,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
     logger.info(f"[{upload_id}] Processing start | job={job_id} | deferred={is_deferred}")
     ctx = None
     temp_dir = None
+    resume_stage: Optional[str] = None
 
     try:
         async def _persist_diag_artifacts_now(*keys: str) -> None:
@@ -715,6 +971,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         user_record = await db_stage.load_user(db_pool, user_id)
         if not upload_record or not user_record:
             logger.error(f"[{upload_id}] Records not found")
+            await notify_admin_error(
+                "upload_records_missing",
+                {"upload_id": upload_id, "user_id": user_id},
+                db_pool,
+            )
             return False
 
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
@@ -736,6 +997,16 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             setattr(ctx, "_db_pool", db_pool)
         except Exception:
             pass
+        try:
+            if getattr(ctx, "vehicle_make_id", None) or getattr(ctx, "vehicle_model_id", None):
+                from services.vehicle_catalog import fetch_vehicle_labels
+
+                async with db_pool.acquire() as _c:
+                    _lab = await fetch_vehicle_labels(_c, ctx.vehicle_make_id, ctx.vehicle_model_id)
+                ctx.vehicle_make_name = _lab.get("make_name")
+                ctx.vehicle_model_name = _lab.get("model_name")
+        except Exception as _ve:
+            logger.debug("[%s] vehicle label hydrate skipped: %s", upload_id, _ve)
         ctx.user_settings["_openai_model_override"] = (
             ctx.user_settings.get("trillOpenaiModel")
             or ctx.user_settings.get("trill_openai_model")
@@ -759,10 +1030,6 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             if hasattr(ctx, "caption_frames") and ctx.caption_frames > ent.max_caption_frames:
                 ctx.caption_frames = ent.max_caption_frames
 
-            # Enforce HUD — if can_burn_hud is False, skip HUD stage
-            if not ent.can_burn_hud and hasattr(ctx, "hud_enabled"):
-                ctx.hud_enabled = False
-
             # Free tier: burn-in text from admin_settings (master-editable), DB each job.
             if ent.can_watermark:
                 ctx.watermark_text = await db_stage.load_watermark_burn_text(db_pool)
@@ -784,30 +1051,80 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
         await maybe_cancel(ctx, "init")
 
+        resume_holder = None
+        try:
+            resume_stage, resume_holder = await pipeline_checkpoint.try_resume_from_checkpoint(
+                db_pool, job_data, upload_record, ctx
+            )
+        except Exception as _cp_e:
+            logger.warning(f"[{upload_id}] checkpoint resume probe failed (non-fatal): {_cp_e}")
+            resume_stage, resume_holder = None, None
+
+        if resume_stage:
+            logger.info(f"[{upload_id}] Pipeline checkpoint resume | stage={resume_stage}")
+
         # ============================================================
         # STAGE 1: Download
         # ============================================================
-        ctx.mark_stage("download")
-        temp_dir = tempfile.TemporaryDirectory()
-        ctx.temp_dir = Path(temp_dir.name)
+        if resume_holder is None:
+            ctx.mark_stage("download")
+            temp_dir = tempfile.TemporaryDirectory()
+            ctx.temp_dir = Path(temp_dir.name)
 
-        video_local = ctx.temp_dir / ctx.filename
-        await r2_stage.download_file(ctx.source_r2_key, video_local)
-        ctx.local_video_path = video_local
+            video_local = ctx.temp_dir / ctx.filename
+            await r2_stage.download_file(ctx.source_r2_key, video_local)
+            ctx.local_video_path = video_local
 
-        if ctx.telemetry_r2_key:
-            try:
-                telem_local = ctx.temp_dir / "telemetry.map"
-                await r2_stage.download_file(ctx.telemetry_r2_key, telem_local)
-                ctx.local_telemetry_path = telem_local
-                logger.info(f"[{upload_id}] Telemetry downloaded")
-            except Exception as e:
-                logger.warning(f"[{upload_id}] Telemetry download failed: {e}")
-                ctx.local_telemetry_path = None
+            if ctx.telemetry_r2_key:
+                try:
+                    telem_local = ctx.temp_dir / "telemetry.map"
+                    await r2_stage.download_file(ctx.telemetry_r2_key, telem_local)
+                    ctx.local_telemetry_path = telem_local
+                    logger.info(f"[{upload_id}] Telemetry downloaded")
+                except Exception as e:
+                    logger.warning(f"[{upload_id}] Telemetry download failed: {e}")
+                    ctx.local_telemetry_path = None
+                    _merge_telemetry_ingest_artifact(
+                        ctx,
+                        {
+                            "telemetry_r2_key_configured": True,
+                            "telemetry_downloaded": False,
+                            "telemetry_download_error": str(e)[:500],
+                        },
+                    )
 
-        trill_active = _should_run_trill(ctx)
-        hud_active = _should_run_hud(ctx)
-        logger.info(f"[{upload_id}] Flags: trill={trill_active} hud={hud_active} platforms={ctx.platforms}")
+            if ctx.telemetry_r2_key and ctx.local_telemetry_path:
+                _merge_telemetry_ingest_artifact(
+                    ctx,
+                    {
+                        "telemetry_r2_key_configured": True,
+                        "telemetry_downloaded": True,
+                    },
+                )
+            elif ctx.telemetry_r2_key and not getattr(ctx, "local_telemetry_path", None):
+                _merge_telemetry_ingest_artifact(
+                    ctx,
+                    {"telemetry_r2_key_configured": True, "telemetry_downloaded": False},
+                )
+            elif not ctx.telemetry_r2_key:
+                _merge_telemetry_ingest_artifact(
+                    ctx,
+                    {"telemetry_r2_key_configured": False, "telemetry_downloaded": False},
+                )
+        else:
+            temp_dir = resume_holder
+            _merge_telemetry_ingest_artifact(
+                ctx,
+                {
+                    "checkpoint_resume_stage": str(resume_stage or ""),
+                    "telemetry_r2_key_configured": bool(ctx.telemetry_r2_key),
+                    "telemetry_downloaded": bool(getattr(ctx, "local_telemetry_path", None)),
+                },
+            )
+
+        trill_requested = _should_run_trill(ctx)
+        trill_active = bool(trill_requested and not resume_stage)
+        logger.info(f"[{upload_id}] Flags: trill={trill_active} platforms={ctx.platforms}")
         await maybe_cancel(ctx, "download")
 
         # ============================================================
@@ -828,79 +1145,159 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 logger.info(f"[{upload_id}] Telemetry skipped: {e.reason}")
                 _ai_trace(ctx, upload_id, "telemetry", {"status": "skipped", "reason": e.reason})
                 trill_active = False
-                hud_active = False
             except StageError as e:
                 logger.warning(f"[{upload_id}] Telemetry error: {e.message}")
                 _ai_trace(ctx, upload_id, "telemetry", {"status": "error", "reason": e.message})
                 trill_active = False
-                hud_active = False
-        else:
+        elif not resume_stage:
             ctx.telemetry = None
             ctx.telemetry_data = None
             ctx.trill = None
             ctx.trill_score = None
+
+        try:
+            _tel_sum = ctx.telemetry or ctx.telemetry_data
+            _npts = len(getattr(_tel_sum, "points", None) or []) if _tel_sum else 0
+            _merge_telemetry_ingest_artifact(
+                ctx,
+                {
+                    "telemetry_points": _npts,
+                    "telemetry_trill_requested": bool(trill_requested),
+                    "telemetry_trill_active_after_stage": bool(trill_active),
+                },
+            )
+            await _persist_diag_artifacts_now("telemetry_ingest")
+        except Exception as _ti_e:
+            logger.debug(f"[{upload_id}] telemetry_ingest artifact skipped: {_ti_e}")
+
+        # ── Trill trace (single admin-trace line for ops visibility) ───────
+        try:
+            _tr_obj = ctx.trill or ctx.trill_score
+            _tel_obj = ctx.telemetry or ctx.telemetry_data
+            if _tr_obj is not None and (getattr(_tr_obj, "score", None) is not None):
+                logger.info(
+                    "[%s] Trill OK: score=%s bucket=%s max_speed=%s points=%s geo=%r padus=%r",
+                    upload_id,
+                    getattr(_tr_obj, "score", "?"),
+                    getattr(_tr_obj, "bucket", "?"),
+                    getattr(_tel_obj, "max_speed_mph", None) if _tel_obj else None,
+                    len(getattr(_tel_obj, "points", None) or []) if _tel_obj else 0,
+                    getattr(_tel_obj, "location_display", None) if _tel_obj else None,
+                    getattr(_tel_obj, "padus_unit_name", None) if _tel_obj else None,
+                )
+            else:
+                _reason = "telemetry_disabled" if not trill_active else (
+                    "no_telemetry_points" if (not _tel_obj or not getattr(_tel_obj, "points", None))
+                    else "trill_score_not_computed"
+                )
+                logger.warning(
+                    "[%s] Trill MISSING: reason=%s telemetry_present=%s",
+                    upload_id, _reason, bool(_tel_obj),
+                )
+        except Exception as _tre:
+            logger.debug(f"[{upload_id}] trill trace log skipped: {_tre}")
+
         await maybe_cancel(ctx, "telemetry")
 
-        # ============================================================
-        # STAGE 3: HUD
-        # ============================================================
-        if hud_active:
+        if not resume_stage:
             try:
-                ctx = await run_hud_stage(ctx)
+                await pipeline_checkpoint.save_post_telemetry_checkpoint(db_pool, ctx)
+            except Exception as _cp1:
+                logger.debug(f"[{upload_id}] post_telemetry checkpoint skipped: {_cp1}")
+
+        skip_encode_stages = resume_stage in ("post_transcode", "post_audio", "post_caption")
+
+        # ============================================================
+        # STAGE 3: Watermark
+        # ============================================================
+        if not skip_encode_stages:
+            try:
+                await db_stage.save_trill_metadata(db_pool, ctx)
+            except Exception as e:
+                logger.debug(f"[{upload_id}] Trill metadata persist skipped: {e}")
+
+            try:
+                ctx = await asyncio.wait_for(run_watermark_stage(ctx), timeout=STAGE_TIMEOUT_WATERMARK)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{upload_id}] Watermark timed out after {STAGE_TIMEOUT_WATERMARK}s — continuing without watermark"
+                )
             except SkipStage as e:
-                logger.info(f"[{upload_id}] HUD skipped: {e.reason}")
+                logger.info(f"[{upload_id}] Watermark skipped: {e.reason}")
             except StageError as e:
-                logger.warning(f"[{upload_id}] HUD error: {e.message}")
-        try:
-            await db_stage.save_trill_metadata(db_pool, ctx)
-        except Exception as e:
-            logger.debug(f"[{upload_id}] Trill metadata persist skipped: {e}")
-        await maybe_cancel(ctx, "hud")
+                logger.warning(f"[{upload_id}] Watermark error: {e.message}")
+            await maybe_cancel(ctx, "watermark")
+
+            # ============================================================
+            # STAGE 5: Transcode (deduplicated)
+            # ============================================================
+            try:
+                ctx = await asyncio.wait_for(_run_deduplicated_transcode(ctx), timeout=STAGE_TIMEOUT_TRANSCODE)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{upload_id}] Transcode timed out after {STAGE_TIMEOUT_TRANSCODE}s — falling back to source video"
+                )
+                source = ctx.processed_video_path or ctx.local_video_path
+                for p in (ctx.platforms or []):
+                    ctx.platform_videos[p] = source
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Transcode skipped: {e.reason}")
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Transcode error: {e.message}")
+                source = ctx.processed_video_path or ctx.local_video_path
+                for p in (ctx.platforms or []):
+                    ctx.platform_videos[p] = source
+            await maybe_cancel(ctx, "transcode")
+        else:
+            try:
+                await db_stage.save_trill_metadata(db_pool, ctx)
+            except Exception as e:
+                logger.debug(f"[{upload_id}] Trill metadata persist skipped: {e}")
+            await maybe_cancel(ctx, "watermark")
+            await maybe_cancel(ctx, "transcode")
+
+        if resume_stage in (None, "post_telemetry"):
+            try:
+                await pipeline_checkpoint.save_post_transcode_checkpoint(db_pool, ctx)
+            except Exception as _cp2:
+                logger.debug(f"[{upload_id}] post_transcode checkpoint skipped: {_cp2}")
 
         # ============================================================
-        # STAGE 4: Watermark
+        # STAGE 6–10: Multimodal context (audio, vision, TL, VI, dashcam OSD — feeds M8/captions)
         # ============================================================
-        try:
-            ctx = await run_watermark_stage(ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Watermark skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Watermark error: {e.message}")
-        await maybe_cancel(ctx, "watermark")
-
-        # ============================================================
-        # STAGE 5: Transcode (deduplicated)
-        # ============================================================
-        try:
-            ctx = await _run_deduplicated_transcode(ctx)
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Transcode skipped: {e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Transcode error: {e.message}")
-            source = ctx.processed_video_path or ctx.local_video_path
-            for p in (ctx.platforms or []):
-                ctx.platform_videos[p] = source
-        await maybe_cancel(ctx, "transcode")
-
-        # ============================================================
-        # STAGE 6–10: Multimodal context (audio, vision, TL, VI, HUD — feeds M8/captions)
-        # ============================================================
-        try:
-            ctx = await run_audio_context_stage(ctx)
+        _multimodal_strict_gaps: List[str] = []
+        if resume_stage == "post_audio":
             ac = ctx.audio_context or {}
             _ai_trace(ctx, upload_id, "audio", {
                 "status": "ok",
+                "resume": True,
                 "transcript_chars": len((ctx.ai_transcript or ac.get("transcript") or "").strip()),
                 "music_detected": bool(ac.get("music_detected")),
                 "yamnet_events": len(ac.get("yamnet_events") or []),
             })
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Audio context skipped: {e.reason}")
-            _ai_trace(ctx, upload_id, "audio", {"status": "skipped", "reason": e.reason})
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Audio context error: {e.message}")
-            _ai_trace(ctx, upload_id, "audio", {"status": "error", "reason": e.message})
+        else:
+            try:
+                ctx = await run_audio_context_stage(ctx)
+                ac = ctx.audio_context or {}
+                _ai_trace(ctx, upload_id, "audio", {
+                    "status": "ok",
+                    "transcript_chars": len((ctx.ai_transcript or ac.get("transcript") or "").strip()),
+                    "music_detected": bool(ac.get("music_detected")),
+                    "yamnet_events": len(ac.get("yamnet_events") or []),
+                })
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Audio context skipped: {e.reason}")
+                _ai_trace(ctx, upload_id, "audio", {"status": "skipped", "reason": e.reason})
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Audio context error: {e.message}")
+                _ai_trace(ctx, upload_id, "audio", {"status": "error", "reason": e.message})
         await maybe_cancel(ctx, "audio")
+
+        if resume_stage in (None, "post_telemetry", "post_transcode"):
+            try:
+                await pipeline_checkpoint.save_post_audio_checkpoint(db_pool, ctx)
+            except Exception as _cp3:
+                logger.debug(f"[{upload_id}] post_audio checkpoint skipped: {_cp3}")
 
         try:
             ctx = await run_vision_stage(ctx)
@@ -914,6 +1311,12 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         except SkipStage as e:
             logger.info(f"[{upload_id}] Vision skipped: {e.reason}")
             _ai_trace(ctx, upload_id, "vision", {"status": "skipped", "reason": e.reason})
+            if (
+                _google_multimodal_strict_enabled()
+                and VISION_STAGE_ENABLED
+                and _strict_multimodal_gap_reason(str(e.reason or ""))
+            ):
+                _multimodal_strict_gaps.append(f"vision:{e.reason}")
         except StageError as e:
             logger.warning(f"[{upload_id}] Vision error: {e.message}")
             _ai_trace(ctx, upload_id, "vision", {"status": "error", "reason": e.message})
@@ -938,18 +1341,82 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         try:
             ctx = await run_video_intelligence_stage(ctx)
             vi = getattr(ctx, "video_intelligence", None) or {}
+            vic = getattr(ctx, "video_intelligence_context", None) or {}
+            verr = ""
+            if isinstance(vic, dict):
+                verr = str(vic.get("error") or "").strip()
+                if not verr:
+                    verr = str(vic.get("parse_error") or "").strip()
+            if not verr and isinstance(vi, dict):
+                verr = str(vi.get("error") or "").strip()
+            vi_trace_status = "failed" if verr else "ok"
             _ai_trace(ctx, upload_id, "video_intelligence", {
-                "status": "ok",
+                "status": vi_trace_status,
                 "objects": len(vi.get("object_tracks") or []) if isinstance(vi, dict) else 0,
                 "logos": len(vi.get("logos") or []) if isinstance(vi, dict) else 0,
                 "text": len(vi.get("on_screen_text") or []) if isinstance(vi, dict) else 0,
+                "error": verr[:500] if verr else None,
             })
+            if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                try:
+                    ctx.output_artifacts["video_intelligence_status"] = json.dumps(
+                        {
+                            "status": vi_trace_status,
+                            "error": verr[:2000] if verr else None,
+                        },
+                        default=str,
+                    )[:4000]
+                except Exception:
+                    pass
+            await _persist_diag_artifacts_now("video_intelligence_status")
         except SkipStage as e:
             logger.info(f"[{upload_id}] Video intelligence skipped: {e.reason}")
             _ai_trace(ctx, upload_id, "video_intelligence", {"status": "skipped", "reason": e.reason})
+            if (
+                _google_multimodal_strict_enabled()
+                and VIDEO_INTELLIGENCE_STAGE_ENABLED
+                and _strict_multimodal_gap_reason(str(e.reason or ""))
+            ):
+                _multimodal_strict_gaps.append(f"video_intelligence:{e.reason}")
         except StageError as e:
             logger.warning(f"[{upload_id}] Video intelligence error: {e.message}")
             _ai_trace(ctx, upload_id, "video_intelligence", {"status": "error", "reason": e.message})
+
+        if (
+            _google_multimodal_strict_enabled()
+            and VIDEO_INTELLIGENCE_STAGE_ENABLED
+        ):
+            vic = getattr(ctx, "video_intelligence_context", None) or {}
+            if isinstance(vic, dict):
+                verr2 = str(vic.get("error") or "").strip()
+                if not verr2:
+                    verr2 = str(vic.get("parse_error") or "").strip()
+                if verr2:
+                    vl = verr2.lower()
+                    gap_on_any_error = (
+                        (os.environ.get("VIDEO_INTELLIGENCE_GAP_ON_ANY_ERROR") or "")
+                        .strip()
+                        .lower()
+                        in ("1", "true", "yes", "on")
+                    )
+                    hard_gap = (
+                        gap_on_any_error
+                        or "403" in vl
+                        or "401" in vl
+                        or "permission denied" in vl
+                        or ("permission" in vl and "denied" in vl)
+                        or "disabled" in vl
+                        or "not been used" in vl
+                        or "has not been enabled" in vl
+                        or "not enabled" in vl
+                        or "billing" in vl
+                        or "quota" in vl
+                        or "invalid credential" in vl
+                        or "unauthenticated" in vl
+                        or ("api" in vl and "not" in vl and "enable" in vl)
+                    )
+                    if hard_gap:
+                        _multimodal_strict_gaps.append(f"video_intelligence:{verr2[:400]}")
 
         try:
             from services.recognition_engine import persist_recognition
@@ -982,6 +1449,12 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         except SkipStage as e:
             logger.info(f"[{upload_id}] Dashcam OSD skipped: {e.reason}")
             _ai_trace(ctx, upload_id, "dashcam_osd", {"status": "skipped", "reason": e.reason})
+            if (
+                _google_multimodal_strict_enabled()
+                and DASHCAM_OSD_STAGE_ENABLED
+                and _strict_multimodal_gap_reason(str(e.reason or ""))
+            ):
+                _multimodal_strict_gaps.append(f"dashcam_osd:{e.reason}")
         except StageError as e:
             logger.warning(f"[{upload_id}] Dashcam OSD error: {e.message}")
             _ai_trace(ctx, upload_id, "dashcam_osd", {"status": "error", "reason": e.message})
@@ -990,22 +1463,89 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         except Exception as e:
             logger.warning(f"[{upload_id}] Vision OSD fallback skipped: {e}")
 
-        # Design note: dashcam OSD intentionally runs AFTER HUD (stage 3) because HUD
-        # needs the processed video, not the original. If OSD backfills telemetry from
-        # burned-in GPS/speed, HUD has already rendered without that data. When
-        # dashcam GPS enrichment is important, set DASHCAM_OSD_SKIP_WHEN_MAP_TELEMETRY=false
-        # and ensure a companion .map file is present so telemetry feeds HUD correctly.
-        if (ctx.telemetry or ctx.telemetry_data) and not hud_active:
-            logger.info(
-                f"[{upload_id}] Dashcam OSD backfilled telemetry after HUD stage — "
-                "HUD overlay ran without location/speed data. "
-                "Upload a .map companion file to get HUD overlays with OSD-sourced GPS."
+        if _multimodal_strict_gaps and isinstance(getattr(ctx, "output_artifacts", None), dict):
+            ctx.output_artifacts["google_multimodal_gaps"] = json.dumps(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "gaps": list(_multimodal_strict_gaps),
+                },
+                default=str,
+            )[:16000]
+        if _google_multimodal_strict_enabled() and _multimodal_strict_gaps:
+            setattr(ctx, "google_multimodal_strict_violations", list(_multimodal_strict_gaps))
+            logger.warning(
+                "[%s] GOOGLE_MULTIMODAL_STRICT gaps recorded: %s",
+                upload_id,
+                _multimodal_strict_gaps,
             )
+
+        try:
+            from services.google_visual_recognition import attach_visual_recognition
+
+            attach_visual_recognition(ctx)
+            try:
+                from services.visual_entity_memory import upsert_catalog_entities
+
+                vr_flat = (getattr(ctx, "visual_recognition", None) or {}).get("flat") or {}
+                niche = (getattr(ctx, "visual_recognition", None) or {}).get("niche") or "general"
+                if vr_flat:
+                    await upsert_catalog_entities(
+                        db_pool,
+                        user_id=str(ctx.user_id),
+                        upload_id=str(ctx.upload_id),
+                        catalog_flat=vr_flat,
+                        category=str(niche),
+                    )
+                    try:
+                        from services.ml_entity_hub_sync import sync_visual_entities_for_user
+
+                        hf_sync = await sync_visual_entities_for_user(
+                            db_pool,
+                            user_id=str(ctx.user_id),
+                            category=str(niche),
+                        )
+                        if hf_sync.get("ok") and hf_sync.get("rows"):
+                            logger.info(
+                                "[%s] HF visual entities synced rows=%s",
+                                upload_id,
+                                hf_sync.get("rows"),
+                            )
+                    except Exception as _hf_sync_e:
+                        logger.debug(f"[{upload_id}] HF entity sync skipped: {_hf_sync_e}")
+            except Exception as _mem_e:
+                logger.debug(f"[{upload_id}] visual entity catalog upsert skipped: {_mem_e}")
+        except Exception as _gvr_e:
+            logger.debug(f"[{upload_id}] visual recognition finalize skipped: {_gvr_e}")
+        try:
+            from services.trill_scenic_boost import apply_scenic_trill_boost
+
+            apply_scenic_trill_boost(ctx)
+        except Exception as _tsb_e:
+            logger.debug(f"[{upload_id}] Trill scenic boost skipped: {_tsb_e}")
         try:
             await db_stage.save_trill_metadata(db_pool, ctx)
         except Exception as e:
             logger.debug(f"[{upload_id}] OSD Trill metadata persist skipped: {e}")
         await maybe_cancel(ctx, "dashcam_osd")
+
+        # ── Scene-story + timeline fusion ───────────────────────────────────
+        # Build the ordered VI+Vision+OSD+telemetry+audio timeline AFTER the
+        # dashcam OSD stage so OSD backfill is incorporated. Persist into
+        # output_artifacts so M8 (next), the API, the queue UI, the upload
+        # email, and the user/admin Discord embeds can all surface it.
+        try:
+            _scene_story = build_hydration_story_text(ctx, max_chars=900) or ""
+            _timeline_events = build_video_story_timeline(ctx, max_events=80) or []
+            if isinstance(ctx.output_artifacts, dict):
+                ctx.output_artifacts["scene_story"] = _scene_story[:1600]
+                ctx.output_artifacts["timeline_story"] = json.dumps(_timeline_events)[:48_000]
+            await _persist_diag_artifacts_now("timeline_story", "scene_story")
+            logger.info(
+                f"[{upload_id}] scene_story built ({len(_scene_story)} chars), "
+                f"timeline events={len(_timeline_events)}"
+            )
+        except Exception as _scts_e:
+            logger.debug(f"[{upload_id}] scene_story/timeline build skipped: {_scts_e}")
 
         # Canonical hydration snapshot (thumb + caption + `output_artifacts`).
         try:
@@ -1018,18 +1558,88 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # STAGE 11: Thumbnail — extract frame then immediately upload to R2
         # ============================================================
         try:
-            ctx = await run_thumbnail_stage(ctx)
+            ctx = await asyncio.wait_for(run_thumbnail_stage(ctx), timeout=STAGE_TIMEOUT_THUMBNAIL)
             _ai_trace(ctx, upload_id, "thumbnail", {
                 "status": "ok",
                 "thumbnail_path": str(ctx.thumbnail_path or ""),
                 "candidate_count": len(ctx.thumbnail_paths or []),
             })
+        except asyncio.TimeoutError:
+            logger.warning(f"[{upload_id}] Thumbnail timed out after {STAGE_TIMEOUT_THUMBNAIL}s")
+            _ai_trace(ctx, upload_id, "thumbnail", {"status": "error", "reason": "timeout"})
         except SkipStage as e:
             logger.info(f"[{upload_id}] Thumbnail skipped: {e.reason}")
             _ai_trace(ctx, upload_id, "thumbnail", {"status": "skipped", "reason": e.reason})
         except StageError as e:
             logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
             _ai_trace(ctx, upload_id, "thumbnail", {"status": "error", "reason": e.message})
+
+        # ── Pikzels render failures → one admin ops_incident per upload ─────
+        # ``output_artifacts.pikzels_render_failures`` lists per-platform faults.
+        # Emit a single consolidated incident per upload so ops paging dedupes
+        # cleanly but every failed platform stays visible in ``details``.
+        try:
+            arts = ctx.output_artifacts if isinstance(ctx.output_artifacts, dict) else {}
+            raw_pf = arts.get("pikzels_render_failures")
+            if isinstance(raw_pf, str) and raw_pf.strip():
+                failures = json.loads(raw_pf)
+                if isinstance(failures, list) and failures:
+                    from services.ops_incidents import record_operational_incident
+
+                    rows: List[Dict[str, Any]] = []
+                    for f in failures:
+                        if not isinstance(f, dict):
+                            continue
+                        plat = str(f.get("platform") or "unknown").lower()
+                        status_code = f.get("http_status")
+                        status_label = str(status_code) if status_code not in (None, "", "unknown") else "unknown"
+                        msg = str(f.get("message") or "")[:1000]
+                        rows.append(
+                            {
+                                "platform": plat,
+                                "http_status": status_code,
+                                "http_label": status_label,
+                                "message": msg,
+                            }
+                        )
+                    if rows:
+                        plat_summary = ",".join(r["platform"] for r in rows[:12])
+                        lines = "\n".join(
+                            f"  • {r['platform']}: HTTP {r['http_label']} — {(r['message'] or '')[:280]}"
+                            for r in rows
+                        )
+                        body = lines or "Pikzels studio renderer did not return usable images."
+                        types_suffix = ":".join(
+                            f"{r['platform']}:{r['http_label']}"
+                            for r in rows[:4]
+                        )[:80]
+                        try:
+                            await record_operational_incident(
+                                db_pool,
+                                source="thumbnail",
+                                incident_type=(
+                                    f"pikzels_render_failed:{types_suffix}"
+                                    if types_suffix
+                                    else "pikzels_render_failed"
+                                )[:120],
+                                subject=(
+                                    f"Pikzels render failed ({len(rows)} platform(s)): {plat_summary}"
+                                )[:200],
+                                body=body[:8000],
+                                details={
+                                    "upload_id": str(upload_id),
+                                    "user_id": str(user_id) if user_id else None,
+                                    "failures": rows,
+                                },
+                                user_id=str(user_id) if user_id else None,
+                                upload_id=str(upload_id),
+                                alert_email=True,
+                                alert_discord=True,
+                            )
+                        except Exception as _pfe:
+                            logger.debug(f"[{upload_id}] pikzels ops_incident emit failed: {_pfe}")
+        except Exception as _pfo:
+            logger.debug(f"[{upload_id}] pikzels failure scan: {_pfo}")
 
         if not ctx.thumbnail_path or not Path(ctx.thumbnail_path).exists():
             logger.warning(
@@ -1043,10 +1653,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # We do it here so thumbnail_r2_key is persisted to the DB and the
         # API can return a presigned URL for the dashboard to display.
         if ctx.thumbnail_path and Path(ctx.thumbnail_path).exists():
+            from stages.image_format import ensure_jpeg_file as _ensure_jpeg_file
+
             thumb_r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/thumbnail.jpg"
             try:
+                thumb_local = _ensure_jpeg_file(Path(ctx.thumbnail_path))
                 await r2_stage.upload_file(
-                    Path(ctx.thumbnail_path),
+                    thumb_local,
                     thumb_r2_key,
                     "image/jpeg",
                 )
@@ -1078,13 +1691,20 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 continue
             r2_key = f"thumbnails/{ctx.user_id}/{upload_id}/{platform}.jpg"
             try:
-                await r2_stage.upload_file(Path(local_path), r2_key, "image/jpeg")
+                thumb_local = _ensure_jpeg_file(Path(local_path))
+                await r2_stage.upload_file(thumb_local, r2_key, "image/jpeg")
                 platform_thumb_r2[platform] = r2_key
                 logger.debug(f"[{upload_id}] Platform thumb {platform} → {r2_key}")
             except Exception as e:
                 logger.debug(f"[{upload_id}] Platform thumb {platform} upload failed: {e}")
         if platform_thumb_r2:
             ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2)
+
+        # TikTok: burn styled cover into video pixels (API only supports frame timestamp).
+        try:
+            await _maybe_burn_tiktok_styled_cover(ctx, upload_id)
+        except Exception as _ttb_e:
+            logger.warning(f"[{upload_id}] TikTok cover burn skipped: {_ttb_e}")
 
         # Also upload any additional candidate thumbnails (for tier users who can pick)
         if ctx.thumbnail_paths and len(ctx.thumbnail_paths) > 1:
@@ -1170,6 +1790,35 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     exc_info=True,
                 )
 
+        try:
+            from services.thumbnail_ops import (
+                record_pikzels_studio_ineligible_incident,
+                record_pikzels_template_render_incident,
+            )
+
+            _srr_raw = (ctx.output_artifacts or {}).get("studio_render_report")
+            _srr: dict = {}
+            if isinstance(_srr_raw, str) and _srr_raw.strip():
+                _srr = json.loads(_srr_raw) if _srr_raw.strip().startswith("{") else {}
+            elif isinstance(_srr_raw, dict):
+                _srr = _srr_raw
+            await record_pikzels_template_render_incident(
+                db_pool,
+                upload_id=str(upload_id),
+                user_id=str(ctx.user_id) if ctx.user_id else None,
+                render_method=_thumb_render,
+                studio_report=_srr if isinstance(_srr, dict) else None,
+            )
+            if isinstance(_srr, dict) and _srr:
+                await record_pikzels_studio_ineligible_incident(
+                    db_pool,
+                    upload_id=str(upload_id),
+                    user_id=str(ctx.user_id) if ctx.user_id else None,
+                    studio_report=_srr,
+                )
+        except Exception as _pikz_ops_e:
+            logger.debug("[%s] thumbnail ops incidents skipped: %s", upload_id, _pikz_ops_e)
+
         await maybe_cancel(ctx, "thumbnail")
 
         # ============================================================
@@ -1207,6 +1856,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
             enforce_hydration(ctx)
             await _persist_diag_artifacts_now("hydration_report")
+            try:
+                from services.metadata_quality import validate_metadata_quality
+
+                validate_metadata_quality(ctx)
+                await _persist_diag_artifacts_now("metadata_quality_report", "hydration_report")
+            except Exception as mq_e:
+                logger.debug(f"[{upload_id}] metadata_quality validation skipped: {mq_e}")
         except Exception as hy_e:
             logger.warning(f"[{upload_id}] hydration_enforcer failed (non-fatal): {hy_e}")
             if isinstance(getattr(ctx, "output_artifacts", None), dict):
@@ -1223,6 +1879,16 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             await db_stage.save_generated_metadata(db_pool, ctx)
         except Exception as save_e:
             logger.warning(f"[{upload_id}] save_generated_metadata failed (non-fatal): {save_e}")
+
+        # ── Evidence-usage probes (geo + speed) ─────────────────────────────
+        # These fire ops_incidents when present-but-unused signals reveal that
+        # the LLM/ranker ignored hydration evidence. Per user policy, the post
+        # still ships — these are alerts, not blockers.
+        try:
+            await _check_evidence_usage_and_alert(ctx, upload_id, db_pool)
+        except Exception as _eu_e:
+            logger.debug(f"[{upload_id}] evidence-usage probe failed: {_eu_e}")
+
         await maybe_cancel(ctx, "caption")
 
         # ============================================================
@@ -1276,6 +1942,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
         await maybe_cancel(ctx, "upload")
 
+        try:
+            await pipeline_checkpoint.clear_checkpoint(db_pool, str(upload_id))
+        except Exception:
+            pass
+
         # ============================================================
         # DEFERRED PATH: mark ready_to_publish and STOP
         # The scheduler will fire publish when scheduled_time arrives.
@@ -1295,14 +1966,71 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                         upload_id,
                         json.dumps(processed_assets),
                     )
-                logger.info(f"[{upload_id}] Processing complete → ready_to_publish (waiting for scheduled_time)")
             except Exception as e:
                 logger.error(f"[{upload_id}] Failed to set ready_to_publish: {e}")
+                if ctx:
+                    try:
+                        ctx.mark_error("INTERNAL", f"ready_to_publish DB update failed: {e}")
+                        ctx.state = "failed"
+                        ctx.finished_at = _now_utc()
+                        await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e)[:2000])
+                    except Exception as _dbf:
+                        logger.warning(f"[{upload_id}] mark_processing_failed after ready_to_publish error: {_dbf}")
+                    try:
+                        _scene_fail = ""
+                        if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                            _scene_fail = str(ctx.output_artifacts.get("scene_story") or "")
+                        await notify_upload_terminal(
+                            db_pool,
+                            ctx,
+                            str(upload_id),
+                            status="failed",
+                            scene_story=_scene_fail,
+                        )
+                    except Exception as _nf:
+                        logger.warning(f"[{upload_id}] ready_to_publish failure comms: {_nf}")
+                return False
+            logger.info(
+                f"[{upload_id}] Processing complete → ready_to_publish (waiting for scheduled_time)"
+            )
+            ctx.finished_at = _now_utc()
+            _scene_stg = ""
+            if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                _scene_stg = str(ctx.output_artifacts.get("scene_story") or "")
+            try:
+                await notify_upload_terminal(
+                    db_pool,
+                    ctx,
+                    str(upload_id),
+                    status="staged",
+                    scene_story=_scene_stg,
+                )
+            except Exception as _stg_e:
+                logger.warning(f"[{upload_id}] staged terminal comms error: {_stg_e}")
             return True
 
         # ============================================================
-        # IMMEDIATE PATH: continue to publish
+        # IMMEDIATE PATH: publish (inline or async Redis lane)
         # ============================================================
+        if ASYNC_PUBLISH_QUEUE:
+            pclass = (
+                getattr(ctx.entitlements, "priority_class", None)
+                or job_data.get("priority_class")
+                or "p4"
+            )
+            prefs = ctx.user_settings if isinstance(ctx.user_settings, dict) else (job_data.get("preferences") or {})
+            pub_payload = {
+                "upload_id": str(upload_id),
+                "user_id": str(user_id),
+                "job_id": f"publish-{upload_id}",
+                "priority_class": pclass,
+                "preferences": prefs,
+                "plan_features": job_data.get("plan_features") or {},
+            }
+            if await enqueue_publish_lane_job(pub_payload):
+                logger.info(f"[{upload_id}] Immediate processing complete → publish lane queued")
+                return True
+            logger.error(f"[{upload_id}] Publish lane enqueue failed — falling back to inline publish")
         return await run_publish_and_notify(ctx, upload_id, user_id)
 
     except CancelRequested:
@@ -1315,11 +2043,28 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
         except Exception as wallet_err:
             logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
+        # User comms — cancellation is a terminal state (publish never ran).
+        if ctx:
+            try:
+                ctx.state = "cancelled"
+                ctx.finished_at = _now_utc()
+                if not (getattr(ctx, "error_message", None) or "").strip():
+                    ctx.error_message = "Upload cancelled before publish."
+                _scene = ""
+                if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                    _scene = str(ctx.output_artifacts.get("scene_story") or "")
+                await notify_upload_terminal(
+                    db_pool, ctx, str(upload_id), status="cancelled", scene_story=_scene
+                )
+            except Exception as _cce:
+                logger.warning(f"[{upload_id}] cancel comms error: {_cce}")
         return False
     except Exception as e:
         logger.exception(f"[{upload_id}] Processing failed: {e}")
         if ctx:
             ctx.mark_error("INTERNAL", str(e))
+            ctx.state = "failed"
+            ctx.finished_at = _now_utc()
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
         # ── Release wallet hold on failure ───────────────────────────────────
         try:
@@ -1330,6 +2075,17 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         except Exception as wallet_err:
             logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
         await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
+        # User comms + admin upload-status incident on full-pipeline crash
+        if ctx:
+            try:
+                _scene = ""
+                if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                    _scene = str(ctx.output_artifacts.get("scene_story") or "")
+                await notify_upload_terminal(
+                    db_pool, ctx, str(upload_id), status="failed", scene_story=_scene
+                )
+            except Exception as _cce:
+                logger.warning(f"[{upload_id}] failure comms (notify) error: {_cce}")
         return False
     finally:
         uid = upload_id or (str(ctx.upload_id) if ctx else "")
@@ -1345,6 +2101,167 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 pass
 
 
+_MPH_TOKEN_RE = re.compile(r"\b\d{1,3}\s?mph\b", re.IGNORECASE)
+
+
+def _contains_any_token(haystack: str, needles: List[str]) -> List[str]:
+    """Return the subset of ``needles`` that appear in ``haystack`` (case-insensitive)."""
+    if not haystack or not needles:
+        return []
+    h = haystack.lower()
+    hits: List[str] = []
+    for n in needles:
+        nn = str(n or "").strip().lower()
+        if nn and nn in h:
+            hits.append(n)
+    return hits
+
+
+async def _check_evidence_usage_and_alert(ctx: JobContext, upload_id: str, db_pool_) -> None:
+    """Fire ops_incidents for resolved-but-unused PAD-US/gazetteer/speed evidence.
+
+    Two incident types (both loud-log + admin Discord/email; post still ships):
+      - ``geo_signals_unused``    — gazetteer/protected-area resolved but final
+        title/caption/hashtags do not mention any of them.
+      - ``evidence_unused``       — telemetry/OSD speed >= 25 mph OR osd
+        coverage >= 30% but no MPH/geo/Trill token in final outputs.
+    """
+    if not db_pool_:
+        return
+    try:
+        from services.ops_incidents import record_operational_incident
+    except Exception:
+        return
+
+    ai_title = (ctx.ai_title or "").strip()
+    ai_caption = (ctx.ai_caption or "").strip()
+    tags_list = ctx.ai_hashtags or []
+    ai_tags = " ".join(str(t) for t in tags_list)
+    blob = f"{ai_title}\n{ai_caption}\n{ai_tags}"
+
+    tel = ctx.telemetry or ctx.telemetry_data
+    osd = ctx.dashcam_osd_context or {}
+
+    geo_tokens: List[str] = []
+    if tel is not None:
+        for attr in (
+            "location_road",
+            "location_city",
+            "location_state",
+            "gazetteer_place_name",
+            "padus_unit_name",
+        ):
+            v = getattr(tel, attr, None)
+            if isinstance(v, str) and v.strip():
+                geo_tokens.append(v.strip())
+    near_protected = bool(getattr(tel, "near_padus", False)) if tel else False
+
+    if geo_tokens or near_protected:
+        hits = _contains_any_token(blob, geo_tokens)
+        if not hits:
+            try:
+                await record_operational_incident(
+                    db_pool_,
+                    source="caption",
+                    incident_type="geo_signals_unused",
+                    subject=f"Geo signals unused in upload {upload_id}",
+                    body=(
+                        f"Resolved geo: {geo_tokens or ['(near protected land)']}\n"
+                        f"near_protected: {near_protected}\n"
+                        f"ai_title: {ai_title[:240]}\n"
+                        f"ai_caption: {ai_caption[:600]}\n"
+                        f"ai_hashtags: {ai_tags[:400]}"
+                    ),
+                    details={
+                        "upload_id": str(upload_id),
+                        "user_id": str(ctx.user_id) if ctx.user_id else None,
+                        "geo_tokens": geo_tokens,
+                        "near_protected_land": near_protected,
+                        "ai_title": ai_title[:240],
+                        "ai_caption": ai_caption[:600],
+                    },
+                    user_id=str(ctx.user_id) if ctx.user_id else None,
+                    upload_id=str(upload_id),
+                    alert_email=True,
+                    alert_discord=True,
+                )
+                logger.warning(
+                    "[%s] geo_signals_unused fired: tokens=%s near_protected=%s",
+                    upload_id, geo_tokens, near_protected,
+                )
+            except Exception as e:
+                logger.debug(f"[{upload_id}] geo_signals_unused record failed: {e}")
+
+    max_mph_tel = 0.0
+    try:
+        max_mph_tel = float(getattr(tel, "max_speed_mph", 0) or 0)
+    except (TypeError, ValueError):
+        max_mph_tel = 0.0
+    max_mph_osd = 0.0
+    coverage_pct = 0.0
+    if isinstance(osd, dict):
+        try:
+            max_mph_osd = float(osd.get("max_speed_mph") or 0)
+        except (TypeError, ValueError):
+            max_mph_osd = 0.0
+        try:
+            coverage_pct = float(osd.get("coverage_pct") or 0.0)
+        except (TypeError, ValueError):
+            coverage_pct = 0.0
+
+    fast_enough = (max_mph_tel >= 25 or max_mph_osd >= 25)
+    coverage_strong = coverage_pct >= 0.30
+
+    if fast_enough or coverage_strong:
+        trill_bucket = ""
+        try:
+            tr_obj = ctx.trill or ctx.trill_score
+            trill_bucket = str(getattr(tr_obj, "bucket", "") or "").strip()
+        except Exception:
+            trill_bucket = ""
+        trill_hit = bool(trill_bucket and trill_bucket.lower() in blob.lower())
+        mph_hit = bool(_MPH_TOKEN_RE.search(blob))
+        geo_hit = bool(_contains_any_token(blob, geo_tokens))
+        if not (mph_hit or geo_hit or trill_hit):
+            try:
+                await record_operational_incident(
+                    db_pool_,
+                    source="caption",
+                    incident_type="evidence_unused",
+                    subject=f"Evidence unused in upload {upload_id}",
+                    body=(
+                        f"max_speed_tel={max_mph_tel} max_speed_osd={max_mph_osd} "
+                        f"coverage_pct={coverage_pct}\n"
+                        f"geo_tokens={geo_tokens}\n"
+                        f"trill_bucket={trill_bucket}\n"
+                        f"ai_title: {ai_title[:240]}\n"
+                        f"ai_caption: {ai_caption[:600]}\n"
+                        f"ai_hashtags: {ai_tags[:400]}"
+                    ),
+                    details={
+                        "upload_id": str(upload_id),
+                        "user_id": str(ctx.user_id) if ctx.user_id else None,
+                        "max_speed_mph_telemetry": max_mph_tel,
+                        "max_speed_mph_osd": max_mph_osd,
+                        "osd_coverage_pct": coverage_pct,
+                        "geo_tokens": geo_tokens,
+                        "trill_bucket": trill_bucket,
+                        "ai_title": ai_title[:240],
+                        "ai_caption": ai_caption[:600],
+                    },
+                    user_id=str(ctx.user_id) if ctx.user_id else None,
+                    upload_id=str(upload_id),
+                    alert_email=True,
+                    alert_discord=True,
+                )
+                logger.warning(
+                    "[%s] evidence_unused fired: speed_tel=%.1f speed_osd=%.1f coverage=%.2f geo=%s trill=%r",
+                    upload_id, max_mph_tel, max_mph_osd, coverage_pct, geo_tokens, trill_bucket,
+                )
+            except Exception as e:
+                logger.debug(f"[{upload_id}] evidence_unused record failed: {e}")
+
+
 async def run_publish_and_notify(
     ctx: JobContext,
     upload_id: str,
@@ -1354,14 +2271,64 @@ async def run_publish_and_notify(
     Run publish + notify stages and finalize upload status.
     Called by both the immediate pipeline and the deferred publish path.
     """
+    block_reason = _publish_policy_block_reason(ctx)
+    if block_reason:
+        logger.error(f"[{upload_id}] Publish blocked by policy ({block_reason[:200]!r})")
+        ctx.mark_stage("publish_blocked")
+        ctx.mark_error("POLICY_BLOCKED", block_reason[:2000])
+        ctx.finished_at = _now_utc()
+        ctx.state = "failed"
+        await db_stage.mark_processing_failed(db_pool, ctx, "POLICY_BLOCKED", block_reason[:4000])
+        try:
+            put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
+            user_id_str = str(ctx.user_id) if ctx.user_id else None
+            if user_id_str and (put_cost > 0 or aic_cost > 0):
+                await _release_tokens(
+                    ctx.upload_id,
+                    user_id_str,
+                    put_cost,
+                    aic_cost,
+                    reason="policy_blocked_refund",
+                )
+        except Exception as rel_e:
+            logger.error(f"[{ctx.upload_id}] Policy-block wallet release failed: {rel_e}")
+        scene_story_pb = ""
+        try:
+            if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                scene_story_pb = str(ctx.output_artifacts.get("scene_story") or "")
+        except Exception:
+            scene_story_pb = ""
+        try:
+            await notify_upload_terminal(
+                db_pool, ctx, upload_id, status="failed", scene_story=scene_story_pb
+            )
+        except Exception as ne:
+            logger.warning(f"[{upload_id}] notify after policy-block (non-fatal): {ne}")
+        return False
+
     try:
-        ctx = await run_publish_stage(ctx, db_pool)
+        ctx = await asyncio.wait_for(
+            run_publish_stage(ctx, db_pool), timeout=STAGE_TIMEOUT_PUBLISH
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[{upload_id}] Publish timed out after {STAGE_TIMEOUT_PUBLISH}s")
+        ctx.mark_error("TIMEOUT", f"Publish stage exceeded {STAGE_TIMEOUT_PUBLISH}s")
     except StageError as e:
         logger.error(f"[{upload_id}] Publish error: {e.message}")
+        try:
+            meta = getattr(e, "meta", None)
+            if isinstance(meta, dict) and isinstance(getattr(ctx, "output_artifacts", None), dict):
+                pmg = meta.get("publish_metadata_gate")
+                if isinstance(pmg, dict):
+                    ctx.output_artifacts["publish_metadata_gate"] = json.dumps(
+                        pmg, default=str
+                    )[:12000]
+        except Exception:
+            pass
         ctx.mark_error(e.code.value, e.message)
 
     try:
-        ctx = await run_notify_stage(ctx, db_pool)
+        await run_notify_stage(ctx, db_pool)
     except Exception as e:
         logger.warning(f"[{upload_id}] Notify error: {e}")
 
@@ -1373,7 +2340,109 @@ async def run_publish_and_notify(
     else:
         ctx.state = "failed"
 
+    viol = list(getattr(ctx, "google_multimodal_strict_violations", None) or [])
+    if viol and _google_multimodal_strict_mode() == "degrade":
+        try:
+            blob = {"strict": True, "violations": viol[:40], "mode": "degrade"}
+            if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                ctx.output_artifacts["google_multimodal_strict_report"] = json.dumps(
+                    blob,
+                    default=str,
+                )[:16000]
+        except Exception:
+            pass
+
+        if ctx.state == "succeeded":
+            ctx.state = "partial"
+            setattr(ctx, "_notify_terminal_as_degraded", True)
+            suffix = (
+                "Multimodal requirements not met (GOOGLE_MULTIMODAL_STRICT): "
+                + "; ".join(viol[:12])
+            )
+            em_old = getattr(ctx, "error_message", None) or ""
+            ctx.error_message = (((em_old + " | ").strip(" | ") + suffix) if em_old else suffix)[
+                :4800
+            ]
+        logger.warning("[%s] GOOGLE_MULTIMODAL_STRICT(degrade): %s", upload_id, viol)
+
+    try:
+        from services.metadata_quality import metadata_quality_strict_mode as _mq_mode
+
+        if _mq_mode() == "degrade" and getattr(ctx, "metadata_quality_ok", True) is False:
+            if ctx.state == "succeeded":
+                ctx.state = "partial"
+                setattr(ctx, "_notify_terminal_metadata_degraded", True)
+            mv_list = getattr(ctx, "metadata_quality_violations", None) or []
+            suffix_m = (
+                "Metadata quality: " + "; ".join(str(x) for x in mv_list[:10])
+            ).strip()
+            if suffix_m:
+                em_old2 = getattr(ctx, "error_message", None) or ""
+                ctx.error_message = (((em_old2 + " | " + suffix_m).strip(" | ")) if em_old2 else suffix_m)[
+                    :4800
+                ]
+            logger.warning("[%s] METADATA_QUALITY_STRICT(degrade): %s", upload_id, mv_list[:12])
+    except Exception:
+        pass
+
     await db_stage.mark_processing_completed(db_pool, ctx)
+
+    # ── Post-publish Trill persistence check ────────────────────────────
+    # Trill metadata may be saved during telemetry and dashcam OSD stages
+    # backfill). If it still isn't on disk after publish — and we *had* a
+    # score in memory — that's a silent persistence regression worth paging
+    # admin so the score doesn't quietly disappear from analytics.
+    try:
+        _trill_in_mem = ctx.trill or ctx.trill_score
+        if _trill_in_mem and getattr(_trill_in_mem, "score", None) is not None:
+            async with db_pool.acquire() as _tconn:
+                _trow = await _tconn.fetchrow(
+                    "SELECT trill_score, trill_metadata FROM uploads WHERE id = $1",
+                    ctx.upload_id,
+                )
+            _persisted_score = _trow["trill_score"] if _trow else None
+            _persisted_meta = _trow["trill_metadata"] if _trow else None
+            if _persisted_score is None and not _persisted_meta:
+                logger.warning(
+                    "[%s] Trill MISSING after publish: in_memory_score=%s bucket=%s "
+                    "but DB trill_score & trill_metadata are both NULL",
+                    upload_id,
+                    getattr(_trill_in_mem, "score", "?"),
+                    getattr(_trill_in_mem, "bucket", "?"),
+                )
+                try:
+                    from services.ops_incidents import record_operational_incident
+
+                    await record_operational_incident(
+                        db_pool,
+                        source="worker",
+                        incident_type="trill_persist_missing",
+                        subject=f"Trill not persisted for upload {upload_id}",
+                        body=(
+                            f"In-memory Trill score={getattr(_trill_in_mem, 'score', '?')} "
+                            f"bucket={getattr(_trill_in_mem, 'bucket', '?')} but "
+                            "uploads.trill_score and trill_metadata are both NULL."
+                        ),
+                        details={
+                            "upload_id": str(upload_id),
+                            "user_id": str(ctx.user_id) if ctx.user_id else None,
+                            "in_memory_score": getattr(_trill_in_mem, "score", None),
+                            "in_memory_bucket": getattr(_trill_in_mem, "bucket", None),
+                        },
+                        user_id=str(ctx.user_id) if ctx.user_id else None,
+                        upload_id=str(upload_id),
+                        alert_email=True,
+                        alert_discord=True,
+                    )
+                except Exception as _tpe:
+                    logger.debug(f"[{upload_id}] trill_persist_missing record failed: {_tpe}")
+            else:
+                logger.info(
+                    "[%s] Trill OK persisted: db_score=%s",
+                    upload_id, _persisted_score,
+                )
+    except Exception as _tce:
+        logger.debug(f"[{upload_id}] post-publish Trill persistence check skipped: {_tce}")
 
     # ── Finalize wallet hold (capture on success/partial, release on failure) ──
     try:
@@ -1409,89 +2478,34 @@ async def run_publish_and_notify(
         # Never let wallet accounting crash the job finalization
         logger.error(f"[{ctx.upload_id}] Wallet finalize failed (non-fatal): {wallet_err}")
 
-    # ── Upload email (after wallet so balances reflect capture / refund) ───────
+    # ── Unified upload comms (user when enabled, admin always for partial/failed) ─
+    scene_story = ""
     try:
-        _u = ctx.user_record
-        _user_email = _u.get("email") if _u else None
-        _user_name = (_u.get("name") if _u else None) or "there"
-        if _user_email:
-            async with db_pool.acquire() as _pconn:
-                _prefs = await _pconn.fetchrow(
-                    "SELECT email_notifications FROM user_preferences WHERE user_id = $1",
-                    ctx.user_id,
-                )
-            _wants_email = True
-            if _prefs and _prefs.get("email_notifications") is not None:
-                _wants_email = bool(_prefs["email_notifications"])
-            if _wants_email:
-                _platforms = ctx.platforms or []
-                _put_cost, _aic_cost = await _get_upload_costs(ctx.upload_id)
-                if ctx.state in ("succeeded", "partial"):
-                    _put_bal = _aic_bal = None
-                    try:
-                        async with db_pool.acquire() as _wconn:
-                            _wrow = await _wconn.fetchrow(
-                                "SELECT put_balance, aic_balance FROM wallets WHERE user_id = $1::uuid",
-                                ctx.user_id,
-                            )
-                        if _wrow:
-                            _put_bal = int(_wrow["put_balance"] or 0)
-                            _aic_bal = int(_wrow["aic_balance"] or 0)
-                    except Exception:
-                        pass
-                    _extras = build_upload_completed_email_extensions(
-                        ctx,
-                        put_balance=_put_bal,
-                        aic_balance=_aic_bal,
-                    )
-                    try:
-                        from services.upload_notification_preview import (
-                            resolve_upload_notification_preview_https_url,
-                        )
-
-                        _preview_u = await resolve_upload_notification_preview_https_url(
-                            db_pool, ctx
-                        )
-                        if _preview_u:
-                            _extras["preview_image_url"] = _preview_u
-                    except Exception:
-                        pass
-                    _dur = int(_extras.pop("duration_seconds", 0) or 0)
-                    await send_upload_completed_email(
-                        _user_email,
-                        _user_name,
-                        ctx.filename or upload_id,
-                        ctx.get_success_platforms() or _platforms,
-                        int(_put_cost or 0),
-                        int(_aic_cost or 0),
-                        str(upload_id),
-                        _dur,
-                        **_extras,
-                    )
-                elif ctx.state == "failed":
-                    _err_reason = getattr(ctx, "error_message", "") or ""
-                    _err_stage = getattr(ctx, "current_stage", "") or ""
-                    await send_upload_failed_email(
-                        _user_email,
-                        _user_name,
-                        ctx.filename or upload_id,
-                        _platforms,
-                        _err_reason,
-                        str(upload_id),
-                        _err_stage,
-                    )
-    except Exception as _email_err:
-        logger.warning(f"[{upload_id}] Upload email notification failed (non-fatal): {_email_err}")
+        if isinstance(getattr(ctx, "output_artifacts", None), dict):
+            scene_story = str(ctx.output_artifacts.get("scene_story") or "")
+    except Exception:
+        scene_story = ""
+    term_status = str(getattr(ctx, "state", "") or "").strip().lower()
+    if getattr(ctx, "_notify_terminal_as_degraded", False) or getattr(
+        ctx, "_notify_terminal_metadata_degraded", False
+    ):
+        term_status = "degraded"
+    try:
+        await notify_upload_terminal(
+            db_pool, ctx, upload_id, status=term_status, scene_story=scene_story
+        )
+    except Exception as _comms_err:
+        logger.warning(f"[{upload_id}] Upload comms (notify) failed (non-fatal): {_comms_err}")
 
     if ctx.is_success():
         await db_stage.increment_upload_count(db_pool, user_id)
 
-        elapsed = (ctx.finished_at - ctx.started_at).total_seconds() if ctx.started_at else 0
-        logger.info(
-            f"[{upload_id}] Pipeline {ctx.state} in {elapsed:.1f}s | "
-            f"ok={ctx.get_success_platforms()} fail={ctx.get_failed_platforms()}"
-        )
-        return ctx.is_success()
+    elapsed = (ctx.finished_at - ctx.started_at).total_seconds() if ctx.started_at else 0
+    logger.info(
+        f"[{upload_id}] Pipeline {ctx.state} in {elapsed:.1f}s | "
+        f"ok={ctx.get_success_platforms()} fail={ctx.get_failed_platforms()}"
+    )
+    return ctx.is_success()
 
 
 # ---------------------------------------------------------------------------
@@ -1531,6 +2545,20 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
+        try:
+            setattr(ctx, "_db_pool", db_pool)
+        except Exception:
+            pass
+        try:
+            if getattr(ctx, "vehicle_make_id", None) or getattr(ctx, "vehicle_model_id", None):
+                from services.vehicle_catalog import fetch_vehicle_labels
+
+                async with db_pool.acquire() as _c:
+                    _lab = await fetch_vehicle_labels(_c, ctx.vehicle_make_id, ctx.vehicle_model_id)
+                ctx.vehicle_make_name = _lab.get("make_name")
+                ctx.vehicle_model_name = _lab.get("model_name")
+        except Exception as _ve:
+            logger.debug("[%s] vehicle label hydrate skipped (deferred): %s", upload_id, _ve)
 
         # ── Server-side entitlement cap enforcement ───────────────────────
         # Re-resolve entitlements from DB (authoritative — not from job_data).
@@ -1548,10 +2576,6 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             # Cap caption frames
             if hasattr(ctx, "caption_frames") and ctx.caption_frames > ent.max_caption_frames:
                 ctx.caption_frames = ent.max_caption_frames
-
-            # Enforce HUD — if can_burn_hud is False, skip HUD stage
-            if not ent.can_burn_hud and hasattr(ctx, "hud_enabled"):
-                ctx.hud_enabled = False
 
             # Enforce AI depth
             if not ent.can_ai and hasattr(ctx, "use_ai"):
@@ -1658,8 +2682,20 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         logger.exception(f"[{upload_id}] Deferred publish failed: {e}")
         if ctx:
             ctx.mark_error("INTERNAL", str(e))
+            ctx.state = "failed"
+            ctx.finished_at = _now_utc()
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
         await notify_admin_error("deferred_publish_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
+        if ctx:
+            try:
+                _scene_dp = ""
+                if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                    _scene_dp = str(ctx.output_artifacts.get("scene_story") or "")
+                await notify_upload_terminal(
+                    db_pool, ctx, str(upload_id), status="failed", scene_story=_scene_dp
+                )
+            except Exception as _cce:
+                logger.warning(f"[{upload_id}] deferred-publish comms error: {_cce}")
         return False
 
 
@@ -1932,7 +2968,12 @@ async def run_analytics_sync_loop() -> None:
                         # No platform results to query — stamp and skip
                         async with db_pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
+                                """
+                                UPDATE uploads
+                                   SET analytics_synced_at = NOW(),
+                                       updated_at = NOW()
+                                 WHERE id = $1
+                                """,
                                 row["upload_id"],
                             )
                         continue
@@ -1940,9 +2981,12 @@ async def run_analytics_sync_loop() -> None:
                     # Fetch active tokens for this user
                     async with db_pool.acquire() as conn:
                         token_rows = await conn.fetch(
-                            """SELECT platform, token_blob, account_id
-                                  FROM platform_tokens
-                                 WHERE user_id= AND revoked_at IS NULL""",
+                            """
+                            SELECT platform, token_blob, account_id
+                              FROM platform_tokens
+                             WHERE user_id = $1
+                               AND revoked_at IS NULL
+                            """,
                             row["user_id"],
                         )
 
@@ -1966,7 +3010,12 @@ async def run_analytics_sync_loop() -> None:
                         # User has no active tokens — stamp and skip
                         async with db_pool.acquire() as conn:
                             await conn.execute(
-                                "UPDATE uploads SET analytics_synced_at=NOW() WHERE id=",
+                                """
+                                UPDATE uploads
+                                   SET analytics_synced_at = NOW(),
+                                       updated_at = NOW()
+                                 WHERE id = $1
+                                """,
                                 row["upload_id"],
                             )
                         continue
@@ -2086,6 +3135,7 @@ async def run_scheduler_loop() -> None:
     )
 
     while not shutdown_requested:
+        _ensure_worker_semaphores()
         try:
             now = _now_utc()
             process_cutoff = now + timedelta(minutes=PROCESSING_WINDOW_MINUTES)
@@ -2148,8 +3198,33 @@ async def run_scheduler_loop() -> None:
                         "deferred": True,  # <-- tells pipeline to stop before publish
                     }
 
-                    task = asyncio.create_task(_run_job_with_semaphore(job_data))
-                    logger.debug(f"[{upload_id}] Processing task dispatched")
+                    if WORKER_LANE == "publish":
+                        payload = await _build_process_job_payload(
+                            upload_id,
+                            user_id,
+                            deferred=True,
+                            job_id=f"scheduled-{upload_id}",
+                        )
+                        if payload and await enqueue_process_lane_job(payload):
+                            logger.info(
+                                f"[{upload_id}] Scheduler: staged → Redis process queue "
+                                f"(publish worker)"
+                            )
+                        else:
+                            logger.error(
+                                f"[{upload_id}] Scheduler: Redis enqueue failed — reverting to staged"
+                            )
+                            await conn.execute(
+                                """
+                                UPDATE uploads
+                                   SET status = 'staged', updated_at = NOW()
+                                 WHERE id = $1 AND status = 'queued'
+                                """,
+                                row["upload_id"],
+                            )
+                    else:
+                        asyncio.create_task(_run_job_with_semaphore(job_data))
+                        logger.debug(f"[{upload_id}] Processing task dispatched")
 
                 # --------------------------------------------------------
                 # CHECK 2: ready_to_publish jobs past scheduled_time
@@ -2236,6 +3311,362 @@ async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> 
             logger.exception(f"[{upload_id}] Unhandled deferred publish error: {e}")
 
 
+def _ensure_worker_semaphores() -> None:
+    """Initialize lane semaphores once (safe for publish-only or process-only workers)."""
+    global _process_semaphore, _publish_semaphore, _job_semaphore
+    if _process_semaphore is None:
+        _process_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
+    if _publish_semaphore is None:
+        _publish_semaphore = asyncio.Semaphore(PUBLISH_CONCURRENCY)
+    _job_semaphore = _process_semaphore
+
+
+def _process_queue_name(priority_class: str) -> str:
+    return PROCESS_PRIORITY_QUEUE if priority_class in PRIORITY_QUEUE_CLASSES else PROCESS_NORMAL_QUEUE
+
+
+def _publish_queue_name(priority_class: str) -> str:
+    return PUBLISH_PRIORITY_QUEUE if priority_class in PRIORITY_QUEUE_CLASSES else PUBLISH_NORMAL_QUEUE
+
+
+async def _build_process_job_payload(
+    upload_id: str,
+    user_id: str,
+    *,
+    deferred: bool,
+    job_id: str,
+    resume_from_checkpoint: bool = False,
+) -> Optional[dict]:
+    """Shape matches /complete enqueue for Redis process lane."""
+    try:
+        upload_record = await db_stage.load_upload_record(db_pool, upload_id)
+        user_record = await db_stage.load_user(db_pool, user_id)
+        if not upload_record or not user_record:
+            return None
+        user_settings = await db_stage.load_user_settings(db_pool, user_id)
+        await db_stage.merge_pikzels_thumbnail_persona_id(db_pool, user_id, user_settings)
+        overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
+        ent = get_entitlements_from_user(user_record, overrides)
+        payload = {
+            "upload_id": str(upload_id),
+            "user_id": str(user_id),
+            "job_id": job_id,
+            "deferred": deferred,
+            "preferences": user_settings or {},
+            "plan_features": {
+                "ai": ent.can_ai,
+                "priority": ent.can_priority,
+                "watermark": ent.can_watermark,
+                "ai_depth": ent.ai_depth,
+                "caption_frames": ent.max_caption_frames,
+            },
+            "priority_class": ent.priority_class,
+        }
+        if resume_from_checkpoint:
+            payload["resume_from_checkpoint"] = True
+        return payload
+    except Exception as e:
+        logger.warning(f"[{upload_id}] _build_process_job_payload failed: {e}")
+        return None
+
+
+async def enqueue_process_lane_job(payload: dict) -> bool:
+    """LPUSH a job to the process Redis lane (worker has its own redis client)."""
+    global redis_client
+    if not redis_client:
+        return False
+    pc = str(payload.get("priority_class") or "p4")
+    q = _process_queue_name(pc)
+    body = {
+        **payload,
+        "job_id": payload.get("job_id") or str(uuid.uuid4()),
+        "lane": "process",
+        "enqueued_at": _now_utc().isoformat(),
+    }
+    try:
+        await redis_client.lpush(q, json.dumps(body))
+        logger.info(f"[{payload.get('upload_id')}] Enqueued process lane → {q}")
+        return True
+    except Exception as e:
+        logger.error(f"[{payload.get('upload_id')}] enqueue process lane failed: {e}")
+        return False
+
+
+async def enqueue_publish_lane_job(payload: dict) -> bool:
+    """LPUSH a job to the publish Redis lane."""
+    global redis_client
+    if not redis_client:
+        return False
+    pc = str(payload.get("priority_class") or "p4")
+    q = _publish_queue_name(pc)
+    body = {
+        **payload,
+        "job_id": payload.get("job_id") or str(uuid.uuid4()),
+        "lane": "publish",
+        "enqueued_at": _now_utc().isoformat(),
+    }
+    try:
+        await redis_client.lpush(q, json.dumps(body))
+        logger.info(f"[{payload.get('upload_id')}] Enqueued publish lane → {q}")
+        return True
+    except Exception as e:
+        logger.error(f"[{payload.get('upload_id')}] enqueue publish lane failed: {e}")
+        return False
+
+
+async def _publish_one_job(job_json: str) -> None:
+    try:
+        job_data = json.loads(job_json)
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid publish job JSON: {e}")
+        return
+    upload_id = job_data.get("upload_id")
+    user_id = job_data.get("user_id")
+    if not upload_id or not user_id:
+        logger.error("Publish job missing upload_id or user_id")
+        return
+    async with _publish_semaphore:
+        try:
+            await run_deferred_publish(str(upload_id), str(user_id))
+        except Exception as e:
+            logger.exception(f"[{upload_id}] publish lane job error: {e}")
+
+
+async def publish_jobs() -> None:
+    """
+    Consume publish-lane Redis jobs (API-light). Used when ASYNC_PUBLISH_QUEUE is on
+    or on dedicated publish workers (WORKER_LANE=publish).
+    """
+    global shutdown_requested, redis_client, _publish_semaphore
+
+    _ensure_worker_semaphores()
+    queues = [PUBLISH_PRIORITY_QUEUE, PUBLISH_NORMAL_QUEUE]
+    logger.info(
+        f"Publish consumer started | publish_concurrency={PUBLISH_CONCURRENCY} | "
+        f"queues={PUBLISH_PRIORITY_QUEUE}, {PUBLISH_NORMAL_QUEUE}"
+    )
+    consecutive_redis_errors = 0
+    active_tasks: List[asyncio.Task] = []
+
+    while not shutdown_requested:
+        active_tasks = [t for t in active_tasks if not t.done()]
+        try:
+            job_raw = await redis_client.brpop(queues, timeout=int(POLL_INTERVAL))
+            consecutive_redis_errors = 0
+            if not job_raw:
+                continue
+            _, job_json = job_raw
+            task = asyncio.create_task(_publish_one_job(job_json))
+            active_tasks.append(task)
+        except redis.ReadOnlyError:
+            consecutive_redis_errors += 1
+            wait = min(REDIS_RETRY_DELAY * consecutive_redis_errors, 60.0)
+            logger.warning(f"Redis read-only (publish), retrying in {wait:.0f}s")
+            await asyncio.sleep(wait)
+        except (redis.ConnectionError, redis.TimeoutError, OSError) as e:
+            consecutive_redis_errors += 1
+            wait = min(REDIS_RETRY_DELAY * consecutive_redis_errors, 60.0)
+            logger.warning(f"Redis error (publish): {e}, retrying in {wait:.0f}s")
+            await asyncio.sleep(wait)
+        except Exception as e:
+            logger.exception(f"Publish consumer error: {e}")
+            await asyncio.sleep(1)
+
+    if active_tasks:
+        logger.info(f"Shutdown: waiting for {len(active_tasks)} in-flight publish jobs...")
+        await asyncio.gather(*active_tasks, return_exceptions=True)
+    logger.info("Publish consumer stopped")
+
+
+async def run_stale_job_recovery_loop() -> None:
+    """
+    Re-enqueue long-stuck `queued` uploads (Redis consumer died / lost message).
+
+    When STALE_PROCESSING_MINUTES > 0, also handle stuck `processing` rows:
+    if STALE_PROCESSING_RECOVER_CHECKPOINT is on and ``pipeline_resume`` is
+    at ``post_transcode`` or ``post_audio`` with valid R2 checkpoint objects,
+    reset the row to ``queued`` and enqueue with ``resume_from_checkpoint`` so
+    the worker skips download/transcode (and audio when stage is post_audio).
+    Otherwise mark the upload failed with STALE_PROCESSING.
+    """
+    global shutdown_requested, shutdown_event, redis_client
+
+    if not STALE_JOB_RECOVERY_ENABLED:
+        logger.info("Stale job recovery disabled (STALE_JOB_RECOVERY_ENABLED=false)")
+        await shutdown_event.wait()
+        return
+
+    logger.info(
+        f"Stale job recovery started | interval={STALE_JOB_RECOVERY_INTERVAL_SEC}s | "
+        f"queued>{STALE_QUEUED_MINUTES}m | processing>{STALE_PROCESSING_MINUTES}m (0=off) | "
+        f"processing_checkpoint_recover={STALE_PROCESSING_RECOVER_CHECKPOINT}"
+    )
+
+    while not shutdown_requested:
+        try:
+            if db_pool and redis_client:
+                async with db_pool.acquire() as conn:
+                    stale = await conn.fetch(
+                        """
+                        SELECT id, user_id
+                          FROM uploads
+                         WHERE status = 'queued'
+                           AND processing_started_at IS NULL
+                           AND updated_at < NOW() - ($1::int * INTERVAL '1 minute')
+                         ORDER BY updated_at ASC
+                         LIMIT 15
+                        """,
+                        STALE_QUEUED_MINUTES,
+                    )
+                for row in stale:
+                    uid = str(row["user_id"])
+                    up = str(row["id"])
+                    lock_key = f"stale_recover:{up}"
+                    try:
+                        got = await redis_client.set(lock_key, "1", nx=True, ex=180)
+                    except Exception:
+                        got = True
+                    if not got:
+                        continue
+                    async with db_pool.acquire() as conn2:
+                        st = await conn2.fetchval(
+                            "SELECT status FROM uploads WHERE id = $1",
+                            up,
+                        )
+                    if str(st or "").lower() != "queued":
+                        continue
+                    payload = await _build_process_job_payload(
+                        up, uid, deferred=False, job_id=f"stale-recover-{up}"
+                    )
+                    if not payload:
+                        continue
+                    ok = await enqueue_process_lane_job(payload)
+                    if ok:
+                        async with db_pool.acquire() as conn3:
+                            await conn3.execute(
+                                "UPDATE uploads SET updated_at = NOW() WHERE id = $1",
+                                up,
+                            )
+                        logger.warning(f"[{up}] stale recovery: re-enqueued process job (queued {STALE_QUEUED_MINUTES}+ min)")
+
+                if STALE_PROCESSING_MINUTES > 0:
+                    async with db_pool.acquire() as conn:
+                        zomb = await conn.fetch(
+                            """
+                            SELECT id, user_id
+                              FROM uploads
+                             WHERE status = 'processing'
+                               AND processing_started_at IS NOT NULL
+                               AND processing_started_at < NOW() - ($1::int * INTERVAL '1 minute')
+                               AND updated_at < NOW() - ($1::int * INTERVAL '1 minute')
+                             LIMIT 10
+                            """,
+                            STALE_PROCESSING_MINUTES,
+                        )
+                    for row in zomb:
+                        up = str(row["id"])
+                        uid = str(row["user_id"])
+                        lock_key = f"stale_recover:{up}"
+                        try:
+                            got = await redis_client.set(lock_key, "1", nx=True, ex=180)
+                        except Exception:
+                            got = True
+                        if not got:
+                            continue
+
+                        recover_ok = False
+                        ur: Optional[dict] = None
+                        if STALE_PROCESSING_RECOVER_CHECKPOINT:
+                            ur = await db_stage.load_upload_record(db_pool, up)
+                            if ur:
+                                cp = pipeline_checkpoint.load_resume(ur)
+                                stg = str((cp or {}).get("stage") or "").lower()
+                                if (
+                                    cp
+                                    and stg in ("post_transcode", "post_audio")
+                                    and pipeline_checkpoint.checkpoint_matches_upload(cp, ur)
+                                ):
+                                    try:
+                                        recover_ok = await pipeline_checkpoint.verify_transcode_r2_keys(
+                                            dict(cp.get("transcode_r2") or {})
+                                        )
+                                    except Exception:
+                                        recover_ok = False
+
+                        if recover_ok and ur:
+                            deferred = str(ur.get("schedule_mode") or "immediate").lower() in (
+                                "scheduled",
+                                "smart",
+                            )
+                            payload = await _build_process_job_payload(
+                                up,
+                                uid,
+                                deferred=deferred,
+                                job_id=f"stale-recover-proc-{up}",
+                                resume_from_checkpoint=True,
+                            )
+                            if payload and await enqueue_process_lane_job(payload):
+                                async with db_pool.acquire() as uconn:
+                                    await uconn.execute(
+                                        """
+                                        UPDATE uploads
+                                           SET status = 'queued',
+                                               processing_started_at = NULL,
+                                               error_code = NULL,
+                                               error_detail = NULL,
+                                               updated_at = NOW()
+                                         WHERE id = $1 AND status = 'processing'
+                                        """,
+                                        up,
+                                    )
+                                logger.warning(
+                                    f"[{up}] stale recovery: re-queued from pipeline checkpoint "
+                                    f"(processing>{STALE_PROCESSING_MINUTES}m)"
+                                )
+                                continue
+                            if recover_ok:
+                                logger.error(
+                                    f"[{up}] stale checkpoint recovery: enqueue failed — leaving status=processing"
+                                )
+                                continue
+
+                        async with db_pool.acquire() as uconn:
+                            tag = await uconn.execute(
+                                """
+                                UPDATE uploads
+                                   SET status = 'failed',
+                                       error_code = 'STALE_PROCESSING',
+                                       error_detail = 'Worker marked this upload stale after extended processing with no progress.',
+                                       updated_at = NOW()
+                                 WHERE id = $1 AND status = 'processing'
+                                """,
+                                up,
+                            )
+                        if tag and str(tag) != "UPDATE 0":
+                            logger.error(f"[{up}] stale recovery: marked failed STALE_PROCESSING")
+                            try:
+                                await notify_admin_error(
+                                    "stale_processing_marked_failed",
+                                    {"upload_id": up, "user_id": uid},
+                                    db_pool,
+                                )
+                            except Exception:
+                                pass
+        except Exception as e:
+            logger.warning(f"Stale job recovery cycle error: {e}")
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=float(STALE_JOB_RECOVERY_INTERVAL_SEC),
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Stale job recovery stopped")
+
+
 # ---------------------------------------------------------------------------
 # Redis job consumer (immediate uploads only)
 # ---------------------------------------------------------------------------
@@ -2261,9 +3692,7 @@ async def process_jobs() -> None:
     """
     global shutdown_requested, redis_client, _process_semaphore, _publish_semaphore, _job_semaphore
 
-    _process_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
-    _publish_semaphore = asyncio.Semaphore(PUBLISH_CONCURRENCY)
-    _job_semaphore     = _process_semaphore  # legacy alias
+    _ensure_worker_semaphores()
 
     # All queues worker should drain — priority first, then normal, then legacy
     all_process_queues = [
@@ -2334,6 +3763,120 @@ async def process_jobs() -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+async def _ensure_worker_heartbeat_schema() -> None:
+    """Create worker_heartbeat table on first run. Idempotent."""
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS worker_heartbeat (
+                worker_id           TEXT PRIMARY KEY,
+                last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                worker_concurrency  INT NOT NULL DEFAULT 0,
+                publish_concurrency INT NOT NULL DEFAULT 0,
+                version             TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_worker_heartbeat_last_seen
+                ON worker_heartbeat (last_seen_at DESC)
+        """)
+
+
+async def run_heartbeat_loop() -> None:
+    """
+    Background loop: writes WORKER_ID + last_seen_at + concurrency snapshot
+    every HEARTBEAT_INTERVAL seconds. Admin can SELECT worker_id, last_seen_at
+    FROM worker_heartbeat to see liveness (stale = NOW() - last_seen_at > 30s).
+    """
+    global shutdown_event
+    await _ensure_worker_heartbeat_schema()
+
+    version = os.environ.get("RENDER_GIT_COMMIT", "")[:12] or None
+
+    # Upsert started_at on first beat so admin can see worker uptime
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO worker_heartbeat
+                        (worker_id, last_seen_at, started_at,
+                         worker_concurrency, publish_concurrency, version)
+                    VALUES ($1, NOW(), NOW(), $2, $3, $4)
+                    ON CONFLICT (worker_id) DO UPDATE SET
+                        started_at          = NOW(),
+                        worker_concurrency  = EXCLUDED.worker_concurrency,
+                        publish_concurrency = EXCLUDED.publish_concurrency,
+                        version             = EXCLUDED.version,
+                        last_seen_at        = NOW()
+                """, WORKER_ID, WORKER_CONCURRENCY, PUBLISH_CONCURRENCY, version)
+        except Exception as e:
+            logger.warning(f"Heartbeat init failed: {e}")
+
+    logger.info(
+        f"Heartbeat loop started | worker_id={WORKER_ID} | interval={HEARTBEAT_INTERVAL}s"
+    )
+
+    while not shutdown_requested:
+        try:
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE worker_heartbeat SET last_seen_at = NOW() WHERE worker_id = $1",
+                        WORKER_ID,
+                    )
+        except Exception as e:
+            # Don't crash the loop on transient DB issues — supervisor would
+            # restart us, but heartbeat misses are themselves the signal admin
+            # cares about, so just log and keep trying.
+            logger.warning(f"Heartbeat write failed: {e}")
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=HEARTBEAT_INTERVAL)
+            break  # shutdown signaled
+        except asyncio.TimeoutError:
+            pass  # normal — beat again
+
+    logger.info("Heartbeat loop stopped")
+
+
+async def _supervise(name: str, coro_factory: Callable[[], Awaitable[Any]]) -> None:
+    """
+    Run a background loop forever, restarting it with exponential backoff
+    if it crashes. Exits cleanly when shutdown_event is set.
+    """
+    backoff = 1.0
+    max_backoff = 60.0
+    while not shutdown_requested:
+        try:
+            logger.info(f"[supervisor] starting {name}")
+            await coro_factory()
+            # Coroutine returned cleanly (e.g. drained on shutdown). Exit.
+            logger.info(f"[supervisor] {name} returned cleanly")
+            return
+        except asyncio.CancelledError:
+            logger.info(f"[supervisor] {name} cancelled")
+            raise
+        except Exception as e:
+            logger.exception(f"[supervisor] {name} crashed: {e}")
+            try:
+                await notify_admin_error(
+                    "supervisor_loop_crash",
+                    {"loop": name, "error": str(e)},
+                    db_pool,
+                )
+            except Exception:
+                pass
+            # Sleep with shutdown sensitivity
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=backoff)
+                return  # shutdown set during backoff
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, max_backoff)
+
+
 async def main() -> None:
     global db_pool, redis_client, shutdown_event
 
@@ -2358,26 +3901,45 @@ async def main() -> None:
     logger.info("Redis connected")
 
     shutdown_event = asyncio.Event()
+    _ensure_worker_semaphores()
 
-    # Six concurrent loops:
-    # 1. process_jobs          — Redis consumer for immediate uploads
-    # 2. run_scheduler_loop    — polls DB for staged/ready_to_publish jobs
-    # 3. run_verification_loop — delivery verification polling
-    # 4. run_analytics_sync_loop — periodic engagement stats fetch from platform APIs
-    # 5. run_kpi_collector_loop — every 30 min: Stripe/Mailgun/OpenAI costs → cost_tracking
+    lane = WORKER_LANE if WORKER_LANE in ("full", "process", "publish") else "full"
+    logger.info(
+        f"Worker lane={lane} | ASYNC_PUBLISH_QUEUE={ASYNC_PUBLISH_QUEUE} | "
+        f"WORKER_CONCURRENCY={WORKER_CONCURRENCY} | PUBLISH_CONCURRENCY={PUBLISH_CONCURRENCY}"
+    )
+
+    background_loops: List[Tuple[str, Any]] = [
+        ("heartbeat", run_heartbeat_loop),
+    ]
+    if lane != "publish":
+        background_loops.append(("process_jobs", process_jobs))
+    if ASYNC_PUBLISH_QUEUE or lane == "publish":
+        background_loops.append(("publish_jobs", publish_jobs))
+    background_loops.append(("scheduler_loop", run_scheduler_loop))
+    if STALE_JOB_RECOVERY_ENABLED:
+        background_loops.append(("stale_recovery", run_stale_job_recovery_loop))
+    background_loops.extend(
+        [
+            ("verification_loop", lambda: run_verification_loop(db_pool, shutdown_event)),
+            ("analytics_sync", run_analytics_sync_loop),
+            ("kpi_collector", run_kpi_collector_loop),
+        ]
+    )
+
     tasks = [
-        asyncio.create_task(process_jobs()),
-        asyncio.create_task(run_scheduler_loop()),
-        asyncio.create_task(run_verification_loop(db_pool, shutdown_event)),
-        asyncio.create_task(run_analytics_sync_loop()),
-        asyncio.create_task(run_kpi_collector_loop()),
+        asyncio.create_task(_supervise(name, factory))
+        for name, factory in background_loops
     ]
 
     try:
         await notify_admin_worker_start(db_pool)
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for t in pending:
+        # Wait until shutdown is signaled (SIGTERM/SIGINT). Supervised loops
+        # restart themselves on failure; only an explicit shutdown ends them.
+        await shutdown_event.wait()
+        for t in tasks:
             t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         try:
             shutdown_event.set()

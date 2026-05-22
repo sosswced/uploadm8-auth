@@ -64,7 +64,10 @@ async def enqueue_job(
     job_data["lane"]           = lane
     job_data["priority_class"] = priority_class
 
-    payload = json.dumps(job_data)
+    # user_preferences snapshots can include UUID / datetime / Decimal values
+    # from asyncpg (e.g. trill_public_name_reviewed_by). default=str keeps the
+    # queue payload JSON-safe without losing information for the worker.
+    payload = json.dumps(job_data, default=str)
     upload_id = job_data.get("upload_id", "?")
 
     # One extra retry on transient socket errors. The Retry policy on the

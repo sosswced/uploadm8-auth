@@ -78,6 +78,12 @@ def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+# When true, PATCH must not change price_usd / price_usd_yearly until a pricing request is approved.
+CATALOG_PRICING_APPROVAL_REQUIRED = _env_truthy("CATALOG_PRICING_APPROVAL_REQUIRED")
+# Non-production break-glass: allow direct money PATCH without ticket when approval is required.
+CATALOG_PRICING_APPROVAL_BYPASS = _env_truthy("CATALOG_PRICING_APPROVAL_BYPASS")
+
+
 def _env_active_default_true(name: str) -> bool:
     """Opt-out flags: ON when unset/empty; OFF only for explicit disable values."""
     raw = os.environ.get(name)

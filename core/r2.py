@@ -58,13 +58,48 @@ def _normalize_r2_key(key: str) -> str:
     return k
 
 
-def resolve_stored_account_avatar_url(stored: str | None, *, ttl: int = 86_400) -> str:
+def platform_avatar_redirect_path(stored_key: str) -> str:
+    """Same-origin path for authenticated redirect when presign is unavailable."""
+    k = (stored_key or "").strip().lstrip("/")
+    if not k.startswith("platform-avatars/"):
+        return ""
+    parts = k.split("/")
+    if len(parts) < 4:
+        return ""
+    _prefix, uid, plat, filename = parts[0], parts[1], parts[2], parts[3]
+    if not uid or not plat or not filename:
+        return ""
+    return f"/platform-avatars/{uid}/{plat}/{filename}"
+
+
+def user_avatar_redirect_path(stored_key: str | None) -> str:
+    """
+    Same-origin path for the signed-in user's profile avatar (R2 key ``avatars/{user_id}/{file}``).
+    Presign runs on GET /user-avatars/... so GET /api/me stays fast.
+    """
+    k = (stored_key or "").strip().lstrip("/")
+    if not k.startswith("avatars/"):
+        return ""
+    parts = k.split("/")
+    if len(parts) < 3:
+        return ""
+    _prefix, uid, filename = parts[0], parts[1], parts[2]
+    if not uid or not filename or ".." in filename or "/" in filename:
+        return ""
+    return f"/user-avatars/{uid}/{filename}"
+
+
+def resolve_user_profile_avatar_url(avatar_r2_key: str | None) -> str:
+    """Redirect path for profile avatars — no R2 presign on the hot path."""
+    return user_avatar_redirect_path(avatar_r2_key)
+
+
+def resolve_stored_account_avatar_url(stored: str | None, *, ttl: int = 86_400, presign: bool = True) -> str:
     """
     platform_tokens.account_avatar may be:
       - https?://... (provider CDN — return as-is)
-      - R2 object key (e.g. platform-avatars/{user_id}/{platform}/{id}.jpg) — presign for <img src>
-
-    Without presigning, browsers request same-origin /platform-avatars/... and get 404.
+      - R2 object key (e.g. platform-avatars/{user_id}/{platform}/{id}.jpg) — presign or redirect
+      - when ``presign=False`` (bulk list/bootstrap), use same-origin /platform-avatars/... only
     """
     if stored is None:
         return ""
@@ -76,11 +111,15 @@ def resolve_stored_account_avatar_url(stored: str | None, *, ttl: int = 86_400) 
     low = s.lower()
     if low.startswith("http://") or low.startswith("https://"):
         return s
+    if not presign:
+        return platform_avatar_redirect_path(s)
     try:
-        return generate_presigned_download_url(s, ttl=int(ttl)) or ""
+        presigned = generate_presigned_download_url(s, ttl=int(ttl)) or ""
+        if presigned:
+            return presigned
     except Exception as e:
         logger.debug("resolve_stored_account_avatar_url: presign failed for key=%s err=%s", s[:120], e)
-        return ""
+    return platform_avatar_redirect_path(s)
 
 
 def generate_presigned_download_url(key: str, ttl: int = 3600) -> str:
@@ -98,9 +137,24 @@ def generate_presigned_download_url(key: str, ttl: int = 3600) -> str:
     )
 
 
+_s3_client = None
+
+
 def get_s3_client():
+    """Reused boto3 client — avoids constructing a new client on every presign/head."""
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
     endpoint = R2_ENDPOINT_URL or f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
-    return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=R2_ACCESS_KEY_ID, aws_secret_access_key=R2_SECRET_ACCESS_KEY, config=Config(signature_version="s3v4"), region_name="auto")
+    _s3_client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+    return _s3_client
 
 
 def r2_presign_get_url(r2_key: str, expires_in: int = 3600) -> str:

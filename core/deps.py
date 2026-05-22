@@ -11,6 +11,7 @@ import core.state
 from core.auth import verify_access_jwt
 from core.cookie_auth import access_token_from_cookie
 from core.wallet import get_wallet, daily_refill
+from services.workspace import get_workspace_for_user, billing_user_id
 
 
 def _resolve_user_id_from_session(authorization: Optional[str], cookies: dict) -> Tuple[Optional[str], str]:
@@ -38,6 +39,43 @@ def _resolve_user_id_from_session(authorization: Optional[str], cookies: dict) -
     return None, "invalid"
 
 
+async def _attach_workspace_context(conn, user: dict, request: Optional[Request]) -> dict:
+    """Resolve workspace membership and owner billing wallet."""
+    user_id = str(user["id"])
+    ws_header = None
+    if request is not None:
+        ws_header = request.headers.get("X-Workspace-Id") or request.headers.get("x-workspace-id")
+    active_ws = user.get("active_workspace_id")
+    ws_id = ws_header or (str(active_ws) if active_ws else None)
+    ctx = None
+    try:
+        ctx = await get_workspace_for_user(conn, user_id, ws_id)
+    except HTTPException:
+        raise
+    except Exception:
+        ctx = None
+
+    billing_id = billing_user_id(ctx, user_id)
+    wallet = await get_wallet(conn, billing_id)
+    out = {**user, "wallet": wallet}
+    if ctx:
+        owner = ctx.owner_row
+        out["workspace"] = {
+            "id": ctx.workspace_id,
+            "owner_user_id": ctx.owner_user_id,
+            "role": ctx.role,
+            "name": owner.get("name") or owner.get("email"),
+        }
+        out["billing_user_id"] = billing_id
+        # Entitlements/tier follow workspace owner for members
+        if billing_id != user_id:
+            out["subscription_tier"] = owner.get("subscription_tier")
+            out["flex_enabled"] = owner.get("flex_enabled")
+    else:
+        out["billing_user_id"] = user_id
+    return out
+
+
 async def get_current_user(request: Request, authorization: Optional[str] = Header(None)):
     user_id, reason = _resolve_user_id_from_session(authorization, request.cookies)
     if not user_id:
@@ -58,15 +96,16 @@ async def get_current_user(request: Request, authorization: Optional[str] = Head
                 },
             )
         await conn.execute("UPDATE users SET last_active_at = NOW() WHERE id = $1", user_id)
-        # Single wallet fetch shared with daily_refill — eliminates the duplicate
-        # SELECT * FROM wallets that Sentry flagged as "Consecutive DB Queries".
-        # daily_refill returns the (possibly updated) wallet, or None when it
-        # short-circuited for a paid/internal tier without touching the DB.
-        wallet = await get_wallet(conn, user_id)
-        refreshed = await daily_refill(conn, user_id, user["subscription_tier"], wallet=wallet)
+        user_dict = dict(user)
+        user_dict = await _attach_workspace_context(conn, user_dict, request)
+        billing_id = user_dict.get("billing_user_id") or user_id
+        refreshed = await daily_refill(
+            conn, billing_id, user_dict.get("subscription_tier") or user["subscription_tier"],
+            wallet=user_dict.get("wallet"),
+        )
         if refreshed is not None:
-            wallet = refreshed
-        return {**dict(user), "wallet": wallet}
+            user_dict["wallet"] = refreshed
+        return user_dict
 
 
 async def get_current_user_readonly(request: Request, authorization: Optional[str] = Header(None)):
@@ -97,8 +136,9 @@ async def get_current_user_readonly(request: Request, authorization: Optional[st
                     "code": "email_not_verified",
                 },
             )
-        wallet = await get_wallet(conn, user_id)
-        return {**dict(user), "wallet": wallet}
+        user_dict = dict(user)
+        user_dict = await _attach_workspace_context(conn, user_dict, request)
+        return user_dict
 
 
 async def get_current_user_readonly_no_wallet(
@@ -157,3 +197,54 @@ async def get_verified_user_id(request: Request, authorization: Optional[str] = 
             raise HTTPException(401, "Missing authorization")
         raise HTTPException(401, "Invalid token")
     return user_id
+
+
+async def require_verified_user_on_conn(conn, user_id: str) -> dict:
+    """
+    Same auth gates as ``get_current_user_readonly`` on an existing asyncpg connection.
+
+    Pair with ``get_verified_user_id`` for read-heavy handlers that only need ``users``
+    row validation (no wallet / daily_refill).
+    """
+    user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+    if not user:
+        raise HTTPException(401, "User not found")
+    if user["status"] == "banned":
+        raise HTTPException(403, "Account suspended")
+    if user.get("email_verified") is False:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Please verify your email to use the app.",
+                "code": "email_not_verified",
+            },
+        )
+    return dict(user)
+
+
+async def require_master_admin_on_conn(conn, user_id: str) -> dict:
+    """
+    Same auth gates as ``require_master_admin`` on an existing asyncpg connection.
+
+    Pair with ``get_verified_user_id`` so admin handlers use one pool checkout for auth
+    and business SQL (Sentry: consecutive ``pg_advisory_unlock_all`` spans).
+    """
+    user = await conn.fetchrow(
+        "SELECT id, email, name, role, status, email_verified FROM users WHERE id = $1",
+        user_id,
+    )
+    if not user:
+        raise HTTPException(401, "User not found")
+    if user["status"] == "banned":
+        raise HTTPException(403, "Account suspended")
+    if user.get("email_verified") is False:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "Please verify your email to use the app.",
+                "code": "email_not_verified",
+            },
+        )
+    if user.get("role") != "master_admin":
+        raise HTTPException(403, "Master admin required")
+    return dict(user)

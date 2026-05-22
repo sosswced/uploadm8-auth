@@ -25,14 +25,22 @@ async def ledger_entry(conn, user_id: str, token_type: str, delta: int, reason: 
     await conn.execute("""
         INSERT INTO token_ledger (user_id, token_type, platform, delta, reason, upload_id, stripe_event_id, meta)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    """, user_id, token_type, platform, delta, reason, upload_id, stripe_event_id, json.dumps(meta) if meta else None)
+    """, user_id, token_type, platform, delta, reason, upload_id, stripe_event_id, json.dumps(meta, default=str) if meta else None)
 
 def _wallet_bypass_tokens(user_record: dict | None) -> bool:
     """PUT/AIC wallet bypass — see ``wallet_bypass_for_user_record``."""
     return wallet_bypass_for_user_record(user_record)
 
 
-async def reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str) -> bool:
+async def reserve_tokens(
+    conn,
+    user_id: str,
+    put_count: int,
+    aic_count: int,
+    upload_id: str,
+    *,
+    ledger_meta: dict | None = None,
+) -> bool:
     urow = await conn.fetchrow(
         "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
         user_id,
@@ -46,12 +54,20 @@ async def reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upl
         return False
     await conn.execute("UPDATE wallets SET put_reserved = put_reserved + $1, aic_reserved = aic_reserved + $2 WHERE user_id = $3", put_count, aic_count, user_id)
     if put_count > 0:
-        await ledger_entry(conn, user_id, "put", -put_count, "reserve", upload_id)
+        await ledger_entry(conn, user_id, "put", -put_count, "reserve", upload_id, meta=ledger_meta)
     if aic_count > 0:
-        await ledger_entry(conn, user_id, "aic", -aic_count, "reserve", upload_id)
+        await ledger_entry(conn, user_id, "aic", -aic_count, "reserve", upload_id, meta=ledger_meta)
     return True
 
-async def atomic_reserve_tokens(conn, user_id: str, put_count: int, aic_count: int, upload_id: str) -> bool:
+async def atomic_reserve_tokens(
+    conn,
+    user_id: str,
+    put_count: int,
+    aic_count: int,
+    upload_id: str,
+    *,
+    ledger_meta: dict | None = None,
+) -> bool:
     """Atomically check-and-reserve tokens in a single UPDATE.
     Returns True if reserved, False if insufficient balance.
     Prevents race conditions where concurrent presign calls share the same balance."""
@@ -74,9 +90,9 @@ async def atomic_reserve_tokens(conn, user_id: str, put_count: int, aic_count: i
     if row is None:
         return False
     if put_count > 0:
-        await ledger_entry(conn, user_id, "put", -put_count, "reserve", upload_id)
+        await ledger_entry(conn, user_id, "put", -put_count, "reserve", upload_id, meta=ledger_meta)
     if aic_count > 0:
-        await ledger_entry(conn, user_id, "aic", -aic_count, "reserve", upload_id)
+        await ledger_entry(conn, user_id, "aic", -aic_count, "reserve", upload_id, meta=ledger_meta)
     return True
 
 async def atomic_debit_tokens(
@@ -307,7 +323,7 @@ async def partial_refund_tokens(
     await conn.execute(
         """
         INSERT INTO token_ledger
-            (user_id, token_type, delta, reason, upload_id, ref_type, metadata)
+            (user_id, token_type, delta, reason, upload_id, ref_type, meta)
         VALUES
             ($1, 'put', $2, 'partial_platform_refund', $3, 'upload',
              jsonb_build_object(

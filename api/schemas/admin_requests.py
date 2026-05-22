@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -83,3 +83,4 @@ class AnnouncementRequest(BaseModel):
     send_user_webhooks: Optional[bool] = None
     target: str = "all"
     target_tiers: List[str] = Field(default_factory=list)
+    promo_media: Optional[Dict[str, Any]] = None

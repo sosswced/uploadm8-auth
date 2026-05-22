@@ -2,12 +2,186 @@
 
 Single source of truth: edit this file only. ``app.py`` lifespan calls
 ``run_migrations(db_pool)`` — do not duplicate migration lists elsewhere.
+
+v1066 creates ``catalog_products`` + ``catalog_sync_log`` and seeds catalog rows
+(equivalent to ``scripts/001_catalog_products.sql``; that file is kept for manual
+``psql -f`` repair and must stay in sync with v1066).
 """
 from __future__ import annotations
 
 import logging
 
 logger = logging.getLogger("uploadm8-api")
+
+# v1066 — must match scripts/001_catalog_products.sql (DDL + INSERT … ON CONFLICT DO NOTHING).
+CATALOG_PRODUCTS_BOOTSTRAP_SQL = r"""
+CREATE TABLE IF NOT EXISTS catalog_products (
+    id                   SERIAL PRIMARY KEY,
+    lookup_key           TEXT NOT NULL UNIQUE,
+    stripe_product_id    TEXT,
+    product_kind         TEXT NOT NULL,
+    tier_slug            TEXT,
+    sort_order           INT  NOT NULL DEFAULT 100,
+
+    display_name         TEXT NOT NULL,
+    stripe_product_name  TEXT NOT NULL,
+    statement_descriptor TEXT NOT NULL,
+    unit_label           TEXT NOT NULL,
+    tax_code             TEXT NOT NULL DEFAULT 'txcd_10103001',
+
+    price_usd            NUMERIC(10,2) NOT NULL,
+    price_usd_yearly     NUMERIC(10,2),
+    currency             TEXT NOT NULL DEFAULT 'usd',
+
+    wallet               TEXT,
+    token_amount         INT,
+
+    put_monthly          INT,
+    aic_monthly          INT,
+    put_daily            INT,
+    max_accounts         INT,
+    max_accounts_per_platform INT,
+    queue_depth          INT,
+    lookahead_hours      INT,
+    trial_days           INT,
+    team_seats           INT,
+
+    watermark            BOOLEAN DEFAULT FALSE,
+    ads                  BOOLEAN DEFAULT FALSE,
+    webhooks             BOOLEAN DEFAULT FALSE,
+    white_label          BOOLEAN DEFAULT FALSE,
+    hud                  BOOLEAN DEFAULT FALSE,
+    excel                BOOLEAN DEFAULT FALSE,
+    flex                 BOOLEAN DEFAULT FALSE,
+    priority_class       TEXT,
+    ai_depth             TEXT,
+    analytics            TEXT,
+
+    image_filename       TEXT NOT NULL,
+    image_url            TEXT,
+    image_hash           TEXT,
+
+    is_internal          BOOLEAN DEFAULT FALSE,
+    is_archived          BOOLEAN DEFAULT FALSE,
+
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_synced_at       TIMESTAMPTZ,
+    last_synced_by       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalog_products_kind ON catalog_products(product_kind);
+CREATE INDEX IF NOT EXISTS idx_catalog_products_tier ON catalog_products(tier_slug);
+CREATE INDEX IF NOT EXISTS idx_catalog_products_active
+    ON catalog_products(is_archived) WHERE is_archived = FALSE;
+
+
+CREATE TABLE IF NOT EXISTS catalog_sync_log (
+    id                BIGSERIAL PRIMARY KEY,
+    catalog_product_id INT REFERENCES catalog_products(id) ON DELETE CASCADE,
+    lookup_key        TEXT NOT NULL,
+    operation         TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    stripe_response   JSONB,
+    error_message     TEXT,
+    actor             TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalog_sync_log_product ON catalog_sync_log(catalog_product_id, created_at DESC);
+
+
+INSERT INTO catalog_products (
+    lookup_key, stripe_product_id, product_kind, tier_slug, sort_order,
+    display_name, stripe_product_name, statement_descriptor, unit_label,
+    price_usd, price_usd_yearly, put_monthly, aic_monthly, put_daily, max_accounts,
+    max_accounts_per_platform, queue_depth, lookahead_hours, trial_days, team_seats,
+    watermark, ads, webhooks, white_label, hud, excel, flex,
+    priority_class, ai_depth, analytics, image_filename
+) VALUES
+    ('uploadm8_creatorlite_monthly', 'prod_UDD0jSiHkf0s0n', 'subscription', 'creator_lite', 10,
+     'Creator Lite', 'UploadM8 Creator Lite - Monthly Subscription', 'UPLOADM8 CREATOR LITE', 'subscription',
+     12, 120, 600, 200, 20, 10, 3, 100, 12, 7, 1,
+     FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE,
+     'p3', 'enhanced', 'standard', 'sub_creator_lite.png'),
+
+    ('uploadm8_creatorpro_monthly', 'prod_UDD01YK0Fa5SW5', 'subscription', 'creator_pro', 20,
+     'Creator Pro', 'UploadM8 Creator Pro - Monthly Subscription', 'UPLOADM8 CREATOR PRO', 'subscription',
+     29, 290, 2000, 600, 60, 25, 6, 500, 24, 7, 3,
+     FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE,
+     'p2', 'advanced', 'full', 'sub_creator_pro.png'),
+
+    ('uploadm8_studio_monthly', 'prod_UDD0NSQKtdQM7D', 'subscription', 'studio', 30,
+     'Studio', 'UploadM8 Studio - Monthly Subscription', 'UPLOADM8 STUDIO', 'subscription',
+     79, 790, 6000, 2000, 150, 75, 20, 2500, 72, 7, 10,
+     FALSE, FALSE, TRUE, FALSE, FALSE, TRUE, FALSE,
+     'p1', 'max', 'full_export', 'sub_studio.png'),
+
+    ('uploadm8_agency_monthly', 'prod_UDD0JV6l2sbrmM', 'subscription', 'agency', 40,
+     'Agency', 'UploadM8 Agency - Monthly Subscription', 'UPLOADM8 AGENCY', 'subscription',
+     199, 1990, 20000, 7000, 500, 300, 100, 99999, 168, 7, 25,
+     FALSE, FALSE, TRUE, TRUE, FALSE, TRUE, TRUE,
+     'p0', 'max', 'full_export', 'sub_agency.png')
+ON CONFLICT (lookup_key) DO NOTHING;
+
+
+INSERT INTO catalog_products (
+    lookup_key, stripe_product_id, product_kind, sort_order,
+    display_name, stripe_product_name, statement_descriptor, unit_label,
+    price_usd, wallet, token_amount, image_filename
+) VALUES
+    ('uploadm8_put_250',  'prod_UDD0VgzKZur5Qy', 'topup_put', 70,
+     'PUT 250',  'UploadM8 PUT 250 - Upload Token Top-Up',   'UPLOADM8 PUT 250',  'token',
+     4.99,  'put', 250,  'topup_put_250.png'),
+
+    ('uploadm8_put_500',  'prod_UDCtVBGtibAVxy', 'topup_put', 80,
+     'PUT 500',  'UploadM8 PUT 500 - Upload Token Top-Up',   'UPLOADM8 PUT 500',  'token',
+     7.99,  'put', 500,  'topup_put_500.png'),
+
+    ('uploadm8_put_1000', 'prod_UDCtoSuZPbF0yl', 'topup_put', 90,
+     'PUT 1000', 'UploadM8 PUT 1,000 - Upload Token Top-Up', 'UPLOADM8 PUT 1000', 'token',
+     14.99, 'put', 1000, 'topup_put_1000.png'),
+
+    ('uploadm8_put_2500', NULL, 'topup_put', 95,
+     'PUT 2500', 'UploadM8 PUT 2,500 - Upload Token Top-Up', 'UPLOADM8 PUT 2500', 'token',
+     29.99, 'put', 2500, 'topup_put_2500.png'),
+
+    ('uploadm8_put_5000', NULL, 'topup_put', 96,
+     'PUT 5000', 'UploadM8 PUT 5,000 - Upload Token Top-Up', 'UPLOADM8 PUT 5000', 'token',
+     49.99, 'put', 5000, 'topup_put_5000.png')
+ON CONFLICT (lookup_key) DO NOTHING;
+
+
+INSERT INTO catalog_products (
+    lookup_key, stripe_product_id, product_kind, sort_order,
+    display_name, stripe_product_name, statement_descriptor, unit_label,
+    price_usd, wallet, token_amount, image_filename
+) VALUES
+    ('uploadm8_aic_250',  NULL, 'topup_aic', 130,
+     'AIC 250',  'UploadM8 AIC 250 - AI Credit Token Top-Up',   'UPLOADM8 AIC 250',   'token',
+     4.99,  'aic', 250,  'topup_aic_250.png'),
+
+    ('uploadm8_aic_500',  'prod_UDD0CCQzccfHTY', 'topup_aic', 140,
+     'AIC 500',  'UploadM8 AIC 500 - AI Credit Token Top-Up',   'UPLOADM8 AIC 500',   'token',
+     7.99,  'aic', 500,  'topup_aic_500.png'),
+
+    ('uploadm8_aic_1000', 'prod_UDCt8PqZ9z1VnF', 'topup_aic', 150,
+     'AIC 1000', 'UploadM8 AIC 1,000 - AI Credit Token Top-Up', 'UPLOADM8 AIC 1000', 'token',
+     14.99, 'aic', 1000, 'topup_aic_1000.png'),
+
+    ('uploadm8_aic_2500', NULL, 'topup_aic', 155,
+     'AIC 2500', 'UploadM8 AIC 2,500 - AI Credit Token Top-Up', 'UPLOADM8 AIC 2500', 'token',
+     29.99, 'aic', 2500, 'topup_aic_2500.png'),
+
+    ('uploadm8_aic_5000', NULL, 'topup_aic', 156,
+     'AIC 5000', 'UploadM8 AIC 5,000 - AI Credit Token Top-Up', 'UPLOADM8 AIC 5000', 'token',
+     49.99, 'aic', 5000, 'topup_aic_5000.png'),
+
+    ('uploadm8_aic_10000', NULL, 'topup_aic', 157,
+     'AIC 10000', 'UploadM8 AIC 10,000 - AI Credit Token Top-Up', 'UPLOADM8 AIC 10000', 'token',
+     79.99, 'aic', 10000, 'topup_aic_10000.png')
+ON CONFLICT (lookup_key) DO NOTHING;
+"""
 
 async def run_migrations(db_pool):
     async with db_pool.acquire() as conn:
@@ -992,6 +1166,439 @@ async def run_migrations(db_pool):
                     ON upload_recognition_summary USING gin(top_logos);
                 CREATE INDEX IF NOT EXISTS idx_recognition_summary_hydration
                     ON upload_recognition_summary(hydration_score DESC);
+            """),
+            # Default new accounts to auto thumbnails + Trill on (NULL-safe GET still applies).
+            (1053, """
+                ALTER TABLE user_preferences ALTER COLUMN auto_thumbnails SET DEFAULT TRUE;
+                ALTER TABLE user_preferences ALTER COLUMN trill_enabled SET DEFAULT TRUE;
+            """),
+            (1054, """
+                ALTER TABLE marketing_campaigns ADD COLUMN IF NOT EXISTS promo_media JSONB NOT NULL DEFAULT '{}'::jsonb;
+                ALTER TABLE announcements ADD COLUMN IF NOT EXISTS promo_media JSONB NOT NULL DEFAULT '{}'::jsonb;
+                CREATE TABLE IF NOT EXISTS marketing_promo_media_runs (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    entity_kind VARCHAR(32) NOT NULL,
+                    entity_id UUID,
+                    variant_id VARCHAR(64) NOT NULL DEFAULT '',
+                    http_status INT,
+                    ok BOOLEAN NOT NULL DEFAULT FALSE,
+                    detail TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_marketing_promo_media_runs_created
+                    ON marketing_promo_media_runs(created_at DESC);
+            """),
+            (1055, """
+                ALTER TABLE token_ledger ADD COLUMN IF NOT EXISTS ref_type VARCHAR(50);
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_user_created
+                    ON token_ledger(user_id, created_at DESC);
+            """),
+            (1056, """
+                CREATE TABLE IF NOT EXISTS wallet_disputes (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    ledger_id UUID NOT NULL REFERENCES token_ledger(id) ON DELETE CASCADE,
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    status VARCHAR(24) NOT NULL DEFAULT 'open',
+                    note TEXT NOT NULL DEFAULT '',
+                    admin_internal_note TEXT,
+                    resolution_message TEXT,
+                    operational_incident_id UUID REFERENCES operational_incidents(id) ON DELETE SET NULL,
+                    user_email_sent_at TIMESTAMPTZ,
+                    user_discord_sent_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    resolved_at TIMESTAMPTZ,
+                    CONSTRAINT wallet_disputes_status_chk CHECK (
+                        status IN ('open', 'in_review', 'resolved', 'rejected')
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_wallet_disputes_user_created
+                    ON wallet_disputes(user_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_wallet_disputes_status
+                    ON wallet_disputes(status, created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_disputes_one_open_per_ledger
+                    ON wallet_disputes(ledger_id)
+                    WHERE status IN ('open', 'in_review');
+            """),
+            (1057, """
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_leaderboard_opt_in BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_map_sharing_opt_in BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_welcome_modal_seen_at TIMESTAMPTZ NULL;
+            """),
+            (1058, """
+                CREATE TABLE IF NOT EXISTS marketing_campaign_audience (
+                    campaign_id UUID NOT NULL REFERENCES marketing_campaigns(id) ON DELETE CASCADE,
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    rendered_image_url TEXT,
+                    variant_id VARCHAR(128),
+                    rendered_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (campaign_id, user_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_mca_campaign_pending
+                    ON marketing_campaign_audience(campaign_id)
+                    WHERE rendered_image_url IS NULL;
+            """),
+            # PostGIS + PAD-US spatial index (table is optional; created by scripts/load_padus.py).
+            (1059, """
+                CREATE EXTENSION IF NOT EXISTS postgis;
+                DO $padus_idx$
+                BEGIN
+                    IF to_regclass('public.padus_protected_areas') IS NOT NULL THEN
+                        BEGIN
+                            EXECUTE $sql$
+                                CREATE INDEX IF NOT EXISTS idx_padus_protected_areas_geom_gist
+                                ON public.padus_protected_areas USING GIST (geometry)
+                            $sql$;
+                        EXCEPTION
+                            WHEN undefined_column THEN
+                                NULL;
+                        END;
+                    END IF;
+                END
+                $padus_idx$;
+            """),
+            (1060, """
+                CREATE TABLE IF NOT EXISTS billing_service_weights (
+                    service_id TEXT PRIMARY KEY,
+                    aic_weight INT NOT NULL CHECK (aic_weight >= 0 AND aic_weight <= 5000),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_by UUID REFERENCES users(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_billing_service_weights_updated
+                    ON billing_service_weights(updated_at DESC);
+            """),
+            (1061, """
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS billing_breakdown JSONB;
+            """),
+            (1062, """
+                CREATE TABLE IF NOT EXISTS vehicle_makes (
+                    id SERIAL PRIMARY KEY,
+                    nhtsa_make_id INT UNIQUE,
+                    name TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_vehicle_makes_name_lower
+                    ON vehicle_makes (LOWER(name));
+                CREATE TABLE IF NOT EXISTS vehicle_models (
+                    id SERIAL PRIMARY KEY,
+                    make_id INT NOT NULL REFERENCES vehicle_makes(id) ON DELETE CASCADE,
+                    nhtsa_model_id INT,
+                    name TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_vehicle_models_make_nhtsa_uid
+                    ON vehicle_models(make_id, nhtsa_model_id)
+                    WHERE nhtsa_model_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_vehicle_models_make ON vehicle_models(make_id);
+                CREATE INDEX IF NOT EXISTS idx_vehicle_models_name_lower
+                    ON vehicle_models (LOWER(name));
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS default_vehicle_make_id INT REFERENCES vehicle_makes(id) ON DELETE SET NULL;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS default_vehicle_model_id INT REFERENCES vehicle_models(id) ON DELETE SET NULL;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS vehicle_make_id INT REFERENCES vehicle_makes(id) ON DELETE SET NULL;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS vehicle_model_id INT REFERENCES vehicle_models(id) ON DELETE SET NULL;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_public_name VARCHAR(64) NULL;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_public_name_pending VARCHAR(64) NULL;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_public_name_status VARCHAR(20) NOT NULL DEFAULT 'none';
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_public_name_rejection_reason TEXT NULL;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_public_name_reviewed_at TIMESTAMPTZ NULL;
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_public_name_reviewed_by UUID NULL REFERENCES users(id) ON DELETE SET NULL;
+            """),
+            (1063, """
+                ALTER TABLE m8_model_runs ADD COLUMN IF NOT EXISTS related_ops_incident_ids UUID[] NOT NULL DEFAULT '{}'::uuid[];
+                CREATE INDEX IF NOT EXISTS idx_m8_model_runs_related_incidents
+                    ON m8_model_runs USING gin (related_ops_incident_ids);
+            """),
+            (1064, """
+                CREATE TABLE IF NOT EXISTS billing_catalog (
+                    id INT PRIMARY KEY CHECK (id = 1),
+                    tier_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    topup_overrides JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                    last_sync_at TIMESTAMPTZ,
+                    last_sync_ok BOOLEAN,
+                    last_sync_error TEXT,
+                    last_sync_detail JSONB
+                );
+                INSERT INTO billing_catalog (id) VALUES (1)
+                ON CONFLICT (id) DO NOTHING;
+            """),
+            (1065, """
+                CREATE TABLE IF NOT EXISTS marketing_approval_tickets (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    campaign_id UUID NOT NULL REFERENCES marketing_campaigns(id) ON DELETE CASCADE,
+                    status VARCHAR(24) NOT NULL DEFAULT 'open',
+                    submitted_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                    resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+                    resolution_notes TEXT,
+                    copy_snapshot_hash VARCHAR(128),
+                    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    resolved_at TIMESTAMPTZ,
+                    CONSTRAINT marketing_approval_tickets_status_chk CHECK (
+                        status IN ('open', 'in_review', 'approved', 'rejected')
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_mat_campaign_created
+                    ON marketing_approval_tickets(campaign_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_mat_status_created
+                    ON marketing_approval_tickets(status, created_at DESC);
+
+                INSERT INTO marketing_approval_tickets (
+                    campaign_id, status, submitted_by, resolved_by, resolution_notes, created_at, resolved_at, copy_snapshot_hash
+                )
+                SELECT c.id, 'approved', c.approved_by, c.approved_by, 'legacy_backfill',
+                       COALESCE(c.approved_at, c.updated_at), c.approved_at, NULL
+                FROM marketing_campaigns c
+                WHERE c.approved_at IS NOT NULL
+                  AND LOWER(COALESCE(c.channel, '')) IN ('email', 'discord', 'mixed')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM marketing_approval_tickets t
+                      WHERE t.campaign_id = c.id AND t.status = 'approved' AND t.resolved_by IS NOT NULL
+                  );
+            """),
+            (1066, CATALOG_PRODUCTS_BOOTSTRAP_SQL),
+            (1068, """
+                ALTER TABLE vehicle_makes ADD COLUMN IF NOT EXISTS consumer_vehicle BOOLEAN NOT NULL DEFAULT FALSE;
+                CREATE INDEX IF NOT EXISTS idx_vehicle_makes_consumer_name
+                    ON vehicle_makes (consumer_vehicle, LOWER(name))
+                    WHERE consumer_vehicle = TRUE;
+            """),
+            (1070, """
+                CREATE TABLE IF NOT EXISTS trill_badge_definitions (
+                    id SERIAL PRIMARY KEY,
+                    slug VARCHAR(64) NOT NULL UNIQUE,
+                    title VARCHAR(120) NOT NULL,
+                    description TEXT,
+                    icon VARCHAR(64) NOT NULL DEFAULT 'fa-medal',
+                    tier VARCHAR(16) NOT NULL DEFAULT 'bronze',
+                    category VARCHAR(32) NOT NULL DEFAULT 'general',
+                    sort_order INT NOT NULL DEFAULT 0,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE
+                );
+                CREATE TABLE IF NOT EXISTS trill_user_badges (
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    badge_id INT NOT NULL REFERENCES trill_badge_definitions(id) ON DELETE CASCADE,
+                    earned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    PRIMARY KEY (user_id, badge_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_trill_user_badges_user ON trill_user_badges(user_id);
+                CREATE TABLE IF NOT EXISTS trill_seasons (
+                    id SERIAL PRIMARY KEY,
+                    slug VARCHAR(16) NOT NULL UNIQUE,
+                    starts_at TIMESTAMPTZ NOT NULL,
+                    ends_at TIMESTAMPTZ NOT NULL,
+                    status VARCHAR(16) NOT NULL DEFAULT 'active'
+                );
+                CREATE TABLE IF NOT EXISTS trill_hall_of_fame (
+                    id SERIAL PRIMARY KEY,
+                    season_id INT NOT NULL REFERENCES trill_seasons(id) ON DELETE CASCADE,
+                    rank INT NOT NULL,
+                    user_id UUID NOT NULL,
+                    driver_handle VARCHAR(64) NOT NULL,
+                    best_trill_score NUMERIC(5,2),
+                    category VARCHAR(32) NOT NULL DEFAULT 'overall',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS trill_rivals (
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    rival_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (user_id, rival_user_id)
+                );
+                CREATE TABLE IF NOT EXISTS trill_weekly_challenges (
+                    id SERIAL PRIMARY KEY,
+                    week_start DATE NOT NULL UNIQUE,
+                    challenge_type VARCHAR(32) NOT NULL,
+                    target_value NUMERIC(10,2) NOT NULL,
+                    reward_put INT NOT NULL DEFAULT 0,
+                    reward_aic INT NOT NULL DEFAULT 0,
+                    title VARCHAR(120) NOT NULL,
+                    description TEXT,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE
+                );
+                CREATE TABLE IF NOT EXISTS trill_challenge_completions (
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    challenge_id INT NOT NULL REFERENCES trill_weekly_challenges(id) ON DELETE CASCADE,
+                    completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    proof_upload_id UUID,
+                    PRIMARY KEY (user_id, challenge_id)
+                );
+                ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS trill_lb_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb;
+            """),
+            (1069, """
+                DELETE FROM vehicle_models WHERE make_id IN (
+                    SELECT id FROM vehicle_makes WHERE COALESCE(nhtsa_make_id, 0) < 1
+                );
+                DELETE FROM user_preferences
+                WHERE default_vehicle_make_id IN (
+                    SELECT id FROM vehicle_makes WHERE COALESCE(nhtsa_make_id, 0) < 1
+                );
+                UPDATE uploads SET vehicle_make_id = NULL, vehicle_model_id = NULL
+                WHERE vehicle_make_id IN (
+                    SELECT id FROM vehicle_makes WHERE COALESCE(nhtsa_make_id, 0) < 1
+                );
+                DELETE FROM vehicle_makes WHERE COALESCE(nhtsa_make_id, 0) < 1;
+            """),
+            (1072, """
+                CREATE TABLE IF NOT EXISTS trill_notifications (
+                    id SERIAL PRIMARY KEY,
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    kind VARCHAR(48) NOT NULL,
+                    rival_user_id UUID,
+                    sort_key VARCHAR(32),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    meta JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                CREATE INDEX IF NOT EXISTS idx_trill_notifications_user_kind_time
+                    ON trill_notifications(user_id, kind, created_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trill_hof_season_rank
+                    ON trill_hall_of_fame(season_id, rank, category);
+            """),
+            (1071, """
+                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS last_oauth_reconnect_at TIMESTAMPTZ;
+                ALTER TABLE platform_tokens ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+                CREATE INDEX IF NOT EXISTS idx_platform_tokens_user_last_used
+                    ON platform_tokens (user_id, last_used_at DESC)
+                    WHERE revoked_at IS NULL;
+            """),
+            (1073, """
+                CREATE TABLE IF NOT EXISTS user_visual_entity_catalog (
+                    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    bucket          VARCHAR(32) NOT NULL,
+                    entity_name     VARCHAR(200) NOT NULL,
+                    normalized_name VARCHAR(200) NOT NULL,
+                    seen_count      INT NOT NULL DEFAULT 1,
+                    last_category   VARCHAR(64) NOT NULL DEFAULT 'general',
+                    last_upload_id  UUID REFERENCES uploads(id) ON DELETE SET NULL,
+                    first_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (user_id, bucket, normalized_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_visual_entity_user_bucket
+                    ON user_visual_entity_catalog(user_id, bucket, last_seen_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_user_visual_entity_normalized
+                    ON user_visual_entity_catalog(user_id, normalized_name);
+            """),
+            (1067, """
+                CREATE TABLE IF NOT EXISTS catalog_pricing_requests (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    lookup_key TEXT NOT NULL,
+                    status VARCHAR(24) NOT NULL DEFAULT 'open',
+                    proposed_patch JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    actor_email TEXT,
+                    resolution_notes TEXT,
+                    resolved_by_email TEXT,
+                    resolved_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT catalog_pricing_requests_status_chk CHECK (
+                        status IN ('open', 'approved', 'rejected')
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_catalog_pricing_requests_status_created
+                    ON catalog_pricing_requests(status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_catalog_pricing_requests_lookup
+                    ON catalog_pricing_requests(lookup_key, created_at DESC);
+            """),
+            (1074, """
+                ALTER TABLE billing_catalog
+                    ADD COLUMN IF NOT EXISTS put_cost_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
+            """),
+            (1075, """
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS group_ids UUID[] DEFAULT '{}';
+            """),
+            (1076, """
+                CREATE TABLE IF NOT EXISTS workspaces (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    name VARCHAR(255) NOT NULL DEFAULT 'My Workspace',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_user_id);
+
+                CREATE TABLE IF NOT EXISTS workspace_members (
+                    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    role VARCHAR(20) NOT NULL DEFAULT 'editor',
+                    status VARCHAR(20) NOT NULL DEFAULT 'active',
+                    invited_at TIMESTAMPTZ,
+                    joined_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (workspace_id, user_id),
+                    CONSTRAINT workspace_members_role_chk CHECK (role IN ('owner', 'admin', 'editor', 'viewer')),
+                    CONSTRAINT workspace_members_status_chk CHECK (status IN ('active', 'invited', 'removed'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id, status);
+
+                CREATE TABLE IF NOT EXISTS workspace_invites (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                    email VARCHAR(255) NOT NULL,
+                    token_hash VARCHAR(128) NOT NULL,
+                    role VARCHAR(20) NOT NULL DEFAULT 'editor',
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    accepted_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT workspace_invites_role_chk CHECK (role IN ('editor', 'viewer', 'admin'))
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_invites_token ON workspace_invites(token_hash);
+                CREATE INDEX IF NOT EXISTS idx_workspace_invites_email ON workspace_invites(workspace_id, LOWER(email));
+
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS active_workspace_id UUID REFERENCES workspaces(id) ON DELETE SET NULL;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(id) ON DELETE SET NULL;
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS created_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+                CREATE INDEX IF NOT EXISTS idx_uploads_workspace ON uploads(workspace_id, created_at DESC);
+            """),
+            (1077, """
+                INSERT INTO workspaces (id, owner_user_id, name, created_at)
+                SELECT gen_random_uuid(), u.id, COALESCE(NULLIF(TRIM(u.name), ''), u.email, 'My Workspace'), COALESCE(u.created_at, NOW())
+                FROM users u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM workspace_members wm
+                    WHERE wm.user_id = u.id AND wm.role = 'owner' AND wm.status = 'active'
+                );
+
+                INSERT INTO workspace_members (workspace_id, user_id, role, status, joined_at)
+                SELECT w.id, w.owner_user_id, 'owner', 'active', COALESCE(w.created_at, NOW())
+                FROM workspaces w
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM workspace_members wm
+                    WHERE wm.workspace_id = w.id AND wm.user_id = w.owner_user_id
+                );
+
+                UPDATE users u SET active_workspace_id = w.id
+                FROM workspaces w
+                WHERE w.owner_user_id = u.id AND u.active_workspace_id IS NULL;
+
+                UPDATE uploads up SET workspace_id = w.id, created_by_user_id = up.user_id
+                FROM workspaces w
+                WHERE w.owner_user_id = up.user_id AND up.workspace_id IS NULL;
+            """),
+            (1078, """
+                ALTER TABLE billing_catalog
+                    ADD COLUMN IF NOT EXISTS tier_service_overrides JSONB NOT NULL DEFAULT '{}'::jsonb;
+            """),
+            (1079, """
+                INSERT INTO catalog_products (
+                    lookup_key, stripe_product_id, product_kind, sort_order,
+                    display_name, stripe_product_name, statement_descriptor, unit_label,
+                    price_usd, wallet, put_monthly, aic_monthly, image_filename
+                ) VALUES
+                    ('uploadm8_boost_small', NULL, 'topup_bundle', 160,
+                     'Boost Small', 'UploadM8 Boost Small - PUT + AIC Bundle', 'UPLOADM8 BOOST SM', 'token',
+                     7.99, 'bundle', 200, 100, 'topup_bundle_small.png'),
+                    ('uploadm8_boost_medium', NULL, 'topup_bundle', 161,
+                     'Boost Medium', 'UploadM8 Boost Medium - PUT + AIC Bundle', 'UPLOADM8 BOOST MD', 'token',
+                     29.99, 'bundle', 1000, 500, 'topup_bundle_medium.png'),
+                    ('uploadm8_boost_large', NULL, 'topup_bundle', 162,
+                     'Boost Large', 'UploadM8 Boost Large - PUT + AIC Bundle', 'UPLOADM8 BOOST LG', 'token',
+                     99.99, 'bundle', 4000, 2000, 'topup_bundle_large.png')
+                ON CONFLICT (lookup_key) DO NOTHING;
+            """),
+            (1080, """
+                UPDATE catalog_products
+                SET hud = FALSE, updated_at = NOW()
+                WHERE hud IS TRUE;
             """),
         ]
 

@@ -57,6 +57,7 @@ logger = logging.getLogger("uploadm8-api")
 #   - padus_protected_areas  (656,986 rows, geometry+GIST index)
 #   - gazetteer_places       (32,333 rows)
 # Loaded once from local files via scripts/load_padus.py + load_gaz.py.
+# Runtime migration v1059 ensures PostGIS is enabled and (if the table exists) a GiST index on geometry.
 # No runtime download required.
 # ============================================================
 
@@ -86,12 +87,15 @@ from routers.uploads import router as uploads_router
 from routers.scheduled import router as scheduled_router
 from routers.preferences import router as preferences_router
 from routers.groups import router as groups_router
+from routers.workspace import router as workspace_router
 from routers.platforms import router as platforms_router
 from routers.platform_avatar_redirect import router as platform_avatar_redirect_router
+from routers.user_avatar_redirect import router as user_avatar_redirect_router
 from routers.billing import router as billing_router
 from routers.webhooks import router as webhooks_router
 from routers.analytics import router as analytics_router
 from routers.admin import router as admin_router
+from routers.admin_catalog import router as admin_catalog_router
 from routers.admin_contract import (
     admin_compat_router,
     marketing_router as admin_marketing_contract_router,
@@ -104,11 +108,13 @@ from routers.trill import router as trill_router, seed_trill_places
 from routers.entitlements import router as entitlements_router
 from routers.support import router as support_router
 from routers.catalog import router as catalog_router
+from routers.features import router as features_router
 from routers.ops import router as ops_router
 from routers.oauth import router as oauth_router
 from routers.api_keys import router as api_keys_router
 from routers.thumbnail_studio_api import router as thumbnail_studio_router
 from routers.domain import populate_domain_router, router as domain_router
+from routers.vehicles import router as vehicles_router
 
 init_sentry_for_api()
 
@@ -128,6 +134,15 @@ async def lifespan(app: FastAPI):
     logger.info("Database connected")
 
     await run_migrations(core.state.db_pool)
+
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            from services.billing_service_weights import ensure_billing_weights_seeded
+
+            await ensure_billing_weights_seeded(conn)
+            logger.info("billing_service_weights seed check complete")
+    except Exception as e:
+        logger.warning("billing_service_weights seed failed: %s", e)
 
     if REDIS_URL:
         try:
@@ -165,6 +180,22 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            from services.catalog_publish import refresh_pricing_caches_after_catalog_sync
+
+            detail = await refresh_pricing_caches_after_catalog_sync(conn)
+            if detail.get("api_pricing_ready"):
+                logger.info(
+                    "pricing caches hydrated (catalog_products → TIER_CONFIG overlays + billing_catalog): "
+                    "loaded_at=%s",
+                    detail.get("catalog_pricing_loaded_at"),
+                )
+            else:
+                logger.warning("pricing cache hydrate incomplete: %s", detail)
+    except Exception as e:
+        logger.warning("pricing cache hydrate failed: %s", e)
+
     if BOOTSTRAP_ADMIN_EMAIL:
         async with core.state.db_pool.acquire() as conn:
             await conn.execute(
@@ -180,7 +211,35 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Trill places seeding failed: {e}")
 
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            from services.vehicle_catalog import ensure_makes_populated
+
+            await ensure_makes_populated(conn)
+            logger.info("vehicle makes catalog ready (popular seed, no request-path NHTSA)")
+    except Exception as e:
+        logger.warning("vehicle makes seed check failed: %s", e)
+
+    trill_maintenance_task = None
+    if core.state.db_pool:
+        import asyncio
+        from services.trill_background import run_trill_maintenance_loop
+
+        trill_maintenance_task = asyncio.create_task(
+            run_trill_maintenance_loop(core.state.db_pool)
+        )
+        logger.info("Trill maintenance loop started")
+
     yield
+
+    if trill_maintenance_task:
+        import asyncio as _asyncio
+
+        trill_maintenance_task.cancel()
+        try:
+            await trill_maintenance_task
+        except _asyncio.CancelledError:
+            pass
 
     # Shutdown: pool/redis close can race with Ctrl+C / reload — never let teardown
     # exceptions escape lifespan (uvicorn already logs its own CancelledError on the
@@ -304,14 +363,55 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
+# ── Static asset cache + CDN preconnect (HTML responses) ─────────────────────
+_STATIC_CACHE_EXTS = (
+    ".js",
+    ".css",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".ico",
+    ".woff",
+    ".woff2",
+)
+_PRECONNECT_LINK = (
+    "<https://fonts.googleapis.com>; rel=preconnect, "
+    "<https://fonts.gstatic.com>; rel=preconnect; crossorigin, "
+    "<https://cdnjs.cloudflare.com>; rel=preconnect"
+)
+
+
+@app.middleware("http")
+async def static_cache_and_preconnect(request: Request, call_next):
+    resp = await call_next(request)
+    path = request.url.path.lower()
+    if any(path.endswith(ext) for ext in _STATIC_CACHE_EXTS):
+        resp.headers.setdefault(
+            "Cache-Control",
+            "public, max-age=86400, stale-while-revalidate=604800",
+        )
+    content_type = (resp.headers.get("content-type") or "").lower()
+    if "text/html" in content_type or path.endswith(".html") or path in ("", "/"):
+        existing = resp.headers.get("Link", "")
+        resp.headers["Link"] = (
+            f"{existing}, {_PRECONNECT_LINK}" if existing else _PRECONNECT_LINK
+        )
+    return resp
+
+
 # ── Security headers middleware ──────────────────────────────────────────────
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
+    # SAMEORIGIN: allow Settings guide iframe; still blocks third-party embeds.
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Content-Security-Policy"] = (
+        "frame-ancestors 'self'; "
         "default-src 'self'; "
         "media-src 'self' blob: data: https:; "
         "img-src 'self' data: https: blob:; "
@@ -321,6 +421,7 @@ async def security_headers(request: Request, call_next):
         "connect-src 'self' https://api.stripe.com https://js.stripe.com "
         "https://uploadm8.com https://*.uploadm8.com "
         "https://cdn.jsdelivr.net https://cdn.sheetjs.com https://cdnjs.cloudflare.com "
+        "https://unpkg.com "
         "https://*.r2.cloudflarestorage.com https://*.r2.dev;"
     )
     return resp
@@ -335,13 +436,16 @@ app.include_router(uploads_router)
 app.include_router(scheduled_router)
 app.include_router(preferences_router)
 app.include_router(groups_router)
+app.include_router(workspace_router)
 app.include_router(oauth_router)
 app.include_router(platforms_router)
 app.include_router(platform_avatar_redirect_router)
+app.include_router(user_avatar_redirect_router)
 app.include_router(billing_router)
 app.include_router(webhooks_router)
 app.include_router(analytics_router)
 app.include_router(admin_router)
+app.include_router(admin_catalog_router)
 app.include_router(admin_marketing_contract_router)
 app.include_router(admin_ml_contract_router)
 app.include_router(admin_compat_router)
@@ -353,8 +457,10 @@ app.include_router(entitlements_router)
 app.include_router(support_router)
 app.include_router(api_keys_router)
 app.include_router(catalog_router)
+app.include_router(features_router)
 app.include_router(ops_router)
 app.include_router(thumbnail_studio_router)
+app.include_router(vehicles_router)
 
 populate_domain_router()
 app.include_router(domain_router)

@@ -233,7 +233,6 @@ def safe_analyze_video(
     gaz_places_path: Optional[str] = None,
     padus_path: Optional[str] = None,
     padus_layer: Optional[str] = None,
-    hud_enabled: bool = False,
 ) -> Dict[str, Any]:
     """Analyze a .map route and return the historical UploadM8 result shape."""
     try:
@@ -274,7 +273,6 @@ def safe_analyze_video(
             "hashtags": hashtags,
             "place_lat": telemetry.mid_lat,
             "place_lon": telemetry.mid_lon,
-            "hud_enabled": bool(hud_enabled),
         }
         data.update(extra)
         if extra.get("gazetteer_place_name"):
@@ -287,7 +285,3 @@ def safe_analyze_video(
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-
-def ensure_hud_mp4(video_path: str, map_path: str) -> str:
-    """Compatibility shim for preview router; full worker uses hud_stage."""
-    return video_path

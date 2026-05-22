@@ -168,6 +168,63 @@ def _before_send(event: dict[str, Any], hint: dict[str, Any] | None) -> dict[str
     return event
 
 
+def _is_asyncpg_pool_reset_description(description: str) -> bool:
+    """asyncpg pool release runs RESET ALL — not actionable app SQL (Sentry UPLOADM8-*)."""
+    d = (description or "").lower()
+    return (
+        "pg_advisory_unlock_all" in d
+        or "reset all" in d
+        or "close all" in d
+        or "unlisten *" in d
+    )
+
+
+def _filter_pool_reset_spans(spans: list) -> list:
+    """Drop asyncpg pool-reset spans; recurse into nested children when present."""
+    out: list = []
+    for s in spans or []:
+        if not isinstance(s, dict):
+            continue
+        desc = str(s.get("description") or "")
+        if _is_asyncpg_pool_reset_description(desc):
+            continue
+        child = s.get("spans")
+        if isinstance(child, list):
+            filtered_child = _filter_pool_reset_spans(child)
+            if filtered_child != child:
+                s = dict(s)
+                s["spans"] = filtered_child
+        out.append(s)
+    return out
+
+
+def _strip_asyncpg_pool_reset_spans(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Remove asyncpg connection-pool reset spans from performance transactions.
+
+    Sentry's consecutive-DB detector treats ``pg_advisory_unlock_all`` as a parallelizable
+    SELECT (no WHERE clause) and opens issues like UPLOADM8-28 even when the handler uses
+    a single ``pool.acquire()``. Stripping these spans keeps real query regressions visible.
+    """
+    spans = event.get("spans")
+    if not isinstance(spans, list) or not spans:
+        return event
+    filtered = _filter_pool_reset_spans(spans)
+    if filtered != spans:
+        event = dict(event)
+        event["spans"] = filtered
+    return event
+
+
+def _before_send_transaction(event: dict[str, Any], hint: dict[str, Any] | None) -> dict[str, Any] | None:
+    try:
+        if _should_drop_fastapi_testclient_request(event):
+            return None
+        return _strip_asyncpg_pool_reset_spans(event)
+    except Exception:
+        return event
+
+
 def _trace_sample_rate() -> float:
     raw = (os.environ.get("SENTRY_TRACES_SAMPLE_RATE") or os.environ.get("SENTRY_TRACES_RATE") or "0").strip()
     if not raw:
@@ -211,6 +268,7 @@ def init_sentry_for_api() -> None:
         environment=_env_name(),
         release=_release(),
         before_send=_before_send,
+        before_send_transaction=_before_send_transaction,
     )
 
 

@@ -27,6 +27,25 @@ admin_settings_cache: Dict[str, Any] = {
     "watermark_burn_text": "Upload M8",
 }
 
+# Master-admin catalog overrides (merged with stages/entitlements TIER_CONFIG + TOPUP_PRODUCTS).
+billing_catalog_cache: Dict[str, Any] = {
+    "tier_overrides": {},
+    "topup_overrides": {},
+    "put_cost_overrides": {},
+    "tier_service_overrides": {},
+    "last_sync_at": None,
+    "last_sync_ok": None,
+    "last_sync_error": None,
+    "last_sync_detail": None,
+}
+
+# Rows from ``catalog_products`` (subscriptions + top-ups), merged before billing_catalog_cache.
+catalog_pricing_cache: Dict[str, Any] = {
+    "tier_overlay": {},
+    "topup_overlay": {},
+    "loaded_at": None,
+}
+
 # ── Schema introspection cache ────────────────────────────────
 _UPLOADS_COLS: Optional[Set[str]] = None
 

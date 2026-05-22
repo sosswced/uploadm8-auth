@@ -9,6 +9,7 @@ ACCOUNT_DELETION_COUNT_TABLES: frozenset[str] = frozenset(
         "uploads",
         "platform_tokens",
         "token_ledger",
+        "wallet_disputes",
         "wallets",
         "user_settings",
         "user_preferences",
@@ -32,9 +33,21 @@ ALLOWED_WALLET_BALANCE_COLUMNS: frozenset[str] = frozenset({"put_balance", "aic_
 
 # uploads: PATCH metadata + complete-upload body
 UPLOADS_METADATA_PATCH_COLUMNS: frozenset[str] = frozenset(
-    {"title", "caption", "hashtags", "scheduled_time", "schedule_metadata", "schedule_mode", "updated_at"}
+    {
+        "title",
+        "caption",
+        "hashtags",
+        "scheduled_time",
+        "schedule_metadata",
+        "schedule_mode",
+        "updated_at",
+        "vehicle_make_id",
+        "vehicle_model_id",
+    }
 )
-UPLOADS_COMPLETE_BODY_COLUMNS: frozenset[str] = frozenset({"title", "caption", "hashtags", "target_accounts"})
+UPLOADS_COMPLETE_BODY_COLUMNS: frozenset[str] = frozenset(
+    {"title", "caption", "hashtags", "target_accounts", "vehicle_make_id", "vehicle_model_id"}
+)
 
 ACCOUNT_GROUPS_UPDATE_COLUMNS: frozenset[str] = frozenset(
     {"name", "description", "color", "account_ids", "updated_at"}

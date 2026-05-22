@@ -26,7 +26,6 @@ class BillingSubscriptionActionRequest(BaseModel):
 class UploadCostEstimateRequest(BaseModel):
     num_publish_targets: int = Field(default=1, ge=1, le=100)
     use_ai: bool = True
-    use_hud: bool = False
     num_thumbnails: int = Field(default=1, ge=1, le=20)
     duration_seconds: Optional[float] = None
     file_size: Optional[int] = None

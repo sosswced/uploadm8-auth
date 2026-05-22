@@ -14,7 +14,7 @@ import json
 import re
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import urlparse
 import httpx
 
@@ -25,6 +25,609 @@ from . import db as db_stage
 from .publish_stage import resolve_privacy_level
 
 logger = logging.getLogger("uploadm8-worker")
+
+
+def append_notification_delivery_record(ctx: JobContext, record: Dict[str, Any]) -> None:
+    """Append one delivery row into ``ctx.output_artifacts['notification_delivery']``.
+
+    Last 120 rows kept. Safe no-op when artifacts dict is missing.
+    """
+    arts = getattr(ctx, "output_artifacts", None)
+    if not isinstance(arts, dict):
+        return
+    key = "notification_delivery"
+    rows: List[Dict[str, Any]] = []
+    raw = arts.get(key)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                rows = parsed
+        except Exception:
+            rows = []
+    row = dict(record)
+    row.setdefault("ts", datetime.now(timezone.utc).isoformat())
+    rows.append(row)
+    rows = rows[-120:]
+    try:
+        arts[key] = json.dumps(rows, default=str)[:48000]
+    except Exception:
+        pass
+
+
+async def append_notification_delivery_to_upload_db(
+    db_pool_: Any,
+    upload_id: str,
+    record: Dict[str, Any],
+) -> None:
+    """Append a delivery diagnostic row onto ``uploads.output_artifacts['notification_delivery']``.
+
+    Mirrors :func:`append_notification_delivery_record` but persists without ``JobContext``
+    (e.g. background verify webhook / email paths).
+    """
+    if not db_pool_ or not upload_id:
+        return
+
+    row = dict(record)
+    row.setdefault("ts", datetime.now(timezone.utc).isoformat())
+
+    try:
+        async with db_pool_.acquire() as conn:
+            async with conn.transaction():
+                rec = await conn.fetchrow(
+                    "SELECT output_artifacts FROM uploads WHERE id = $1 FOR UPDATE",
+                    str(upload_id),
+                )
+                if not rec:
+                    return
+                arts_raw = rec.get("output_artifacts")
+                arts: Dict[str, Any] = (
+                    dict(arts_raw)
+                    if isinstance(arts_raw, dict)
+                    else {}
+                )
+
+                rows: List[Any] = []
+                key_nd = "notification_delivery"
+                raw_nd = arts.get(key_nd)
+
+                def _consume_parsed(parsed: Any) -> None:
+                    nonlocal rows
+                    if isinstance(parsed, list):
+                        rows = parsed
+
+                if isinstance(raw_nd, str) and raw_nd.strip():
+                    try:
+                        j = json.loads(raw_nd)
+                        _consume_parsed(j)
+                    except Exception:
+                        rows = []
+                elif isinstance(raw_nd, list):
+                    rows = raw_nd
+
+                rows.append(row)
+                rows = rows[-120:]
+                arts[key_nd] = json.dumps(rows, default=str)[:48000]
+
+                await conn.execute(
+                    """
+                    UPDATE uploads
+                       SET output_artifacts = $2::jsonb,
+                           updated_at = NOW()
+                     WHERE id = $1
+                    """,
+                    str(upload_id),
+                    arts,
+                )
+    except ImportError:
+        logger.debug(
+            "append_notification_delivery_to_upload_db: asyncpg missing — skipping"
+        )
+    except Exception as ex:
+        logger.debug(
+            "append_notification_delivery_to_upload_db failed upload=%s: %s",
+            upload_id,
+            ex,
+        )
+
+
+async def user_wants_upload_email_notifications(db_pool_: Any, user_id_: Any) -> bool:
+    """Per-user toggle for pipeline upload emails — default TRUE when prefs row missing."""
+
+    if not db_pool_ or not user_id_:
+        return True
+    try:
+        async with db_pool_.acquire() as _pconn:
+            _prefs = await _pconn.fetchrow(
+                "SELECT email_notifications FROM user_preferences WHERE user_id = $1",
+                user_id_,
+            )
+    except Exception as _pe:
+        logger.debug("user email-pref lookup failed (default TRUE): %s", _pe)
+        return True
+    if not _prefs:
+        return True
+    val = _prefs.get("email_notifications")
+    return True if val is None else bool(val)
+
+
+def _parse_notification_delivery_from_artifacts(arts: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = arts.get("notification_delivery")
+    rows: List[Dict[str, Any]] = []
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                rows = [x for x in parsed if isinstance(x, dict)]
+        except Exception:
+            return []
+    elif isinstance(raw, list):
+        rows = [x for x in raw if isinstance(x, dict)]
+    return rows
+
+
+async def _record_terminal_comms_provider_trace(
+    db_pool_: Any,
+    ctx: JobContext,
+    raw_status: str,
+) -> None:
+    """Append a synthetic ``provider_error_trace`` row summarizing user email/Discord outcomes.
+
+    Correlates terminal pipeline status with the last delivery attempts persisted under
+    ``output_artifacts['notification_delivery']`` (read from DB when available).
+    """
+    try:
+        from services.provider_error_trace import append_provider_error
+    except Exception:
+        return
+
+    arts: Dict[str, Any] = {}
+    uid = str(getattr(ctx, "upload_id", "") or "")
+    if db_pool_ and uid:
+        try:
+            async with db_pool_.acquire() as conn:
+                rec = await conn.fetchrow(
+                    "SELECT output_artifacts FROM uploads WHERE id = $1",
+                    uid,
+                )
+            if rec and isinstance(rec.get("output_artifacts"), dict):
+                arts = dict(rec["output_artifacts"])
+        except Exception:
+            arts = {}
+    if not arts and isinstance(getattr(ctx, "output_artifacts", None), dict):
+        arts = dict(ctx.output_artifacts or {})
+
+    rows = _parse_notification_delivery_from_artifacts(arts)
+    tail = rows[-48:] if rows else []
+    email_rows = [r for r in tail if r.get("channel") == "user_upload_email"]
+    discord_rows = [r for r in tail if r.get("channel") == "user_upload_discord"]
+    last_email = email_rows[-1] if email_rows else None
+    last_discord = discord_rows[-1] if discord_rows else None
+
+    def _pick(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not d:
+            return None
+        return {
+            "ok": d.get("ok"),
+            "kind": d.get("kind"),
+            "reason": d.get("reason"),
+        }
+
+    summary: Dict[str, Any] = {
+        "terminal_status": raw_status,
+        "last_user_upload_email": _pick(last_email),
+        "last_user_upload_discord": _pick(last_discord),
+        "email_delivery_rows": len(email_rows),
+        "discord_delivery_rows": len(discord_rows),
+    }
+
+    tier = "ok"
+    for d in (last_email, last_discord):
+        if not d or d.get("ok") is not False:
+            continue
+        reason = str(d.get("reason") or "")
+        if reason == "no_webhook_configured":
+            continue
+        tier = "degraded"
+
+    append_provider_error(
+        ctx,
+        provider="uploadm8_terminal_comms",
+        stage="notify_upload_terminal",
+        operation="delivery_summary",
+        message=json.dumps(summary, default=str)[:1300],
+        result_tier=tier,
+    )
+
+
+async def _fetch_upload_costs_for_notify(db_pool_: Any, upload_id: Any) -> Tuple[int, int]:
+    if not db_pool_:
+        return 0, 0
+    try:
+        async with db_pool_.acquire() as conn:
+            prow = await conn.fetchrow(
+                "SELECT put_cost, aic_cost, put_reserved, aic_reserved FROM uploads WHERE id = $1",
+                upload_id,
+            )
+        if not prow:
+            return 0, 0
+        put_c = prow["put_cost"] or prow["put_reserved"] or 0
+        aic_c = prow["aic_cost"] or prow["aic_reserved"] or 0
+        return int(put_c), int(aic_c)
+    except Exception:
+        return 0, 0
+
+
+async def notify_upload_terminal(
+    db_pool_: Any,
+    ctx: JobContext,
+    upload_id: str,
+    *,
+    status: str,
+    scene_story: str = "",
+) -> None:
+    """Unified terminal upload comms: user email / Discord where applicable + admin paging.
+
+    Accepted ``status``: succeeded / success / partial / failed / cancelled / degraded
+    (``degraded`` is treated like ``partial`` for user-facing semantics).
+    """
+    raw_status = (status or "").strip().lower()
+    st = raw_status
+    if st not in (
+        "succeeded",
+        "success",
+        "partial",
+        "failed",
+        "cancelled",
+        "degraded",
+        "staged",
+    ):
+        return
+    if st == "success":
+        st = "succeeded"
+    elif st == "degraded":
+        st = "partial"
+    # ``staged`` = processing finished, publish deferred to scheduled_time (keep raw for branching).
+
+    user_email = None
+    user_name = "there"
+    try:
+        u = getattr(ctx, "user_record", None) or {}
+        user_email = u.get("email") if u else None
+        user_name = (u.get("name") if u else None) or "there"
+    except Exception:
+        pass
+
+    wants_email = await user_wants_upload_email_notifications(
+        db_pool_, str(ctx.user_id) if ctx.user_id else None
+    )
+
+    if user_email and wants_email:
+        try:
+            from stages.emails.uploads import (
+                send_upload_completed_email,
+                send_upload_failed_email,
+                send_upload_staged_processing_email,
+            )
+            from stages.emails import build_upload_completed_email_extensions
+
+            platforms = list(ctx.platforms or [])
+            put_cost, aic_cost = await _fetch_upload_costs_for_notify(db_pool_, ctx.upload_id)
+
+            if raw_status == "staged":
+                from stages.emails.base import mailgun_ready
+
+                if not mailgun_ready():
+                    await append_notification_delivery_to_upload_db(
+                        db_pool_,
+                        str(upload_id),
+                        {
+                            "channel": "user_upload_email",
+                            "ok": False,
+                            "kind": "upload_staged_processing",
+                            "reason": "mailgun_not_ready",
+                        },
+                    )
+                else:
+                    st_label = ""
+                    try:
+                        st_raw = getattr(ctx, "scheduled_time", None)
+                        if st_raw is not None:
+                            if hasattr(st_raw, "strftime"):
+                                st_label = st_raw.strftime("%Y-%m-%d %H:%M UTC")
+                            else:
+                                st_label = str(st_raw)
+                    except Exception:
+                        st_label = ""
+                    await send_upload_staged_processing_email(
+                        user_email,
+                        user_name,
+                        ctx.filename or upload_id,
+                        platforms,
+                        str(upload_id),
+                        scheduled_at_label=st_label or "your scheduled time",
+                    )
+                    await append_notification_delivery_to_upload_db(
+                        db_pool_,
+                        str(upload_id),
+                        {"channel": "user_upload_email", "ok": True, "kind": "upload_staged_processing"},
+                    )
+            elif st in ("succeeded", "partial"):
+                put_bal = aic_bal = None
+                try:
+                    async with db_pool_.acquire() as _wconn:
+                        _wrow = await _wconn.fetchrow(
+                            "SELECT put_balance, aic_balance FROM wallets WHERE user_id = $1::uuid",
+                            ctx.user_id,
+                        )
+                    if _wrow:
+                        put_bal = int(_wrow["put_balance"] or 0)
+                        aic_bal = int(_wrow["aic_balance"] or 0)
+                except Exception:
+                    pass
+                brand_ctx = None
+                try:
+                    from services.white_label import load_effective_brand_context
+
+                    async with db_pool_.acquire() as _bconn:
+                        brand_ctx = await load_effective_brand_context(_bconn, str(ctx.user_id))
+                except Exception:
+                    pass
+                extras = build_upload_completed_email_extensions(
+                    ctx, put_balance=put_bal, aic_balance=aic_bal
+                )
+                if scene_story:
+                    extras["scene_story"] = scene_story[:1600]
+                try:
+                    from services.upload_notification_preview import (
+                        resolve_upload_notification_preview_https_url,
+                    )
+
+                    preview_u = await resolve_upload_notification_preview_https_url(
+                        db_pool_, ctx
+                    )
+                    if preview_u:
+                        extras["preview_image_url"] = preview_u
+                except Exception:
+                    pass
+
+                dedupe_kind = (
+                    "upload_completed_ok"
+                    if st == "succeeded"
+                    else (
+                        "upload_completed_partial_strict"
+                        if raw_status == "degraded"
+                        else "upload_completed_partial"
+                    )
+                )
+
+                from stages.emails.base import mailgun_ready
+
+                if not mailgun_ready():
+                    await append_notification_delivery_to_upload_db(
+                        db_pool_,
+                        str(upload_id),
+                        {
+                            "channel": "user_upload_email",
+                            "ok": False,
+                            "kind": dedupe_kind,
+                            "reason": "mailgun_not_ready",
+                        },
+                    )
+                else:
+                    dur = int(extras.pop("duration_seconds", 0) or 0)
+                    if brand_ctx:
+                        extras["brand"] = brand_ctx
+                    await send_upload_completed_email(
+                        user_email,
+                        user_name,
+                        ctx.filename or upload_id,
+                        ctx.get_success_platforms() or platforms,
+                        int(put_cost or 0),
+                        int(aic_cost or 0),
+                        str(upload_id),
+                        dur,
+                        **extras,
+                    )
+                    await append_notification_delivery_to_upload_db(
+                        db_pool_,
+                        str(upload_id),
+                        {"channel": "user_upload_email", "ok": True, "kind": dedupe_kind},
+                    )
+            else:
+                err_reason = getattr(ctx, "error_message", "") or ""
+                err_stage = getattr(ctx, "current_stage", "") or ""
+                if raw_status == "cancelled":
+                    err_reason = err_reason or "Upload cancelled before publish."
+
+                from stages.emails.base import mailgun_ready
+
+                if not mailgun_ready():
+                    await append_notification_delivery_to_upload_db(
+                        db_pool_,
+                        str(upload_id),
+                        {
+                            "channel": "user_upload_email",
+                            "ok": False,
+                            "kind": "upload_failed_email",
+                            "reason": "mailgun_not_ready",
+                        },
+                    )
+                else:
+                    fail_brand = None
+                    try:
+                        from services.white_label import load_effective_brand_context
+
+                        async with db_pool_.acquire() as _bconn:
+                            fail_brand = await load_effective_brand_context(_bconn, str(ctx.user_id))
+                    except Exception:
+                        pass
+                    await send_upload_failed_email(
+                        user_email,
+                        user_name,
+                        ctx.filename or upload_id,
+                        platforms,
+                        err_reason,
+                        str(upload_id),
+                        err_stage,
+                        scene_story=scene_story[:1600] if scene_story else "",
+                        brand=fail_brand,
+                    )
+                    await append_notification_delivery_to_upload_db(
+                        db_pool_,
+                        str(upload_id),
+                        {"channel": "user_upload_email", "ok": True, "kind": "upload_failed_email"},
+                    )
+        except Exception as _email_err:
+            logger.warning(f"[{upload_id}] Upload email failed (non-fatal): {_email_err}")
+            try:
+                await append_notification_delivery_to_upload_db(
+                    db_pool_,
+                    str(upload_id),
+                    {
+                        "channel": "user_upload_email",
+                        "ok": False,
+                        "kind": "upload_email_exception",
+                        "error": str(_email_err)[:500],
+                    },
+                )
+            except Exception:
+                pass
+
+    # User Discord: early failures/cancel, deferred "staged" processing complete, or
+    # publish path (run_notify_stage) for success/partial/fail.
+    if raw_status == "staged":
+        try:
+            wh_sq = await _resolve_user_discord_webhook(ctx, db_pool=db_pool_)
+            if not wh_sq:
+                await append_notification_delivery_to_upload_db(
+                    db_pool_,
+                    str(upload_id),
+                    {
+                        "channel": "user_upload_discord",
+                        "ok": False,
+                        "kind": "upload_staged_discord",
+                        "reason": "no_webhook_configured",
+                    },
+                )
+            elif not _is_allowed_discord_webhook_url(wh_sq):
+                await append_notification_delivery_to_upload_db(
+                    db_pool_,
+                    str(upload_id),
+                    {
+                        "channel": "user_upload_discord",
+                        "ok": False,
+                        "kind": "upload_staged_discord",
+                        "reason": "invalid_webhook_url",
+                    },
+                )
+            else:
+                staged_discord_ok = False
+                setattr(ctx, "_notify_terminal_staged", True)
+                try:
+                    staged_discord_ok = await send_user_upload_notification(wh_sq, ctx, db_pool=db_pool_)
+                finally:
+                    try:
+                        delattr(ctx, "_notify_terminal_staged")
+                    except Exception:
+                        setattr(ctx, "_notify_terminal_staged", False)
+                await append_notification_delivery_to_upload_db(
+                    db_pool_,
+                    str(upload_id),
+                    {
+                        "channel": "user_upload_discord",
+                        "ok": bool(staged_discord_ok),
+                        "kind": "upload_staged_discord",
+                    },
+                )
+        except Exception as e:
+            logger.debug(f"[{upload_id}] staged discord notify: {e}")
+            try:
+                await append_notification_delivery_to_upload_db(
+                    db_pool_,
+                    str(upload_id),
+                    {
+                        "channel": "user_upload_discord",
+                        "ok": False,
+                        "kind": "upload_staged_discord",
+                        "error": str(e)[:400],
+                    },
+                )
+            except Exception:
+                pass
+    # User Discord on early failures (publish path already runs notify_stage).
+    elif st in ("failed", "cancelled") and not (ctx.platform_results or []):
+        try:
+            wh_quick = await _resolve_user_discord_webhook(ctx, db_pool=db_pool_)
+            discord_early_ok = False
+            prev_state = getattr(ctx, "state", None)
+            try:
+                if st == "cancelled":
+                    setattr(ctx, "state", "cancelled")
+                discord_early_ok = await run_notify_stage(ctx, db_pool_)
+            finally:
+                if prev_state is not None:
+                    setattr(ctx, "state", prev_state)
+            if not wh_quick:
+                await append_notification_delivery_to_upload_db(
+                    db_pool_,
+                    str(upload_id),
+                    {
+                        "channel": "user_upload_discord",
+                        "ok": False,
+                        "kind": "early_terminal_run_notify_stage",
+                        "reason": "no_webhook_configured",
+                        "detail": st,
+                    },
+                )
+            else:
+                await append_notification_delivery_to_upload_db(
+                    db_pool_,
+                    str(upload_id),
+                    {
+                        "channel": "user_upload_discord",
+                        "ok": bool(discord_early_ok),
+                        "kind": "early_terminal_run_notify_stage",
+                        "detail": st,
+                    },
+                )
+        except Exception as e:
+            logger.debug(f"[{upload_id}] notify_stage on failure path: {e}")
+            try:
+                await append_notification_delivery_to_upload_db(
+                    db_pool_,
+                    str(upload_id),
+                    {
+                        "channel": "user_upload_discord",
+                        "ok": False,
+                        "kind": "early_terminal_run_notify_stage",
+                        "error": str(e)[:400],
+                    },
+                )
+            except Exception:
+                pass
+
+    try:
+        await _record_terminal_comms_provider_trace(db_pool_, ctx, raw_status)
+    except Exception:
+        logger.debug("[%s] terminal comms provider trace skipped", upload_id, exc_info=True)
+
+    # Admin paging — partial / failed (canonical), plus explicit degraded semantics.
+    if st in ("partial", "failed") or raw_status == "degraded":
+        admin_st = raw_status if raw_status == "degraded" else st
+        if admin_st not in ("partial", "failed"):
+            admin_st = "partial"
+        try:
+            await notify_admin_upload_status(
+                ctx,
+                status=admin_st,
+                upload_id=str(upload_id),
+                db_pool=db_pool_,
+                scene_story=scene_story or "",
+            )
+        except Exception as e:
+            logger.warning(f"[{upload_id}] admin upload-status notify failed: {e}")
+
 
 # Configuration
 ADMIN_DISCORD_WEBHOOK_URL = os.environ.get("ADMIN_DISCORD_WEBHOOK_URL", "")
@@ -377,10 +980,24 @@ async def notify_user_pikzels_generation(
     if img:
         embed["image"] = {"url": img}
 
-    await _send_discord_webhook(wh, embeds=[embed])
+    ok_pz = bool(await _send_discord_webhook(wh, embeds=[embed]))
+    if upload_id:
+        try:
+            await append_notification_delivery_to_upload_db(
+                db_pool,
+                str(upload_id),
+                {
+                    "channel": "user_upload_discord",
+                    "ok": ok_pz,
+                    "kind": "pikzels_preview",
+                    "operation": (operation or "")[:120],
+                },
+            )
+        except Exception:
+            pass
 
 
-async def run_notify_stage(ctx: JobContext, db_pool=None) -> JobContext:
+async def run_notify_stage(ctx: JobContext, db_pool=None) -> bool:
     """
     Send notifications for completed upload.
 
@@ -388,6 +1005,9 @@ async def run_notify_stage(ctx: JobContext, db_pool=None) -> JobContext:
     1. Resolve user's Discord webhook (ctx.user_settings → DB fallback)
     2. Send embed with title / caption / hashtags / per-platform results
     3. Log explicit reason when no notification is sent
+
+    Returns:
+        True if a user Discord webhook was sent and returned 200/204; False if skipped or failed.
     """
     ctx.mark_stage("notify")
 
@@ -397,35 +1017,78 @@ async def run_notify_stage(ctx: JobContext, db_pool=None) -> JobContext:
         logger.info(
             f"[{ctx.upload_id}] notify: no user discord webhook configured — skipping user notification"
         )
-        return ctx
+        return False
 
     if not _is_allowed_discord_webhook_url(user_webhook):
         logger.warning(
             f"[{ctx.upload_id}] notify: user discord webhook is not a recognized Discord webhook URL — skipping"
         )
-        return ctx
+        return False
 
     logger.info(
         f"[{ctx.upload_id}] notify: sending user discord webhook "
         f"(success={ctx.is_success()} partial={ctx.is_partial_success()})"
     )
-    await send_user_upload_notification(user_webhook, ctx, db_pool=db_pool)
-
-    return ctx
+    return bool(await send_user_upload_notification(user_webhook, ctx, db_pool=db_pool))
 
 
-async def send_user_upload_notification(webhook_url: str, ctx: JobContext, db_pool=None):
+async def send_user_upload_notification(webhook_url: str, ctx: JobContext, db_pool=None) -> bool:
     """Send upload status to user's Discord webhook.
 
     Embed includes:
-      - Status (success / partial / failed)
+      - Status (success / partial / failed / staged)
       - AI-generated title, caption, and hashtags
       - Per-platform result with clickable post links
+
+    Returns True when the Discord POST succeeded (200/204); False on skip, HTTP error, or exception.
     """
     try:
-        is_success = ctx.is_success()
+        if getattr(ctx, "_notify_terminal_staged", False):
+            color = 0x3b82f6
+            status_title = "📅 Upload processed — scheduled publish"
+            st_raw = getattr(ctx, "scheduled_time", None)
+            st_lbl = ""
+            try:
+                if st_raw is not None and hasattr(st_raw, "strftime"):
+                    st_lbl = st_raw.strftime("%Y-%m-%d %H:%M UTC")
+                elif st_raw is not None:
+                    st_lbl = str(st_raw)
+            except Exception:
+                st_lbl = ""
+            status_desc = (
+                "Your video finished processing and is queued for automatic publish "
+                + (f"at **{st_lbl}** (UTC). " if st_lbl else "at your scheduled time. ")
+                + "You can still edit or cancel from the queue before then."
+            )
+            video_title = (
+                ctx.get_effective_title()
+                if hasattr(ctx, "get_effective_title")
+                else (getattr(ctx, "title", None) or ctx.filename or "Untitled")
+            )
+            embed: Dict[str, Any] = {
+                "title": status_title,
+                "description": status_desc,
+                "color": color,
+                "fields": [
+                    {"name": "📹 Title", "value": str(video_title)[:256], "inline": False},
+                    {"name": "📤 Platforms", "value": ", ".join(sorted(set(ctx.platforms or []))) or "—", "inline": True},
+                    {"name": "📁 File", "value": (ctx.filename or "—")[:80], "inline": True},
+                ],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "footer": {"text": "UploadM8"},
+            }
+            ok = await _send_discord_webhook(webhook_url, embeds=[embed])
+            return bool(ok)
 
-        if is_success:
+        cancelled = str(getattr(ctx, "state", "") or "").lower() == "cancelled"
+
+        is_success = ctx.is_success() and not cancelled
+
+        if cancelled:
+            color = 0x6b7280
+            status_title = "🛑 Upload Cancelled"
+            status_desc = "This upload was cancelled before it finished publishing."
+        elif is_success:
             color = 0x22c55e        # green
             status_title = "✅ Upload Completed"
             status_desc  = "Your video has been published successfully!"
@@ -513,6 +1176,24 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext, db_po
             tq = thumbnail_quality_summary_text(ctx)
             if tq:
                 fields.append({"name": "🖼️ Thumbnail", "value": tq[:1020], "inline": False})
+            try:
+                from services.uploads_handlers import pikzels_template_thumbnail_warning
+
+                pw = pikzels_template_thumbnail_warning(getattr(ctx, "output_artifacts", None) or {})
+                if pw:
+                    hint = pw.get("message") or ""
+                    if pw.get("skip_reason"):
+                        hint += f"\nReason: {pw['skip_reason']}"
+                    hint += "\nFix: Settings → Thumbnail Studio (enable auto-thumbnails + studio engine, pipeline Auto)."
+                    fields.append(
+                        {
+                            "name": "⚠️ Thumbnail Studio",
+                            "value": hint[:1020],
+                            "inline": False,
+                        }
+                    )
+            except Exception:
+                pass
             preview_url = await resolve_upload_notification_preview_https_url(db_pool, ctx)
         except Exception as e:
             logger.debug("[%s] upload notify preview prep skipped: %s", getattr(ctx, "upload_id", ""), e)
@@ -529,6 +1210,20 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext, db_po
                         "inline": False,
                     }
                 )
+        except Exception:
+            pass
+
+        # ── Scene Story (fused VI + Vision + OSD + telemetry + audio paragraph) ─
+        try:
+            scene_story_value = ""
+            if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                scene_story_value = str(ctx.output_artifacts.get("scene_story") or "").strip()
+            if scene_story_value:
+                fields.append({
+                    "name": "📖 Scene Story",
+                    "value": (scene_story_value[:1017] + "…") if len(scene_story_value) > 1020 else scene_story_value,
+                    "inline": False,
+                })
         except Exception:
             pass
 
@@ -585,10 +1280,163 @@ async def send_user_upload_notification(webhook_url: str, ctx: JobContext, db_po
         if preview_url:
             embed["image"] = {"url": preview_url[:2048]}
 
-        await _send_discord_webhook(webhook_url, embeds=[embed])
+        ok_discord = await _send_discord_webhook(webhook_url, embeds=[embed])
+        append_notification_delivery_record(
+            ctx,
+            {
+                "channel": "user_upload_discord",
+                "ok": bool(ok_discord),
+                "kind": "upload_status",
+                "upload_id": str(getattr(ctx, "upload_id", "") or ""),
+            },
+        )
+        return bool(ok_discord)
 
     except Exception as e:
         logger.exception(f"[{ctx.upload_id}] User webhook notification failed: {e}")
+        return False
+
+
+async def notify_user_publish_rejected(
+    db_pool,
+    *,
+    user_id: str,
+    upload_id: str,
+    platform: str,
+    detail: str = "",
+    verify_outcome: str = "rejected",
+) -> None:
+    """Notify user when verification finds the platform rejected/removed the post or failed to confirm."""
+    if not db_pool or not user_id or not upload_id:
+        return
+    plat_key = (platform or "").strip().lower()
+    if plat_key not in ("tiktok", "youtube"):
+        return
+
+    outcome = (verify_outcome or "rejected").strip().lower()
+    is_failed = outcome == "failed"
+    discord_kind = "publish_verify_failed" if is_failed else "publish_verify_rejected"
+    email_kind = "publish_verify_failed_email" if is_failed else "publish_verify_rejected_email"
+    filename = ""
+    email = ""
+    name = "there"
+    wants_email = True
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT u.email AS email,
+                       COALESCE(NULLIF(TRIM(u.name), ''), 'there') AS display_name,
+                       ups.filename AS filename,
+                       up.email_notifications AS email_notifications
+                FROM uploads ups
+                JOIN users u ON u.id = ups.user_id
+                LEFT JOIN user_preferences up ON up.user_id = u.id
+                WHERE ups.id = $1 AND ups.user_id = $2::uuid
+                """,
+                upload_id,
+                user_id,
+            )
+            if row:
+                email = str(row["email"] or "").strip()
+                name = str(row["display_name"] or "there")
+                fn = row.get("filename")
+                filename = str(fn).strip() if fn else ""
+                pref = row.get("email_notifications")
+                wants_email = True if pref is None else bool(pref)
+    except Exception as e:
+        logger.warning("publish_rejected: lookup failed upload=%s: %s", upload_id, e)
+
+    plat_label = _platform_label(plat_key)
+    reason = (detail or "").strip() or (
+        (
+            f"{plat_label} verification could not confirm this post is live "
+            "(API error, timeout, or missing publish)."
+        )
+        if is_failed
+        else (
+            f"{plat_label} verification reported this upload as rejected, removed, "
+            "or not publicly accessible."
+        )
+    )
+
+    embed_title = (
+        f"⚠️ {plat_label}: verification could not confirm post"
+        if is_failed
+        else f"⚠️ {plat_label}: post rejected or removed"
+    )
+
+    wh = await fetch_user_discord_webhook_from_db(db_pool, user_id)
+    discord_ok = False
+    if wh and _is_allowed_discord_webhook_url(wh):
+        try:
+            discord_ok = bool(
+                await _send_discord_webhook(
+                    wh,
+                    embeds=[
+                        {
+                            "title": embed_title,
+                            "description": (
+                                f"{(filename or 'Your video')} — verification failed.\n\n"
+                                f"{reason[:900]}"
+                            ),
+                            "color": 0xef4444,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "footer": {"text": "UploadM8 · platform verification"},
+                        }
+                    ],
+                )
+            )
+        except Exception as e:
+            logger.warning("publish_rejected Discord failed upload=%s: %s", upload_id, e)
+            discord_ok = False
+    try:
+        await append_notification_delivery_to_upload_db(
+            db_pool,
+            str(upload_id),
+            {
+                "channel": "user_upload_discord",
+                "ok": bool(discord_ok),
+                "kind": discord_kind,
+                "platform": plat_key,
+            },
+        )
+    except Exception:
+        pass
+
+    if email and wants_email:
+        email_ok = False
+        try:
+            from stages.emails.base import mailgun_ready
+            from stages.emails.uploads import send_upload_failed_email
+
+            if mailgun_ready():
+                await send_upload_failed_email(
+                    email,
+                    name,
+                    filename or upload_id,
+                    [plat_key],
+                    reason,
+                    str(upload_id),
+                    "platform_verify",
+                    "",
+                )
+                email_ok = True
+        except Exception as e:
+            logger.warning("publish_rejected email failed upload=%s: %s", upload_id, e)
+        try:
+            await append_notification_delivery_to_upload_db(
+                db_pool,
+                str(upload_id),
+                {
+                    "channel": "user_upload_email",
+                    "ok": bool(email_ok),
+                    "kind": email_kind,
+                    "platform": plat_key,
+                },
+            )
+        except Exception:
+            pass
 
 
 async def notify_user_publish_confirmed(
@@ -620,6 +1468,7 @@ async def notify_user_publish_confirmed(
 
     plat_label = _platform_label(plat_key)
     wh = await fetch_user_discord_webhook_from_db(db_pool, user_id)
+    discord_ok = False
     if wh and _is_allowed_discord_webhook_url(wh):
         desc_parts = [
             (filename or "Your video") + f" is confirmed live on **{plat_label}**.",
@@ -627,20 +1476,36 @@ async def notify_user_publish_confirmed(
         if (post_url or "").strip().startswith("http"):
             desc_parts.append(f"[View post]({post_url.strip()})")
         try:
-            await _send_discord_webhook(
-                wh,
-                embeds=[
-                    {
-                        "title": f"✅ {plat_label} confirmed",
-                        "description": "\n\n".join(desc_parts)[:1800],
-                        "color": 0x22c55e,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "footer": {"text": "UploadM8 · publish confirmation"},
-                    }
-                ],
+            discord_ok = bool(
+                await _send_discord_webhook(
+                    wh,
+                    embeds=[
+                        {
+                            "title": f"✅ {plat_label} confirmed",
+                            "description": "\n\n".join(desc_parts)[:1800],
+                            "color": 0x22c55e,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "footer": {"text": "UploadM8 · publish confirmation"},
+                        }
+                    ],
+                )
             )
         except Exception as e:
             logger.warning("publish_confirmed Discord failed upload=%s: %s", upload_id, e)
+            discord_ok = False
+    try:
+        await append_notification_delivery_to_upload_db(
+            db_pool,
+            str(upload_id),
+            {
+                "channel": "user_upload_discord",
+                "ok": bool(discord_ok),
+                "kind": "publish_verify_confirmed",
+                "platform": plat_key,
+            },
+        )
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -718,6 +1583,119 @@ async def notify_admin_mrr_collected(amount: float, customer_email: str, plan: s
     }
     
     await _send_discord_webhook(webhook, embeds=[embed])
+
+
+async def notify_admin_upload_status(
+    ctx: "JobContext",
+    *,
+    status: str,
+    upload_id: str,
+    db_pool=None,
+    scene_story: str = "",
+) -> None:
+    """Per-upload admin notification for partial / failed outcomes.
+
+    Always fires admin Discord embed AND admin ops email (ADMIN_OPS_EMAIL via
+    services.ops_incidents.record_operational_incident) regardless of user prefs
+    so the operator sees every partial/failed pipeline. Successes do NOT page admin.
+
+    The DB row is always written (see ops_incidents) so the admin-incidents page
+    sees every status; alerting channels dedupe within OPS_ALERT_DEDUPE_SECONDS.
+    """
+    st = (status or "").strip().lower()
+    if st not in ("partial", "failed"):
+        return  # success does not page admin
+
+    if not db_pool:
+        return
+
+    try:
+        from services.ops_incidents import record_operational_incident
+    except Exception as e:
+        logger.debug("notify_admin_upload_status: ops_incidents import failed: %s", e)
+        return
+
+    succeeded = []
+    failed = []
+    try:
+        succeeded = list(ctx.get_success_platforms() or [])
+        failed = list(ctx.get_failed_platforms() or [])
+    except Exception:
+        pass
+
+    details: Dict[str, Any] = {
+        "upload_id": str(upload_id) if upload_id else None,
+        "user_id": str(getattr(ctx, "user_id", "") or "") or None,
+        "filename": getattr(ctx, "filename", None),
+        "platforms": list(getattr(ctx, "platforms", None) or []),
+        "succeeded_platforms": succeeded,
+        "failed_platforms": failed,
+        "error_code": getattr(ctx, "error_code", None),
+        "error_message": (getattr(ctx, "error_message", "") or "")[:1000],
+        "current_stage": getattr(ctx, "current_stage", None),
+        "ai_title": str(getattr(ctx, "ai_title", "") or "")[:240],
+    }
+    viol = list(getattr(ctx, "google_multimodal_strict_violations", None) or [])
+    if viol:
+        details["google_multimodal_strict_violations"] = viol[:30]
+
+    arts_gap = getattr(ctx, "output_artifacts", None)
+    if isinstance(arts_gap, dict):
+        _gaps_raw = arts_gap.get("google_multimodal_gaps")
+        if _gaps_raw:
+            details["google_multimodal_gaps"] = str(_gaps_raw)[:2000]
+        mq_art = arts_gap.get("metadata_quality_report")
+        if mq_art:
+            details["metadata_quality_report_snippet"] = str(mq_art)[:2000]
+
+    mq_ctx = getattr(ctx, "metadata_quality_violations", None) or []
+    if mq_ctx:
+        details["metadata_quality_violations"] = mq_ctx[:40]
+
+    if scene_story:
+        details["scene_story"] = scene_story[:600]
+
+    plat_lines: List[str] = []
+    for r in getattr(ctx, "platform_results", None) or []:
+        try:
+            icon = "OK" if r.success else "FAIL"
+            label = r.platform
+            if getattr(r, "account_username", None):
+                label = f"{label} (@{r.account_username})"
+            reason = ""
+            if not r.success:
+                reason = f": {r.error_code or 'UNKNOWN'} — {(r.error_message or '')[:200]}"
+            plat_lines.append(f"{icon} {label}{reason}")
+        except Exception:
+            continue
+
+    body = (
+        f"Filename: {details['filename'] or '—'}\n"
+        f"Platforms requested: {', '.join(details['platforms']) or '—'}\n"
+        f"Succeeded: {', '.join(succeeded) or '—'}\n"
+        f"Failed: {', '.join(failed) or '—'}\n"
+        f"Error: {details['error_code'] or '—'} — {details['error_message'] or '—'}\n"
+        f"Stage: {details['current_stage'] or '—'}\n"
+        f"Title: {details['ai_title'] or '—'}\n"
+        + ("Scene story: " + scene_story[:600] + "\n" if scene_story else "")
+        + ("\nPer-platform:\n" + "\n".join(plat_lines) if plat_lines else "")
+    )[:8000]
+
+    try:
+        await record_operational_incident(
+            db_pool,
+            source="upload",
+            incident_type=f"upload_{st}",
+            subject=f"Upload {st}: {details['filename'] or upload_id}",
+            body=body,
+            details=details,
+            user_id=details.get("user_id"),
+            upload_id=details.get("upload_id"),
+            alert_email=True,
+            alert_discord=True,
+        )
+    except Exception as e:
+        logger.warning("notify_admin_upload_status record failed: %s", e)
 
 
 async def notify_admin_error(error_type: str, details: dict, db_pool=None):
@@ -881,29 +1859,30 @@ async def send_tier_change_email(email: str, name: str, old_tier: str, new_tier:
 # Internal Helpers
 # ============================================================
 
-async def _send_discord_webhook(webhook_url: str, content: str = None, embeds: List[dict] = None):
-    """Send message to Discord webhook."""
+async def _send_discord_webhook(webhook_url: str, content: str = None, embeds: List[dict] = None) -> bool:
+    """POST to a Discord webhook. Returns True on 200/204, False otherwise."""
     if not webhook_url:
-        return
-    
+        return False
+
     payload = {}
     if content:
         payload["content"] = content
     if embeds:
         payload["embeds"] = embeds
-    
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(webhook_url, json=payload)
             if response.status_code not in (200, 204):
-                # Discord returns JSON error details (e.g. "embed too large", "invalid url")
-                # in the body — surface them so silent drops are diagnosable.
                 body = (response.text or "")[:500]
                 logger.warning(
                     f"Discord webhook failed: HTTP {response.status_code} body={body}"
                 )
+                return False
+            return True
     except Exception as e:
         logger.warning(f"Discord webhook error: {e}")
+        return False
 
 
 async def _send_mailgun_email(to: str, subject: str, html: str):

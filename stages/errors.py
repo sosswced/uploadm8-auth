@@ -10,7 +10,7 @@ Canonical exports:
   - SkipStage
   - CancelRequested
   - PublishError, StorageError, TelemetryError, TranscodeError,
-    ThumbnailError, CaptionError, WatermarkError, VerifyError, HUDError
+    ThumbnailError, CaptionError, WatermarkError, VerifyError
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ class ErrorCode(str, Enum):
 
     # Processing stages
     PUBLISH = "PUBLISH"
+    PUBLISH_METADATA_REJECTED = "PUBLISH_METADATA_REJECTED"
     TELEMETRY = "TELEMETRY"
     TELEMETRY_PARSE_FAILED = "TELEMETRY_PARSE_FAILED"
     TELEMETRY_EMPTY = "TELEMETRY_EMPTY"
@@ -49,9 +50,6 @@ class ErrorCode(str, Enum):
     CAPTION = "CAPTION"
     WATERMARK = "WATERMARK"
     VERIFY = "VERIFY"
-    HUD = "HUD"
-    HUD_GENERATION_FAILED = "HUD_GENERATION_FAILED"
-
     # FFmpeg
     FFMPEG_FAILED = "FFMPEG_FAILED"
     FFMPEG_NOT_FOUND = "FFMPEG_NOT_FOUND"
@@ -178,12 +176,6 @@ class VerifyError(StageError):
         super().__init__(code=code, message=message, stage="verify", meta=meta, retryable=retryable, detail=detail)
 
 
-class HUDError(StageError):
-    def __init__(self, message: str = "HUD generation failed", *, code=ErrorCode.HUD,
-                 meta: Optional[Dict[str, Any]] = None, retryable: bool = False, detail: str = None):
-        super().__init__(code=code, message=message, stage="hud", meta=meta, retryable=retryable, detail=detail)
-
-
 __all__ = [
     "ErrorCode",
     "StageError",
@@ -197,5 +189,4 @@ __all__ = [
     "CaptionError",
     "WatermarkError",
     "VerifyError",
-    "HUDError",
 ]

@@ -83,7 +83,11 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
     """
     ctx.mark_stage("twelvelabs")
 
-    if not user_pref_ai_service_enabled(ctx.user_settings or {}, "twelvelabs", default=True):
+    tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
+    tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
+    if not user_pref_ai_service_enabled(
+        ctx.user_settings or {}, "twelvelabs", default=True, allowed_services=tier_allowed_set
+    ):
         raise SkipStage("Scene Understanding disabled in upload preferences (aiServiceSceneUnderstanding)")
 
     if not TWELVE_LABS_API_KEY:

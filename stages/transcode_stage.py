@@ -4,7 +4,7 @@ UploadM8 Transcode Stage - Platform-specific video transcoding
 Creates separate, optimized video files for each target platform.
 Each platform gets its own properly formatted MP4 with correct:
   - Aspect ratio (9:16 vertical via pad/crop based on reframe_mode)
-  - Resolution (max 1080x1920)
+  - Resolution (1080x1920 default; optional 2160x3840 for YouTube via TRANSCODE_YOUTUBE_4K)
   - Duration (trimmed to platform max)
   - Codec (H.264 High + AAC-LC)
   - Frame rate (capped per platform)
@@ -25,6 +25,25 @@ import json
 import logging
 import os
 import subprocess
+
+# Cap FFmpeg CPU per invocation so concurrent jobs don't pin all cores.
+# Default scales with WORKER_CONCURRENCY: cpu_count // concurrency, min 1.
+_FFMPEG_THREADS_DEFAULT = max(
+    1,
+    (os.cpu_count() or 2) // max(1, int(os.environ.get("WORKER_CONCURRENCY", "3"))),
+)
+FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", str(_FFMPEG_THREADS_DEFAULT)))
+
+# Encode quality (override without code changes)
+TRANSCODE_X264_CRF = (os.environ.get("TRANSCODE_X264_CRF", "20").strip() or "20")
+TRANSCODE_X264_PRESET = (os.environ.get("TRANSCODE_X264_PRESET", "medium").strip() or "medium")
+TRANSCODE_YOUTUBE_4K = os.environ.get("TRANSCODE_YOUTUBE_4K", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -49,7 +68,7 @@ PLATFORM_SPECS = {
         "video_codec": "h264",
         "audio_codec": "aac",
         "max_fps": 30,                  # 60 accepted but heavily compressed; 30 safer
-        "max_bitrate_video": "10M",
+        "max_bitrate_video": "12M",
         "max_bitrate_audio": "256k",
         "sample_rate": 44100,
         "pixel_format": "yuv420p",
@@ -66,7 +85,7 @@ PLATFORM_SPECS = {
         "video_codec": "h264",
         "audio_codec": "aac",
         "max_fps": 60,
-        "max_bitrate_video": "12M",
+        "max_bitrate_video": "16M",
         "max_bitrate_audio": "192k",
         "sample_rate": 48000,
         "pixel_format": "yuv420p",
@@ -83,7 +102,7 @@ PLATFORM_SPECS = {
         "video_codec": "h264",
         "audio_codec": "aac",
         "max_fps": 30,
-        "max_bitrate_video": "5M",      # IG compresses aggressively; lower = less re-compression
+        "max_bitrate_video": "10M",
         "max_bitrate_audio": "128k",
         "sample_rate": 44100,
         "pixel_format": "yuv420p",
@@ -100,7 +119,7 @@ PLATFORM_SPECS = {
         "video_codec": "h264",
         "audio_codec": "aac",
         "max_fps": 30,
-        "max_bitrate_video": "8M",
+        "max_bitrate_video": "12M",
         "max_bitrate_audio": "128k",
         "sample_rate": 44100,
         "pixel_format": "yuv420p",
@@ -109,6 +128,38 @@ PLATFORM_SPECS = {
         "max_file_mb": 4096,            # 4GB
     },
 }
+
+_YOUTUBE_4K_OVERRIDES = {
+    "target_width": 2160,
+    "target_height": 3840,
+    "max_bitrate_video": "40M",
+    "profile": "high",
+    "level": "5.1",
+}
+
+
+def get_platform_spec(platform: str) -> dict:
+    """Return platform transcode spec, applying optional YouTube 4K overrides."""
+    base = PLATFORM_SPECS.get(platform) or PLATFORM_SPECS["tiktok"]
+    if platform == "youtube" and TRANSCODE_YOUTUBE_4K:
+        return {**base, **_YOUTUBE_4K_OVERRIDES}
+    return base
+
+
+def _scale_filter(
+    width: int,
+    height: int,
+    *,
+    decrease: bool = False,
+    increase: bool = False,
+) -> str:
+    """Lanczos scale for sharper down/up-scales."""
+    flags = "flags=lanczos"
+    if decrease:
+        return f"scale={width}:{height}:{flags}:force_original_aspect_ratio=decrease"
+    if increase:
+        return f"scale={width}:{height}:{flags}:force_original_aspect_ratio=increase"
+    return f"scale={width}:{height}:{flags}"
 
 
 # -------------------------------------------------------------------------
@@ -280,9 +331,13 @@ def resolve_reframe_action(info: VideoInfo, reframe_mode: str, platform: str) ->
     return "pad"
 
 
-def needs_transcode(info: VideoInfo, platform: str, reframe_action: str) -> Tuple[bool, List[str]]:
+def needs_transcode(
+    info: VideoInfo,
+    platform: str,
+    reframe_action: str,
+) -> Tuple[bool, List[str]]:
     """Check if video needs transcoding for the target platform"""
-    spec = PLATFORM_SPECS.get(platform)
+    spec = get_platform_spec(platform) if platform in PLATFORM_SPECS else None
     if not spec:
         return False, []
 
@@ -305,8 +360,13 @@ def needs_transcode(info: VideoInfo, platform: str, reframe_action: str) -> Tupl
 
     # Check resolution (even without reframe, may need downscale)
     if reframe_action == "none":
-        if info.width > spec["target_width"] or info.height > spec["target_height"]:
-            reasons.append(f"resolution {info.width}x{info.height} exceeds max")
+        max_w = spec["target_width"]
+        max_h = spec["target_height"]
+        if info.is_landscape:
+            max_w = max(spec["target_width"], spec["target_height"])
+            max_h = min(spec["target_width"], spec["target_height"])
+        if info.width > max_w or info.height > max_h:
+            reasons.append(f"resolution {info.width}x{info.height} exceeds max {max_w}x{max_h}")
 
     # Check fps
     if info.fps > spec["max_fps"]:
@@ -340,7 +400,7 @@ def build_ffmpeg_command(
     force_duration_trim_sec: Optional[float] = None,
 ) -> list:
     """Build platform-specific FFmpeg command"""
-    spec = PLATFORM_SPECS.get(platform, PLATFORM_SPECS["tiktok"])
+    spec = get_platform_spec(platform)
 
     needs_silent_audio = not info.audio_codec
 
@@ -376,36 +436,26 @@ def build_ffmpeg_command(
     th = spec["target_height"]
 
     if reframe_action == "pad":
-        # Scale to fit inside target box, then pad with black bars
-        # force_original_aspect_ratio=decrease -> shrink to fit
-        # pad -> center in target box
-        vf_filters.append(f"scale={tw}:{th}:force_original_aspect_ratio=decrease")
+        vf_filters.append(_scale_filter(tw, th, decrease=True))
         vf_filters.append(f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2")
 
     elif reframe_action == "crop":
-        # Scale to fill target box (some edges clipped), then crop to exact size
-        # force_original_aspect_ratio=increase -> scale up to fill
-        # crop -> center-crop to target
-        vf_filters.append(f"scale={tw}:{th}:force_original_aspect_ratio=increase")
+        vf_filters.append(_scale_filter(tw, th, increase=True))
         vf_filters.append(f"crop={tw}:{th}")
 
     elif reframe_action == "none":
-        # Keep original aspect ratio but ensure within max bounds
         max_w = spec["target_width"]
         max_h = spec["target_height"]
 
-        # For landscape videos with reframe=none, allow landscape dimensions
         if info.is_landscape:
-            max_w = max(spec["target_width"], spec["target_height"])  # 1920
-            max_h = min(spec["target_width"], spec["target_height"])  # 1080
+            max_w = max(spec["target_width"], spec["target_height"])
+            max_h = min(spec["target_width"], spec["target_height"])
 
         if info.width > max_w or info.height > max_h:
-            vf_filters.append(f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease")
+            vf_filters.append(_scale_filter(max_w, max_h, decrease=True))
 
-        # Ensure even dimensions (h264 requirement)
         vf_filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
 
-    # 3. Force yuv420p (universal compatibility)
     vf_filters.append("format=yuv420p")
 
     if vf_filters:
@@ -414,8 +464,9 @@ def build_ffmpeg_command(
     # -- Video codec settings --
     cmd.extend([
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "23",
+        "-threads", str(FFMPEG_THREADS),
+        "-preset", TRANSCODE_X264_PRESET,
+        "-crf", TRANSCODE_X264_CRF,
         "-profile:v", spec.get("profile", "high"),
         "-level", spec.get("level", "4.1"),
         "-maxrate", spec["max_bitrate_video"],
@@ -610,7 +661,7 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
     reframe_mode = getattr(ctx, "reframe_mode", "auto") or "auto"
 
     # -- Step 1: Analyze input video --
-    # Use HUD/watermarked video if available (pipeline reorder: HUD+watermark run before transcode)
+    # Use watermarked source if watermark stage ran before transcode
     input_video = ctx.local_video_path
     if ctx.processed_video_path and ctx.processed_video_path.exists():
         input_video = ctx.processed_video_path
@@ -645,11 +696,12 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
     transcoded_any = False
 
     for platform in platforms:
-        spec = PLATFORM_SPECS.get(platform)
-        if not spec:
+        if platform not in PLATFORM_SPECS:
             logger.warning(f"Unknown platform '{platform}', skipping transcode")
             ctx.platform_videos[platform] = ctx.local_video_path
             continue
+
+        spec = get_platform_spec(platform)
 
         # Resolve what reframe action to take for this platform
         reframe_action = resolve_reframe_action(info, reframe_mode, platform)

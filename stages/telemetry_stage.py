@@ -82,6 +82,71 @@ def _pick_col(row: List[str], hdr: Dict[str, int], *aliases: str) -> Optional[st
     return None
 
 
+def _nmea_to_decimal(raw: Any, hemisphere: str) -> Optional[float]:
+    """Convert NMEA DDMM.MMMM / DDDMM.MMMM to signed decimal degrees."""
+    val = _to_float(raw)
+    if val is None:
+        return None
+    hemi = str(hemisphere or "").strip().upper().rstrip(";")
+    deg = int(val // 100)
+    minutes = val - (deg * 100)
+    decimal = deg + (minutes / 60.0)
+    if hemi in ("S", "W"):
+        decimal = -decimal
+    elif hemi not in ("N", "E"):
+        return None
+    return decimal
+
+
+def _looks_like_nmea_row(parts: List[str]) -> bool:
+    """Detect Escort/dashcam .map rows: A,DDMMYY,HHMMSS,lat,N,lon,W,speed,..."""
+    if len(parts) < 8:
+        return False
+    hemi_lat = str(parts[4] or "").strip().upper().rstrip(";")
+    hemi_lon = str(parts[6] or "").strip().upper().rstrip(";")
+    return hemi_lat in ("N", "S") and hemi_lon in ("E", "W")
+
+
+def _parse_nmea_datetime(date_raw: str, time_raw: str, fallback_ts: float) -> float:
+    """Parse DDMMYY + HHMMSS telemetry timestamps."""
+    try:
+        d = str(date_raw or "").strip()
+        t = str(time_raw or "").strip().rstrip(";")
+        if len(d) < 6 or len(t) < 6:
+            return fallback_ts
+        day = int(d[0:2])
+        month = int(d[2:4])
+        year = 2000 + int(d[4:6])
+        hour = int(t[0:2])
+        minute = int(t[2:4])
+        second = int(t[4:6])
+        return datetime(year, month, day, hour, minute, second).timestamp()
+    except (ValueError, TypeError):
+        return fallback_ts
+
+
+def _parse_nmea_point_from_row(row: List[str], *, fallback_ts: float) -> Optional[Dict[str, float]]:
+    """Parse one Escort/NMEA-style .map CSV row."""
+    if not _looks_like_nmea_row(row):
+        return None
+    lat = _nmea_to_decimal(row[3], row[4])
+    lon = _nmea_to_decimal(row[5], row[6])
+    speed = _to_float(str(row[7]).rstrip(";"))
+    if lat is None or lon is None or speed is None:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    ts = _parse_nmea_datetime(row[1], row[2], fallback_ts=fallback_ts)
+    alt = _to_float(str(row[10]).rstrip(";")) if len(row) > 10 else 0.0
+    return {
+        "timestamp": float(ts),
+        "lat": float(lat),
+        "lon": float(lon),
+        "speed_mph": float(speed),
+        "altitude": float(alt or 0.0),
+    }
+
+
 def _parse_point_from_row(
     row: List[str],
     *,
@@ -149,6 +214,7 @@ def parse_map_file(map_path: Path) -> TelemetryData:
         TelemetryError: If parsing fails
     """
     data_points: List[Dict] = []
+    sample_lines: List[str] = []
 
     try:
         hdr: Optional[Dict[str, int]] = None
@@ -162,16 +228,24 @@ def parse_map_file(map_path: Path) -> TelemetryData:
                 # Prefer CSV; fall back to whitespace-delimited records.
                 parts = [p.strip() for p in (line.split(',') if ',' in line else line.split())]
                 if len(parts) < 3:
+                    if len(sample_lines) < 10:
+                        sample_lines.append(f"L{_line_num}:{line[:140]}")
                     continue
 
                 if hdr is None and _looks_like_header(parts):
                     hdr = _normalize_header(parts)
                     continue
 
-                point = _parse_point_from_row(parts, fallback_ts=fallback_ts, hdr=hdr)
+                point = None
+                if hdr is None and _looks_like_nmea_row(parts):
+                    point = _parse_nmea_point_from_row(parts, fallback_ts=fallback_ts)
+                if not point:
+                    point = _parse_point_from_row(parts, fallback_ts=fallback_ts, hdr=hdr)
                 if point:
                     data_points.append(point)
                     fallback_ts = float(point["timestamp"]) + 1.0
+                elif len(sample_lines) < 10:
+                    sample_lines.append(f"L{_line_num}:{line[:140]}")
 
     except FileNotFoundError:
         raise TelemetryError(
@@ -186,9 +260,16 @@ def parse_map_file(map_path: Path) -> TelemetryData:
         )
 
     if not data_points:
+        detail = " | ".join(sample_lines) if sample_lines else "(no non-comment lines parsed)"
+        logger.warning(
+            "parse_map_file: no valid points map=%s samples=%s",
+            map_path,
+            detail[:800],
+        )
         raise TelemetryError(
             "No valid telemetry data found",
-            code=ErrorCode.TELEMETRY_EMPTY
+            code=ErrorCode.TELEMETRY_EMPTY,
+            detail=detail[:2000],
         )
 
     speeds = [p['speed_mph'] for p in data_points]
@@ -413,8 +494,10 @@ def calculate_trill_score(
     else:
         bucket = "chill"
 
+    total_int = int(total)
     return TrillScore(
-        score=int(total),
+        score=total_int,
+        base_score=total_int,
         bucket=bucket,
         speed_score=float(speed_score),
         speeding_score=float(speeding_score),
@@ -456,49 +539,79 @@ async def apply_padus_gazetteer_to_telemetry(
     (``dashcam_osd_stage``) so captions see the same geo signals whether GPS came
     from a companion map file or burned-in OSD.
     """
-    gaz = GAZETTEER_PLACES_PATH if (GAZETTEER_PLACES_PATH and os.path.isfile(GAZETTEER_PLACES_PATH)) else None
+    gaz_file = GAZETTEER_PLACES_PATH if (GAZETTEER_PLACES_PATH and os.path.isfile(GAZETTEER_PLACES_PATH)) else None
     if not telemetry.points and not (telemetry.mid_lat is not None and telemetry.mid_lon is not None):
         return
-    if not (gaz or db_pool):
+    # DB pool alone can satisfy gazetteer (PostGIS) + PAD-US; file is optional fallback.
+    if not db_pool and not gaz_file:
         return
     try:
         from telemetry_trill import enrich_route_padus_gazetteer
 
-        extra = await asyncio.to_thread(
+        extra: Dict[str, Any] = {}
+        lat_f: Optional[float] = None
+        lon_f: Optional[float] = None
+        if telemetry.mid_lat is not None and telemetry.mid_lon is not None:
+            try:
+                lat_f = float(telemetry.mid_lat)
+                lon_f = float(telemetry.mid_lon)
+            except (TypeError, ValueError):
+                lat_f, lon_f = None, None
+        if lat_f is None or lon_f is None:
+            mid = get_representative_coords(telemetry.points)
+            if mid:
+                lat_f, lon_f = float(mid[0]), float(mid[1])
+
+        gazetteer_source = "none"
+        db_gaz_hit = False
+        if db_pool is not None and lat_f is not None and lon_f is not None:
+            try:
+                from services.gazetteer_db import gazetteer_db_enabled, nearest_gazetteer_place_from_db
+
+                if gazetteer_db_enabled():
+                    async with db_pool.acquire() as conn:
+                        db_gaz = await nearest_gazetteer_place_from_db(conn, lat_f, lon_f)
+                    if db_gaz.get("gazetteer_place_name"):
+                        db_gaz_hit = True
+                        gazetteer_source = "db"
+                        extra.update(db_gaz)
+                        telemetry.gazetteer_place_name = str(db_gaz["gazetteer_place_name"]).strip() or None
+                        gps = db_gaz.get("gazetteer_state_usps")
+                        telemetry.gazetteer_state_usps = (
+                            str(gps).strip() if isinstance(gps, str) and gps.strip() else None
+                        )
+            except Exception as e:
+                logger.debug("DB gazetteer enrichment skipped: %s", e)
+
+        file_extra = await asyncio.to_thread(
             enrich_route_padus_gazetteer,
             telemetry.points,
             telemetry.mid_lat,
             telemetry.mid_lon,
-            gaz_places_path=gaz,
+            gaz_places_path=(None if db_gaz_hit else gaz_file),
             padus_path=None,
             padus_layer=None,
         )
-        if not isinstance(extra, dict):
-            extra = {}
-        if extra.get("gazetteer_place_name"):
-            telemetry.gazetteer_place_name = str(extra["gazetteer_place_name"]).strip() or None
-        if extra.get("gazetteer_state_usps"):
-            telemetry.gazetteer_state_usps = str(extra["gazetteer_state_usps"]).strip() or None
+        if isinstance(file_extra, dict):
+            for k, v in file_extra.items():
+                if k.startswith("gazetteer") and db_gaz_hit:
+                    continue
+                if k not in extra or extra.get(k) in (None, ""):
+                    extra[k] = v
 
-        if db_pool is not None:
+        if not db_gaz_hit:
+            if extra.get("gazetteer_place_name"):
+                gazetteer_source = "file"
+                telemetry.gazetteer_place_name = str(extra["gazetteer_place_name"]).strip() or None
+            if extra.get("gazetteer_state_usps"):
+                telemetry.gazetteer_state_usps = str(extra["gazetteer_state_usps"]).strip() or None
+
+        if db_pool is not None and lat_f is not None and lon_f is not None:
             from services.padus_db import padus_hit_dict_from_db
 
             async with db_pool.acquire() as conn:
-                lat_f: Optional[float] = None
-                lon_f: Optional[float] = None
-                if telemetry.mid_lat is not None and telemetry.mid_lon is not None:
-                    try:
-                        lat_f = float(telemetry.mid_lat)
-                        lon_f = float(telemetry.mid_lon)
-                    except (TypeError, ValueError):
-                        lat_f, lon_f = None, None
-                if lat_f is None or lon_f is None:
-                    mid = get_representative_coords(telemetry.points)
-                    if mid:
-                        lat_f, lon_f = float(mid[0]), float(mid[1])
-                if lat_f is not None and lon_f is not None:
-                    db_extra = await padus_hit_dict_from_db(conn, lat_f, lon_f)
-                    extra.update(db_extra)
+                db_extra = await padus_hit_dict_from_db(conn, lat_f, lon_f)
+                extra.update(db_extra)
 
         telemetry.near_padus = bool(extra.get("near_padus"))
         if extra.get("padus_unit_name"):
@@ -506,10 +619,43 @@ async def apply_padus_gazetteer_to_telemetry(
         elif not telemetry.near_padus:
             telemetry.padus_unit_name = None
         logger.info(
-            "Geo enrichment: gazetteer=%s padus=%s",
+            "Geo enrichment: gazetteer=%s (source=%s) padus=%s",
             telemetry.gazetteer_place_name or "—",
+            gazetteer_source,
             telemetry.padus_unit_name or ("near" if telemetry.near_padus else "—"),
         )
+
+        # Probe: when GPS is clearly present (mid coords OR at least 2 points)
+        # but NEITHER gazetteer nor PADUS came back, log a single INFO line so
+        # ops can confirm the DB is populated and the gazetteer file is loaded.
+        try:
+            no_gaz = not (telemetry.gazetteer_place_name and telemetry.gazetteer_place_name.strip())
+            no_padus = not telemetry.near_padus and not (telemetry.padus_unit_name or "")
+            has_gps = (
+                (telemetry.mid_lat is not None and telemetry.mid_lon is not None)
+                or len(telemetry.points or []) >= 2
+            )
+            if has_gps and no_gaz and no_padus:
+                lat_dbg = telemetry.mid_lat or (telemetry.points[0].lat if telemetry.points else None)
+                lon_dbg = telemetry.mid_lon or (telemetry.points[0].lon if telemetry.points else None)
+                padus_row_count: Optional[int] = None
+                if db_pool is not None:
+                    try:
+                        async with db_pool.acquire() as conn:
+                            padus_row_count = await conn.fetchval(
+                                "SELECT COUNT(*) FROM padus_protected_areas LIMIT 1"
+                            )
+                    except Exception:
+                        padus_row_count = None
+                logger.info(
+                    "[geo-probe] PADUS+gazetteer empty for GPS=(%.5f, %.5f) gaz_file=%s padus_rows=%s",
+                    float(lat_dbg) if lat_dbg is not None else 0.0,
+                    float(lon_dbg) if lon_dbg is not None else 0.0,
+                    gaz_file or "<none>",
+                    padus_row_count if padus_row_count is not None else "<unknown>",
+                )
+        except Exception:
+            pass
     except Exception as e:
         logger.debug("PADUS/gazetteer enrichment skipped: %s", e)
 

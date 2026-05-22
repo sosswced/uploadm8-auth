@@ -234,6 +234,28 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
         except Exception as e:
             logger.debug(f"Could not read users.preferences for {user_id} (non-fatal): {e}")
 
+        # ── 4. user_color_preferences — platform badge / accent colors ────────
+        try:
+            color_row = await conn.fetchrow(
+                """
+                SELECT tiktok_color, youtube_color, instagram_color,
+                       facebook_color, accent_color
+                FROM user_color_preferences
+                WHERE user_id = $1
+                """,
+                user_id,
+            )
+            if color_row:
+                from services.platform_colors import normalize_platform_colors
+
+                colors = normalize_platform_colors(dict(color_row))
+                result["platform_colors"] = colors
+                result["platformColors"] = colors
+        except asyncpg.exceptions.UndefinedTableError:
+            pass
+        except Exception as e:
+            logger.debug("Could not read user_color_preferences for %s (non-fatal): %s", user_id, e)
+
     return result
 
 
@@ -656,10 +678,10 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
 
 
 async def save_trill_metadata(pool: asyncpg.Pool, ctx: JobContext) -> None:
-    """Persist Trill/HUD evidence so completed uploads visibly prove telemetry ran."""
+    """Persist Trill/telemetry evidence so completed uploads visibly prove drive analysis ran."""
     trill = getattr(ctx, "trill_score", None) or getattr(ctx, "trill", None)
     telemetry = getattr(ctx, "telemetry_data", None) or getattr(ctx, "telemetry", None)
-    if not trill and not telemetry and not getattr(ctx, "hud_applied", False):
+    if not trill and not telemetry:
         return
 
     try:
@@ -680,11 +702,28 @@ async def save_trill_metadata(pool: asyncpg.Pool, ctx: JobContext) -> None:
     patch = {
         "trill": trill_to_dict(trill),
         "telemetry": telemetry_to_dict(telemetry),
-        "hud_applied": bool(getattr(ctx, "hud_applied", False)),
     }
-    patch = {k: v for k, v in patch.items() if v is not None}
 
     async with pool.acquire() as conn:
+        if getattr(ctx, "vehicle_make_id", None) or getattr(ctx, "vehicle_model_id", None):
+            try:
+                from services.vehicle_catalog import fetch_vehicle_labels
+
+                lab = await fetch_vehicle_labels(
+                    conn, ctx.vehicle_make_id, ctx.vehicle_model_id
+                )
+                patch["vehicle"] = {
+                    "make_id": ctx.vehicle_make_id,
+                    "model_id": ctx.vehicle_model_id,
+                    "make_name": getattr(ctx, "vehicle_make_name", None) or lab.get("make_name"),
+                    "model_name": getattr(ctx, "vehicle_model_name", None) or lab.get("model_name"),
+                }
+            except Exception:
+                patch["vehicle"] = {
+                    "make_id": getattr(ctx, "vehicle_make_id", None),
+                    "model_id": getattr(ctx, "vehicle_model_id", None),
+                }
+        patch = {k: v for k, v in patch.items() if v is not None}
         try:
             await conn.execute(
                 """
@@ -700,7 +739,7 @@ async def save_trill_metadata(pool: asyncpg.Pool, ctx: JobContext) -> None:
                 score,
                 bucket,
                 json.dumps(patch),
-                json.dumps({"trill": patch.get("trill"), "hud_applied": patch.get("hud_applied")}),
+                json.dumps({"trill": patch.get("trill")}),
             )
         except asyncpg.exceptions.UndefinedColumnError:
             # Older DBs may not have the Trill columns yet; still keep a debug
@@ -714,7 +753,7 @@ async def save_trill_metadata(pool: asyncpg.Pool, ctx: JobContext) -> None:
                     WHERE id = $1
                     """,
                     ctx.upload_id,
-                    json.dumps({"trill": patch.get("trill"), "hud_applied": patch.get("hud_applied")}),
+                    json.dumps({"trill": patch.get("trill")}),
                 )
             except Exception:
                 logger.debug("save_trill_metadata fallback skipped", exc_info=True)
@@ -941,13 +980,28 @@ async def fetch_m8_historical_signals(
     except Exception as e:
         logger.debug(f"fetch_m8_historical_signals: {e}")
 
+    visual_recall: Dict[str, List[str]] = {}
+    try:
+        from services.visual_entity_memory import fetch_user_entity_recall
+
+        visual_recall = await fetch_user_entity_recall(
+            pool,
+            user_id=user_id,
+            category=(category or "general").lower(),
+            limit_per_bucket=8,
+        )
+    except Exception as e:
+        logger.debug(f"fetch_m8_historical_signals visual_recall: {e}")
+
     return {
         "__pattern_corpus__": pattern_corpus,
         "__strategy_priors__": {"top": pri_top, "lookback_days": lookback_days},
+        "__visual_entity_recall__": visual_recall,
         "__meta__": {
             "ok": True,
             "pattern_n": len(pattern_corpus),
             "prior_n": len(pri_top),
+            "visual_recall_buckets": sum(1 for v in (visual_recall or {}).values() if v),
         },
     }
 
@@ -1217,6 +1271,24 @@ async def load_platform_token_by_id(pool: asyncpg.Pool, token_id: str) -> Option
     except Exception as e:
         logger.error(f"Failed to load platform token by id {token_id}: {e}")
         return None
+
+
+async def touch_platform_token_last_used(pool: asyncpg.Pool, token_row_id: str) -> None:
+    """Record that a platform_tokens row was used for publishing."""
+    if not token_row_id:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE platform_tokens
+                SET last_used_at = NOW(), updated_at = NOW()
+                WHERE id = $1 AND revoked_at IS NULL
+                """,
+                str(token_row_id),
+            )
+    except Exception as e:
+        logger.debug("touch_platform_token_last_used failed for %s: %s", token_row_id, e)
 
 
 # ============================================================

@@ -12,7 +12,7 @@ from typing import List, Optional, Tuple
 from .base import (
     send_email, mailgun_ready, tier_label, MAIL_FROM_SUPPORT, SUPPORT_EMAIL,
     email_shell, intro_row, cta_button, tinted_box, stat_grid, secondary_links,
-    section_tag, metric_hero, divider_accent,
+    section_tag, metric_hero, divider_accent, BrandContext,
     GRAD_BLUE, GRAD_PURPLE,
     URL_DASHBOARD, URL_BILLING, URL_PRICING, URL_SUPPORT, URL_LOGIN,
 )
@@ -200,6 +200,7 @@ async def send_report_ready_email(
     report_title: str,
     download_url: str,
     expires_at_label: str,
+    brand: Optional[BrandContext] = None,
 ) -> None:
     """Notify user that an async export is ready to download."""
     if not mailgun_ready():
@@ -209,6 +210,7 @@ async def send_report_ready_email(
         gradient=GRAD_BLUE,
         tagline="Your requested report is ready",
         preheader_text=f"{report_title} is ready. Download before {expires_at_label}.",
+        brand=brand,
         body_rows=(
             section_tag("Report Ready", "#2563eb")
             + intro_row(
@@ -230,9 +232,12 @@ async def send_report_ready_email(
         ),
         footer_note="You received this because you requested an analytics export.",
     )
+    subject = f"UploadM8 report ready — {report_title}"
+    if brand:
+        subject = f"{brand.company_name} report ready — {report_title}"
     await send_email(
         email,
-        f"UploadM8 report ready — {report_title}",
+        subject,
         html,
         from_addr=MAIL_FROM_SUPPORT,
         reply_to=SUPPORT_EMAIL,

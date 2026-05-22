@@ -28,6 +28,11 @@ import asyncpg
 import httpx
 
 from core.helpers import strip_stray_hashtag_json_blob
+from core.vision_labels import (
+    is_generic_vision_label,
+    penalize_generic_vision_hashtags,
+    vision_labels_for_m8_scene_graph,
+)
 
 from .context import (
     JobContext,
@@ -278,7 +283,7 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
             },
         }
 
-    labels_full = list(vc.get("label_names") or [])
+    labels_full = vision_labels_for_m8_scene_graph(vc.get("label_names") or [], limit=24)
     ocr_full = (vc.get("ocr_text") or "").strip()
     landmark_names = [str(x).strip() for x in (vc.get("landmark_names") or []) if str(x).strip()]
     logo_names = [str(x).strip() for x in (vc.get("logo_names") or []) if str(x).strip()]
@@ -364,6 +369,24 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
             "landmarks": landmark_names[:12],
             "logos": logo_names[:12],
             "landmark_hints": extract_landmark_hints(labels_full, ocr_full, landmark_names),
+            "web_entities": [
+                (w.get("description") if isinstance(w, dict) else str(w))
+                for w in (vc.get("web_entities") or [])[:16]
+            ],
+            "localized_objects": [
+                (o.get("name") if isinstance(o, dict) else str(o))
+                for o in (vc.get("localized_objects") or [])[:16]
+            ],
+            "dominant_colors": [
+                (c.get("name") if isinstance(c, dict) else str(c))
+                for c in (vc.get("dominant_colors") or [])[:8]
+            ],
+            "recognition_summary": str(vc.get("recognition_summary") or "")[:2500],
+            "recognition_flat": (
+                vc.get("recognition_flat")
+                if isinstance(vc.get("recognition_flat"), dict)
+                else (getattr(ctx, "visual_recognition", {}) or {}).get("flat") or {}
+            ),
         },
         "video_understanding": {
             "scene": (vu.get("scene_description") or vu.get("description") or "")[:8000],
@@ -415,6 +438,32 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
 
     if trend_block:
         out_graph["trend_intel"] = trend_block
+
+    # Inject the ordered evidence timeline (built in worker.py after the OSD
+    # stage) so the LLM gets per-second beats instead of one flattened
+    # paragraph. Cap to ~32 events to keep the prompt compact.
+    try:
+        timeline_events: List[Dict[str, Any]] = []
+        arts_raw = getattr(ctx, "output_artifacts", None) or {}
+        ts_raw = arts_raw.get("timeline_story") if isinstance(arts_raw, dict) else None
+        if isinstance(ts_raw, str) and ts_raw.strip():
+            parsed_ts = json.loads(ts_raw)
+            if isinstance(parsed_ts, list):
+                timeline_events = parsed_ts
+        if not timeline_events:
+            try:
+                from stages.context import build_video_story_timeline as _bvst
+                timeline_events = _bvst(ctx, max_events=64) or []
+            except Exception:
+                timeline_events = []
+        if timeline_events:
+            out_graph["timeline"] = list(timeline_events)[:32]
+            scene_story_artifact = arts_raw.get("scene_story") if isinstance(arts_raw, dict) else None
+            if isinstance(scene_story_artifact, str) and scene_story_artifact.strip():
+                out_graph["scene_story"] = scene_story_artifact[:1600]
+    except Exception:
+        pass
+
     return out_graph
 
 
@@ -582,6 +631,44 @@ def _build_m8_prompt(
         else "Set title to null for all platforms that do not need titles."
     )
 
+    title_evidence_contract = """
+TITLE EVIDENCE BUILD CONTRACT (HARD — REJECTION RULES APPLY):
+1. Build titles ONLY from these scene_graph fields (and their direct synonyms):
+     - geo.road, geo.city, geo.state, geo.gazetteer_place, geo.protected_area_name
+     - geo.max_speed_mph (formatted as "<N> MPH"), telemetry/osd peak speeds
+     - trill.bucket (e.g. "Cruise", "Active", "Spirited", "Aggressive", "Reckless")
+     - dominant tokens from vision.labels / video_intelligence.object_tracks /
+       video_intelligence.on_screen_text / vision.landmarks / vision.logos
+     - music.artist, music.title, music.genre — ARTIST or TITLE words ONLY,
+       NEVER paraphrased lyrics or transcript phrases.
+     - dashcam_osd.driver_name and dashcam_osd.first_seen.date when present.
+     - scene_graph.timeline beats (place / on_screen_text / landmark fragments).
+2. TITLES MUST NOT CONTAIN:
+     - Any 4-word window that appears verbatim (case-insensitive) in
+       transcript.text or transcript.segments[*].text.
+     - Paraphrased lyric fragments. If music.copyright_risk is true or any
+       transcript segment looks like a song lyric, treat the whole transcript as
+       OFF-LIMITS for the title.
+     - Profanity (bitch, shit, fuck, ass, damn, hell, slur tokens, etc.) — even
+       when present in the source clip.
+     - Generic clickbait openers: "POV:", "Wait until", "You won't believe",
+       "This is why", "Watch this", "Insane", "Crazy" (used alone), "OMG".
+3. PLATFORM TITLE SHAPES:
+     - YouTube: 50–70 chars, Capitalized Headline Style, keyword-front-loaded
+       (place / road / speed / Trill bucket leading); end with concrete noun
+       (e.g. "I-5", "Yellowstone", "Mustang GT", "Cruise Run").
+     - TikTok: title = null (caption-led platform).
+     - Instagram / Facebook: 25–40 char punchy headline-style; nouns over verbs.
+4. PER-PLATFORM VARIANCE:
+     - YouTube title and Instagram/Facebook title MUST share at most 30% token
+       overlap. If you start from the same evidence cluster, swap the leading
+       cluster (geo → speed → trill → visual-object → music) for the smaller
+       platform. The ranker WILL penalize duplicate titles.
+5. EVIDENCE FALLBACK:
+     - If none of the allowed fields are populated, return null for title on
+       every platform. NEVER invent a place, speed, song, or driver name.
+"""
+
     caption_rule = (
         "Write captions only when generate_caption is true; otherwise use empty string."
         if not generate_caption
@@ -640,8 +727,20 @@ def _build_m8_prompt(
                 "variety without sacrificing factual grounding.\n"
             )
 
-    pattern_block = ""
+    visual_memory_block = ""
     hist = historical or {}
+    recall = hist.get("__visual_entity_recall__") or {}
+    if isinstance(recall, dict) and any(recall.values()):
+        try:
+            from services.visual_entity_memory import format_recall_for_prompt
+
+            vmem = format_recall_for_prompt(recall)
+            if vmem:
+                visual_memory_block = f"\n{vmem}\n"
+        except Exception:
+            pass
+
+    pattern_block = ""
     pats = hist.get("__pattern_corpus__") or []
     if isinstance(pats, list) and pats:
         lines: List[str] = []
@@ -722,6 +821,11 @@ Google Video Intelligence (full-clip labels + segment timeline when present),
 merged multi-frame Vision (union labels + OCR from several moments), faces, landmark hints, and video understanding.
 Use scene_graph.hydration_story as the short factual scene paragraph: it is the preferred backbone for chaining
 time, place, visual subjects, music, speech, and analysis into one grounded story beat.
+Use scene_graph.timeline (when present) as the ORDERED list of beats in this video — each entry is
+{{t_seconds, kind, text}}. Treat it as the source of truth for sequence: hook from an early beat (low t_seconds),
+land the climax from a peak beat (e.g. osd_speed / object / on_screen_text / landmark), and tie back to a
+late beat for the closer. Captions and titles must reference at least one beat token verbatim (place name,
+MPH number, on-screen text fragment, landmark, or driver) when the timeline contains them.
 When trend_intel.summary / trend_intel.rows are present, treat them as **recent search-title shape** for the niche only —
 borrow pacing and topic nouns, never copy titles or pretend this video matches an unrelated viral clip.
 Do NOT write from transcript alone when other fields are populated. Prefer nouns from labels + geo + OCR over generic hype.
@@ -746,10 +850,12 @@ EFFECTIVE STRATEGY (user-seeded, policy rules may override per platform): style=
 {_task_prompt(generate_title, generate_caption, generate_hashtags)}
 
 {fusion}
+{title_evidence_contract}
 {must_use_block}
 {hydration_contract_block}
 {cluster_block}
 {pattern_block}
+{visual_memory_block}
 {strategy_priors_block}
 PLATFORM RULES:
 {chr(10).join(plat_blocks)}
@@ -771,6 +877,13 @@ ANTI-GENERIC RULES:
 - Do not claim the creator wrote/performed an original song if transcript_role is third_party_lyrics or music is identified as a known track unless Scene Graph explicitly says otherwise.
 - Do not write in first person as the recording artist (no "I channel", "my vocals", "my track") when lyrics are third-party unless the visuals show a clear performance.
 - Prefer concrete nouns from labels/OCR/geo/telemetry over abstract hype.
+- When scene_graph.vision.recognition_summary or recognition_flat is present, treat it as
+  the primary inventory of visible entities (vehicles with year/make, brands, food,
+  colors, products) and cite specific items from it in titles/captions/hashtags.
+- HASHTAGS: Prefer scene_graph.timeline beats, video_intelligence.on_screen_text, geo,
+  landmarks, logos, music artist/title, and VI object tracks. Do NOT use coarse Vision
+  detector labels (color, windshield, boat, motorvehicle, lensflare, driving) unless they
+  also appear in must_use tokens or on-screen text.
 - Hashtags must read like real community search terms, not platform metadata.
 - Captions are prose-only: never paste JSON hashtag arrays or quoted hash-plus-bracket fragments into caption; use the hashtags array only.
 - No Unicode emojis or emoticons in any title or caption field.
@@ -979,7 +1092,9 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
     # 6. Video Intelligence object/person/text/logo tracks (added by phase 3)
     vi = scene_graph.get("video_intelligence") or {}
     for label in (vi.get("top_labels") or [])[:4]:
-        _push(str(label).split(" (", 1)[0])
+        desc = str(label).split(" (", 1)[0].strip()
+        if desc and not is_generic_vision_label(desc):
+            _push(desc)
     for row in (vi.get("segment_labels") or [])[:4]:
         if isinstance(row, dict) and row.get("description"):
             _push(str(row.get("description")))
@@ -996,6 +1111,21 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
     for logo in (vi.get("logos") or [])[:3]:
         if isinstance(logo, dict) and logo.get("description"):
             _push(str(logo.get("description")))
+
+    # 6b. Google visual recognition buckets (vehicles, food, plants, …)
+    rec_flat = vision.get("recognition_flat") or {}
+    if isinstance(rec_flat, dict):
+        cat = str(scene_graph.get("category") or "general").lower()
+        try:
+            from core.visual_entity_taxonomy import niche_bucket_order
+
+            bucket_order = niche_bucket_order(cat)
+        except Exception:
+            bucket_order = ["vehicles", "food", "plants", "brands", "objects", "outdoors", "sports"]
+        for bucket in bucket_order:
+            for name in (rec_flat.get(bucket) or [])[:3]:
+                if name and not is_generic_vision_label(str(name), min_specific_len=3):
+                    _push(str(name))
 
     # 7. OSD driver name (HUD)
     if osd.get("driver_name"):
@@ -1217,6 +1347,9 @@ def _preflight_artifact_checks(
         if slug in {"viral", "trending", "follow", "like", "subscribe"}:
             hash_fail = True
             break
+        if is_generic_vision_label(slug):
+            hash_fail = True
+            break
     # Persona consistency sanity check
     persona = str((strategy_target or {}).get("persona") or "").lower()
     persona_fail = False
@@ -1316,6 +1449,9 @@ def score_variant(
     base -= _attribution_penalty(caption, title, scene_graph)
     base -= _quality_gate_penalty(platform, title, caption)
     base -= _primary_hydration_penalty(caption, title, scene_graph)
+    tags = variant.get("hashtags") or []
+    if isinstance(tags, list):
+        base -= penalize_generic_vision_hashtags(tags)
 
     # Hard evidence-coverage floor: any candidate that uses ZERO tokens from
     # the must_use shortlist when evidence exists scores -200. This is the
@@ -1388,6 +1524,7 @@ def rank_and_select(
         ranked.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
         winner = None
         runner_up = None
+        title_validation_meta: Dict[str, Any] = {"rejected_titles": []}
         if ranked:
             winner = ranked[0]
             if len(ranked) > 1:
@@ -1397,6 +1534,48 @@ def rank_and_select(
                 if float(cand.get("score") or 0) >= 45.0:
                     winner = cand
                     break
+
+            # ── Title hard-ban filter ────────────────────────────────────
+            # Walk candidates in score order; first one whose title passes
+            # _validate_title wins. If every candidate fails AND we still need
+            # a title for this platform, fall back to a deterministic
+            # evidence-only title built from allowed scene_graph fields.
+            need_title = pl in ("youtube", "instagram", "facebook")
+            if need_title:
+                for cand in ranked:
+                    cand_title = str(cand.get("title") or "").strip()
+                    ok_t, reason_t = _validate_title(cand_title, scene_graph, platform=pl)
+                    if ok_t:
+                        winner = cand
+                        break
+                    title_validation_meta["rejected_titles"].append({
+                        "variant_index": cand.get("variant_index"),
+                        "title": cand_title[:120],
+                        "reason": reason_t,
+                    })
+                else:
+                    # All variants failed — rewrite winner.title with a
+                    # deterministic evidence-only title.
+                    fallback = _deterministic_evidence_title(scene_graph, platform=pl)
+                    if winner is None:
+                        winner = ranked[0]
+                    if fallback:
+                        winner = dict(winner)
+                        winner["title"] = fallback
+                        title_validation_meta["evidence_fallback_used"] = True
+                    else:
+                        # No allowed evidence — return null title rather than
+                        # ship a transcript/lyric quote.
+                        winner = dict(winner)
+                        winner["title"] = None
+                        title_validation_meta["evidence_fallback_used"] = False
+                        title_validation_meta["title_set_to_null"] = True
+            elif pl == "tiktok":
+                # Caption-led platform — null out any title to enforce contract.
+                if winner is not None:
+                    winner = dict(winner)
+                    winner["title"] = None
+
         preflight_meta: Dict[str, bool] = {}
         if winner:
             winner, preflight_meta = _repair_artifacts_selective(
@@ -1407,6 +1586,7 @@ def rank_and_select(
             "winner": winner,
             "runner_up": runner_up,
             "preflight": preflight_meta,
+            "title_validation": title_validation_meta,
         }
 
     return {
@@ -1414,6 +1594,201 @@ def rank_and_select(
         "platforms": out_plat,
         "must_use": must_use,
     }
+
+
+# ---------------------------------------------------------------------------
+# Title hard-ban validator + deterministic evidence-only fallback
+#
+# Implements the TITLE EVIDENCE BUILD CONTRACT — keep transcript / lyrics /
+# profanity OUT of every winning title across every platform. Used by
+# rank_and_select to filter LLM variants, and by apply_selection_to_context
+# to force per-platform variance.
+# ---------------------------------------------------------------------------
+
+# Small denylist — extend cautiously. Matched as whole-word case-insensitive.
+_TITLE_PROFANITY = frozenset({
+    "bitch", "bitches", "shit", "shits", "fuck", "fucking", "fucked", "fucker",
+    "ass", "asses", "asshole", "damn", "dammit", "hell", "piss", "pussy",
+    "cunt", "dick", "cock", "bastard", "slut", "whore", "nigga", "nigger",
+    "retard", "retarded", "faggot",
+})
+
+# Generic clickbait openers (and short stop-phrases) that smell like AI filler.
+_TITLE_CLICKBAIT_RE = re.compile(
+    r"^(pov:|wait until|you won't believe|this is why|watch this|"
+    r"omg|crazy[!.]*$|insane[!.]*$|you need to see|here'?s why)",
+    re.IGNORECASE,
+)
+
+_TITLE_TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
+
+
+def _title_tokens(text: str) -> List[str]:
+    return [t.lower() for t in _TITLE_TOKEN_RE.findall(str(text or ""))]
+
+
+def _validate_title(
+    candidate: str,
+    scene_graph: Dict[str, Any],
+    *,
+    platform: str = "",
+) -> Tuple[bool, str]:
+    """Return (is_valid, reason). Empty/None titles are considered valid (=null)."""
+    title = (candidate or "").strip()
+    if not title:
+        return True, "empty_ok"
+
+    title_lc = title.lower()
+    if _TITLE_CLICKBAIT_RE.search(title_lc):
+        return False, "clickbait_opener"
+
+    title_toks = _title_tokens(title)
+    for w in title_toks:
+        if w in _TITLE_PROFANITY:
+            return False, f"profanity:{w}"
+
+    transcript_data = scene_graph.get("transcript") or {}
+    transcript_text = str(transcript_data.get("text") or "")
+    if transcript_text and title_toks:
+        title_lower_str = " " + " ".join(title_toks) + " "
+        ttoks = _title_tokens(transcript_text)
+        # Any 4-gram from the transcript appearing verbatim in the title fails.
+        for i in range(0, max(0, len(ttoks) - 3)):
+            gram = " " + " ".join(ttoks[i : i + 4]) + " "
+            if gram in title_lower_str:
+                return False, "transcript_overlap_4gram"
+        # Direct >=3-word phrase from any transcript segment also fails.
+        for seg in (transcript_data.get("segments") or [])[:60]:
+            if not isinstance(seg, dict):
+                continue
+            seg_toks = _title_tokens(seg.get("text") or "")
+            if len(seg_toks) < 3:
+                continue
+            for i in range(0, len(seg_toks) - 2):
+                gram = " " + " ".join(seg_toks[i : i + 3]) + " "
+                if gram in title_lower_str:
+                    return False, "transcript_segment_3gram"
+
+    # Platform-specific length sanity (HARD floors/ceilings — the contract
+    # already asks for shape but the LLM sometimes ignores it).
+    plat = (platform or "").lower()
+    L = len(title)
+    if plat == "youtube" and (L < 20 or L > 100):
+        return False, f"youtube_length:{L}"
+    if plat in ("instagram", "facebook") and L > 100:
+        return False, f"{plat}_length:{L}"
+
+    return True, "ok"
+
+
+def _deterministic_evidence_title(
+    scene_graph: Dict[str, Any],
+    *,
+    platform: str = "",
+    preferred_cluster: str = "auto",
+) -> Optional[str]:
+    """Build a safe, evidence-only title using only allowed scene_graph fields.
+
+    Returns ``None`` if no allowed evidence is available. The output is shaped
+    per-platform: YouTube 50-70 chars headline; IG/FB 25-40 char short.
+    """
+    geo = scene_graph.get("geo") or {}
+    trill = scene_graph.get("trill") or {}
+    osd = scene_graph.get("dashcam_osd") or {}
+    music = scene_graph.get("music") or {}
+    vi = scene_graph.get("video_intelligence") or {}
+    vision = scene_graph.get("vision") or {}
+
+    place_token = ""
+    for k in ("gazetteer_place", "protected_area_name", "city", "state", "road"):
+        v = geo.get(k)
+        if isinstance(v, str) and v.strip():
+            place_token = v.strip()
+            break
+
+    speed_token = ""
+    try:
+        mph_val = geo.get("max_speed_mph")
+        if mph_val is None:
+            mph_val = osd.get("max_speed_mph")
+        if mph_val is not None:
+            mph = int(round(float(mph_val)))
+            if mph >= 5:
+                speed_token = f"{mph} MPH"
+    except (TypeError, ValueError):
+        pass
+
+    bucket_token = ""
+    bv = trill.get("bucket")
+    if isinstance(bv, str) and bv.strip():
+        bucket_token = bv.strip().title()
+
+    visual_token = ""
+    obj_tracks = vi.get("object_tracks") or []
+    if isinstance(obj_tracks, list):
+        for ot in obj_tracks[:3]:
+            if not isinstance(ot, dict):
+                continue
+            d = str(ot.get("description") or "").strip()
+            if d:
+                visual_token = d.title()
+                break
+    if not visual_token:
+        landmarks = vision.get("landmarks") or []
+        if landmarks:
+            visual_token = str(landmarks[0]).strip().title()
+
+    music_token = ""
+    artist = str(music.get("artist") or "").strip()
+    track = str(music.get("title") or "").strip()
+    if artist and track:
+        music_token = f"{artist} — {track}"
+    elif artist or track:
+        music_token = artist or track
+
+    cluster_order: List[str]
+    pref = (preferred_cluster or "").lower()
+    if pref in ("geo", "speed", "trill", "visual", "music"):
+        rest = [c for c in ("geo", "speed", "trill", "visual", "music") if c != pref]
+        cluster_order = [pref] + rest
+    else:
+        cluster_order = ["geo", "speed", "trill", "visual", "music"]
+
+    cluster_token: Dict[str, str] = {
+        "geo": place_token,
+        "speed": speed_token,
+        "trill": bucket_token,
+        "visual": visual_token,
+        "music": music_token,
+    }
+
+    parts: List[str] = []
+    for cl in cluster_order:
+        tok = cluster_token.get(cl) or ""
+        if tok and tok not in parts:
+            parts.append(tok)
+        if len(parts) >= 3:
+            break
+
+    if not parts:
+        return None
+
+    plat = (platform or "").lower()
+    if plat == "youtube":
+        joined = " · ".join(parts[:3])
+        if speed_token and speed_token not in joined and len(joined) < 60:
+            joined = f"{joined} at {speed_token}"
+        if len(joined) > 70:
+            joined = joined[:67].rstrip(" ,-—·") + "..."
+        if len(joined) < 20 and bucket_token and bucket_token not in joined:
+            joined = f"{joined} — {bucket_token} Run"
+        return joined[:100]
+    if plat in ("instagram", "facebook"):
+        short = parts[0]
+        if len(parts) > 1 and len(short) + 3 + len(parts[1]) <= 38:
+            short = f"{short} · {parts[1]}"
+        return short[:40]
+    return " · ".join(parts[:2])[:80]
 
 
 def _platform_title_from_caption(platform: str, caption: str) -> Optional[str]:
@@ -1679,6 +2054,42 @@ def apply_selection_to_context(
             ctx.m8_platform_titles[pl] = fallback_title[:120]
         if fallback_tags and pl not in ctx.m8_platform_hashtags:
             ctx.m8_platform_hashtags[pl] = list(fallback_tags[: max(1, hashtag_count)])
+
+    # ── Per-platform title variance enforcement ─────────────────────────
+    # If two platform titles share more than 70% token overlap, rebuild the
+    # lower-priority one from a different evidence cluster. Priority order:
+    # youtube > instagram > facebook (tiktok title is always null by contract).
+    scene_for_variance = getattr(ctx, "m8_scene_graph", None) or selection.get("scene_graph") or {}
+    priority = ["youtube", "instagram", "facebook"]
+    used_clusters: List[str] = []
+    cluster_cycle = ["geo", "speed", "trill", "visual", "music"]
+    for i, pl_hi in enumerate(priority):
+        title_hi = (ctx.m8_platform_titles or {}).get(pl_hi)
+        if not title_hi:
+            continue
+        toks_hi = set(_title_tokens(title_hi))
+        if not toks_hi:
+            continue
+        for pl_lo in priority[i + 1:]:
+            title_lo = (ctx.m8_platform_titles or {}).get(pl_lo)
+            if not title_lo:
+                continue
+            toks_lo = set(_title_tokens(title_lo))
+            if not toks_lo:
+                continue
+            overlap = len(toks_hi & toks_lo) / max(1, len(toks_hi | toks_lo))
+            if overlap > 0.70:
+                next_cluster = next(
+                    (c for c in cluster_cycle if c not in used_clusters), cluster_cycle[0]
+                )
+                rebuilt = _deterministic_evidence_title(
+                    scene_for_variance, platform=pl_lo, preferred_cluster=next_cluster
+                )
+                if rebuilt and rebuilt.lower() != str(title_lo).lower():
+                    ok_t, _ = _validate_title(rebuilt, scene_for_variance, platform=pl_lo)
+                    if ok_t:
+                        ctx.m8_platform_titles[pl_lo] = rebuilt[:120]
+                        used_clusters.append(next_cluster)
 
     # Legacy single fields — pick defaults for UI / non-platform consumers
     if "youtube" in ctx.m8_platform_titles:

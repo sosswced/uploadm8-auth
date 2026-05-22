@@ -116,6 +116,7 @@ from .billing_changes import (
     send_plan_upgraded_email,
     send_plan_downgraded_email,
     send_topup_receipt_email,
+    send_bundle_topup_receipt_email,
 )
 
 # ── Phase 4: Uploads ──────────────────────────────────────────────────────────
@@ -177,6 +178,7 @@ __all__ = [
     "send_plan_upgraded_email",
     "send_plan_downgraded_email",
     "send_topup_receipt_email",
+    "send_bundle_topup_receipt_email",
     # Uploads
     "send_upload_completed_email",
     "build_upload_completed_email_extensions",

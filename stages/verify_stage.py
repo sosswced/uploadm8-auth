@@ -22,7 +22,7 @@ import httpx
 from services.worker_leader_lock import acquire_leader_lock, release_leader_lock
 
 from . import db as db_stage
-from .notify_stage import notify_user_publish_confirmed
+from .notify_stage import notify_user_publish_confirmed, notify_user_publish_rejected
 from .publish_stage import decrypt_token, init_enc_keys
 
 logger = logging.getLogger("uploadm8-worker")
@@ -280,6 +280,65 @@ async def verify_single_attempt(
                 )
             except Exception as e:
                 logger.warning("publish_confirmed notify failed upload=%s: %s", uid_upload, e)
+
+    if (
+        db_pool
+        and verify_status == "rejected"
+        and prev_verify != "rejected"
+        and user_id
+    ):
+        uid_upload = str(attempt.get("upload_id", ""))
+        if uid_upload and platform in ("tiktok", "youtube"):
+            if platform == "tiktok":
+                detail = (
+                    "TikTok reported a terminal publish failure "
+                    "(FAILED or UPLOAD_ERROR), or another hard reject state."
+                )
+            else:
+                detail = (
+                    "YouTube reports the Short as failed, rejected, deleted, "
+                    "or no longer accessible via your channel."
+                )
+            try:
+                await notify_user_publish_rejected(
+                    db_pool,
+                    user_id=user_id,
+                    upload_id=uid_upload,
+                    platform=platform,
+                    detail=detail,
+                )
+            except Exception as e:
+                logger.warning("publish_rejected notify failed upload=%s: %s", uid_upload, e)
+
+    if (
+        db_pool
+        and verify_status == "failed"
+        and prev_verify != "failed"
+        and user_id
+    ):
+        uid_upload = str(attempt.get("upload_id", ""))
+        if uid_upload and platform in ("tiktok", "youtube"):
+            if platform == "tiktok":
+                detail = (
+                    "TikTok verification returned FAILED or could not confirm the publish "
+                    "(timeout, API error, or publish_id no longer valid)."
+                )
+            else:
+                detail = (
+                    "YouTube verification could not confirm the Short is live "
+                    "(API error, deleted video, or verification timeout)."
+                )
+            try:
+                await notify_user_publish_rejected(
+                    db_pool,
+                    user_id=user_id,
+                    upload_id=uid_upload,
+                    platform=platform,
+                    detail=detail,
+                    verify_outcome="failed",
+                )
+            except Exception as e:
+                logger.warning("publish_verify_failed notify failed upload=%s: %s", uid_upload, e)
 
 
 async def run_verification_loop(

@@ -39,6 +39,8 @@ Env:
       always read burned-in HUD into ``dashcam_osd_context``; ``.map`` remains the
       source of truth for Trill / route, and PADUS+gazetteer stay on that route
       (``telemetry_stage``). Backfill from OSD only when there are no ``.map`` points.
+  ``DASHCAM_OSD_FORCE_WHEN_MAP_TELEMETRY`` — ``true`` to **always** run the OCR sweep
+      even when ``DASHCAM_OSD_SKIP_WHEN_MAP_TELEMETRY=true`` (evidence-first ops; higher GCV cost).
   ``DASHCAM_OSD_BACKFILL_TELEMETRY`` — ``true`` to backfill ctx.telemetry_data
                                        when no .map file (default ``true``).
 """
@@ -668,12 +670,19 @@ def _vision_osd_context(ctx: JobContext) -> Dict[str, Any]:
         samples.append(parse_osd_line(chunk, t_s=t_s))
 
     osd = _aggregate(samples)
-    if not osd.get("gps_path"):
-        return {}
-    osd["engine"] = "vision_gcv_ocr"
-    osd["source"] = "vision_stage"
-    osd["vision_ocr_chars"] = len(ocr)
-    return osd
+    if osd.get("gps_path"):
+        osd["engine"] = "vision_gcv_ocr"
+        osd["source"] = "vision_stage"
+        osd["vision_ocr_chars"] = len(ocr)
+        return osd
+    # Speed-only path: Vision saw MPH/KMH tokens but no parseable GPS fixes.
+    peak = float(osd.get("max_speed_mph") or 0)
+    if peak > 0 or any(s.get("speed_mph") for s in osd.get("samples") or []):
+        osd["engine"] = "vision_gcv_ocr"
+        osd["source"] = "vision_stage_speed_only"
+        osd["vision_ocr_chars"] = len(ocr)
+        return osd
+    return {}
 
 
 async def backfill_telemetry_from_vision_osd(ctx: JobContext, *, enrich_geo: bool = True) -> bool:
@@ -690,6 +699,22 @@ async def backfill_telemetry_from_vision_osd(ctx: JobContext, *, enrich_geo: boo
         return False
 
     did = _backfill_telemetry(ctx, osd)
+    if not did and float(osd.get("max_speed_mph") or 0) > 0:
+        cur = getattr(ctx, "dashcam_osd_context", None)
+        if not isinstance(cur, dict):
+            cur = {}
+        cur = dict(cur)
+        prev_peak = float(cur.get("max_speed_mph") or 0)
+        od_peak = float(osd.get("max_speed_mph") or 0)
+        if od_peak > prev_peak:
+            cur["max_speed_mph"] = od_peak
+        cur["vision_osd_speed_fallback"] = osd
+        ctx.dashcam_osd_context = cur
+        logger.info(
+            "[dashcam_osd] merged Vision OCR peak speed (no GPS path): %.1f mph",
+            od_peak,
+        )
+        return True
     if not did:
         return False
     _apply_trill_from_backfilled_telemetry(ctx)
@@ -800,14 +825,21 @@ async def run_dashcam_osd_stage(ctx: JobContext) -> JobContext:
     if not DASHCAM_OSD_STAGE_ENABLED:
         raise SkipStage("Dashcam OSD stage disabled via env")
 
-    if not user_pref_ai_service_enabled(ctx.user_settings or {}, "dashcam_osd", default=True):
+    tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
+    tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
+    if not user_pref_ai_service_enabled(
+        ctx.user_settings or {}, "dashcam_osd", default=True, allowed_services=tier_allowed_set
+    ):
         raise SkipStage("Dashcam HUD Reader disabled in upload preferences (aiServiceDashcamOSD)")
 
     # Legacy / cost opt-out: skip full-strip OCR when Trill .map already populated.
     # Default is to always run so captions + fusion see HUD speed/driver/timeline
     # alongside .map GPS; PADUS/gazetteer still apply only to the .map route in
     # telemetry_stage (backfill path unchanged when no .map).
-    if _env_bool("DASHCAM_OSD_SKIP_WHEN_MAP_TELEMETRY", False):
+    if (
+        _env_bool("DASHCAM_OSD_SKIP_WHEN_MAP_TELEMETRY", False)
+        and not _env_bool("DASHCAM_OSD_FORCE_WHEN_MAP_TELEMETRY", False)
+    ):
         has_telemetry = bool(
             (ctx.telemetry_data and ctx.telemetry_data.points)
             or (ctx.telemetry and ctx.telemetry.points)
@@ -868,6 +900,39 @@ async def run_dashcam_osd_stage(ctx: JobContext) -> JobContext:
     osd["fps"] = fps
     osd["bottom_pct"] = bottom_pct
     osd["video_duration_s"] = round(duration, 2) if duration else None
+
+    # Full-frame Vision OCR often captures ESCORT-style footer HUD (lat/lon/speed) that
+    # bottom-strip sampling misses when the crop excludes the overlay.
+    strip_gps = bool(osd.get("gps_path"))
+    if not strip_gps:
+        vision_osd = _vision_osd_context(ctx)
+        path_v = (vision_osd or {}).get("gps_path") or []
+        if path_v:
+            osd["gps_path"] = path_v
+            osd["vision_strip_fallback"] = True
+            osd["vision_osd_source"] = str(vision_osd.get("source") or "vision_stage")
+            for _key in ("first_seen", "last_seen"):
+                vs = vision_osd.get(_key)
+                if isinstance(vs, dict) and vs.get("lat") is not None and vs.get("lon") is not None:
+                    cur = osd.get(_key)
+                    if not isinstance(cur, dict) or cur.get("lat") is None:
+                        osd[_key] = dict(vs)
+            try:
+                v_peak = float(vision_osd.get("max_speed_mph") or 0.0)
+                s_peak = float(osd.get("max_speed_mph") or 0.0)
+                if v_peak > s_peak:
+                    osd["max_speed_mph"] = vision_osd.get("max_speed_mph")
+                    osd["max_speed_at_s"] = vision_osd.get("max_speed_at_s")
+            except (TypeError, ValueError):
+                pass
+            if not osd.get("driver_name") and vision_osd.get("driver_name"):
+                osd["driver_name"] = vision_osd.get("driver_name")
+            osd["engine"] = "gcv+vision_fallback"
+            logger.info(
+                "[dashcam_osd] merged Vision OCR HUD path: fixes=%d source=%s",
+                len(path_v),
+                osd.get("vision_osd_source"),
+            )
 
     backfilled = False
     if backfill_enabled:

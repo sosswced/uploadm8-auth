@@ -166,6 +166,24 @@ _gcv_executor    = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gcv")
 VISION_LOGO_LANDMARK = (
     os.environ.get("VISION_LOGO_LANDMARK", "true").lower() in ("1", "true", "yes", "on")
 )
+VISION_WEB_DETECTION = os.environ.get("VISION_WEB_DETECTION", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+VISION_OBJECT_LOCALIZATION = os.environ.get("VISION_OBJECT_LOCALIZATION", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+VISION_IMAGE_PROPERTIES = os.environ.get("VISION_IMAGE_PROPERTIES", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 LIKELIHOOD_MAP = {
     0: "UNKNOWN",
@@ -324,9 +342,9 @@ def _get_gcv_client():
 
 
 def _vision_label_params() -> Tuple[int, float]:
-    label_max = int(os.environ.get("VISION_LABEL_MAX_RESULTS", "24") or 24)
+    label_max = int(os.environ.get("VISION_LABEL_MAX_RESULTS", "32") or 32)
     label_max = max(8, min(label_max, 50))
-    label_min_score = float(os.environ.get("VISION_LABEL_MIN_SCORE", "0.65") or 0.65)
+    label_min_score = float(os.environ.get("VISION_LABEL_MIN_SCORE", "0.55") or 0.55)
     label_min_score = max(0.35, min(label_min_score, 0.95))
     return label_max, label_min_score
 
@@ -340,6 +358,12 @@ def _gcv_feature_list(v: Any, label_max: int) -> List[Any]:
     if VISION_LOGO_LANDMARK:
         features.append(v.Feature(type_=v.Feature.Type.LOGO_DETECTION, max_results=10))
         features.append(v.Feature(type_=v.Feature.Type.LANDMARK_DETECTION, max_results=10))
+    if VISION_WEB_DETECTION:
+        features.append(v.Feature(type_=v.Feature.Type.WEB_DETECTION, max_results=20))
+    if VISION_OBJECT_LOCALIZATION:
+        features.append(v.Feature(type_=v.Feature.Type.OBJECT_LOCALIZATION, max_results=20))
+    if VISION_IMAGE_PROPERTIES:
+        features.append(v.Feature(type_=v.Feature.Type.IMAGE_PROPERTIES))
     return features
 
 
@@ -435,6 +459,56 @@ def _single_response_to_dict(response: Any, label_min_score: float) -> Dict[str,
     logo_names = [x["description"] for x in logos if x.get("description")]
     landmark_names = [x["description"] for x in landmarks if x.get("description")]
 
+    web_entities: List[Dict[str, Any]] = []
+    web_best_guess: List[str] = []
+    wd = getattr(response, "web_detection", None)
+    if wd is not None:
+        for ent in getattr(wd, "web_entities", None) or []:
+            desc = (getattr(ent, "description", None) or "").strip()
+            sc = float(getattr(ent, "score", 0.0) or 0.0)
+            web_min = float(os.environ.get("VISION_WEB_ENTITY_MIN_SCORE", "0.35") or 0.35)
+            if desc and sc >= web_min:
+                web_entities.append({"description": desc, "score": round(sc, 3)})
+        for lbl in getattr(wd, "best_guess_labels", None) or []:
+            g = (getattr(lbl, "label", None) or str(lbl) or "").strip()
+            if g:
+                web_best_guess.append(g)
+
+    localized_objects: List[Dict[str, Any]] = []
+    for obj in getattr(response, "localized_object_annotations", None) or []:
+        name = (getattr(obj, "name", None) or "").strip()
+        sc = float(getattr(obj, "score", 0.0) or 0.0)
+        obj_min = float(os.environ.get("VISION_LOCALIZED_OBJECT_MIN_SCORE", "0.45") or 0.45)
+        if name and sc >= obj_min:
+            localized_objects.append({"name": name, "score": round(sc, 3)})
+
+    dominant_colors: List[Dict[str, Any]] = []
+    ipa = getattr(response, "image_properties_annotation", None)
+    if ipa is not None:
+        dc = getattr(ipa, "dominant_colors", None)
+        for col in getattr(dc, "colors", None) or []:
+            try:
+                color = getattr(col, "color", None)
+                if color is None:
+                    continue
+                r = int(getattr(color, "red", 0) or 0)
+                g = int(getattr(color, "green", 0) or 0)
+                b = int(getattr(color, "blue", 0) or 0)
+                frac = float(getattr(col, "pixel_fraction", 0) or 0)
+                if frac < 0.04:
+                    continue
+                from services.google_visual_recognition import _rgb_color_name
+
+                dominant_colors.append(
+                    {
+                        "name": _rgb_color_name(r, g, b),
+                        "rgb": [r, g, b],
+                        "score": round(frac, 3),
+                    }
+                )
+            except (TypeError, ValueError, AttributeError):
+                continue
+
     return {
         "faces": faces,
         "face_count": len(faces),
@@ -448,6 +522,10 @@ def _single_response_to_dict(response: Any, label_min_score: float) -> Dict[str,
         "landmarks": landmarks,
         "logo_names": logo_names,
         "landmark_names": landmark_names,
+        "web_entities": web_entities,
+        "web_best_guess": web_best_guess,
+        "localized_objects": localized_objects,
+        "dominant_colors": dominant_colors[:8],
     }
 
 
@@ -480,14 +558,31 @@ def _merge_vision_dicts(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
     all_labels: List[Dict[str, Any]] = []
     all_logos: List[Dict[str, Any]] = []
     all_landmarks: List[Dict[str, Any]] = []
+    all_web: List[Dict[str, Any]] = []
+    all_localized: List[Dict[str, Any]] = []
+    all_colors: List[Dict[str, Any]] = []
+    web_guess_seen: set[str] = set()
+    web_best_guess: List[str] = []
     for p in parts:
         all_labels.extend(p.get("labels") or [])
         all_logos.extend(p.get("logos") or [])
         all_landmarks.extend(p.get("landmarks") or [])
+        all_web.extend(p.get("web_entities") or [])
+        all_localized.extend(p.get("localized_objects") or [])
+        all_colors.extend(p.get("dominant_colors") or [])
+        for g in p.get("web_best_guess") or []:
+            gs = str(g).strip()
+            if gs and gs.lower() not in web_guess_seen:
+                web_guess_seen.add(gs.lower())
+                web_best_guess.append(gs)
 
     labels = _merge_scored(all_labels)
     logos = _merge_scored(all_logos)
     landmarks = _merge_scored(all_landmarks)
+    web_entities = _merge_scored(all_web)
+    localized_objects = _merge_scored(
+        [{"description": x.get("name"), "score": x.get("score")} for x in all_localized if x.get("name")]
+    )
 
     best_faces = max(
         parts,
@@ -524,6 +619,17 @@ def _merge_vision_dicts(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
         "landmarks": landmarks,
         "logo_names": logo_names,
         "landmark_names": landmark_names,
+        "web_entities": web_entities,
+        "web_best_guess": web_best_guess[:12],
+        "localized_objects": [
+            {"name": x.get("description"), "score": x.get("score")}
+            for x in localized_objects
+            if x.get("description")
+        ],
+        "dominant_colors": sorted(
+            all_colors,
+            key=lambda x: -float(x.get("score") or 0),
+        )[:8],
         "vision_multi_frame": len(parts),
     }
 
@@ -861,10 +967,16 @@ async def run_vision_stage(ctx: JobContext) -> JobContext:
             )
 
         ctx.vision_context = result
+        try:
+            from services.google_visual_recognition import attach_visual_recognition
+
+            attach_visual_recognition(ctx)
+        except Exception as _vr_e:
+            logger.debug("[vision] visual recognition rollup skipped: %s", _vr_e)
 
         mf = result.get("vision_multi_frame") if isinstance(result, dict) else None
         logger.info(
-            "[vision] multi=%s faces=%s expressive=%s ocr_chars=%s labels=%s logos=%s landmarks=%s",
+            "[vision] multi=%s faces=%s expressive=%s ocr_chars=%s labels=%s logos=%s landmarks=%s web=%s",
             mf or 1,
             result.get("face_count", 0),
             result.get("expressive", False),
@@ -872,6 +984,7 @@ async def run_vision_stage(ctx: JobContext) -> JobContext:
             (result.get("label_names") or [])[:4],
             (result.get("logo_names") or [])[:5],
             (result.get("landmark_names") or [])[:5],
+            len(result.get("web_entities") or []),
         )
 
         return ctx

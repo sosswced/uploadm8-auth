@@ -529,14 +529,20 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
 
     env_audio = billing_env_from_os()
     transcribe_pref = bool(us.get("audio_transcription", us.get("audioTranscription", True)))
-    want_whisper = transcribe_pref and user_pref_ai_service_enabled(us, "audio_whisper", default=True)
+    tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
+    tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
+    want_whisper = transcribe_pref and user_pref_ai_service_enabled(
+        us, "audio_whisper", default=True, allowed_services=tier_allowed_set
+    )
     want_yamnet = env_audio.get("YAMNET_ENABLED", True) and user_pref_ai_service_enabled(
-        us, "audio_yamnet", default=True
+        us, "audio_yamnet", default=True, allowed_services=tier_allowed_set
     )
     want_acr = env_audio.get("ACRCLOUD_CONFIGURED", False) and user_pref_ai_service_enabled(
-        us, "audio_acr", default=True
+        us, "audio_acr", default=True, allowed_services=tier_allowed_set
     )
-    want_gpt_summary = user_pref_ai_service_enabled(us, "audio_gpt_classify", default=True)
+    want_gpt_summary = user_pref_ai_service_enabled(
+        us, "audio_gpt_classify", default=True, allowed_services=tier_allowed_set
+    )
 
     if not any((want_whisper, want_yamnet, want_acr, want_gpt_summary)):
         raise SkipStage("All audio analysis services disabled in upload preferences")

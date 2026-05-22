@@ -21,8 +21,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -54,13 +56,108 @@ _PERSONA_STYLE_TEXT_GUARD = (
     "only on the reference image. "
 )
 
+_DASHCAM_POV_FIDELITY_GUARD = (
+    "DASHCAM POV FIDELITY: edit the supplied in-car forward-facing frame only. "
+    "Preserve the real road, vehicle hood or windshield, trees, sky, and any HUD timestamp "
+    "overlay exactly. Do NOT add faces, people, celebrities, reaction shots, stock subjects, "
+    "neon compass circles, or graphic overlays not in the source frame."
+)
+
 logger = logging.getLogger("uploadm8-worker.thumb_renderer")
 
 MIN_THUMB_SIZE = 2048  # bytes — smaller responses are treated as render failures.
 DEFAULT_PIKZELS_MODEL = (os.environ.get("PIKZELS_THUMBNAIL_MODEL") or "pkz_4").strip() or "pkz_4"
 # Pikzels accepts long prompts; we cap to control cost/latency. Prioritize fused evidence first
 # (see ``_build_pikzels_v2_prompt``) so truncation cuts generic composition hints, not facts.
-_PIKZELS_IMAGE_PROMPT_MAX = max(400, int(os.environ.get("PIKZELS_THUMBNAIL_PROMPT_MAX", "1200") or 1200))
+# Pikzels public API rejects prompts over 1000 chars (VALIDATION_ERROR). Default below limit.
+# Abbreviations (_PROMPT_LABEL_ABBREVS) pack more hydration evidence into that budget.
+PIKZELS_API_PROMPT_HARD_MAX = 1000
+_PIKZELS_IMAGE_PROMPT_MAX = max(
+    400,
+    min(PIKZELS_API_PROMPT_HARD_MAX, int(os.environ.get("PIKZELS_THUMBNAIL_PROMPT_MAX", "950") or 950)),
+)
+
+# Long phrase → short token (applied before length trim).
+_PROMPT_LABEL_ABBREVS: List[tuple[str, str]] = [
+    ("Canonical geo (hydration_payload): ", "Geo: "),
+    ("Canonical dashcam/OSD (hydration_payload): ", "OSD: "),
+    ("Canonical music (hydration_payload): ", "Music: "),
+    ("Canonical speech/transcript (hydration_payload): ", "Speech: "),
+    ("Canonical vision labels (hydration_payload): ", "Vis: "),
+    ("Canonical vision OCR (hydration_payload): ", "OCR: "),
+    ("Canonical Trill (hydration_payload): ", "Trill: "),
+    ("UploadM8 fused evidence (canonical hydration_payload): ", "Fusion: "),
+    ("UploadM8 hydration story (canonical): ", "Story: "),
+    ("Canonical anchor phrase (hydration_payload): ", "Anchor: "),
+    ("Canonical signal hashtags (hydration_payload): ", "Tags: "),
+    ("UploadM8 fused evidence (ground truth): ", "Fusion: "),
+    ("UploadM8 hydration story (scene paragraph): ", "Story: "),
+    ("Pikzels creative brief: ", "Brief: "),
+    ("User-selected default thumbnail strategy: ", "Layout: "),
+    ("Geo/route context to reflect truthfully: ", "Geo: "),
+    ("Dashcam HUD/OSD context to preserve: ", "OSD: "),
+    ("Trill driving-energy context: ", "Trill: "),
+    ("Music/audio vibe context, do not imply ownership: ", "Music: "),
+    ("Speech/Whisper context for truthful hooks: ", "Speech: "),
+    ("Relevant signal tags for strategy: ", "Tags: "),
+    ("Layout and style notes: ", "Layout: "),
+    ("Hydration focus: ", "Hydr: "),
+    ("Ground in canonical hydration: ", "Hydr: "),
+    ("peak speed ", "spd "),
+    ("driver/OSD ", "drv "),
+    ("recording start ", "rec "),
+    ("road/highway ", "rd "),
+    ("coordinates ", "coords "),
+    ("bucket ", "bkt "),
+    (" score ", " sc "),
+]
+
+_PROMPT_TAIL_DROP_MARKERS: List[str] = [
+    "MrBeast-style YouTube thumbnail composition",
+    "YT thumb style:",
+    "Natural cinematic grade on existing scene only",
+    "Use the supplied source frame as factual grounding",
+    "Ground on supplied frame",
+    "16:9 widescreen YouTube canvas",
+    "9:16 vertical canvas",
+]
+
+
+def abbreviate_pikzels_prompt(prompt: str) -> str:
+    """Shorten verbose hydration labels so more evidence fits under the API cap."""
+    s = re.sub(r"\s+", " ", str(prompt or "").strip())
+    for old, new in _PROMPT_LABEL_ABBREVS:
+        s = s.replace(old, new)
+    # Compact telemetry speed tokens only — do not rewrite headline text like "64 MPH".
+    s = re.sub(r"\bspd\s+(\d+(?:\.\d+)?)\s*mph\b", r"spd \1mph", s, flags=re.I)
+    s = re.sub(r"\bpeak speed[:\s]+(\d+(?:\.\d+)?)\s*mph\b", r"spd \1mph", s, flags=re.I)
+    s = re.sub(r"\btranscript\b", "txcript", s, flags=re.I)
+    s = re.sub(r"\brecording\b", "rec", s, flags=re.I)
+    s = re.sub(r"\bhighway\b", "hwy", s, flags=re.I)
+    return re.sub(r"\s{2,}", " ", s).strip()
+
+
+def fit_pikzels_prompt_to_budget(prompt: str, cap: Optional[int] = None) -> str:
+    """Abbreviate, then drop low-priority tail hints, then word-safe trim."""
+    limit = int(cap) if cap is not None else min(_PIKZELS_IMAGE_PROMPT_MAX, PIKZELS_API_PROMPT_HARD_MAX)
+    limit = max(400, min(PIKZELS_API_PROMPT_HARD_MAX, limit))
+    s = abbreviate_pikzels_prompt(prompt)
+    if len(s) <= limit:
+        return s
+    for marker in _PROMPT_TAIL_DROP_MARKERS:
+        if len(s) <= limit:
+            break
+        idx = s.rfind(marker)
+        if idx > int(limit * 0.45):
+            s = s[:idx].rstrip(" .;,")
+    if len(s) > limit:
+        s = s[:limit].rsplit(" ", 1)[0].rstrip(" .;,")
+    return s
+
+
+def clamp_pikzels_image_prompt(prompt: str) -> str:
+    """Final guard before POST — abbreviate and never exceed Pikzels API hard limit."""
+    return fit_pikzels_prompt_to_budget(str(prompt or "").strip())
 
 # Internal-only brief notes that must never block hydration or consume prompt budget.
 _THUMB_NOTES_PLACEHOLDERS = frozenset({"No AI — evidence-based brief", "Fallback brief"})
@@ -113,10 +210,13 @@ def _build_pikzels_v2_prompt(
     platform: str,
     trace_sink: Optional[Any] = None,
     hydration_payload: Optional[Dict[str, Any]] = None,
+    platform_color: Optional[str] = None,
+    accent_color: Optional[str] = None,
 ) -> str:
     """Compose a single-string render prompt from the GPT-generated brief."""
     if not isinstance(brief, dict):
         brief = {}
+    dashcam_pov = bool(brief.get("_uploadm8_dashcam_pov")) or (category or "").strip().lower() == "dashcam"
     parts: List[str] = []
 
     headline = str(brief.get("selected_headline") or "").strip()
@@ -173,6 +273,9 @@ def _build_pikzels_v2_prompt(
             "wording. Pure photographic composition only — no typography of any kind."
         )
 
+    if dashcam_pov:
+        parts.append(_DASHCAM_POV_FIDELITY_GUARD)
+
     prioritized: List[str] = []
 
     hp = hydration_payload if isinstance(hydration_payload, dict) else None
@@ -183,8 +286,11 @@ def _build_pikzels_v2_prompt(
         city = str(geo.get("city") or "").strip()
         st = str(geo.get("state") or "").strip()
         geo_parts: List[str] = []
+        disp = str(geo.get("display") or "").strip()
+        if disp:
+            geo_parts.append(disp[:120])
         if road:
-            geo_parts.append(f"road/highway {road}")
+            geo_parts.append(f"rd {road}")
         if city and st:
             geo_parts.append(f"{city}, {st}")
         elif city:
@@ -192,60 +298,48 @@ def _build_pikzels_v2_prompt(
         lat, lon = geo.get("lat"), geo.get("lon")
         if lat is not None and lon is not None:
             try:
-                geo_parts.append(f"coords {float(lat):.4f},{float(lon):.4f}")
+                geo_parts.append(f"gps {float(lat):.4f},{float(lon):.4f}")
             except (TypeError, ValueError):
                 pass
         if geo_parts:
-            prioritized.append(
-                "Canonical geo (hydration_payload): " + "; ".join(geo_parts)[:280]
-            )
+            prioritized.append("Geo: " + "; ".join(geo_parts)[:200])
 
         osd = ev.get("osd") if isinstance(ev.get("osd"), dict) else {}
         osd_parts: List[str] = []
         msm = osd.get("max_speed_mph")
         if msm is not None:
             try:
-                osd_parts.append(f"peak speed {float(msm):.1f} mph")
+                osd_parts.append(f"spd {float(msm):.0f}mph")
             except (TypeError, ValueError):
-                osd_parts.append(f"peak speed {msm}")
+                osd_parts.append(f"spd {msm}mph")
         dn = str(osd.get("driver_name") or "").strip()
         if dn:
-            osd_parts.append(f"driver/OSD {dn}")
+            osd_parts.append(f"drv {dn[:40]}")
         fss = str(osd.get("first_seen") or "").strip()
         if fss:
-            osd_parts.append(f"recording start {fss}")
+            osd_parts.append(f"rec {fss[:32]}")
         if osd_parts:
-            prioritized.append(
-                "Canonical dashcam/OSD (hydration_payload): " + "; ".join(osd_parts)[:280]
-            )
+            prioritized.append("OSD: " + "; ".join(osd_parts)[:160])
 
         mus = ev.get("music") if isinstance(ev.get("music"), dict) else {}
         ma, mt = str(mus.get("artist") or "").strip(), str(mus.get("title") or "").strip()
         if ma or mt:
-            prioritized.append(
-                "Canonical music (hydration_payload): "
-                + " — ".join(p for p in (ma, mt) if p)[:220]
-            )
+            prioritized.append("Music: " + " — ".join(p for p in (ma, mt) if p)[:140])
 
         spch = ev.get("speech") if isinstance(ev.get("speech"), dict) else {}
         phrase = str(spch.get("phrase") or "").strip()
         if phrase:
-            prioritized.append(
-                f"Canonical speech/transcript (hydration_payload): {phrase[:260]}"
-            )
+            prioritized.append(f"Speech: {phrase[:200]}")
 
         vis = ev.get("vision") if isinstance(ev.get("vision"), dict) else {}
         vlabels = vis.get("labels") if isinstance(vis.get("labels"), list) else []
         if vlabels:
             prioritized.append(
-                "Canonical vision labels (hydration_payload): "
-                + ", ".join(str(x) for x in vlabels[:10])[:240]
+                "Vis: " + ", ".join(str(x) for x in vlabels[:8])[:160]
             )
-        voc = str(vis.get("ocr") or "").strip()[:140]
+        voc = str(vis.get("ocr") or "").strip()[:100]
         if voc:
-            prioritized.append(
-                f"Canonical vision OCR (hydration_payload): {voc}"
-            )
+            prioritized.append(f"OCR: {voc}")
 
         tri = ev.get("trill") if isinstance(ev.get("trill"), dict) else {}
         tbuck = str(tri.get("bucket") or "").strip()
@@ -254,50 +348,43 @@ def _build_pikzels_v2_prompt(
             if tsco is not None:
                 try:
                     prioritized.append(
-                        f"Canonical Trill (hydration_payload): bucket {tbuck} score {float(tsco):.0f}"[:240]
+                        f"Trill: bkt {tbuck} sc {float(tsco):.0f}"[:80] if tbuck else f"Trill: sc {float(tsco):.0f}"[:40]
                     )
                 except (TypeError, ValueError):
                     if tbuck:
-                        prioritized.append(f"Canonical Trill (hydration_payload): {tbuck}"[:220])
+                        prioritized.append(f"Trill: {tbuck}"[:60])
             elif tbuck:
-                prioritized.append(f"Canonical Trill (hydration_payload): {tbuck}"[:220])
+                prioritized.append(f"Trill: {tbuck}"[:60])
 
         cfs = str(hp.get("fusion_summary") or "").strip()
         if cfs:
-            prioritized.append(
-                "UploadM8 fused evidence (canonical hydration_payload): " + cfs[:400]
-            )
+            prioritized.append("Fusion: " + cfs[:280])
 
         hstory = str(hp.get("hydration_story") or "").strip()
         if hstory:
-            prioritized.append(
-                "UploadM8 hydration story (canonical): " + hstory[:320]
-            )
+            prioritized.append("Story: " + hstory[:220])
 
         anch = str(hp.get("anchor_phrase") or "").strip()
         if anch:
-            prioritized.append(f"Canonical anchor phrase (hydration_payload): {anch[:220]}")
+            prioritized.append(f"Anchor: {anch[:120]}")
 
         sigs = hp.get("signal_hashtags")
         if isinstance(sigs, list) and sigs:
             prioritized.append(
-                "Canonical signal hashtags (hydration_payload): "
-                + ", ".join(str(x) for x in sigs[:10])[:180]
+                "Tags: " + ", ".join(str(x) for x in sigs[:8])[:120]
             )
 
     fusion = str(brief.get("fusion_summary") or "").strip()
-    if fusion:
-        prioritized.append(f"UploadM8 fused evidence (ground truth): {fusion[:400]}")
+    if fusion and not any(p.startswith("Fusion:") for p in prioritized):
+        prioritized.append(f"Fusion: {fusion[:280]}")
 
     hydration_story_slice = str(brief.get("hydration_story") or "").strip()
-    if hydration_story_slice and len(fusion) < 120:
-        prioritized.append(
-            "UploadM8 hydration story (scene paragraph): " + hydration_story_slice[:320]
-        )
+    if hydration_story_slice and len(fusion) < 120 and not any(p.startswith("Story:") for p in prioritized):
+        prioritized.append(f"Story: {hydration_story_slice[:220]}")
 
     text_brief = str(brief.get("pikzels_text_brief") or brief.get("engine_text_brief") or "").strip()
     if text_brief:
-        prioritized.append(f"Pikzels creative brief: {text_brief[:380]}")
+        prioritized.append(f"Brief: {text_brief[:240]}")
 
     default_strategy = brief.get("default_strategy")
     if isinstance(default_strategy, dict) and default_strategy:
@@ -322,71 +409,87 @@ def _build_pikzels_v2_prompt(
         prioritized.append(notes)
 
     geo_context = str(brief.get("geo_context") or "").strip()
-    if geo_context:
-        prioritized.append(f"Geo/route context to reflect truthfully: {geo_context[:260]}")
+    if geo_context and not any(p.startswith("Geo:") for p in prioritized):
+        prioritized.append(f"Geo: {geo_context[:200]}")
 
     osd_context = str(brief.get("osd_context") or "").strip()
-    if osd_context:
-        prioritized.append(f"Dashcam HUD/OSD context to preserve: {osd_context[:220]}")
+    if osd_context and not any(p.startswith("OSD:") for p in prioritized):
+        prioritized.append(f"OSD: {osd_context[:160]}")
 
     trill_context = str(brief.get("trill_context") or "").strip()
-    if trill_context:
-        prioritized.append(f"Trill driving-energy context: {trill_context[:220]}")
+    if trill_context and not any(p.startswith("Trill:") for p in prioritized):
+        prioritized.append(f"Trill: {trill_context[:120]}")
 
     music_context = str(brief.get("music_context") or "").strip()
-    if music_context:
-        prioritized.append(f"Music/audio vibe context, do not imply ownership: {music_context[:220]}")
+    if music_context and not any(p.startswith("Music:") for p in prioritized):
+        prioritized.append(f"Music: {music_context[:140]}")
 
     speech_context = str(brief.get("speech_context") or "").strip()
-    if speech_context:
-        prioritized.append(f"Speech/Whisper context for truthful hooks: {speech_context[:260]}")
+    if speech_context and not any(p.startswith("Speech:") for p in prioritized):
+        prioritized.append(f"Speech: {speech_context[:200]}")
 
     signal_hashtags = str(brief.get("signal_hashtags") or "").strip()
-    if signal_hashtags:
-        prioritized.append(f"Relevant signal tags for strategy: {signal_hashtags[:180]}")
+    if signal_hashtags and not any(p.startswith("Tags:") for p in prioritized):
+        prioritized.append(f"Tags: {signal_hashtags[:120]}")
 
     styling: List[str] = []
-    badge_text = str(brief.get("badge_text") or "").strip()
-    badge_style = str(brief.get("badge_style") or "").strip().lower()
-    if badge_text:
-        if badge_style:
-            styling.append(f'a {badge_style} circular badge with the word "{badge_text[:14]}"')
-        else:
-            styling.append(f'a circular badge with the word "{badge_text[:14]}"')
+    if not dashcam_pov:
+        badge_text = str(brief.get("badge_text") or "").strip()
+        badge_style = str(brief.get("badge_style") or "").strip().lower()
+        if badge_text:
+            if badge_style:
+                styling.append(f'a {badge_style} circular badge with the word "{badge_text[:14]}"')
+            else:
+                styling.append(f'a circular badge with the word "{badge_text[:14]}"')
 
-    direction = str(brief.get("directional_element") or "").strip().lower()
-    if direction and direction not in ("none", "null"):
-        styling.append(f"a bold {direction} directional element pointing at the subject")
+        direction = str(brief.get("directional_element") or "").strip().lower()
+        if direction and direction not in ("none", "null"):
+            styling.append(f"a bold {direction} directional element pointing at the subject")
 
-    props = brief.get("props") or []
-    if isinstance(props, list):
-        clean_props = [str(p).strip() for p in props if isinstance(p, (str, int, float)) and str(p).strip()]
-        if clean_props:
-            styling.append(f"props: {', '.join(clean_props[:5])}")
+        props = brief.get("props") or []
+        if isinstance(props, list):
+            clean_props = [str(p).strip() for p in props if isinstance(p, (str, int, float)) and str(p).strip()]
+            if clean_props:
+                styling.append(f"props: {', '.join(clean_props[:5])}")
 
-    emotion = str(brief.get("emotion_cue") or "").strip().lower()
-    if emotion:
-        styling.append(_EMOTION_HINTS.get(emotion, f"{emotion} facial expression"))
+        emotion = str(brief.get("emotion_cue") or "").strip().lower()
+        if emotion:
+            styling.append(_EMOTION_HINTS.get(emotion, f"{emotion} facial expression"))
 
     color_mood = str(brief.get("color_mood") or "").strip().lower()
     if color_mood:
         styling.append(_COLOR_MOOD_HINTS.get(color_mood, color_mood.replace("_", " ") + " color palette"))
 
+    plat_color = str(platform_color or "").strip()
+    if plat_color:
+        styling.append(
+            f"platform badge and corner indicator use solid color {plat_color}"
+        )
+    accent = str(accent_color or "").strip()
+    if accent:
+        styling.append(
+            f"accent highlight strokes, arrows, circles, and focal glow use {accent}"
+        )
+
     tail: List[str] = []
-    if category and category != "general":
+    if category and category != "general" and not dashcam_pov:
         tail.append(f"{category} content category visual cues")
 
-    canvas_hint = "16:9 widescreen YouTube canvas" if (platform or "").lower() == "youtube" else "9:16 vertical canvas, subject centered for safe-area cropping"
+    canvas_hint = "16:9 YT" if (platform or "").lower() == "youtube" else "9:16 vert, safe crop"
     tail.append(canvas_hint)
 
-    tail.append("Use the supplied source frame as factual grounding; keep text and visuals specific to visible content")
-    tail.append("MrBeast-style YouTube thumbnail composition: high contrast, sharp subject, dramatic lighting, eye magnet")
+    if dashcam_pov:
+        tail.append("Natural cinematic grade on existing scene only; no new subjects")
+    else:
+        tail.append("Ground on supplied frame; match visible content")
+        tail.append("YT thumb style: hi contrast, sharp subj, dramatic light")
 
     ordered = parts + prioritized + styling + tail
     prompt = ". ".join(p for p in ordered if p)
-    cap = _PIKZELS_IMAGE_PROMPT_MAX
-    if len(prompt) > cap:
-        prompt = prompt[:cap]
+    # Public API: prompt cannot contain URLs (YouTube links in notes/fusion would 4xx).
+    prompt = re.sub(r"https?://[^\s]+", "", prompt, flags=re.IGNORECASE)
+    prompt = re.sub(r"\s{2,}", " ", prompt).strip()
+    prompt = fit_pikzels_prompt_to_budget(prompt)
     if callable(trace_sink):
         try:
             trace_sink(
@@ -543,6 +646,11 @@ async def render_thumbnail_with_studio_renderer(
     """
     Render a styled platform thumbnail via Pikzels v2 ``/v2/thumbnail/image``.
 
+    When ``brief`` contains ``_uploadm8_pikzels_support_image_url`` (HTTPS still, e.g.
+    YouTube ``i.ytimg.com``), it is sent as ``support_image_url`` for pkz_4 / pkz_4_5
+    (public API forbids URLs inside ``prompt``). Prompt assembly strips any remaining
+    URL tokens to avoid validation errors.
+
     Returns True only when a non-empty output image is written to ``output_path``.
     All failures are non-fatal and logged at WARNING.
     """
@@ -572,26 +680,44 @@ async def render_thumbnail_with_studio_renderer(
     hp_raw = getattr(job_context, "hydration_payload", None) if job_context is not None else None
     hydration_payload = hp_raw if isinstance(hp_raw, dict) else None
 
+    from services.platform_colors import platform_color_for, resolve_platform_colors
+
+    us = getattr(job_context, "user_settings", None) if job_context is not None else None
+    color_map = resolve_platform_colors(us if isinstance(us, dict) else None)
+
     prompt = _build_pikzels_v2_prompt(
         brief or {},
         category=category or "",
         platform=plat,
         trace_sink=trace_sink,
         hydration_payload=hydration_payload,
+        platform_color=platform_color_for(color_map, plat),
+        accent_color=color_map.get("accent"),
     )
 
     iw = "medium"
+    explicit_weight = False
     if isinstance(options, dict):
         ow = str(options.get("image_weight") or "").strip().lower()
         if ow in ("low", "medium", "high"):
             iw = ow
+            explicit_weight = True
         else:
             rs = options.get("reference_strength")
             if isinstance(rs, (int, float)):
                 try:
                     iw = closeness_to_pikzels_image_weight(int(rs))
+                    explicit_weight = True
                 except (TypeError, ValueError):
                     pass
+    has_persona = bool(
+        isinstance(persona, dict)
+        and str(persona.get("id") or persona.get("pikzonality_id") or "").strip()
+    )
+    if isinstance(brief, dict) and brief.get("_uploadm8_dashcam_pov"):
+        iw = "high"
+    elif not explicit_weight and not has_persona:
+        iw = "high"
 
     payload: Dict[str, Any] = {
         "prompt": prompt,
@@ -600,6 +726,24 @@ async def render_thumbnail_with_studio_renderer(
         "model": DEFAULT_PIKZELS_MODEL,
         "format": fmt,
     }
+
+    _model_lc = str(payload.get("model") or DEFAULT_PIKZELS_MODEL).strip().lower()
+    _sup_ref = ""
+    if isinstance(brief, dict):
+        _sup_ref = str(brief.get("_uploadm8_pikzels_support_image_url") or "").strip()
+    if _sup_ref.startswith("https://") and _model_lc in ("pkz_4", "pkz_4_5"):
+        payload["support_image_url"] = _sup_ref[:2000]
+        logger.info(
+            "[thumb-renderer] Pikzels payload includes support_image_url (YouTube still) upload=%s platform=%s",
+            upload_id,
+            plat,
+        )
+    elif _sup_ref.startswith("https://") and _model_lc:
+        logger.debug(
+            "[thumb-renderer] support_image_url skipped (model %s; pkz_4+ only) upload=%s",
+            _model_lc,
+            upload_id,
+        )
 
     persona_uuid_set = False
     style_uuid_set = False
@@ -668,9 +812,20 @@ async def render_thumbnail_with_studio_renderer(
         )
 
     if persona_uuid_set or style_uuid_set:
-        payload["prompt"] = (
+        payload["prompt"] = clamp_pikzels_image_prompt(
             _PERSONA_STYLE_TEXT_GUARD + str(payload.get("prompt") or "")
-        ).strip()[:_PIKZELS_IMAGE_PROMPT_MAX]
+        )
+
+    pre_post_len = len(str(payload.get("prompt") or ""))
+    payload["prompt"] = clamp_pikzels_image_prompt(str(payload.get("prompt") or ""))
+    if pre_post_len > len(payload["prompt"]):
+        logger.warning(
+            "[thumb-renderer] Pikzels prompt capped upload=%s platform=%s from=%d to=%d",
+            upload_id,
+            plat,
+            pre_post_len,
+            len(payload["prompt"]),
+        )
 
     if job_context is not None:
         from services.thumbnail_trace import persist_pikzels_prompt_for_platform, trace_append
@@ -713,14 +868,32 @@ async def render_thumbnail_with_studio_renderer(
             status, upload_id, plat, str(data)[:240],
         )
         if job_context is not None:
+            body_blob = ""
+            try:
+                body_blob = json.dumps(data, default=str)[:2000] if isinstance(data, dict) else str(data)[:2000]
+            except Exception:
+                body_blob = str(data)[:2000]
+            low = body_blob.lower()
+            prompt_long = status == 400 and (
+                "1000" in low
+                or "prompt must" in low
+                or "validation_error" in low
+                or "too long" in low
+            )
             append_provider_error(
                 job_context,
                 provider="pikzels",
                 stage="thumbnail_stage",
                 operation="thumbnail_image_post",
-                message="non-2xx or non-json response",
+                message=(
+                    "Pikzels rejected prompt length (API max 1000 chars); shorten fused evidence "
+                    "or lower PIKZELS_THUMBNAIL_PROMPT_MAX"
+                    if prompt_long
+                    else "non-2xx or non-json response"
+                ),
                 http_status=status,
-                response_body_snippet=str(data)[:1200],
+                provider_code="prompt_too_long" if prompt_long else None,
+                response_body_snippet=body_blob[:1200],
             )
         return False
 
@@ -788,7 +961,7 @@ async def refine_thumbnail_with_pikzels_edit(
     plat = (platform or "").strip().lower()
     fmt = _PLATFORM_FORMAT.get(plat, "16:9")
     payload: Dict[str, Any] = {
-        "prompt": ep[:980],
+        "prompt": clamp_pikzels_image_prompt(ep),
         "image_base64": f"data:image/jpeg;base64,{b64}",
         "format": fmt,
         "model": DEFAULT_PIKZELS_MODEL,

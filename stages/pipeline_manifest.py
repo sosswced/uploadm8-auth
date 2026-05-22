@@ -59,7 +59,6 @@ def init_pipeline_diag(ctx: JobContext, upload_record: dict, *, is_deferred: boo
             "reframe_mode": getattr(ctx, "reframe_mode", None) or "auto",
             "privacy": getattr(ctx, "privacy", None) or "public",
             "can_watermark": bool(ctx.entitlements.can_watermark) if ctx.entitlements else None,
-            "can_burn_hud": bool(ctx.entitlements.can_burn_hud) if ctx.entitlements else None,
             "can_ai": bool(ctx.entitlements.can_ai) if ctx.entitlements else None,
             "user_ai_service_toggles": toggles,
             "worker_env": {

@@ -25,7 +25,7 @@ from .base import (
     send_email, mailgun_ready,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, stat_grid, secondary_links,
-    section_tag, metric_hero,
+    section_tag, metric_hero, BrandContext,
     GRAD_GREEN, GRAD_RED, GRAD_ORANGE, GRAD_BLUE,
     URL_DASHBOARD, URL_SETTINGS, SUPPORT_EMAIL, FRONTEND_URL,
 )
@@ -151,6 +151,12 @@ def build_upload_completed_email_extensions(
     if ctx.finished_at:
         posted = ctx.finished_at.strftime("%Y-%m-%d %H:%M UTC")
     tq = thumbnail_quality_summary_text(ctx)
+    scene_story_value = ""
+    try:
+        if isinstance(ctx.output_artifacts, dict):
+            scene_story_value = str(ctx.output_artifacts.get("scene_story") or "").strip()
+    except Exception:
+        scene_story_value = ""
     return {
         "duration_seconds": _video_duration_seconds(ctx),
         "detail_title": title,
@@ -163,6 +169,7 @@ def build_upload_completed_email_extensions(
         "platform_links_html": _platform_post_links_html(ctx),
         "partial_warning_html": _partial_failures_block(ctx),
         "thumbnail_score_summary": tq,
+        "scene_story": scene_story_value[:1600],
     }
 
 
@@ -190,6 +197,8 @@ async def send_upload_completed_email(
     partial_warning_html: str = "",
     thumbnail_score_summary: str = "",
     preview_image_url: Optional[str] = None,
+    scene_story: str = "",
+    brand: Optional[BrandContext] = None,
 ) -> None:
     """
     Sent when an upload job reaches ``succeeded`` or ``partial`` status.
@@ -275,6 +284,17 @@ async def send_upload_completed_email(
             hex_color="#0ea5e9",
         )
 
+    scene_box = ""
+    sc = (scene_story or "").strip()
+    if sc:
+        sc_esc = html.escape(sc, quote=False)
+        scene_box = tinted_box(
+            f'<p style="margin:0 0 6px;color:#6b7280;font-size:10px;text-transform:uppercase;'
+            f'letter-spacing:1.2px;font-weight:600;">Scene Story</p>'
+            f'<p style="margin:0;color:#e5e7eb;font-size:13px;line-height:1.65;white-space:pre-wrap;">{sc_esc}</p>',
+            hex_color="#10b981",
+        )
+
     prefs_box = ""
     if (prefs_summary_html or "").strip():
         prefs_box = tinted_box(
@@ -294,10 +314,11 @@ async def send_upload_completed_email(
             padding="0 40px 20px",
         )
 
-    html = email_shell(
+    body_html = email_shell(
         gradient=GRAD_GREEN,
         tagline="Upload once. Publish everywhere.",
         preheader_text=f"{filename} is live! Published to {platform_count} {platform_word} — open links below.",
+        brand=brand,
         body_rows=(
             section_tag("Upload Live &#127775;", "#16a34a")
             + intro_row(
@@ -315,6 +336,7 @@ async def send_upload_completed_email(
             + _platform_badges(platforms)
             + preview_box
             + copy_box
+            + scene_box
             + links_box
             + prefs_box
             + partial_row
@@ -331,7 +353,79 @@ async def send_upload_completed_email(
         footer_note="You received this because upload email notifications are enabled on your account.",
     )
 
-    await send_email(email, f"🌟 Your upload is live on {platform_count} {platform_word}!", html)
+    subject = f"🌟 Your upload is live on {platform_count} {platform_word}!"
+    if brand:
+        subject = f"{brand.company_name} — upload live on {platform_count} {platform_word}"
+    await send_email(email, subject, body_html)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b. Processing complete — scheduled publish (deferred / staged uploads)
+# ─────────────────────────────────────────────────────────────────────────────
+async def send_upload_staged_processing_email(
+    email: str,
+    name: str,
+    filename: str,
+    platforms: list[str],
+    upload_id: str = "",
+    *,
+    scheduled_at_label: str = "",
+) -> None:
+    """Sent when processing finishes but publish is deferred until ``scheduled_time``."""
+    if not mailgun_ready():
+        return
+
+    plat_n = len(platforms or [])
+    plat_word = "platform" if plat_n == 1 else "platforms"
+    queue_href = (
+        f"{FRONTEND_URL.rstrip('/')}/queue.html?focus={quote(str(upload_id), safe='')}&open=1"
+        if upload_id
+        else URL_DASHBOARD
+    )
+    sched = (scheduled_at_label or "").strip() or "your scheduled time (UTC)"
+
+    body_html = email_shell(
+        gradient=GRAD_BLUE,
+        tagline="Upload once. Publish everywhere.",
+        preheader_text=f"{filename} is processed and queued — publishes {sched}.",
+        body_rows=(
+            section_tag("Ready to publish", "#2563eb")
+            + intro_row(
+                "Video processed — waiting for your schedule &#9200;",
+                f"Hi {html.escape(name, quote=False)}, "
+                f"<strong style='color:#ffffff;'>{html.escape(filename, quote=False)}</strong> "
+                f"finished AI processing and is queued for "
+                f"<strong style='color:#60a5fa;'>{html.escape(sched, quote=False)}</strong>. "
+                f"It will go live to <strong style='color:#93c5fd;'>{plat_n} {plat_word}</strong> automatically. "
+                "Open the queue if you want to edit metadata or cancel before publish.",
+            )
+            + tinted_box(
+                f'<p style="margin:0;color:#9ca3af;font-size:13px;line-height:1.65;">'
+                f'You received this because upload email notifications are enabled.</p>'
+                + (
+                    f'<p style="margin:10px 0 0;color:#9ca3af;font-size:12px;">'
+                    f'Upload ID: <code style="color:#f97316;">{html.escape(str(upload_id), quote=False)}</code></p>'
+                    if upload_id
+                    else ""
+                ),
+                hex_color="#374151",
+                pb="28px",
+            )
+            + cta_button("Open queue", queue_href, pt="14px", pb="20px")
+            + secondary_links(
+                ("Queue", queue_href),
+                ("Dashboard", URL_DASHBOARD),
+                ("Settings", URL_SETTINGS),
+            )
+        ),
+        footer_note="You received this because upload email notifications are enabled on your account.",
+    )
+
+    await send_email(
+        email,
+        f"⏰ Processed — scheduled publish: {filename}",
+        body_html,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -345,6 +439,8 @@ async def send_upload_failed_email(
     error_reason: str = "",
     upload_id: str = "",
     stage: str = "",
+    scene_story: str = "",
+    brand: Optional[BrandContext] = None,
 ) -> None:
     """
     Sent when an upload job reaches 'failed' status.
@@ -358,10 +454,22 @@ async def send_upload_failed_email(
     reason_display = error_reason or "An unexpected error occurred during processing."
     stage_label    = stage.replace("_", " ").title() if stage else "Processing"
 
-    html = email_shell(
+    scene_box = ""
+    sc = (scene_story or "").strip()
+    if sc:
+        sc_esc = html.escape(sc, quote=False)
+        scene_box = tinted_box(
+            f'<p style="margin:0 0 6px;color:#6b7280;font-size:10px;text-transform:uppercase;'
+            f'letter-spacing:1.2px;font-weight:600;">Scene Story (what we saw before it failed)</p>'
+            f'<p style="margin:0;color:#e5e7eb;font-size:13px;line-height:1.65;white-space:pre-wrap;">{sc_esc}</p>',
+            hex_color="#10b981",
+        )
+
+    body_html = email_shell(
         gradient=GRAD_RED,
         tagline="Upload once. Publish everywhere.",
         preheader_text=f"Upload failed: {filename} could not be published. Your tokens have been refunded.",
+        brand=brand,
         body_rows=(
             section_tag("Upload Failed", "#ef4444")
             + intro_row(
@@ -382,6 +490,7 @@ async def send_upload_failed_email(
                 ),
                 hex_color="#ef4444",
             )
+            + scene_box
             + check_list(
                 "Tokens used for this upload have been refunded",
                 "Your other uploads are not affected",
@@ -402,7 +511,10 @@ async def send_upload_failed_email(
         footer_note="You received this because upload email notifications are enabled on your account.",
     )
 
-    await send_email(email, f"❌ Upload failed — {filename}", html)
+    subject = f"❌ Upload failed — {filename}"
+    if brand:
+        subject = f"{brand.company_name} — upload failed — {filename}"
+    await send_email(email, subject, body_html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -467,7 +579,7 @@ async def send_scheduled_publish_alert_email(
         if upload_id else ""
     )
 
-    html = email_shell(
+    shell_html = email_shell(
         gradient=gradient,
         tagline="Scheduled publish notice",
         preheader_text=f"{filename} — scheduled for {scheduled_at_label}",
@@ -489,4 +601,4 @@ async def send_scheduled_publish_alert_email(
         footer_note="You received this because email notifications are enabled and you have a scheduled upload.",
     )
 
-    await send_email(email, subject, html)
+    await send_email(email, subject, shell_html)

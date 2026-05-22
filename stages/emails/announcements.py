@@ -39,6 +39,7 @@ async def send_announcement_email(
     cta_url: str = "",
     tier_label: str = "",
     gradient: str = GRAD_ORANGE,
+    hero_image_url: str = "",
 ) -> None:
     """
     Branded version of the announcement email.
@@ -83,6 +84,17 @@ async def send_announcement_email(
             f'<tr><td style="height:8px;"></td></tr>'
         )
 
+    # Optional hero image (HTTPS URL from R2 presign or CDN)
+    hero_row = ""
+    hi = (hero_image_url or "").strip()
+    if hi.startswith("https://"):
+        hero_row = (
+            '<tr><td style="padding:0 40px 12px;text-align:center;">'
+            f'<img src="{hi}" width="520" alt="" '
+            'style="max-width:100%;height:auto;border-radius:10px;border:1px solid #27272a;display:block;margin:0 auto;" />'
+            "</td></tr>"
+        )
+
     # Format body: preserve simple line breaks as <br> if no HTML tags present
     formatted_body = body
     if "<" not in body:
@@ -102,6 +114,7 @@ async def send_announcement_email(
         body_rows=(
             section_tag("Announcement &#128226;", "#f97316")
             + tier_badge_row
+            + hero_row
             + f'<tr><td style="padding:28px 40px 20px;">'
             f'<h2 style="margin:0 0 16px;color:#ffffff;font-size:26px;font-weight:800;'
             f'line-height:1.3;letter-spacing:-0.3px;">'

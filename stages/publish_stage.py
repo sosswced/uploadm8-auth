@@ -42,6 +42,9 @@ from .errors import CancelRequested, PublishError, ErrorCode
 from .context import JobContext, PlatformResult
 from . import db as db_stage
 from . import r2 as r2_stage
+from .image_format import ensure_jpeg_file, sniff_image_format
+
+from services.publish_metadata_gate import assert_publish_metadata_gate
 
 
 async def _publish_cancelled(ctx: JobContext) -> bool:
@@ -99,10 +102,13 @@ _SHORTS_HASHTAG_ONLY_RE = re.compile(
 # Platform Thumbnail Push
 # =====================================================================
 
-def _get_platform_thumbnail_path(ctx, platform: str):
+def _get_platform_thumbnail_path(ctx, platform: str) -> Optional[Path]:
     """
-    Return the best thumbnail path for a platform.
-    Prefers platform-specific styled thumbnail (16:9 YouTube, 9:16 IG/FB) when available.
+    Return the best local thumbnail path for a platform when the file still exists.
+
+    Prefer ``platform_thumbnail_map`` (per-platform styled 16:9 / 9:16). Fall back to
+    the sharpness-selected frame. Use ``_ensure_platform_thumbnail_local`` when paths
+    may be stale (deferred publish) or bytes may be PNG masquerading as JPEG.
     """
     pm = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
     try:
@@ -122,6 +128,80 @@ def _get_platform_thumbnail_path(ctx, platform: str):
     return None
 
 
+async def _ensure_platform_thumbnail_local(ctx: JobContext, platform: str) -> Optional[Path]:
+    """Resolve a platform thumbnail to a local JPEG file for post-publish APIs."""
+    import tempfile
+
+    local = _get_platform_thumbnail_path(ctx, platform)
+    if local:
+        try:
+            return ensure_jpeg_file(local)
+        except Exception as e:
+            logger.warning("Thumbnail JPEG normalize failed for %s: %s", platform, e)
+            return local
+
+    thumb_r2_key = None
+    pt_json = ctx.output_artifacts.get("platform_thumbnail_r2_keys", "{}")
+    try:
+        pt_keys = json.loads(pt_json) if isinstance(pt_json, str) else (pt_json or {})
+        thumb_r2_key = pt_keys.get(platform)
+    except Exception:
+        pass
+    if not thumb_r2_key:
+        thumb_r2_key = getattr(ctx, "thumbnail_r2_key", None)
+
+    if not thumb_r2_key:
+        return None
+
+    base_dir = getattr(ctx, "temp_dir", None)
+    if base_dir:
+        out = Path(base_dir) / f"thumb_{platform}_publish.jpg"
+    else:
+        out = Path(tempfile.mkdtemp(prefix="thumb_pub_")) / f"thumb_{platform}.jpg"
+    try:
+        await r2_stage.download_file(thumb_r2_key, out)
+        out = ensure_jpeg_file(out)
+        plat_map = {}
+        pm = ctx.output_artifacts.get("platform_thumbnail_map", "{}")
+        try:
+            plat_map = json.loads(pm) if isinstance(pm, str) else (pm or {})
+        except Exception:
+            plat_map = {}
+        plat_map[platform] = str(out)
+        ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(plat_map)
+        logger.info("Publish: loaded %s thumbnail from R2 for cover push", platform)
+        return out
+    except Exception as e:
+        logger.warning("Publish: could not load %s thumbnail from R2: %s", platform, e)
+        return None
+
+
+def _tiktok_cover_timestamp_ms(ctx: JobContext) -> int:
+    """TikTok Direct Post uses a video frame for cover — not a custom image upload.
+
+    When the worker burned a styled thumb into the MP4 (``tiktok_cover_burned``),
+    use the same offset so the API selects that frame.
+    """
+    arts = ctx.output_artifacts or {}
+    if str(arts.get("tiktok_cover_burned") or "").lower() in ("1", "true", "yes"):
+        raw = arts.get("tiktok_cover_burn_offset_seconds")
+        if raw is not None and raw != "":
+            try:
+                return int(max(0.0, float(raw)) * 1000)
+            except (TypeError, ValueError):
+                pass
+    for key in ("thumbnail_frame_offset_seconds", "tiktok_thumb_offset_seconds"):
+        raw = (ctx.output_artifacts or {}).get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            sec = max(0.0, float(raw))
+            return int(sec * 1000)
+        except (TypeError, ValueError):
+            continue
+    return 1500
+
+
 async def _push_thumbnail_to_platform(
     platform: str,
     video_id: str,
@@ -135,13 +215,14 @@ async def _push_thumbnail_to_platform(
     Non-fatal — a failure here never blocks the upload result.
 
     YouTube:   POST /thumbnails/set  (multipart, requires verified channel)
-    TikTok:    Cover API not available to 3rd-party apps — skipped.
+    TikTok:    Uses ``video_cover_timestamp_ms`` at init (not custom image upload).
     Instagram: Cover must be set at container creation time (handled there).
     Facebook:  POST /{video_id}  with thumb= multipart field.
     """
     if not thumbnail_path or not thumbnail_path.exists():
         return False
     try:
+        thumbnail_path = ensure_jpeg_file(Path(thumbnail_path))
         if platform == "youtube":
             with open(thumbnail_path, "rb") as f:
                 thumb_bytes = f.read()
@@ -177,8 +258,6 @@ async def _push_thumbnail_to_platform(
             logger.warning(f"Facebook thumbnail failed: {resp.status_code} {resp.text[:200]}")
             return False
 
-        # TikTok: cover API restricted — platform auto-selects from video
-        # Instagram: cover_url injected into container creation payload
         return False
     except Exception as e:
         logger.warning(f"Thumbnail push {platform} failed (non-fatal): {e}")
@@ -252,6 +331,16 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
 
     # Unknown platform — return canonical as-is (safe default)
     return level
+
+
+def _tiktok_force_private_unaudited_enabled() -> bool:
+    """When true, TikTok Direct Post uses ``SELF_ONLY`` regardless of upload privacy.
+
+    Use for TikTok apps pending production audit (public posts may be rejected).
+    Env: ``TIKTOK_FORCE_PRIVATE_UNAUDITED`` = 1/true/yes/on.
+    """
+    v = (os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 # =====================================================================
@@ -386,9 +475,11 @@ def _strip_youtube_shorts_hashtag_markers(text: str) -> str:
     return t.strip()
 
 
-def _get_title(ctx: JobContext) -> str:
-    """Get the best available title for publishing."""
-    return ctx.get_effective_title() if hasattr(ctx, "get_effective_title") else (
+def _get_title(ctx: JobContext, platform: str = "") -> str:
+    """Get the best available title for publishing (per-platform when ``platform`` is set)."""
+    if hasattr(ctx, "get_effective_title"):
+        return ctx.get_effective_title(platform=platform)
+    return (
         getattr(ctx, "ai_title", None)
         or getattr(ctx, "title", None)
         or getattr(ctx, "video_title", None)
@@ -520,7 +611,7 @@ def _tiktok_post_title(ctx: JobContext) -> str:
     """TikTok `post_info.title` is the full caption (hashtags allowed), max 2200 UTF-16 runes."""
     caption = (_build_platform_caption(ctx, "tiktok") or "").strip()
     if not caption:
-        return _utf16_clip(_get_title(ctx), 2200)
+        return _utf16_clip(_get_title(ctx, "tiktok"), 2200)
     return _utf16_clip(caption, 2200)
 
 
@@ -929,6 +1020,25 @@ async def publish_to_tiktok(
             getattr(ctx, "privacy", None) or "public",
             "tiktok",
         )
+        if _tiktok_force_private_unaudited_enabled():
+            if tiktok_privacy != "SELF_ONLY":
+                logger.info(
+                    "TikTok: TIKTOK_FORCE_PRIVATE_UNAUDITED — clamping privacy_level %s → SELF_ONLY",
+                    tiktok_privacy,
+                )
+            tiktok_privacy = "SELF_ONLY"
+
+        cover_ms = _tiktok_cover_timestamp_ms(ctx)
+        post_info = {
+            "title": tiktok_title,
+            "privacy_level": tiktok_privacy,
+            "video_cover_timestamp_ms": cover_ms,
+        }
+        logger.info(
+            "TikTok: video_cover_timestamp_ms=%s (%.2fs)",
+            cover_ms,
+            cover_ms / 1000.0,
+        )
 
         async with httpx.AsyncClient(timeout=120) as client:
             # Step 1: Initialize upload
@@ -939,10 +1049,7 @@ async def publish_to_tiktok(
                     "Content-Type": "application/json; charset=UTF-8"
                 },
                 json={
-                    "post_info": {
-                        "title": tiktok_title,
-                        "privacy_level": tiktok_privacy,
-                    },
+                    "post_info": post_info,
                     "source_info": {
                         "source": "FILE_UPLOAD",
                         "video_size": file_size,
@@ -1125,7 +1232,7 @@ async def publish_to_youtube(
             (getattr(ctx, "audio_context", None) or {}).get("copyright_risk"),
         )
 
-    title = _get_title(ctx)[:100]
+    title = _get_title(ctx, "youtube")[:100]
     caption = _build_platform_caption(ctx, "youtube")
     if rights_long_form:
         title = _strip_youtube_shorts_hashtag_markers(title)[:100]
@@ -1213,11 +1320,17 @@ async def publish_to_youtube(
 
             logger.info(f"YouTube publish accepted: video_id={video_id}, url={platform_url}")
             # Push thumbnail to YouTube (non-fatal — requires verified channel)
-            thumb_path = _get_platform_thumbnail_path(ctx, "youtube")
+            thumb_path = await _ensure_platform_thumbnail_local(ctx, "youtube")
             if video_id and thumb_path:
-                await _push_thumbnail_to_platform(
+                pushed = await _push_thumbnail_to_platform(
                     "youtube", video_id, thumb_path, access_token, client
                 )
+                if not pushed:
+                    logger.warning(
+                        "YouTube: custom thumbnail not applied for video_id=%s "
+                        "(channel may need verification)",
+                        video_id,
+                    )
             return PlatformResult(
                 platform="youtube",
                 success=True,
@@ -1235,6 +1348,46 @@ async def publish_to_youtube(
             error_code="PUBLISH_EXCEPTION",
             error_message=str(e)
         )
+
+
+async def _instagram_cover_public_url(
+    thumb_r2_key: str,
+    ctx: JobContext,
+) -> Optional[str]:
+    """Return a Meta-fetchable JPEG URL for Reels ``cover_url``.
+
+    Pikzels often writes PNG bytes to ``*.jpg`` keys; Instagram rejects non-JPEG covers
+    (opaque subcode 2207085). Re-encode and upload ``instagram_ig_cover.jpg`` when needed.
+    """
+    import tempfile
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ig_cover_"))
+    local = tmp_dir / "cover_src.jpg"
+    await r2_stage.download_file(thumb_r2_key, local)
+    fmt = sniff_image_format(local)
+    if fmt == "jpeg" and local.stat().st_size <= 8 * 1024 * 1024:
+        pub = r2_stage.get_public_url(thumb_r2_key)
+        if pub:
+            return pub
+        return r2_stage.generate_presigned_url(thumb_r2_key, expires=PRESIGNED_URL_EXPIRY)
+
+    jpeg_path = tmp_dir / "cover_meta.jpg"
+    jpeg_path.write_bytes(local.read_bytes())
+    ensure_jpeg_file(jpeg_path)
+    user_id = getattr(ctx, "user_id", None) or "unknown"
+    upload_id = getattr(ctx, "upload_id", None) or "unknown"
+    meta_key = f"thumbnails/{user_id}/{upload_id}/instagram_ig_cover.jpg"
+    await r2_stage.upload_file(jpeg_path, meta_key, "image/jpeg")
+    logger.info(
+        "Instagram: cover re-encoded to JPEG (%s -> %s, was %s)",
+        thumb_r2_key,
+        meta_key,
+        fmt,
+    )
+    pub = r2_stage.get_public_url(meta_key)
+    if pub:
+        return pub
+    return r2_stage.generate_presigned_url(meta_key, expires=PRESIGNED_URL_EXPIRY)
 
 
 async def publish_to_instagram(
@@ -1315,23 +1468,48 @@ async def publish_to_instagram(
                 "share_to_feed": "true" if ig_privacy == "public" else "false",
             }
             # Instagram cover_url must be set at creation time — cannot change after publish.
-            # Prefer platform-specific 9:16 thumbnail when available (styled thumbnails).
-            thumb_r2_key = None
-            pt_json = ctx.output_artifacts.get("platform_thumbnail_r2_keys", "{}")
-            try:
-                pt_keys = json.loads(pt_json) if isinstance(pt_json, str) else (pt_json or {})
-                thumb_r2_key = pt_keys.get("instagram")
-            except Exception:
-                pass
-            thumb_r2_key = thumb_r2_key or getattr(ctx, "thumbnail_r2_key", None)
-            if thumb_r2_key:
+            # Prefer platform-specific styled 9:16 thumbnail (Pikzels / persona / custom).
+            thumb_cover_url = None
+            thumb_path = await _ensure_platform_thumbnail_local(ctx, "instagram")
+            if thumb_path:
                 try:
-                    from . import r2 as _r2
-                    thumb_cover_url = _r2.generate_presigned_url(thumb_r2_key, expires=3600)
-                    ig_params["cover_url"] = thumb_cover_url
-                    logger.info(f"Instagram: cover_url set from R2 thumbnail")
+                    import tempfile
+
+                    tmp_dir = Path(tempfile.mkdtemp(prefix="ig_cover_"))
+                    jpeg_path = tmp_dir / "cover_meta.jpg"
+                    jpeg_path.write_bytes(thumb_path.read_bytes())
+                    ensure_jpeg_file(jpeg_path)
+                    user_id = getattr(ctx, "user_id", None) or "unknown"
+                    upload_id = getattr(ctx, "upload_id", None) or "unknown"
+                    meta_key = f"thumbnails/{user_id}/{upload_id}/instagram_ig_cover.jpg"
+                    await r2_stage.upload_file(jpeg_path, meta_key, "image/jpeg")
+                    thumb_cover_url = r2_stage.get_public_url(meta_key)
+                    if not thumb_cover_url:
+                        thumb_cover_url = r2_stage.generate_presigned_url(
+                            meta_key, expires=PRESIGNED_URL_EXPIRY
+                        )
+                    if thumb_cover_url:
+                        logger.info("Instagram: cover_url set from styled thumbnail (JPEG-safe)")
                 except Exception as _e:
-                    logger.warning(f"Instagram: could not set cover_url: {_e}")
+                    logger.warning(f"Instagram: could not set cover_url from local thumb: {_e}")
+            if not thumb_cover_url:
+                thumb_r2_key = None
+                pt_json = ctx.output_artifacts.get("platform_thumbnail_r2_keys", "{}")
+                try:
+                    pt_keys = json.loads(pt_json) if isinstance(pt_json, str) else (pt_json or {})
+                    thumb_r2_key = pt_keys.get("instagram")
+                except Exception:
+                    pass
+                thumb_r2_key = thumb_r2_key or getattr(ctx, "thumbnail_r2_key", None)
+                if thumb_r2_key:
+                    try:
+                        thumb_cover_url = await _instagram_cover_public_url(thumb_r2_key, ctx)
+                        if thumb_cover_url:
+                            logger.info("Instagram: cover_url set from R2 key (JPEG-safe)")
+                    except Exception as _e:
+                        logger.warning(f"Instagram: could not set cover_url: {_e}")
+            if thumb_cover_url:
+                ig_params["cover_url"] = thumb_cover_url
             create_resp = await client.post(
                 f"https://graph.facebook.com/{META_API_VERSION}/{ig_user_id}/media",
                 params=ig_params
@@ -1622,11 +1800,16 @@ async def publish_to_facebook(
                         platform_url = f"https://www.facebook.com/watch/?v={video_id}"
             logger.info(f"Facebook publish accepted: video_id={video_id}, url={platform_url}")
             # Push thumbnail to Facebook (non-fatal)
-            thumb_path = _get_platform_thumbnail_path(ctx, "facebook")
+            thumb_path = await _ensure_platform_thumbnail_local(ctx, "facebook")
             if video_id and thumb_path:
-                await _push_thumbnail_to_platform(
+                pushed = await _push_thumbnail_to_platform(
                     "facebook", video_id, thumb_path, access_token, client
                 )
+                if not pushed:
+                    logger.warning(
+                        "Facebook: custom thumbnail not applied for video_id=%s",
+                        video_id,
+                    )
             return PlatformResult(
                 platform="facebook",
                 success=True,
@@ -1726,6 +1909,8 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
         publish_targets = [(p, None) for p in ctx.platforms]
 
     logger.info(f"Publishing to {len(publish_targets)} target(s)")
+
+    assert_publish_metadata_gate(ctx, publish_targets)
 
     for platform, token_id in publish_targets:
         # Per-target cancel check — once a single platform has been posted we
@@ -1909,6 +2094,8 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                         response_payload=result.response_payload,
                         publish_id=result.publish_id,
                     )
+                    if token_id:
+                        await db_stage.touch_platform_token_last_used(db_pool, token_id)
                 else:
                     await db_stage.update_publish_attempt_failed(
                         db_pool,

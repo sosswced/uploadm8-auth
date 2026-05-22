@@ -177,6 +177,11 @@ class TrillScore:
     excessive_speed: bool = False
     title_modifier: str = ""
     hashtags: List[str] = field(default_factory=list)
+    # Speed-only subtotal before scenic/route significance boost (vision + geo + VI).
+    base_score: int = 0
+    scenic_boost: float = 0.0
+    scenic_breakdown: Dict[str, float] = field(default_factory=dict)
+    scenic_factors: List[str] = field(default_factory=list)
 
     # Legacy aliases
     @property
@@ -255,6 +260,8 @@ class JobContext:
     hashtags: List[str] = field(default_factory=list)
     privacy: str = "public"
     reframe_mode: str = "auto"  # auto | pad | crop | none
+    # Scheduled publish (uploads.scheduled_time) — used for deferred/staged user comms.
+    scheduled_time: Optional[datetime] = None
 
     entitlements: Optional[Entitlements] = None
     user_settings: Dict[str, Any] = field(default_factory=dict)
@@ -281,6 +288,8 @@ class JobContext:
     ai_hashtags: List[str] = field(default_factory=list)
     # M8 caption engine: per-platform AI hashtag variants (tiktok, instagram, …)
     m8_platform_hashtags: Dict[str, List[str]] = field(default_factory=dict)
+    m8_platform_titles: Dict[str, str] = field(default_factory=dict)
+    m8_platform_captions: Dict[str, str] = field(default_factory=dict)
     # Optional: full style x tone x voice sweep from one M8 call (see m8_engine caption_evidence_matrix)
     m8_caption_evidence_matrix: Dict[str, Any] = field(default_factory=dict)
     # Populated by audio_stage (Whisper) when enabled — injected into caption prompts.
@@ -288,6 +297,7 @@ class JobContext:
     audio_path: Optional[Path] = None
     audio_context: Dict[str, Any] = field(default_factory=dict)
     vision_context: Dict[str, Any] = field(default_factory=dict)
+    visual_recognition: Dict[str, Any] = field(default_factory=dict)
     video_understanding: Dict[str, Any] = field(default_factory=dict)
     video_intelligence_context: Dict[str, Any] = field(default_factory=dict)
     # Compact recognition view (object_tracks / on_screen_text /
@@ -311,12 +321,14 @@ class JobContext:
 
     telemetry_data: Optional[TelemetryData] = None
     trill_score: Optional[TrillScore] = None
+    vehicle_make_id: Optional[int] = None
+    vehicle_model_id: Optional[int] = None
+    vehicle_make_name: Optional[str] = None
+    vehicle_model_name: Optional[str] = None
 
     # Back-compat aliases used by older stages
     telemetry: Optional[TelemetryData] = None
     trill: Optional[TrillScore] = None
-    hud_applied: bool = False
-
     platform_results: List[PlatformResult] = field(default_factory=list)
     output_artifacts: Dict[str, str] = field(default_factory=dict)
     # When AI_TRACE_ENABLED: ordered events for one `[ai-pipeline-summary]` log per upload.
@@ -378,12 +390,24 @@ class JobContext:
             return self.processed_video_path
         return self.local_video_path
 
-    def get_effective_title(self) -> str:
+    def get_effective_title(self, platform: str = "") -> str:
         # Explicit user copy wins, but client defaults / stock titles must not mask hydration.
         t = (self.title or "").strip()
         ai = (self.ai_title or "").strip()
         if t and not (ai and is_placeholder_upload_title(t, self.filename)):
             return t
+        pl = (platform or "").strip().lower()
+        if pl:
+            m8_titles = getattr(self, "m8_platform_titles", None) or {}
+            if isinstance(m8_titles, dict) and m8_titles:
+                tt = m8_titles.get(pl) or m8_titles.get(platform or "")
+                if tt is None:
+                    for mk, mv in m8_titles.items():
+                        if str(mk).strip().lower() == pl:
+                            tt = mv
+                            break
+                if tt and str(tt).strip():
+                    return str(tt).strip()
         if ai:
             return ai
         return (self.filename or "").strip() or ""
@@ -824,6 +848,7 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
         hashtags=_normalize_upload_hashtags_field(upload_record.get("hashtags")),
         privacy=upload_record.get("privacy", "public") or "public",
         reframe_mode=reframe_mode,
+        scheduled_time=upload_record.get("scheduled_time"),
         user_settings=user_settings or {},
         entitlements=entitlements,
     )
@@ -892,6 +917,18 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
             ctx.ai_hashtags = ctx.m8_platform_hashtags["tiktok"]
         else:
             ctx.ai_hashtags = next(iter(ctx.m8_platform_hashtags.values()))
+    try:
+        ctx.vehicle_make_id = upload_record.get("vehicle_make_id")
+        if ctx.vehicle_make_id is not None:
+            ctx.vehicle_make_id = int(ctx.vehicle_make_id)
+    except (TypeError, ValueError):
+        ctx.vehicle_make_id = None
+    try:
+        ctx.vehicle_model_id = upload_record.get("vehicle_model_id")
+        if ctx.vehicle_model_id is not None:
+            ctx.vehicle_model_id = int(ctx.vehicle_model_id)
+    except (TypeError, ValueError):
+        ctx.vehicle_model_id = None
     return ctx
 
 
@@ -1243,6 +1280,12 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     """
     max_chars = max(180, min(int(max_chars or 700), 1600))
 
+    from core.vision_entities import (
+        build_scene_hook_line,
+        collect_visual_entities,
+        visual_entity_story_clauses,
+    )
+
     tel = ctx.telemetry or ctx.telemetry_data
     osd = ctx.dashcam_osd_context or {}
     ac = ctx.audio_context or {}
@@ -1317,20 +1360,21 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     if isinstance(osd, dict) and osd.get("driver_name"):
         motion_bits.append(f"driver label {str(osd.get('driver_name')).strip()[:40]}")
 
-    vi_objects = []
-    if isinstance(vi, dict):
-        vi_objects.extend(vi.get("object_tracks") or [])
-        vi_objects.extend(vi.get("segment_labels") or [])
-    if isinstance(vic, dict):
-        vi_objects.extend(vic.get("object_tracks") or [])
-        vi_objects.extend(vic.get("segment_labels") or [])
-    object_names = _unique_phrases(vi_objects, limit=8)
-    vehicle_names = [
-        name for name in object_names
-        if re.search(r"\b(vehicle|car|truck|bus|motorcycle|bicycle|suv|van|road|highway)\b", name, re.I)
-    ][:4]
-    if vehicle_names:
-        motion_bits.append("visible " + ", ".join(vehicle_names))
+    entity_bundle = collect_visual_entities(
+        vision_context=vc if isinstance(vc, dict) else None,
+        video_intelligence=vi if isinstance(vi, dict) else None,
+        video_intelligence_context=vic if isinstance(vic, dict) else None,
+        category=str(
+            getattr(ctx, "thumbnail_category", None)
+            or (getattr(ctx, "hydration_payload", None) or {}).get("category")
+            or "general"
+        ),
+        filename=str(getattr(ctx, "filename", "") or ""),
+    )
+    if entity_bundle.vehicles:
+        motion_bits.append("vehicles/models: " + ", ".join(entity_bundle.vehicles[:4]))
+    elif entity_bundle.brands:
+        motion_bits.append("brand cues: " + ", ".join(entity_bundle.brands[:3]))
     person_count = 0
     if isinstance(vi, dict):
         person_count += len(vi.get("person_segments") or [])
@@ -1346,33 +1390,31 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     if motion_bits:
         clauses.append("Subject and motion: " + "; ".join(motion_bits) + ".")
 
-    # Visual scene facts.
-    visual_bits: List[str] = []
-    labels = []
-    if isinstance(vic, dict):
-        labels.extend(vic.get("top_labels") or [])
-        labels.extend(vic.get("shot_labels") or [])
-    if isinstance(vi, dict):
-        labels.extend(vi.get("top_labels") or [])
-        labels.extend(vi.get("shot_labels") or [])
+    # Visual scene facts — prefer specific entities over generic Vision labels.
+    rec_summary = ""
     if isinstance(vc, dict):
-        labels.extend(vc.get("label_names") or [])
-        labels.extend(vc.get("landmark_names") or [])
-        labels.extend(vc.get("logo_names") or [])
-    visual_names = _unique_phrases(labels, limit=8)
-    if visual_names:
-        visual_bits.append(", ".join(visual_names[:6]))
+        rec_summary = str(vc.get("recognition_summary") or "").strip()
+    if not rec_summary:
+        vr = getattr(ctx, "visual_recognition", None) or {}
+        if isinstance(vr, dict):
+            from services.google_visual_recognition import build_recognition_narrative
+
+            rec_summary = build_recognition_narrative(vr)
+    if rec_summary:
+        clauses.append(rec_summary if rec_summary.endswith(".") else rec_summary + ".")
+    else:
+        entity_clauses = visual_entity_story_clauses(entity_bundle)
+        clauses.extend(entity_clauses)
+
     ocr = ""
     if isinstance(vic, dict):
         ocr_rows = vic.get("on_screen_text") or vic.get("text_detections") or []
         ocr_names = _unique_phrases(ocr_rows, limit=3)
         ocr = "; ".join(ocr_names)
     if not ocr and isinstance(vc, dict):
-        ocr = str(vc.get("ocr_text") or "").strip().replace("\n", " ")
-    if ocr:
-        visual_bits.append("on-screen text: " + ocr[:140])
-    if visual_bits:
-        clauses.append("Visual analysis: " + "; ".join(visual_bits) + ".")
+        ocr = str(vc.get("ocr_text") or "").strip().replace("\n", " | ")
+    if ocr and not entity_bundle.signage:
+        clauses.append("On-screen text: " + ocr[:140] + ".")
 
     # Audio/music/speech.
     audio_bits: List[str] = []
@@ -1398,6 +1440,27 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     if audio_bits:
         clauses.append("Audio context: " + "; ".join(audio_bits) + ".")
 
+    place_for_hook = ""
+    if tel:
+        place_for_hook = _first_nonempty(
+            getattr(tel, "location_city", None),
+            getattr(tel, "gazetteer_place_name", None),
+            getattr(tel, "location_road", None),
+        )
+    music_artist = music_title = ""
+    if isinstance(ac, dict):
+        music_artist = str(ac.get("music_artist") or "").strip()
+        music_title = str(ac.get("music_title") or "").strip()
+    hook = build_scene_hook_line(
+        place=place_for_hook,
+        max_speed_mph=max_speed,
+        music_artist=music_artist,
+        music_title=music_title,
+        bundle=entity_bundle,
+    )
+    if hook:
+        clauses.append("Scene hook: " + hook + ".")
+
     if not clauses:
         fname = (ctx.filename or "uploaded video").strip()
         return f"Hydration story: {fname} has no strong analysis signals yet; use the actual frame and filename only."[:max_chars]
@@ -1406,6 +1469,242 @@ def build_hydration_story_text(ctx: JobContext, *, max_chars: int = 700) -> str:
     if len(story) > max_chars:
         story = story[: max_chars - 1].rstrip() + "."
     return story
+
+
+def build_video_story_timeline(ctx: JobContext, *, max_events: int = 80) -> List[Dict[str, Any]]:
+    """Build an ordered ``[{t_seconds, kind, text}, ...]`` timeline fused from VI,
+    Vision, Dashcam OSD, telemetry, and audio analysis on ``ctx``.
+
+    This is the "what happens in the video over time" view that feeds the M8
+    prompt, the user/admin Discord embeds, the upload email, and the queue.html
+    detail panel. Each event is JSON-safe and bounded so the artifact stays
+    well under the JSONB column size limits.
+    """
+    max_events = max(8, min(int(max_events or 80), 200))
+    events: List[Dict[str, Any]] = []
+
+    vi = ctx.video_intelligence or {}
+    vic = ctx.video_intelligence_context or {}
+    osd = ctx.dashcam_osd_context or {}
+    ac = ctx.audio_context or {}
+    vc = ctx.vision_context or {}
+    tel = ctx.telemetry or ctx.telemetry_data
+
+    def _t(v: Any) -> Optional[float]:
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            return None
+
+    def _add(t: Any, kind: str, text: str) -> None:
+        text_clean = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not text_clean:
+            return
+        ts = _t(t)
+        if ts is None or ts < 0:
+            ts = 0.0
+        events.append({"t_seconds": ts, "kind": str(kind)[:24], "text": text_clean[:240]})
+
+    # ── Video Intelligence: shot changes (cap to 10 boundaries) ──────────
+    shots = []
+    if isinstance(vic, dict):
+        shots = list(vic.get("shots") or [])
+    if not shots and isinstance(vi, dict):
+        shots = list(vi.get("shots") or [])
+    for i, shot in enumerate(shots[:10]):
+        if not isinstance(shot, dict):
+            continue
+        st = shot.get("start_s")
+        if st is None:
+            continue
+        _add(st, "shot", f"Shot {i + 1} begins")
+
+    # ── VI object tracks (top by confidence; one event per object start) ─
+    obj_tracks = []
+    if isinstance(vi, dict):
+        obj_tracks.extend(vi.get("object_tracks") or [])
+    if isinstance(vic, dict):
+        obj_tracks.extend(vic.get("object_tracks") or [])
+    seen_obj: set[str] = set()
+    for ot in sorted(obj_tracks, key=lambda x: -float(x.get("confidence") or 0))[:12]:
+        if not isinstance(ot, dict):
+            continue
+        desc = str(ot.get("description") or "").strip()
+        if not desc or desc.lower() in seen_obj:
+            continue
+        seen_obj.add(desc.lower())
+        _add(ot.get("start_s"), "object", desc)
+
+    # ── VI on-screen text (highest-confidence first, cap 8) ──────────────
+    ost = []
+    if isinstance(vi, dict):
+        ost.extend(vi.get("on_screen_text") or [])
+    if isinstance(vic, dict):
+        ost.extend(vic.get("on_screen_text") or [])
+    for ts_row in sorted(ost, key=lambda x: -float(x.get("confidence") or 0))[:8]:
+        if not isinstance(ts_row, dict):
+            continue
+        txt = str(ts_row.get("text") or "").strip()
+        if not txt:
+            continue
+        _add(ts_row.get("start_s"), "on_screen_text", txt)
+
+    # ── VI logos (Tesla, In-N-Out, etc.) ────────────────────────────────
+    logos = []
+    if isinstance(vi, dict):
+        logos.extend(vi.get("logos") or [])
+    if isinstance(vic, dict):
+        logos.extend(vic.get("logos") or [])
+    seen_logo: set[str] = set()
+    for lg in logos[:6]:
+        if not isinstance(lg, dict):
+            continue
+        name = str(lg.get("description") or lg.get("name") or "").strip()
+        if not name or name.lower() in seen_logo:
+            continue
+        seen_logo.add(name.lower())
+        _add(lg.get("start_s") or 0.0, "logo", f"Logo: {name}")
+
+    # ── Vision (Google Cloud Vision) sampled-frame labels ───────────────
+    if isinstance(vc, dict):
+        fracs = vc.get("vision_sample_fractions") or []
+        labels = vc.get("label_names") or []
+        landmarks = vc.get("landmark_names") or []
+        ocr = str(vc.get("ocr_text") or "").strip()
+        try:
+            duration_for_fracs = float(vc.get("video_duration_s") or 0.0) or 0.0
+        except (TypeError, ValueError):
+            duration_for_fracs = 0.0
+        # Use fraction-based timing when we know the duration; otherwise
+        # treat the whole clip as a single t=0 frame.
+        if isinstance(fracs, list) and fracs and duration_for_fracs > 0:
+            for idx, frac in enumerate(fracs[:6]):
+                try:
+                    t = float(frac) * duration_for_fracs
+                except (TypeError, ValueError):
+                    continue
+                _add(t, "vision_frame", f"Vision sample {idx + 1}/{len(fracs)} @ {t:.1f}s")
+        elif labels or landmarks or ocr:
+            _add(0.0, "vision_frame", "Vision sampled frame")
+        for lbl in (labels or [])[:6]:
+            txt = str(lbl).strip()
+            if txt:
+                _add(0.0, "vision_label", txt)
+        for lm in (landmarks or [])[:3]:
+            txt = str(lm).strip()
+            if txt:
+                _add(0.0, "landmark", txt)
+        if ocr:
+            _add(0.0, "vision_ocr", ocr.replace("\n", " ")[:200])
+
+    # ── Dashcam OSD (start/end stamps, per-frame speed, GPS path beats) ──
+    if isinstance(osd, dict):
+        fs = osd.get("first_seen") or {}
+        ls = osd.get("last_seen") or {}
+        if isinstance(fs, dict) and (fs.get("date") or fs.get("time")):
+            _add(
+                0.0,
+                "osd_start",
+                f"HUD start {str(fs.get('date') or '').strip()} {str(fs.get('time') or '').strip()}".strip(),
+            )
+        if isinstance(ls, dict) and (ls.get("date") or ls.get("time")):
+            _add(
+                ls.get("t_s") or 1e9,
+                "osd_end",
+                f"HUD end {str(ls.get('date') or '').strip()} {str(ls.get('time') or '').strip()}".strip(),
+            )
+        try:
+            max_mph_osd = float(osd.get("max_speed_mph") or 0)
+        except (TypeError, ValueError):
+            max_mph_osd = 0.0
+        if max_mph_osd >= 5:
+            _add(osd.get("max_speed_t_s") or 0.0, "osd_speed", f"OSD peak {int(round(max_mph_osd))} MPH")
+        speed_series = osd.get("speed_series") if isinstance(osd, dict) else None
+        if isinstance(speed_series, list) and speed_series:
+            step = max(1, len(speed_series) // 5)
+            for entry in speed_series[::step][:5]:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    s_mph = float(entry.get("mph") or entry.get("speed_mph") or 0)
+                except (TypeError, ValueError):
+                    s_mph = 0.0
+                if s_mph <= 0:
+                    continue
+                _add(entry.get("t_s") or entry.get("ts_s") or 0.0, "osd_speed_beat", f"{int(round(s_mph))} MPH")
+        gps_path = osd.get("gps_path") if isinstance(osd, dict) else None
+        if isinstance(gps_path, list) and gps_path:
+            step = max(1, len(gps_path) // 4)
+            for i, pt in enumerate(gps_path[::step][:4]):
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    try:
+                        lat = float(pt[0]); lon = float(pt[1])
+                        _add(0.0, "osd_gps", f"GPS waypoint {i + 1}: {lat:.4f}, {lon:.4f}")
+                    except (TypeError, ValueError):
+                        continue
+
+    # ── Telemetry highlights ─────────────────────────────────────────────
+    if tel is not None:
+        place = _first_nonempty(
+            getattr(tel, "location_display", None),
+            getattr(tel, "gazetteer_place_name", None),
+            getattr(tel, "location_city", None),
+            getattr(tel, "padus_unit_name", None),
+        )
+        if place:
+            _add(0.0, "geo_place", f"Location: {place}")
+        road = _first_nonempty(getattr(tel, "location_road", None))
+        if road:
+            _add(0.0, "geo_road", f"Road: {road}")
+        try:
+            max_mph_tel = float(getattr(tel, "max_speed_mph", 0) or 0)
+        except (TypeError, ValueError):
+            max_mph_tel = 0.0
+        if max_mph_tel >= 5:
+            _add(0.0, "telemetry_speed", f"Telemetry peak {int(round(max_mph_tel))} MPH")
+
+    # ── Audio: transcript segments (cap 10, ordered by time) ─────────────
+    if isinstance(ac, dict):
+        ts_segs = ac.get("transcript_segments") or []
+        if isinstance(ts_segs, list):
+            for s in ts_segs[:10]:
+                if not isinstance(s, dict):
+                    continue
+                _add(s.get("start"), "transcript", str(s.get("text") or "").strip())
+        artist = str(ac.get("music_artist") or "").strip()
+        track = str(ac.get("music_title") or "").strip()
+        if artist or track:
+            label = f"{artist} — {track}" if (artist and track) else (artist or track)
+            _add(0.0, "music", f"Music detected: {label}")
+        yn = ac.get("yamnet_events") or []
+        if isinstance(yn, list):
+            seen_y: set[str] = set()
+            for ev in yn[:8]:
+                txt = str(ev).strip() if not isinstance(ev, dict) else str(ev.get("label") or ev.get("name") or "")
+                if not txt or txt.lower() in seen_y:
+                    continue
+                seen_y.add(txt.lower())
+                _add(0.0 if not isinstance(ev, dict) else (ev.get("t_s") or 0.0), "yamnet", txt)
+        top_sound = str(ac.get("top_sound_class") or "").strip()
+        if top_sound:
+            _add(0.0, "ambient_sound", f"Ambient: {top_sound}")
+
+    # Sort by time, deduplicate exact same (kind, text) within 0.5s windows,
+    # cap to ``max_events``.
+    events.sort(key=lambda e: (float(e.get("t_seconds") or 0.0), str(e.get("kind") or "")))
+    deduped: List[Dict[str, Any]] = []
+    last_keys: List[Tuple[str, str, float]] = []
+    for ev in events:
+        k = (str(ev.get("kind") or ""), str(ev.get("text") or "").lower())
+        t = float(ev.get("t_seconds") or 0.0)
+        if any(prev_k == k[0] and prev_text == k[1] and abs(t - prev_t) < 0.5 for prev_k, prev_text, prev_t in last_keys):
+            continue
+        last_keys.append((k[0], k[1], t))
+        deduped.append(ev)
+        if len(deduped) >= max_events:
+            break
+
+    return deduped
 
 
 def _vision_digest_header(vc: Dict[str, Any]) -> str:
@@ -1493,8 +1792,30 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
         lg = vc.get("logo_names") or []
         if isinstance(lg, list) and lg:
             lines.append("Detected logos / brands: " + ", ".join(str(x) for x in lg[:12]))
+        rec = str(vc.get("recognition_summary") or "").strip()
+        if rec:
+            lines.insert(0, rec)
+        web = vc.get("web_entities") or []
+        if isinstance(web, list) and web:
+            web_names = [
+                (w.get("description") if isinstance(w, dict) else str(w))
+                for w in web[:12]
+            ]
+            lines.append("Web entity matches: " + ", ".join(str(x) for x in web_names if x))
+        loc = vc.get("localized_objects") or []
+        if isinstance(loc, list) and loc:
+            loc_names = [(o.get("name") if isinstance(o, dict) else str(o)) for o in loc[:12]]
+            lines.append("Localized objects: " + ", ".join(str(x) for x in loc_names if x))
+        dc = vc.get("dominant_colors") or []
+        if isinstance(dc, list) and dc:
+            lines.append(
+                "Dominant colors: "
+                + ", ".join(
+                    str((c.get("name") if isinstance(c, dict) else c)) for c in dc[:6]
+                )
+            )
         if lines:
-            push(_vision_digest_header(vc), "\n".join(lines), 0.18)
+            push(_vision_digest_header(vc), "\n".join(lines), 0.22)
 
     ac = ctx.audio_context or {}
     if isinstance(ac, dict):

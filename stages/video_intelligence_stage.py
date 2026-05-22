@@ -12,6 +12,10 @@ Use cases:
 Input: inline bytes (local file) when size <= VIDEO_INTELLIGENCE_MAX_BYTES (default 100 MiB),
        OR gs:// URI when VIDEO_INTELLIGENCE_INPUT_URI is set.
 
+GCP: enable the **Video Intelligence API** on the worker service account project
+(``gcloud services enable videointelligence.googleapis.com``) or annotate calls
+return permission/API-not-enabled errors that surface as ``ctx.video_intelligence_context.error``.
+
 Env:
   VIDEO_INTELLIGENCE_MAX_BYTES (default 104857600 = 100 MiB; clamped 10 MiB - 1 GiB; loads full file into RAM)
   VIDEO_INTELLIGENCE_TIMEOUT_SEC (default 1800)  LRO wait for annotate_video result()
@@ -81,6 +85,9 @@ VIDEO_INTELLIGENCE_MAX_BYTES = _parse_vi_max_bytes()
 VIDEO_INTELLIGENCE_TIMEOUT_SEC = _parse_vi_timeout_sec()
 VIDEO_INTELLIGENCE_INPUT_URI = (os.environ.get("VIDEO_INTELLIGENCE_INPUT_URI") or "").strip()
 VIDEO_INTELLIGENCE_MAX_DURATION_SEC = _parse_vi_max_duration_sec()
+VIDEO_INTELLIGENCE_STAGE_ENABLED = (
+    os.environ.get("VIDEO_INTELLIGENCE_STAGE_ENABLED", "true").lower() == "true"
+)
 VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE = (
     os.environ.get("VIDEO_INTELLIGENCE_INCLUDE_SHOT_CHANGE", "true").lower() == "true"
 )
@@ -432,6 +439,86 @@ def _analyze_sync_inline(video_bytes: bytes, creds: Any = None) -> Dict[str, Any
     return _parse_annotation_result(result)
 
 
+async def _build_vi_inline_proxy(
+    video_path: Path,
+    *,
+    max_bytes: int,
+    temp_dir: Optional[Path],
+) -> Optional[Path]:
+    """FFmpeg a smaller proxy when the source exceeds inline VI byte limits."""
+    from stages.ffmpeg_env import resolve_ffmpeg_executable
+
+    out_dir = temp_dir or video_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dst = out_dir / f"_vi_proxy_{video_path.stem}.mp4"
+    ffmpeg = resolve_ffmpeg_executable("ffmpeg") or "ffmpeg"
+
+    # Progressively lower resolution / raise CRF until under the inline cap.
+    presets = (
+        ("1280:-2", 32, "96k"),
+        ("854:-2", 34, "64k"),
+        ("640:-2", 36, "48k"),
+        ("480:-2", 38, "32k"),
+    )
+    for scale, crf, abit in presets:
+        if dst.exists():
+            try:
+                dst.unlink()
+            except OSError:
+                pass
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(video_path),
+            "-vf",
+            f"scale={scale}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(crf),
+            "-c:a",
+            "aac",
+            "-b:a",
+            abit,
+            "-ac",
+            "1",
+            "-movflags",
+            "+faststart",
+            str(dst),
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+        except (OSError, FileNotFoundError) as e:
+            logger.warning("[video_intelligence] ffmpeg proxy unavailable: %s", e)
+            return None
+        if proc.returncode != 0:
+            logger.debug(
+                "[video_intelligence] ffmpeg proxy failed scale=%s crf=%s: %s",
+                scale,
+                crf,
+                (stderr or b"").decode("utf-8", errors="replace")[:400],
+            )
+            continue
+        if dst.exists() and dst.stat().st_size <= max_bytes:
+            return dst
+    if dst.exists() and dst.stat().st_size < video_path.stat().st_size:
+        logger.warning(
+            "[video_intelligence] proxy still %.1f MB (> %.1f MB cap); using best-effort proxy",
+            dst.stat().st_size / (1024 * 1024),
+            max_bytes / (1024 * 1024),
+        )
+        return dst
+    return None
+
+
 def _analyze_sync_gcs(uri: str, creds: Any = None) -> Dict[str, Any]:
     from google.cloud import videointelligence_v1 as vi
 
@@ -455,6 +542,9 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
     Populate ctx.video_intelligence_context with labels + shot boundaries.
     """
     ctx.mark_stage("video_intelligence")
+
+    if not VIDEO_INTELLIGENCE_STAGE_ENABLED:
+        raise SkipStage("Video Intelligence stage disabled via env")
 
     dur = _ctx_duration_sec(ctx)
     if VIDEO_INTELLIGENCE_MAX_DURATION_SEC > 0:
@@ -513,6 +603,7 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
                 operation="annotate_video_gcs",
                 message=str(e),
                 exception_type=type(e).__name__,
+                result_tier="degraded",
             )
             ctx.video_intelligence_context = {"error": str(e)}
             return ctx
@@ -526,16 +617,38 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
         raise SkipStage("No local video file for Video Intelligence")
 
     size = video_path.stat().st_size
+    vi_input_path = video_path
     if size > VIDEO_INTELLIGENCE_MAX_BYTES:
-        raise SkipStage(
-            f"Video too large for inline Video Intelligence ({size} bytes > {VIDEO_INTELLIGENCE_MAX_BYTES}); "
-            "set VIDEO_INTELLIGENCE_INPUT_URI to gs://... or raise VIDEO_INTELLIGENCE_MAX_BYTES"
+        proxy = await _build_vi_inline_proxy(
+            video_path,
+            max_bytes=VIDEO_INTELLIGENCE_MAX_BYTES,
+            temp_dir=getattr(ctx, "temp_dir", None),
         )
+        if proxy and proxy.exists():
+            vi_input_path = proxy
+            logger.info(
+                "[video_intelligence] inline proxy %s (%.1f MB -> %.1f MB)",
+                proxy.name,
+                size / (1024 * 1024),
+                proxy.stat().st_size / (1024 * 1024),
+            )
+        else:
+            raise SkipStage(
+                f"Video too large for inline Video Intelligence ({size} bytes > {VIDEO_INTELLIGENCE_MAX_BYTES}); "
+                "set VIDEO_INTELLIGENCE_INPUT_URI to gs://... or raise VIDEO_INTELLIGENCE_MAX_BYTES"
+            )
 
     try:
-        video_bytes = video_path.read_bytes()
+        video_bytes = vi_input_path.read_bytes()
     except (OSError, PermissionError) as e:
         raise SkipStage(f"Cannot read video file: {e}") from e
+
+    if len(video_bytes) > VIDEO_INTELLIGENCE_MAX_BYTES:
+        raise SkipStage(
+            f"Video too large for inline Video Intelligence ({len(video_bytes)} bytes > "
+            f"{VIDEO_INTELLIGENCE_MAX_BYTES}); set VIDEO_INTELLIGENCE_INPUT_URI to gs://... "
+            "or raise VIDEO_INTELLIGENCE_MAX_BYTES"
+        )
 
     try:
         data = await loop.run_in_executor(
@@ -564,6 +677,7 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
             operation="annotate_video_inline",
             message=str(e),
             exception_type=type(e).__name__,
+            result_tier="degraded",
         )
         ctx.video_intelligence_context = {"error": str(e)}
 

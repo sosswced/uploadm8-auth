@@ -347,4 +347,29 @@ async def run_kpi_collect(db_pool) -> dict:
             now,
         )
 
+        # 7. Env-prorated vendor monthly costs (Google Cloud, Pikzels, TwelveLabs, SerpAPI)
+        for category, env_key in (
+            ("google_cloud", "KPI_GOOGLE_CLOUD_MONTHLY_COST"),
+            ("pikzels", "KPI_PIKZELS_MONTHLY_COST"),
+            ("twelvelabs", "KPI_TWELVELABS_MONTHLY_COST"),
+            ("serpapi", "KPI_SERPAPI_MONTHLY_COST"),
+        ):
+            monthly = float(os.environ.get(env_key, "0") or 0)
+            if monthly <= 0:
+                continue
+            vendor_cost = _prorate_monthly_cost(monthly, since, now)
+            if vendor_cost <= 0:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO cost_tracking (user_id, category, operation, cost_usd, created_at)
+                VALUES (NULL, $1, 'kpi_sync', $2, NOW())
+                """,
+                category,
+                vendor_cost,
+            )
+            summary_key = category.replace("-", "_") + "_cost"
+            summary[summary_key] = vendor_cost
+            summary["rows_inserted"] += 1
+
     return summary

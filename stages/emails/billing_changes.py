@@ -223,3 +223,79 @@ async def send_topup_receipt_email(
     )
 
     await send_email(email, f"UploadM8 top-up confirmed — +{tokens_added:,} {wt_short} tokens 💰", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+
+
+async def send_bundle_topup_receipt_email(
+    email: str,
+    name: str,
+    put_added: int,
+    aic_added: int,
+    amount: float,
+    stripe_payment_id: str = "",
+    *,
+    bonus_put: int = 0,
+    bonus_aic: int = 0,
+    put_balance: int = 0,
+    aic_balance: int = 0,
+) -> None:
+    """Receipt for PUT+AIC bundle top-up (checkout.session.completed, mode=payment)."""
+    if not mailgun_ready():
+        return
+
+    inv_label = f"PAY-{stripe_payment_id[:8].upper()}" if stripe_payment_id else "—"
+    receipt_rows = [
+        receipt_row("Bundle", "PUT + AIC pack"),
+        receipt_row("PUT added", f"+{put_added:,}"),
+        receipt_row("AIC added", f"+{aic_added:,}"),
+    ]
+    if bonus_put or bonus_aic:
+        receipt_rows.append(
+            receipt_row(
+                "First-time bonus",
+                f"+{bonus_put:,} PUT · +{bonus_aic:,} AIC",
+            )
+        )
+    receipt_rows.extend([
+        receipt_row("New PUT balance", f"{put_balance:,}" if put_balance else "See dashboard"),
+        receipt_row("New AIC balance", f"{aic_balance:,}" if aic_balance else "See dashboard"),
+        receipt_row("Payment Ref", inv_label),
+        receipt_row("Amount Charged", f"${amount:.2f}", is_total=True),
+    ])
+    receipt_lines = (
+        '<table cellpadding="0" cellspacing="0" width="100%">'
+        + "".join(receipt_rows)
+        + "</table>"
+    )
+
+    bonus_note = ""
+    if bonus_put or bonus_aic:
+        bonus_note = f" First-time top-up bonus: +{bonus_put:,} PUT and +{bonus_aic:,} AIC."
+
+    html = email_shell(
+        gradient=GRAD_PURPLE,
+        tagline="Your token wallet has been topped up",
+        preheader_text=f"+{put_added:,} PUT and +{aic_added:,} AIC added.{bonus_note}",
+        body_rows=(
+            section_tag("+ Bundle credits added", "#7c3aed")
+            + intro_row(
+                f"Top-up confirmed, {name}!",
+                f"<strong style='color:#a78bfa;'>+{put_added:,} PUT</strong> and "
+                f"<strong style='color:#a78bfa;'>+{aic_added:,} AIC</strong> are in your wallet.{bonus_note}",
+            )
+            + tinted_box(receipt_lines, hex_color="#7c3aed")
+            + cta_button("Start Uploading", URL_DASHBOARD, pt="20px", pb="20px")
+            + secondary_links(
+                ("Token Wallet &amp; Balance", URL_BILLING),
+                ("Dashboard", URL_DASHBOARD),
+            )
+        ),
+        footer_note="You received this because a token top-up payment was processed on your account.",
+    )
+
+    await send_email(
+        email,
+        f"UploadM8 bundle top-up — +{put_added:,} PUT / +{aic_added:,} AIC",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+    )

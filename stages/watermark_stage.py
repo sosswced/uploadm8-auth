@@ -15,6 +15,14 @@ import os
 from pathlib import Path
 from typing import Optional
 
+# Cap FFmpeg CPU per invocation so concurrent jobs don't pin all cores.
+# Default scales with WORKER_CONCURRENCY: cpu_count // concurrency, min 1.
+_FFMPEG_THREADS_DEFAULT = max(
+    1,
+    (os.cpu_count() or 2) // max(1, int(os.environ.get("WORKER_CONCURRENCY", "3"))),
+)
+FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", str(_FFMPEG_THREADS_DEFAULT)))
+
 from .errors import SkipStage
 from .context import JobContext
 from .ffmpeg_env import resolve_ffmpeg_executable
@@ -217,6 +225,7 @@ async def run_watermark_stage(ctx: JobContext) -> JobContext:
         "-i", str(video_path),
         "-vf", drawtext_filter,
         "-c:v", "libx264",
+        "-threads", str(FFMPEG_THREADS),
         "-preset", WATERMARK_X264_PRESET,
         "-crf", WATERMARK_X264_CRF,
         "-c:a", "copy",

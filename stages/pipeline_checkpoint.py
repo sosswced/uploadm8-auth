@@ -1,15 +1,25 @@
 """
 Pipeline checkpoint / resume for the upload worker.
 
-Persists post-transcode and post-caption state to R2 + uploads.output_artifacts
-so a failed job can retry from the last durable stage without re-downloading
-the source or re-running FFmpeg transcode.
+Persists durable stages to R2 + uploads.output_artifacts (``pipeline_resume``)
+so a failed or stale-recovered job can continue without re-downloading the
+source or re-running FFmpeg transcode. Stages:
+
+- ``post_telemetry`` — telemetry/trill snapshot (+ optional source re-download).
+- ``post_transcode`` — per-platform MP4s under ``checkpoints/{user}/{upload}/``.
+- ``post_audio`` — compact ``audio_context`` (+ same transcode R2 keys) to
+  resume before Google Vision / downstream multimodal stages.
+- ``post_caption`` — thumbnail keys on R2 (optional promotion from worker).
+
+Resume is triggered by ``job_data["action"] == "retry"`` or
+``job_data["resume_from_checkpoint"]`` (used by stale processing recovery).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +32,10 @@ logger = logging.getLogger("uploadm8-worker")
 
 CHECKPOINT_VERSION = 1
 RESUME_KEY = "pipeline_resume"
+# JSON blob size cap for audio_context inside pipeline_resume (UTF-8 bytes)
+AUDIO_CONTEXT_CHECKPOINT_MAX_BYTES = int(
+    os.environ.get("AUDIO_CONTEXT_CHECKPOINT_MAX_BYTES", "150000")
+)
 
 
 def norm_platforms(platforms: Optional[List[str]]) -> List[str]:
@@ -99,6 +113,72 @@ def restore_telemetry_from_dict(ctx: JobContext, telemetry: Optional[dict], tril
             ctx.trill = ctx.trill_score
         except Exception as e:
             logger.debug(f"restore trill snapshot failed: {e}")
+
+
+def clip_audio_context_for_checkpoint(ac: Any) -> Dict[str, Any]:
+    """Return a JSON-serializable audio_context dict capped for DB storage."""
+    if not isinstance(ac, dict) or not ac:
+        return {}
+    try:
+        slim: Dict[str, Any] = json.loads(json.dumps(ac, default=str))
+    except Exception:
+        return {}
+    ts = slim.get("transcript_segments")
+    if isinstance(ts, list) and len(ts) > 48:
+        slim["transcript_segments"] = ts[:48]
+    yn = slim.get("yamnet_events")
+    if isinstance(yn, list) and len(yn) > 120:
+        slim["yamnet_events"] = yn[:120]
+    slim.pop("yamnet_scoreboard", None)
+    t_struct = slim.get("transcript_structured")
+    if isinstance(t_struct, dict) and len(json.dumps(t_struct, default=str)) > 40_000:
+        slim.pop("transcript_structured", None)
+    raw = json.dumps(slim, default=str).encode("utf-8")
+    if len(raw) <= AUDIO_CONTEXT_CHECKPOINT_MAX_BYTES:
+        return slim
+    slim2 = {
+        "transcript": str(slim.get("transcript") or "")[:8000],
+        "fusion_narrative": str(slim.get("fusion_narrative") or "")[:1900],
+        "gpt_audio_summary": str(slim.get("gpt_audio_summary") or "")[:2400],
+        "music_title": str(slim.get("music_title") or "")[:400],
+        "music_artist": str(slim.get("music_artist") or "")[:400],
+        "music_genre": str(slim.get("music_genre") or "")[:200],
+        "top_sound_class": str(slim.get("top_sound_class") or "")[:200],
+        "sound_profile": str(slim.get("sound_profile") or "")[:1200],
+        "transcript_language": slim.get("transcript_language"),
+        "language": slim.get("language"),
+        "music_detected": slim.get("music_detected"),
+        "transcript_chars": slim.get("transcript_chars"),
+        "suggested_keywords": (slim.get("suggested_keywords") or [])[:24]
+        if isinstance(slim.get("suggested_keywords"), list)
+        else [],
+        "content_signals": (slim.get("content_signals") or [])[:16]
+        if isinstance(slim.get("content_signals"), list)
+        else [],
+    }
+    raw2 = json.dumps(slim2, default=str).encode("utf-8")
+    if len(raw2) > AUDIO_CONTEXT_CHECKPOINT_MAX_BYTES:
+        slim2["transcript"] = str(slim2.get("transcript") or "")[:4000]
+    return slim2
+
+
+def restore_audio_context_from_dict(ctx: JobContext, data: Any) -> None:
+    if not data:
+        ctx.audio_context = dict(getattr(ctx, "audio_context", None) or {})
+        return
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            ctx.audio_context = {}
+            return
+    if not isinstance(data, dict):
+        ctx.audio_context = {}
+        return
+    ctx.audio_context = dict(data)
+    tr = str(data.get("transcript") or "").strip()
+    if tr:
+        ctx.ai_transcript = tr[:9500]
 
 
 async def verify_transcode_r2_keys(transcode_r2: Dict[str, str]) -> bool:
@@ -181,10 +261,10 @@ async def save_post_telemetry_checkpoint(pool, ctx: JobContext) -> None:
     source video is already up there under ``r2_key``. We only stash the
     telemetry/trill snapshot and the ffprobe video_info dict in
     ``uploads.output_artifacts`` so a retry that fails between telemetry and
-    transcode (HUD burn, watermark encode, transcode itself) doesn't have to
+    transcode (watermark encode, transcode itself) doesn't have to
     re-run telemetry parsing or hit the geocoding APIs again.
 
-    Idempotent: if a later checkpoint (post_transcode/post_caption) already
+    Idempotent: if a later checkpoint (post_transcode / post_audio / post_caption) already
     promoted the resume blob, we leave that one alone — it carries strictly
     more state than this one.
     """
@@ -193,7 +273,7 @@ async def save_post_telemetry_checkpoint(pool, ctx: JobContext) -> None:
 
     ur = await db_stage.load_upload_record(pool, upload_id)
     existing = load_resume(ur or {})
-    if existing and existing.get("stage") in ("post_transcode", "post_caption"):
+    if existing and existing.get("stage") in ("post_transcode", "post_audio", "post_caption"):
         return
 
     resume = {
@@ -215,6 +295,13 @@ async def save_post_transcode_checkpoint(pool, ctx: JobContext) -> None:
     upload_id = ctx.upload_id
     user_id = ctx.user_id
     if not ctx.platform_videos:
+        return
+
+    from stages import db as db_stage
+
+    ur0 = await db_stage.load_upload_record(pool, upload_id)
+    ex0 = load_resume(ur0 or {})
+    if ex0 and ex0.get("stage") in ("post_audio", "post_caption"):
         return
 
     transcode_r2: Dict[str, str] = {}
@@ -257,6 +344,23 @@ async def save_post_transcode_checkpoint(pool, ctx: JobContext) -> None:
     logger.info(f"[{upload_id}] Checkpoint saved: post_transcode ({list(transcode_r2.keys())})")
 
 
+async def save_post_audio_checkpoint(pool, ctx: JobContext) -> None:
+    """Promote checkpoint to post_audio after Whisper/ACR/YAMNet (resume before Vision)."""
+    from stages import db as db_stage
+
+    upload_id = ctx.upload_id
+    ur = await db_stage.load_upload_record(pool, upload_id)
+    resume = load_resume(ur or {})
+    if not resume or resume.get("stage") != "post_transcode":
+        return
+    resume = dict(resume)
+    resume["stage"] = "post_audio"
+    resume["audio_context"] = clip_audio_context_for_checkpoint(getattr(ctx, "audio_context", None) or {})
+    resume["saved_at_audio"] = datetime.now(timezone.utc).isoformat()
+    await merge_output_artifacts_patch(pool, upload_id, {RESUME_KEY: resume})
+    logger.info(f"[{upload_id}] Checkpoint promoted: post_audio")
+
+
 def _platforms_covered_transcode(transcode_r2: Dict[str, str], platforms: List[str]) -> bool:
     keys_lower = {str(k).strip().lower() for k in transcode_r2.keys()}
     for p in platforms:
@@ -273,7 +377,7 @@ async def save_post_caption_checkpoint(pool, ctx: JobContext) -> None:
     upload_id = ctx.upload_id
     ur = await db_stage.load_upload_record(pool, upload_id)
     resume = load_resume(ur or {})
-    if not resume or resume.get("stage") != "post_transcode":
+    if not resume or resume.get("stage") not in ("post_transcode", "post_audio"):
         return
     resume = dict(resume)
     resume["stage"] = "post_caption"
@@ -298,15 +402,18 @@ async def try_resume_from_checkpoint(
     ctx: JobContext,
 ) -> Tuple[Optional[str], Optional[Any]]:
     """
-    If action=retry and checkpoint is valid, prepare temp dir + ctx for resume.
+    If ``action=retry`` or ``resume_from_checkpoint`` and checkpoint is valid,
+    prepare temp dir + ctx for resume.
 
     Returns:
-        (mode, temp_dir_holder) where mode is 'post_transcode' | 'post_caption' | None,
+        (mode, temp_dir_holder) where mode is
+        ``post_telemetry`` | ``post_transcode`` | ``post_audio`` | ``post_caption`` | None,
         and temp_dir_holder is tempfile.TemporaryDirectory if mode is set (caller must cleanup).
     """
     import tempfile
 
-    if job_data.get("action") != "retry":
+    allow = (job_data.get("action") == "retry") or bool(job_data.get("resume_from_checkpoint"))
+    if not allow:
         return None, None
 
     cp = load_resume(upload_record)
@@ -314,7 +421,7 @@ async def try_resume_from_checkpoint(
         return None, None
 
     stage = (cp.get("stage") or "").strip().lower()
-    if stage not in ("post_telemetry", "post_transcode", "post_caption"):
+    if stage not in ("post_telemetry", "post_transcode", "post_audio", "post_caption"):
         return None, None
 
     # ── post_telemetry: re-download source, restore telemetry snapshot ──
@@ -412,6 +519,18 @@ async def try_resume_from_checkpoint(
     ctx.local_video_path = first
     ctx.processed_video_path = first
 
+    stage_out = stage
+    if stage == "post_audio":
+        ac_blob = cp.get("audio_context")
+        if isinstance(ac_blob, dict) and ac_blob:
+            restore_audio_context_from_dict(ctx, ac_blob)
+        else:
+            logger.info(
+                "[%s] post_audio checkpoint missing audio_context — resuming at transcode (re-run audio)",
+                ctx.upload_id,
+            )
+            stage_out = "post_transcode"
+
     if stage == "post_caption":
         ctx.thumbnail_r2_key = (cp.get("thumbnail_r2_key") or "") or upload_record.get("thumbnail_r2_key")
         ptr = cp.get("platform_thumbnail_r2") or {}
@@ -431,5 +550,5 @@ async def try_resume_from_checkpoint(
         if platform_thumb_map:
             ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_thumb_map)
 
-    logger.info(f"[{ctx.upload_id}] Resuming from checkpoint: {stage}")
-    return stage, holder
+    logger.info(f"[{ctx.upload_id}] Resuming from checkpoint: {stage_out}")
+    return stage_out, holder

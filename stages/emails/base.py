@@ -25,7 +25,10 @@ DESIGN v2 UPGRADES:
 
 import os
 import logging
+import html
 import httpx
+from dataclasses import dataclass
+from typing import Optional
 
 logger = logging.getLogger("uploadm8-worker")
 
@@ -171,12 +174,45 @@ def _preheader_block(text: str) -> str:
 # HTML shell  —  v2
 # ═════════════════════════════════════════════════════════════════════════════
 
+@dataclass
+class BrandContext:
+    """Email/export branding — UploadM8 defaults or agency white label."""
+
+    logo_url: str
+    company_name: str
+    primary_color: str
+    footer_name: str
+    product_name: str
+
+    @classmethod
+    def uploadm8_default(cls) -> "BrandContext":
+        return cls(
+            logo_url=LOGO_URL,
+            company_name="UploadM8",
+            primary_color="#f97316",
+            footer_name="UploadM8",
+            product_name="UploadM8",
+        )
+
+    def header_gradient(self) -> str:
+        c = self.primary_color or "#f97316"
+        return f"linear-gradient(135deg,{c} 0%,{c} 50%,#c2410c 100%)"
+
+    def accent_stripe_css(self) -> str:
+        c = self.primary_color or "#f97316"
+        return (
+            f"background:linear-gradient(90deg,{c} 0%,{c} 35%,"
+            f"rgba(249,115,22,0.5) 65%,rgba(249,115,22,0) 100%);"
+        )
+
+
 def email_shell(
     body_rows: str,
     gradient: str = GRAD_ORANGE,
     tagline: str = "Upload once. Publish everywhere.",
     footer_note: str = "",
     preheader_text: str = "",
+    brand: Optional[BrandContext] = None,
 ) -> str:
     """
     Wraps body_rows (concatenated <tr> strings) in the full branded card.
@@ -201,10 +237,17 @@ def email_shell(
         if footer_note else ""
     )
 
+    bc = brand or BrandContext.uploadm8_default()
+    grad = bc.header_gradient() if brand else gradient
+    logo_src = bc.logo_url or LOGO_URL
+    logo_alt = html.escape(bc.company_name or "UploadM8", quote=True)
+    footer_brand = html.escape(bc.footer_name or "UploadM8", quote=False)
+    page_title = html.escape(bc.product_name or "UploadM8", quote=False)
+
     header = (
-        f'<tr><td style="background:{gradient};padding:34px 40px 30px;text-align:center;">'
+        f'<tr><td style="background:{grad};padding:34px 40px 30px;text-align:center;">'
         f'<a href="{FRONTEND_URL}" style="display:inline-block;text-decoration:none;">'
-        f'<img src="{LOGO_URL}" alt="UploadM8" height="46" '
+        f'<img src="{logo_src}" alt="{logo_alt}" height="46" '
         f'style="display:block;margin:0 auto 12px;max-width:200px;border:0;">'
         f'</a>'
         f'<p style="margin:0;color:rgba(255,255,255,0.85);font-size:13px;'
@@ -212,19 +255,20 @@ def email_shell(
         f'</td></tr>'
     )
 
-    # Orange-to-transparent glow stripe — brand signature below every header
+    accent_css = bc.accent_stripe_css() if brand else (
+        'background:linear-gradient(90deg,#f97316 0%,#fb923c 35%,#fdba74 65%,rgba(249,115,22,0) 100%);'
+    )
     accent_stripe = (
         '<tr><td style="padding:0;line-height:0;font-size:0;">'
-        '<div style="height:3px;'
-        'background:linear-gradient(90deg,#f97316 0%,#fb923c 35%,#fdba74 65%,rgba(249,115,22,0) 100%);">'
+        f'<div style="height:3px;{accent_css}">'
         '</div></td></tr>'
     )
 
     footer = (
         '<tr><td style="padding:26px 40px 24px;text-align:center;'
         'border-top:1px solid rgba(255,255,255,0.06);">'
-        '<p style="margin:0 0 6px;color:#4b5563;font-size:13px;">'
-        '&#169; 2025 UploadM8 &middot; All rights reserved</p>'
+        f'<p style="margin:0 0 6px;color:#4b5563;font-size:13px;">'
+        f'&#169; 2025 {footer_brand} &middot; All rights reserved</p>'
         f'<p style="margin:0 0 8px;color:#4b5563;font-size:12px;">Need help? '
         f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
         f'{SUPPORT_EMAIL}</a></p>'
@@ -241,7 +285,7 @@ def email_shell(
         '<!DOCTYPE html><html lang="en"><head>'
         '<meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
-        '<title>UploadM8</title>'
+        f'<title>{page_title}</title>'
         '</head>'
         '<body style="margin:0;padding:0;background-color:#0f0f0f;'
         "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\">"

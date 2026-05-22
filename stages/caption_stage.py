@@ -96,6 +96,22 @@ def _setting_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+def _user_explicitly_disabled_auto_captions(us: Dict[str, Any]) -> bool:
+    """
+    True when upload preferences explicitly turn off auto captions.
+
+    Used so placeholder title/caption hydration does not override a deliberate
+    ``autoCaptions: false`` (or legacy string ``\"false\"``).
+    """
+    if "auto_generate_captions" in us and not _setting_bool(us.get("auto_generate_captions"), True):
+        return True
+    if "autoCaptions" in us and not _setting_bool(us.get("autoCaptions"), True):
+        return True
+    if "auto_captions" in us and not _setting_bool(us.get("auto_captions"), True):
+        return True
+    return False
+
+
 # ============================================================
 # Universal Content Category Engine
 # ============================================================
@@ -848,32 +864,81 @@ def _build_narrative_prompt(
 ) -> str:
     """Build the full AI prompt with category context, multi-frame narrative, and Trill beat."""
     platform_str = ", ".join(ctx.platforms) if ctx.platforms else "social media"
+    caption_length = {
+        "story":   "150–280 characters — tell a narrative arc",
+        "punchy":  "under 120 characters — hook in the first 3 words",
+        "factual": "100–200 characters — lead with the most impressive stat",
+    }.get(caption_style, "150–280 characters")
 
-    # ── Task list ────────────────────────────────────────────────────────────
-    tasks = []
+    _allowed_plats = frozenset({"youtube", "tiktok", "instagram", "facebook"})
+    _raw_plats = [str(p).strip().lower() for p in (ctx.platforms or []) if str(p).strip()]
+    _selected_platforms = [p for p in _raw_plats if p in _allowed_plats]
+    if not _selected_platforms:
+        _selected_platforms = ["youtube", "tiktok", "instagram", "facebook"]
+    sel_label = ", ".join(_selected_platforms)
+
+    _platform_title_specs = {
+        "youtube": "Keyword-front-loaded searchable title; strongest nouns in the first 40 chars; max 100 chars; plain language; no emojis; avoid Title Case Every Word and generic hooks (POV:, This is why, Wait for, Nobody expected).",
+        "tiktok": "3–8 word FYP-style hook; concrete visual, place, or speed when visible; max 100 chars; no emoji; never invent facts.",
+        "instagram": "Short Reels headline: aesthetic + specific to visible details; max 100 chars; no emoji.",
+        "facebook": "Plain-language discovery title for a broad feed; who/what/where when visible; max 100 chars.",
+    }
+    _platform_caption_specs = {
+        "youtube": f"YouTube — {caption_length}; searchable nouns early; evidence-grounded description energy.",
+        "tiktok": f"TikTok — {caption_length}; hook in the first 3 words; trend-native but never invent facts.",
+        "instagram": f"Instagram Reels — {caption_length}; niche keywords + vibe tied to visible details.",
+        "facebook": f"Facebook — {caption_length}; conversational, shareable prose; clear who/what/where.",
+    }
+
+    # ── Task list (per-platform JSON + legacy top-level keys for back-compat) ─
+    tasks: List[str] = []
+    ti = 0
     if generate_title:
+        ti += 1
+        spec_lines = "\n".join(
+            f"   • {pl.upper()}: {_platform_title_specs[pl]}"
+            for pl in _selected_platforms
+            if pl in _platform_title_specs
+        )
         tasks.append(
-            "1. A TITLE (max 100 characters): plain language, specific to this clip; "
-            "no emojis; avoid Title Case Every Word and generic AI-style hooks "
-            '("POV:", "This is why", "Wait for", "Nobody expected").'
+            f"{ti}. titles_by_platform: JSON object with one string title per target platform.\n"
+            f"   Target platforms for this upload: {sel_label}\n"
+            f"   Each platform title MUST be meaningfully different from the others.\n"
+            f"{spec_lines}\n"
+            '   Also set top-level "title" to the same string as titles_by_platform["youtube"] '
+            'when "youtube" is among the targets; otherwise use the best title for the first '
+            "listed target platform."
         )
     if generate_caption:
-        caption_length = {
-            "story":   "150–280 characters — tell a narrative arc",
-            "punchy":  "under 120 characters — hook in the first 3 words",
-            "factual": "100–200 characters — lead with the most impressive stat",
-        }.get(caption_style, "150–280 characters")
-        tasks.append(f'2. A CAPTION ({caption_length})')
+        ti += 1
+        cspec_lines = "\n".join(
+            f"   • {pl.upper()}: {_platform_caption_specs[pl]}"
+            for pl in _selected_platforms
+            if pl in _platform_caption_specs
+        )
+        tasks.append(
+            f"{ti}. captions_by_platform: JSON object with one caption string per target platform.\n"
+            f"   Target platforms: {sel_label}\n"
+            f"{cspec_lines}\n"
+            '   Also set top-level "caption" to the same string as captions_by_platform["tiktok"] '
+            'when "tiktok" is among the targets; otherwise use the caption for the first '
+            "listed short-form platform (instagram, then facebook, else youtube)."
+        )
     if generate_hashtags and hashtag_count > 0:
+        ti += 1
         style_hint = {
             "trending": "prioritise viral trending tags",
             "niche":    "prioritise specific niche community tags",
             "mixed":    "mix viral and niche tags",
         }.get(hashtag_style, "mix viral and niche tags")
         tasks.append(
-            f'3. Exactly {hashtag_count} HASHTAGS ({style_hint}) — '
-            f'return as JSON array of complete words WITHOUT the # symbol. '
-            f'NEVER return single letters or word fragments.'
+            f"{ti}. hashtags_by_platform: JSON object mapping each target platform to an array of "
+            f"up to {hashtag_count} hashtag words WITHOUT the # symbol ({style_hint}). "
+            f"NEVER return single letters or word fragments.\n"
+            f"   Target platforms: {sel_label}\n"
+            '   Also set top-level "hashtags" to the same array as hashtags_by_platform["tiktok"] '
+            'when "tiktok" is among the targets; else hashtags_by_platform["instagram"], then '
+            '"facebook", else "youtube".'
         )
     tasks_block = "\n".join(tasks) if tasks else "(none requested)"
 
@@ -990,7 +1055,20 @@ def _build_narrative_prompt(
             bits.append(f"On-screen / OCR text: {ocr[:2200]}")
         labels = vc.get("label_names") or []
         if labels:
-            bits.append("Scene labels: " + ", ".join(str(x) for x in labels[:22]))
+            from core.vision_labels import filter_vision_labels_for_context
+
+            cat = str(
+                getattr(ctx, "thumbnail_category", None)
+                or (getattr(ctx, "hydration_payload", None) or {}).get("category")
+                or "general"
+            )
+            filtered = filter_vision_labels_for_context(
+                labels,
+                category=cat,
+                filename=str(getattr(ctx, "filename", "") or ""),
+            )
+            if filtered:
+                bits.append("Scene labels: " + ", ".join(str(x) for x in filtered[:22]))
         fc = vc.get("face_count")
         if fc:
             bits.append(f"Approx. faces in sampled frame: {fc}")
@@ -1092,10 +1170,19 @@ def _build_narrative_prompt(
     # ── Platform-specific output notes ───────────────────────────────────────
     platform_notes = []
     if "youtube" in (ctx.platforms or []):
-        platform_notes.append("YouTube: provide both title and description.")
+        platform_notes.append("YouTube: titles_by_platform.youtube is the SEO title.")
     if any(p in (ctx.platforms or []) for p in ("tiktok", "instagram", "facebook")):
-        platform_notes.append("TikTok/Instagram/Facebook: caption only — no title field.")
+        platform_notes.append(
+            "TikTok/Instagram/Facebook: publish may be caption-led; still supply distinct titles per platform."
+        )
+    platform_notes.append(
+        f"Per-platform JSON keys required only for: {sel_label}. Omit other platform keys entirely."
+    )
     platform_note = " | ".join(platform_notes)
+
+    ex_titles_shape = "{" + ", ".join(f'"{p}":"…"' for p in _selected_platforms) + "}"
+    ex_caps_shape = "{" + ", ".join(f'"{p}":"…"' for p in _selected_platforms) + "}"
+    ex_tags_shape = "{" + ", ".join(f'"{p}":["tag"]' for p in _selected_platforms) + "}"
 
     prompt = f"""You are helping polish upload copy for {platform_str} — write like the creator would,
 from what is actually in the video and context blocks (not like a corporate social team or a generic "expert" persona).
@@ -1140,8 +1227,12 @@ Rules:
 - Be SPECIFIC to what is actually visible — generic content gets buried
 - If Trill data provided: caption MUST reference at least one real data point
 
-Respond ONLY in this exact JSON format (no markdown, no explanation):
-{{"title": "...", "caption": "...", "hashtags": ["word1", "word2", ...]}}
+Respond ONLY in this exact JSON format (no markdown, no explanation).
+Include only the keys you are generating; use null for omitted top-level keys.
+Per-platform objects MUST only include keys from this upload's target list: {sel_label}.
+
+Example shape (ellipsis not literal):
+{{"titles_by_platform": {ex_titles_shape}, "captions_by_platform": {ex_caps_shape}, "hashtags_by_platform": {ex_tags_shape}, "title": "…", "caption": "…", "hashtags": ["word1", "word2"]}}
 
 Use null for any key you are not generating."""
 
@@ -1158,9 +1249,15 @@ async def _call_openai(
     model: str,
     hashtag_count: int,
 ) -> Dict[str, Any]:
-    """Call OpenAI with prompt + attached frames. Returns {title, caption, hashtags, tokens}."""
+    """Call OpenAI with prompt + attached frames. Returns title/caption/hashtags + per-platform maps."""
     result: Dict[str, Any] = {
-        "title": None, "caption": None, "hashtags": [], "tokens": {}
+        "title": None,
+        "caption": None,
+        "hashtags": [],
+        "titles_by_platform": {},
+        "captions_by_platform": {},
+        "hashtags_by_platform": {},
+        "tokens": {},
     }
 
     if not OPENAI_API_KEY:
@@ -1224,6 +1321,45 @@ async def _call_openai(
             if parsed.get("caption"):
                 result["caption"] = str(parsed["caption"])[:500]
 
+            _plat_ok = frozenset({"youtube", "tiktok", "instagram", "facebook"})
+
+            tbp = parsed.get("titles_by_platform")
+            if isinstance(tbp, dict):
+                for k, v in tbp.items():
+                    kk = str(k).strip().lower()
+                    if kk in _plat_ok and v is not None and str(v).strip():
+                        result["titles_by_platform"][kk] = str(v).strip()[:120]
+
+            cbp = parsed.get("captions_by_platform")
+            if isinstance(cbp, dict):
+                for k, v in cbp.items():
+                    kk = str(k).strip().lower()
+                    if kk in _plat_ok and v is not None and str(v).strip():
+                        result["captions_by_platform"][kk] = strip_stray_hashtag_json_blob(
+                            str(v).strip()
+                        )[:2200]
+
+            hbp = parsed.get("hashtags_by_platform")
+            if isinstance(hbp, dict):
+                for k, v in hbp.items():
+                    kk = str(k).strip().lower()
+                    if kk not in _plat_ok or v is None:
+                        continue
+                    raw_pl = v if isinstance(v, list) else []
+                    if isinstance(v, str):
+                        raw_pl = [t.strip() for t in v.replace(",", " ").split() if t.strip()]
+                    cleaned_pl: List[str] = []
+                    for tag in raw_pl:
+                        ts = str(tag).strip() if tag is not None else ""
+                        if not ts:
+                            continue
+                        parts = ts.split() if " " in ts else [ts]
+                        for part in parts:
+                            body = sanitize_hashtag_body(str(part).strip())
+                            if len(body) >= 2:
+                                cleaned_pl.append(body)
+                    result["hashtags_by_platform"][kk] = cleaned_pl[:hashtag_count]
+
             raw_tags = parsed.get("hashtags")
             if raw_tags is not None:
                 if isinstance(raw_tags, str):
@@ -1249,6 +1385,38 @@ async def _call_openai(
         logger.error(f"OpenAI API call failed: {e}")
 
     return result
+
+
+# Platform-meta tags stripped before M8 final hashtag merge (see signal_hashtags._BLOCKED_META).
+_META_HASHTAG_SLUGS = frozenset({
+    "viral", "fyp", "foryou", "foryoupage", "trending", "mustwatch",
+    "follow", "like", "subscribe", "video", "reels", "content",
+    "youtube", "tiktok", "instagram", "facebook",
+})
+
+
+def strip_meta_hashtags(
+    tags: List[str],
+    max_count: int,
+    *,
+    category: str = "general",
+    extra_seeds: Optional[List[str]] = None,
+) -> List[str]:
+    """Remove platform-meta spam; keep evidence/category tags up to max_count."""
+    _ = category, extra_seeds  # reserved for future seed-priority ordering
+    out: List[str] = []
+    seen: set = set()
+    for raw in tags or []:
+        body = sanitize_hashtag_body(str(raw))
+        if not body or body in seen:
+            continue
+        if body.lower() in _META_HASHTAG_SLUGS:
+            continue
+        seen.add(body)
+        out.append(body)
+        if len(out) >= max(0, int(max_count or 0)):
+            break
+    return out[: max(0, int(max_count or 0))]
 
 
 # ============================================================
@@ -1381,7 +1549,11 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
 
     us = ctx.user_settings or {}
 
-    caption_llm_enabled = user_pref_ai_service_enabled(us, "caption_llm", default=True)
+    tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
+    tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
+    caption_llm_enabled = user_pref_ai_service_enabled(
+        us, "caption_llm", default=True, allowed_services=tier_allowed_set
+    )
 
     # ── User preference toggles ──────────────────────────────────────────────
     generate_caption  = _setting_bool(us.get("autoCaptions", us.get("auto_captions")), False)
@@ -1404,10 +1576,11 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         generate_title = True
     if (ctx.caption or "").strip() and not caption_is_placeholder:
         generate_caption = False
-    elif caption_is_placeholder and title_is_placeholder:
-        # Both title and caption are placeholders → enable caption generation so
-        # the pipeline writes a hydrated caption even if the user has not yet
-        # explicitly toggled autoCaptions in their settings.
+    elif caption_is_placeholder and title_is_placeholder and not _user_explicitly_disabled_auto_captions(
+        us
+    ):
+        # Both placeholders → hydrate caption for empty uploads when the user
+        # has not explicitly opted out of auto captions (missing pref uses this path).
         generate_caption = True
 
     # ── Style/tone preferences ───────────────────────────────────────────────
@@ -1473,6 +1646,14 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
         str(getattr(ctx, "upload_id", "") or ""),
     )
     ctx.thumbnail_category = category
+
+    # Re-roll recognition narrative with detected niche (food, travel, automotive, …).
+    try:
+        from services.google_visual_recognition import attach_visual_recognition
+
+        attach_visual_recognition(ctx)
+    except Exception:
+        pass
 
     # If AI path is unavailable/disabled, still hydrate a caption from context engine.
     # This avoids stale generic defaults from older fallback copy.
@@ -1590,16 +1771,81 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                             len(ctx.ai_hashtags or []),
                             ctx.ai_hashtags,
                         )
+                    m8c = getattr(ctx, "m8_platform_captions", None) or {}
+                    m8t = getattr(ctx, "m8_platform_titles", None) or {}
+                    _trace_caption(ctx, str(ctx.upload_id), "m8_engine_ok", {
+                        "m8_platform_caption_keys": sorted(
+                            str(k).lower() for k in (m8c.keys() if isinstance(m8c, dict) else [])
+                        ),
+                        "m8_platform_title_keys": sorted(
+                            str(k).lower() for k in (m8t.keys() if isinstance(m8t, dict) else [])
+                        ),
+                        "target_platforms": [str(p).lower() for p in (ctx.platforms or [])],
+                    })
+                    if isinstance(m8c, dict) and ctx.platforms and not any(
+                        str(m8c.get(str(p).lower()) or "").strip() for p in (ctx.platforms or [])
+                    ):
+                        try:
+                            ctx.output_artifacts["m8_degraded_reason"] = json.dumps(
+                                {"ok": True, "issue": "m8_empty_per_platform_captions"},
+                                default=str,
+                            )[:2000]
+                        except Exception:
+                            pass
+                        _trace_caption(ctx, str(ctx.upload_id), "m8_degraded_per_platform", {
+                            "issue": "m8_empty_per_platform_captions",
+                            "legacy_fallback_next": False,
+                            "target_platforms": [str(p).lower() for p in (ctx.platforms or [])],
+                        })
                 else:
                     logger.warning(
                         "M8 caption engine failed (%s); falling back to legacy narrative prompt",
                         meta.get("error"),
                     )
+                    try:
+                        ctx.output_artifacts["m8_degraded_reason"] = json.dumps(
+                            {
+                                "ok": False,
+                                "error": meta.get("error"),
+                                "legacy_fallback": True,
+                            },
+                            default=str,
+                        )[:4000]
+                    except Exception:
+                        pass
+                    _trace_caption(ctx, str(ctx.upload_id), "m8_engine_failed", {
+                        "legacy_fallback": True,
+                        "error": str(meta.get("error") or "")[:800],
+                    })
             except Exception as m8_err:
                 logger.warning(
                     "M8 caption path error: %s; falling back to legacy narrative prompt",
                     m8_err,
                 )
+                try:
+                    ctx.output_artifacts["m8_degraded_reason"] = json.dumps(
+                        {"ok": False, "error": str(m8_err)[:800], "legacy_fallback": True},
+                        default=str,
+                    )[:4000]
+                except Exception:
+                    pass
+                _trace_caption(ctx, str(ctx.upload_id), "m8_engine_exception", {
+                    "legacy_fallback": True,
+                    "error": str(m8_err)[:800],
+                })
+
+        if not used_m8 and _USE_M8_CAPTION_ENGINE:
+            raw_deg = ""
+            try:
+                raw_deg = str(
+                    (ctx.output_artifacts or {}).get("m8_degraded_reason") or ""
+                )
+            except Exception:
+                raw_deg = ""
+            _trace_caption(ctx, str(ctx.upload_id), "m8_legacy_fallback", {
+                "legacy_fallback": True,
+                "m8_degraded_reason": raw_deg[:2000],
+            })
 
         if not used_m8:
             # ── Legacy: single category-aware narrative prompt ───────────────
@@ -1629,25 +1875,118 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                 hashtag_count=hashtag_count,
             )
 
-            if result.get("title") and generate_title:
-                ctx.ai_title = result["title"]
-                logger.info(f"AI title: {ctx.ai_title[:80]}")
+            titles_bp = result.get("titles_by_platform") if isinstance(result.get("titles_by_platform"), dict) else {}
+            caps_bp = result.get("captions_by_platform") if isinstance(result.get("captions_by_platform"), dict) else {}
+            tags_bp = result.get("hashtags_by_platform") if isinstance(result.get("hashtags_by_platform"), dict) else {}
 
-            if result.get("caption") and generate_caption:
-                ctx.ai_caption = strip_stray_hashtag_json_blob(str(result["caption"]).strip())[:500]
-                logger.info(f"AI caption: {ctx.ai_caption[:80]}")
-
-            if generate_hashtags:
-                ai_raw = result.get("hashtags") or []
-                ctx.ai_hashtags = _finalise_hashtags(
-                    ai_tags=ai_raw,
+            ctx.m8_platform_titles = dict(titles_bp)
+            ctx.m8_platform_captions = dict(caps_bp)
+            ctx.m8_platform_hashtags = {}
+            for pl_h, raw_list in (tags_bp or {}).items():
+                if not isinstance(raw_list, list):
+                    continue
+                ctx.m8_platform_hashtags[str(pl_h).lower()] = _finalise_hashtags(
+                    ai_tags=raw_list,
                     base_tags=list(ctx.hashtags or []) + always_tags,
                     blocked=blocked_tags,
                     max_total=pref_max,
                 )
+
+            if result.get("title") and generate_title:
+                ctx.ai_title = str(result["title"]).strip()[:120]
+            elif generate_title and titles_bp.get("youtube"):
+                ctx.ai_title = str(titles_bp["youtube"]).strip()[:120]
+            elif generate_title and titles_bp:
+                ctx.ai_title = str(next(iter(titles_bp.values()))).strip()[:120]
+
+            if result.get("caption") and generate_caption:
+                ctx.ai_caption = strip_stray_hashtag_json_blob(str(result["caption"]).strip())[:500]
+            elif generate_caption and caps_bp.get("tiktok"):
+                ctx.ai_caption = strip_stray_hashtag_json_blob(str(caps_bp["tiktok"]).strip())[:500]
+            elif generate_caption:
+                for _k in ("tiktok", "instagram", "facebook", "youtube"):
+                    if caps_bp.get(_k):
+                        ctx.ai_caption = strip_stray_hashtag_json_blob(str(caps_bp[_k]).strip())[:500]
+                        break
+
+            if generate_hashtags:
+                if result.get("hashtags"):
+                    ai_raw = result.get("hashtags") or []
+                    ctx.ai_hashtags = _finalise_hashtags(
+                        ai_tags=ai_raw,
+                        base_tags=list(ctx.hashtags or []) + always_tags,
+                        blocked=blocked_tags,
+                        max_total=pref_max,
+                    )
+                elif tags_bp.get("tiktok"):
+                    ctx.ai_hashtags = _finalise_hashtags(
+                        ai_tags=tags_bp.get("tiktok") or [],
+                        base_tags=list(ctx.hashtags or []) + always_tags,
+                        blocked=blocked_tags,
+                        max_total=pref_max,
+                    )
+                elif tags_bp.get("instagram"):
+                    ctx.ai_hashtags = _finalise_hashtags(
+                        ai_tags=tags_bp.get("instagram") or [],
+                        base_tags=list(ctx.hashtags or []) + always_tags,
+                        blocked=blocked_tags,
+                        max_total=pref_max,
+                    )
+                elif tags_bp.get("facebook"):
+                    ctx.ai_hashtags = _finalise_hashtags(
+                        ai_tags=tags_bp.get("facebook") or [],
+                        base_tags=list(ctx.hashtags or []) + always_tags,
+                        blocked=blocked_tags,
+                        max_total=pref_max,
+                    )
+                elif tags_bp.get("youtube"):
+                    ctx.ai_hashtags = _finalise_hashtags(
+                        ai_tags=tags_bp.get("youtube") or [],
+                        base_tags=list(ctx.hashtags or []) + always_tags,
+                        blocked=blocked_tags,
+                        max_total=pref_max,
+                    )
                 logger.info(
-                    f"AI hashtags finalised ({len(ctx.ai_hashtags)}): {ctx.ai_hashtags}"
+                    f"AI hashtags finalised ({len(ctx.ai_hashtags or [])}): {ctx.ai_hashtags}"
                 )
+
+            if ctx.ai_title:
+                logger.info(f"AI title: {ctx.ai_title[:80]}")
+            if ctx.ai_caption:
+                logger.info(f"AI caption: {ctx.ai_caption[:80]}")
+
+            legacy_gap: Dict[str, Any] = {}
+            try:
+                plat_sel = [
+                    str(p).strip().lower()
+                    for p in (ctx.platforms or [])
+                    if str(p).strip()
+                ]
+                plat_ok = frozenset({"youtube", "tiktok", "instagram", "facebook"})
+                plat_sel = [p for p in plat_sel if p in plat_ok]
+                if generate_caption and plat_sel:
+                    missing_c = [
+                        p for p in plat_sel if not str((caps_bp or {}).get(p) or "").strip()
+                    ]
+                    if missing_c:
+                        legacy_gap["missing_caption_platforms"] = missing_c
+                if generate_title and plat_sel:
+                    missing_t = [
+                        p for p in plat_sel if not str((titles_bp or {}).get(p) or "").strip()
+                    ]
+                    if missing_t:
+                        legacy_gap["missing_title_platforms"] = missing_t
+                if generate_hashtags and plat_sel:
+                    missing_h = [p for p in plat_sel if not (tags_bp or {}).get(p)]
+                    if missing_h:
+                        legacy_gap["missing_hashtag_platforms"] = missing_h
+                if legacy_gap:
+                    ctx.output_artifacts["caption_legacy_per_platform_gap"] = json.dumps(
+                        legacy_gap,
+                        default=str,
+                    )[:2000]
+            except Exception:
+                pass
 
             tokens_used = result.get("tokens", {})
             cost = _estimate_cost(tokens_used, len(frames))
@@ -1660,6 +1999,10 @@ async def run_caption_stage(ctx: JobContext, db_pool=None) -> JobContext:
                 "title": str(ctx.ai_title or ""),
                 "caption": str(ctx.ai_caption or ""),
                 "hashtag_count": len(ctx.ai_hashtags or []),
+                "titles_by_platform": dict(titles_bp),
+                "captions_by_platform": {k: (str(v)[:220] + "…") if len(str(v)) > 220 else str(v) for k, v in caps_bp.items()},
+                "hashtags_by_platform": {k: list(v)[:24] for k, v in (tags_bp or {}).items()},
+                "legacy_per_platform_gap": legacy_gap,
                 "tokens": tokens_used,
                 "estimated_cost": round(cost, 6),
             })

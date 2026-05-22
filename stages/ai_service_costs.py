@@ -14,10 +14,15 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, Dict, FrozenSet, Optional, Set, Tuple, List
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 # Relative AIC units per service — ordered by typical vendor $ to recoup (higher = costlier).
-# Full-clip / minute-metered APIs sit at the top; local or near-free at the bottom.
+# Audit bands (defaults; tune live via admin Debit weights page):
+#   24–28  minute-metered cloud APIs (twelvelabs, video_intelligence)
+#   16–22  LLM / heavy gen (caption_llm, thumbnail_ai, thumbnail_recreate_ai)
+#   8–14   vision / persona / ranking middle tier
+#   2–7    fingerprint, local CPU, lightweight search (audio_acr … trend_intel)
+#   1      telemetry parse (negligible API cost)
 SERVICE_WEIGHTS: Dict[str, int] = {
     "twelvelabs": 28,  # Full-video index + Pegasus — usually highest $/min
     "video_intelligence": 24,  # GCP Video Intelligence — billed per minute of video
@@ -31,6 +36,7 @@ SERVICE_WEIGHTS: Dict[str, int] = {
     "thumbnail_recreate_ai": 14,  # URL-to-thumbnail recreate + prompt synthesis
     "persona_consistency": 10,  # Persona profile consistency checks
     "thumbnail_ctr_ranker": 6,  # Pre-publish scoring + suggestions
+    "marketing_image": 2,  # Per-user product card + optional Pikzels headline overlay
     "thumbnail_competitor_gap": 4,  # Competitor gap analysis mode
     "audio_yamnet": 2,  # Local AudioSet / YAMNet — CPU only
     "telemetry_trill": 1,  # .map parse + Nominatim geocode — negligible API $
@@ -46,7 +52,6 @@ DURATION_SCALED: FrozenSet[str] = frozenset(
     }
 )
 
-# Per-service user setting keys (frontend/API-facing; defaults = enabled).
 SERVICE_PREF_KEYS: Dict[str, str] = {
     "telemetry_trill": "aiServiceTelemetry",
     "audio_yamnet": "aiServiceAudioSignals",
@@ -60,6 +65,53 @@ SERVICE_PREF_KEYS: Dict[str, str] = {
     "twelvelabs": "aiServiceSceneUnderstanding",
     "dashcam_osd": "aiServiceDashcamOSD",
 }
+
+# ``user_preferences`` column names persisted by save_user_content_preferences.
+AI_SERVICE_DB_FIELD_TO_ID: Dict[str, str] = {
+    "ai_service_telemetry": "telemetry_trill",
+    "ai_service_dashcam_osd": "dashcam_osd",
+    "ai_service_audio_signals": "audio_yamnet",
+    "ai_service_music_detection": "audio_acr",
+    "ai_service_audio_summary": "audio_gpt_classify",
+    "ai_service_caption_writer": "caption_llm",
+    "ai_service_thumbnail_designer": "thumbnail_ai",
+    "ai_service_speech_to_text": "audio_whisper",
+    "ai_service_scene_understanding": "twelvelabs",
+}
+
+PREF_KEY_TO_SERVICE_ID: Dict[str, str] = {v: k for k, v in SERVICE_PREF_KEYS.items()}
+
+
+def clamp_ai_service_db_fields(
+    allowed_services: Optional[FrozenSet[str]],
+    fields: Dict[str, bool],
+) -> Dict[str, bool]:
+    """Force AI service toggles off when the user's tier does not allow the service."""
+    if allowed_services is None:
+        return dict(fields)
+    out = dict(fields)
+    for db_field, svc_id in AI_SERVICE_DB_FIELD_TO_ID.items():
+        if db_field in out and svc_id not in allowed_services:
+            out[db_field] = False
+    return out
+
+
+def clamp_ai_service_pref_payload(
+    allowed_services: Optional[FrozenSet[str]],
+    prefs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Clamp camelCase/snakeCase AI service keys in a preferences dict."""
+    if allowed_services is None:
+        return prefs
+    out = dict(prefs)
+    for pref_key, svc_id in PREF_KEY_TO_SERVICE_ID.items():
+        snake = pref_key[0].lower() + "".join(
+            ("_" + c.lower()) if c.isupper() else c for c in pref_key[1:]
+        )
+        for key in (pref_key, snake):
+            if key in out and svc_id not in allowed_services:
+                out[key] = False
+    return out
 
 # User-facing, provider-agnostic labels/help text.
 SERVICE_PUBLIC_META: Dict[str, Dict[str, str]] = {
@@ -108,8 +160,8 @@ SERVICE_PUBLIC_META: Dict[str, Dict[str, str]] = {
         "description": "Reads key visual details (faces/text/objects) from representative frames.",
     },
     "dashcam_osd": {
-        "label": "Dashcam HUD Reader",
-        "description": "Reads burned-in date, time, GPS, speed and driver name from dashcam overlay across the whole clip.",
+        "label": "Dashcam OSD Reader",
+        "description": "Reads on-screen date, time, GPS, speed, and driver name already in your clip (OCR only—no new overlay burned in).",
     },
     "audio_whisper": {
         "label": "Speech-to-Text Transcript",
@@ -127,13 +179,104 @@ SERVICE_PUBLIC_META: Dict[str, Dict[str, str]] = {
         "label": "Search Title Trends",
         "description": "Pulls a short sample of recent YouTube-style titles for the niche so captions align with real search language.",
     },
+    "marketing_image": {
+        "label": "Marketing Product Card",
+        "description": "Generates per-user product card art and optional headline overlay for marketing surfaces.",
+    },
 }
 
 
-def service_catalog() -> List[Dict[str, Any]]:
+def merge_service_weights_from_db(db_map: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """
+    Code defaults overlaid with DB rows from ``billing_service_weights``.
+    Unknown keys in db_map are ignored; missing DB rows use ``SERVICE_WEIGHTS``.
+    """
+    out = dict(SERVICE_WEIGHTS)
+    if not db_map:
+        return out
+    for k, v in db_map.items():
+        sk = str(k or "").strip()
+        if sk not in SERVICE_WEIGHTS:
+            continue
+        try:
+            out[sk] = max(0, min(5000, int(v)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _aic_raw_parts(
+    enabled: Set[str],
+    duration_seconds: float,
+    max_caption_frames: int,
+    num_thumbnails: int,
+    weights: Dict[str, int],
+) -> Dict[str, float]:
+    """Non-negative float contribution per service (caption_llm includes frame surcharge)."""
+    dm = duration_multiplier(duration_seconds)
+    parts: Dict[str, float] = {}
+    for svc in enabled:
+        w = float(weights.get(svc, 0))
+        if w <= 0:
+            continue
+        if svc == "thumbnail_ai":
+            n = max(1, int(num_thumbnails))
+            w *= 1.0 + 0.12 * float(max(0, n - 1))
+        if svc in DURATION_SCALED:
+            parts[svc] = w * dm
+        else:
+            parts[svc] = w
+    if "caption_llm" in enabled:
+        parts["caption_llm"] = parts.get("caption_llm", 0.0) + float(_caption_frame_surcharge(max_caption_frames))
+    return parts
+
+
+def _allocate_aic_integers(parts: Dict[str, float], target: int) -> Dict[str, int]:
+    """Largest-remainder allocation so values sum exactly to ``target``."""
+    if target <= 0 or not parts:
+        return {}
+    wsum = sum(parts.values())
+    if wsum <= 0:
+        return {k: 0 for k in parts}
+    pref = {k: (target * parts[k] / wsum) for k in parts}
+    floors = {k: int(math.floor(pref[k])) for k in parts}
+    rem = target - sum(floors.values())
+    fracs = sorted(((pref[k] - floors[k], k) for k in parts), reverse=True)
+    for i in range(max(0, rem)):
+        floors[fracs[i % len(fracs)][1]] += 1
+    return floors
+
+
+def build_billing_breakdown(
+    *,
+    put_breakdown: Dict[str, Any],
+    aic_total: int,
+    aic_by_service: Dict[str, int],
+    duration_seconds_estimated: float,
+    duration_multiplier_val: float,
+    enabled_services: List[str],
+) -> Dict[str, Any]:
+    """Canonical JSON for ``uploads.billing_breakdown`` and ``token_ledger.meta``."""
+    return {
+        "schema_version": 1,
+        "put": dict(put_breakdown),
+        "aic": {
+            "total": int(aic_total),
+            "duration_seconds_estimated": round(float(duration_seconds_estimated), 2),
+            "duration_multiplier": round(float(duration_multiplier_val), 4),
+            "enabled_services": list(enabled_services),
+            "by_service": dict(sorted(aic_by_service.items(), key=lambda kv: (-kv[1], kv[0]))),
+        },
+    }
+
+
+def service_catalog(weights: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
     """Provider-agnostic service catalog for UI/settings screens."""
+    wsrc = weights if weights is not None else SERVICE_WEIGHTS
     rows: List[Dict[str, Any]] = []
-    for service_id, weight in sorted(SERVICE_WEIGHTS.items(), key=lambda kv: kv[1], reverse=True):
+    for service_id, weight in sorted(wsrc.items(), key=lambda kv: kv[1], reverse=True):
+        if service_id not in SERVICE_WEIGHTS:
+            continue
         meta = SERVICE_PUBLIC_META.get(service_id, {})
         rows.append(
             {
@@ -171,6 +314,7 @@ def user_pref_ai_service_enabled(
     logical_service_id: str,
     *,
     default: bool = True,
+    allowed_services: Optional[Set[str]] = None,
 ) -> bool:
     """
     Worker/runtime gate aligned with billing SERVICE_PREF_KEYS.
@@ -179,8 +323,12 @@ def user_pref_ai_service_enabled(
     ``telemetry_trill``, ``caption_llm``, ``thumbnail_ai``, ``audio_whisper``,
     ``vision_google`` (Frame Inspector in UI).
     """
+    if allowed_services is not None and logical_service_id not in allowed_services:
+        return False
     pref_key = SERVICE_PREF_KEYS.get(logical_service_id)
     if not pref_key:
+        if allowed_services is not None:
+            return logical_service_id in allowed_services
         return default
     return _pref_true(prefs, pref_key, default)
 
@@ -259,6 +407,7 @@ def resolve_enabled_ai_services(
     use_ai_request: bool,
     has_telemetry: bool,
     env: Dict[str, bool],
+    tier_allowed: Optional[Set[str]] = None,
 ) -> Set[str]:
     """
     Decide which logical services participate in this upload for billing.
@@ -300,16 +449,17 @@ def resolve_enabled_ai_services(
         if env.get("ACRCLOUD_CONFIGURED") and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_acr", ""), True):
             out.add("audio_acr")
 
+    # Base Google frame + clip analysis are priced when caption/thumb work needs
+    # them; ``aiServiceFrameInspector`` / ``aiServiceVideoAnalyzer`` are legacy UI
+    # toggles and do not remove these from the presign service set.
     vision_on = env.get("VISION_STAGE_ENABLED", True) and (want_caption or want_thumb)
-    if vision_on and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("vision_google", ""), True):
+    if vision_on:
         out.add("vision_google")
 
     if want_caption and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("twelvelabs", ""), True):
         out.add("twelvelabs")
 
-    if (want_caption or want_thumb) and _pref_true(
-        user_prefs, SERVICE_PREF_KEYS.get("video_intelligence", ""), True
-    ):
+    if want_caption or want_thumb:
         out.add("video_intelligence")
 
     if want_thumb and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("thumbnail_ai", ""), True):
@@ -321,6 +471,8 @@ def resolve_enabled_ai_services(
         if env.get("TREND_INTEL_AVAILABLE", False):
             out.add("trend_intel")
 
+    if tier_allowed is not None:
+        out = {svc for svc in out if svc in tier_allowed}
     return out
 
 
@@ -345,30 +497,17 @@ def compute_aic_service_charge(
     duration_seconds: float,
     max_caption_frames: int,
     num_thumbnails: int,
+    weights: Dict[str, int],
 ) -> int:
-    """Return integer AIC for the enabled service set."""
+    """Return integer AIC for the enabled service set (ceil of summed float parts)."""
     if not enabled:
         return 0
-
-    dm = duration_multiplier(duration_seconds)
-    total = 0.0
-
-    for svc in enabled:
-        w = float(SERVICE_WEIGHTS.get(svc, 0))
-        if w <= 0:
-            continue
-        if svc == "thumbnail_ai":
-            n = max(1, int(num_thumbnails))
-            # Scale sublinearly with extra frames/styles — +12% per thumb beyond first
-            w *= 1.0 + 0.12 * float(max(0, n - 1))
-        if svc in DURATION_SCALED:
-            total += w * dm
-        else:
-            total += w
-
-    if "caption_llm" in enabled:
-        total += float(_caption_frame_surcharge(max_caption_frames))
-
+    parts = _aic_raw_parts(
+        enabled, duration_seconds, max_caption_frames, num_thumbnails, weights
+    )
+    if enabled and sum(parts.values()) <= 0:
+        parts = {sorted(enabled)[0]: 1.0}
+    total = sum(parts.values())
     return max(1, int(math.ceil(total)))
 
 
@@ -384,11 +523,14 @@ def compute_aic_breakdown(
     max_caption_frames: int,
     num_thumbnails: int,
     env: Optional[Dict[str, bool]] = None,
+    service_weights_map: Optional[Dict[str, Any]] = None,
+    tier_allowed: Optional[Set[str]] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """
     Returns (aic_integer, debug_dict) for API responses and logging.
     """
     env = env or billing_env_from_os()
+    merged_w = merge_service_weights_from_db(service_weights_map)
     if not can_ai:
         return 0, {
             "enabled_services": [],
@@ -396,11 +538,13 @@ def compute_aic_breakdown(
             "duration_multiplier": 1.0,
             "num_thumbnails": num_thumbnails,
             "service_weights": {},
+            "aic_by_service": {},
             "reason": "plan_cannot_ai",
         }
 
     hint = duration_hint if duration_hint is not None else (duration_seconds if duration_seconds > 0 else None)
     dur = estimate_duration_seconds(file_size, hint)
+    dm = duration_multiplier(dur)
 
     enabled = resolve_enabled_ai_services(
         can_ai=True,
@@ -408,31 +552,39 @@ def compute_aic_breakdown(
         use_ai_request=use_ai_request,
         has_telemetry=has_telemetry,
         env=env,
+        tier_allowed=tier_allowed,
     )
     if not enabled:
         return 0, {
             "enabled_services": [],
             "duration_seconds_estimated": round(dur, 2),
-            "duration_multiplier": round(duration_multiplier(dur), 4),
+            "duration_multiplier": round(dm, 4),
             "num_thumbnails": num_thumbnails,
             "service_weights": {},
+            "aic_by_service": {},
             "reason": "no_ai_services_selected",
         }
 
+    parts = _aic_raw_parts(enabled, dur, max_caption_frames, num_thumbnails, merged_w)
+    if enabled and sum(parts.values()) <= 0:
+        parts = {sorted(enabled)[0]: 1.0}
     aic = compute_aic_service_charge(
         enabled=enabled,
         duration_seconds=dur,
         max_caption_frames=max_caption_frames,
         num_thumbnails=num_thumbnails,
+        weights=merged_w,
     )
+    by_svc = _allocate_aic_integers(parts, aic) if parts else {}
 
     debug = {
         "enabled_services": sorted(enabled),
         "duration_seconds_estimated": round(dur, 2),
-        "duration_multiplier": round(duration_multiplier(dur), 4),
+        "duration_multiplier": round(dm, 4),
         "num_thumbnails": num_thumbnails,
-        "service_weights": {k: SERVICE_WEIGHTS[k] for k in sorted(enabled) if k in SERVICE_WEIGHTS},
-        "service_catalog": service_catalog(),
+        "service_weights": {k: int(merged_w.get(k, 0)) for k in sorted(enabled) if k in merged_w},
+        "aic_by_service": dict(sorted(by_svc.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "service_catalog": service_catalog(merged_w),
     }
     return aic, debug
 
@@ -445,16 +597,17 @@ def compute_presign_put_aic_costs(
     duration_hint: Optional[float],
     has_telemetry: bool,
     use_ai_checkbox: bool,
-    hud_enabled_effective: bool,
     user_prefs: Dict[str, Any],
     num_thumbnails_override: Optional[int] = None,
-) -> Tuple[int, int]:
+    service_weights_map: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, int, Dict[str, Any]]:
     """
     PUT + AIC reservation for upload presign / wallet (aligned with pipeline prefs).
 
-    ``hud_enabled_effective`` should already include plan entitlement (e.g. can_burn_hud).
+    Returns ``(put_total, aic_total, billing_breakdown)`` for DB + ledger meta.
+
     """
-    from stages.entitlements import PRIORITY_QUEUE_CLASSES, compute_put_cost
+    from stages.entitlements import PRIORITY_QUEUE_CLASSES, compute_put_breakdown
 
     cap = max(1, int(getattr(ent, "max_thumbnails", 1) or 1))
     if num_thumbnails_override is not None:
@@ -468,15 +621,23 @@ def compute_presign_put_aic_costs(
         )
 
     is_priority = getattr(ent, "priority_class", "") in PRIORITY_QUEUE_CLASSES
-    put = compute_put_cost(
+    put_break = compute_put_breakdown(
         num_platforms=num_publish_targets,
-        hud_enabled=bool(hud_enabled_effective),
         is_priority=is_priority,
         num_thumbnails=num_thumbs,
     )
+    put = int(put_break["total"])
 
     if not getattr(ent, "can_ai", False):
-        return put, 0
+        bd = build_billing_breakdown(
+            put_breakdown=put_break,
+            aic_total=0,
+            aic_by_service={},
+            duration_seconds_estimated=0.0,
+            duration_multiplier_val=1.0,
+            enabled_services=[],
+        )
+        return put, 0, bd
 
     try:
         emax = int(getattr(ent, "max_caption_frames", 6) or 6)
@@ -489,7 +650,11 @@ def compute_presign_put_aic_costs(
         user_fc_int = emax
     eff_caption_frames = max(2, min(user_fc_int, emax, 12))
 
-    aic, _dbg = compute_aic_breakdown(
+    tier_allowed = getattr(ent, "allowed_ai_services", None)
+    if tier_allowed is not None and not isinstance(tier_allowed, set):
+        tier_allowed = set(tier_allowed)
+
+    aic, dbg = compute_aic_breakdown(
         can_ai=True,
         user_prefs=user_prefs,
         use_ai_request=use_ai_checkbox,
@@ -499,5 +664,19 @@ def compute_presign_put_aic_costs(
         max_caption_frames=eff_caption_frames,
         num_thumbnails=num_thumbs,
         env=billing_env_from_os(),
+        service_weights_map=service_weights_map,
+        tier_allowed=tier_allowed,
     )
-    return put, int(aic)
+    hint = duration_hint if duration_hint is not None else None
+    dur = estimate_duration_seconds(file_size, hint)
+    dm = float(dbg.get("duration_multiplier") or duration_multiplier(dur))
+    by_svc = dict(dbg.get("aic_by_service") or {})
+    bd = build_billing_breakdown(
+        put_breakdown=put_break,
+        aic_total=int(aic),
+        aic_by_service=by_svc,
+        duration_seconds_estimated=float(dbg.get("duration_seconds_estimated") or dur),
+        duration_multiplier_val=dm,
+        enabled_services=list(dbg.get("enabled_services") or []),
+    )
+    return put, int(aic), bd

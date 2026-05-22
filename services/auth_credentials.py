@@ -64,6 +64,10 @@ async def register_user(
     await ledger_entry(conn, user_id, "put", signup_put, "signup_bonus")
     await ledger_entry(conn, user_id, "aic", signup_aic, "signup_bonus")
 
+    from services.workspace import create_personal_workspace
+
+    await create_personal_workspace(conn, user_id, data.name or "My Workspace")
+
     if not issue_tokens:
         return None, None
     access = create_access_jwt(user_id)

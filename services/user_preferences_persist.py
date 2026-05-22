@@ -6,11 +6,13 @@ import logging
 import re
 import traceback
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from fastapi import HTTPException
 
-from stages.entitlements import get_entitlements_for_tier
+from stages.entitlements import get_entitlements_from_user
+from stages.ai_service_costs import clamp_ai_service_db_fields
 
 from core.upload_preference_dependencies import normalize_preferences_dict, normalize_upload_preferences_snake
 
@@ -36,9 +38,11 @@ _CAMEL_TO_SNAKE: dict[str, str] = {
     "discordWebhook": "discord_webhook",
     "trillEnabled": "trill_enabled",
     "trillMinScore": "trill_min_score",
-    "trillHudEnabled": "trill_hud_enabled",
     "trillAiEnhance": "trill_ai_enhance",
     "trillOpenaiModel": "trill_openai_model",
+    "trillLeaderboardOptIn": "trill_leaderboard_opt_in",
+    "trillMapSharingOptIn": "trill_map_sharing_opt_in",
+    "trillWelcomeModalMarkSeen": "trill_welcome_modal_mark_seen",
     "styledThumbnails": "styled_thumbnails",
     "captionStyle": "caption_style",
     "captionTone": "caption_tone",
@@ -226,7 +230,7 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
     log.info("platform_hashtags: %s", platform)
 
     auto_captions = _coerce_bool(p.get("auto_captions"), False)
-    auto_thumbnails = _coerce_bool(p.get("auto_thumbnails"), False)
+    auto_thumbnails = _coerce_bool(p.get("auto_thumbnails"), True)
     styled_thumbnails = _coerce_bool(p.get("styled_thumbnails"), True)
 
     try:
@@ -274,13 +278,12 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
     scheduled_alert_emails = _coerce_bool(p.get("scheduled_alert_emails"), True)
     discord_webhook = p.get("discord_webhook")
 
-    trill_enabled = _coerce_bool(p.get("trill_enabled"), False)
+    trill_enabled = _coerce_bool(p.get("trill_enabled"), True)
     try:
         trill_min_score = int(p.get("trill_min_score", 60))
         trill_min_score = max(0, min(100, trill_min_score))
     except (TypeError, ValueError):
         trill_min_score = 60
-    trill_hud_enabled = _coerce_bool(p.get("trill_hud_enabled"), False)
     trill_ai_enhance = _coerce_bool(p.get("trill_ai_enhance"), True)
     trill_openai_model = str(p.get("trill_openai_model", "gpt-4o-mini") or "gpt-4o-mini")[:50]
     use_audio_context = _coerce_bool(p.get("useAudioContext", p.get("use_audio_context")), True)
@@ -300,6 +303,47 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
         p.get("aiServiceSceneUnderstanding", p.get("ai_service_scene_understanding")),
         True,
     )
+
+    ent = get_entitlements_from_user(user)
+    ai_service_dashcam_osd = _coerce_bool(
+        p.get("aiServiceDashcamOSD", p.get("ai_service_dashcam_osd")), True
+    )
+    _svc_clamped = clamp_ai_service_db_fields(
+        ent.allowed_ai_services,
+        {
+            "ai_service_telemetry": ai_service_telemetry,
+            "ai_service_dashcam_osd": ai_service_dashcam_osd,
+            "ai_service_audio_signals": ai_service_audio_signals,
+            "ai_service_music_detection": ai_service_music_detection,
+            "ai_service_audio_summary": ai_service_audio_summary,
+            "ai_service_caption_writer": ai_service_caption_writer,
+            "ai_service_thumbnail_designer": ai_service_thumbnail_designer,
+            "ai_service_speech_to_text": ai_service_speech_to_text,
+            "ai_service_scene_understanding": ai_service_scene_understanding,
+        },
+    )
+    ai_service_telemetry = _svc_clamped["ai_service_telemetry"]
+    ai_service_dashcam_osd = _svc_clamped["ai_service_dashcam_osd"]
+    ai_service_audio_signals = _svc_clamped["ai_service_audio_signals"]
+    ai_service_music_detection = _svc_clamped["ai_service_music_detection"]
+    ai_service_audio_summary = _svc_clamped["ai_service_audio_summary"]
+    ai_service_caption_writer = _svc_clamped["ai_service_caption_writer"]
+    ai_service_thumbnail_designer = _svc_clamped["ai_service_thumbnail_designer"]
+    ai_service_speech_to_text = _svc_clamped["ai_service_speech_to_text"]
+    ai_service_scene_understanding = _svc_clamped["ai_service_scene_understanding"]
+
+    exd: dict[str, Any] = dict(existing_row) if existing_row else {}
+    trill_leaderboard_opt_in = _coerce_bool(
+        p.get("trill_leaderboard_opt_in"), _coerce_bool(exd.get("trill_leaderboard_opt_in"), False)
+    )
+    trill_map_sharing_opt_in = _coerce_bool(
+        p.get("trill_map_sharing_opt_in"), _coerce_bool(exd.get("trill_map_sharing_opt_in"), False)
+    )
+    trill_welcome_modal_seen_at = exd.get("trill_welcome_modal_seen_at")
+    if _coerce_bool(p.get("trill_welcome_modal_mark_seen"), False) or _coerce_bool(
+        p.get("trillWelcomeModalMarkSeen"), False
+    ):
+        trill_welcome_modal_seen_at = datetime.now(timezone.utc)
 
     try:
         await conn.execute(
@@ -330,22 +374,24 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 discord_webhook = $18,
                 trill_enabled = $19,
                 trill_min_score = $20,
-                trill_hud_enabled = $21,
-                trill_ai_enhance = $22,
-                trill_openai_model = $23,
-                use_audio_context = $24,
-                audio_transcription = $25,
-                ai_service_telemetry = $26,
-                ai_service_audio_signals = $27,
-                ai_service_music_detection = $28,
-                ai_service_audio_summary = $29,
-                ai_service_emotion_signals = $30,
-                ai_service_caption_writer = $31,
-                ai_service_thumbnail_designer = $32,
-                ai_service_speech_to_text = $33,
-                ai_service_scene_understanding = $34,
+                trill_ai_enhance = $21,
+                trill_openai_model = $22,
+                use_audio_context = $23,
+                audio_transcription = $24,
+                ai_service_telemetry = $25,
+                ai_service_audio_signals = $26,
+                ai_service_music_detection = $27,
+                ai_service_audio_summary = $28,
+                ai_service_emotion_signals = $29,
+                ai_service_caption_writer = $30,
+                ai_service_thumbnail_designer = $31,
+                ai_service_speech_to_text = $32,
+                ai_service_scene_understanding = $33,
+                trill_leaderboard_opt_in = $34,
+                trill_map_sharing_opt_in = $35,
+                trill_welcome_modal_seen_at = $36,
                 updated_at = NOW()
-            WHERE user_id = $35
+            WHERE user_id = $37
             """,
             auto_captions,
             auto_thumbnails,
@@ -372,7 +418,6 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             discord_webhook,
             trill_enabled,
             trill_min_score,
-            trill_hud_enabled,
             trill_ai_enhance,
             trill_openai_model,
             use_audio_context,
@@ -386,15 +431,19 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             ai_service_thumbnail_designer,
             ai_service_speech_to_text,
             ai_service_scene_understanding,
+            trill_leaderboard_opt_in,
+            trill_map_sharing_opt_in,
+            trill_welcome_modal_seen_at,
             uid,
         )
 
         await conn.execute(
             """
-            INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled) VALUES ($1, $2, $3)
+            INSERT INTO user_settings (user_id, discord_webhook, telemetry_enabled)
+            VALUES ($1, $2, $3)
             ON CONFLICT (user_id) DO UPDATE SET
-                discord_webhook = $2,
-                telemetry_enabled = $3,
+                discord_webhook = EXCLUDED.discord_webhook,
+                telemetry_enabled = EXCLUDED.telemetry_enabled,
                 updated_at = NOW()
             """,
             uid,

@@ -6,8 +6,8 @@ Routers keep HTTP wiring (cookies, Request, presigned URL generation, enqueue, a
 
 from __future__ import annotations
 
-import asyncio
 import json
+import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Union
@@ -24,36 +24,23 @@ from core.helpers import (
     sanitize_hashtag_body,
 )
 from core.models import UploadInit
-from core.r2 import _normalize_r2_key, get_s3_client, r2_object_exists
+from core.r2 import _normalize_r2_key, get_s3_client
 from core.scheduling import get_existing_scheduled_days
+from services.billing_service_weights import fetch_service_weights_map
+from services.account_groups import resolve_group_ids_to_target_accounts
 from services.smart_schedule_insights import calculate_smart_schedule_data_driven
+from services.workspace import billing_user_id, can_upload_in_workspace, get_workspace_for_user
 from core.sql_allowlist import UPLOADS_COMPLETE_BODY_COLUMNS, assert_set_fragments_columns
 from core.wallet import atomic_reserve_tokens, get_wallet
 from routers.preferences import get_user_prefs_for_upload
-from services.thumbnail_regenerate import ensure_upload_thumbnail_resident
+from services.platform_posted_thumbnails import (
+    pick_primary_thumbnail_url,
+    posted_platform_thumbnail_urls_from_results,
+)
 from services.uploads_api import enrich_platform_results_batch
 from stages.ai_service_costs import compute_presign_put_aic_costs
 from stages.context import is_placeholder_upload_caption, is_placeholder_upload_title
 from stages.entitlements import entitlements_to_dict, get_entitlements_from_user
-
-# Parallel R2 HEAD checks for list payloads — sequential per-row checks dominated bootstrap latency.
-_THUMBNAIL_R2_EXISTS_MAX_CONCURRENCY = 32
-
-
-async def _batch_r2_object_exists(keys: List[str], *, concurrency: int = _THUMBNAIL_R2_EXISTS_MAX_CONCURRENCY) -> List[bool]:
-    if not keys:
-        return []
-    sem = asyncio.Semaphore(concurrency)
-
-    async def one(k: str) -> bool:
-        async with sem:
-            try:
-                return await asyncio.to_thread(r2_object_exists, k)
-            except Exception:
-                return False
-
-    return list(await asyncio.gather(*(one(k) for k in keys)))
-
 
 def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: Any) -> None:
     """Overlay presign-body thumbnail toggles onto the snapshot stored on ``uploads.user_preferences``."""
@@ -72,6 +59,19 @@ def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: An
         v = bool(use_pkz)
         user_prefs["thumbnail_pikzels_enabled"] = v
         user_prefs["thumbnailPikzelsEnabled"] = v
+    elif use_eng is None:
+        # Presign default: when the server has Pikzels configured, opt uploads into
+        # studio unless the client explicitly disabled engine/pikzels on the body.
+        try:
+            from stages.pikzels_api import studio_renderer_enabled
+
+            if studio_renderer_enabled():
+                user_prefs["thumbnail_pikzels_enabled"] = True
+                user_prefs["thumbnailPikzelsEnabled"] = True
+                user_prefs.setdefault("thumbnail_studio_engine_enabled", True)
+                user_prefs.setdefault("thumbnailStudioEngineEnabled", True)
+        except Exception:
+            pass
 
     use_per = getattr(data, "thumbnail_use_persona", None)
     if use_per is True:
@@ -88,6 +88,8 @@ def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: An
         s = str(pid).strip()
         user_prefs["thumbnail_default_persona_id"] = s
         user_prefs["thumbnailDefaultPersonaId"] = s
+        user_prefs["thumbnail_persona_enabled"] = True
+        user_prefs["thumbnailPersonaEnabled"] = True
 
     pst = getattr(data, "thumbnail_persona_strength", None)
     if pst is not None:
@@ -145,6 +147,155 @@ def youtube_copyright_shorts_notice_from_artifacts(raw: Any) -> Optional[dict]:
         except Exception:
             return None
     return None
+
+
+def scene_story_from_artifacts(raw: Any) -> str:
+    """Pull the human-readable scene-story paragraph from output_artifacts."""
+    artifacts = _safe_json(raw, {})
+    if not isinstance(artifacts, dict):
+        return ""
+    v = artifacts.get("scene_story")
+    if isinstance(v, str):
+        return v.strip()
+    return ""
+
+
+def timeline_story_from_artifacts(raw: Any) -> list:
+    """Pull the ordered [{t_seconds, kind, text}] timeline from output_artifacts."""
+    artifacts = _safe_json(raw, {})
+    if not isinstance(artifacts, dict):
+        return []
+    v = artifacts.get("timeline_story")
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str) and v.strip():
+        try:
+            parsed = json.loads(v)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return []
+    return []
+
+
+def thumbnail_render_method_from_artifacts(raw: Any) -> str:
+    """Worker-persisted thumbnail pipeline method (studio_renderer, template, none, …)."""
+    artifacts = _safe_json(raw, {})
+    if not isinstance(artifacts, dict):
+        return ""
+    return str(artifacts.get("thumbnail_render_method") or "").strip().lower()
+
+
+def pikzels_template_thumbnail_warning(raw_artifacts: Any) -> Optional[Dict[str, str]]:
+    """
+    When the server has PIKZELS_API_KEY but this upload used PIL template render,
+    return a short warning for queue/upload UI.
+    """
+    method = thumbnail_render_method_from_artifacts(raw_artifacts)
+    if method not in ("template", "none", ""):
+        return None
+    try:
+        from services.pikzels_v2 import resolve_public_api_key
+
+        if not (resolve_public_api_key() or "").strip():
+            return None
+    except Exception:
+        return None
+    artifacts = _safe_json(raw_artifacts, {}) or {}
+    skip_reason = ""
+    raw_report = artifacts.get("studio_render_report")
+    if isinstance(raw_report, str) and raw_report.strip():
+        try:
+            rep = json.loads(raw_report)
+            if isinstance(rep, dict):
+                skip_reason = str(rep.get("skip_reason") or "").strip()
+        except Exception:
+            pass
+    elif isinstance(raw_report, dict):
+        skip_reason = str(raw_report.get("skip_reason") or "").strip()
+    return {
+        "code": "pikzels_template_fallback",
+        "message": (
+            "This upload did not use Pikzels Studio (template or raw frame only). "
+            "Turn on auto-thumbnails and Thumbnail Studio in Settings, and set render pipeline to Auto."
+        ),
+        "settings_path": "settings.html#thumbnail-studio",
+        "skip_reason": skip_reason,
+    }
+
+
+def geo_location_hint_for_upload(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """
+    When driving/telemetry content has no resolved place, suggest .map or dashcam HUD.
+    """
+    tel = None
+    tm = _safe_json(row.get("trill_metadata"), {}) or {}
+    if isinstance(tm, dict) and isinstance(tm.get("telemetry"), dict):
+        tel = tm["telemetry"]
+    has_gps = False
+    has_place = False
+    if isinstance(tel, dict):
+        for k in (
+            "location_display",
+            "location_city",
+            "location_road",
+            "gazetteer_place_name",
+            "padus_unit_name",
+        ):
+            if str(tel.get(k) or "").strip():
+                has_place = True
+                break
+        if tel.get("near_padus") in (True, "true", "1"):
+            has_place = True
+        for k in ("mid_lat", "mid_lon", "start_lat", "start_lon"):
+            try:
+                v = float(tel.get(k))
+                if abs(v) > 1e-6:
+                    has_gps = True
+                    break
+            except (TypeError, ValueError):
+                pass
+    if has_place:
+        return None
+    platforms = list(row.get("platforms") or [])
+    filename = str(row.get("filename") or "").lower()
+    drivingish = bool(row.get("telemetry_r2_key")) or filename.endswith(".map")
+    if not drivingish and not row.get("trill_score"):
+        return None
+    if has_gps and not has_place:
+        msg = (
+            "GPS was detected but place names did not resolve. Confirm gazetteer/PAD-US "
+            "tables are loaded on the server, or retry after processing finishes."
+        )
+    else:
+        msg = (
+            "No route GPS for this upload. Add a companion .map file (same basename as the video) "
+            "or use dashcam footage with a burned-in GPS HUD so captions and hashtags can name roads and places."
+        )
+    return {
+        "code": "geo_signals_missing",
+        "message": msg,
+        "settings_path": "settings.html",
+    }
+
+
+def merged_platform_thumbnail_urls(
+    output_artifacts: Any,
+    platform_results: Any,
+    *,
+    expires_in: int = 3600,
+) -> dict:
+    """UploadM8-generated R2 previews; live posted covers fill gaps only."""
+    artifact_urls = platform_thumbnail_urls_from_artifacts(output_artifacts, expires_in=expires_in)
+    posted_urls = posted_platform_thumbnail_urls_from_results(
+        platform_results if isinstance(platform_results, list) else []
+    )
+    merged = dict(artifact_urls)
+    for plat, url in posted_urls.items():
+        existing = str(merged.get(plat) or "").strip()
+        if not existing.startswith("http"):
+            merged[plat] = url
+    return merged
 
 
 def platform_thumbnail_urls_from_artifacts(raw: Any, expires_in: int = 3600) -> dict:
@@ -343,12 +494,31 @@ def _normalize_platform_results_detail(raw: Any) -> List[dict]:
     return out
 
 
+def _json_safe_for_api(v: Any) -> Any:
+    """Normalize values for Starlette JSONResponse (json.dumps without default=)."""
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return {str(k): _json_safe_for_api(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_safe_for_api(x) for x in v]
+    if hasattr(v, "isoformat") and callable(getattr(v, "isoformat", None)):
+        try:
+            return v.isoformat()
+        except Exception:
+            return str(v)
+    return v
+
+
 def compute_smart_schedule_display(schedule_mode: str, schedule_metadata: Any) -> Optional[dict]:
     if schedule_mode != "smart" or not schedule_metadata:
         return None
     try:
         sm = schedule_metadata if isinstance(schedule_metadata, dict) else json.loads(schedule_metadata)
-        return {p: v for p, v in sm.items()}
+        if not isinstance(sm, dict):
+            return None
+        out = _json_safe_for_api(sm)
+        return out if isinstance(out, dict) else None
     except Exception:
         return None
 
@@ -359,11 +529,18 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
 
     Returns dict with upload_id, r2_key, put_cost, aic_cost, user_prefs, smart_schedule (or None).
     """
+    member_id = str(user["id"])
+    ws_ctx = await get_workspace_for_user(conn, member_id)
+    if ws_ctx and not can_upload_in_workspace(ws_ctx):
+        raise HTTPException(403, "Viewers cannot create uploads")
+    billing_user = ws_ctx.owner_row if ws_ctx else user
+    bill_id = billing_user_id(ws_ctx, member_id)
+
     db_ent = await conn.fetchrow(
         "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
-        user["id"],
+        bill_id,
     )
-    user_for_ent = dict(user)
+    user_for_ent = dict(billing_user)
     if db_ent:
         for _k in ("subscription_tier", "role", "flex_enabled"):
             _v = db_ent.get(_k)
@@ -377,7 +554,18 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
     if getattr(data, "platforms", None) is None:
         data.platforms = []
 
-    user_prefs = await get_user_prefs_for_upload(conn, user["id"])
+    group_ids_raw = getattr(data, "group_ids", None) or []
+    resolved_group_ids: List[str] = []
+    if group_ids_raw:
+        resolved_accounts, resolved_group_ids = await resolve_group_ids_to_target_accounts(
+            conn,
+            bill_id,
+            group_ids_raw,
+            data.platforms,
+        )
+        data.target_accounts = resolved_accounts
+
+    user_prefs = await get_user_prefs_for_upload(conn, bill_id)
     merge_upload_init_thumbnail_preferences(user_prefs, data)
 
     if not getattr(data, "privacy", None):
@@ -395,26 +583,26 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
     data.hashtags = list(dict.fromkeys(combined))[: int(user_prefs.get("max_hashtags", 30))]
 
     use_ai_checkbox = bool(getattr(data, "use_ai", False))
-    use_hud = bool(user_prefs.get("hud_enabled", False)) and ent_cost.can_burn_hud
 
     num_publish_targets = len(data.target_accounts) if data.target_accounts else len(data.platforms)
-    put_cost, aic_cost = compute_presign_put_aic_costs(
+    db_weights = await fetch_service_weights_map(conn)
+    put_cost, aic_cost, billing_breakdown = compute_presign_put_aic_costs(
         ent_cost,
         num_publish_targets=num_publish_targets,
         file_size=getattr(data, "file_size", None),
         duration_hint=None,
         has_telemetry=bool(getattr(data, "has_telemetry", False)),
         use_ai_checkbox=use_ai_checkbox,
-        hud_enabled_effective=use_hud,
         user_prefs=user_prefs,
         num_thumbnails_override=None,
+        service_weights_map=db_weights,
     )
 
     pending_count = await conn.fetchval(
         """SELECT COUNT(*) FROM uploads
            WHERE user_id = $1
            AND status IN ('pending','staged','queued','processing','ready_to_publish')""",
-        user["id"],
+        bill_id,
     )
     if pending_count >= ent_cost.queue_depth:
         raise HTTPException(
@@ -424,20 +612,22 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
         )
 
     upload_id = str(uuid.uuid4())
-    r2_key = f"uploads/{user['id']}/{upload_id}/{data.filename}"
+    r2_key = f"uploads/{bill_id}/{upload_id}/{data.filename}"
     telemetry_r2_key = telemetry_r2_key_for_upload(
-        str(user["id"]),
+        bill_id,
         upload_id,
         bool(getattr(data, "has_telemetry", False)),
     )
 
+    ws_id = ws_ctx.workspace_id if ws_ctx else None
+
     smart_schedule = None
     if getattr(data, "schedule_mode", None) == "smart":
         days = getattr(data, "smart_schedule_days", 7)
-        blocked = await get_existing_scheduled_days(conn, user["id"], days)
+        blocked = await get_existing_scheduled_days(conn, bill_id, days)
         smart_schedule = await calculate_smart_schedule_data_driven(
             conn,
-            str(user["id"]),
+            bill_id,
             data.platforms,
             num_days=days,
             blocked_day_offsets=blocked or None,
@@ -450,18 +640,36 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
         schedule_metadata = {p: _schedule_slot_iso(dt) for p, dt in smart_schedule.items()}
         scheduled_time = min(smart_schedule.values())
 
+    vm_id = getattr(data, "vehicle_make_id", None)
+    vmd_id = getattr(data, "vehicle_model_id", None)
+    if vm_id is None:
+        vm_id = user_prefs.get("default_vehicle_make_id")
+    if vmd_id is None:
+        vmd_id = user_prefs.get("default_vehicle_model_id")
+    if vm_id is not None and vmd_id is not None:
+        ok = await conn.fetchrow(
+            "SELECT 1 FROM vehicle_models WHERE id = $1 AND make_id = $2",
+            vmd_id,
+            vm_id,
+        )
+        if not ok:
+            raise HTTPException(400, "Invalid vehicle model for selected make")
+    elif vmd_id is not None and vm_id is None:
+        raise HTTPException(400, "vehicle_make_id required when vehicle_model_id is set")
+
     await conn.execute(
         """
             INSERT INTO uploads (
                 id, user_id, r2_key, telemetry_r2_key, filename, file_size, platforms,
                 title, caption, hashtags, privacy, status, scheduled_time,
-                schedule_mode, put_reserved, aic_reserved, schedule_metadata,
-                user_preferences, target_accounts
+                schedule_mode, put_reserved, aic_reserved, billing_breakdown, schedule_metadata,
+                user_preferences, target_accounts, vehicle_make_id, vehicle_model_id, group_ids,
+                workspace_id, created_by_user_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13, $14, $15, $16, $17, $18)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
         """,
         upload_id,
-        user["id"],
+        bill_id,
         r2_key,
         telemetry_r2_key,
         data.filename,
@@ -475,15 +683,27 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
         data.schedule_mode,
         put_cost,
         aic_cost,
+        json.dumps(billing_breakdown, default=str),
         _json_for_upload_row(schedule_metadata) if schedule_metadata else None,
         _json_for_upload_row(user_prefs),
         data.target_accounts or [],
+        vm_id,
+        vmd_id,
+        resolved_group_ids or [],
+        ws_id,
+        member_id,
     )
 
-    reserved = await atomic_reserve_tokens(conn, user["id"], put_cost, aic_cost, upload_id)
+    ledger_meta = {"billing_breakdown": billing_breakdown}
+    if ws_ctx:
+        ledger_meta["actor_user_id"] = member_id
+        ledger_meta["workspace_id"] = ws_id
+    reserved = await atomic_reserve_tokens(
+        conn, bill_id, put_cost, aic_cost, upload_id, ledger_meta=ledger_meta
+    )
     if not reserved:
         await conn.execute("DELETE FROM uploads WHERE id = $1", upload_id)
-        fresh_wallet = await get_wallet(conn, user["id"])
+        fresh_wallet = await get_wallet(conn, bill_id)
         put_avail = fresh_wallet["put_balance"] - fresh_wallet["put_reserved"]
         aic_avail = fresh_wallet["aic_balance"] - fresh_wallet["aic_reserved"]
         if put_avail < put_cost:
@@ -510,6 +730,7 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
         "telemetry_r2_key": telemetry_r2_key,
         "put_cost": put_cost,
         "aic_cost": aic_cost,
+        "billing_breakdown": billing_breakdown,
         "user_prefs": user_prefs,
         "smart_schedule": smart_schedule,
     }
@@ -563,6 +784,37 @@ async def complete_upload_transaction(conn, upload_id: str, user_id: str, body: 
         params.append(tags)
         idx += 1
 
+    if any(
+        k in body
+        for k in ("vehicle_make_id", "vehicleMakeId", "vehicle_model_id", "vehicleModelId")
+    ):
+        vm_raw = body.get("vehicle_make_id", body.get("vehicleMakeId"))
+        vmd_raw = body.get("vehicle_model_id", body.get("vehicleModelId"))
+        try:
+            vm_id = int(vm_raw) if vm_raw is not None and str(vm_raw).strip() != "" else None
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Invalid vehicle_make_id") from None
+        try:
+            vmd_id = int(vmd_raw) if vmd_raw is not None and str(vmd_raw).strip() != "" else None
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Invalid vehicle_model_id") from None
+        if vm_id is not None and vmd_id is not None:
+            ok = await conn.fetchrow(
+                "SELECT 1 FROM vehicle_models WHERE id = $1 AND make_id = $2",
+                vmd_id,
+                vm_id,
+            )
+            if not ok:
+                raise HTTPException(400, "Invalid vehicle model for selected make")
+        elif vmd_id is not None and vm_id is None:
+            raise HTTPException(400, "vehicle_make_id required when vehicle_model_id is set")
+        updates.append(f"{_safe_col('vehicle_make_id', _COMPLETE_COLS)} = ${idx}")
+        params.append(vm_id)
+        idx += 1
+        updates.append(f"{_safe_col('vehicle_model_id', _COMPLETE_COLS)} = ${idx}")
+        params.append(vmd_id)
+        idx += 1
+
     if updates:
         assert_set_fragments_columns(updates, UPLOADS_COMPLETE_BODY_COLUMNS)
         params.append(upload_id)
@@ -602,6 +854,9 @@ async def fetch_user_uploads_list(
     offset: int,
     trill_only: bool,
     meta: bool,
+    workspace_id: Optional[str] = None,
+    presign_r2_thumbnails: bool = False,
+    presign_platform_avatars: bool = False,
 ) -> Union[list, dict]:
     cols = await _load_uploads_columns(pool)
 
@@ -649,12 +904,20 @@ async def fetch_user_uploads_list(
         "speed_bucket",
         "trill_metadata",
         "output_artifacts",
+        "created_by_user_id",
+        "workspace_id",
     ]
     select_cols = _pick_cols(wanted, cols) or ["id", "filename", "platforms", "status", "created_at"]
-    select_sql = f"SELECT {', '.join(select_cols)} FROM uploads WHERE user_id = $1"
-    count_sql = "SELECT COUNT(*) FROM uploads WHERE user_id = $1"
-    params: List[Any] = [user_id]
-    count_params: List[Any] = [user_id]
+    if workspace_id:
+        select_sql = f"SELECT {', '.join(select_cols)} FROM uploads WHERE workspace_id = $1::uuid"
+        count_sql = "SELECT COUNT(*) FROM uploads WHERE workspace_id = $1::uuid"
+        params: List[Any] = [workspace_id]
+        count_params: List[Any] = [workspace_id]
+    else:
+        select_sql = f"SELECT {', '.join(select_cols)} FROM uploads WHERE user_id = $1"
+        count_sql = "SELECT COUNT(*) FROM uploads WHERE user_id = $1"
+        params: List[Any] = [user_id]
+        count_params: List[Any] = [user_id]
 
     if view == "all":
         pass
@@ -693,96 +956,135 @@ async def fetch_user_uploads_list(
         total = await conn.fetchval(count_sql, *count_params) if meta else None
 
         row_dicts = [dict(r) for r in rows]
-        enriched_pr = await enrich_platform_results_batch(conn, row_dicts, str(user_id))
+        enriched_pr = await enrich_platform_results_batch(
+            conn, row_dicts, str(user_id), presign_avatars=presign_platform_avatars
+        )
+        urow = await conn.fetchrow(
+            "SELECT subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+            user_id,
+        )
+        creator_ids = list({
+            str(d["created_by_user_id"])
+            for d in row_dicts
+            if d.get("created_by_user_id")
+        })
+        creator_map: Dict[str, str] = {}
+        if creator_ids:
+            crows = await conn.fetch(
+                "SELECT id::text AS id, email FROM users WHERE id = ANY($1::uuid[])",
+                creator_ids,
+            )
+            creator_map = {str(r["id"]): r["email"] for r in crows}
 
-        for d, platform_results in zip(row_dicts, enriched_pr):
-            ai_title = (d.get("ai_generated_title") or d.get("ai_title") or "") or ""
-            ai_caption = (d.get("ai_generated_caption") or d.get("ai_caption") or "") or ""
-            ai_hashtags = _normalize_hashtags_list(d.get("ai_generated_hashtags"))
+    for d, platform_results in zip(row_dicts, enriched_pr):
+        ai_title = (d.get("ai_generated_title") or d.get("ai_title") or "") or ""
+        ai_caption = (d.get("ai_generated_caption") or d.get("ai_caption") or "") or ""
+        ai_hashtags = _normalize_hashtags_list(d.get("ai_generated_hashtags"))
 
-            raw_title = (d.get("title") or "").strip()
-            title = ai_title if ai_title and is_placeholder_upload_title(raw_title, d.get("filename") or "") else (raw_title or ai_title)
-            raw_caption = (d.get("caption") or "").strip()
-            caption = ai_caption if ai_caption and is_placeholder_upload_caption(raw_caption) else (raw_caption or ai_caption)
+        raw_title = (d.get("title") or "").strip()
+        title = ai_title if ai_title and is_placeholder_upload_title(raw_title, d.get("filename") or "") else (raw_title or ai_title)
+        raw_caption = (d.get("caption") or "").strip()
+        caption = ai_caption if ai_caption and is_placeholder_upload_caption(raw_caption) else (raw_caption or ai_caption)
 
-            hashtags = _normalize_hashtags_list(d.get("hashtags"))
+        hashtags = _normalize_hashtags_list(d.get("hashtags"))
 
-            # Generate presigned URL optimistically — no R2 HEAD check here; any missing object
-            # is surfaced by an image onerror on the client, which then triggers backfill.
-            thumbnail_url = None
-            thumb_key = d.get("thumbnail_r2_key")
-            sk = str(thumb_key).strip() if thumb_key else ""
-            if sk:
-                try:
-                    s3 = s3 or get_s3_client()
-                    thumbnail_url = s3.generate_presigned_url(
-                        "get_object",
-                        Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(sk)},
-                        ExpiresIn=3600,
-                    )
-                except Exception:
-                    thumbnail_url = None
+        thumb_key = d.get("thumbnail_r2_key")
+        sk = str(thumb_key).strip() if thumb_key else ""
+        r2_thumb_url = None
+        if sk and presign_r2_thumbnails:
+            try:
+                s3 = s3 or get_s3_client()
+                r2_thumb_url = s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(sk)},
+                    ExpiresIn=3600,
+                )
+            except Exception:
+                r2_thumb_url = None
 
-            raw_status = d.get("status") or ""
-            item = {
-                "id": str(d.get("id")),
-                "filename": d.get("filename"),
-                "platforms": list(d.get("platforms") or []),
-                "status": raw_status,
-                "status_label": UPLOAD_STATUS_LABEL.get(
-                    raw_status, raw_status.replace("_", " ").title() if raw_status else "Unknown"
-                ),
-                "privacy": d.get("privacy", "public"),
-                "title": title,
-                "caption": caption,
-                "hashtags": hashtags,
-                "ai_title": ai_title,
-                "ai_caption": ai_caption,
-                "ai_hashtags": ai_hashtags,
-                "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
-                "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
-                "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
-                "put_cost": int(d.get("put_reserved") or 0),
-                "aic_cost": int(d.get("aic_reserved") or 0),
-                "error_code": d.get("error_code"),
-                "error": d.get("error_detail") or d.get("error_code") or None,
-                "thumbnail_url": thumbnail_url,
-                "thumbnail_storage_missing": not bool(thumbnail_url) and bool(sk),
-                "platform_thumbnail_urls": platform_thumbnail_urls_from_artifacts(d.get("output_artifacts")),
-                "platform_results": platform_results,
-                "file_size": d.get("file_size"),
-                "views": int(d.get("views") or 0),
-                "likes": int(d.get("likes") or 0),
-                "comments": int(d.get("comments") or 0),
-                "shares": int(d.get("shares") or 0),
-                "progress": int(d.get("processing_progress") or 0),
-                "current_stage": d.get("processing_stage"),
-                "processing_started_at": d.get("processing_started_at").isoformat()
-                if d.get("processing_started_at")
-                else None,
-                "processingStartedAt": d.get("processing_started_at").isoformat()
-                if d.get("processing_started_at")
-                else None,
-                "updated_at": d.get("updated_at").isoformat()
-                if d.get("updated_at")
-                else None,
-                "updatedAt": d.get("updated_at").isoformat()
-                if d.get("updated_at")
-                else None,
-                "schedule_mode": d.get("schedule_mode") or "immediate",
-                "schedule_metadata": _safe_json(d.get("schedule_metadata"), None),
-                "smart_schedule": _safe_json(d.get("schedule_metadata"), None),
-                "is_editable": d.get("status")
-                in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
-                "video_url": d.get("video_url"),
-                "trill_score": float(d["trill_score"]) if d.get("trill_score") is not None else None,
-                "speed_bucket": d.get("speed_bucket"),
-                "trill_metadata": _safe_json(d.get("trill_metadata"), None),
-                "youtubeCopyrightShorts": youtube_copyright_shorts_notice_from_artifacts(
-                    d.get("output_artifacts")
-                ),
-            }
-            out.append(item)
+        plat_thumb_urls = merged_platform_thumbnail_urls(
+            d.get("output_artifacts"), platform_results
+        )
+        posted_urls = posted_platform_thumbnail_urls_from_results(platform_results)
+        thumbnail_url = pick_primary_thumbnail_url(
+            posted=posted_urls,
+            artifact_platform_urls=plat_thumb_urls,
+            r2_presigned=r2_thumb_url,
+            upload_platforms=list(d.get("platforms") or []),
+        )
+
+        raw_status = d.get("status") or ""
+        item = {
+            "id": str(d.get("id")),
+            "filename": d.get("filename"),
+            "platforms": list(d.get("platforms") or []),
+            "status": raw_status,
+            "status_label": UPLOAD_STATUS_LABEL.get(
+                raw_status, raw_status.replace("_", " ").title() if raw_status else "Unknown"
+            ),
+            "privacy": d.get("privacy", "public"),
+            "title": title,
+            "caption": caption,
+            "hashtags": hashtags,
+            "ai_title": ai_title,
+            "ai_caption": ai_caption,
+            "ai_hashtags": ai_hashtags,
+            "scheduled_time": d.get("scheduled_time").isoformat() if d.get("scheduled_time") else None,
+            "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
+            "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
+            "put_cost": int(d.get("put_reserved") or 0),
+            "aic_cost": int(d.get("aic_reserved") or 0),
+            "error_code": d.get("error_code"),
+            "error": d.get("error_detail") or d.get("error_code") or None,
+            "thumbnail_url": thumbnail_url,
+            "thumbnail_storage_missing": not bool(thumbnail_url) and bool(sk),
+            "posted_platform_thumbnail_urls": posted_urls,
+            "platform_thumbnail_urls": plat_thumb_urls,
+            "scene_story": scene_story_from_artifacts(d.get("output_artifacts")),
+            "timeline_story": timeline_story_from_artifacts(d.get("output_artifacts")),
+            "platform_results": platform_results,
+            "file_size": d.get("file_size"),
+            "views": int(d.get("views") or 0),
+            "likes": int(d.get("likes") or 0),
+            "comments": int(d.get("comments") or 0),
+            "shares": int(d.get("shares") or 0),
+            "progress": int(d.get("processing_progress") or 0),
+            "current_stage": d.get("processing_stage"),
+            "processing_started_at": d.get("processing_started_at").isoformat()
+            if d.get("processing_started_at")
+            else None,
+            "processingStartedAt": d.get("processing_started_at").isoformat()
+            if d.get("processing_started_at")
+            else None,
+            "updated_at": d.get("updated_at").isoformat()
+            if d.get("updated_at")
+            else None,
+            "updatedAt": d.get("updated_at").isoformat()
+            if d.get("updated_at")
+            else None,
+            "schedule_mode": d.get("schedule_mode") or "immediate",
+            "schedule_metadata": _safe_json(d.get("schedule_metadata"), None),
+            "smart_schedule": _safe_json(d.get("schedule_metadata"), None),
+            "is_editable": d.get("status")
+            in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
+            "video_url": d.get("video_url"),
+            "trill_score": float(d["trill_score"]) if d.get("trill_score") is not None else None,
+            "speed_bucket": d.get("speed_bucket"),
+            "created_by_user_id": str(d.get("created_by_user_id")) if d.get("created_by_user_id") else None,
+            "created_by_email": creator_map.get(str(d.get("created_by_user_id"))) if d.get("created_by_user_id") else None,
+            "trill_metadata": _safe_json(d.get("trill_metadata"), None),
+            "youtubeCopyrightShorts": youtube_copyright_shorts_notice_from_artifacts(
+                d.get("output_artifacts")
+            ),
+            "thumbnail_render_method": thumbnail_render_method_from_artifacts(
+                d.get("output_artifacts")
+            ),
+            "pikzels_thumbnail_warning": pikzels_template_thumbnail_warning(
+                d.get("output_artifacts")
+            ),
+            "geo_location_hint": geo_location_hint_for_upload(d),
+        }
+        out.append(item)
 
     if not meta:
         return out
@@ -847,18 +1149,28 @@ def build_upload_detail_payload(d: dict) -> dict:
     hashtags = _normalize_hashtags_list(d.get("hashtags"))
     platform_results = _normalize_platform_results_detail(d.get("platform_results"))
 
-    thumbnail_url = None
     thumb_key = d.get("thumbnail_r2_key")
-    if thumb_key:
+    sk = str(thumb_key).strip() if thumb_key else ""
+    r2_thumb_url = None
+    if sk:
         try:
             s3 = get_s3_client()
-            thumbnail_url = s3.generate_presigned_url(
+            r2_thumb_url = s3.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(thumb_key)},
+                Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(sk)},
                 ExpiresIn=3600,
             )
         except Exception:
-            thumbnail_url = None
+            r2_thumb_url = None
+
+    plat_thumb_urls = merged_platform_thumbnail_urls(d.get("output_artifacts"), platform_results)
+    posted_urls = posted_platform_thumbnail_urls_from_results(platform_results)
+    thumbnail_url = pick_primary_thumbnail_url(
+        posted=posted_urls,
+        artifact_platform_urls=plat_thumb_urls,
+        r2_presigned=r2_thumb_url,
+        upload_platforms=list(d.get("platforms") or []),
+    )
 
     duration_seconds = None
     ps = d.get("processing_started_at")
@@ -896,7 +1208,11 @@ def build_upload_detail_payload(d: dict) -> dict:
         "error_code": d.get("error_code"),
         "error": d.get("error_detail") or d.get("error_code") or None,
         "thumbnail_url": thumbnail_url,
-        "platform_thumbnail_urls": platform_thumbnail_urls_from_artifacts(d.get("output_artifacts")),
+        "thumbnail_storage_missing": not bool(thumbnail_url) and bool(sk),
+        "posted_platform_thumbnail_urls": posted_urls,
+        "platform_thumbnail_urls": plat_thumb_urls,
+        "scene_story": scene_story_from_artifacts(d.get("output_artifacts")),
+        "timeline_story": timeline_story_from_artifacts(d.get("output_artifacts")),
         "platform_results": platform_results,
         "file_size": d.get("file_size"),
         "views": int(d.get("views") or 0),
@@ -918,6 +1234,9 @@ def build_upload_detail_payload(d: dict) -> dict:
         "youtubeCopyrightShorts": youtube_copyright_shorts_notice_from_artifacts(
             d.get("output_artifacts")
         ),
+        "thumbnail_render_method": thumbnail_render_method_from_artifacts(d.get("output_artifacts")),
+        "pikzels_thumbnail_warning": pikzels_template_thumbnail_warning(d.get("output_artifacts")),
+        "geo_location_hint": geo_location_hint_for_upload(d),
     }
 
 
@@ -925,6 +1244,12 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
     """
     Load upload detail for ``user_id`` after the same auth gates as ``get_current_user_readonly``,
     using a single pooled connection (upload row + optional recognition + cold schema probe).
+
+    Thumbnail URLs are presigned optimistically in ``build_upload_detail_payload`` (same as the
+    uploads list). Missing R2 objects are handled client-side via image ``onerror`` backfill —
+    do not call ``ensure_upload_thumbnail_resident`` here; it opens extra pool checkouts and
+    can synchronously regenerate on GET (Sentry UPLOADM8-2H).
+
     Caller should pass a JWT-verified ``user_id`` (e.g. from ``get_verified_user_id``).
     """
     wanted = [
@@ -970,10 +1295,9 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
         "trill_metadata",
         "output_artifacts",
     ]
-    thumb_user: Optional[Dict[str, Any]] = None
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
-            "SELECT id, status, email_verified, subscription_tier, role, flex_enabled FROM users WHERE id = $1",
+            "SELECT id, status, email_verified FROM users WHERE id = $1",
             user_id,
         )
         if not user:
@@ -988,12 +1312,6 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
                     "code": "email_not_verified",
                 },
             )
-
-        thumb_user = {
-            "subscription_tier": user.get("subscription_tier"),
-            "role": user.get("role"),
-            "flex_enabled": user.get("flex_enabled"),
-        }
 
         cols = await ensure_uploads_columns_loaded(conn)
         select_cols = _pick_cols(wanted, cols) or [
@@ -1030,18 +1348,6 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
 
     row_d = dict(row)
     payload = build_upload_detail_payload(row_d)
-    if thumb_user:
-        try:
-            thumb_url, _ = await ensure_upload_thumbnail_resident(
-                db_pool=pool,
-                user_id=user_id,
-                upload_row=row_d,
-                user_row=thumb_user,
-            )
-            if thumb_url:
-                payload["thumbnail_url"] = thumb_url
-        except Exception:
-            pass
     if recognition_row is not None:
         payload["recognition"] = {
             "object_track_count": int(recognition_row["object_track_count"] or 0),
@@ -1057,3 +1363,121 @@ async def fetch_upload_detail(pool, upload_id: str, user_id: str) -> dict:
             "hydration_score": float(recognition_row["hydration_score"] or 0),
         }
     return payload
+
+
+async def poll_upload_thumbnails_payload(
+    pool: Any,
+    user_id: str,
+    upload_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    DB-only thumbnail snapshot for client polling (no platform API calls).
+
+    Returns upload_id -> {thumbnail_url, posted_platform_thumbnail_urls, platform_thumbnail_urls}.
+    """
+    if not upload_ids:
+        return {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, thumbnail_r2_key, platforms, output_artifacts, platform_results
+            FROM uploads
+            WHERE user_id = $1 AND id = ANY($2::uuid[])
+            """,
+            user_id,
+            upload_ids,
+        )
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        d = dict(row)
+        uid = str(d.get("id") or "")
+        if not uid:
+            continue
+        platform_results = _normalize_platform_results_detail(d.get("platform_results"))
+        sk = str(d.get("thumbnail_r2_key") or "").strip()
+        r2_thumb_url = None
+        if sk:
+            try:
+                s3 = get_s3_client()
+                r2_thumb_url = s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(sk)},
+                    ExpiresIn=3600,
+                )
+            except Exception:
+                r2_thumb_url = None
+        plat_thumb_urls = merged_platform_thumbnail_urls(d.get("output_artifacts"), platform_results)
+        posted_urls = posted_platform_thumbnail_urls_from_results(platform_results)
+        thumb = pick_primary_thumbnail_url(
+            posted=posted_urls,
+            artifact_platform_urls=plat_thumb_urls,
+            r2_presigned=r2_thumb_url,
+            upload_platforms=list(d.get("platforms") or []),
+        )
+        if not thumb:
+            continue
+        out[uid] = {
+            "thumbnail_url": thumb,
+            "posted_platform_thumbnail_urls": posted_urls,
+            "platform_thumbnail_urls": plat_thumb_urls,
+        }
+    return out
+
+
+async def poll_upload_thumbnails_payload(
+    pool: Any,
+    user_id: str,
+    upload_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    DB-only thumbnail snapshot for client polling (no platform API calls).
+
+    Returns upload_id -> {thumbnail_url, posted_platform_thumbnail_urls, platform_thumbnail_urls}.
+    """
+    if not upload_ids:
+        return {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, thumbnail_r2_key, platforms, output_artifacts, platform_results
+            FROM uploads
+            WHERE user_id = $1 AND id = ANY($2::uuid[])
+            """,
+            user_id,
+            upload_ids,
+        )
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        d = dict(row)
+        uid = str(d.get("id") or "")
+        if not uid:
+            continue
+        platform_results = _normalize_platform_results_detail(d.get("platform_results"))
+        sk = str(d.get("thumbnail_r2_key") or "").strip()
+        r2_thumb_url = None
+        if sk:
+            try:
+                s3 = get_s3_client()
+                r2_thumb_url = s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(sk)},
+                    ExpiresIn=3600,
+                )
+            except Exception:
+                r2_thumb_url = None
+        plat_thumb_urls = merged_platform_thumbnail_urls(d.get("output_artifacts"), platform_results)
+        posted_urls = posted_platform_thumbnail_urls_from_results(platform_results)
+        thumb = pick_primary_thumbnail_url(
+            posted=posted_urls,
+            artifact_platform_urls=plat_thumb_urls,
+            r2_presigned=r2_thumb_url,
+            upload_platforms=list(d.get("platforms") or []),
+        )
+        if not thumb:
+            continue
+        out[uid] = {
+            "thumbnail_url": thumb,
+            "posted_platform_thumbnail_urls": posted_urls,
+            "platform_thumbnail_urls": plat_thumb_urls,
+        }
+    return out

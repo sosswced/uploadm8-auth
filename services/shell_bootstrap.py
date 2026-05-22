@@ -52,7 +52,7 @@ async def _fetch_platforms_bundle(pool: Any, user_id: str, plan: Mapping[str, An
                 "account_id": acc["account_id"],
                 "name": acc["account_name"],
                 "username": acc["account_username"],
-                "avatar": resolve_stored_account_avatar_url(acc["account_avatar"]),
+                "avatar": resolve_stored_account_avatar_url(acc["account_avatar"], presign=False),
                 "is_primary": acc["is_primary"],
                 "status": "active",
                 "connected_at": acc["created_at"].isoformat() if acc["created_at"] else None,
@@ -99,6 +99,8 @@ async def shell_bootstrap_payload(
         offset=0,
         trill_only=False,
         meta=meta,
+        presign_r2_thumbnails=False,
+        presign_platform_avatars=False,
     )
     platforms_coro = _fetch_platforms_bundle(pool, uid, plan)
 

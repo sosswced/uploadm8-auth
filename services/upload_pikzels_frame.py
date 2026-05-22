@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import json
 import logging
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -15,65 +13,30 @@ from typing import Any, Dict, Optional, Tuple
 from core.config import R2_BUCKET_NAME
 from core.r2 import _normalize_r2_key, get_s3_client
 
-from services.hydration_from_upload_row import hydration_context_from_upload_row
+from services.hydration_from_upload_row import (
+    hydration_context_from_upload_row,
+    hydration_payload_from_upload_row,
+)
+from services.hydration_payload import hydration_brief_strings_compact
+from stages.pikzels_api import fit_pikzels_prompt_to_budget
 from services.thumbnail_studio import hydration_signal_lanes
 
 logger = logging.getLogger(__name__)
 
 
 def _ffmpeg_frame_at_offset(video_path: Path, thumb_path: Path, offset_seconds: Optional[float]) -> Tuple[float, bool]:
-    """Extract one JPEG. If ``offset_seconds`` is None, use ~30% of duration (same spirit as regenerate)."""
-    duration = 10.0
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(video_path)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if probe.returncode == 0:
-            data = json.loads(probe.stdout or "{}")
-            for stream in data.get("streams", []):
-                if stream.get("codec_type") == "video":
-                    duration = float(stream.get("duration", 10) or 10)
-                    break
-    except Exception:
-        duration = 10.0
+    """Decode one JPEG via imageio (no PATH ffmpeg/ffprobe)."""
+    from services.thumbnail_frame_extract import extract_jpeg_at_offset, video_duration_seconds
 
+    dur = video_duration_seconds(video_path)
     if offset_seconds is None:
-        offset = max(0.5, duration * 0.30)
+        offset = max(0.5, dur * 0.30)
     else:
         offset = max(0.0, float(offset_seconds))
-
-    def _run(ss: float) -> bool:
-        try:
-            r = subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-ss",
-                    f"{ss:.3f}",
-                    "-i",
-                    str(video_path),
-                    "-vframes",
-                    "1",
-                    "-q:v",
-                    "2",
-                    "-vf",
-                    "scale=1080:-2",
-                    str(thumb_path),
-                ],
-                capture_output=True,
-                timeout=60,
-            )
-            return r.returncode == 0 and thumb_path.exists()
-        except Exception as e:
-            logger.warning("ffmpeg frame extract failed: %s", e)
-            return False
-
-    if not _run(offset):
-        return offset, _run(1.0)
-    return offset, True
+    if extract_jpeg_at_offset(video_path, thumb_path, offset):
+        return offset, True
+    fallback = min(1.0, max(0.15, dur * 0.05))
+    return fallback, extract_jpeg_at_offset(video_path, thumb_path, fallback)
 
 
 def append_hydration_to_prompt(
@@ -82,28 +45,53 @@ def append_hydration_to_prompt(
     *,
     use_hydration: bool,
     hydration_lane: str,
-    max_len: int = 1000,
+    max_len: int = 950,
 ) -> str:
     p = (prompt or "").strip()
     if not use_hydration:
         return p[:max_len]
-    ctx = hydration_context_from_upload_row(upload_row)
-    lanes = hydration_signal_lanes(ctx)
-    if not lanes:
-        return p[:max_len]
-    lane_key = (hydration_lane or "combined").lower().strip()
-    pick = None
-    if lane_key == "first":
-        pick = lanes[0]
+    hp = hydration_payload_from_upload_row(upload_row)
+    brief_bits: list[str] = []
+    if hp.get("evidence"):
+        for key in (
+            "geo_context",
+            "osd_context",
+            "music_context",
+            "trill_context",
+            "speech_context",
+            "vision_context",
+        ):
+            val = hydration_brief_strings_compact(hp).get(key)
+            if val:
+                label = {
+                    "geo_context": "Geo",
+                    "osd_context": "OSD",
+                    "music_context": "Music",
+                    "trill_context": "Trill",
+                    "speech_context": "Speech",
+                    "vision_context": "Vis",
+                }.get(key, key)
+                brief_bits.append(f"{label}: {val[:100]}")
+    if brief_bits:
+        suffix = " Hydr: " + "; ".join(brief_bits[:6]) + "."
     else:
-        pick = next((x for x in lanes if x["key"] == lane_key), None)
-    if pick is None:
-        pick = next((x for x in lanes if x["key"] == "combined"), lanes[-1])
-    suffix = (
-        f" Hydration focus: {pick['directive']} using this evidence: "
-        f"{str(pick.get('value') or '')[:240]}."
-    )
-    return (p + suffix).strip()[:max_len]
+        ctx = hydration_context_from_upload_row(upload_row)
+        lanes = hydration_signal_lanes(ctx)
+        if not lanes:
+            return p[:max_len]
+        lane_key = (hydration_lane or "combined").lower().strip()
+        pick = None
+        if lane_key == "first":
+            pick = lanes[0]
+        else:
+            pick = next((x for x in lanes if x["key"] == lane_key), None)
+        if pick is None:
+            pick = next((x for x in lanes if x["key"] == "combined"), lanes[-1])
+        suffix = (
+            f" Hydration focus: {pick['directive']} using this evidence: "
+            f"{str(pick.get('value') or '')[:240]}."
+        )
+    return fit_pikzels_prompt_to_budget((p + suffix).strip(), max_len)
 
 
 async def load_upload_frame_jpeg_base64(

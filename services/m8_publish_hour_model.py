@@ -30,6 +30,25 @@ _MIN_TOTAL_ROWS = 800
 _MIN_PLATFORM_ROWS = 80
 
 
+def related_ops_incident_ids_from_env(*, limit: int = 32) -> List[uuid.UUID]:
+    """Comma-separated UUIDs in ``M8_RELATED_OPS_INCIDENT_IDS`` (training / cron postmortems)."""
+    raw = (os.environ.get("M8_RELATED_OPS_INCIDENT_IDS") or "").strip()
+    if not raw:
+        return []
+    out: List[uuid.UUID] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(uuid.UUID(part))
+        except ValueError:
+            logger.warning("m8_train: skip invalid UUID in M8_RELATED_OPS_INCIDENT_IDS: %s", part[:80])
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -276,7 +295,12 @@ def _fit_and_predict_hour_grid(df) -> Tuple[Dict[str, List[float]], Dict[str, An
     return priors, metrics
 
 
-async def train_m8_publish_hour_priors(pool: Any, *, lookback_days: int = 420) -> Dict[str, Any]:
+async def train_m8_publish_hour_priors(
+    pool: Any,
+    *,
+    lookback_days: int = 420,
+    related_ops_incident_ids: Optional[Sequence[uuid.UUID]] = None,
+) -> Dict[str, Any]:
     """
     Pull PCI training data, fit HGBR, insert ``m8_model_runs``, replace hour priors.
 
@@ -285,6 +309,8 @@ async def train_m8_publish_hour_priors(pool: Any, *, lookback_days: int = 420) -
         COALESCE(pci.published_at, u.completed_at, u.created_at).
       M8_TRAIN_SOURCE_ALLOWLIST — e.g. ``uploadm8,linked`` (comma-separated, lower).
       M8_TRAIN_CONTENT_KIND_ALLOWLIST — e.g. ``reel,short`` (optional).
+      M8_RELATED_OPS_INCIDENT_IDS — comma-separated UUIDs stored on the run row
+        (``m8_model_runs.related_ops_incident_ids``) for postmortems beside ``training_run_id``.
     """
     from core.scheduling import static_hour_prior_24
 
@@ -320,6 +346,11 @@ async def train_m8_publish_hour_priors(pool: Any, *, lookback_days: int = 420) -
         "sql_row_count": len(rows),
         "frame_row_count": int(len(df)),
     }
+    if related_ops_incident_ids is not None:
+        inc_ids: List[uuid.UUID] = list(related_ops_incident_ids)[:32]
+    else:
+        inc_ids = related_ops_incident_ids_from_env()
+    train_config["related_ops_incident_ids"] = [str(x) for x in inc_ids]
     track.log(
         {
             "phase": "data_load",
@@ -385,13 +416,14 @@ async def train_m8_publish_hour_priors(pool: Any, *, lookback_days: int = 420) -
     insert_run_sql = """
         INSERT INTO m8_model_runs (
             id, trained_at, model_version, train_row_count, val_mae_log1p_views,
-            features_used, train_config, metrics
-        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb)
+            features_used, train_config, metrics, related_ops_incident_ids
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, $9::uuid[])
     """
     run_metrics_out = dict(run_metrics)
     run_metrics_out["training_run_id"] = str(run_id)
     run_metrics_out["trained_at"] = trained_at.isoformat()
     run_metrics_out["model_version"] = model_version
+    run_metrics_out["related_ops_incident_ids"] = [str(x) for x in inc_ids]
 
     insert_prior_sql = """
         INSERT INTO m8_publish_hour_priors (
@@ -428,16 +460,23 @@ async def train_m8_publish_hour_priors(pool: Any, *, lookback_days: int = 420) -
                 json.dumps(features_used),
                 json.dumps(train_config, default=str),
                 json.dumps(run_metrics_out, default=str),
+                inc_ids,
             )
             await conn.executemany(insert_prior_sql, records)
 
-    logger.info("m8_train: finished run_id=%s %s", run_id, run_metrics_out)
+    logger.info(
+        "m8_train: finished run_id=%s related_ops_incident_ids=%s metrics_keys=%s",
+        run_id,
+        [str(x) for x in inc_ids],
+        sorted(run_metrics_out.keys()),
+    )
     track.log(
         {
             "phase": "persist",
             "train_row_count": int(len(df)),
             "model_version": model_version,
             "training_run_id": str(run_id),
+            "related_ops_incident_ids": [str(x) for x in inc_ids],
         }
     )
     track.finish()

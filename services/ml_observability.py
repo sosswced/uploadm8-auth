@@ -15,15 +15,20 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger("uploadm8.ml_observability")
 
 
+def hf_write_token() -> str:
+    """Write-capable Hub token: ``HF_TOKEN`` first, then ``HUGGING_FACE_HUB_TOKEN``."""
+    return (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+
+
 def hf_env_status(*, require_write_token: bool = False) -> Tuple[bool, str]:
     """
     Validate Hugging Face env configuration for dataset operations.
     """
-    token = (os.environ.get("HF_TOKEN") or "").strip()
+    token = hf_write_token()
     if not token:
-        return False, "HF_TOKEN is not set"
+        return False, "Hub token is not set (HF_TOKEN or HUGGING_FACE_HUB_TOKEN)"
     if require_write_token and len(token) < 16:
-        return False, "HF_TOKEN appears invalid/too short"
+        return False, "Hub token appears invalid/too short"
     return True, "ok"
 
 

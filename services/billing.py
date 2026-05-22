@@ -69,10 +69,10 @@ def create_wallet_topup_checkout_session(
         cancel_url=cancel_url,
         metadata={
             "user_id": str(user_id),
-            "wallet": product["wallet"],
-            "amount": str(product["amount"]),
-            "kind": "topup",
             "lookup_key": lookup_key,
+            "wallet": product["wallet"],
+            "amount": str(product.get("amount", 0)),
+            "kind": "topup",
         },
     )
 

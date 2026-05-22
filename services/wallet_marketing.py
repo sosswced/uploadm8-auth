@@ -14,6 +14,14 @@ logger = logging.getLogger("uploadm8.wallet_marketing")
 
 from stages.entitlements import TIER_CONFIG, get_next_public_upgrade_tier, normalize_tier
 from services.growth_intelligence import fetch_user_engagement_snapshot
+from services.marketing_promo_media import (
+    _promo_media_dict,
+    promo_media_enabled,
+    resolve_or_generate_campaign_promo_url,
+    resolve_promo_presigned_url,
+    user_segment_bucket,
+    user_visual_context_enabled_for_campaign,
+)
 
 
 def _now_utc() -> datetime:
@@ -51,6 +59,11 @@ async def _period_anchor(conn, user_id: str) -> datetime:
     return month_start
 
 
+async def get_wallet_usage_period_anchor(conn, user_id: str):
+    """UTC period start for wallet usage / burn (same anchor as marketing)."""
+    return await _period_anchor(conn, user_id)
+
+
 async def _ledger_sums(
     conn,
     user_id: str,
@@ -59,9 +72,11 @@ async def _ledger_sums(
     """Aggregate token_ledger rows since period_start."""
     q = """
     SELECT
-      COALESCE(SUM(CASE WHEN token_type = 'put' AND reason = 'spend' AND delta < 0
+      COALESCE(SUM(CASE WHEN token_type = 'put' AND delta < 0
+                     AND reason IN ('spend', 'upload_debit')
                      THEN ABS(delta::bigint) ELSE 0 END), 0)::bigint AS put_spent,
-      COALESCE(SUM(CASE WHEN token_type = 'aic' AND reason = 'spend' AND delta < 0
+      COALESCE(SUM(CASE WHEN token_type = 'aic' AND delta < 0
+                     AND reason IN ('spend', 'upload_debit')
                      THEN ABS(delta::bigint) ELSE 0 END), 0)::bigint AS aic_spent,
       COALESCE(SUM(CASE WHEN token_type = 'put' AND reason IN ('topup', 'topup_purchase') AND delta > 0
                      THEN delta::bigint ELSE 0 END), 0)::bigint AS put_topup,
@@ -249,7 +264,7 @@ async def _user_campaign_features(conn, user_id: str, range_key: str) -> Dict[st
 async def _live_campaign_for_user(conn, user_id: str, tier: str) -> Optional[Dict[str, Any]]:
     rows = await conn.fetch(
         """
-        SELECT id, name, objective, channel, status, range_key, targeting, schedule_at, created_at
+        SELECT id, name, objective, channel, status, range_key, targeting, schedule_at, created_at, promo_media
         FROM marketing_campaigns
         WHERE status IN ('active', 'scheduled')
           AND channel IN ('in_app', 'mixed', 'discount')
@@ -342,6 +357,7 @@ async def build_wallet_marketing_payload(
         "platforms": "/platforms.html",
         "analytics": "/analytics.html",
         "dashboard": "/dashboard.html",
+        "token_balances": "/settings.html#token-balances",
     }
     experiments = {
         "cta_variant": _stable_ab_variant(user_id, "cta_text"),
@@ -647,6 +663,32 @@ async def build_wallet_marketing_payload(
         elif ch == "mixed":
             cta_link = links["upgrade"]
             cta_label = "View campaign"
+        pm_live = _promo_media_dict(live_campaign.get("promo_media"))
+        promo_image_url = ""
+        promo_variant_id = ""
+        if promo_media_enabled() and str(pm_live.get("mode") or "").strip().lower() in (
+            "pikzels_static",
+            "pikzels",
+            "image",
+        ):
+            try:
+                if user_visual_context_enabled_for_campaign(pm_live):
+                    pu, pv, _ex = await resolve_or_generate_campaign_promo_url(
+                        conn,
+                        campaign_id=str(live_campaign.get("id") or ""),
+                        user_tier=tier,
+                        user_id=user_id,
+                    )
+                    promo_image_url = pu or ""
+                    promo_variant_id = pv or ""
+                else:
+                    seg_live = user_segment_bucket(tier, live_campaign.get("targeting") or {})
+                    if str(pm_live.get("segment_bucket") or "") == seg_live and pm_live.get("last_r2_key"):
+                        promo_image_url = await resolve_promo_presigned_url(conn, pm_live) or ""
+                        promo_variant_id = str(pm_live.get("variant_id") or "")
+            except Exception:
+                promo_image_url = ""
+                promo_variant_id = ""
         _append_opportunity(
             opps,
             type_=f"campaign_{live_campaign.get('id')}",
@@ -661,6 +703,8 @@ async def build_wallet_marketing_payload(
                 "campaign_status": str(live_campaign.get("status") or ""),
                 "campaign_range": str(live_campaign.get("range_key") or "30d"),
                 "audience_eval": live_campaign.get("audience_eval") or {},
+                "promo_image_url": promo_image_url,
+                "promo_variant_id": str(pm_live.get("variant_id") or ""),
             },
         )
 

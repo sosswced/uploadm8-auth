@@ -179,6 +179,30 @@ def build_summary(vi_payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
+def merge_visual_catalog_into_summary(
+    summary: Dict[str, Any],
+    visual_recognition: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Attach Google Vision rollup buckets to the persisted summary row."""
+    if not isinstance(summary, dict):
+        summary = {}
+    flat = {}
+    if isinstance(visual_recognition, dict):
+        flat = visual_recognition.get("flat") or {}
+    if not flat:
+        return summary
+    out = dict(summary)
+    out["recognition_flat"] = flat
+    out["recognition_niche"] = str(visual_recognition.get("niche") or "general")[:64]
+    # Top tokens per bucket for fast GIN-less reads in admin/widgets.
+    tops: Dict[str, List[str]] = {}
+    for key, names in flat.items():
+        if isinstance(names, list) and names:
+            tops[key] = [str(n)[:120] for n in names[:12]]
+    out["recognition_buckets"] = tops
+    return out
+
+
 def select_thumbnail_keyframe_offset(
     vi_payload: Optional[Dict[str, Any]],
     *,
@@ -282,6 +306,8 @@ async def persist_recognition(
     upload_id: str,
     user_id: str,
     vi_payload: Optional[Dict[str, Any]],
+    visual_recognition: Optional[Dict[str, Any]] = None,
+    category: str = "general",
 ) -> Dict[str, Any]:
     """Write per-detection rows + summary row for an upload.
 
@@ -292,6 +318,7 @@ async def persist_recognition(
     the summary row in a single transaction.
     """
     summary = build_summary(vi_payload)
+    summary = merge_visual_catalog_into_summary(summary, visual_recognition)
     if not db_pool:
         return summary
     if not upload_id or not user_id:
@@ -328,7 +355,14 @@ async def persist_recognition(
     _add("logo", logos, desc_key="description")
 
     summary_blob = json.dumps(summary)
-    raw_summary_blob = json.dumps({"summary_text": summary.get("summary_text") or ""})
+    raw_summary_blob = json.dumps(
+        {
+            "summary_text": summary.get("summary_text") or "",
+            "recognition_flat": summary.get("recognition_flat") or {},
+            "recognition_buckets": summary.get("recognition_buckets") or {},
+            "recognition_niche": summary.get("recognition_niche") or "",
+        }
+    )
 
     try:
         async with db_pool.acquire() as conn:
@@ -396,6 +430,21 @@ async def persist_recognition(
                     summary["hydration_score"],
                     raw_summary_blob,
                 )
+        try:
+            from services.visual_entity_memory import upsert_catalog_entities
+
+            flat = summary.get("recognition_flat") or {}
+            if isinstance(flat, dict) and flat:
+                await upsert_catalog_entities(
+                    db_pool,
+                    user_id=user_id,
+                    upload_id=upload_id,
+                    catalog_flat=flat,
+                    category=category,
+                )
+        except Exception as mem_e:
+            logger.debug("[recognition] entity catalog upsert skipped: %s", mem_e)
+
         logger.info(
             "[recognition] persisted upload=%s objects=%d text=%d persons=%d logos=%d "
             "hydration_score=%.2f",

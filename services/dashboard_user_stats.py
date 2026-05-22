@@ -5,8 +5,7 @@ import json
 import logging
 from typing import Any, Mapping
 
-from fastapi import HTTPException
-
+from core.deps import require_verified_user_on_conn
 from core.helpers import _now_utc, get_plan
 from core.wallet import get_wallet
 from services.upload_engagement import compute_upload_engagement_totals as _compute_upload_engagement_totals
@@ -468,20 +467,7 @@ async def fetch_dashboard_stats_for_user_id(pool: Any, user_id: str) -> dict[str
     ``get_current_user_readonly`` before this block.
     """
     async with pool.acquire() as conn:
-        user_row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        if not user_row:
-            raise HTTPException(status_code=401, detail="User not found")
-        if user_row["status"] == "banned":
-            raise HTTPException(status_code=403, detail="Account suspended")
-        if user_row.get("email_verified") is False:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "message": "Please verify your email to use the app.",
-                    "code": "email_not_verified",
-                },
-            )
-        user = dict(user_row)
+        user = await require_verified_user_on_conn(conn, user_id)
         wallet = await get_wallet(conn, user_id)
         plan = get_plan(user.get("subscription_tier", "free"))
         return await _dashboard_stats_on_conn(conn, user, plan, wallet)

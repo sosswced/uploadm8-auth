@@ -48,6 +48,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from core.helpers import sanitize_hashtag_body
+from core.vision_labels import (
+    evidence_pool_has_strong_hashtag_signals,
+    filter_vision_labels_for_hashtags,
+    is_generic_vision_label,
+    is_redundant_vision_label,
+    resolve_ambient_profiles,
+    vision_label_slug,
+)
 from stages.context import JobContext, build_hydration_story_text
 
 logger = logging.getLogger("uploadm8-worker")
@@ -129,6 +137,8 @@ _CATEGORY_SEED_TAGS = {
     "morningroutine", "selfcare", "wellnesstok", "authenticlife",
     # platform-meta (already blocked elsewhere; mirror for safety)
     "viral", "fyp", "foryoupage", "trending", "mustwatch",
+    # leaked QA / placeholder tags
+    "tester", "qwe",
 }
 
 # Words that indicate the caption is a real evidence-grounded sentence.
@@ -172,10 +182,10 @@ class EvidencePool:
     protected_area: Optional[str] = None
     near_protected_land: bool = False
 
-    # Speed (telemetry .map first, OSD HUD second)
+    # Speed (canonical: .map telemetry > OSD HUD > Vision OCR — see collect_evidence)
     max_speed_mph: float = 0.0
     avg_speed_mph: float = 0.0
-    speed_source: str = ""  # "telemetry" / "osd"
+    speed_source: str = ""  # "telemetry" | "osd" | "vision_ocr"
 
     # OSD HUD facts
     driver_name: Optional[str] = None
@@ -208,6 +218,12 @@ class EvidencePool:
     has_faces: bool = False
     expressive_faces: bool = False
 
+    # Google visual recognition buckets (vehicles, food, plants, fishing, …)
+    recognition_entities: Dict[str, List[str]] = field(default_factory=dict)
+
+    # Resolved ambient-redundancy profiles (automotive, dashcam, cooking, …)
+    ambient_profiles: List[str] = field(default_factory=list)
+
     # Twelve Labs / Video Intelligence (legacy text + new structured tracks)
     video_understanding_phrase: Optional[str] = None
     video_summary_phrase: Optional[str] = None
@@ -233,6 +249,7 @@ class EvidencePool:
                 self.video_labels, self.yamnet_top,
                 self.vi_object_tracks, self.vi_text_detections,
                 self.vi_person_segments, self.vi_logos,
+                self.recognition_entities,
             )
         )
 
@@ -289,6 +306,9 @@ class EvidencePool:
                 "ocr_tokens": self.vision_ocr_tokens[:6],
                 "highways": self.vision_highways[:4],
                 "has_faces": self.has_faces,
+                "recognition_entities": {
+                    k: v[:6] for k, v in (self.recognition_entities or {}).items() if v
+                },
             },
             "video_understanding": self.video_understanding_phrase,
             "yamnet_top": self.yamnet_top,
@@ -376,12 +396,35 @@ def _clean_video_label(raw: Any) -> str:
     return text
 
 
+def _vision_ocr_peak_mph(ocr: str) -> float:
+    """Best-effort peak speed from Vision OCR (fallback when .map and OSD lack HUD)."""
+    if not ocr:
+        return 0.0
+    best = 0.0
+    for m in re.finditer(r"\b(\d{1,3})\s*(?:mph|mi/h)\b", ocr, re.IGNORECASE):
+        try:
+            v = float(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        if 5.0 <= v <= 220.0:
+            best = max(best, v)
+    for m in re.finditer(r"\b(\d{1,3})\s*(?:kmh|km/h)\b", ocr, re.IGNORECASE):
+        try:
+            v = float(m.group(1)) * 0.621371
+        except (TypeError, ValueError):
+            continue
+        if 5.0 <= v <= 220.0:
+            best = max(best, v)
+    return best
+
+
 def collect_evidence(ctx: JobContext) -> EvidencePool:
     """Build EvidencePool from every analyzed source on ctx. Cheap and pure."""
     pool = EvidencePool()
 
-    # ── Telemetry (.map + reverse-geocode + gazetteer + PADUS) ──────────
+    # Speed — canonical resolver: .map telemetry > OSD HUD > Vision OCR text.
     tel = getattr(ctx, "telemetry", None) or getattr(ctx, "telemetry_data", None)
+    tel_max = tel_avg = 0.0
     if tel is not None:
         pool.road = (getattr(tel, "location_road", None) or None)
         pool.city = (getattr(tel, "location_city", None) or None)
@@ -392,26 +435,38 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
         pool.near_protected_land = bool(getattr(tel, "near_padus", False))
         pool.state_abbr = _state_abbr(pool.state, pool.country)
         try:
-            pool.max_speed_mph = float(getattr(tel, "max_speed_mph", 0) or 0)
-            pool.avg_speed_mph = float(getattr(tel, "avg_speed_mph", 0) or 0)
+            tel_max = float(getattr(tel, "max_speed_mph", 0) or 0)
+            tel_avg = float(getattr(tel, "avg_speed_mph", 0) or 0)
         except (TypeError, ValueError):
-            pool.max_speed_mph = pool.avg_speed_mph = 0.0
-        if pool.max_speed_mph > 0:
-            pool.speed_source = "telemetry"
+            tel_max = tel_avg = 0.0
 
-    # ── OSD HUD (covers OSD-only routes where .map is missing) ──────────
+    vc_early = getattr(ctx, "vision_context", None) or {}
+    ocr_blob = str(vc_early.get("ocr_text") or "") if isinstance(vc_early, dict) else ""
+    vision_peak = _vision_ocr_peak_mph(ocr_blob)
+
     osd = getattr(ctx, "dashcam_osd_context", None) or {}
+    osd_max = osd_avg = 0.0
     if isinstance(osd, dict) and osd and not osd.get("skipped"):
         try:
             osd_max = float(osd.get("max_speed_mph") or 0)
             osd_avg = float(osd.get("avg_speed_mph") or 0)
         except (TypeError, ValueError):
             osd_max = osd_avg = 0.0
-        if osd_max > pool.max_speed_mph:
-            pool.max_speed_mph = osd_max
-            pool.speed_source = "osd"
-        if osd_avg > pool.avg_speed_mph:
-            pool.avg_speed_mph = osd_avg
+
+    if tel_max > 0:
+        pool.max_speed_mph = tel_max
+        pool.avg_speed_mph = tel_avg if tel_avg > 0 else tel_max
+        pool.speed_source = "telemetry"
+    elif osd_max > 0:
+        pool.max_speed_mph = osd_max
+        pool.avg_speed_mph = osd_avg if osd_avg > 0 else osd_max
+        pool.speed_source = "osd"
+    elif vision_peak > 0:
+        pool.max_speed_mph = vision_peak
+        pool.avg_speed_mph = vision_peak
+        pool.speed_source = "vision_ocr"
+
+    if isinstance(osd, dict) and osd and not osd.get("skipped"):
         drv = osd.get("driver_name")
         if drv and isinstance(drv, str) and drv.strip():
             pool.driver_name = drv.strip()
@@ -527,6 +582,25 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
                     if s and s not in pool.vision_highways:
                         pool.vision_highways.append(s)
             pool.vision_ocr_tokens = _extract_transcript_nouns(ocr, limit=8)
+        rec_flat = vc.get("recognition_flat") or {}
+        if not rec_flat:
+            vr = getattr(ctx, "visual_recognition", None) or {}
+            if isinstance(vr, dict):
+                rec_flat = vr.get("flat") or {}
+        if isinstance(rec_flat, dict) and rec_flat:
+            pool.recognition_entities = {
+                k: [str(x).strip() for x in v[:10] if str(x).strip()]
+                for k, v in rec_flat.items()
+                if isinstance(v, list) and v
+            }
+            for key in (
+                "vehicles", "food", "plants", "animals", "brands",
+                "outdoors", "sports", "art", "restaurants", "products",
+            ):
+                for name in (rec_flat.get(key) or [])[:6]:
+                    low = str(name).strip().lower()
+                    if low and low not in pool.vision_labels:
+                        pool.vision_labels.append(low)
 
     # ── Twelve Labs / Video Intelligence narrative ──────────────────────
     vu = getattr(ctx, "video_understanding", None) or {}
@@ -604,6 +678,30 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
             summary = vic.get("summary_text") or ""
             if isinstance(summary, str) and summary.strip():
                 pool.video_summary_phrase = _first_sentence(summary, max_chars=160)
+
+    cat = str(getattr(ctx, "thumbnail_category", None) or "").strip().lower()
+    if not cat:
+        hp = getattr(ctx, "hydration_payload", None) or {}
+        if isinstance(hp, dict):
+            cat = str(hp.get("category") or "").strip().lower()
+    if not cat:
+        cat = "general"
+    ambient = resolve_ambient_profiles(
+        category=cat,
+        filename=str(getattr(ctx, "filename", "") or ""),
+        vision_label_names=pool.vision_labels,
+    )
+    pool.ambient_profiles = sorted(ambient)
+    pool.vision_labels = [
+        lbl
+        for lbl in pool.vision_labels
+        if not is_redundant_vision_label(lbl, ambient_profiles=ambient)
+    ]
+    pool.video_labels = [
+        lbl
+        for lbl in pool.video_labels
+        if not is_redundant_vision_label(lbl, ambient_profiles=ambient)
+    ]
 
     return pool
 
@@ -864,26 +962,24 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
     for logo in pool.vision_logos[:2]:
         _push(logo)
 
-    # Vision generic labels: keep only ones that look specific (not 1–3 chars,
-    # not too generic). We allow these only after the priority signals so they
-    # never crowd out actual hard evidence.
-    _GENERIC_LABEL = {
-        "sky", "outdoor", "outdoors", "indoor", "indoors", "vehicle", "car",
-        "transport", "transportation", "asphalt", "road", "tree", "trees",
-        "plant", "grass", "land", "landscape", "cloud", "clouds", "person",
-        "people", "object", "view", "scene",
-    }
-    for lbl in pool.vision_labels:
-        slug = re.sub(r"[^A-Za-z0-9]+", "", lbl)
-        if not slug or slug.lower() in _GENERIC_LABEL or len(slug) < 4:
-            continue
-        _push(slug)
+    # Vision / VI segment labels: only when no stronger geo/VI text/landmark signals,
+    # and never generic / ambient-redundant detector slugs.
+    strong_signals = evidence_pool_has_strong_hashtag_signals(pool)
+    ambient = tuple(pool.ambient_profiles or ())
+    if not strong_signals:
+        for lbl in filter_vision_labels_for_hashtags(
+            pool.vision_labels,
+            min_specific_len=4,
+            ambient_profiles=ambient or None,
+        ):
+            _push(vision_label_slug(lbl) or lbl)
 
     for lbl in pool.video_labels[:8]:
-        slug = re.sub(r"[^A-Za-z0-9]+", "", lbl)
-        if not slug or slug.lower() in _GENERIC_LABEL or len(slug) < 4:
+        if is_redundant_vision_label(lbl, ambient_profiles=ambient or None):
             continue
-        _push(slug)
+        slug = vision_label_slug(lbl)
+        if slug:
+            _push(slug)
 
     # Transcript STRUCTURED entities (people / places / products / orgs from GPT pass).
     for kind in ("places", "products", "organizations", "people"):
@@ -1023,12 +1119,20 @@ def _hydrate_caption(caption: str, anchor: str, *, max_chars: int = 520) -> str:
 
 
 def _hydrate_title(title: str, anchor: str, *, max_chars: int = 100) -> str:
-    """Replace title with anchor when it's empty or too generic. Keeps non-generic titles."""
+    """Replace title with anchor when it's empty or clearly generic. Keeps editorial titles."""
     t = (title or "").strip()
     a = (anchor or "").strip()
     if not a:
         return t[:max_chars]
-    if not t or _is_generic_caption(t):
+    if not t:
+        return a[:max_chars]
+    # Long or subtitle-style headlines must not be replaced by a raw speed+music
+    # anchor. ``_is_generic_caption`` is substring-based (e.g. ``open road`` matches
+    # inside ``…Through the Open Road``) and was clobbering good LLM titles with
+    # truncated anchors that pulled profanity from transcript-adjacent evidence.
+    if len(t) >= 36 or (":" in t and len(t) >= 18):
+        return t[:max_chars]
+    if _is_generic_caption(t):
         return a[:max_chars]
     return t[:max_chars]
 
@@ -1151,6 +1255,22 @@ def _fallback_anchor_from_ctx(ctx: JobContext, category: Optional[str] = None) -
         frag = _sanitize_anchor_fragment(frag, max_chars=max(24, 230 - len(out)))
         if frag:
             out = f"{out[:-1]} — heard: {frag}." if out.endswith(".") else f"{out} — heard: {frag}."
+    return out
+
+
+def _scrub_leaked_junk_hashtags(tags: Iterable[str]) -> List[str]:
+    """Remove obvious QA/placeholder tokens from AI hashtag lists."""
+    from core.helpers import sanitize_hashtag_body
+
+    banned = frozenset({"tester", "qwe", "asdf", "foobar", "lorem", "ipsum"})
+    out: List[str] = []
+    for raw in tags or []:
+        body = sanitize_hashtag_body(str(raw).strip().lstrip("#"))
+        if not body:
+            continue
+        if body.lower() in banned:
+            continue
+        out.append(body)
     return out
 
 
@@ -1375,6 +1495,23 @@ def enforce_hydration(
         elif seed_only:
             ctx.ai_hashtags = _merge_hashtag_lists(evidence_tags, existing, cap=cap)
 
+    ctx.ai_hashtags = _scrub_leaked_junk_hashtags(list(getattr(ctx, "ai_hashtags", None) or []))
+    if isinstance(m8_hashtags, dict):
+        for pl, raw_list in list(m8_hashtags.items()):
+            m8_hashtags[pl] = _scrub_leaked_junk_hashtags(list(raw_list or []))
+
+    # ── Metadata quality notes (surfaced in hydration_report / admin trace) ─
+    qual: List[str] = []
+    cap_all = f"{getattr(ctx, 'ai_title', '')} {getattr(ctx, 'ai_caption', '')}".strip()
+    if has_evidence and cap_all and not used_fallback:
+        if not _caption_uses_evidence(cap_all, pool):
+            qual.append("combined_copy_missing_explicit_evidence_token")
+        if _is_generic_caption(cap_all):
+            qual.append("combined_copy_matches_generic_template")
+    if qual:
+        report["warnings"].extend(qual)
+    report["metadata_quality"] = {"notes": qual}
+
     # Persist report for diagnostics if ctx supports it.
     try:
         if not isinstance(getattr(ctx, "output_artifacts", None), dict):
@@ -1391,6 +1528,7 @@ def enforce_hydration(
             "evidence_tags": list(report["evidence_tags"]),
             "evidence": report["evidence"],
             "warnings": report["warnings"],
+            "metadata_quality": report.get("metadata_quality") or {},
         }
     except (AttributeError, TypeError):
         pass

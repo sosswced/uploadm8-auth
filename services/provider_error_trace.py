@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 _TRACE_KEY = "provider_error_trace"
 _MAX_ENTRIES = 80
@@ -35,8 +35,13 @@ def append_provider_error(
     url: Optional[str] = None,
     response_body_snippet: Optional[str] = None,
     exception_type: Optional[str] = None,
+    result_tier: str = "failed",
 ) -> None:
-    """Append normalized provider error row into ctx.output_artifacts[_TRACE_KEY]."""
+    """Append normalized provider error row into ctx.output_artifacts[_TRACE_KEY].
+
+    ``result_tier``: ``ok`` | ``degraded`` | ``failed`` — used by admin trace / ops
+    (``failed`` = user-visible or blocking; ``degraded`` = soft skip / partial data).
+    """
     arts = getattr(ctx, "output_artifacts", None)
     if not isinstance(arts, dict):
         return
@@ -57,6 +62,7 @@ def append_provider_error(
         "operation": str(operation or "").strip(),
         "message": _safe_str(message, max_chars=1400),
         "upload_id": str(getattr(ctx, "upload_id", "") or ""),
+        "result_tier": str(result_tier or "failed").strip().lower(),
     }
     p = row["provider"]
     if p in _PROVIDER_DOCS:
@@ -82,3 +88,22 @@ def append_provider_error(
     except Exception:
         return
 
+
+def normalize_provider_trace_rows(rows: Any) -> List[Dict[str, Any]]:
+    """Return a list of trace dicts with ``result_tier`` defaulted for admin UIs."""
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        row = dict(r)
+        tier = str(row.get("result_tier") or "failed").strip().lower()
+        if tier not in ("ok", "degraded", "failed"):
+            tier = "failed"
+        row["result_tier"] = tier
+        out.append(row)
+    return out
+
+
+__all__ = ["append_provider_error", "normalize_provider_trace_rows"]

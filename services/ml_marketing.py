@@ -55,10 +55,13 @@ async def evaluate_uplift_vs_baseline(
     *,
     model_key: str = "propensity_v1",
     min_samples: int = 40,
+    record_audit: bool = True,
 ) -> Dict[str, Any]:
     """
     Compare label rate in top half of model scores vs bottom half (offline proxy).
     Only promote if lift exceeds margin.
+
+    When ``record_audit`` is False, skips writes to ``ml_model_promotion_audit`` (dashboard GETs).
     """
     rows = await conn.fetch(
         """
@@ -104,16 +107,17 @@ async def evaluate_uplift_vs_baseline(
             "model_rate": None,
             "lift": None,
         }
-        await conn.execute(
-            """
-            INSERT INTO ml_model_promotion_audit
-                (model_key, baseline_rate, model_rate, lift, promoted, sample_n, meta)
-            VALUES ($1, NULL, NULL, NULL, FALSE, $2, $3::jsonb)
-            """,
-            model_key[:80],
-            n,
-            json.dumps(out),
-        )
+        if record_audit:
+            await conn.execute(
+                """
+                INSERT INTO ml_model_promotion_audit
+                    (model_key, baseline_rate, model_rate, lift, promoted, sample_n, meta)
+                    VALUES ($1, NULL, NULL, NULL, FALSE, $2, $3::jsonb)
+                """,
+                model_key[:80],
+                n,
+                json.dumps(out),
+            )
         return out
 
     scored.sort(key=lambda x: x[0])
@@ -135,21 +139,117 @@ async def evaluate_uplift_vs_baseline(
         "promoted": promoted,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
     }
-    await conn.execute(
-        """
-        INSERT INTO ml_model_promotion_audit
-            (model_key, baseline_rate, model_rate, lift, promoted, sample_n, meta)
-        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-        """,
-        model_key[:80],
-        base_rate,
-        top_rate,
-        lift,
-        promoted,
-        n,
-        json.dumps(meta),
-    )
+    if record_audit:
+        await conn.execute(
+            """
+            INSERT INTO ml_model_promotion_audit
+                (model_key, baseline_rate, model_rate, lift, promoted, sample_n, meta)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            """,
+            model_key[:80],
+            base_rate,
+            top_rate,
+            lift,
+            promoted,
+            n,
+            json.dumps(meta),
+        )
     return meta
+
+
+async def fetch_marketing_conversion_proxy(
+    conn: asyncpg.Connection, *, days: int = 90, limit_rows: int = 80
+) -> Dict[str, Any]:
+    """
+    Roll up marketing_events rows that carry ``payload.campaign_id`` — sends, opens,
+    and generic funnel events for proxying conversion analysis in the admin UI.
+    """
+    days = max(7, min(int(days), 365))
+    limit_rows = max(10, min(int(limit_rows), 500))
+    rows = await conn.fetch(
+        """
+        SELECT
+            NULLIF(TRIM(payload->>'campaign_id'), '') AS campaign_id,
+            COUNT(*) FILTER (WHERE event_type = 'campaign_email_sent')::bigint AS email_sent,
+            COUNT(*) FILTER (WHERE event_type = 'campaign_discord_prompt')::bigint AS discord_sent,
+            COUNT(*) FILTER (WHERE event_type = 'campaign_email_open')::bigint AS email_open,
+            COUNT(*) FILTER (WHERE event_type = 'shown')::bigint AS nudge_shown,
+            COUNT(*) FILTER (WHERE event_type = 'clicked')::bigint AS nudge_clicked,
+            COUNT(*) FILTER (WHERE event_type = 'converted')::bigint AS converted,
+            COUNT(*) FILTER (WHERE event_type = 'dismissed')::bigint AS dismissed
+        FROM marketing_events
+        WHERE created_at >= NOW() - ($1::int * INTERVAL '1 day')
+          AND NULLIF(TRIM(payload->>'campaign_id'), '') IS NOT NULL
+        GROUP BY 1
+        ORDER BY (email_sent + discord_sent) DESC NULLS LAST
+        LIMIT $2
+        """,
+        days,
+        limit_rows,
+    )
+    by_campaign: List[Dict[str, Any]] = []
+    for r in rows:
+        cid = str(r["campaign_id"] or "")
+        es = int(r["email_sent"] or 0)
+        eo = int(r["email_open"] or 0)
+        by_campaign.append(
+            {
+                "campaign_id": cid,
+                "email_sent": es,
+                "discord_sent": int(r["discord_sent"] or 0),
+                "email_open": eo,
+                "nudge_shown": int(r["nudge_shown"] or 0),
+                "nudge_clicked": int(r["nudge_clicked"] or 0),
+                "converted": int(r["converted"] or 0),
+                "dismissed": int(r["dismissed"] or 0),
+                "open_rate_proxy_pct": round(100.0 * eo / max(es, 1), 2) if es else 0.0,
+            }
+        )
+    return {"days": days, "by_campaign": by_campaign, "truncated_to": limit_rows}
+
+
+async def infer_promo_media_defaults(conn: asyncpg.Connection) -> Dict[str, Any]:
+    """
+    Suggest ``promo_media`` keys from aggregate wallet-pressure levers + recent ML labels.
+
+    Callers merge over these defaults so explicit UI fields win.
+    """
+    from services.growth_intelligence import fetch_sales_opportunity_levers
+
+    levers = await fetch_sales_opportunity_levers(conn)
+    low_aic = int(levers.get("users_low_aic_available_0_9") or 0)
+    low_put = int(levers.get("users_low_put_available_0_29") or 0)
+    if low_aic >= low_put and low_aic > 0:
+        card_kind, amount = "topup_aic", 100
+    elif low_put > 0:
+        card_kind, amount = "topup_put", 50
+    else:
+        card_kind, amount = "sub_upgrade", None
+
+    variant_hint: Optional[str] = None
+    row = await conn.fetchrow(
+        """
+        SELECT variant_id
+        FROM ml_outcome_labels
+        WHERE created_at >= NOW() - INTERVAL '120 days'
+          AND variant_id IS NOT NULL
+          AND variant_id LIKE 'v\\_%' ESCAPE '\\'
+          AND LENGTH(variant_id) BETWEEN 4 AND 64
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    )
+    if row and row.get("variant_id"):
+        variant_hint = str(row["variant_id"])[:128]
+
+    return {
+        "personalize_product_card": True,
+        "card_kind": card_kind,
+        "amount": amount,
+        "variant_id": variant_hint,
+        "infer_source": "wallet_levers_plus_recent_variant",
+        "levers_snapshot": {"users_low_aic": low_aic, "users_low_put": low_put},
+    }
 
 
 async def fetch_variant_leaderboard(conn: asyncpg.Connection, limit: int = 40) -> List[Dict[str, Any]]:

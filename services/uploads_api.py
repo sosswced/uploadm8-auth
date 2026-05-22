@@ -47,12 +47,19 @@ def _platform_items_already_enriched(items: list) -> bool:
     )
 
 
-def _resolve_platform_result_avatars(items: list) -> list:
-    """Presign R2 keys in account_avatar so <img src> works without same-origin redirect."""
+def _resolve_platform_result_avatars(items: list, *, presign: bool = False) -> list:
+    """Resolve account_avatar for API responses (redirect paths on bulk list; presign on detail)."""
     out: list = []
     for e in items:
         if isinstance(e, dict):
-            out.append({**e, "account_avatar": resolve_stored_account_avatar_url(e.get("account_avatar"))})
+            out.append(
+                {
+                    **e,
+                    "account_avatar": resolve_stored_account_avatar_url(
+                        e.get("account_avatar"), presign=presign
+                    ),
+                }
+            )
         else:
             out.append(e)
     return out
@@ -81,7 +88,9 @@ def _merge_platform_entries(items: list, token_map: dict, platform_fallback: dic
     return enriched
 
 
-async def enrich_platform_results_batch(conn, upload_rows: list, user_id: str) -> list:
+async def enrich_platform_results_batch(
+    conn, upload_rows: list, user_id: str, *, presign_avatars: bool = False
+) -> list:
     """
     Enrich platform_results for many uploads with at most two DB round-trips total
     (target token ids + per-platform primary fallbacks), instead of up to two per row.
@@ -167,7 +176,7 @@ async def enrich_platform_results_batch(conn, upload_rows: list, user_id: str) -
     for i in range(n):
         row = out[i]
         if isinstance(row, list):
-            out[i] = _resolve_platform_result_avatars(row)
+            out[i] = _resolve_platform_result_avatars(row, presign=presign_avatars)
 
     return out
 
@@ -255,6 +264,26 @@ async def update_upload_metadata(conn, upload_id: str, user_id: str, update_data
         param_count += 1
         updates.append(f"{_safe_col('schedule_mode', cols)} = ${param_count}")
         params.append("smart")
+
+    if update_data.vehicle_make_id is not None or update_data.vehicle_model_id is not None:
+        vm_id = update_data.vehicle_make_id
+        vmd_id = update_data.vehicle_model_id
+        if vm_id is not None and vmd_id is not None:
+            ok = await conn.fetchrow(
+                "SELECT 1 FROM vehicle_models WHERE id = $1 AND make_id = $2",
+                vmd_id,
+                vm_id,
+            )
+            if not ok:
+                raise HTTPException(400, "Invalid vehicle model for selected make")
+        elif vmd_id is not None and vm_id is None:
+            raise HTTPException(400, "vehicle_make_id required when vehicle_model_id is set")
+        param_count += 1
+        updates.append(f"{_safe_col('vehicle_make_id', cols)} = ${param_count}")
+        params.append(vm_id)
+        param_count += 1
+        updates.append(f"{_safe_col('vehicle_model_id', cols)} = ${param_count}")
+        params.append(vmd_id)
 
     if not updates:
         raise HTTPException(400, "No updates provided")

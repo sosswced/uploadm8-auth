@@ -14,13 +14,20 @@ import httpx
 logger = logging.getLogger(__name__)
 
 TIKTOK_USER_INFO_URL = "https://open.tiktokapis.com/v2/user/info/"
-# Stats fields require user.info.stats; if a token lacks it, retry with basic-only.
+# Scope tiers (https://developers.tiktok.com/bulletin/user-info-scope-migration):
+# - user.info.basic: open_id, display_name, avatar_*
+# - user.info.profile: username, bio_description, is_verified, profile_deep_link
+# - user.info.stats: follower_count, following_count, likes_count, video_count
 TIKTOK_USER_INFO_FIELDS_BASIC = (
-    "open_id,union_id,username,display_name,avatar_url,avatar_url_100,avatar_large_url"
+    "open_id,union_id,display_name,avatar_url,avatar_url_100,avatar_large_url"
 )
-TIKTOK_USER_INFO_FIELDS_FULL = TIKTOK_USER_INFO_FIELDS_BASIC + (
-    ",unique_id,follower_count,following_count,likes_count"
+TIKTOK_USER_INFO_FIELDS_PROFILE = (
+    "open_id,union_id,username,display_name,avatar_url,avatar_url_100,avatar_large_url,"
+    "bio_description,is_verified,profile_deep_link"
 )
+TIKTOK_USER_INFO_FIELDS_STATS = "follower_count,following_count,likes_count,video_count"
+# Legacy alias — do not request username/stats here (breaks basic-only tokens).
+TIKTOK_USER_INFO_FIELDS_FULL = TIKTOK_USER_INFO_FIELDS_PROFILE
 
 # Single list used by catalog sync and any caller of ``tiktok_video_list_url`` — no short/long split;
 # all published videos are requested with the same field set.
@@ -141,71 +148,80 @@ def tiktok_identity_from_user_object(user_obj: Mapping[str, Any]) -> dict:
     }
 
 
+def _merge_tiktok_user_objects(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict:
+    out = dict(base) if isinstance(base, Mapping) else {}
+    if not isinstance(extra, Mapping):
+        return out
+    for key, val in extra.items():
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        if key not in out or not out.get(key):
+            out[key] = val
+    return out
+
+
+async def _tiktok_user_info_get(
+    client: httpx.AsyncClient,
+    access_token: str,
+    fields: str,
+) -> Tuple[Optional[dict], str]:
+    """Single GET /v2/user/info/; returns (user_obj or None, log_hint)."""
+    headers = {
+        "Authorization": f"Bearer {access_token.strip()}",
+        "Accept": "application/json",
+    }
+    try:
+        resp = await client.get(
+            TIKTOK_USER_INFO_URL,
+            params={"fields": fields},
+            headers=headers,
+        )
+        try:
+            body = resp.json() if resp.content else {}
+        except Exception:
+            body = {}
+        env_err = tiktok_envelope_error(body)
+        if resp.status_code != 200 or env_err:
+            return None, (
+                f"GET fields={fields[:48]} HTTP {resp.status_code} envelope={env_err!r}"
+            )
+        user_obj = tiktok_extract_user_from_info_body(body)
+        if user_obj:
+            return user_obj, "ok"
+        return None, f"GET fields={fields[:48]} empty user payload"
+    except Exception as e:
+        return None, f"GET fields={fields[:48]} exception: {type(e).__name__}: {e}"
+
+
 async def fetch_tiktok_user_profile_for_oauth(
     client: httpx.AsyncClient,
     access_token: str,
 ) -> dict:
     """
-    Fetch display name + avatar after OAuth. Tries GET (documented), then POST (some configs),
-    then retries with fewer fields if stats fields are rejected.
-    Returns tiktok_identity_from_user_object shape (may be empty strings).
+    Fetch display name + avatar after OAuth using ``user.info.basic`` fields only.
+
+    TikTok scope migration: ``open_id``, ``display_name``, and ``avatar_*`` live under
+    ``user.info.basic``. The old code incorrectly included ``username`` in the basic
+    field list; ``username`` requires ``user.info.profile`` and caused the whole
+    ``/v2/user/info/`` call to fail — empty name/avatar and ui-avatars placeholders.
     """
     if not access_token or not str(access_token).strip():
         return tiktok_identity_from_user_object({})
 
-    headers = {
-        "Authorization": f"Bearer {access_token.strip()}",
-        "Accept": "application/json",
-    }
-    last_log: str = ""
+    user_obj, hint = await _tiktok_user_info_get(
+        client, access_token, TIKTOK_USER_INFO_FIELDS_BASIC
+    )
+    if user_obj:
+        ident = tiktok_identity_from_user_object(user_obj)
+        logger.info(
+            "TikTok user/info (basic) has_name=%s has_avatar=%s open_id=%s",
+            bool(ident.get("account_name")),
+            bool(ident.get("account_avatar")),
+            bool(ident.get("account_id")),
+        )
+        return ident
 
-    for fields, label in (
-        (TIKTOK_USER_INFO_FIELDS_FULL, "full"),
-        (TIKTOK_USER_INFO_FIELDS_BASIC, "basic"),
-    ):
-        for method in ("get", "post"):
-            try:
-                if method == "get":
-                    resp = await client.get(
-                        TIKTOK_USER_INFO_URL,
-                        params={"fields": fields},
-                        headers=headers,
-                    )
-                else:
-                    resp = await client.post(
-                        TIKTOK_USER_INFO_URL,
-                        headers={**headers, "Content-Type": "application/json"},
-                        json={"fields": fields},
-                    )
-                try:
-                    body = resp.json() if resp.content else {}
-                except Exception:
-                    body = {}
-                env_err = tiktok_envelope_error(body)
-                if resp.status_code != 200 or env_err:
-                    last_log = (
-                        f"TikTok user/info {method.upper()} ({label}) HTTP {resp.status_code} "
-                        f"envelope={env_err!r}"
-                    )
-                    logger.warning("%s body_snip=%r", last_log, str(body)[:400])
-                    continue
-                user_obj = tiktok_extract_user_from_info_body(body)
-                ident = tiktok_identity_from_user_object(user_obj)
-                if ident.get("account_name") or ident.get("account_avatar") or ident.get("account_id"):
-                    logger.info(
-                        "TikTok user/info ok via %s %s (has_name=%s has_avatar=%s)",
-                        method,
-                        label,
-                        bool(ident.get("account_name")),
-                        bool(ident.get("account_avatar")),
-                    )
-                    return ident
-                last_log = f"TikTok user/info {method} ({label}) empty user payload"
-                logger.warning("%s keys=%r", last_log, list(body.keys())[:20])
-            except Exception as e:
-                last_log = f"TikTok user/info {method} ({label}) exception: {type(e).__name__}: {e}"
-                logger.warning(last_log)
-
-    if last_log:
-        logger.warning("TikTok user profile: all attempts failed; last=%s", last_log)
+    logger.warning("TikTok user/info (basic) failed: %s", hint)
     return tiktok_identity_from_user_object({})

@@ -54,6 +54,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from core.helpers import sanitize_hashtag_body
+from core.vision_labels import is_generic_vision_label, vision_label_slug
 from stages.context import JobContext
 
 logger = logging.getLogger("uploadm8-worker")
@@ -252,6 +253,18 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
 
     # ── Vision: logos (brands visible on screen) ─────────────────────────
     _take(list(vc.get("logo_names") or []), 2)
+
+    # ── Video Intelligence on-screen text (signs, highway numbers) ───────
+    vi = getattr(ctx, "video_intelligence", None) or getattr(ctx, "video_intelligence_context", None) or {}
+    if isinstance(vi, dict):
+        ost = list(vi.get("on_screen_text") or [])
+        for row in sorted(ost, key=lambda x: -float((x or {}).get("confidence") or 0) if isinstance(x, dict) else 0)[:4]:
+            if isinstance(row, dict):
+                txt = str(row.get("text") or "").strip()
+            else:
+                txt = str(row).strip()
+            if txt and len(txt) >= 3 and not is_generic_vision_label(txt):
+                _push(tags, seen, vision_label_slug(txt)[:36] or txt[:36])
 
     # ── Trill score bucket (driving energy) ──────────────────────────────
     tr = ctx.trill or ctx.trill_score

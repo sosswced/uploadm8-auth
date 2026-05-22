@@ -78,7 +78,7 @@ PIKZELS_FEATURE_MAP: Tuple[Tuple[str, str, str, str], ...] = (
         "Recreate",
         "recreate",
         V2_THUMBNAIL_IMAGE,
-        "POST create-from-image / reference image workflow (see create-from-image.md).",
+        "POST create-from-image; optional support_image_url (HTTPS still, pkz_4+) for layout reference.",
     ),
     (
         "One-Click Fix™",

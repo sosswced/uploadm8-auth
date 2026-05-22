@@ -33,6 +33,28 @@ from services.pikzels_v2 import (
     resolve_public_api_key,
 )
 from services.pikzels_errors import format_pikzels_error_message
+
+# Guided recreate: each variant = one Pikzels /v2/thumbnail/image (+ optional faceswap).
+STUDIO_VARIANT_COUNT_MIN = max(1, int(os.environ.get("THUMBNAIL_STUDIO_VARIANT_MIN", "1")))
+STUDIO_VARIANT_COUNT_MAX = max(
+    STUDIO_VARIANT_COUNT_MIN,
+    int(os.environ.get("THUMBNAIL_STUDIO_VARIANT_MAX", "8")),
+)
+STUDIO_VARIANT_COUNT_DEFAULT = max(
+    STUDIO_VARIANT_COUNT_MIN,
+    min(
+        STUDIO_VARIANT_COUNT_MAX,
+        int(os.environ.get("THUMBNAIL_STUDIO_VARIANT_DEFAULT", "2")),
+    ),
+)
+
+
+def clamp_studio_variant_count(raw: Any) -> int:
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = STUDIO_VARIANT_COUNT_DEFAULT
+    return max(STUDIO_VARIANT_COUNT_MIN, min(STUDIO_VARIANT_COUNT_MAX, n))
 from services.pikzels_v2_client import (
     normalize_url_or_base64,
     pikzels_v2_get,
@@ -401,7 +423,7 @@ def estimate_studio_cost(
     competitor_gap_mode: bool,
     has_channel_memory: bool,
 ) -> Tuple[int, int, Dict[str, Any]]:
-    n = max(4, min(8, int(variant_count or 4)))
+    n = clamp_studio_variant_count(variant_count)
     put = 4 + n
     aic = 10 + (n * 2)
     persona_base_aic = 5 if has_persona else 0
@@ -459,6 +481,39 @@ def detect_safety_flags(text: str) -> List[str]:
     for h in celeb_hits:
         flags.append(f"celebrity_reference:{str(h).lower()}")
     return flags
+
+
+def cap_pikzels_studio_render_prompt(prompt: str, max_len: Optional[int] = None) -> str:
+    """
+    Keep studio recreate prompts within Pikzels' 1000-char API limit (abbreviated when possible).
+
+    Prefer preserving the headline hook and YouTube-reference guardrails; trim tail
+    (creative/hydration lanes) when necessary.
+    """
+    try:
+        cap = int(max_len) if max_len is not None else int(
+            os.environ.get("PIKZELS_THUMBNAIL_PROMPT_MAX", "950") or 950
+        )
+    except (TypeError, ValueError):
+        cap = 950
+    cap = max(400, min(1000, cap))
+    p = re.sub(r"\s+", " ", (prompt or "").strip())
+    if len(p) <= cap:
+        return p
+    if " Hydration focus:" in p:
+        p = p.split(" Hydration focus:")[0].strip()
+    if len(p) <= cap:
+        return p
+    if " Creative direction:" in p and len(p) > cap:
+        head, _, tail = p.partition(" Creative direction:")
+        if len(head) + 80 < cap:
+            tail_budget = max(40, cap - len(head) - len(" Creative direction:"))
+            p = f"{head} Creative direction:{tail[:tail_budget].rsplit(' ', 1)[0]}".strip()
+    if len(p) <= cap:
+        return p
+    from stages.pikzels_api import fit_pikzels_prompt_to_budget
+
+    return fit_pikzels_prompt_to_budget(p, cap)
 
 
 def closeness_to_pikzels_image_weight(closeness: int) -> str:
@@ -561,6 +616,66 @@ _LAYOUT_FRAME_POOL: Tuple[Tuple[str, str], ...] = (
     ("Meme stack", "stacked reaction layers, meme-native contrast, punchy hook zone"),
 )
 
+# Stable wireframe ids for Thumbnail Studio layout preview UI (maps 1:1 with _LAYOUT_FRAME_POOL order).
+_LAYOUT_PREVIEW_IDS: Tuple[str, ...] = (
+    "split_reveal",
+    "arrow_insight",
+    "single_hero",
+    "dual_tension",
+    "macro_proof",
+    "wide_story",
+    "speed_streak",
+    "clean_studio",
+    "neon_punch",
+    "document_stack",
+    "map_corridor",
+    "timer_urgency",
+    "podcast_depth",
+    "product_hero",
+    "outdoor_scale",
+    "meme_stack",
+)
+
+_CURATED_LAYOUT_PREVIEW: Dict[str, str] = {
+    "gaming_shock_face": "shock_face",
+    "reaction_meme": "meme_stack",
+    "finance_split": "split_reveal",
+    "education_arrow": "arrow_insight",
+    "automotive_speed": "speed_streak",
+    "lifestyle_glow": "single_hero",
+    "podcast_guest": "podcast_depth",
+    "music_release": "neon_punch",
+    "sports_showdown": "dual_tension",
+    "tech_product": "product_hero",
+    "beauty_transformation": "split_reveal",
+    "food_crave": "macro_proof",
+    "travel_wonder": "outdoor_scale",
+    "fitness_result": "timer_urgency",
+    "true_crime_case": "document_stack",
+    "real_estate_listing": "wide_story",
+}
+
+
+def layout_preview_id(format_key: str) -> str:
+    """Wireframe slug for guided-recreate layout chips (frontend SVG previews)."""
+    k = (format_key or "").strip()
+    if not k:
+        return "mixed_variants"
+    if k in _CURATED_LAYOUT_PREVIEW:
+        return _CURATED_LAYOUT_PREVIEW[k]
+    parsed = parse_dynamic_layout_key(k)
+    if parsed:
+        _, idx = parsed
+        return _LAYOUT_PREVIEW_IDS[idx % len(_LAYOUT_PREVIEW_IDS)]
+    return "single_hero"
+
+
+def attach_layout_preview_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    pid = layout_preview_id(str(row.get("key") or ""))
+    out["preview_id"] = pid
+    return out
+
 
 def dynamic_layout_row(format_key: str) -> Optional[Dict[str, Any]]:
     """Resolve a procedural ``dyn-…`` row; stable for a given key and niche."""
@@ -634,7 +749,7 @@ def format_library_rows(niche: Optional[str] = None) -> List[Dict[str, Any]]:
         row = dynamic_layout_row(f"dyn-{slug}-{i:04d}")
         if row:
             rows.append(row)
-    return rows
+    return [attach_layout_preview_fields(r) for r in rows]
 
 
 def build_variant_suggestions(variant: Dict[str, Any]) -> List[str]:
@@ -694,8 +809,20 @@ def normalize_hydration_context(raw: Optional[Dict[str, Any]]) -> Dict[str, str]
         "longitude": _clean("longitude", 40),
         "artist": _clean("artist", 120),
         "track": _clean("track", 160),
+        "speed_mph": _clean("speed_mph", 24),
+        "osd_driver": _clean("osd_driver", 80),
+        "osd_recording_start": _clean("osd_recording_start", 80),
+        "speech": _clean("speech", 320),
+        "trill_bucket": _clean("trill_bucket", 48),
+        "trill_score": _clean("trill_score", 24),
+        "vision_ocr": _clean("vision_ocr", 180),
+        "vision_labels": _clean("vision_labels", 220),
     }
-    return {k: v for k, v in out.items() if v}
+    out = {k: v for k, v in out.items() if v}
+    for key, value in raw.items():
+        if str(key).startswith("_") and value is not None:
+            out[str(key)] = str(value).strip()[:240]
+    return out
 
 
 def hydration_signal_lanes(ctx: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
@@ -745,6 +872,62 @@ def hydration_signal_lanes(ctx: Optional[Dict[str, Any]]) -> List[Dict[str, str]
                 "directive": "Let the recognized music influence mood, typography, and hook",
             }
         )
+    speed_bits = []
+    if clean.get("speed_mph"):
+        speed_bits.append(f"{clean['speed_mph']} mph peak")
+    if clean.get("osd_driver"):
+        speed_bits.append(f"driver/HUD {clean['osd_driver']}")
+    if clean.get("osd_recording_start"):
+        speed_bits.append(f"rec {clean['osd_recording_start']}")
+    speed_value = " · ".join(speed_bits)
+    if speed_value:
+        lanes.append(
+            {
+                "key": "speed",
+                "label": "Dashcam speed / OSD",
+                "value": speed_value[:220],
+                "directive": "Show speed, HUD, or dashcam telemetry as a believable visual cue",
+            }
+        )
+    trill_bits = []
+    if clean.get("trill_bucket"):
+        trill_bits.append(str(clean["trill_bucket"]))
+    if clean.get("trill_score"):
+        trill_bits.append(f"score {clean['trill_score']}")
+    trill_value = " · ".join(trill_bits)
+    if trill_value:
+        lanes.append(
+            {
+                "key": "trill",
+                "label": "Trill intensity",
+                "value": trill_value[:220],
+                "directive": "Match the energy level implied by the Trill score bucket",
+            }
+        )
+    if clean.get("speech"):
+        lanes.append(
+            {
+                "key": "speech",
+                "label": "Speech / transcript",
+                "value": clean["speech"][:220],
+                "directive": "Reflect this spoken line or transcript beat in expression or scene",
+            }
+        )
+    vision_bits = []
+    if clean.get("vision_ocr"):
+        vision_bits.append(clean["vision_ocr"][:120])
+    if clean.get("vision_labels"):
+        vision_bits.append(clean["vision_labels"][:120])
+    vision_value = " · ".join(vision_bits)
+    if vision_value:
+        lanes.append(
+            {
+                "key": "vision",
+                "label": "Vision OCR / labels",
+                "value": vision_value[:220],
+                "directive": "Use on-frame text or vision labels as concrete scene anchors",
+            }
+        )
     if clean:
         all_bits = []
         if clean.get("story"):
@@ -753,8 +936,16 @@ def hydration_signal_lanes(ctx: Optional[Dict[str, Any]]) -> List[Dict[str, str]
             all_bits.append(clean["caption"])
         if geo_value:
             all_bits.append(geo_value)
+        if speed_value:
+            all_bits.append(speed_value)
         if music_value:
             all_bits.append(music_value)
+        if trill_value:
+            all_bits.append(trill_value)
+        if clean.get("speech"):
+            all_bits.append(clean["speech"])
+        if vision_value:
+            all_bits.append(vision_value)
         lanes.append(
             {
                 "key": "combined",
@@ -779,7 +970,7 @@ def generate_recreate_variants(
     format_key: Optional[str] = None,
     hydration_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    n = max(4, min(8, int(variant_count or 4)))
+    n = clamp_studio_variant_count(variant_count)
     try:
         _close = int(closeness)
     except (TypeError, ValueError):
@@ -789,14 +980,18 @@ def generate_recreate_variants(
     niche_clean = (niche or "general").strip().lower()
     audience = audience_label(niche_clean)
     voice = (persona_name or "default").strip()
-    fmt = format_row_by_key(format_key)
-    layout_name = str(fmt.get("name") or "") if fmt else ""
-    layout_pattern = str(fmt.get("pattern") or "") if fmt else ""
-    fmt_key = str(fmt.get("key") or "") if fmt else ""
+    fmt_selected = format_row_by_key(format_key) if (format_key or "").strip() else None
     hydration_lanes = hydration_signal_lanes(hydration_context)
 
     rows: List[Dict[str, Any]] = []
     for i in range(n):
+        if fmt_selected:
+            fmt = fmt_selected
+        else:
+            fmt = dynamic_layout_row(f"dyn-{niche_clean}-{i:04d}")
+        layout_name = str(fmt.get("name") or "") if fmt else ""
+        layout_pattern = str(fmt.get("pattern") or "") if fmt else ""
+        fmt_key = str(fmt.get("key") or "") if fmt else ""
         seed = f"{base}|{niche_clean}|{closeness}|{i}|{voice}|{channel_memory_hint}|{fmt_key}|{layout_pattern}"
         profile = pattern_profile(seed)
         # Consumer-facing subhead (avoid "safe clone" jargon in UI).
@@ -839,8 +1034,7 @@ def generate_recreate_variants(
         if hydration:
             hydration_summary = f"{hydration['label']}: {hydration['value']}"
             hydration_prompt = (
-                f" Hydration focus: {hydration['directive']} using this evidence: "
-                f"{hydration['value'][:240]}."
+                f" Hydr: {hydration.get('key', 'ev')} — {hydration['value'][:200]}."
             )
         variant = {
             "index": i + 1,
@@ -854,14 +1048,16 @@ def generate_recreate_variants(
             "persona": voice or None,
             "format_key": fmt_key or None,
             "layout_pattern": layout_pattern or None,
-            "render_prompt": (
-                f"Recreate the provided reference thumbnail for a {audience} audience{thumb_layout_suffix} "
-                f"New thumbnail text hook: {headline}. {reference_prompt}{persona_prompt} "
-                f"Use {profile['emotion_bias']} emotion, "
-                f"{profile['text_position']} text placement, {profile['contrast_profile']} contrast, "
-                f"and approximately {profile['face_scale']:.2f} face scale. "
-                f"Creative direction: {creative_directive}"
-                f"{hydration_prompt}"
+            "render_prompt": cap_pikzels_studio_render_prompt(
+                (
+                    f"Recreate the provided reference thumbnail for a {audience} audience{thumb_layout_suffix} "
+                    f"New thumbnail text hook: {headline}. {reference_prompt}{persona_prompt} "
+                    f"Use {profile['emotion_bias']} emotion, "
+                    f"{profile['text_position']} text placement, {profile['contrast_profile']} contrast, "
+                    f"and approximately {profile['face_scale']:.2f} face scale. "
+                    f"Creative direction: {creative_directive}"
+                    f"{hydration_prompt}"
+                )
             ),
             "hydration_focus": hydration["label"] if hydration else "",
             "hydration_signal": hydration["value"] if hydration else "",
@@ -1536,6 +1732,49 @@ async def _pikzels_score_from_url(image_url: str, title: str) -> Optional[float]
     return None
 
 
+def build_studio_pikzels_prompt(
+    variant: Dict[str, Any],
+    *,
+    hydration_context: Optional[Dict[str, Any]] = None,
+    engine_text_brief: str = "",
+    niche: str = "general",
+) -> str:
+    """
+    Studio recreate: merge layout/render notes with canonical hydration evidence
+    (geo, speed/OSD, music, speech, vision, Trill) via ``_build_pikzels_v2_prompt``.
+    """
+    from services.hydration_from_upload_row import flat_context_to_hydration_payload
+    from services.hydration_payload import hydration_brief_strings_compact
+    from stages.pikzels_api import _build_pikzels_v2_prompt, clamp_pikzels_image_prompt
+
+    layout_notes = cap_pikzels_studio_render_prompt(str(variant.get("render_prompt") or ""))
+    hp = flat_context_to_hydration_payload(hydration_context)
+    ev = hp.get("evidence") if isinstance(hp, dict) and isinstance(hp.get("evidence"), dict) else {}
+    has_evidence = any(isinstance(v, dict) and v for v in ev.values())
+    if not has_evidence:
+        return clamp_pikzels_image_prompt(layout_notes)
+
+    brief_dict: Dict[str, Any] = {
+        "selected_headline": str(variant.get("headline") or "").strip(),
+        "pikzels_text_brief": (engine_text_brief or "").strip(),
+        "notes": layout_notes[:420] if layout_notes else "",
+    }
+    for key, value in hydration_brief_strings_compact(hp).items():
+        brief_dict.setdefault(key, value)
+    brief_dict.setdefault("fusion_summary", str(hp.get("fusion_summary") or ""))
+    brief_dict.setdefault("hydration_story", str(hp.get("hydration_story") or ""))
+
+    prompt = _build_pikzels_v2_prompt(
+        brief_dict,
+        category=(niche or "general").strip().lower() or "general",
+        platform="youtube",
+        hydration_payload=hp,
+    )
+    if layout_notes and "Layout:" not in prompt:
+        prompt = f"{prompt} Layout: {layout_notes[:200]}".strip()
+    return clamp_pikzels_image_prompt(cap_pikzels_studio_render_prompt(prompt))
+
+
 async def enrich_variants_with_uploadm8_engine(
     variants: List[Dict[str, Any]],
     *,
@@ -1550,6 +1789,7 @@ async def enrich_variants_with_uploadm8_engine(
     closeness: int = 55,
     persona_face_ref: str = "",
     reference_image_data_url: str = "",
+    hydration_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     When PIKZELS_API_KEY (or THUMB_RENDER_API_KEY) is set, run Pikzels v2 text + image + score
@@ -1612,7 +1852,14 @@ async def enrich_variants_with_uploadm8_engine(
                     f"{pv.get('subhead') or ''} · {(brief_visible or brief)[:120]}".strip(" ·")
                 )
                 pv["subhead"] = strip_pikzels_urls_from_text(merged)
-            prompt = str(pv.get("render_prompt") or "")[:980]
+            prompt = build_studio_pikzels_prompt(
+                pv,
+                hydration_context=hydration_context,
+                engine_text_brief=str(brief or ""),
+                niche=niche or "general",
+            )
+            pv["pikzels_prompt_len"] = len(prompt)
+            pv["pikzels_prompt_has_hydration"] = bool(hydration_context)
             payload: Dict[str, Any] = {
                 "prompt": prompt,
                 "image_weight": image_weight,

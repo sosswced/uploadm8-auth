@@ -15,6 +15,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.helpers import sanitize_hashtag_body
+from core.vision_labels import filter_vision_labels_for_context
 from stages.context import build_fusion_summary_text, build_hydration_story_text
 
 logger = logging.getLogger("uploadm8-worker.hydration_payload")
@@ -131,17 +132,19 @@ def build_hydration_payload(
     first_seen = ""
     if isinstance(fs, dict) and (fs.get("date") or fs.get("time")):
         first_seen = f"{str(fs.get('date') or '').strip()} {str(fs.get('time') or '').strip()}".strip()
-    max_osd: Optional[float] = None
-    if isinstance(osd_ctx, dict) and osd_ctx.get("max_speed_mph") is not None:
-        try:
-            max_osd = float(osd_ctx.get("max_speed_mph"))
-        except (TypeError, ValueError):
-            max_osd = None
+    # Speed on this node must mirror ``collect_evidence`` (telemetry > OSD > Vision OCR).
+    # Do not re-merge raw ``dashcam_osd_context.max_speed_mph`` here — it can be 0 while the
+    # pool already resolved a Vision-OCR peak, which previously made ``evidence.osd`` disagree
+    # with ``hydration_report`` / story text.
+    canon_mph = float(pool.max_speed_mph or 0)
+    canon_avg = float(pool.avg_speed_mph or 0)
     osd: Dict[str, Any] = {
-        "max_speed_mph": max_osd,
+        "max_speed_mph": canon_mph if canon_mph > 0 else None,
+        "speed_source": (pool.speed_source or None) if canon_mph > 0 else None,
         "driver_name": pool.driver_name or (osd_ctx.get("driver_name") if isinstance(osd_ctx, dict) else None),
         "first_seen": first_seen or None,
-        "avg_speed_mph": osd_ctx.get("avg_speed_mph") if isinstance(osd_ctx, dict) else None,
+        "avg_speed_mph": (canon_avg if canon_avg > 0 else None)
+        or (osd_ctx.get("avg_speed_mph") if isinstance(osd_ctx, dict) else None),
     }
 
     ac = ctx.audio_context or {}
@@ -158,7 +161,12 @@ def build_hydration_payload(
     speech = {"phrase": speech_phrase}
 
     vc = ctx.vision_context or {}
-    labels = list(vc.get("label_names") or [])[:40]
+    raw_labels = list(vc.get("label_names") or [])[:40]
+    labels = filter_vision_labels_for_context(
+        raw_labels,
+        category=str(category or "general"),
+        filename=str(getattr(ctx, "filename", "") or ""),
+    )
     landmarks = [str(x) for x in (vc.get("landmark_names") or [])[:12]]
     vision: Dict[str, Any] = {
         "labels": labels,
@@ -301,6 +309,102 @@ def hydration_brief_strings(hp: Dict[str, Any]) -> Dict[str, str]:
         clean = [sanitize_hashtag_body(str(x)) for x in sigs if sanitize_hashtag_body(str(x))]
         if clean:
             out["signal_hashtags"] = ", ".join(clean[:14])
+
+    return out
+
+
+def hydration_brief_strings_compact(hp: Dict[str, Any]) -> Dict[str, str]:
+    """Abbreviated brief fragments for Pikzels image prompts (fits ≤1200 chars total)."""
+    out: Dict[str, str] = {}
+    if str(hp.get("hydration_story") or "").strip():
+        out["hydration_story"] = str(hp["hydration_story"])[:220]
+    if str(hp.get("fusion_summary") or "").strip():
+        out["fusion_summary"] = str(hp["fusion_summary"])[:280]
+
+    ev = hp.get("evidence") if isinstance(hp.get("evidence"), dict) else {}
+    geo = ev.get("geo") if isinstance(ev.get("geo"), dict) else {}
+    geo_bits: List[str] = []
+    disp = str(geo.get("display") or "").strip()
+    if disp:
+        geo_bits.append(disp[:100])
+    rd = str(geo.get("road") or "").strip()
+    if rd:
+        geo_bits.append(f"rd {rd[:80]}")
+    city = str(geo.get("city") or "").strip()
+    st = str(geo.get("state") or "").strip()
+    if city and st:
+        geo_bits.append(f"{city}, {st}")
+    elif city:
+        geo_bits.append(city)
+    lat, lon = geo.get("lat"), geo.get("lon")
+    if lat is not None and lon is not None:
+        try:
+            geo_bits.append(f"gps {float(lat):.4f},{float(lon):.4f}")
+        except (TypeError, ValueError):
+            pass
+    if geo_bits:
+        out["geo_context"] = "; ".join(geo_bits)[:200]
+
+    osd = ev.get("osd") if isinstance(ev.get("osd"), dict) else {}
+    osd_bits: List[str] = []
+    msm = osd.get("max_speed_mph")
+    if msm is not None:
+        try:
+            osd_bits.append(f"spd {float(msm):.0f}mph")
+        except (TypeError, ValueError):
+            osd_bits.append(f"spd {msm}mph")
+    dn = str(osd.get("driver_name") or "").strip()
+    if dn:
+        osd_bits.append(f"drv {dn[:40]}")
+    fss = str(osd.get("first_seen") or "").strip()
+    if fss:
+        osd_bits.append(f"rec {fss[:32]}")
+    if osd_bits:
+        out["osd_context"] = "; ".join(osd_bits)[:160]
+
+    tri = ev.get("trill") if isinstance(ev.get("trill"), dict) else {}
+    tb = str(tri.get("bucket") or "").strip()
+    tsc = tri.get("score")
+    if tb or tsc is not None:
+        if tsc is not None:
+            try:
+                tsf = float(tsc)
+                out["trill_context"] = (
+                    f"bkt {tb} sc {tsf:.0f}" if tb else f"sc {tsf:.0f}"
+                )[:80]
+            except (TypeError, ValueError):
+                if tb:
+                    out["trill_context"] = tb[:60]
+        elif tb:
+            out["trill_context"] = tb[:60]
+
+    mus = ev.get("music") if isinstance(ev.get("music"), dict) else {}
+    ma = str(mus.get("artist") or "").strip()
+    mt = str(mus.get("title") or "").strip()
+    if ma or mt:
+        out["music_context"] = " — ".join(p for p in (ma, mt) if p)[:140]
+
+    sp = ev.get("speech") if isinstance(ev.get("speech"), dict) else {}
+    ph = str(sp.get("phrase") or "").strip()
+    if ph:
+        out["speech_context"] = ph[:200]
+
+    vis = ev.get("vision") if isinstance(ev.get("vision"), dict) else {}
+    vlabels = vis.get("labels") if isinstance(vis.get("labels"), list) else []
+    voc = str(vis.get("ocr") or "").strip()
+    vis_bits: List[str] = []
+    if vlabels:
+        vis_bits.append(", ".join(str(x) for x in vlabels[:6])[:100])
+    if voc:
+        vis_bits.append(f"ocr {voc[:80]}")
+    if vis_bits:
+        out["vision_context"] = "; ".join(vis_bits)[:160]
+
+    sigs = hp.get("signal_hashtags")
+    if isinstance(sigs, list) and sigs:
+        clean = [sanitize_hashtag_body(str(x)) for x in sigs if sanitize_hashtag_body(str(x))]
+        if clean:
+            out["signal_hashtags"] = ", ".join(clean[:8])[:100]
 
     return out
 

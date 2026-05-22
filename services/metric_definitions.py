@@ -130,10 +130,11 @@ def engagement_crosswalk() -> Dict[str, Any]:
         },
         "admin_global_upload_sum": {
             "api": "GET /api/admin/kpis",
-            "fields": "total_views, total_likes (windowed)",
-            "computation": "SUM(uploads.views), SUM(uploads.likes) across all users",
-            "time_basis": "uploads.created_at in selected admin range (same raw columns as row totals).",
-            "vs_canonical": "No per-user pci/pr dedupe; not catalog breadth.",
+            "fields": "total_views, total_likes, total_comments, total_shares (windowed)",
+            "computation": "services.canonical_engagement.compute_admin_engagement_totals (sum of per-tenant canonical rollups)",
+            "time_basis": "Half-open UTC window on uploads.created_at / pci.published_at per tenant rollup.",
+            "raw_crosswalk": "total_views_raw / total_likes_raw = legacy SUM(uploads.views/likes) for comparison.",
+            "vs_canonical": "Global sum of per-user deduped totals; not identical to any single user's Analytics screen.",
         },
     }
 
@@ -215,9 +216,9 @@ def admin_kpi_data_provenance(*, rollup_version: int) -> Dict[str, Any]:
         "canonical_engagement_rollup_version": rollup_version,
         "total_views_total_likes": {
             "store": "postgres",
-            "relation": "uploads",
-            "aggregation": "SUM(views), SUM(likes) over rows with created_at in selected UTC window",
-            "not": "Global admin totals are not compute_canonical_engagement_rollup (that is per user_id).",
+            "relation": "uploads + platform_content_items",
+            "aggregation": "compute_admin_engagement_totals — sum of per-user canonical rollups in UTC window",
+            "raw_crosswalk": "total_views_raw / total_likes_raw = SUM(uploads.views/likes) in same window",
             "compare_with": (
                 "GET /api/analytics per tenant — deduped pci + platform_results; see kpi_sources and root engagement_crosswalk. "
                 "GET /api/catalog/aggregate — catalog SQL totals (see that response kpi_sources and metric_definitions)."

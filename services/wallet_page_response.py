@@ -84,6 +84,7 @@ async def load_wallet_page_data(
             "topup_put": "/settings.html?topup=uploadm8_put_500#billing",
             "topup_aic": "/settings.html?topup=uploadm8_aic_1000#billing",
             "upgrade": "/settings.html#billing",
+            "token_balances": "/settings.html#token-balances",
         },
         "period_start": None,
         "put_spent_period": 0,
@@ -204,6 +205,7 @@ def build_wallet_api_json(
     _links.setdefault("topup_put", "/settings.html?topup=uploadm8_put_500#billing")
     _links.setdefault("topup_aic", "/settings.html?topup=uploadm8_aic_1000#billing")
     _links.setdefault("upgrade", "/settings.html#billing")
+    _links.setdefault("token_balances", "/settings.html#token-balances")
 
     return {
         "wallet": wallet,

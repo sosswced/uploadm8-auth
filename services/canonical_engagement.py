@@ -650,3 +650,101 @@ def merge_upload_and_catalog_engagement(
     if engagement_window_utc is not None:
         out["engagement_window_utc"] = engagement_window_utc
     return out
+
+
+async def compute_admin_engagement_totals(
+    conn: "asyncpg.Connection",
+    *,
+    window_start: Optional[datetime],
+    window_end_exclusive: Optional[datetime],
+) -> Dict[str, Any]:
+    """
+    Global admin engagement: sum per-tenant canonical rollups over distinct users
+    active in the upload window. Also returns raw upload-column sums for crosswalk.
+    """
+    t0 = time.perf_counter()
+    ws = window_start
+    we = window_end_exclusive
+    raw_params: List[Any] = []
+    raw_where = ["status IN ('completed', 'succeeded', 'partial')"]
+    if ws is not None:
+        raw_where.append(f"created_at >= ${len(raw_params) + 1}")
+        raw_params.append(ws)
+    if we is not None:
+        raw_where.append(f"created_at < ${len(raw_params) + 1}")
+        raw_params.append(we)
+    raw_sql = f"""
+        SELECT
+            COALESCE(SUM(views), 0)::bigint AS views,
+            COALESCE(SUM(likes), 0)::bigint AS likes,
+            COALESCE(SUM(comments), 0)::bigint AS comments,
+            COALESCE(SUM(shares), 0)::bigint AS shares
+        FROM uploads
+        WHERE {" AND ".join(raw_where)}
+    """
+    try:
+        raw_row = await conn.fetchrow(raw_sql, *raw_params)
+    except Exception as e:
+        logger.warning("admin engagement raw sum failed: %s", e)
+        raw_row = None
+
+    uid_where = ["1=1"]
+    uid_params: List[Any] = []
+    if ws is not None:
+        uid_where.append(f"created_at >= ${len(uid_params) + 1}")
+        uid_params.append(ws)
+    if we is not None:
+        uid_where.append(f"created_at < ${len(uid_params) + 1}")
+        uid_params.append(we)
+    uid_rows = await conn.fetch(
+        f"SELECT DISTINCT user_id::text AS user_id FROM uploads WHERE {' AND '.join(uid_where)}",
+        *uid_params,
+    )
+
+    total = _zero_vec()
+    tenants = 0
+    for ur in uid_rows or []:
+        uid = str(ur["user_id"] or "").strip()
+        if not uid:
+            continue
+        try:
+            cr = await compute_canonical_engagement_rollup(
+                conn,
+                uid,
+                window_start=ws,
+                window_end_exclusive=we,
+                platform=None,
+            )
+            total = _vec_add(total, {k: int(cr.get(k) or 0) for k in _ENG_KEYS})
+            tenants += 1
+        except Exception as e:
+            logger.debug("admin engagement skip user %s: %s", uid[:8], e)
+
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+    if latency_ms >= SLOW_ROLLUP_WARN_MS:
+        logger.warning(
+            "admin engagement rollup slow: tenants=%s latency_ms=%.1f",
+            tenants,
+            latency_ms,
+        )
+
+    return {
+        "views": _clamp_nonneg(total["views"]),
+        "likes": _clamp_nonneg(total["likes"]),
+        "comments": _clamp_nonneg(total["comments"]),
+        "shares": _clamp_nonneg(total["shares"]),
+        "rollup_version": ROLLUP_VERSION,
+        "rollup_rule": "sum_per_tenant_canonical_engagement_rollup",
+        "tenants_in_window": tenants,
+        "raw_upload_sum_views": int(raw_row["views"] or 0) if raw_row else 0,
+        "raw_upload_sum_likes": int(raw_row["likes"] or 0) if raw_row else 0,
+        "raw_upload_sum_comments": int(raw_row["comments"] or 0) if raw_row else 0,
+        "raw_upload_sum_shares": int(raw_row["shares"] or 0) if raw_row else 0,
+        "kpi_sources": {
+            "rollup_version": ROLLUP_VERSION,
+            "headline_engagement": "sum_of_per_user_compute_canonical_engagement_rollup",
+            "raw_upload_sums": "uploads.views/likes/comments/shares SUM for crosswalk only",
+            "tenant_scope": "all_users_distinct_in_window",
+            "latency_ms": round(latency_ms, 2),
+        },
+    }

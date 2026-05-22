@@ -33,16 +33,16 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 load_dotenv(_REPO_ROOT / ".env")
 
-from services.ml_observability import hf_env_status
+from services.ml_observability import hf_env_status, hf_write_token
 
 
 def _require_hf_token() -> str:
     ok, reason = hf_env_status(require_write_token=True)
     if not ok:
         raise SystemExit(f"HF env check failed: {reason}")
-    token = (os.environ.get("HF_TOKEN") or "").strip()
+    token = hf_write_token()
     if not token:
-        raise SystemExit("HF_TOKEN is required")
+        raise SystemExit("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required")
     return token
 
 

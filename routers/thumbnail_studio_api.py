@@ -59,6 +59,10 @@ from services.thumbnail_studio import (
     extract_youtube_video_id,
     fetch_youtube_title,
     generate_recreate_variants,
+    clamp_studio_variant_count,
+    STUDIO_VARIANT_COUNT_DEFAULT,
+    STUDIO_VARIANT_COUNT_MAX,
+    STUDIO_VARIANT_COUNT_MIN,
     normalize_hydration_context,
     normalize_persona_face_ref_for_pikzels,
     register_creator_persona_with_pikzels,
@@ -78,6 +82,68 @@ from services.wallet_marketing import _user_campaign_features
 logger = logging.getLogger("uploadm8-api")
 
 router = APIRouter(tags=["thumbnail-studio"])
+
+
+class YoutubeReferenceItem(BaseModel):
+    id: Optional[str] = None
+    label: str = ""
+    youtube_url: str = ""
+    youtube_video_id: Optional[str] = None
+    is_default: bool = False
+
+
+class YoutubeReferencesBody(BaseModel):
+    references: List[YoutubeReferenceItem] = Field(default_factory=list)
+
+
+@router.get("/api/thumbnail-studio/youtube-references")
+async def get_thumbnail_studio_youtube_references(
+    user: dict = Depends(get_current_user_readonly),
+):
+    """Saved YouTube style references + default URL for Studio and upload pipeline."""
+    from services.thumbnail_youtube_refs import list_youtube_references
+
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
+    prefs = _json_obj(row["preferences"] if row else None)
+    refs = list_youtube_references(prefs)
+    default = next((r for r in refs if r.get("is_default")), refs[0] if refs else None)
+    return {
+        "references": refs,
+        "default": default,
+        "default_youtube_url": (default or {}).get("youtube_url") or "",
+    }
+
+
+@router.put("/api/thumbnail-studio/youtube-references")
+async def put_thumbnail_studio_youtube_references(
+    body: YoutubeReferencesBody,
+    user: dict = Depends(get_current_user),
+):
+    from services.thumbnail_youtube_refs import merge_references_into_prefs
+
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
+        prefs = _json_obj(row["preferences"] if row else None)
+        refs_in = [r.model_dump() for r in body.references]
+        merged = merge_references_into_prefs(prefs, refs_in)
+        await conn.execute(
+            """
+            UPDATE users SET preferences = $1::jsonb, updated_at = NOW()
+            WHERE id = $2
+            """,
+            json.dumps(merged),
+            user["id"],
+        )
+    from services.thumbnail_youtube_refs import list_youtube_references
+
+    refs = list_youtube_references(merged)
+    default = next((r for r in refs if r.get("is_default")), refs[0] if refs else None)
+    return {
+        "references": refs,
+        "default": default,
+        "default_youtube_url": (default or {}).get("youtube_url") or "",
+    }
 
 
 async def _resolve_linked_studio_persona_db(
@@ -176,11 +242,12 @@ def _studio_job_public(row: Any) -> Dict[str, Any]:
         "topic": str(d.get("topic") or ""),
         "niche": str(d.get("niche") or "general"),
         "closeness": int(d.get("closeness") or 55),
-        "variant_count": int(d.get("variant_count") or 6),
+        "variant_count": clamp_studio_variant_count(d.get("variant_count")),
         "competitor_gap_mode": bool(d.get("competitor_gap_mode")),
         "put_cost": int(d.get("put_cost") or 0),
         "aic_cost": int(d.get("aic_cost") or 0),
         "persona_id": str(pid) if pid else None,
+        "format_key": str(breakdown.get("format_key") or ""),
         "hydration_context": hydration_context,
         "created_at": ca.isoformat() if hasattr(ca, "isoformat") else str(ca or ""),
     }
@@ -217,6 +284,10 @@ def _thumbnail_strategy_from_variant(
     """Persist a selected Studio variation as upload-time prompt strategy, not fixed copy."""
     job = dict(job_row)
     v = dict(variant_json or {})
+    from services.thumbnail_niches import normalize_niche
+
+    job_yt_url = str(job.get("youtube_url") or "")[:500]
+    job_yt_vid = str(job.get("youtube_video_id") or "")[:32]
     strategy = {
         "version": 1,
         "source": "thumbnail_studio_selected_variant",
@@ -225,7 +296,12 @@ def _thumbnail_strategy_from_variant(
         "format_key": str(v.get("format_key") or "")[:80],
         "layout_name": str(v.get("name") or "")[:120],
         "layout_pattern": str(v.get("layout_pattern") or "")[:240],
-        "audience_niche": str(job.get("niche") or "")[:120],
+        "audience_niche": normalize_niche(str(job.get("niche") or ""))[:120],
+        "reference_youtube_url": job_yt_url,
+        "youtube_url": job_yt_url,
+        "reference_youtube_video_id": job_yt_vid,
+        "youtube_video_id": job_yt_vid,
+        "reference_topic": str(job.get("topic") or "")[:200],
         "reference_strength": int(job.get("closeness") or 55),
         "competitor_gap_mode": bool(job.get("competitor_gap_mode")),
         "persona_id": str(job.get("persona_id") or "")[:80],
@@ -403,7 +479,11 @@ async def thumbnail_studio_cdn_preview(
 
 
 class StudioEstimateBody(BaseModel):
-    variant_count: int = 6
+    variant_count: int = Field(
+        default=STUDIO_VARIANT_COUNT_DEFAULT,
+        ge=STUDIO_VARIANT_COUNT_MIN,
+        le=STUDIO_VARIANT_COUNT_MAX,
+    )
     has_persona: bool = False
     persona_id: Optional[str] = Field(
         default=None,
@@ -418,7 +498,11 @@ class StudioRecreateBody(BaseModel):
     topic: str = ""
     niche: str = "general"
     closeness: int = Field(default=55, ge=0, le=100)
-    variant_count: int = Field(default=6, ge=4, le=8)
+    variant_count: int = Field(
+        default=STUDIO_VARIANT_COUNT_DEFAULT,
+        ge=STUDIO_VARIANT_COUNT_MIN,
+        le=STUDIO_VARIANT_COUNT_MAX,
+    )
     persona_id: Optional[str] = None
     format_key: Optional[str] = None
     competitor_gap_mode: bool = False
@@ -1043,6 +1127,8 @@ async def ts_link_persona_pikzels(persona_id: str, user: dict = Depends(get_curr
 
 @router.post("/api/thumbnail-studio/recreate")
 async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current_user)):
+    from services.thumbnail_niches import normalize_niche
+
     title = await fetch_youtube_title(body.youtube_url)
     vid = extract_youtube_video_id(body.youtube_url)
     if not vid:
@@ -1113,6 +1199,8 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
     )
     if hydration_context:
         breakdown["hydration_context"] = hydration_context
+    if (body.format_key or "").strip():
+        breakdown["format_key"] = str(body.format_key).strip()[:80]
 
     job_id = uuid.uuid4()
     variants_out: List[Dict[str, Any]] = []
@@ -1152,7 +1240,7 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
                 vid or None,
                 (title or "")[:512],
                 (body.topic or "")[:512],
-                (body.niche or "general")[:120],
+                normalize_niche(body.niche or "general")[:120],
                 int(body.closeness),
                 int(body.variant_count),
                 persona_uuid,
@@ -1165,7 +1253,7 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
     raw_variants = generate_recreate_variants(
         youtube_title=title or body.topic or "Video",
         topic=body.topic or "",
-        niche=body.niche or "general",
+        niche=normalize_niche(body.niche or "general"),
         closeness=body.closeness,
         variant_count=body.variant_count,
         persona_name=persona_name,
@@ -1179,7 +1267,7 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
         raw_variants,
         youtube_video_id=vid or "",
         source_title=title or body.topic or "",
-        niche=body.niche or "general",
+        niche=normalize_niche(body.niche or "general"),
         topic=body.topic or "",
         persona_name=persona_name,
         user_id=str(user["id"]),
@@ -1188,6 +1276,7 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
         closeness=int(body.closeness),
         persona_face_ref=persona_face_ref,
         reference_image_data_url=reference_image_data_url,
+        hydration_context=hydration_context,
     )
 
     async with core.state.db_pool.acquire() as conn:
@@ -1489,6 +1578,31 @@ async def ts_feedback(body: StudioFeedbackBody, user: dict = Depends(get_current
                 if strategy.get("persona_id"):
                     prefs["thumbnailDefaultPersonaId"] = prefs["thumbnail_default_persona_id"] = strategy["persona_id"]
                     prefs["thumbnailPersonaEnabled"] = prefs["thumbnail_persona_enabled"] = True
+                yt_url = str(strategy.get("reference_youtube_url") or strategy.get("youtube_url") or "").strip()
+                if yt_url:
+                    from services.thumbnail_youtube_refs import (
+                        list_youtube_references,
+                        merge_references_into_prefs,
+                        normalize_reference_entry,
+                    )
+
+                    existing = list_youtube_references(prefs)
+                    vid = str(strategy.get("reference_youtube_video_id") or "").strip()
+                    new_ref = normalize_reference_entry(
+                        {
+                            "id": "studio-default",
+                            "label": "Studio default",
+                            "youtube_url": yt_url,
+                            "youtube_video_id": vid,
+                            "is_default": True,
+                        }
+                    )
+                    if new_ref:
+                        kept = [r for r in existing if r.get("id") != "studio-default"]
+                        for r in kept:
+                            r["is_default"] = False
+                        kept.insert(0, new_ref)
+                        prefs = merge_references_into_prefs(prefs, kept)
                 await conn.execute(
                     """
                     UPDATE users
@@ -2043,7 +2157,7 @@ async def ts_pikzels_from_upload_frame(
             upload_row,
             use_hydration=body.use_hydration,
             hydration_lane=body.hydration_lane,
-            max_len=1000,
+            max_len=950,
         )
         payload: Dict[str, Any] = {
             "prompt": hydrated,
@@ -2077,7 +2191,7 @@ async def ts_pikzels_from_upload_frame(
             upload_row,
             use_hydration=body.use_hydration,
             hydration_lane=body.hydration_lane,
-            max_len=1000,
+            max_len=950,
         )
         payload = {
             "prompt": hydrated,

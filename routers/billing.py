@@ -25,13 +25,14 @@ from core.helpers import _now_utc, _tier_is_upgrade
 from core.models import CheckoutRequest
 from core.notifications import notify_mrr, notify_topup
 import core.state
+from services.billing_service_weights import fetch_service_weights_map
 from core.wallet import credit_wallet, ledger_entry
 from routers.preferences import get_user_prefs_for_upload
 from stages.ai_service_costs import compute_presign_put_aic_costs
 from stages.entitlements import (
     STRIPE_LOOKUP_TO_TIER,
-    TIER_CONFIG,
-    TOPUP_PRODUCTS,
+    get_effective_tier_config,
+    get_effective_topup_products,
     get_entitlements_for_tier,
 )
 from stages.emails import (
@@ -40,6 +41,7 @@ from stages.emails import (
     send_plan_upgraded_email,
     send_plan_downgraded_email,
     send_topup_receipt_email,
+    send_bundle_topup_receipt_email,
     send_renewal_receipt_email,
     send_subscription_cancelled_email,
     send_trial_cancelled_email,
@@ -111,7 +113,7 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
         session = stripe.checkout.Session.create(**session_params)
 
     else:  # topup / one-time payment
-        product = TOPUP_PRODUCTS.get(data.lookup_key, {})
+        product = get_effective_topup_products().get(data.lookup_key, {})
         if not product:
             raise HTTPException(400, f"Unknown topup product: {data.lookup_key}")
 
@@ -123,6 +125,7 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
             cancel_url  = STRIPE_CANCEL_URL,
             metadata    = {
                 "user_id": str(user["id"]),
+                "lookup_key": data.lookup_key,
                 "wallet":  product.get("wallet", "put"),
                 "amount":  str(product.get("amount", 0)),
             },
@@ -202,14 +205,26 @@ async def get_billing_session(
     # ── Topup fields ─────────────────────────────────────────────────
     topup_wallet = None
     topup_amount = None
+    topup_label = None
     if mode == "payment":
-        meta         = sess.get("metadata") or {}
-        topup_wallet = meta.get("wallet")        # "put" | "aic"
-        topup_amount = meta.get("amount")        # token count as string
+        meta = sess.get("metadata") or {}
+        topup_wallet = meta.get("wallet")
+        topup_amount = meta.get("amount")
+        lk = str(meta.get("lookup_key") or "").strip().lower()
+        prod = get_effective_topup_products().get(lk) if lk else None
+        if prod and str(prod.get("wallet")) == "bundle":
+            topup_wallet = "bundle"
+            topup_label = f"{int(prod.get('put') or 0)} PUT + {int(prod.get('aic') or 0)} AIC"
+            topup_amount = None
+        elif prod and str(prod.get("wallet")) in ("put", "aic"):
+            topup_wallet = prod.get("wallet")
+            topup_amount = str(prod.get("amount", 0))
+        elif topup_amount is None and meta.get("amount") is not None:
+            topup_amount = meta.get("amount")
 
     # Resolve display name
     if tier:
-        cfg       = TIER_CONFIG.get(tier, {})
+        cfg = get_effective_tier_config().get(tier, {})
         plan_name = cfg.get("name", tier.replace("_", " ").title())
     elif not plan_name:
         plan_name = "Your Plan"
@@ -227,7 +242,8 @@ async def get_billing_session(
         "trial_end":           trial_end_ts,            # unix timestamp or None
         "current_period_end":  current_period_end_ts,   # unix timestamp or None
         "topup_wallet":        topup_wallet,
-        "topup_amount":        int(topup_amount) if topup_amount else None,
+        "topup_amount":        int(topup_amount) if topup_amount not in (None, "") else None,
+        "topup_label":         topup_label,
         "is_test_mode":        session_id.startswith("cs_test_"),
         "billing_mode":        BILLING_MODE,
     }
@@ -304,19 +320,19 @@ async def billing_upload_estimate(body: UploadCostEstimateRequest, user: dict = 
     ent = get_entitlements_for_tier(tier)
     async with core.state.db_pool.acquire() as conn:
         user_prefs = await get_user_prefs_for_upload(conn, user["id"])
-    use_hud = bool(body.use_hud) and ent.can_burn_hud
-    put, aic = compute_presign_put_aic_costs(
+        db_weights = await fetch_service_weights_map(conn)
+    put, aic, billing_breakdown = compute_presign_put_aic_costs(
         ent,
         num_publish_targets=body.num_publish_targets,
         file_size=body.file_size,
         duration_hint=body.duration_seconds,
         has_telemetry=body.has_telemetry,
         use_ai_checkbox=body.use_ai,
-        hud_enabled_effective=use_hud,
         user_prefs=user_prefs,
         num_thumbnails_override=body.num_thumbnails,
+        service_weights_map=db_weights,
     )
-    return {"put_cost": put, "aic_cost": aic}
+    return {"put_cost": put, "aic_cost": aic, "billing_breakdown": billing_breakdown}
 
 
 @router.get("/subscription/actions")
@@ -456,13 +472,27 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     )
 
             elif session.mode == "payment":
-                wallet_type   = session.metadata.get("wallet", "put")
-                amount_tokens = int(session.metadata.get("amount", 0))
-                if amount_tokens > 0:
-                    # First top-up bonus: +25% to incentivize trying paid credits
+                meta = session.metadata or {}
+                lookup_key = str(meta.get("lookup_key") or "").strip().lower()
+                prod = get_effective_topup_products().get(lookup_key) if lookup_key else None
+
+                async def _wallet_balances() -> tuple[int, int]:
+                    row = await conn.fetchrow(
+                        "SELECT put_balance, aic_balance FROM wallets WHERE user_id = $1", user_id
+                    )
+                    if not row:
+                        return (0, 0)
+                    return (int(row["put_balance"] or 0), int(row["aic_balance"] or 0))
+
+                if prod is None:
+                    # Legacy sessions: wallet + amount only (no lookup_key)
+                    wallet_type = meta.get("wallet", "put")
+                    amount_tokens = int(meta.get("amount", 0))
+                    if amount_tokens <= 0:
+                        return {"status": "no_topup_amount"}
                     prior = await conn.fetchval(
                         "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
-                        user_id
+                        user_id,
                     )
                     bonus = int(amount_tokens * 0.25) if not prior else 0
                     total = amount_tokens + bonus
@@ -471,7 +501,69 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     await conn.execute(
                         "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
                         "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT DO NOTHING",
-                        user_id, amount, session.id, f"{wallet_type}_{amount_tokens}"
+                        user_id, amount, session.id, f"{wallet_type}_{amount_tokens}",
+                    )
+                    background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
+                    background_tasks.add_task(
+                        send_topup_receipt_email,
+                        email, uname, wallet_type, total, amount, 0, session.id, bonus_tokens=bonus,
+                    )
+                elif prod.get("wallet") == "bundle":
+                    put_base = int(prod.get("put", 0))
+                    aic_base = int(prod.get("aic", 0))
+                    if put_base <= 0 and aic_base <= 0:
+                        return {"status": "invalid_bundle"}
+                    prior = await conn.fetchval(
+                        "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
+                        user_id,
+                    )
+                    bonus_put = int(put_base * 0.25) if (put_base > 0 and not prior) else 0
+                    bonus_aic = int(aic_base * 0.25) if (aic_base > 0 and not prior) else 0
+                    put_total = put_base + bonus_put
+                    aic_total = aic_base + bonus_aic
+                    if put_total > 0:
+                        await credit_wallet(conn, user_id, "put", put_total, "topup_purchase", session.id)
+                    if aic_total > 0:
+                        await credit_wallet(conn, user_id, "aic", aic_total, "topup_purchase", session.id)
+                    put_bal, aic_bal = await _wallet_balances()
+                    amount = (session.amount_total or 0) / 100
+                    await conn.execute(
+                        "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
+                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT DO NOTHING",
+                        user_id, amount, session.id, f"bundle_{lookup_key}",
+                    )
+                    tok_label = f"{put_total} PUT + {aic_total} AIC"
+                    background_tasks.add_task(notify_topup, amount, email, "bundle", tok_label)
+                    background_tasks.add_task(
+                        send_bundle_topup_receipt_email,
+                        email,
+                        uname,
+                        put_total,
+                        aic_total,
+                        amount,
+                        session.id,
+                        bonus_put=bonus_put,
+                        bonus_aic=bonus_aic,
+                        put_balance=put_bal,
+                        aic_balance=aic_bal,
+                    )
+                else:
+                    wallet_type = str(prod.get("wallet", "put"))
+                    amount_tokens = int(prod.get("amount", 0))
+                    if amount_tokens <= 0:
+                        return {"status": "no_topup_amount"}
+                    prior = await conn.fetchval(
+                        "SELECT 1 FROM token_ledger WHERE user_id = $1 AND reason = 'topup_purchase' LIMIT 1",
+                        user_id,
+                    )
+                    bonus = int(amount_tokens * 0.25) if not prior else 0
+                    total = amount_tokens + bonus
+                    await credit_wallet(conn, user_id, wallet_type, total, "topup_purchase", session.id)
+                    amount = (session.amount_total or 0) / 100
+                    await conn.execute(
+                        "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
+                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT DO NOTHING",
+                        user_id, amount, session.id, f"{wallet_type}_{amount_tokens}",
                     )
                     background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
                     background_tasks.add_task(

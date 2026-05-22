@@ -34,7 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 load_dotenv(_REPO_ROOT / ".env")
 
-from services.ml_observability import OptionalTrackioRun, hf_env_status
+from services.ml_observability import OptionalTrackioRun, hf_env_status, hf_write_token
 
 
 PROMO_SQL = """
@@ -189,9 +189,9 @@ def _maybe_push_hf(df: pd.DataFrame, repo_id: str, split: str, private: bool) ->
     ok, reason = hf_env_status(require_write_token=True)
     if not ok:
         raise SystemExit(f"HF env check failed: {reason}")
-    token = (os.environ.get("HF_TOKEN") or "").strip()
+    token = hf_write_token()
     if not token:
-        raise SystemExit("HF_TOKEN is required for push")
+        raise SystemExit("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required for push")
     ds = Dataset.from_pandas(df, preserve_index=False)
     ds.push_to_hub(repo_id, token=token, split=split, private=private)
     print(f"Pushed {len(ds)} rows to {repo_id} ({split})")

@@ -12,7 +12,7 @@ from typing import Optional
 
 import httpx
 import stripe
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, BackgroundTasks
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, BackgroundTasks
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
@@ -51,15 +51,17 @@ from core.models import (
     PreferencesUpdate,
     TransferRequest,
     CheckoutRequest,
+    WalletDisputeCreate,
 )
 from pydantic import BaseModel, Field
 from core.oauth import _revoke_platform_token
 from stages.emails import send_account_deleted_email, send_password_changed_email
-from stages.entitlements import TOPUP_PRODUCTS
+from stages.entitlements import get_effective_topup_products
 from services.me_profile import (
     apply_me_profile_update,
     apply_settings_profile_update,
     build_me_response,
+    fetch_me_endpoint_data,
 )
 from services.growth_intelligence import (
     build_user_coach_payload,
@@ -69,31 +71,43 @@ from services.growth_intelligence import (
 from services.content_insights import build_user_content_insights, merge_preferences_patch_for_apply
 from services.user_preferences_persist import save_user_content_preferences
 from services.wallet_page_response import fetch_me_wallet_endpoint_data
+from services.wallet_ledger_query import build_wallet_ledger_payload
+from services.wallet_disputes import create_wallet_dispute, list_user_wallet_disputes
+from services.white_label import (
+    get_white_label_settings_or_defaults,
+    upsert_white_label_settings,
+)
+from stages.entitlements import get_entitlements_from_user
 
 logger = logging.getLogger("uploadm8-api")
 
 router = APIRouter(tags=["me"])
 
 
+class WhiteLabelUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    company_name: Optional[str] = Field(None, max_length=255)
+    logo_url: Optional[str] = Field(None, max_length=512)
+    primary_color: Optional[str] = Field(None, max_length=20)
+
+
 # ============================================================
 # User Profile & Wallet
 # ============================================================
 @router.get("/api/me")
-async def get_me(user: dict = Depends(get_current_user_readonly)):
-    """Read-only auth: skips ``last_active_at`` + ``daily_refill`` (hot path; see Sentry consecutive-query notes)."""
-    payload = build_me_response(user)
-    pool = core.state.db_pool
-    if pool:
-        try:
-            from services.thumbnail_personas_list import list_thumbnail_studio_personas
+async def get_me(user_id: str = Depends(get_verified_user_id)):
+    """
+    Authenticated user profile, plan, wallet, and thumbnail personas.
 
-            async with pool.acquire() as conn:
-                payload["thumbnail_personas"] = await list_thumbnail_studio_personas(conn, user["id"])
-        except Exception:
-            logger.debug("GET /api/me thumbnail_personas skipped", exc_info=True)
-            payload["thumbnail_personas"] = []
-    else:
-        payload.setdefault("thumbnail_personas", [])
+    Uses ``get_verified_user_id`` (JWT only) plus ``fetch_me_endpoint_data`` so users,
+    wallet, and personas share **one** pooled connection (Sentry UPLOADM8-11).
+    """
+    pool = core.state.db_pool
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    user, thumbnail_personas = await fetch_me_endpoint_data(pool, user_id)
+    payload = build_me_response(user)
+    payload["thumbnail_personas"] = thumbnail_personas
     return payload
 
 
@@ -179,7 +193,7 @@ async def dismiss_marketing_touchpoint(delivery_id: str, user: dict = Depends(ge
                 meta = COALESCE(meta, '{}'::jsonb) || $3::jsonb
             WHERE id = $1::uuid AND user_id = $2::uuid
               AND channel = 'in_app' AND status = 'pending'
-            RETURNING id
+            RETURNING id, campaign_id, meta
             """,
             did,
             user["id"],
@@ -195,6 +209,30 @@ async def dismiss_marketing_touchpoint(delivery_id: str, user: dict = Depends(ge
                     user["id"],
                     json.dumps({"delivery_id": str(did), "channel": "in_app"}),
                 )
+            except Exception:
+                pass
+            try:
+                from services.ml_marketing import record_outcome_label
+
+                meta = row.get("meta") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                cid = str(row.get("campaign_id") or meta.get("campaign_id") or "")
+                vid = str(meta.get("promo_variant_id") or meta.get("variant_id") or "")[:128]
+                if cid:
+                    await record_outcome_label(
+                        conn,
+                        user_id=str(user["id"]),
+                        upload_id=None,
+                        variant_id=vid or None,
+                        feature_snapshot={"campaign_id": cid, "delivery_id": str(did)},
+                        label_json={"touchpoint_dismissed": True},
+                    )
             except Exception:
                 pass
     if not row:
@@ -300,7 +338,7 @@ async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depend
 
 
 @router.put("/api/settings/password")
-async def update_password_settings(data: PasswordChange, user: dict = Depends(get_current_user)):
+async def update_password_settings(data: PasswordChange, request: Request, user: dict = Depends(get_current_user)):
     """Change user password (settings endpoint version)"""
     async with core.state.db_pool.acquire() as conn:
         # Verify current password
@@ -317,7 +355,7 @@ async def update_password_settings(data: PasswordChange, user: dict = Depends(ge
 
     logger.info(f"Password changed via settings for user {user['id']}")
     resp = JSONResponse(content={"status": "success", "message": "Password changed successfully"})
-    clear_auth_cookies(resp)
+    clear_auth_cookies(resp, request)
     return resp
 
 @router.post("/api/settings/avatar")
@@ -356,10 +394,12 @@ async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_c
                 user["id"],
             )
 
-        signed_url = r2_presign_get_url(r2_key)
+        from core.r2 import resolve_user_profile_avatar_url
+
+        avatar_url = resolve_user_profile_avatar_url(r2_key) or r2_presign_get_url(r2_key)
 
         logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
-        return {"success": True, "r2_key": r2_key, "avatar_url": signed_url, "avatarUrl": signed_url}
+        return {"success": True, "r2_key": r2_key, "avatar_url": avatar_url, "avatarUrl": avatar_url}
 
     except HTTPException:
         raise
@@ -444,6 +484,7 @@ async def _execute_account_deletion(
     if background_tasks is not None:
         background_tasks.add_task(send_account_deleted_email, _del_email, _del_name)
 
+    await conn.execute("DELETE FROM wallet_disputes          WHERE user_id = $1", user["id"])
     await conn.execute("DELETE FROM refresh_tokens          WHERE user_id = $1", user["id"])
     await conn.execute("DELETE FROM token_ledger             WHERE user_id = $1", user["id"])
     await conn.execute("DELETE FROM wallets                  WHERE user_id = $1", user["id"])
@@ -571,7 +612,7 @@ async def delete_account(
                     },
                 }
             )
-            clear_auth_cookies(resp)
+            clear_auth_cookies(resp, request)
             return resp
 
 # ============================================================
@@ -614,9 +655,83 @@ async def get_wallet_endpoint(user_id: str = Depends(get_verified_user_id)):
         }
         return JSONResponse(content=jsonable_encoder(fallback))
 
+
+@router.get("/api/wallet/ledger")
+async def get_wallet_ledger(
+    user_id: str = Depends(get_verified_user_id),
+    limit: int = Query(40, ge=1, le=100),
+    token_type: Optional[str] = Query(None, pattern="^(put|aic)$"),
+    reason_prefix: Optional[str] = Query(None, max_length=80),
+    upload_id: Optional[str] = Query(None),
+    from_ts: Optional[str] = Query(None, alias="from"),
+    to_ts: Optional[str] = Query(None, alias="to"),
+    cursor_at: Optional[str] = Query(None),
+    cursor_id: Optional[str] = Query(None),
+):
+    """Paginated ledger with upload context, period summary, and pricing rules (read-only)."""
+    pool = core.state.db_pool
+    if pool is None:
+        raise HTTPException(503, "Database unavailable")
+    try:
+        payload = await build_wallet_ledger_payload(
+            pool,
+            user_id,
+            limit=limit,
+            token_type=token_type,
+            reason_prefix=reason_prefix,
+            upload_id_raw=upload_id,
+            from_raw=from_ts,
+            to_raw=to_ts,
+            cursor_at_raw=cursor_at,
+            cursor_id_raw=cursor_id,
+        )
+        return JSONResponse(content=jsonable_encoder(payload))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("/api/wallet/ledger failed user=%s: %s", user_id, e)
+        raise HTTPException(500, "Ledger unavailable") from e
+
+
+@router.get("/api/wallet/disputes")
+async def list_my_wallet_disputes(
+    user_id: str = Depends(get_verified_user_id),
+    limit: int = Query(40, ge=1, le=100),
+):
+    pool = core.state.db_pool
+    if pool is None:
+        raise HTTPException(503, "Database unavailable")
+    try:
+        items = await list_user_wallet_disputes(pool, user_id, limit=limit)
+        return JSONResponse(content=jsonable_encoder({"disputes": items}))
+    except Exception as e:
+        logger.warning("/api/wallet/disputes failed user=%s: %s", user_id, e)
+        raise HTTPException(500, "Could not load disputes") from e
+
+
+@router.post("/api/wallet/disputes")
+async def create_my_wallet_dispute(
+    data: WalletDisputeCreate,
+    user_id: str = Depends(get_verified_user_id),
+):
+    pool = core.state.db_pool
+    if pool is None:
+        raise HTTPException(503, "Database unavailable")
+    try:
+        row = await create_wallet_dispute(pool, user_id=user_id, ledger_id=data.ledger_id, note=data.note)
+        return JSONResponse(content=jsonable_encoder({"dispute": row}))
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        logger.warning("/api/wallet/disputes POST failed user=%s: %s", user_id, e)
+        raise HTTPException(500, "Could not create dispute") from e
+
+
 @router.post("/api/wallet/topup")
 async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_user)):
-    product = TOPUP_PRODUCTS.get(data.lookup_key)
+    product = get_effective_topup_products().get(data.lookup_key)
     if not product: raise HTTPException(400, "Invalid product")
 
     async with core.state.db_pool.acquire() as conn:
@@ -635,7 +750,12 @@ async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_u
         mode="payment",
         success_url=STRIPE_SUCCESS_URL,
         cancel_url=STRIPE_CANCEL_URL,
-        metadata={"user_id": str(user["id"]), "wallet": product["wallet"], "amount": product["amount"]},
+        metadata={
+            "user_id": str(user["id"]),
+            "lookup_key": data.lookup_key,
+            "wallet": product.get("wallet", "put"),
+            "amount": str(product.get("amount", 0)),
+        },
     )
     return {"checkout_url": session.url}
 
@@ -654,14 +774,8 @@ async def wallet_transfer(data: TransferRequest, user: dict = Depends(get_curren
 _SETTINGS_DEFAULTS = {
     "discord_webhook": None,
     "telemetry_enabled": True,
-    "hud_enabled": True,
-    "hud_position": "bottom-left",
     "speeding_mph": 80,
     "euphoria_mph": 100,
-    "hud_speed_unit": "mph",
-    "hud_color": "#FFFFFF",
-    "hud_font_family": "Arial",
-    "hud_font_size": 24,
     "ffmpeg_screenshot_interval": 5,
     "auto_generate_thumbnails": True,
     "auto_generate_captions": True,
@@ -670,6 +784,23 @@ _SETTINGS_DEFAULTS = {
     "always_use_hashtags": False,
 }
 
+
+async def _merge_discord_webhook_from_user_preferences(conn, user_id, result: dict) -> None:
+    """If ``user_settings.discord_webhook`` is empty, use ``user_preferences`` (POST /preferences)."""
+    cur = (result.get("discord_webhook") or "").strip()
+    if cur:
+        return
+    try:
+        alt = await conn.fetchval(
+            "SELECT NULLIF(TRIM(discord_webhook), '') FROM user_preferences WHERE user_id = $1",
+            user_id,
+        )
+    except Exception:
+        return
+    if alt and str(alt).strip():
+        result["discord_webhook"] = str(alt).strip()
+
+
 @router.get("/api/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
     """Get user settings including Trill preferences"""
@@ -677,9 +808,8 @@ async def get_settings(user: dict = Depends(get_current_user)):
         try:
             settings = await conn.fetchrow("""
                 SELECT
-                    discord_webhook, telemetry_enabled, hud_enabled, hud_position,
-                    speeding_mph, euphoria_mph, hud_speed_unit, hud_color,
-                    hud_font_family, hud_font_size, ffmpeg_screenshot_interval,
+                    discord_webhook, telemetry_enabled,
+                    speeding_mph, euphoria_mph, ffmpeg_screenshot_interval,
                     auto_generate_thumbnails, auto_generate_captions,
                     auto_generate_hashtags, default_hashtag_count, always_use_hashtags
                 FROM user_settings
@@ -689,33 +819,60 @@ async def get_settings(user: dict = Depends(get_current_user)):
             # Fallback if extended columns not yet migrated (e.g. pre-707)
             logger.warning(f"Full settings SELECT failed ({e}), using base columns")
             settings = await conn.fetchrow("""
-                SELECT discord_webhook, telemetry_enabled, hud_enabled, hud_position,
-                    speeding_mph, euphoria_mph, hud_speed_unit, hud_color
+                SELECT discord_webhook, telemetry_enabled,
+                    speeding_mph, euphoria_mph
                 FROM user_settings WHERE user_id = $1
             """, user["id"])
             if settings:
                 settings = dict(settings)
                 for k, v in _SETTINGS_DEFAULTS.items():
                     settings.setdefault(k, v)
+                await _merge_discord_webhook_from_user_preferences(conn, user["id"], settings)
                 return settings
-            return dict(_SETTINGS_DEFAULTS)
+            out = dict(_SETTINGS_DEFAULTS)
+            await _merge_discord_webhook_from_user_preferences(conn, user["id"], out)
+            return out
 
         if not settings:
-            return dict(_SETTINGS_DEFAULTS)
+            out = dict(_SETTINGS_DEFAULTS)
+            await _merge_discord_webhook_from_user_preferences(conn, user["id"], out)
+            return out
         result = dict(settings)
         for k, v in _SETTINGS_DEFAULTS.items():
             result.setdefault(k, v)
+        await _merge_discord_webhook_from_user_preferences(conn, user["id"], result)
         return result
+
+
+@router.get("/api/me/white-label")
+async def get_white_label(user: dict = Depends(get_current_user)):
+    ent = get_entitlements_from_user(user)
+    if not ent.can_white_label:
+        raise HTTPException(
+            403,
+            {"code": "feature_white_label", "message": "White label requires Agency plan."},
+        )
+    async with core.state.db_pool.acquire() as conn:
+        settings = await get_white_label_settings_or_defaults(conn, str(user["id"]))
+    return settings
+
+
+@router.put("/api/me/white-label")
+async def put_white_label(body: WhiteLabelUpdate, user: dict = Depends(get_current_user)):
+    payload = body.model_dump(exclude_unset=True)
+    async with core.state.db_pool.acquire() as conn:
+        settings = await upsert_white_label_settings(conn, user, payload)
+    return settings
+
 
 # Base columns that exist in user_settings from migration 5 (before 707)
 _SETTINGS_BASE_FIELDS = [
-    "discord_webhook", "telemetry_enabled", "hud_enabled",
-    "hud_position", "speeding_mph", "euphoria_mph",
-    "hud_speed_unit", "hud_color",
+    "discord_webhook", "telemetry_enabled",
+    "speeding_mph", "euphoria_mph",
 ]
 # Extended columns added in migration 707
 _SETTINGS_EXTENDED_FIELDS = [
-    "hud_font_family", "hud_font_size", "ffmpeg_screenshot_interval",
+    "ffmpeg_screenshot_interval",
     "auto_generate_thumbnails", "auto_generate_captions", "auto_generate_hashtags",
     "default_hashtag_count", "always_use_hashtags",
 ]
@@ -771,6 +928,46 @@ async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current
 
     logger.info(f"Updated settings for user {user['id']}: {updates}")
     return {"status": "updated"}
+
+
+@router.get("/api/me/discord-webhook-status")
+async def get_me_discord_webhook_status(user: dict = Depends(get_current_user_readonly)):
+    """Whether the owner has a saved Discord webhook (masked) — for Settings / support diagnostics."""
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database not ready")
+    from stages.notify_stage import _is_allowed_discord_webhook_url
+
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT COALESCE(
+              NULLIF(TRIM(us.discord_webhook), ''),
+              NULLIF(TRIM(up.discord_webhook), ''),
+              NULLIF(TRIM(COALESCE(
+                u.preferences->>'discordWebhook',
+                u.preferences->>'discord_webhook'
+              )), '')
+            ) AS url
+            FROM users u
+            LEFT JOIN user_settings us ON us.user_id = u.id
+            LEFT JOIN user_preferences up ON up.user_id = u.id
+            WHERE u.id = $1
+            """,
+            user["id"],
+        )
+    url = (row["url"] or "").strip() if row else ""
+    if not url:
+        return {
+            "configured": False,
+            "valid_discord_url": False,
+            "preview": None,
+        }
+    valid = _is_allowed_discord_webhook_url(url)
+    if len(url) <= 44:
+        preview = "https://…/(hidden)"
+    else:
+        preview = f"{url[:26]}…{url[-14:]}"
+    return {"configured": True, "valid_discord_url": bool(valid), "preview": preview}
 
 
 @router.post("/api/settings/test-discord-webhook")

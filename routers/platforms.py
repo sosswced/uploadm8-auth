@@ -12,95 +12,97 @@ from core.deps import get_current_user, get_current_user_readonly
 from core.oauth import _revoke_platform_token
 from core.audit import log_system_event
 from core.helpers import get_plan
-from core.r2 import resolve_stored_account_avatar_url
+from services.platform_accounts import (
+    _PLATFORM_TOKEN_SELECT,
+    fetch_auth_errors_by_token,
+    serialize_platform_account,
+    serialize_platform_account_flat,
+)
+from services.platform_profile_refresh import refresh_platform_token_profile
 
 logger = logging.getLogger("uploadm8-api")
 
 router = APIRouter(tags=["platforms"])
 
 
+async def _load_user_platform_accounts(conn, user_id: str):
+    auth_errors = await fetch_auth_errors_by_token(conn, user_id)
+    rows = await conn.fetch(_PLATFORM_TOKEN_SELECT, user_id)
+    return rows, auth_errors
+
+
 @router.get("/api/platforms")
 async def get_platforms(user: dict = Depends(get_current_user_readonly)):
     async with core.state.db_pool.acquire() as conn:
-        accounts = await conn.fetch("""
-            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
-                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
-            FROM platform_tokens
-            WHERE user_id = $1
-              AND revoked_at IS NULL
-              AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
-            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
-        """, user["id"])
+        accounts, auth_errors = await _load_user_platform_accounts(conn, user["id"])
 
     platforms = {}
     for acc in accounts:
         p = acc["platform"]
-        if p not in platforms: platforms[p] = []
-        platforms[p].append(
-            {
-                "id": str(acc["id"]),
-                "account_id": acc["account_id"],
-                "name": acc["account_name"],
-                "username": acc["account_username"],
-                "avatar": resolve_stored_account_avatar_url(acc["account_avatar"]),
-                "is_primary": acc["is_primary"],
-                "status": "active",
-                "connected_at": acc["created_at"].isoformat() if acc["created_at"] else None,
-            }
-        )
+        if p not in platforms:
+            platforms[p] = []
+        platforms[p].append(serialize_platform_account(acc, auth_error_by_token=auth_errors))
 
     plan = get_plan(user.get("subscription_tier", "free"))
     total = sum(len(v) for v in platforms.values())
-    return {"platforms": platforms, "total_accounts": total, "max_accounts": plan.get("max_accounts", 1), "can_add_more": total < plan.get("max_accounts", 1)}
+    return {
+        "platforms": platforms,
+        "total_accounts": total,
+        "max_accounts": plan.get("max_accounts", 1),
+        "can_add_more": total < plan.get("max_accounts", 1),
+    }
 
-# Alias endpoint for frontend compatibility
+
 @router.get("/api/platform-accounts")
 async def get_platform_accounts(user: dict = Depends(get_current_user_readonly)):
     """Returns flat list of accounts for frontend compatibility"""
     async with core.state.db_pool.acquire() as conn:
-        accounts = await conn.fetch("""
-            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
-                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
-            FROM platform_tokens
-            WHERE user_id = $1
-              AND revoked_at IS NULL
-              AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
-            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
-        """, user["id"])
+        accounts, auth_errors = await _load_user_platform_accounts(conn, user["id"])
 
-    result = []
-    for acc in accounts:
-        result.append({
-            "id": str(acc["id"]),
-            "platform": acc["platform"],
-            "account_id": acc["account_id"],
-            "account_name": acc["account_name"],
-            "account_username": acc["account_username"],
-            "account_avatar_url": resolve_stored_account_avatar_url(acc["account_avatar"]),
-            "is_primary": acc["is_primary"],
-            "status": "active",
-            "connected_at": acc["created_at"].isoformat() if acc["created_at"] else None,
-        })
-    return {"accounts": result}
+    return {
+        "accounts": [
+            serialize_platform_account_flat(acc, acc["platform"], auth_error_by_token=auth_errors)
+            for acc in accounts
+        ]
+    }
+
 
 @router.get("/api/accounts")
 async def get_accounts_simple(user: dict = Depends(get_current_user_readonly)):
     """Simple accounts list for dashboard"""
     async with core.state.db_pool.acquire() as conn:
-        accounts = await conn.fetch("SELECT DISTINCT ON (platform, account_id) id, platform, account_name, account_username, account_avatar FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL AND account_id IS NOT NULL AND account_id <> '' AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '') ORDER BY platform, account_id, created_at DESC", user["id"])
+        accounts, auth_errors = await _load_user_platform_accounts(conn, user["id"])
     return [
         {
             "id": str(a["id"]),
             "platform": a["platform"],
             "name": a["account_name"],
             "username": a["account_username"],
-            "avatar": resolve_stored_account_avatar_url(a["account_avatar"]),
-            "status": "active",
+            "avatar": serialize_platform_account(a, auth_error_by_token=auth_errors)["avatar"],
+            "status": serialize_platform_account(a, auth_error_by_token=auth_errors)["status"],
         }
         for a in accounts
     ]
+
+
+@router.post("/api/platform-accounts/{account_id}/refresh-profile")
+async def refresh_account_profile(
+    account_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """Re-fetch provider display name / avatar (fixes TikTok ui-avatars placeholders)."""
+    async with core.state.db_pool.acquire() as conn:
+        updated = await refresh_platform_token_profile(conn, user_id=str(user["id"]), token_id=account_id)
+        if not updated:
+            raise HTTPException(404, "Account not found or profile could not be refreshed")
+        row = await conn.fetchrow(
+            "SELECT * FROM platform_tokens WHERE id = $1 AND user_id = $2",
+            account_id,
+            user["id"],
+        )
+        auth_errors = await fetch_auth_errors_by_token(conn, str(user["id"]))
+    return serialize_platform_account_flat(row, row["platform"], auth_error_by_token=auth_errors)
+
 
 @router.delete("/api/platforms/{platform}/accounts/{account_id}")
 async def disconnect_account(
@@ -125,17 +127,13 @@ async def disconnect_account(
         if not row:
             raise HTTPException(404, "Account not found")
 
-        # Revoke token at provider
         ok, err = await _revoke_platform_token(row["platform"], row["token_blob"])
 
-        # Hard-delete (mark revoked_at first to satisfy the partial unique index,
-        # then delete so no stale token lingers)
         await conn.execute(
             "UPDATE platform_tokens SET revoked_at = NOW() WHERE id = $1", row["id"]
         )
         await conn.execute("DELETE FROM platform_tokens WHERE id = $1", row["id"])
 
-        # Audit log — platform_disconnect_log (existing) + system_event_log (new)
         await conn.execute(
             """
             INSERT INTO platform_disconnect_log
@@ -151,12 +149,21 @@ async def disconnect_account(
             err or None,
             ip_addr,
         )
-        await log_system_event(conn, user_id=str(user["id"]), action="PLATFORM_DISCONNECTED",
-                               event_category="PLATFORM", resource_type="platform",
-                               resource_id=f"{row['platform']}:{row['account_id']}",
-                               details={"platform": row["platform"], "account_name": row["account_name"],
-                                        "provider_revoked": ok, "provider_error": err},
-                               severity="WARNING")
+        await log_system_event(
+            conn,
+            user_id=str(user["id"]),
+            action="PLATFORM_DISCONNECTED",
+            event_category="PLATFORM",
+            resource_type="platform",
+            resource_id=f"{row['platform']}:{row['account_id']}",
+            details={
+                "platform": row["platform"],
+                "account_name": row["account_name"],
+                "provider_revoked": ok,
+                "provider_error": err,
+            },
+            severity="WARNING",
+        )
 
     return {"status": "disconnected", "provider_revoked": ok}
 
@@ -169,7 +176,7 @@ async def disconnect_account_by_id(
 ):
     """Alias for the disconnect endpoint (used by older frontend code)."""
     return await disconnect_account(
-        platform="",      # platform is looked up from the DB row
+        platform="",
         account_id=account_id,
         request=request,
         user=user,

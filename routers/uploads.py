@@ -21,7 +21,7 @@ from core.audit import log_system_event
 from core.auth import decrypt_blob
 from core.cancel_signal import clear_cancel_signal, signal_cancel
 from core.config import R2_BUCKET_NAME
-from core.deps import get_current_user, get_verified_user_id
+from core.deps import get_current_user, get_current_user_readonly, get_verified_user_id
 from core.helpers import _safe_json, get_plan
 from core.models import CompleteUploadBody, UploadInit, UploadUpdate
 from core.queue import enqueue_job
@@ -38,7 +38,12 @@ from core.wallet import partial_refund_tokens, refund_tokens
 from routers.preferences import get_user_prefs_for_upload
 from stages.entitlements import get_entitlements_for_tier
 from services.platform_oauth_refresh import refresh_decrypted_token_for_row
+from services.platform_posted_thumbnails import (
+    background_sync_posted_thumbnails,
+    upload_ids_needing_posted_thumbnail_sync,
+)
 from services.sync_analytics_helpers import resolve_token_candidates_for_platform_result
+from services.uploads_handlers import poll_upload_thumbnails_payload
 from services.uploads_api import update_upload_metadata
 from services.thumbnail_regenerate import (
     regenerate_upload_thumbnail,
@@ -164,6 +169,7 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
     r2_key = pres["r2_key"]
     put_cost = pres["put_cost"]
     aic_cost = pres["aic_cost"]
+    billing_breakdown = pres.get("billing_breakdown")
     user_prefs = pres["user_prefs"]
     smart_schedule = pres["smart_schedule"]
     telemetry_r2_key = pres.get("telemetry_r2_key")
@@ -176,6 +182,7 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
             "r2_key": r2_key,
             "put_cost": put_cost,
             "aic_cost": aic_cost,
+            "billing_breakdown": billing_breakdown,
             "schedule_mode": data.schedule_mode,
             "target_accounts": data.target_accounts or [],
             "preferences_applied": {
@@ -464,7 +471,7 @@ async def get_uploads(
     offset: int = 0,
     trill_only: bool = False,
     meta: bool = False,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_user_readonly),
 ):
     """
     Upload queue list for current user.
@@ -483,13 +490,14 @@ async def get_uploads(
     """
     return await fetch_user_uploads_list(
         core.state.db_pool,
-        str(user["id"]),
+        str(user.get("billing_user_id") or user["id"]),
         status=status,
         view=view,
         limit=limit,
         offset=offset,
         trill_only=trill_only,
         meta=meta,
+        workspace_id=(user.get("workspace") or {}).get("id"),
     )
 
 
@@ -513,9 +521,10 @@ async def generate_thumbnail_for_upload(
     Backfill / regenerate the thumbnail for an existing upload.
 
     Uses the processed video when available, extracts a base frame with FFmpeg, then
-    runs the same styled stack as the worker (Pikzels v2 when configured, else PIL
-    template) for accounts with custom styled thumbnails. Tier without styled thumbs
-    gets FFmpeg-only JPEG.
+    reuses ``output_artifacts.thumbnail_brief_json`` + ``hydration_payload`` + scene/timeline
+    story when present (same signals as user/admin UI). Runs the styled stack
+    (Pikzels v2 with persona, optional Pikzels edit pass, GPT image-edit when entitled,
+    then PIL template). Persists the merged brief JSON back to ``output_artifacts``.
 
     Query ``force=1`` to replace an existing thumbnail (default: return current URL only).
     """
@@ -523,7 +532,8 @@ async def generate_thumbnail_for_upload(
         row = await conn.fetchrow(
             """
             SELECT u.id, u.r2_key, u.processed_r2_key, u.thumbnail_r2_key, u.status, u.platforms,
-                   u.title, u.ai_title, u.ai_generated_title, u.user_preferences,
+                   u.title, u.caption, u.ai_title, u.ai_caption, u.ai_generated_title, u.ai_generated_caption,
+                   u.user_preferences, u.output_artifacts, u.platform_results,
                    usr.subscription_tier AS ent_subscription_tier,
                    usr.role AS ent_role,
                    usr.flex_enabled AS ent_flex_enabled
@@ -559,9 +569,14 @@ async def generate_thumbnail_for_upload(
         "status": row["status"],
         "platforms": row["platforms"],
         "title": row["title"],
+        "caption": row.get("caption"),
         "ai_title": row["ai_title"],
+        "ai_caption": row.get("ai_caption"),
         "ai_generated_title": row["ai_generated_title"],
+        "ai_generated_caption": row.get("ai_generated_caption"),
         "user_preferences": row["user_preferences"],
+        "output_artifacts": row.get("output_artifacts"),
+        "platform_results": row.get("platform_results"),
     }
     user_dict = {
         "subscription_tier": row["ent_subscription_tier"],
@@ -966,6 +981,10 @@ async def _background_sync_uploads_analytics(user_id: str, upload_ids: list[str]
         await asyncio.sleep(0.35)
 
 
+async def _background_sync_uploads_thumbnails(user_id: str, upload_ids: list[str]) -> None:
+    await background_sync_posted_thumbnails(core.state.db_pool, user_id, upload_ids)
+
+
 @router.post("/sync-analytics/all")
 async def sync_all_upload_analytics(
     background_tasks: BackgroundTasks,
@@ -1008,6 +1027,70 @@ async def sync_all_upload_analytics(
             pass
         await asyncio.sleep(0.25)
     return {"ok": True, "candidates": len(ids), "synced": synced, "async_mode": False}
+
+
+@router.post("/sync-thumbnails/all")
+async def sync_all_upload_thumbnails(
+    background_tasks: BackgroundTasks,
+    max_uploads: int = Query(120, ge=1, le=400),
+    async_mode: bool = Query(True),
+    user: dict = Depends(get_current_user),
+):
+    """
+  Queue live platform cover fetch for completed uploads (non-blocking).
+
+  Clients should poll GET /api/uploads/thumbnails/poll to apply URLs when ready.
+    """
+    uid = str(user["id"])
+    async with core.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, status, platform_results, thumbnail_r2_key, output_artifacts, platforms
+            FROM uploads
+            WHERE user_id = $1::uuid
+              AND status = ANY($2::varchar[])
+              AND platform_results IS NOT NULL
+              AND platform_results::text NOT IN ('null', '[]', '{}')
+            ORDER BY updated_at DESC
+            LIMIT $3
+            """,
+            uid,
+            ["completed", "succeeded", "partial"],
+            max_uploads,
+        )
+    ids = [
+        str(r["id"])
+        for r in rows
+        if upload_ids_needing_posted_thumbnail_sync(dict(r))
+    ]
+
+    if async_mode:
+        if ids:
+            background_tasks.add_task(_background_sync_uploads_thumbnails, uid, ids)
+        return {"ok": True, "queued": len(ids), "async_mode": True}
+
+    await background_sync_posted_thumbnails(core.state.db_pool, uid, ids)
+    return {"ok": True, "synced": len(ids), "async_mode": False}
+
+
+@router.get("/thumbnails/poll")
+async def poll_upload_thumbnails(
+    ids: str = Query(..., description="Comma-separated upload UUIDs (max 40)"),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Fast DB-only read of thumbnail URLs for visible rows.
+
+    Used by dashboard/queue to swap in covers after background sync-thumbnails completes.
+    """
+    raw = [x.strip() for x in (ids or "").split(",") if x.strip()]
+    upload_ids = raw[:40]
+    if not upload_ids:
+        return {"thumbnails": {}}
+    payload = await poll_upload_thumbnails_payload(
+        core.state.db_pool, str(user["id"]), upload_ids
+    )
+    return {"thumbnails": payload}
 
 
 @router.post("/{upload_id}/sync-analytics")
@@ -1285,9 +1368,9 @@ async def get_upload_details(upload_id: str, user_id: str = Depends(get_verified
     Upload detail for current user.
 
     Uses ``get_verified_user_id`` (JWT only, no DB) plus a single connection in
-    ``fetch_upload_detail`` for user gates + upload + recognition — avoids a second
-    pool checkout and duplicate connection teardown (Sentry: consecutive queries /
-    ``pg_advisory_unlock_all`` on ``/api/uploads/{id}``).
+    ``fetch_upload_detail`` for user gates + upload + recognition. Thumbnails are
+    presigned optimistically (no sync repair on GET — avoids extra pool checkouts;
+    Sentry UPLOADM8-2H).
 
     Contract (frontend-safe):
       - thumbnail_url: presigned R2 URL (if thumbnail_r2_key exists)

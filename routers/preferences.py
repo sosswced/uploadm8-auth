@@ -7,11 +7,11 @@ thumbnails, Trill settings, etc.).
 
 import json
 import logging
-import pathlib
-from fastapi import APIRouter, Body, Depends, HTTPException
+import os
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 import core.state
-from core.deps import get_current_user
+from core.deps import get_current_user, get_current_user_readonly
 from core.helpers import (
     _now_utc,
     _safe_json,
@@ -24,10 +24,22 @@ from core.sql_allowlist import USER_COLOR_PREFERENCES_UPDATE_COLUMNS, assert_set
 from core.models import ColorPreferencesUpdate, UserPreferencesUpdate
 from services.user_preferences_persist import save_user_content_preferences
 from services.thumbnail_personas_list import list_thumbnail_studio_personas
+from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["preferences"])
+
+# Audit / metadata columns on user_preferences that asyncpg returns as native
+# datetime/UUID types. Workers do not need them in the job payload snapshot.
+_UPLOAD_PREF_STRIP_KEYS = (
+    "created_at",
+    "updated_at",
+    "user_id",
+    "trill_public_name_reviewed_at",
+    "trill_public_name_reviewed_by",
+    "trill_welcome_modal_seen_at",
+)
 
 
 # ============================================================
@@ -52,7 +64,7 @@ async def get_color_preferences(user: dict = Depends(get_current_user)):
                 "youtube_color": "#FF0000",
                 "instagram_color": "#E4405F",
                 "facebook_color": "#1877F2",
-                "accent_color": "#F97316"
+                "accent_color": "#3B82F6"
             }
 
     return {
@@ -139,18 +151,6 @@ async def update_color_preferences(
 # User Content Preferences — helpers
 # ============================================================
 
-_DEBUG_LOG_PATH = pathlib.Path(__file__).resolve().parent.parent / "debug-0d13f7.log"
-
-def _dbg_write(msg: str, data: dict = None, hid: str = "H3"):
-    try:
-        import json as _j
-        line = _j.dumps({"sessionId":"0d13f7","hypothesisId":hid,"location":"app.py:get_user_preferences","message":msg,"data":data or {},"timestamp":__import__("time").time()*1000}) + "\n"
-        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception:
-        pass
-
-
 def _parse_users_preferences(raw) -> dict:
     """Parse users.preferences JSONB into a dict."""
     if not raw:
@@ -224,7 +224,6 @@ def _hydrate_snake_camel_mirror(result: dict) -> None:
         ("discord_webhook", "discordWebhook"),
         ("trill_enabled", "trillEnabled"),
         ("trill_min_score", "trillMinScore"),
-        ("trill_hud_enabled", "trillHudEnabled"),
         ("trill_ai_enhance", "trillAiEnhance"),
         ("trill_openai_model", "trillOpenaiModel"),
         ("use_audio_context", "useAudioContext"),
@@ -339,7 +338,6 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     Merges user_preferences table + users.preferences + user_settings so:
     - PUT /api/me/preferences (users.preferences) wins for hashtag/caption fields
     - POST /api/settings/preferences (user_preferences) provides defaults
-    - user_settings provides hud_enabled for Trill HUD cost calculation
     """
     result = {}
     # Read from user_preferences table
@@ -349,7 +347,7 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     )
     if prefs_row:
         pr = dict(prefs_row)
-        for _k in ("created_at", "updated_at", "user_id"):
+        for _k in _UPLOAD_PREF_STRIP_KEYS:
             pr.pop(_k, None)
         result.update(pr)
         # Defensive: JSONB columns can come back as JSON-encoded strings if a
@@ -371,14 +369,6 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     users_prefs_row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user_id)
     up = _parse_users_preferences(users_prefs_row["preferences"] if users_prefs_row else None)
     _overlay_users_prefs_on_result(result, up)
-
-    # Overlay user_settings for hud_enabled (Trill HUD; PUT /api/settings writes here)
-    try:
-        us_row = await conn.fetchrow("SELECT hud_enabled FROM user_settings WHERE user_id = $1", user_id)
-        if us_row and us_row.get("hud_enabled") is not None:
-            result["hud_enabled"] = bool(us_row["hud_enabled"])
-    except Exception:
-        pass
 
     if result:
         _hydrate_snake_camel_mirror(result)
@@ -409,7 +399,7 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     styled = prefs.get("styledThumbnails", prefs.get("styled_thumbnails", True))
     out = {
         "auto_captions": prefs.get("autoCaptions", False),
-        "auto_thumbnails": prefs.get("autoThumbnails", False),
+        "auto_thumbnails": prefs.get("autoThumbnails", prefs.get("auto_thumbnails", True)),
         "styled_thumbnails": styled,
         "styledThumbnails": styled,
         "thumbnail_interval": prefs.get("thumbnailInterval", 5),
@@ -431,13 +421,6 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
         "email_notifications": prefs.get("emailNotifications", True),
         "discord_webhook": prefs.get("discordWebhook", None)
     }
-    # Add hud_enabled from user_settings for fallback path
-    try:
-        us_row = await conn.fetchrow("SELECT hud_enabled FROM user_settings WHERE user_id = $1", user_id)
-        if us_row and us_row.get("hud_enabled") is not None:
-            out["hud_enabled"] = bool(us_row["hud_enabled"])
-    except Exception:
-        pass
     if isinstance(prefs, dict):
         _overlay_users_prefs_on_result(out, prefs)
     _hydrate_snake_camel_mirror(out)
@@ -448,23 +431,19 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 # GET /api/settings/preferences
 # ============================================================
 @router.get("/api/settings/preferences")
-async def get_user_preferences(user: dict = Depends(get_current_user)):
+async def get_user_preferences(
+    include_personas: bool = Query(False, description="Include thumbnail studio personas (slow; settings only)"),
+    user: dict = Depends(get_current_user_readonly),
+):
     """GET user content preferences - used by settings page AND upload workflow"""
-    # #region agent log
-    _dbg_write("get_user_preferences ENTRY", {"user_id": str(user.get("id"))})
-    # #endregion
     try:
         async with core.state.db_pool.acquire() as conn:
-            # #region agent log
-            _dbg_write("Before SELECT user_preferences")
-            # #endregion
             try:
                 prefs = await conn.fetchrow(
                     "SELECT * FROM user_preferences WHERE user_id = $1",
                     user["id"]
                 )
-            except Exception as e1:
-                _dbg_write("user_preferences SELECT failed", {"error": str(e1), "type": type(e1).__name__})
+            except Exception:
                 prefs = None  # fall through to INSERT-on-demand
 
             if not prefs:
@@ -481,11 +460,6 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
             blocked_tags = d.get("blocked_hashtags")
             platform_tags = d.get("platform_hashtags")
 
-            # DEBUG: Log what we loaded from database
-            logger.info(f"Loading preferences for user {user['id']}")
-            logger.info(f"always_hashtags from DB: {always_tags} (type: {type(always_tags)})")
-            logger.info(f"blocked_hashtags from DB: {blocked_tags} (type: {type(blocked_tags)})")
-
             # Defensive parse: JSONB might come back as a single- or double-encoded
             # string when a write path used `json.dumps()` on top of the asyncpg
             # JSONB codec. The helpers peel both layers so the malformed
@@ -499,7 +473,9 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
 
             out = {
                 "autoCaptions": d.get("auto_captions", False),
-                "autoThumbnails": d.get("auto_thumbnails", False),
+                "autoThumbnails": (
+                    True if d.get("auto_thumbnails") is None else bool(d.get("auto_thumbnails"))
+                ),
                 "thumbnailInterval": str(d.get("thumbnail_interval", 5)),
                 "defaultPrivacy": d.get("default_privacy", "public"),
                 "aiHashtagsEnabled": d.get("ai_hashtags_enabled", False),
@@ -512,11 +488,18 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
                 "platformHashtags": platform_tags or {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
                 "emailNotifications": d.get("email_notifications", True),
                 "discordWebhook": d.get("discord_webhook"),
-                "trillEnabled": bool(d.get("trill_enabled", False)),
-                "trillMinScore": int(d.get("trill_min_score", 0) or 0),
-                "trillHudEnabled": bool(d.get("trill_hud_enabled", False)),
-                "trillAiEnhance": bool(d.get("trill_ai_enhance", False)),
+                "trillEnabled": (
+                    True if d.get("trill_enabled") is None else bool(d.get("trill_enabled"))
+                ),
+                "trillMinScore": (
+                    60 if d.get("trill_min_score") is None else int(d.get("trill_min_score") or 60)
+                ),
+                "trillAiEnhance": (
+                    True if d.get("trill_ai_enhance") is None else bool(d.get("trill_ai_enhance"))
+                ),
                 "trillOpenaiModel": d.get("trill_openai_model", "gpt-4o-mini"),
+                "trillLeaderboardOptIn": bool(d.get("trill_leaderboard_opt_in", False)),
+                "trillMapSharingOptIn": bool(d.get("trill_map_sharing_opt_in", False)),
                 "styledThumbnails": d.get("styled_thumbnails", True),
                 "useAudioContext": bool(d.get("use_audio_context", True)),
                 "audioTranscription": bool(d.get("audio_transcription", True)),
@@ -534,18 +517,12 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
                 "aiServiceSpeechToText": bool(d.get("ai_service_speech_to_text", True)),
                 "aiServiceSceneUnderstanding": bool(d.get("ai_service_scene_understanding", True)),
             }
-            # #region agent log
-            _dbg_write("Before SELECT users.preferences")
-            # #endregion
             # Overlay users.preferences -- source of truth for hashtags + caption (PUT /api/me/preferences)
             users_prefs = None
             try:
                 users_prefs = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user["id"])
             except Exception as col_err:
-                _dbg_write("users.preferences SELECT failed (column may not exist)", {"error": str(col_err)})
-            # #region agent log
-            _dbg_write("After SELECT users.preferences", {"has_prefs": users_prefs is not None})
-            # #endregion
+                logger.debug("users.preferences SELECT failed: %s", col_err)
             up = _parse_users_preferences(users_prefs) if users_prefs else {}
             if up:
                 # Use key presence — never `a or b` here: [] and {} are falsy and would
@@ -580,27 +557,29 @@ async def get_user_preferences(user: dict = Depends(get_current_user)):
                 out.setdefault("thumbnail_selection_mode", "ai")
                 out.setdefault("thumbnailRenderPipeline", "auto")
                 out.setdefault("thumbnail_render_pipeline", "auto")
-            try:
-                plist = await list_thumbnail_studio_personas(conn, user["id"])
-                out["thumbnail_personas"] = out["thumbnailPersonas"] = plist
-            except Exception:
+            if include_personas:
+                try:
+                    plist = await list_thumbnail_studio_personas(conn, user["id"])
+                    out["thumbnail_personas"] = out["thumbnailPersonas"] = plist
+                except Exception:
+                    out["thumbnail_personas"] = out["thumbnailPersonas"] = []
+            else:
                 out["thumbnail_personas"] = out["thumbnailPersonas"] = []
             return out
     except Exception as e:
-        # #region agent log
-        _dbg_write("get_user_preferences EXCEPTION", {"error": str(e), "type": type(e).__name__})
-        # #endregion
         logger.exception("get_user_preferences failed: %s", e)
         # Return defaults so settings page loads; avoid 500 when DB schema mismatch or migration not run
         return {
-            "autoCaptions": False, "autoThumbnails": False, "thumbnailInterval": "5",
+            "autoCaptions": False, "autoThumbnails": True, "thumbnailInterval": "5",
             "defaultPrivacy": "public", "aiHashtagsEnabled": False, "aiHashtagCount": "5",
             "aiHashtagStyle": "mixed", "hashtagPosition": "end", "maxHashtags": "15",
             "alwaysHashtags": [], "blockedHashtags": [],
             "platformHashtags": {"tiktok": [], "youtube": [], "instagram": [], "facebook": []},
             "emailNotifications": True, "discordWebhook": None,
-            "trillEnabled": False, "trillMinScore": 60, "trillHudEnabled": False,
-            "trillAiEnhance": True, "trillOpenaiModel": "gpt-4o-mini", "styledThumbnails": True,
+            "trillEnabled": True, "trillMinScore": 60,
+            "trillAiEnhance": True, "trillOpenaiModel": "gpt-4o-mini",
+            "trillLeaderboardOptIn": False, "trillMapSharingOptIn": False,
+            "styledThumbnails": True,
             "captionStyle": "story", "captionTone": "authentic", "captionVoice": "default", "captionFrameCount": 6,
             "thumbnailSelectionMode": "ai", "thumbnail_selection_mode": "ai",
             "thumbnailRenderPipeline": "auto", "thumbnail_render_pipeline": "auto",
@@ -638,3 +617,56 @@ async def save_user_preferences_put(
 ):
     """Backward-compatible alias for clients that still call PUT"""
     return await save_user_preferences(prefs.model_dump(by_alias=True), user)
+
+
+# ============================================================
+# GET /api/settings/channel-catalog
+# ============================================================
+@router.get("/api/settings/channel-catalog")
+async def get_channel_visual_catalog(user: dict = Depends(get_current_user)):
+    """
+    What UploadM8 has learned from this creator's uploads (Google Vision + VI buckets).
+    Powers Settings → "What UploadM8 knows about my channel" and HF ML export.
+    """
+    from services.thumbnail_niches import normalize_niche
+    from services.visual_entity_memory import fetch_channel_catalog_detail
+
+    category = "general"
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT preferences FROM users WHERE id = $1::uuid",
+                user["id"],
+            )
+            if row:
+                prefs = coerce_jsonb_dict(row.get("preferences") or {})
+                nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy")
+                if isinstance(nested, dict) and nested.get("audience_niche"):
+                    category = normalize_niche(str(nested["audience_niche"]))
+    except Exception as e:
+        logger.debug("channel-catalog niche lookup: %s", e)
+
+    catalog = await fetch_channel_catalog_detail(
+        core.state.db_pool,
+        user_id=str(user["id"]),
+        category=category,
+        limit_per_bucket=14,
+    )
+    hub_urls = get_ml_hub_urls()
+    hf = ml_hub_huggingface_dict()
+    return {
+        "catalog": catalog,
+        "ml_hub": {
+            "dataset_repo": hub_urls.get("dataset_repo"),
+            "dataset_url": hub_urls.get("dataset_url"),
+            "trackio_space_url": hub_urls.get("trackio_space_url"),
+            "hf_sync_enabled": os.environ.get("UM8_HF_SYNC_VISUAL_ENTITIES", "").strip().lower()
+            in ("1", "true", "yes"),
+            "docs": {
+                "datasets": hf.get("datasets_hub"),
+                "trainer": hf.get("trl_docs"),
+                "jobs": hf.get("hub_docs_jobs"),
+                "evaluation": hf.get("evaluation_doc"),
+            },
+        },
+    }

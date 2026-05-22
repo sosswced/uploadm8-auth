@@ -2,26 +2,205 @@
 UploadM8 Scheduled-uploads routes — extracted from app.py.
 """
 
+import asyncio
 import json
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, List
+from typing import Any, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from core.config import R2_BUCKET_NAME
 import core.state
-from core.deps import get_current_user
+from core.deps import get_current_user, get_current_user_readonly
 from core.wallet import refund_tokens
-from core.helpers import _load_uploads_columns, _now_utc, _pick_cols, _safe_col
+from core.helpers import _load_uploads_columns, _now_utc, _pick_cols, _safe_col, get_plan
 from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragments_columns
 from core.r2 import get_s3_client, _normalize_r2_key, resolve_stored_account_avatar_url
 from core.models import SmartScheduleOnlyUpdate
 from services.uploads_handlers import SCHEDULED_PIPELINE_STATUSES, scheduled_in_clause
+from services.shell_bootstrap import _fetch_platforms_bundle
 
 logger = logging.getLogger(__name__)
+
+
+def _presign_thumbnail_r2_key(thumb_key: Any) -> Optional[str]:
+    if not thumb_key or not str(thumb_key).strip():
+        return None
+    try:
+        s3 = get_s3_client()
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": R2_BUCKET_NAME,
+                "Key": _normalize_r2_key(thumb_key),
+            },
+            ExpiresIn=3600,
+        )
+    except Exception:
+        return None
+
+
+def _smart_schedule_from_upload_row(upload: dict) -> Optional[dict]:
+    """Read smart_schedule dict from a list/detail row (not PATCH validation)."""
+    try:
+        sm = upload.get("schedule_metadata")
+        if sm and upload.get("schedule_mode") == "smart":
+            return sm if isinstance(sm, dict) else json.loads(sm)
+    except Exception:
+        pass
+    return None
+
+
+async def _scheduled_stats_row(conn: Any, uid: str) -> dict[str, int]:
+    """One query for pending / today / week (replaces three COUNT round-trips)."""
+    now = _now_utc()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+    week_end = now + timedelta(days=7)
+    ph, statuses = scheduled_in_clause(2)
+    n = len(statuses)
+    today_start_idx = 2 + n
+    row = await conn.fetchrow(
+        f"""
+        SELECT
+            COUNT(*)::int AS pending,
+            COUNT(*) FILTER (
+                WHERE scheduled_time >= ${today_start_idx}
+                  AND scheduled_time < ${today_start_idx + 1}
+            )::int AS today,
+            COUNT(*) FILTER (
+                WHERE scheduled_time >= ${today_start_idx + 2}
+                  AND scheduled_time < ${today_start_idx + 3}
+            )::int AS week
+        FROM uploads
+        WHERE user_id = $1
+          AND status IN ({ph})
+        """,
+        uid,
+        *statuses,
+        today_start,
+        today_end,
+        now,
+        week_end,
+    )
+    return {
+        "pending": int((row["pending"] if row else 0) or 0),
+        "today": int((row["today"] if row else 0) or 0),
+        "week": int((row["week"] if row else 0) or 0),
+    }
+
+
+async def _scheduled_upload_list_for_user(
+    pool: Any,
+    uid: str,
+    *,
+    presign_thumbnails: bool = False,
+    presign_account_avatars: bool = False,
+) -> list[dict[str, Any]]:
+    async with pool.acquire() as conn:
+        cols = await _load_uploads_columns(pool)
+        select_cols = _pick_cols(_SCHEDULED_LIST_COLS, cols)
+        if not select_cols:
+            select_cols = [
+                "id",
+                "filename",
+                "title",
+                "scheduled_time",
+                "platforms",
+                "status",
+                "created_at",
+                "schedule_mode",
+            ]
+        col_sql = ", ".join(select_cols)
+        ph, statuses = scheduled_in_clause(2)
+        uploads = await conn.fetch(
+            f"""
+            SELECT {col_sql}
+            FROM uploads
+            WHERE user_id = $1
+              AND status IN ({ph})
+            ORDER BY scheduled_time ASC NULLS LAST, created_at ASC
+            """,
+            uid,
+            *statuses,
+        )
+
+        all_token_ids: set[str] = set()
+        normalized_by_row: list[List[str]] = []
+        for upload in uploads:
+            tids = _normalize_target_account_uuids(upload.get("target_accounts"))
+            normalized_by_row.append(tids)
+            all_token_ids.update(tids)
+
+        token_rows_by_id: dict = {}
+        if all_token_ids:
+            tok_rows = await conn.fetch(
+                """SELECT id, platform, account_name, account_username, account_avatar
+                   FROM platform_tokens
+                   WHERE user_id = $1 AND id = ANY($2::uuid[]) AND revoked_at IS NULL""",
+                uid,
+                list(all_token_ids),
+            )
+            for r in tok_rows:
+                token_rows_by_id[str(r["id"])] = r
+
+        result: list[dict[str, Any]] = []
+        for upload, target_ids in zip(uploads, normalized_by_row):
+            has_thumbnail = bool(upload.get("thumbnail_r2_key") and str(upload.get("thumbnail_r2_key")).strip())
+            thumbnail_url = (
+                _presign_thumbnail_r2_key(upload["thumbnail_r2_key"])
+                if presign_thumbnails and has_thumbnail
+                else None
+            )
+            smart_schedule = _smart_schedule_from_upload_row(upload)
+
+            target_account_details = []
+            for tid in target_ids:
+                r = token_rows_by_id.get(tid)
+                if not r:
+                    continue
+                target_account_details.append(
+                    {
+                        "id": str(r["id"]),
+                        "platform": r["platform"],
+                        "name": r["account_name"] or "",
+                        "username": r["account_username"] or "",
+                        "avatar": resolve_stored_account_avatar_url(
+                            r["account_avatar"],
+                            presign=presign_account_avatars,
+                        )
+                        or "",
+                    }
+                )
+
+            result.append(
+                {
+                    "id": str(upload["id"]),
+                    "filename": upload.get("filename") or "",
+                    "title": upload.get("title") or "Untitled",
+                    "scheduled_time": upload["scheduled_time"].isoformat()
+                    if upload.get("scheduled_time")
+                    else None,
+                    "timezone": str(upload.get("timezone") or "UTC"),
+                    "platforms": list(upload["platforms"]) if upload.get("platforms") else [],
+                    "target_accounts": target_ids,
+                    "target_account_details": target_account_details,
+                    "thumbnail": thumbnail_url,
+                    "has_thumbnail": has_thumbnail,
+                    "caption": upload.get("caption"),
+                    "status": upload["status"],
+                    "schedule_mode": upload.get("schedule_mode") or "scheduled",
+                    "smart_schedule": smart_schedule,
+                    "is_editable": upload["status"] in SCHEDULED_PIPELINE_STATUSES,
+                    "created_at": upload["created_at"].isoformat()
+                    if upload.get("created_at")
+                    else None,
+                }
+            )
+    return result
 
 _SCHEDULED_LIST_COLS = [
     "id",
@@ -120,193 +299,78 @@ async def get_scheduled(user: dict = Depends(get_current_user)):
 # GET /api/scheduled/stats
 # ------------------------------------------------------------------
 @router.get("/stats")
-async def get_scheduled_stats(user: dict = Depends(get_current_user)):
+async def get_scheduled_stats(user: dict = Depends(get_current_user_readonly)):
     """Get scheduled upload statistics for the current user"""
     uid = user["id"]
     try:
         async with core.state.db_pool.acquire() as conn:
-            now = _now_utc()
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            today_end = today_start + timedelta(days=1)
-            week_end = now + timedelta(days=7)
-
-            # Pending = canonical SCHEDULED_PIPELINE_STATUSES (no scheduled_time
-            # filter) so this number matches /api/scheduled/list, dashboard's
-            # "Scheduled" stat card, and queue's "Processing" tab.
-            ph_p, statuses = scheduled_in_clause(2)
-            pending_count = await conn.fetchval(
-                f"""
-                SELECT COUNT(*) FROM uploads
-                WHERE user_id = $1
-                  AND status IN ({ph_p})
-                """,
-                uid,
-                *statuses,
-            )
-
-            # Today / This-week buckets remain date-windowed (they're explicitly
-            # about scheduled_time placement on a calendar, not bucket
-            # membership) but use the same canonical status set.
-            ph_t, _ = scheduled_in_clause(4)
-            today_count = await conn.fetchval(
-                f"""
-                SELECT COUNT(*) FROM uploads
-                WHERE user_id = $1
-                  AND scheduled_time >= $2
-                  AND scheduled_time < $3
-                  AND status IN ({ph_t})
-                """,
-                uid,
-                today_start,
-                today_end,
-                *statuses,
-            )
-
-            ph_w, _ = scheduled_in_clause(4)
-            week_count = await conn.fetchval(
-                f"""
-                SELECT COUNT(*) FROM uploads
-                WHERE user_id = $1
-                  AND scheduled_time >= $2
-                  AND scheduled_time < $3
-                  AND status IN ({ph_w})
-                """,
-                uid,
-                now,
-                week_end,
-                *statuses,
-            )
-
-        return {
-            "pending": int(pending_count or 0),
-            "today": int(today_count or 0),
-            "week": int(week_count or 0),
-        }
+            return await _scheduled_stats_row(conn, uid)
     except Exception:
         logger.exception("get_scheduled_stats failed user_id=%s", uid)
         raise
 
 
 # ------------------------------------------------------------------
+# GET /api/scheduled/bootstrap — stats + list + platforms (one round-trip)
+# ------------------------------------------------------------------
+@router.get("/bootstrap")
+async def get_scheduled_bootstrap(user: dict = Depends(get_current_user_readonly)):
+    """
+    First paint for scheduled.html: stats, upload list (no R2 presign), and
+    platform accounts (redirect avatars, not presigned).
+    """
+    uid = str(user["id"])
+    pool = core.state.db_pool
+    if pool is None:
+        raise HTTPException(503, "Database unavailable")
+    plan = get_plan(user.get("subscription_tier", "free"))
+
+    async def _stats():
+        async with pool.acquire() as conn:
+            return await _scheduled_stats_row(conn, uid)
+
+    try:
+        stats, uploads, platforms = await asyncio.gather(
+            _stats(),
+            _scheduled_upload_list_for_user(
+                pool,
+                uid,
+                presign_thumbnails=False,
+                presign_account_avatars=False,
+            ),
+            _fetch_platforms_bundle(pool, uid, plan),
+        )
+    except Exception:
+        logger.exception("get_scheduled_bootstrap failed user_id=%s", uid)
+        raise
+
+    return {
+        "stats": stats,
+        "uploads": uploads,
+        "platforms": platforms,
+    }
+
+
+# ------------------------------------------------------------------
 # GET /api/scheduled/list  — paginated list
 # ------------------------------------------------------------------
 @router.get("/list")
-async def get_scheduled_list(user: dict = Depends(get_current_user)):
+async def get_scheduled_list(
+    user: dict = Depends(get_current_user_readonly),
+    presign_thumbnails: bool = Query(
+        False,
+        description="Presign R2 thumbnail URLs (slow for large lists; use bootstrap + thumbnails/poll instead)",
+    ),
+):
     """Get list of all scheduled uploads for the current user"""
     uid = user["id"]
     try:
-        async with core.state.db_pool.acquire() as conn:
-            cols = await _load_uploads_columns(core.state.db_pool)
-            select_cols = _pick_cols(_SCHEDULED_LIST_COLS, cols)
-            if not select_cols:
-                select_cols = [
-                    "id",
-                    "filename",
-                    "title",
-                    "scheduled_time",
-                    "platforms",
-                    "status",
-                    "created_at",
-                    "schedule_mode",
-                ]
-            col_sql = ", ".join(select_cols)
-            ph, statuses = scheduled_in_clause(2)
-            uploads = await conn.fetch(
-                f"""
-                SELECT {col_sql}
-                FROM uploads
-                WHERE user_id = $1
-                  AND status IN ({ph})
-                ORDER BY scheduled_time ASC NULLS LAST, created_at ASC
-                """,
-                uid,
-                *statuses,
-            )
-
-            all_token_ids: set[str] = set()
-            normalized_by_row: list[List[str]] = []
-            for upload in uploads:
-                tids = _normalize_target_account_uuids(upload.get("target_accounts"))
-                normalized_by_row.append(tids)
-                all_token_ids.update(tids)
-
-            token_rows_by_id: dict = {}
-            if all_token_ids:
-                tok_rows = await conn.fetch(
-                    """SELECT id, platform, account_name, account_username, account_avatar
-                       FROM platform_tokens
-                       WHERE user_id = $1 AND id = ANY($2::uuid[]) AND revoked_at IS NULL""",
-                    uid,
-                    list(all_token_ids),
-                )
-                for r in tok_rows:
-                    token_rows_by_id[str(r["id"])] = r
-
-            result = []
-            for upload, target_ids in zip(uploads, normalized_by_row):
-                thumbnail_url = None
-                if upload.get("thumbnail_r2_key"):
-                    try:
-                        s3 = get_s3_client()
-                        thumbnail_url = s3.generate_presigned_url(
-                            "get_object",
-                            Params={
-                                "Bucket": R2_BUCKET_NAME,
-                                "Key": _normalize_r2_key(upload["thumbnail_r2_key"]),
-                            },
-                            ExpiresIn=3600,
-                        )
-                    except Exception:
-                        pass
-
-                smart_schedule = None
-                try:
-                    sm = upload.get("schedule_metadata")
-                    if sm and upload.get("schedule_mode") == "smart":
-                        smart_schedule = sm if isinstance(sm, dict) else json.loads(sm)
-                except Exception:
-                    pass
-
-                target_account_details = []
-                for tid in target_ids:
-                    r = token_rows_by_id.get(tid)
-                    if not r:
-                        continue
-                    target_account_details.append(
-                        {
-                            "id": str(r["id"]),
-                            "platform": r["platform"],
-                            "name": r["account_name"] or "",
-                            "username": r["account_username"] or "",
-                            "avatar": resolve_stored_account_avatar_url(r["account_avatar"]) or "",
-                        }
-                    )
-
-                result.append(
-                    {
-                        "id": str(upload["id"]),
-                        "filename": upload.get("filename") or "",
-                        "title": upload.get("title") or "Untitled",
-                        "scheduled_time": upload["scheduled_time"].isoformat()
-                        if upload.get("scheduled_time")
-                        else None,
-                        "timezone": str(upload.get("timezone") or "UTC"),
-                        "platforms": list(upload["platforms"]) if upload.get("platforms") else [],
-                        "target_accounts": target_ids,
-                        "target_account_details": target_account_details,
-                        "thumbnail": thumbnail_url,
-                        "caption": upload.get("caption"),
-                        "status": upload["status"],
-                        "schedule_mode": upload.get("schedule_mode") or "scheduled",
-                        "smart_schedule": smart_schedule,
-                        "is_editable": upload["status"] in SCHEDULED_PIPELINE_STATUSES,
-                        "created_at": upload["created_at"].isoformat()
-                        if upload.get("created_at")
-                        else None,
-                    }
-                )
-
-        return result
+        return await _scheduled_upload_list_for_user(
+            core.state.db_pool,
+            uid,
+            presign_thumbnails=presign_thumbnails,
+            presign_account_avatars=presign_thumbnails,
+        )
     except Exception:
         logger.exception("get_scheduled_list failed user_id=%s", uid)
         raise

@@ -3,6 +3,7 @@ UploadM8 Admin Router — all /api/admin/* endpoints.
 Admin HTTP surface; prefer thin handlers and ``services/`` for new logic.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -43,15 +44,31 @@ from core.models import (
     AdminResetPasswordIn,
     AnnouncementRequest,
     NotificationSettings,
+    AdminWalletDisputePatch,
 )
 from stages.entitlements import (
     TIER_CONFIG,
     TOPUP_PRODUCTS,
+    PUBLIC_TIER_SLUGS,
     get_entitlements_for_tier,
+    get_effective_tier_config,
+    get_effective_topup_products,
+    get_tiers_for_api,
     entitlements_to_dict,
     normalize_tier,
+    tier_cfg_to_api_dict,
 )
-from services.admin_kpi_finance import fetch_stripe_refunds_window
+from services.admin_kpi_finance import build_admin_costs_summary, fetch_stripe_refunds_window
+from services.admin_kpi_reliability import (
+    fetch_admin_attach_metrics,
+    fetch_admin_growth_metrics,
+    fetch_admin_reliability_metrics,
+)
+from services.canonical_engagement import ROLLUP_VERSION, compute_admin_engagement_totals
+from services import metric_definitions as metric_definitions_svc
+from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
+from services.ml_observability import hf_write_token
+from services.wallet_disputes import admin_patch_wallet_dispute, list_admin_wallet_disputes
 from stages.emails import (
     send_email_change_email,
     send_admin_reset_password_email,
@@ -66,6 +83,17 @@ from stages.emails import (
 logger = logging.getLogger("uploadm8-api")
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+
+class BillingWeightsPut(BaseModel):
+    weights: Dict[str, int] = Field(default_factory=dict)
+    put_cost_rules: Optional[Dict[str, int]] = None
+
+
+class BillingCatalogPut(BaseModel):
+    tier_overrides: Dict[str, Any] = Field(default_factory=dict)
+    topup_overrides: Dict[str, Any] = Field(default_factory=dict)
+    tier_service_overrides: Dict[str, Dict[str, bool]] = Field(default_factory=dict)
 
 
 def _tier_json_key(tier: Any) -> str:
@@ -89,7 +117,7 @@ def _platform_upload_mix_sql() -> str:
 def _tier_list_price_usd(tier: Any) -> float:
     """Monthly list price from TIER_CONFIG (get_plan / entitlements_to_dict omit price)."""
     slug = normalize_tier(str(tier) if tier is not None else "free")
-    return float((TIER_CONFIG.get(slug) or {}).get("price", 0) or 0)
+    return float((get_effective_tier_config().get(slug) or {}).get("price", 0) or 0)
 
 
 @router.get("/ml/observability-overview")
@@ -102,11 +130,18 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
     dataset_path = root / "data" / "ml" / "promo_targeting_train_v1.parquet"
     baseline_report_path = root / "data" / "ml" / "promo_targeting_baseline_report.json"
 
-    hf_token = (os.environ.get("HF_TOKEN") or "").strip()
+    hf_token = hf_write_token()
     trackio_project = (os.environ.get("TRACKIO_PROJECT") or "").strip()
     trackio_space = (os.environ.get("TRACKIO_SPACE_ID") or "").strip()
+    try:
+        trackio_package_importable = importlib.util.find_spec("trackio") is not None
+    except Exception:
+        trackio_package_importable = False
 
+    hf_links = ml_hub_huggingface_dict()
+    hub_urls = get_ml_hub_urls()
     summary: Dict[str, Any] = {
+        "as_of": datetime.now(timezone.utc).isoformat(),
         "local": {
             "repo_root": str(root),
             "dataset_path": str(dataset_path),
@@ -116,15 +151,18 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
         },
         "huggingface": {
             "token_configured": bool(hf_token),
-            "dataset_repo": "cedy243/uploadm8-promo-targeting-v1",
-            "dataset_url": "https://huggingface.co/datasets/cedy243/uploadm8-promo-targeting-v1",
-            "trackio_space_url": "https://huggingface.co/spaces/cedy243/uploadm8-trackio",
+            **hf_links,
+        },
+        "hub_pages": {
+            "dataset_url_configured": bool(hub_urls.get("dataset_url")),
+            "trackio_space_url_configured": bool(hub_urls.get("trackio_space_url")),
         },
         "trackio": {
             "project_configured": bool(trackio_project),
             "project": trackio_project,
             "space_configured": bool(trackio_space),
             "space_id": trackio_space,
+            "package_importable": trackio_package_importable,
         },
     }
 
@@ -144,14 +182,41 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
             db["upload_quality_scores_daily_count"] = int(
                 await conn.fetchval("SELECT COUNT(*)::int FROM upload_quality_scores_daily") or 0
             )
-            db["latest_m8_model_run"] = await conn.fetchrow(
+            try:
+                db["visual_entity_catalog_count"] = int(
+                    await conn.fetchval("SELECT COUNT(*)::int FROM user_visual_entity_catalog") or 0
+                )
+                db["visual_entity_creator_count"] = int(
+                    await conn.fetchval(
+                        "SELECT COUNT(DISTINCT user_id)::int FROM user_visual_entity_catalog"
+                    )
+                    or 0
+                )
+            except Exception:
+                db["visual_entity_catalog_count"] = 0
+                db["visual_entity_creator_count"] = 0
+            lr = await conn.fetchrow(
                 """
-                SELECT id::text AS id, trained_at, model_version, train_row_count, val_mae_log1p_views
+                SELECT id::text AS id, trained_at, model_version, train_row_count, val_mae_log1p_views,
+                       COALESCE(related_ops_incident_ids, ARRAY[]::uuid[]) AS related_ops_incident_ids
                 FROM m8_model_runs
                 ORDER BY trained_at DESC
                 LIMIT 1
                 """
             )
+            if lr:
+                db["latest_m8_model_run"] = {
+                    "id": lr["id"],
+                    "trained_at": lr["trained_at"].isoformat() if lr.get("trained_at") else None,
+                    "model_version": lr["model_version"],
+                    "train_row_count": int(lr["train_row_count"] or 0),
+                    "val_mae_log1p_views": float(lr["val_mae_log1p_views"])
+                    if lr.get("val_mae_log1p_views") is not None
+                    else None,
+                    "related_ops_incident_ids": [str(x) for x in (lr["related_ops_incident_ids"] or [])],
+                }
+            else:
+                db["latest_m8_model_run"] = None
     except Exception as e:
         db["error"] = str(e)
 
@@ -164,7 +229,7 @@ async def ml_observability_trends(days: int = Query(30, ge=7, le=90), user: dict
     """
     Daily trend snapshots for ML observability page.
     """
-    out: Dict[str, Any] = {"days": int(days), "series": {}}
+    out: Dict[str, Any] = {"days": int(days), "as_of": datetime.now(timezone.utc).isoformat(), "series": {}}
     try:
         async with core.state.db_pool.acquire() as conn:
             outcome = await conn.fetch(
@@ -401,6 +466,17 @@ async def _insert_delivery_intents(conn, announcement_id: str, *, sender_user_id
 
 async def _execute_announcement_deliveries(conn, announcement_id: str, title: str, body: str):
     """Execute queued deliveries for an announcement and update rollups."""
+    from services.marketing_promo_media import resolve_promo_presigned_url
+
+    ann_row = await conn.fetchrow(
+        "SELECT promo_media FROM announcements WHERE id = $1::uuid",
+        announcement_id,
+    )
+    hero_url = ""
+    if ann_row:
+        u = await resolve_promo_presigned_url(conn, ann_row.get("promo_media"))
+        hero_url = (u or "").strip()
+
     rows = await conn.fetch(
         """
         SELECT id, channel, destination
@@ -425,7 +501,7 @@ async def _execute_announcement_deliveries(conn, announcement_id: str, title: st
 
         if ch == "email":
             try:
-                await send_announcement_email(dest, title, body)
+                await send_announcement_email(dest, title, body, hero_image_url=hero_url)
                 ok = True
                 email_sent += 1
             except Exception as e:
@@ -433,12 +509,18 @@ async def _execute_announcement_deliveries(conn, announcement_id: str, title: st
                 err = str(e)
 
         elif ch == "discord_community":
-            ok, err = await _discord_post_raw(dest, embeds=[{"title": f"\U0001f4e2 {title}", "description": body, "color": 0xf97316}])
+            emb: Dict[str, Any] = {"title": f"\U0001f4e2 {title}", "description": body, "color": 0xf97316}
+            if hero_url:
+                emb["image"] = {"url": hero_url[:2048]}
+            ok, err = await _discord_post_raw(dest, embeds=[emb])
             if ok:
                 discord_sent += 1
 
         elif ch == "user_webhook":
-            ok, err = await _discord_post_raw(dest, embeds=[{"title": f"\U0001f4e2 {title}", "description": body, "color": 0xf97316}])
+            emb2: Dict[str, Any] = {"title": f"\U0001f4e2 {title}", "description": body, "color": 0xf97316}
+            if hero_url:
+                emb2["image"] = {"url": hero_url[:2048]}
+            ok, err = await _discord_post_raw(dest, embeds=[emb2])
             if ok:
                 webhook_sent += 1
 
@@ -620,12 +702,21 @@ async def send_announcement(data: AnnouncementRequest, background_tasks: Backgro
         # Insert announcement row
         # ----------------------------
         ann_id = str(uuid.uuid4())
+        pm_raw = getattr(data, "promo_media", None)
+        pm_row: Dict[str, Any] = pm_raw if isinstance(pm_raw, dict) else {}
         await conn.execute(
             """
-            INSERT INTO announcements (id, title, body, channels, target, target_tiers, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO announcements (id, title, body, channels, target, target_tiers, created_by, promo_media)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
             """,
-            ann_id, title, body, channels_store, getattr(data, "target", "all"), getattr(data, "target_tiers", None), user["id"]
+            ann_id,
+            title,
+            body,
+            channels_store,
+            getattr(data, "target", "all"),
+            getattr(data, "target_tiers", None),
+            user["id"],
+            json.dumps(pm_row),
         )
 
         # ----------------------------
@@ -1366,28 +1457,34 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
             since,
         )
 
-        # Costs (openai, storage, compute, stripe_fees, mailgun, bandwidth, postgres, redis)
-        costs = await conn.fetchrow("""
-            SELECT
-                COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
-                COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
-                COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
-                COALESCE(SUM(CASE WHEN category = 'stripe_fees' THEN cost_usd ELSE 0 END), 0)::decimal AS stripe_fees,
-                COALESCE(SUM(CASE WHEN category = 'mailgun' THEN cost_usd ELSE 0 END), 0)::decimal AS mailgun,
-                COALESCE(SUM(CASE WHEN category = 'bandwidth' THEN cost_usd ELSE 0 END), 0)::decimal AS bandwidth,
-                COALESCE(SUM(CASE WHEN category = 'postgres' THEN cost_usd ELSE 0 END), 0)::decimal AS postgres,
-                COALESCE(SUM(CASE WHEN category = 'redis' THEN cost_usd ELSE 0 END), 0)::decimal AS redis
-            FROM cost_tracking WHERE created_at >= $1
-        """, since)
-        openai_cost = float(costs["openai"] or 0) if costs else 0
-        storage_cost = float(costs["storage"] or 0) if costs else 0
-        compute_cost = float(costs["compute"] or 0) if costs else 0
-        stripe_fees = float(costs.get("stripe_fees") or 0) if costs else 0
-        mailgun_cost = float(costs.get("mailgun") or 0) if costs else 0
-        bandwidth_cost = float(costs.get("bandwidth") or 0) if costs else 0
-        postgres_cost = float(costs.get("postgres") or 0) if costs else 0
-        redis_cost = float(costs.get("redis") or 0) if costs else 0
-        total_costs = openai_cost + storage_cost + compute_cost + stripe_fees + mailgun_cost + bandwidth_cost + postgres_cost + redis_cost
+        until = _now_utc()
+        cost_summary = await build_admin_costs_summary(
+            conn, since=since, until=until, range_key=range,
+        )
+        openai_cost = cost_summary["openai_cost"]
+        openai_calls = cost_summary["openai_calls"]
+        google_cloud_cost = cost_summary["google_cloud_cost"]
+        pikzels_cost = cost_summary["pikzels_cost"]
+        pikzels_calls = cost_summary["pikzels_calls"]
+        twelvelabs_cost = cost_summary["twelvelabs_cost"]
+        serpapi_cost = cost_summary["serpapi_cost"]
+        other_provider_cost = cost_summary["other_provider_cost"]
+        storage_cost = cost_summary["storage_cost"]
+        storage_gb = cost_summary["storage_gb"]
+        bandwidth_cost = cost_summary["bandwidth_cost"]
+        bandwidth_tb = cost_summary["bandwidth_tb"]
+        compute_cost = cost_summary["compute_cost"]
+        stripe_fees = cost_summary["stripe_fees"]
+        stripe_fee_txns = cost_summary["stripe_fee_txns"]
+        mailgun_cost = cost_summary["mailgun_cost"]
+        mailgun_emails_sent = cost_summary["mailgun_emails_sent"]
+        postgres_cost = cost_summary["postgres_cost"]
+        postgres_size_gb = cost_summary["postgres_size_gb"]
+        redis_cost = cost_summary["redis_cost"]
+        redis_memory_mb = cost_summary["redis_memory_mb"]
+        total_costs = cost_summary["total_costs"]
+        cost_providers = cost_summary.get("providers") or []
+        cost_provenance = cost_summary.get("cost_provenance") or {}
 
         gross_margin = ((total_mrr - total_costs) / max(total_mrr, 1)) * 100 if total_mrr > 0 else 0
 
@@ -1404,7 +1501,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
 
         prev_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1 AND created_at < $2", prev_since, since)
         uploads_change = ((total_uploads - prev_uploads) / max(prev_uploads, 1)) * 100 if prev_uploads > 0 else 0
-        cost_per_upload = total_costs / max(successful_uploads, 1)
+        cost_per_upload = cost_summary["cost_per_upload"]
 
         w_min = float(os.environ.get("KPI_WHISPER_ASSUMED_MINUTES_PER_UPLOAD", "0.5") or 0.5)
         w_usd = float(os.environ.get("KPI_WHISPER_USD_PER_MINUTE", "0.006") or 0.006)
@@ -1426,6 +1523,12 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
 
         cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
 
+        admin_eng = await compute_admin_engagement_totals(
+            conn, window_start=since, window_end_exclusive=until,
+        )
+        reliability = await fetch_admin_reliability_metrics(conn, since, until)
+        attach = await fetch_admin_attach_metrics(conn, since, until)
+
     return {
         "total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": mrr_by_tier,
         "mrr_launch": mrr_by_tier.get("launch", 0), "mrr_creator_pro": mrr_by_tier.get("creator_pro", 0),
@@ -1438,9 +1541,16 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "topup_count": int(revenue["topup_cnt"] or 0) if revenue else 0,
         "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
         "refunds": 0, "refund_count": 0,
-        "openai_cost": openai_cost, "storage_cost": storage_cost, "compute_cost": compute_cost,
-        "stripe_fees": stripe_fees, "mailgun_cost": mailgun_cost, "bandwidth_cost": bandwidth_cost,
-        "postgres_cost": postgres_cost, "redis_cost": redis_cost,
+        "openai_cost": openai_cost, "openai_calls": openai_calls,
+        "google_cloud_cost": google_cloud_cost, "pikzels_cost": pikzels_cost, "pikzels_calls": pikzels_calls,
+        "twelvelabs_cost": twelvelabs_cost, "serpapi_cost": serpapi_cost, "other_provider_cost": other_provider_cost,
+        "storage_cost": storage_cost, "storage_gb": storage_gb,
+        "compute_cost": compute_cost, "bandwidth_cost": bandwidth_cost, "bandwidth_tb": bandwidth_tb,
+        "stripe_fees": stripe_fees, "stripe_fee_txns": stripe_fee_txns,
+        "mailgun_cost": mailgun_cost, "mailgun_emails_sent": mailgun_emails_sent,
+        "postgres_cost": postgres_cost, "postgres_size_gb": postgres_size_gb,
+        "redis_cost": redis_cost, "redis_memory_mb": redis_memory_mb,
+        "providers": cost_providers, "cost_provenance": cost_provenance,
         "total_costs": total_costs, "cost_per_upload": round(cost_per_upload, 4),
         "gross_margin": round(gross_margin, 1), "gross_margin_change": 0,
         "funnel_signups": new_users, "funnel_connected": funnel_connected, "funnel_uploaded": funnel_uploaded,
@@ -1449,11 +1559,27 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "cancellations": cancellations, "cancellation_rate": round((cancellations / max(paid_users, 1)) * 100, 1),
         "failed_payments": 0, "payment_failure_rate": 0,
         "total_uploads": total_uploads, "successful_uploads": successful_uploads, "success_rate": round(success_rate, 1),
-        "transcode_fail_rate": 0, "platform_fail_rate": 0, "retry_rate": 0,
-        "avg_process_time": 0, "avg_transcode_time": 0, "cancel_rate": 0, "queue_depth": queue_depth or 0,
+        "transcode_fail_rate": reliability.get("transcode_fail_rate", 0),
+        "platform_fail_rate": reliability.get("platform_fail_rate", 0),
+        "retry_rate": reliability.get("retry_rate", 0),
+        "avg_process_time": reliability.get("avg_process_time", 0),
+        "avg_transcode_time": reliability.get("avg_transcode_time") or 0,
+        "cancel_rate": reliability.get("cancel_rate", 0),
+        "queue_depth": reliability.get("queue_depth", queue_depth or 0),
+        "ai_attach_rate": attach.get("ai_attach_rate", 0),
+        "topup_attach_rate": attach.get("topup_attach_rate", 0),
+        "flex_adoption_rate": attach.get("flex_adoption_rate", 0),
         "new_users": new_users, "new_users_change": round(new_users_change, 1), "uploads_change": round(uploads_change, 1),
-        "active_users": active_users or 0, "total_views": upload_stats["views"] if upload_stats else 0,
-        "total_likes": upload_stats["likes"] if upload_stats else 0,
+        "active_users": active_users or 0,
+        "total_views": admin_eng.get("views", 0),
+        "total_likes": admin_eng.get("likes", 0),
+        "total_comments": admin_eng.get("comments", 0),
+        "total_shares": admin_eng.get("shares", 0),
+        "total_views_raw": admin_eng.get("raw_upload_sum_views", 0),
+        "total_likes_raw": admin_eng.get("raw_upload_sum_likes", 0),
+        "engagement_crosswalk": metric_definitions_svc.engagement_crosswalk(),
+        "metric_definitions": metric_definitions_svc.admin_kpi_data_provenance(rollup_version=ROLLUP_VERSION),
+        "engagement_provenance": admin_eng.get("kpi_sources"),
         "avg_uploads_per_user": round(total_uploads / max(active_users or 1, 1), 1),
         "tier_breakdown": tier_breakdown, "platform_distribution": platform_distribution,
         "whisper_cost_estimate_usd": round(whisper_cost_estimate_usd, 4),
@@ -1607,63 +1733,30 @@ async def get_kpi_revenue(range: str = Query("30d"), user: dict = Depends(requir
 async def get_kpi_costs(range: str = Query("30d"), user: dict = Depends(require_admin)):
     minutes = _range_to_minutes(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
+    until = _now_utc()
     async with core.state.db_pool.acquire() as conn:
-        costs = await conn.fetchrow("""
-            SELECT
-                COALESCE(SUM(CASE WHEN category = 'openai' THEN cost_usd ELSE 0 END), 0)::decimal AS openai,
-                COALESCE(SUM(CASE WHEN category = 'storage' THEN cost_usd ELSE 0 END), 0)::decimal AS storage,
-                COALESCE(SUM(CASE WHEN category = 'compute' THEN cost_usd ELSE 0 END), 0)::decimal AS compute,
-                COALESCE(SUM(CASE WHEN category = 'stripe_fees' THEN cost_usd ELSE 0 END), 0)::decimal AS stripe_fees,
-                COALESCE(SUM(CASE WHEN category = 'mailgun' THEN cost_usd ELSE 0 END), 0)::decimal AS mailgun,
-                COALESCE(SUM(CASE WHEN category = 'bandwidth' THEN cost_usd ELSE 0 END), 0)::decimal AS bandwidth,
-                COALESCE(SUM(CASE WHEN category = 'postgres' THEN cost_usd ELSE 0 END), 0)::decimal AS postgres,
-                COALESCE(SUM(CASE WHEN category = 'redis' THEN cost_usd ELSE 0 END), 0)::decimal AS redis
-            FROM cost_tracking WHERE created_at >= $1
-        """, since)
-        uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('completed','succeeded') AND created_at >= $1", since)
-    if not costs:
-        return {"openai_cost": 0, "storage_cost": 0, "compute_cost": 0, "stripe_fees": 0, "mailgun_cost": 0, "bandwidth_cost": 0, "postgres_cost": 0, "redis_cost": 0, "total_costs": 0, "costs_change": 0, "cost_per_upload": 0, "successful_uploads": uploads or 0, "total_cogs": 0}
-    o = float(costs["openai"] or 0)
-    s = float(costs["storage"] or 0)
-    c = float(costs["compute"] or 0)
-    sf = float(costs.get("stripe_fees") or 0)
-    mg = float(costs.get("mailgun") or 0)
-    bw = float(costs.get("bandwidth") or 0)
-    pg = float(costs.get("postgres") or 0)
-    rd = float(costs.get("redis") or 0)
-    total = o + s + c + sf + mg + bw + pg + rd
-    return {"openai_cost": o, "storage_cost": s, "compute_cost": c, "stripe_fees": sf, "mailgun_cost": mg, "bandwidth_cost": bw, "postgres_cost": pg, "redis_cost": rd, "total_costs": total, "costs_change": 0, "cost_per_upload": round(total / max(uploads or 1, 1), 4), "successful_uploads": uploads or 0, "total_cogs": total}
+        summary = await build_admin_costs_summary(
+            conn, since=since, until=until, range_key=range,
+        )
+    return {**summary, "costs_change": 0}
 
 
 @router.get("/kpi/growth")
 async def get_kpi_growth(range: str = Query("30d"), user: dict = Depends(require_admin)):
     minutes = _range_to_minutes(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
+    until = _now_utc()
     async with core.state.db_pool.acquire() as conn:
-        signups = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
-        connected = await conn.fetchval("SELECT COUNT(DISTINCT u.id) FROM users u JOIN platform_tokens pt ON u.id = pt.user_id WHERE u.created_at >= $1", since)
-        uploaded = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
-        paid = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family', 'lifetime') AND subscription_status = 'active' AND updated_at >= $1", since)
-        cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
-    return {"activation": {"rate": round((uploaded / max(signups, 1)) * 100, 1), "signups": signups, "connected": connected, "firstUpload": uploaded},
-            "conversion": {"freeToPaid": round((paid / max(signups, 1)) * 100, 1), "trialToPaid": 0, "avgDays": 7, "count30d": paid, "change": 0},
-            "attach": {"ai": 0, "topups": 0, "flex": 0, "average": 0},
-            "churn": {"rate": 0, "cancellations": cancellations, "failedPayments": 0, "downgrades": 0},
-            "free_to_paid_rate": round((paid / max(signups, 1)) * 100, 1), "conversion_change": 0}
+        return await fetch_admin_growth_metrics(conn, since, until)
 
 
 @router.get("/kpi/reliability")
 async def get_kpi_reliability(range: str = Query("30d"), user: dict = Depends(require_admin)):
     minutes = _range_to_minutes(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
+    until = _now_utc()
     async with core.state.require_pool().acquire() as conn:
-        stats = await conn.fetchrow("SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed FROM uploads WHERE created_at >= $1", since)
-        queue = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE status IN ('pending', 'queued', 'processing')")
-    total, completed = (stats["total"] or 0, stats["completed"] or 0) if stats else (0, 0)
-    sr = (completed / max(total, 1)) * 100
-    return {"success_rate": round(sr, 1), "reliability_change": 0, "failRates": {"ingest": 0.5, "processing": 1, "upload": round(100-sr, 1), "publish": 0.5, "average": round(100-sr, 1)},
-            "retries": {"rate": 5, "one": 3, "two": 1.5, "threePlus": 0.5}, "processingTime": {"ingest": 2, "transcode": 15, "upload": 8, "average": 25},
-            "cancels": {"rate": 2, "beforeProcessing": 1.5, "duringProcessing": 0.5, "total30d": 0}, "queue_depth": queue or 0}
+        return await fetch_admin_reliability_metrics(conn, since, until)
 
 
 @router.post("/kpi/refresh")
@@ -1785,6 +1878,29 @@ async def get_kpi_recognition(
             limit,
         )
 
+    entity_catalog_total = 0
+    entity_buckets: Dict[str, Any] = {}
+    try:
+        from services.visual_entity_memory import fetch_platform_bucket_kpis
+        from core.visual_entity_taxonomy import narrative_bucket_labels
+
+        async with core.state.require_pool().acquire() as conn_ec:
+            entity_catalog_total = await conn_ec.fetchval(
+                "SELECT COUNT(*)::int FROM user_visual_entity_catalog"
+            )
+        bucket_kpis = await fetch_platform_bucket_kpis(
+            core.state.db_pool, since=since, limit=min(limit, 12)
+        )
+        labels = narrative_bucket_labels()
+        for key, items in (bucket_kpis.get("buckets") or {}).items():
+            if items:
+                entity_buckets[key] = {
+                    "label": labels.get(key, key),
+                    "top": items,
+                }
+    except Exception as e:
+        logger.debug("kpi recognition entity buckets: %s", e)
+
     coverage_pct = (
         (summary_total or 0) / max(upload_total or 1, 1) * 100.0
     ) if upload_total else 0.0
@@ -1808,24 +1924,55 @@ async def get_kpi_recognition(
         "top_objects": [{"label": r["d"], "count": int(r["n"])} for r in top_objects],
         "top_logos": [{"label": r["d"], "count": int(r["n"])} for r in top_logos],
         "top_text": [{"label": r["d"], "count": int(r["n"])} for r in top_text],
+        "entity_catalog_total": int(entity_catalog_total or 0),
+        "entity_buckets": entity_buckets,
     }
+
+
+@router.post("/ml/sync-visual-entities")
+async def admin_sync_visual_entities_hub(
+    user: dict = Depends(require_admin),
+    limit_users: int = Query(200, ge=1, le=2000),
+):
+    """
+    Push aggregated visual entity catalogs to the configured Hugging Face dataset
+    (``UM8_HF_DATASET_REPO``, config ``visual_entities``). Requires ``HF_TOKEN``.
+    """
+    from services.ml_entity_hub_sync import build_platform_visual_entity_export, push_visual_entities_to_hub
+
+    rows = await build_platform_visual_entity_export(
+        core.state.db_pool, limit_per_user=limit_users
+    )
+    result = push_visual_entities_to_hub(rows)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=400 if result.get("skipped") else 502,
+            detail=result.get("error") or result.get("reason") or "sync failed",
+        )
+    return result
 
 
 @router.get("/kpi/usage")
 async def get_kpi_usage(range: str = Query("30d"), user: dict = Depends(require_admin)):
     minutes = _range_to_minutes(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
-    prev_since = since - timedelta(minutes=minutes)
+    until = _now_utc()
     async with core.state.db_pool.acquire() as conn:
         active = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since)
         new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
+        prev_since = since - timedelta(minutes=minutes)
         prev_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1 AND created_at < $2", prev_since, since)
-        engagement = await conn.fetchrow("SELECT COALESCE(SUM(views), 0)::bigint AS views, COALESCE(SUM(likes), 0)::bigint AS likes FROM uploads WHERE created_at >= $1", since)
+        admin_eng = await compute_admin_engagement_totals(
+            conn, window_start=since, window_end_exclusive=until,
+        )
     chg = ((new_users - prev_users) / max(prev_users, 1)) * 100 if prev_users > 0 else 0
     return {"active_users": active or 0, "active_users_change": 0, "total_uploads": uploads or 0, "uploads_change": 0,
-            "new_users": new_users or 0, "new_users_change": round(chg, 1), "total_views": engagement["views"] if engagement else 0,
-            "total_likes": engagement["likes"] if engagement else 0, "avg_uploads_per_user": round((uploads or 0) / max(active or 1, 1), 1)}
+            "new_users": new_users or 0, "new_users_change": round(chg, 1),
+            "total_views": admin_eng.get("views", 0), "total_likes": admin_eng.get("likes", 0),
+            "total_comments": admin_eng.get("comments", 0), "total_shares": admin_eng.get("shares", 0),
+            "total_views_raw": admin_eng.get("raw_upload_sum_views", 0),
+            "avg_uploads_per_user": round((uploads or 0) / max(active or 1, 1), 1)}
 
 
 # ============================================================
@@ -1863,8 +2010,190 @@ async def get_chart_users(period: str = Query("30d"), user: dict = Depends(requi
 
 
 # ============================================================
-# SETTINGS
+# BILLING — pipeline AIC weights (master admin)
 # ============================================================
+
+
+@router.get("/billing/service-weights")
+async def admin_get_billing_service_weights(user: dict = Depends(require_master_admin)):
+    """Live per-service AIC weights from ``billing_service_weights`` merged with code defaults."""
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database unavailable")
+    from stages.ai_service_costs import SERVICE_WEIGHTS, merge_service_weights_from_db, service_catalog
+    from services.billing_service_weights import fetch_service_weights_map
+    from services.billing_catalog import (
+        PUT_COST_DEFAULTS,
+        effective_put_cost_rules,
+        merge_put_cost_overrides,
+    )
+
+    async with core.state.require_pool().acquire() as conn:
+        raw = await fetch_service_weights_map(conn)
+    merged = merge_service_weights_from_db(raw)
+    put_db = dict(core.state.billing_catalog_cache.get("put_cost_overrides") or {})
+    put_effective = effective_put_cost_rules()
+    return {
+        "code_defaults": dict(SERVICE_WEIGHTS),
+        "db_weights": raw,
+        "effective": merged,
+        "catalog": service_catalog(merged),
+        "put_cost_defaults": dict(PUT_COST_DEFAULTS),
+        "put_cost_db_overrides": put_db,
+        "put_cost_effective": put_effective,
+    }
+
+
+@router.put("/billing/service-weights")
+async def admin_put_billing_service_weights(
+    body: BillingWeightsPut,
+    user: dict = Depends(require_master_admin),
+):
+    """Upsert AIC weights (only ``SERVICE_WEIGHTS`` keys) and optional PUT debit constants."""
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database unavailable")
+    if not body.weights and body.put_cost_rules is None:
+        raise HTTPException(400, "Provide weights and/or put_cost_rules")
+    from services.billing_service_weights import upsert_service_weights
+    from services.billing_catalog import save_put_cost_overrides, validate_put_cost_overrides
+
+    n = 0
+    put_n = 0
+    async with core.state.require_pool().acquire() as conn:
+        if body.weights:
+            n = await upsert_service_weights(conn, body.weights, updated_by=str(user["id"]))
+        if body.put_cost_rules is not None:
+            validated = validate_put_cost_overrides(body.put_cost_rules)
+            await save_put_cost_overrides(conn, validated, str(user["id"]))
+            put_n = len(validated)
+    return {"status": "updated", "rows_written": n, "put_cost_rows_written": put_n}
+
+
+@router.get("/billing/catalog")
+async def admin_get_billing_catalog(user: dict = Depends(require_master_admin)):
+    """DB overrides for public tiers + top-ups; merged values for UI."""
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database unavailable")
+    from services.billing_catalog import (
+        effective_tier_services_matrix,
+        fetch_catalog_row,
+        tier_config_before_billing_overrides,
+        topup_products_before_billing_overrides,
+    )
+    from services.stripe_lookup_keys import subscription_keys_from_catalog
+    from stages.ai_service_costs import service_catalog
+
+    async with core.state.require_pool().acquire() as conn:
+        row = await fetch_catalog_row(conn)
+        subscription_stripe_keys = await subscription_keys_from_catalog(conn)
+    tier_cfg = get_effective_tier_config()
+    public = {s: tier_cfg.get(s, {}) for s in ("free", "creator_lite", "creator_pro", "studio", "agency")}
+    tier_base = tier_config_before_billing_overrides()
+    baseline_public_tiers = {s: tier_base.get(s, {}) for s in ("free", "creator_lite", "creator_pro", "studio", "agency")}
+    topups = []
+    top_base = topup_products_before_billing_overrides()
+    baseline_topups = {}
+    for lk, meta in get_effective_topup_products().items():
+        wallet = meta.get("wallet") or ""
+        kind = "bundle" if wallet == "bundle" else wallet
+        row_d = {
+            "lookup_key": lk,
+            "kind": kind,
+            "wallet": meta.get("wallet"),
+            "amount": meta.get("amount"),
+            "put": meta.get("put"),
+            "aic": meta.get("aic"),
+            "price_usd": meta.get("price_usd") or meta.get("price"),
+        }
+        topups.append(row_d)
+        bmeta = top_base.get(lk) or {}
+        baseline_topups[lk] = {
+            "lookup_key": lk,
+            "wallet": bmeta.get("wallet"),
+            "amount": bmeta.get("amount"),
+            "put": bmeta.get("put"),
+            "aic": bmeta.get("aic"),
+            "price_usd": bmeta.get("price_usd") or bmeta.get("price"),
+        }
+    svc_matrix = effective_tier_services_matrix()
+    return {
+        "tier_overrides": dict(core.state.billing_catalog_cache.get("tier_overrides") or {}),
+        "topup_overrides": dict(core.state.billing_catalog_cache.get("topup_overrides") or {}),
+        "tier_service_overrides": dict(core.state.billing_catalog_cache.get("tier_service_overrides") or {}),
+        "effective_tier_services": svc_matrix,
+        "service_catalog": service_catalog(),
+        "effective_public_tiers": public,
+        "baseline_public_tiers": baseline_public_tiers,
+        "topups": topups,
+        "baseline_topups": baseline_topups,
+        "subscription_stripe_keys": subscription_stripe_keys,
+        "catalog_loaded_at": core.state.catalog_pricing_cache.get("loaded_at"),
+        "last_sync_at": core.state.billing_catalog_cache.get("last_sync_at"),
+        "last_sync_ok": core.state.billing_catalog_cache.get("last_sync_ok"),
+        "last_sync_error": core.state.billing_catalog_cache.get("last_sync_error"),
+        "last_sync_detail": core.state.billing_catalog_cache.get("last_sync_detail"),
+        "updated_at": row["updated_at"].isoformat() if row and row.get("updated_at") else None,
+        "merge_order": "TIER_CONFIG → catalog_products → billing_catalog tier_overrides",
+    }
+
+
+@router.get("/billing/effective-tiers")
+async def admin_get_effective_tiers(user: dict = Depends(require_master_admin)):
+    """
+    Live merged public tier matrix for admin billing UIs.
+    Same values as ``GET /api/pricing`` and runtime entitlement checks (DB-backed).
+    """
+    by_slug = {row["slug"]: row for row in get_tiers_for_api()}
+    tiers = [by_slug[s] for s in PUBLIC_TIER_SLUGS if s in by_slug]
+    return {
+        "tiers": tiers,
+        "tier_slugs": list(PUBLIC_TIER_SLUGS),
+        "catalog_loaded_at": core.state.catalog_pricing_cache.get("loaded_at"),
+        "billing_catalog_updated_at": core.state.billing_catalog_cache.get("updated_at"),
+        "merge_order": "TIER_CONFIG → catalog_products → billing_catalog tier_overrides",
+    }
+
+
+@router.put("/billing/catalog")
+async def admin_put_billing_catalog(
+    body: BillingCatalogPut,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(require_master_admin),
+):
+    """Replace tier/topup override JSON; triggers async PNG regen + Stripe sync."""
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database unavailable")
+    from services.billing_catalog import save_catalog_overrides
+    from services.catalog_publish import refresh_pricing_caches_after_catalog_sync
+
+    async with core.state.require_pool().acquire() as conn:
+        await save_catalog_overrides(
+            conn,
+            body.tier_overrides,
+            body.topup_overrides,
+            str(user["id"]),
+            body.tier_service_overrides,
+        )
+        await refresh_pricing_caches_after_catalog_sync(conn)
+        await log_admin_audit(
+            conn,
+            user_id=str(user["id"]),
+            admin=user,
+            action="ADMIN_BILLING_CATALOG_SAVE",
+            details={
+                "tier_slugs": list(body.tier_overrides.keys()),
+                "topup_keys": list(body.topup_overrides.keys()),
+                "tier_service_slugs": list(body.tier_service_overrides.keys()),
+            },
+            request=request,
+            resource_type="billing_catalog",
+            resource_id="1",
+            severity="INFO",
+        )
+
+    background_tasks.add_task(run_billing_catalog_sync_job)
+    return {"status": "saved", "background_sync": "started"}
+
 
 @router.get("/settings")
 async def get_admin_settings(user: dict = Depends(require_master_admin)):
@@ -1890,27 +2219,45 @@ async def update_admin_settings(settings: dict, user: dict = Depends(require_mas
 async def get_admin_calculator_pricing(user: dict = Depends(require_master_admin)):
     """
     Live pricing and entitlements for the admin Business Calculator.
-    Single source of truth from stages/entitlements.py.
-    Call on page load to prefill inputs with current tiers (including Friends & Family).
+    Merged from catalog_products + billing_catalog (same as /api/pricing).
     """
-    # Revenue tiers (public pricing page)
     revenue_tiers = {}
-    for slug in ("free", "creator_lite", "creator_pro", "studio", "agency", "enterprise"):
-        cfg = TIER_CONFIG.get(slug, {})
+    tier_cfg = get_effective_tier_config()
+    for slug in PUBLIC_TIER_SLUGS:
+        cfg = tier_cfg.get(slug, {})
+        row = tier_cfg_to_api_dict(slug, cfg)
         revenue_tiers[slug] = {
-            "name": cfg.get("name", slug.replace("_", " ").title()),
-            "price": float(cfg.get("price", 0)),
-            "put_monthly": cfg.get("put_monthly", 0),
-            "aic_monthly": cfg.get("aic_monthly", 0),
-            "queue_depth": cfg.get("queue_depth", 0),
-            "lookahead_hours": cfg.get("lookahead_hours", 0),
-            "max_accounts_per_platform": cfg.get("max_accounts_per_platform", 0),
+            "name": row["name"],
+            "price": row["price"],
+            "price_annual": row.get("price_annual"),
+            "put_daily": row.get("put_daily", 0),
+            "put_monthly": row.get("put_monthly", 0),
+            "aic_monthly": row.get("aic_monthly", 0),
+            "queue_depth": row.get("queue_depth", 0),
+            "lookahead_hours": row.get("lookahead_hours", 0),
+            "max_accounts": row.get("max_accounts", 0),
+            "max_accounts_per_platform": row.get("max_accounts_per_platform", 0),
+            "trial_days": row.get("trial_days", 0),
+            "team_seats": row.get("team_seats", 1),
+            "priority_class": row.get("priority_class"),
+            "ai_depth": row.get("ai_depth"),
+            "analytics": row.get("analytics"),
         }
+    # Sales-led floor for admin calculator only — not a billable Stripe tier in this repo.
+    revenue_tiers["enterprise"] = {
+        "name": "Enterprise (quote)",
+        "price": 399.0,
+        "put_monthly": 50000,
+        "aic_monthly": 15000,
+        "queue_depth": 999999,
+        "lookahead_hours": 168,
+        "max_accounts_per_platform": 100,
+    }
 
     # Internal tiers (Friends & Family, Lifetime, Master Admin) -- $0 revenue, full infra cost
     internal_tiers = {}
     for slug in ("friends_family", "lifetime", "master_admin"):
-        cfg = TIER_CONFIG.get(slug, {})
+        cfg = tier_cfg.get(slug, {})
         internal_tiers[slug] = {
             "name": cfg.get("name", slug.replace("_", " ").title()),
             "price": 0,
@@ -1920,24 +2267,73 @@ async def get_admin_calculator_pricing(user: dict = Depends(require_master_admin
 
     # Top-up packs (amounts from entitlements; prices come from Stripe)
     topup_packs = []
-    for lookup_key, meta in TOPUP_PRODUCTS.items():
+    for lookup_key, meta in get_effective_topup_products().items():
         wallet = meta.get("wallet", "")
         amount = meta.get("amount", 0)
         _price = meta.get("price_usd") or meta.get("price")
+        if str(wallet) == "bundle":
+            label = f"{int(meta.get('put') or 0)} PUT + {int(meta.get('aic') or 0)} AIC bundle"
+        else:
+            label = f"{wallet.upper()} {amount} Pack"
         topup_packs.append({
             "lookup_key": lookup_key,
             "wallet": wallet,
             "amount": amount,
+            "put": int(meta.get("put") or 0),
+            "aic": int(meta.get("aic") or 0),
             "price_usd": _price,   # canonical field (new frontend reads this)
             "price": _price,       # legacy alias  (older clients / backcompat)
-            "label": f"{wallet.upper()} {amount} Pack",
+            "label": label,
         })
 
     return {
         "revenue_tiers": revenue_tiers,
         "internal_tiers": internal_tiers,
         "topup_packs": topup_packs,
+        "catalog_loaded_at": core.state.catalog_pricing_cache.get("loaded_at"),
+        "merge_order": "TIER_CONFIG → catalog_products → billing_catalog tier_overrides",
     }
+
+
+@router.get("/workers/heartbeat")
+async def admin_workers_heartbeat(user: dict = Depends(require_master_admin)):
+    """
+    Liveness rows written by worker heartbeat (see worker.run_heartbeat_loop).
+    Table is auto-created by the worker on first run.
+    """
+    if core.state.db_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    worker_id,
+                    last_seen_at,
+                    started_at,
+                    worker_concurrency,
+                    publish_concurrency,
+                    version,
+                    EXTRACT(EPOCH FROM (NOW() - last_seen_at))::int AS seconds_since_last_beat,
+                    CASE
+                        WHEN NOW() - last_seen_at < INTERVAL '30 seconds' THEN 'alive'
+                        WHEN NOW() - last_seen_at < INTERVAL '2 minutes' THEN 'stale'
+                        ELSE 'dead'
+                    END AS status
+                FROM worker_heartbeat
+                ORDER BY last_seen_at DESC
+                """
+            )
+    except asyncpg.UndefinedTableError:
+        return {"workers": [], "note": "worker_heartbeat not initialized yet (start a worker)."}
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k, v in list(d.items()):
+            if hasattr(v, "isoformat"):
+                d[k] = v.isoformat()
+        out.append(d)
+    return {"workers": out}
 
 
 # ============================================================
@@ -2130,6 +2526,9 @@ async def admin_get_user_wallet(
         )
 
     plan = get_plan(target["subscription_tier"] or "free")
+    tier_slug = normalize_tier(target["subscription_tier"] or "free")
+    tier_cfg = get_effective_tier_config()
+    plan_row = tier_cfg_to_api_dict(tier_slug, tier_cfg.get(tier_slug, {}))
 
     return {
         "user": {
@@ -2144,10 +2543,11 @@ async def admin_get_user_wallet(
             "put_reserved": int(wallet.get("put_reserved", 0)),
             "aic_reserved": int(wallet.get("aic_reserved", 0)),
         },
+        "plan": plan_row,
         "plan_limits": {
-            "put_daily":   int(plan.get("put_daily", 0)),
-            "put_monthly": int(plan.get("put_monthly", 0)),
-            "aic_monthly": int(plan.get("aic_monthly", 0)),
+            "put_daily":   int(plan_row.get("put_daily", plan.get("put_daily", 0))),
+            "put_monthly": int(plan_row.get("put_monthly", plan.get("put_monthly", 0))),
+            "aic_monthly": int(plan_row.get("aic_monthly", plan.get("aic_monthly", 0))),
         },
         "ledger": [
             {
@@ -2354,6 +2754,10 @@ async def admin_operational_incidents(
     source: Optional[str] = Query(None, description="Filter by source (worker|web|api|...)"),
     incident_type: Optional[str] = Query(None, description="Filter by incident_type"),
     since_hours: Optional[int] = Query(None, ge=1, le=24 * 90, description="Only return incidents in the last N hours"),
+    incident_id: Optional[str] = Query(
+        None,
+        description="Exact operational_incidents.id (UUID); skips since_hours so deep links work",
+    ),
     user_id: Optional[str] = Query(None, description="Filter by user_id (UUID)"),
     upload_id: Optional[str] = Query(None, description="Filter by upload_id (UUID)"),
     q: Optional[str] = Query(None, description="Substring search across subject/body"),
@@ -2372,16 +2776,25 @@ async def admin_operational_incidents(
 
     where: List[str] = []
     params: List[Any] = []
+    single_incident_mode = False
 
     def _add(clause: str, value: Any) -> None:
         params.append(value)
         where.append(clause.replace("$$", f"${len(params)}"))
 
+    if incident_id:
+        iid = incident_id.strip()
+        try:
+            uuid.UUID(iid)
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid incident_id") from exc
+        _add("i.id = $$::uuid", iid)
+        single_incident_mode = True
     if source:
         _add("source = $$", source[:50])
     if incident_type:
         _add("incident_type = $$", incident_type[:120])
-    if since_hours:
+    if since_hours and not single_incident_mode:
         _add("created_at >= NOW() - ($$ || ' hours')::interval", str(int(since_hours)))
     if user_id:
         try:
@@ -2455,15 +2868,18 @@ async def admin_operational_incidents(
             )
             summary["by_type"] = {r["incident_type"]: int(r["n"]) for r in agg_type}
 
-            last24 = await conn.fetchrow(
-                f"""
-                SELECT COUNT(*)::int AS n
-                FROM operational_incidents i
-                {where_sql + (' AND ' if where else 'WHERE ')}created_at >= NOW() - INTERVAL '24 hours'
-                """,
-                *params,
-            )
-            summary["last_24h"] = int(last24["n"]) if last24 else 0
+            if single_incident_mode:
+                summary["last_24h"] = 0
+            else:
+                last24 = await conn.fetchrow(
+                    f"""
+                    SELECT COUNT(*)::int AS n
+                    FROM operational_incidents i
+                    {where_sql + (' AND ' if where else 'WHERE ')}created_at >= NOW() - INTERVAL '24 hours'
+                    """,
+                    *params,
+                )
+                summary["last_24h"] = int(last24["n"]) if last24 else 0
     except asyncpg.exceptions.UndefinedTableError:
         logger.warning("operational_incidents: table missing (run migrations)")
         return {"incidents": [], "summary": summary, "limit": limit, "offset": offset}
@@ -2485,6 +2901,65 @@ async def admin_operational_incidents(
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.get("/wallet-disputes")
+async def admin_wallet_disputes(
+    limit: int = Query(80, le=200),
+    offset: int = Query(0, ge=0),
+    status: Optional[str] = Query(None, description="open|in_review|resolved|rejected"),
+    user: dict = Depends(get_current_user),
+):
+    if user.get("role") not in ("admin", "master_admin"):
+        raise HTTPException(403, "Admin only")
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database not ready")
+    if status and status not in ("open", "in_review", "resolved", "rejected"):
+        raise HTTPException(400, "Invalid status filter")
+    try:
+        return await list_admin_wallet_disputes(
+            core.state.db_pool, limit=limit, offset=offset, status=status
+        )
+    except asyncpg.exceptions.UndefinedTableError:
+        return {"items": [], "total": 0, "limit": limit, "offset": offset}
+
+
+@router.patch("/wallet-disputes/{dispute_id}")
+async def admin_wallet_disputes_patch(
+    dispute_id: str,
+    data: AdminWalletDisputePatch,
+    user: dict = Depends(get_current_user),
+):
+    if user.get("role") not in ("admin", "master_admin"):
+        raise HTTPException(403, "Admin only")
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database not ready")
+    if data.status is None and data.admin_internal_note is None and data.resolution_message is None:
+        raise HTTPException(400, "No fields to update")
+    try:
+        row = await admin_patch_wallet_dispute(
+            core.state.db_pool,
+            dispute_id=dispute_id,
+            status=data.status,
+            admin_internal_note=data.admin_internal_note,
+            resolution_message=data.resolution_message,
+        )
+        async with core.state.db_pool.acquire() as conn:
+            await log_admin_audit(
+                conn,
+                user_id=str(row.get("user_id") or user.get("id")),
+                admin=user,
+                action="wallet_dispute_patch",
+                details={"dispute_id": dispute_id, "status": data.status, "resolution_set": data.resolution_message is not None},
+            )
+        return {"dispute": row}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    except Exception as e:
+        logger.warning("admin wallet_disputes_patch failed: %s", e)
+        raise HTTPException(500, "Update failed") from e
 
 
 @router.get("/all-failures")
@@ -2733,6 +3208,23 @@ def _looks_like_http_url(v: Any) -> bool:
     return s.startswith("http://") or s.startswith("https://")
 
 
+def _mask_discord_webhook_preview(url: str) -> str:
+    s = (url or "").strip()
+    if not s:
+        return ""
+    if len(s) <= 44:
+        return "https://…/(hidden)"
+    return f"{s[:26]}…{s[-14:]}"
+
+
+def _owner_discord_webhook_from_ai_trace_row(row: Dict[str, Any]) -> Optional[str]:
+    for k in ("_trace_us_dw", "_trace_upr_dw", "_trace_u_dwh", "_trace_u_dwsn"):
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
 def _collect_upload_diagnostics(
     *,
     output_artifacts: Dict[str, Any],
@@ -2849,6 +3341,20 @@ def _serialize_upload_ai_trace_row(
         error_detail=row.get("error_detail"),
     )
     diagnostics["provider_error_count"] = len(provider_error_trace)
+
+    try:
+        from stages.notify_stage import _is_allowed_discord_webhook_url
+
+        wh = _owner_discord_webhook_from_ai_trace_row(row)
+        diagnostics["owner_discord_webhook_configured"] = bool(wh)
+        diagnostics["owner_discord_webhook_valid_url"] = bool(wh and _is_allowed_discord_webhook_url(wh))
+        diagnostics["owner_discord_webhook_preview"] = (
+            _mask_discord_webhook_preview(wh) if wh else None
+        )
+    except Exception:
+        diagnostics["owner_discord_webhook_configured"] = False
+        diagnostics["owner_discord_webhook_valid_url"] = False
+        diagnostics["owner_discord_webhook_preview"] = None
 
     raw_artifacts = None
     if include_raw_artifacts:
@@ -2982,9 +3488,15 @@ async def admin_upload_ai_trace(
             up.created_at, up.updated_at, up.processing_started_at, up.processing_finished_at,
             up.ai_title, up.ai_caption, up.ai_generated_title, up.ai_generated_caption,
             up.ai_generated_hashtags, up.output_artifacts, up.platform_results,
-            u.email AS user_email
+            u.email AS user_email,
+            us.discord_webhook AS _trace_us_dw,
+            upr.discord_webhook AS _trace_upr_dw,
+            u.preferences->>'discordWebhook' AS _trace_u_dwh,
+            u.preferences->>'discord_webhook' AS _trace_u_dwsn
         FROM uploads up
         LEFT JOIN users u ON u.id = up.user_id
+        LEFT JOIN user_settings us ON us.user_id = up.user_id
+        LEFT JOIN user_preferences upr ON upr.user_id = up.user_id
         WHERE {where_sql}
         ORDER BY COALESCE(up.processing_finished_at, up.updated_at, up.created_at) DESC
         LIMIT ${len(params) + 1}
@@ -3057,3 +3569,102 @@ async def admin_tiktok_webhook_log(
             for r in rows
         ],
     }
+
+
+class TrillNameRejectIn(BaseModel):
+    reason: str = Field("", max_length=500)
+
+
+@router.get("/trill-display-names/pending")
+async def admin_trill_display_names_pending(
+    limit: int = Query(50, ge=1, le=200),
+    user: dict = Depends(require_master_admin),
+):
+    async with core.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT up.user_id, u.email, up.trill_public_name_pending, up.trill_public_name,
+                   up.trill_public_name_status, up.updated_at
+            FROM user_preferences up
+            JOIN users u ON u.id = up.user_id
+            WHERE up.trill_public_name_status = 'pending'
+              AND NULLIF(btrim(up.trill_public_name_pending), '') IS NOT NULL
+            ORDER BY up.updated_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    return {
+        "rows": [
+            {
+                "user_id": str(r["user_id"]),
+                "email": r["email"],
+                "pending": r["trill_public_name_pending"],
+                "current_approved": r["trill_public_name"],
+                "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.post("/trill-display-names/{target_user_id}/approve")
+async def admin_trill_display_name_approve(
+    target_user_id: str,
+    user: dict = Depends(require_master_admin),
+):
+    if not _valid_uuid(target_user_id):
+        raise HTTPException(400, "Invalid user id")
+    admin_id = user["id"]
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE user_preferences
+            SET trill_public_name = NULLIF(btrim(trill_public_name_pending), ''),
+                trill_public_name_pending = NULL,
+                trill_public_name_status = 'approved',
+                trill_public_name_rejection_reason = NULL,
+                trill_public_name_reviewed_at = NOW(),
+                trill_public_name_reviewed_by = $2::uuid,
+                updated_at = NOW()
+            WHERE user_id = $1::uuid AND trill_public_name_status = 'pending'
+            RETURNING trill_public_name
+            """,
+            target_user_id,
+            admin_id,
+        )
+    if not row:
+        raise HTTPException(404, "No pending name for this user")
+    return {"ok": True, "approved": row["trill_public_name"]}
+
+
+@router.post("/trill-display-names/{target_user_id}/reject")
+async def admin_trill_display_name_reject(
+    target_user_id: str,
+    body: TrillNameRejectIn,
+    user: dict = Depends(require_master_admin),
+):
+    if not _valid_uuid(target_user_id):
+        raise HTTPException(400, "Invalid user id")
+    admin_id = user["id"]
+    reason = (body.reason or "").strip() or "Rejected"
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE user_preferences
+            SET trill_public_name_pending = NULL,
+                trill_public_name_status = 'rejected',
+                trill_public_name_rejection_reason = $3,
+                trill_public_name_reviewed_at = NOW(),
+                trill_public_name_reviewed_by = $2::uuid,
+                updated_at = NOW()
+            WHERE user_id = $1::uuid AND trill_public_name_status = 'pending'
+            RETURNING trill_public_name
+            """,
+            target_user_id,
+            admin_id,
+            reason[:500],
+        )
+    if not row:
+        raise HTTPException(404, "No pending name for this user")
+    return {"ok": True, "kept_approved": row["trill_public_name"], "reason": reason}

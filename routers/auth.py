@@ -9,7 +9,9 @@ import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request, Query
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request, Query, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -17,7 +19,7 @@ import core.state
 from core.cookie_auth import clear_auth_cookies, refresh_token_from_cookie, set_auth_cookies
 from core.auth import hash_password, verify_password, create_access_jwt, create_refresh_token
 from core.notifications import notify_signup
-from core.deps import get_current_user
+from core.deps import get_current_user, _resolve_user_id_from_session
 from core.config import FRONTEND_URL, SIGNUP_EMAIL_VERIFICATION
 from core.helpers import _sha256_hex
 from core.models import (
@@ -87,17 +89,36 @@ async def register(data: UserCreate, background_tasks: BackgroundTasks, request:
     resp = JSONResponse(
         content={"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
     )
-    set_auth_cookies(resp, access, refresh)
+    set_auth_cookies(resp, access, refresh, request)
     return resp
 
+@router.get("/session-probe")
+async def session_probe(request: Request, authorization: Optional[str] = Header(None)):
+    """
+    Lightweight auth check for public pages (login.html). Always 200 so DevTools
+    does not log a spurious 401 when probing for an HttpOnly cookie session.
+    """
+    user_id, _reason = _resolve_user_id_from_session(authorization, request.cookies)
+    if not user_id:
+        return {"authenticated": False}
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, status, email_verified FROM users WHERE id = $1",
+            user_id,
+        )
+    if not row or row["status"] == "banned" or row.get("email_verified") is False:
+        return {"authenticated": False}
+    return {"authenticated": True}
+
+
 @router.post("/login")
-async def login(data: UserLogin):
+async def login(data: UserLogin, request: Request):
     async with core.state.db_pool.acquire() as conn:
         access, refresh = await login_user(conn, data)
     resp = JSONResponse(
         content={"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
     )
-    set_auth_cookies(resp, access, refresh)
+    set_auth_cookies(resp, access, refresh, request)
     return resp
 
 @router.post("/refresh")
@@ -121,19 +142,19 @@ async def refresh(request: Request):
     resp = JSONResponse(
         content={"access_token": access, "refresh_token": new_refresh, "token_type": "bearer"}
     )
-    set_auth_cookies(resp, access, new_refresh)
+    set_auth_cookies(resp, access, new_refresh, request)
     return resp
 
 @router.post("/logout")
-async def logout(user: dict = Depends(get_current_user)):
+async def logout(request: Request, user: dict = Depends(get_current_user)):
     async with core.state.db_pool.acquire() as conn:
         await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", user["id"])
     resp = JSONResponse(content={"status": "logged_out"})
-    clear_auth_cookies(resp)
+    clear_auth_cookies(resp, request)
     return resp
 
 @router.post("/logout-all")
-async def logout_all(user: dict = Depends(get_current_user)):
+async def logout_all(request: Request, user: dict = Depends(get_current_user)):
     """Revoke all refresh tokens for current user (log out all devices)."""
     async with core.state.db_pool.acquire() as conn:
         await conn.execute(
@@ -141,7 +162,7 @@ async def logout_all(user: dict = Depends(get_current_user)):
             user["id"],
         )
     resp = JSONResponse(content={"status": "logged_out_all"})
-    clear_auth_cookies(resp)
+    clear_auth_cookies(resp, request)
     return resp
 
 
@@ -258,7 +279,7 @@ async def reset_password(payload: ResetPasswordRequest, background: BackgroundTa
     return {"ok": True}
 
 @router.post("/change-password")
-async def change_password(data: PasswordChange, background: BackgroundTasks, user: dict = Depends(get_current_user)):
+async def change_password(data: PasswordChange, background: BackgroundTasks, request: Request, user: dict = Depends(get_current_user)):
     """Change user password"""
     async with core.state.db_pool.acquire() as conn:
         # Verify current password
@@ -276,7 +297,7 @@ async def change_password(data: PasswordChange, background: BackgroundTasks, use
     logger.info(f"Password changed for user {user['id']}")
     background.add_task(send_password_changed_email, user["email"], user.get("name") or "there")
     resp = JSONResponse(content={"status": "password_changed"})
-    clear_auth_cookies(resp)
+    clear_auth_cookies(resp, request)
     return resp
 
 

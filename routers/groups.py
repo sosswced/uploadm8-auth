@@ -11,8 +11,24 @@ from core.deps import get_current_user
 from core.helpers import _safe_col
 from core.sql_allowlist import ACCOUNT_GROUPS_UPDATE_COLUMNS, assert_set_fragments_columns
 from core.models import AccountGroupIn, AccountGroupUpdate, GroupUpsert
+from services.account_groups import validate_account_ids_for_user
+from services.platform_accounts import fetch_group_upload_counts
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
+
+
+def _group_payload(g, uploads_count: int = 0) -> dict:
+    return {
+        "id": str(g["id"]),
+        "name": g["name"],
+        "description": g["description"],
+        "account_ids": g["account_ids"] or [],
+        "members": g["account_ids"] or [],
+        "color": g["color"],
+        "uploads_count": uploads_count,
+        "created_at": g["created_at"].isoformat() if g["created_at"] else None,
+        "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
+    }
 
 
 @router.get("")
@@ -27,19 +43,8 @@ async def get_groups(user: dict = Depends(get_current_user)):
             """,
             user["id"],
         )
-    return [
-        {
-            "id": str(g["id"]),
-            "name": g["name"],
-            "description": g["description"],
-            "account_ids": g["account_ids"] or [],
-            "members": g["account_ids"] or [],
-            "color": g["color"],
-            "created_at": g["created_at"].isoformat() if g["created_at"] else None,
-            "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
-        }
-        for g in groups
-    ]
+        upload_counts = await fetch_group_upload_counts(conn, user["id"])
+    return [_group_payload(g, upload_counts.get(str(g["id"]), 0)) for g in groups]
 
 
 @router.get("/{group_id}")
@@ -54,18 +59,10 @@ async def get_group(group_id: str, user: dict = Depends(get_current_user)):
             group_id,
             user["id"],
         )
-    if not g:
-        raise HTTPException(404, "Group not found")
-    return {
-        "id": str(g["id"]),
-        "name": g["name"],
-        "description": g["description"],
-        "account_ids": g["account_ids"] or [],
-        "members": g["account_ids"] or [],
-        "color": g["color"],
-        "created_at": g["created_at"].isoformat() if g["created_at"] else None,
-        "updated_at": g["updated_at"].isoformat() if g["updated_at"] else None,
-    }
+        if not g:
+            raise HTTPException(404, "Group not found")
+        upload_counts = await fetch_group_upload_counts(conn, user["id"])
+    return _group_payload(g, upload_counts.get(str(g["id"]), 0))
 
 
 @router.post("")
@@ -75,6 +72,9 @@ async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_us
         raise HTTPException(400, "name is required")
     color = payload.color or "#3b82f6"
     account_ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
+
+    async with core.state.db_pool.acquire() as conn:
+        account_ids = await validate_account_ids_for_user(conn, str(user["id"]), account_ids)
     group_id = str(uuid.uuid4())
 
     async with core.state.db_pool.acquire() as conn:
@@ -91,7 +91,15 @@ async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_us
             color,
         )
 
-    return {"id": group_id, "name": name, "description": payload.description, "color": color, "account_ids": account_ids, "members": account_ids}
+    return {
+        "id": group_id,
+        "name": name,
+        "description": payload.description,
+        "color": color,
+        "account_ids": account_ids,
+        "members": account_ids,
+        "uploads_count": 0,
+    }
 
 
 @router.put("/{group_id}")
@@ -112,15 +120,22 @@ async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends
         updates.append(f"{_safe_col('color', _GROUP_COLS)} = ${len(params)+1}")
         params.append(payload.color)
 
-    # accept either account_ids or members
+    pending_account_ids = None
     if payload.account_ids is not None or payload.members is not None:
-        ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
-        updates.append(f"{_safe_col('account_ids', _GROUP_COLS)} = ${len(params)+1}")
-        params.append(ids)
+        pending_account_ids = (
+            payload.account_ids if payload.account_ids is not None else (payload.members or [])
+        )
 
     updates.append(f"{_safe_col('updated_at', _GROUP_COLS)} = NOW()")
 
     async with core.state.db_pool.acquire() as conn:
+        if pending_account_ids is not None:
+            pending_account_ids = await validate_account_ids_for_user(
+                conn, str(user["id"]), pending_account_ids
+            )
+            updates.insert(-1, f"{_safe_col('account_ids', _GROUP_COLS)} = ${len(params)+1}")
+            params.append(pending_account_ids)
+
         row = await conn.fetchrow(
             "SELECT id FROM account_groups WHERE id = $1 AND user_id = $2",
             group_id,

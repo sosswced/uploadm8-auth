@@ -8,11 +8,11 @@ from fastapi import APIRouter, Query
 import core.state
 from stages.db import sanitize_watermark_burn_text
 from stages.entitlements import (
-    TIER_CONFIG,
-    TOPUP_PRODUCTS,
     TIER_SLUGS,
     ENTITLEMENT_KEYS,
+    PUBLIC_TIER_SLUGS,
     get_tiers_for_api,
+    get_effective_topup_products,
 )
 from services.thumbnail_studio import format_library_rows
 
@@ -47,6 +47,14 @@ async def get_entitlements():
     return _entitlements_tiers_payload()
 
 
+@router.get("/api/entitlements/thumbnail-studio-niches")
+async def get_thumbnail_studio_niches():
+    """Canonical audience/niche list for Thumbnail Studio and settings UI."""
+    from services.thumbnail_niches import niche_options_payload
+
+    return {"niches": niche_options_payload()}
+
+
 @router.get("/api/entitlements/thumbnail-studio-formats")
 async def get_thumbnail_studio_layout_formats(niche: str = Query("")):
     """
@@ -57,7 +65,9 @@ async def get_thumbnail_studio_layout_formats(niche: str = Query("")):
     ``niche`` (defaults to ``general``). When ``niche`` is set, matching rows are sorted
     first for convenience; ``format_key`` is the only key required downstream.
     """
-    n = (niche or "").strip().lower()
+    from services.thumbnail_niches import normalize_niche
+
+    n = normalize_niche(niche)
     rows = list(format_library_rows(n if n else None))
     if n and n != "general":
 
@@ -72,45 +82,41 @@ async def get_thumbnail_studio_layout_formats(niche: str = Query("")):
     return {"formats": rows}
 
 
+def _topup_pricing_row(lookup_key: str, meta: dict) -> dict:
+    wallet = meta.get("wallet", "")
+    row = {
+        "lookup_key": lookup_key,
+        "wallet": wallet,
+        "amount": int(meta.get("amount") or 0),
+        "price_usd": meta.get("price_usd") or meta.get("price"),
+        "put": int(meta.get("put") or 0),
+        "aic": int(meta.get("aic") or 0),
+    }
+    if wallet == "bundle":
+        row["label"] = f"{meta.get('put')} PUT + {meta.get('aic')} AIC"
+    else:
+        row["label"] = f"{wallet.upper()} {meta.get('amount', 0)}"
+    return row
+
+
 @router.get("/api/pricing")
 async def get_public_pricing():
     """
     Public pricing and entitlements for landing page and billing UI.
     Returns tiers with PUT/AIC, perks, and top-up packs (with suggested prices).
     """
-    STRIPE_LOOKUP = {
-        "creator_lite": "uploadm8_creatorlite_monthly",
-        "creator_pro": "uploadm8_creatorpro_monthly",
-        "studio": "uploadm8_studio_monthly",
-        "agency": "uploadm8_agency_monthly",
-    }
+    from services.stripe_lookup_keys import STRIPE_MONTHLY_BY_TIER, STRIPE_YEARLY_BY_TIER
+
+    by_slug = {row["slug"]: row for row in get_tiers_for_api()}
     tiers = []
-    for slug in ("free", "creator_lite", "creator_pro", "studio", "agency"):
-        cfg = TIER_CONFIG.get(slug, {})
-        tiers.append({
-            "slug": slug,
-            "name": cfg.get("name", slug.replace("_", " ").title()),
-            "price": float(cfg.get("price", 0)),
-            "put_monthly": cfg.get("put_monthly", 0),
-            "aic_monthly": cfg.get("aic_monthly", 0),
-            "max_accounts": cfg.get("max_accounts", 0),
-            "max_accounts_per_platform": cfg.get("max_accounts_per_platform", 0),
-            "lookahead_hours": cfg.get("lookahead_hours", 0),
-            "queue_depth": cfg.get("queue_depth", 0),
-            "max_thumbnails": cfg.get("max_thumbnails", 0),
-            "max_caption_frames": cfg.get("max_caption_frames", 0),
-            "trial_days": cfg.get("trial_days", 0),
-            "stripe_lookup_key": STRIPE_LOOKUP.get(slug),
-        })
+    for slug in PUBLIC_TIER_SLUGS:
+        row = dict(by_slug.get(slug, {}))
+        row["stripe_lookup_key"] = STRIPE_MONTHLY_BY_TIER.get(slug)
+        row["stripe_lookup_key_annual"] = STRIPE_YEARLY_BY_TIER.get(slug)
+        tiers.append(row)
     topups = []
-    for lookup_key, meta in TOPUP_PRODUCTS.items():
-        topups.append({
-            "lookup_key": lookup_key,
-            "wallet": meta.get("wallet", ""),
-            "amount": meta.get("amount", 0),
-            "price_usd": meta.get("price_usd") or meta.get("price"),
-            "label": f"{meta.get('wallet', '').upper()} {meta.get('amount', 0)}",
-        })
+    for lookup_key, meta in get_effective_topup_products().items():
+        topups.append(_topup_pricing_row(lookup_key, meta))
     wtxt = sanitize_watermark_burn_text(
         core.state.admin_settings_cache.get("watermark_burn_text")
     )

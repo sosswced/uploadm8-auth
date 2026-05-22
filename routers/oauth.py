@@ -28,7 +28,7 @@ from core.config import (
     FACEBOOK_CLIENT_ID,
     FACEBOOK_CLIENT_SECRET,
 )
-from core.deps import get_current_user
+from core.deps import get_current_user_readonly
 from core.oauth import (
     get_oauth_redirect_uri,
     mirror_oauth_profile_image_to_r2,
@@ -55,7 +55,8 @@ async def _oauth_user(
     request: Request,
     authorization: Optional[str] = Header(None),
 ):
-    return await get_current_user(request, authorization)
+    # Start only needs auth + user id; skip last_active_at / daily_refill (faster under DB load).
+    return await get_current_user_readonly(request, authorization)
 
 
 @router.get("/api/oauth/{platform}/start")
@@ -66,7 +67,13 @@ async def oauth_start(
     reconnect_account_id: Optional[str] = Query(None, description="Existing platform_tokens.id to reconnect"),
     user: dict = Depends(_oauth_user),
 ):
-    """Start OAuth flow for a platform"""
+    """Start OAuth flow for a platform.
+
+    Provider URLs are built so the user always sees an explicit auth/consent step
+    (not a silent bind to whoever is already signed in on that browser). TikTok:
+    ``disable_auto_auth=1``; Google: ``prompt`` includes ``login``; Meta:
+    ``auth_type=reauthenticate`` and a per-request ``auth_nonce``.
+    """
     if platform not in OAUTH_CONFIG:
         raise HTTPException(400, f"Unsupported platform: {platform}")
 
@@ -115,6 +122,10 @@ async def oauth_start(
     redirect_uri = get_oauth_redirect_uri(platform)
 
     if platform == "tiktok":
+        # TikTok Login Kit: disable_auto_auth=0 skips the auth/consent UI when the browser
+        # already has a valid TikTok session — every OAuth then returns the same account
+        # (breaks multi-account / "add another" flows). Always show the auth page.
+        # See https://developers.tiktok.com/doc/login-kit-web (disable_auto_auth).
         params = {
             "client_key": TIKTOK_CLIENT_KEY,
             "scope": config["scope"],
@@ -123,10 +134,14 @@ async def oauth_start(
             "state": state,
             "code_challenge": tiktok_code_challenge,
             "code_challenge_method": "S256",
+            "disable_auto_auth": 1,
         }
         if force_login:
             params["prompt"] = "login"
     elif platform == "youtube":
+        # Google OAuth: without `login`, a single Google session can still authorize silently.
+        # `select_account` + `consent` + `login` shows the picker and requires sign-in again
+        # so "Add another channel" is not stuck on the default browser account.
         params = {
             "client_id": YOUTUBE_CLIENT_ID,
             "redirect_uri": redirect_uri,
@@ -134,19 +149,21 @@ async def oauth_start(
             "scope": config["scope"],
             "state": state,
             "access_type": "offline",
-            "prompt": "select_account consent",  # Forces account picker + fresh consent
+            "prompt": "select_account consent login",
         }
     elif platform == "instagram":
+        # Meta Login: `rerequest` only re-prompts for declined permissions; it does not force
+        # a fresh Facebook login. `reauthenticate` requires password again (multi-account).
+        # `auth_nonce` avoids a cached silent dialog when opening the OAuth popup repeatedly.
         params = {
             "client_id": INSTAGRAM_CLIENT_ID,
             "redirect_uri": redirect_uri,
             "scope": meta_instagram_oauth_scope(),
             "response_type": "code",
             "state": state,
-            "auth_type": "rerequest",  # Force re-authentication
+            "auth_type": "reauthenticate",
+            "auth_nonce": secrets.token_hex(12),
         }
-        if force_login:
-            params["auth_nonce"] = secrets.token_hex(12)
     elif platform == "facebook":
         params = {
             "client_id": FACEBOOK_CLIENT_ID,
@@ -154,10 +171,9 @@ async def oauth_start(
             "scope": meta_facebook_oauth_scope(),
             "response_type": "code",
             "state": state,
-            "auth_type": "rerequest",  # Force re-authentication
+            "auth_type": "reauthenticate",
+            "auth_nonce": secrets.token_hex(12),
         }
-        if force_login:
-            params["auth_nonce"] = secrets.token_hex(12)
     
     auth_url = f"{config['auth_url']}?{urlencode(params)}"
     return {"auth_url": auth_url, "state": state}
@@ -480,6 +496,7 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                 "facebook",
                 "instagram",
                 "tiktok",
+                "youtube",
             ):
                 try:
                     mirrored_key = await mirror_oauth_profile_image_to_r2(

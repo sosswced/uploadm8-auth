@@ -21,7 +21,18 @@ import core.state
 from core.deps import get_current_user, get_current_user_readonly
 from core.auth import decrypt_blob
 from core.helpers import _now_utc, _safe_json, get_plan
+from services import metric_definitions as metric_definitions_svc
 from services.growth_intelligence import fetch_user_pikzels_studio_usage, parse_range_since_until
+from services.canonical_engagement import (
+    ANALYTICS_RANGE_MINUTES,
+    ROLLUP_VERSION,
+    compute_canonical_engagement_rollup,
+    engagement_time_window_for_analytics_range,
+    engagement_time_window_for_overview_days,
+    engagement_window_api_dict,
+)
+from services.trill_vehicle_filter import trill_vehicle_where_fragment
+from services.white_label import company_slug, load_effective_brand_context
 from services.tiktok_api import tiktok_video_list_url
 
 logger = logging.getLogger("uploadm8-api")
@@ -475,11 +486,17 @@ async def _platform_metrics_db_cache_set(conn, user_id: str, output: dict) -> No
 # ============================================================
 
 @router.get("/api/analytics")
-async def get_analytics(range: str = "30d", user: dict = Depends(get_current_user_readonly)):
-    # 'all' maps to 1y (largest supported window). 'partial' = at least one platform succeeded.
-    minutes = {"30m": 30, "1h": 60, "6h": 360, "12h": 720, "1d": 1440,
-               "7d": 10080, "30d": 43200, "6m": 262800, "1y": 525600, "all": 525600}.get(range, 43200)
-    since = _now_utc() - timedelta(minutes=minutes)
+async def get_analytics(
+    range: str = "30d",
+    trill_vehicle_make: Optional[str] = Query(None, max_length=120),
+    trill_vehicle_model: Optional[str] = Query(None, max_length=120),
+    user: dict = Depends(get_current_user_readonly),
+):
+    # Align range presets with canonical_engagement (includes 90d, half-open UTC windows).
+    now = _now_utc()
+    win_start, win_end = engagement_time_window_for_analytics_range(range, now=now)
+    minutes = ANALYTICS_RANGE_MINUTES.get((range or "30d").strip().lower(), 43200)
+    since = win_start if win_start is not None else (now - timedelta(minutes=minutes))
     uid = user["id"]
     pool = core.state.db_pool
 
@@ -525,29 +542,43 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
         )
 
         trill_stats = None
+        vf_sql, vf_vals = trill_vehicle_where_fragment(3, trill_vehicle_make, trill_vehicle_model)
         try:
-            trill_data = await conn.fetchrow("""
+            trill_data = await conn.fetchrow(
+                f"""
                 SELECT
                     COUNT(*)::int AS trill_uploads,
                     COALESCE(AVG(trill_score), 0)::decimal AS avg_score,
                     COALESCE(MAX(trill_score), 0)::decimal AS max_score,
                     COALESCE(MAX(max_speed_mph), 0)::decimal AS max_speed_mph,
                     COALESCE(SUM(distance_miles), 0)::decimal AS total_distance_miles
-                FROM uploads
-                WHERE user_id = $1
-                AND created_at >= $2
-                AND trill_score IS NOT NULL
-            """, uid, since)
+                FROM uploads u
+                WHERE u.user_id = $1
+                AND u.created_at >= $2
+                AND u.trill_score IS NOT NULL
+                {vf_sql}
+                """,
+                uid,
+                since,
+                *vf_vals,
+            )
 
             if trill_data and trill_data["trill_uploads"] > 0:
-                speed_buckets = await conn.fetch("""
+                speed_buckets = await conn.fetch(
+                    f"""
                     SELECT speed_bucket, COUNT(*)::int AS count
-                    FROM uploads
-                    WHERE user_id = $1
-                    AND created_at >= $2
+                    FROM uploads u
+                    WHERE u.user_id = $1
+                    AND u.created_at >= $2
                     AND speed_bucket IS NOT NULL
+                    AND u.trill_score IS NOT NULL
+                    {vf_sql}
                     GROUP BY speed_bucket
-                """, uid, since)
+                    """,
+                    uid,
+                    since,
+                    *vf_vals,
+                )
 
                 bucket_counts = {
                     "gloryBoy": 0,
@@ -568,20 +599,227 @@ async def get_analytics(range: str = "30d", user: dict = Depends(get_current_use
                     "max_speed_mph": float(trill_data["max_speed_mph"]),
                     "total_distance_miles": float(trill_data["total_distance_miles"]),
                     "speed_buckets": bucket_counts,
+                    # Frontend legacy / convenience aliases
+                    "avg_trill_score": float(trill_data["avg_score"]),
+                    "max_trill_score": float(trill_data["max_score"]),
                 }
+                try:
+                    upload_rows = await conn.fetch(
+                        f"""
+                        SELECT
+                            u.id,
+                            COALESCE(NULLIF(btrim(u.title), ''), u.filename) AS disp_title,
+                            u.filename,
+                            u.trill_score,
+                            u.speed_bucket,
+                            u.status,
+                            u.created_at,
+                            u.platforms,
+                            COALESCE(
+                                NULLIF(btrim(u.trill_metadata#>>'{{telemetry,gazetteer_place_name}}'), ''), NULL
+                            ) AS gazetteer_place,
+                            COALESCE(
+                                NULLIF(btrim(u.trill_metadata#>>'{{telemetry,padus_unit_name}}'), ''), NULL
+                            ) AS padus_unit,
+                            COALESCE(
+                                (NULLIF(btrim(u.trill_metadata#>>'{{telemetry,near_padus}}'), ''))::boolean,
+                                FALSE
+                            ) AS near_padus,
+                            COALESCE(
+                                u.max_speed_mph,
+                                NULLIF(btrim(u.trill_metadata#>>'{{telemetry,max_speed_mph}}'), '')::numeric
+                            ) AS max_speed_mph,
+                            COALESCE(
+                                u.distance_miles,
+                                NULLIF(btrim(u.trill_metadata#>>'{{telemetry,total_distance_miles}}'), '')::numeric
+                            ) AS distance_miles
+                        FROM uploads u
+                        WHERE u.user_id = $1
+                          AND u.created_at >= $2
+                          AND u.trill_score IS NOT NULL
+                          {vf_sql}
+                        ORDER BY u.created_at DESC
+                        LIMIT 100
+                        """,
+                        uid,
+                        since,
+                        *vf_vals,
+                    )
+                    trill_stats["uploads"] = [
+                        {
+                            "id": str(r["id"]),
+                            "title": r["disp_title"] or r["filename"] or "Untitled",
+                            "filename": r["filename"],
+                            "trill_score": float(r["trill_score"]) if r["trill_score"] is not None else None,
+                            "max_speed_mph": float(r["max_speed_mph"]) if r.get("max_speed_mph") is not None else None,
+                            "distance_miles": float(r["distance_miles"]) if r.get("distance_miles") is not None else None,
+                            "platforms": list(r["platforms"] or []),
+                            "status": r["status"],
+                            "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                            "gazetteer_place": r["gazetteer_place"],
+                            "padus_unit": r["padus_unit"],
+                            "near_padus": bool(r["near_padus"]),
+                        }
+                        for r in upload_rows
+                    ]
+                    try:
+                        top_loc = await conn.fetch(
+                            f"""
+                            SELECT COALESCE(
+                                       NULLIF(btrim(u.trill_metadata#>>'{{telemetry,location_display}}'), ''),
+                                       NULLIF(btrim(u.trill_metadata#>>'{{telemetry,gazetteer_place_name}}'), ''),
+                                       NULLIF(btrim(u.trill_metadata#>>'{{telemetry,padus_unit_name}}'), ''),
+                                       CASE WHEN COALESCE(
+                                           (NULLIF(btrim(u.trill_metadata#>>'{{telemetry,near_padus}}'), ''))::boolean,
+                                           FALSE
+                                       ) THEN 'Near protected land' ELSE NULL END,
+                                       '(unknown)'
+                                   ) AS label,
+                                   COUNT(*)::int AS cnt,
+                                   MAX(u.trill_score)::float AS best_trill
+                            FROM uploads u
+                            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.trill_score IS NOT NULL
+                            {vf_sql}
+                            GROUP BY 1
+                            ORDER BY cnt DESC
+                            LIMIT 8
+                            """,
+                            uid,
+                            since,
+                            *vf_vals,
+                        )
+                        top_cars = await conn.fetch(
+                            f"""
+                            SELECT COALESCE(
+                                       NULLIF(btrim(u.trill_metadata#>>'{{vehicle,make_name}}'), ''),
+                                       '(unknown)'
+                                   ) AS make_name,
+                                   COALESCE(NULLIF(btrim(u.trill_metadata#>>'{{vehicle,model_name}}'), ''), '') AS model_name,
+                                   COUNT(*)::int AS cnt,
+                                   MAX(u.trill_score)::float AS best_trill
+                            FROM uploads u
+                            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.trill_score IS NOT NULL
+                              AND u.trill_metadata ? 'vehicle'
+                              {vf_sql}
+                            GROUP BY 1, 2
+                            ORDER BY cnt DESC
+                            LIMIT 8
+                            """,
+                            uid,
+                            since,
+                            *vf_vals,
+                        )
+                        top_speed_row = await conn.fetchrow(
+                            f"""
+                            SELECT u.id,
+                                   COALESCE(u.max_speed_mph,
+                                       NULLIF(btrim(u.trill_metadata#>>'{{telemetry,max_speed_mph}}'), '')::numeric
+                                   )::float AS max_speed_mph,
+                                   u.trill_score::float AS trill_score,
+                                   COALESCE(NULLIF(btrim(u.title), ''), u.filename) AS disp_title
+                            FROM uploads u
+                            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.trill_score IS NOT NULL
+                            {vf_sql}
+                            ORDER BY COALESCE(u.max_speed_mph,
+                                NULLIF(btrim(u.trill_metadata#>>'{{telemetry,max_speed_mph}}'), '')::numeric
+                            ) DESC NULLS LAST
+                            LIMIT 1
+                            """,
+                            uid,
+                            since,
+                            *vf_vals,
+                        )
+                        trill_stats["tops"] = {
+                            "top_locations": [
+                                {"label": r["label"], "count": int(r["cnt"]), "best_trill": float(r["best_trill"] or 0)}
+                                for r in top_loc
+                            ],
+                            "top_cars": [
+                                {
+                                    "make": r["make_name"],
+                                    "model": r["model_name"],
+                                    "count": int(r["cnt"]),
+                                    "best_trill": float(r["best_trill"] or 0),
+                                }
+                                for r in top_cars
+                            ],
+                            "top_speed_run": (
+                                {
+                                    "upload_id": str(top_speed_row["id"]),
+                                    "title": top_speed_row["disp_title"] or "Untitled",
+                                    "max_speed_mph": float(top_speed_row["max_speed_mph"] or 0),
+                                    "trill_score": float(top_speed_row["trill_score"] or 0),
+                                }
+                                if top_speed_row
+                                else None
+                            ),
+                            "top_driver": {
+                                "label": "You",
+                                "best_trill_score": float(trill_data["max_score"] or 0),
+                                "best_speed_mph": float(trill_data["max_speed_mph"] or 0),
+                            },
+                        }
+                    except Exception as te:
+                        logger.warning("Trill tops unavailable: %s", te)
+                        trill_stats["tops"] = {}
+                except Exception as exu:
+                    logger.warning("Trill uploads list unavailable: %s", exu)
+                    trill_stats["uploads"] = []
         except Exception as e:
             logger.warning("Trill stats unavailable: %s", e)
             trill_stats = None
 
+        # Canonical headline engagement (same merge as GET /api/dashboard/stats).
+        try:
+            cr = await compute_canonical_engagement_rollup(
+                conn,
+                str(uid),
+                window_start=win_start,
+                window_end_exclusive=win_end,
+                platform=None,
+            )
+        except Exception as e:
+            logger.warning("analytics canonical rollup failed: %s", e)
+            cr = {
+                "views": int(stats["views"] or 0) if stats else 0,
+                "likes": int(stats["likes"] or 0) if stats else 0,
+                "comments": 0,
+                "shares": 0,
+                "rollup_rule": "fallback_upload_table_only",
+                "rollup_version": ROLLUP_VERSION,
+                "breakdown": {"compute": {"warnings": ["rollup_exception"], "error_detail": str(e)[:500]}},
+                "kpi_sources": {"error": str(e), "rollup_version": ROLLUP_VERSION},
+                "catalog_tracked_videos": 0,
+            }
+
+    total = int(stats["total"] or 0) if stats else 0
+    completed = int(stats["completed"] or 0) if stats else 0
+    success_rate_pct = round((completed / max(total, 1)) * 100, 1) if total else 0.0
+    eng_window = engagement_window_api_dict(start=win_start, end_exclusive=win_end)
+
     result = {
-        "total_uploads": stats["total"] if stats else 0,
-        "completed": stats["completed"] if stats else 0,
-        "views": stats["views"] if stats else 0,
-        "likes": stats["likes"] if stats else 0,
+        "total_uploads": total,
+        "completed": completed,
+        "success_rate_pct": success_rate_pct,
+        "views": int(cr.get("views") or 0),
+        "likes": int(cr.get("likes") or 0),
+        "comments": int(cr.get("comments") or 0),
+        "shares": int(cr.get("shares") or 0),
         "put_used": stats["put_used"] if stats else 0,
         "aic_used": stats["aic_used"] if stats else 0,
         "daily": [{"date": str(d["date"]), "uploads": d["uploads"]} for d in daily],
-        "platforms": {p["platform"]: p["count"] for p in platforms}
+        "platforms": {p["platform"]: p["count"] for p in platforms},
+        "engagement_rollup_rule": cr.get("rollup_rule"),
+        "rollup_version": cr.get("rollup_version", ROLLUP_VERSION),
+        "rollup_rule": cr.get("rollup_rule"),
+        "breakdown": cr.get("breakdown"),
+        "kpi_sources": cr.get("kpi_sources"),
+        "catalog_tracked_videos": int(cr.get("catalog_tracked_videos") or 0),
+        "engagement_window": eng_window,
+        "engagement_window_utc": eng_window,
+        "metric_definitions": metric_definitions_svc.for_get_analytics(),
+        "engagement_crosswalk": metric_definitions_svc.engagement_crosswalk(),
+        "range": range,
     }
 
     if trill_stats:
@@ -810,13 +1048,29 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
     since = _now_utc() - timedelta(minutes=minutes)
 
     async with core.state.db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT filename, platforms, title, status, views, likes, put_spent, aic_spent, created_at FROM uploads WHERE user_id = $1 AND created_at >= $2 ORDER BY created_at DESC", user["id"], since)
+        ws_id = (user.get("workspace") or {}).get("id")
+        if ws_id:
+            rows = await conn.fetch(
+                "SELECT filename, platforms, title, status, views, likes, put_spent, aic_spent, created_at FROM uploads WHERE workspace_id = $1::uuid AND created_at >= $2 ORDER BY created_at DESC",
+                ws_id,
+                since,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT filename, platforms, title, status, views, likes, put_spent, aic_spent, created_at FROM uploads WHERE user_id = $1 AND created_at >= $2 ORDER BY created_at DESC",
+                user["id"],
+                since,
+            )
+        brand = await load_effective_brand_context(conn, str(user.get("billing_user_id") or user["id"]), user)
 
     try:
         from openpyxl import Workbook
         wb = Workbook()
         ws = wb.active
         ws.title = "Uploads"
+        if brand:
+            ws.append([brand.company_name])
+            ws.append([])
         headers = ["Filename", "Platforms", "Title", "Status", "Views", "Likes", "PUT", "AIC", "Created"]
         ws.append(headers)
         for r in rows:
@@ -824,67 +1078,99 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
         output = BytesIO()
         wb.save(output)
         output.seek(0)
-        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=uploadm8_exports.xlsx"})
+        date_suffix = since.strftime("%Y%m%d")
+        if brand:
+            fname = f"{company_slug(brand.company_name)}-analytics-{date_suffix}.xlsx"
+        else:
+            fname = "uploadm8_exports.xlsx"
+        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={fname}"})
     except ImportError:
         raise HTTPException(500, "Excel export not available")
 
 @router.get("/api/analytics/overview")
-async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = Depends(get_current_user)):
+async def analytics_overview(
+    days: int = Query(30, ge=1, le=3650),
+    platform: str = Query("all"),
+    user: dict = Depends(get_current_user),
+):
     """High-level KPI summary for analytics dashboard."""
-    since = _now_utc() - timedelta(days=days)
+    now = _now_utc()
+    win_start, win_end = engagement_time_window_for_overview_days(days, now=now)
+    since = win_start
+    pf = _normalize_quality_scores_platform(platform)
+    platform_sql = ""
+    upload_params: list = [user["id"], win_start, win_end]
+    if pf:
+        platform_sql = (
+            " AND EXISTS (SELECT 1 FROM unnest(COALESCE(platforms, ARRAY[]::text[])) AS _p "
+            f"WHERE lower(_p::text) = ${len(upload_params) + 1})"
+        )
+        upload_params.append(pf)
 
     async with core.state.db_pool.acquire() as conn:
         # Upload KPIs (defensive against older schemas)
         try:
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT
                     COUNT(*)::int AS uploads_total,
                     SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS uploads_completed,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS uploads_failed,
                     COALESCE(AVG(EXTRACT(EPOCH FROM (processing_finished_at - processing_started_at))), 0)::double precision AS avg_processing_seconds,
-                    COALESCE(SUM(views), 0)::bigint AS views_total,
-                    COALESCE(SUM(likes), 0)::bigint AS likes_total,
                     COALESCE(SUM(cost_attributed), 0)::double precision AS cost_total
                 FROM uploads
-                WHERE user_id = $1 AND created_at >= $2
+                WHERE user_id = $1 AND created_at >= $2 AND created_at < $3
+                {platform_sql}
                 """,
-                user["id"], since
+                *upload_params,
             )
         except Exception as e:
             if e.__class__.__name__ != "UndefinedColumnError":
                 raise
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT
                     COUNT(*)::int AS uploads_total,
                     SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS uploads_completed,
                     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS uploads_failed,
                     0::double precision AS avg_processing_seconds,
-                    0::bigint AS views_total,
-                    0::bigint AS likes_total,
                     0::double precision AS cost_total
                 FROM uploads
-                WHERE user_id = $1 AND created_at >= $2
+                WHERE user_id = $1 AND created_at >= $2 AND created_at < $3
+                {platform_sql}
                 """,
-                user["id"], since
+                *upload_params,
             )
+
+        try:
+            cr = await compute_canonical_engagement_rollup(
+                conn,
+                str(user["id"]),
+                window_start=win_start,
+                window_end_exclusive=win_end,
+                platform=pf,
+            )
+        except Exception as e:
+            logger.warning("analytics overview canonical rollup failed: %s", e)
+            cr = {"views": 0, "likes": 0, "comments": 0, "shares": 0, "rollup_rule": "fallback_upload_table_only"}
 
         # Revenue (optional)
         revenue_total = 0.0
         try:
             rev = await conn.fetchval(
-                "SELECT COALESCE(SUM(amount), 0)::decimal FROM revenue_tracking WHERE user_id = $1 AND created_at >= $2",
-                user["id"], since
+                "SELECT COALESCE(SUM(amount), 0)::decimal FROM revenue_tracking WHERE user_id = $1 AND created_at >= $2 AND created_at < $3",
+                user["id"], win_start, win_end,
             )
             revenue_total = float(rev or 0)
         except Exception as e:
             if e.__class__.__name__ != "UndefinedTableError":
                 raise
 
+    eng_window = engagement_window_api_dict(start=win_start, end_exclusive=win_end)
     return {
         "range_days": days,
         "since": since.isoformat(),
+        "filters": {"days": days, "platform": platform},
         "uploads": {
             "total": int(row["uploads_total"] or 0),
             "completed": int(row["uploads_completed"] or 0),
@@ -892,8 +1178,12 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
             "avg_processing_seconds": float(row["avg_processing_seconds"] or 0),
         },
         "engagement": {
-            "views": int(row["views_total"] or 0),
-            "likes": int(row["likes_total"] or 0),
+            "views": int(cr.get("views") or 0),
+            "likes": int(cr.get("likes") or 0),
+            "comments": int(cr.get("comments") or 0),
+            "shares": int(cr.get("shares") or 0),
+            "rollup_rule": cr.get("rollup_rule"),
+            "rollup_version": cr.get("rollup_version", ROLLUP_VERSION),
         },
         "costs": {
             "cost_total": float(row["cost_total"] or 0),
@@ -901,6 +1191,8 @@ async def analytics_overview(days: int = Query(30, ge=1, le=3650), user: dict = 
         "revenue": {
             "revenue_total": revenue_total,
         },
+        "engagement_window": eng_window,
+        "metric_definitions": metric_definitions_svc.for_analytics_overview(),
     }
 
 

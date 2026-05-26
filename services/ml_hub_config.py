@@ -15,7 +15,6 @@ import os
 from typing import Any, Dict, List, Optional
 
 HUB_DOCS_JOBS = "https://huggingface.co/docs/huggingface_hub/guides/jobs"
-HUB_DOCS_CLI = "https://huggingface.co/docs/huggingface_hub/guides/cli"
 DATASETS_HUB_DOC = "https://huggingface.co/docs/datasets"
 DATASET_CREATE_DOC = "https://huggingface.co/docs/datasets/upload_dataset"
 SPACES_OVERVIEW_DOC = "https://huggingface.co/docs/hub/spaces-overview"
@@ -50,6 +49,9 @@ def hub_public_page_exists(url: str) -> bool:
             timeout=8.0,
             headers={"User-Agent": "UploadM8-MLHubCheck/1.0"},
         )
+        # Private repos often return 401 with a generic HTML shell — still configured.
+        if r.status_code in (401, 403):
+            return True
         body = (r.text or "")[:12000].lower()
         if "can't find the page" in body:
             return False
@@ -57,8 +59,6 @@ def hub_public_page_exists(url: str) -> bool:
             title = body.split("<title>", 1)[1].split("</title>", 1)[0]
             if title.strip().startswith("404") and "hugging face" in title:
                 return False
-        if r.status_code in (401, 403):
-            return True
         if r.status_code >= 400:
             return False
         return True
@@ -89,6 +89,15 @@ def get_ml_hub_urls() -> Dict[str, Optional[str]]:
         "trackio_space_path": trackio_space_path or None,
         "dataset_url": dataset_url or None,
         "trackio_space_url": trackio_space_url or None,
+        "model_repo": (_env("UM8_HF_MODEL_REPO") or None),
+        "model_url": (
+            _env("UM8_HF_MODEL_URL")
+            or (
+                f"https://huggingface.co/{_env('UM8_HF_MODEL_REPO')}"
+                if _env("UM8_HF_MODEL_REPO")
+                else None
+            )
+        ),
     }
 
 
@@ -100,8 +109,9 @@ def ml_hub_huggingface_dict() -> Dict[str, Any]:
         "dataset_url": u["dataset_url"],
         "trackio_space_url": u["trackio_space_url"],
         "trackio_space_path": u["trackio_space_path"],
+        "model_repo": u.get("model_repo"),
+        "model_url": u.get("model_url"),
         "hub_docs_jobs": HUB_DOCS_JOBS,
-        "hub_docs_cli": HUB_DOCS_CLI,
         "datasets_hub": DATASETS_HUB_DOC,
         "trl_docs": TRL_ROOT_DOC,
         "model_cards_doc": MODEL_CARDS_DOC,
@@ -113,13 +123,18 @@ def ml_hub_huggingface_dict() -> Dict[str, Any]:
     }
 
 
-def _resolved_hub_link(configured_url: str, *, fallback_doc: str) -> tuple[str, bool]:
-    """Return (url, placeholder). Falls back to official docs when unset or Hub 404."""
+def _resolved_hub_link(
+    configured_url: str,
+    *,
+    fallback_doc: str,
+    in_app_setup: str = "guide.html#feat-hf-assets-setup",
+) -> tuple[str, bool]:
+    """Return (url, placeholder). Unset or 404 Hub pages link to in-app setup (not empty Hub)."""
     u = (configured_url or "").strip()
     if not u:
-        return fallback_doc, True
+        return in_app_setup, True
     if not hub_public_page_exists(u):
-        return fallback_doc, True
+        return in_app_setup, True
     return u, False
 
 
@@ -142,13 +157,6 @@ def _ecosystem_entries(urls: Dict[str, Optional[str]]) -> List[Dict[str, Any]]:
             "role": "Versioned training and evaluation tables (promo targeting and related).",
             "url": dataset_url,
             "placeholder": dataset_ph,
-        },
-        {
-            "id": "hf-cli",
-            "label": "hf CLI",
-            "role": "Upload artifacts, manage repos, and run `hf datasets sql` from your terminal.",
-            "url": HUB_DOCS_CLI,
-            "placeholder": False,
         },
         {
             "id": "evaluation",

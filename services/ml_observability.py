@@ -63,7 +63,9 @@ class OptionalTrackioRun:
             if space_id and ("/" not in space_id or space_id.endswith("/") or space_id.startswith("/")):
                 logger.warning("TRACKIO_SPACE_ID is invalid; ignoring value")
                 space_id = None
-            run_id = (os.environ.get("TRACKIO_RUN_ID") or self.run_name).strip()
+            run_id = (os.environ.get("TRACKIO_RUN_ID") or "").strip()
+            if not run_id or "${" in run_id or run_id.endswith("-"):
+                run_id = self.run_name
             kwargs: Dict[str, Any] = {
                 "project": project,
                 "name": run_id,

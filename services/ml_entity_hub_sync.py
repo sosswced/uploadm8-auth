@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from services.ml_hub_config import get_ml_hub_urls
 from services.ml_observability import hf_write_token
+from services.hf_dataset_export import coerce_rows_for_hf
 from services.visual_entity_memory import catalog_rows_for_hf_export, fetch_channel_catalog_detail
 
 logger = logging.getLogger("uploadm8.ml_entity_hub_sync")
@@ -86,7 +87,7 @@ def push_visual_entities_to_hub(
 
         api = HfApi(token=token)
         api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
-        ds = Dataset.from_list(rows)
+        ds = Dataset.from_list(coerce_rows_for_hf(rows))
         ds.push_to_hub(
             repo,
             config_name=config_name,

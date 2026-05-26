@@ -24,7 +24,10 @@ from core.sql_allowlist import USER_COLOR_PREFERENCES_UPDATE_COLUMNS, assert_set
 from core.models import ColorPreferencesUpdate, UserPreferencesUpdate
 from services.user_preferences_persist import save_user_content_preferences
 from services.thumbnail_personas_list import list_thumbnail_studio_personas
+from stages.entitlements import get_entitlements_for_tier
 from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
+from core.upload_baseline_defaults import UPLOAD_PREF_STRIP_KEYS, apply_upload_baseline_defaults
+from stages.tiktok_cover_burn import default_tiktok_burn_styled_cover_pref
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +35,7 @@ router = APIRouter(tags=["preferences"])
 
 # Audit / metadata columns on user_preferences that asyncpg returns as native
 # datetime/UUID types. Workers do not need them in the job payload snapshot.
-_UPLOAD_PREF_STRIP_KEYS = (
-    "created_at",
-    "updated_at",
-    "user_id",
-    "trill_public_name_reviewed_at",
-    "trill_public_name_reviewed_by",
-    "trill_welcome_modal_seen_at",
-)
+_UPLOAD_PREF_STRIP_KEYS = UPLOAD_PREF_STRIP_KEYS
 
 
 # ============================================================
@@ -372,6 +368,7 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
 
     if result:
         _hydrate_snake_camel_mirror(result)
+        apply_upload_baseline_defaults(result)
         return result
 
     # Fallback: Try legacy JSONB locations
@@ -424,6 +421,7 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     if isinstance(prefs, dict):
         _overlay_users_prefs_on_result(out, prefs)
     _hydrate_snake_camel_mirror(out)
+    apply_upload_baseline_defaults(out)
     return out
 
 
@@ -516,6 +514,8 @@ async def get_user_preferences(
                 "aiServiceThumbnailDesigner": bool(d.get("ai_service_thumbnail_designer", True)),
                 "aiServiceSpeechToText": bool(d.get("ai_service_speech_to_text", True)),
                 "aiServiceSceneUnderstanding": bool(d.get("ai_service_scene_understanding", True)),
+                "aiServiceFrameInspector": bool(d.get("ai_service_frame_inspector", True)),
+                "aiServiceVideoAnalyzer": bool(d.get("ai_service_video_analyzer", True)),
             }
             # Overlay users.preferences -- source of truth for hashtags + caption (PUT /api/me/preferences)
             users_prefs = None
@@ -553,10 +553,28 @@ async def get_user_preferences(
                 out.setdefault("captionTone", "authentic")
                 out.setdefault("captionVoice", "default")
                 out.setdefault("captionFrameCount", 6)
-                out.setdefault("thumbnailSelectionMode", "ai")
-                out.setdefault("thumbnail_selection_mode", "ai")
+                out.setdefault("thumbnailSelectionMode", "sharpness")
+                out.setdefault("thumbnail_selection_mode", "sharpness")
                 out.setdefault("thumbnailRenderPipeline", "auto")
                 out.setdefault("thumbnail_render_pipeline", "auto")
+            apply_upload_baseline_defaults(out)
+            tier_row = await conn.fetchrow(
+                "SELECT subscription_tier FROM users WHERE id = $1", user["id"]
+            )
+            tier_slug = str((tier_row or {}).get("subscription_tier") or "free")
+            ent = get_entitlements_for_tier(tier_slug)
+            pref_explicit = (
+                d.get("tiktok_burn_styled_cover") is not None
+                or up.get("tiktokBurnStyledCover") is not None
+                or up.get("tiktok_burn_styled_cover") is not None
+            )
+            if not pref_explicit:
+                burn_default = default_tiktok_burn_styled_cover_pref(ent)
+                out["tiktokBurnStyledCover"] = burn_default
+                out["tiktok_burn_styled_cover"] = burn_default
+            out["tiktokBurnStyledCoverTierDefault"] = default_tiktok_burn_styled_cover_pref(ent)
+            out["tiktokBurnStyledCoverAvailable"] = tier_slug != "free"
+            out["tiktokBurnStyledCoverFast"] = tier_slug not in ("free",)
             if include_personas:
                 try:
                     plist = await list_thumbnail_studio_personas(conn, user["id"])
@@ -569,7 +587,7 @@ async def get_user_preferences(
     except Exception as e:
         logger.exception("get_user_preferences failed: %s", e)
         # Return defaults so settings page loads; avoid 500 when DB schema mismatch or migration not run
-        return {
+        return apply_upload_baseline_defaults({
             "autoCaptions": False, "autoThumbnails": True, "thumbnailInterval": "5",
             "defaultPrivacy": "public", "aiHashtagsEnabled": False, "aiHashtagCount": "5",
             "aiHashtagStyle": "mixed", "hashtagPosition": "end", "maxHashtags": "15",
@@ -581,11 +599,11 @@ async def get_user_preferences(
             "trillLeaderboardOptIn": False, "trillMapSharingOptIn": False,
             "styledThumbnails": True,
             "captionStyle": "story", "captionTone": "authentic", "captionVoice": "default", "captionFrameCount": 6,
-            "thumbnailSelectionMode": "ai", "thumbnail_selection_mode": "ai",
+            "thumbnailSelectionMode": "sharpness", "thumbnail_selection_mode": "sharpness",
             "thumbnailRenderPipeline": "auto", "thumbnail_render_pipeline": "auto",
             "aiServiceDashcamOSD": True, "ai_service_dashcam_osd": True,
             "thumbnail_personas": [], "thumbnailPersonas": [],
-        }
+        })
 
 
 # ============================================================
@@ -652,11 +670,12 @@ async def get_channel_visual_catalog(user: dict = Depends(get_current_user)):
         category=category,
         limit_per_bucket=14,
     )
-    hub_urls = get_ml_hub_urls()
-    hf = ml_hub_huggingface_dict()
-    return {
-        "catalog": catalog,
-        "ml_hub": {
+    out: dict = {"catalog": catalog}
+    role = str(user.get("role") or "").strip().lower()
+    if role in ("admin", "master_admin"):
+        hub_urls = get_ml_hub_urls()
+        hf = ml_hub_huggingface_dict()
+        out["ml_hub"] = {
             "dataset_repo": hub_urls.get("dataset_repo"),
             "dataset_url": hub_urls.get("dataset_url"),
             "trackio_space_url": hub_urls.get("trackio_space_url"),
@@ -668,5 +687,5 @@ async def get_channel_visual_catalog(user: dict = Depends(get_current_user)):
                 "jobs": hf.get("hub_docs_jobs"),
                 "evaluation": hf.get("evaluation_doc"),
             },
-        },
-    }
+        }
+    return out

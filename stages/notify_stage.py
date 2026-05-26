@@ -1655,6 +1655,25 @@ async def notify_admin_upload_status(
     if scene_story:
         details["scene_story"] = scene_story[:600]
 
+    platform_errors: List[Dict[str, Any]] = []
+    for r in getattr(ctx, "platform_results", None) or []:
+        try:
+            if r.success:
+                continue
+            platform_errors.append(
+                {
+                    "platform": r.platform,
+                    "error_code": r.error_code,
+                    "http_status": getattr(r, "http_status", None),
+                    "error_message": (r.error_message or "")[:500] or None,
+                    "account_username": getattr(r, "account_username", None),
+                }
+            )
+        except Exception:
+            continue
+    if platform_errors:
+        details["platform_errors"] = platform_errors
+
     plat_lines: List[str] = []
     for r in getattr(ctx, "platform_results", None) or []:
         try:

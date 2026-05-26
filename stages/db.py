@@ -99,7 +99,11 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         prefs_d["platform_hashtags"], default={}
                     )
                 if not result:
-                    result = prefs_d
+                    result = {
+                        k: v
+                        for k, v in prefs_d.items()
+                        if k not in {"user_id", "created_at", "updated_at", "id"}
+                    }
                 else:
                     # Merge all preference columns from user_preferences (authoritative for upload prefs).
                     _skip_prefs_merge = frozenset(
@@ -255,6 +259,13 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
             pass
         except Exception as e:
             logger.debug("Could not read user_color_preferences for %s (non-fatal): %s", user_id, e)
+
+    try:
+        from core.upload_baseline_defaults import apply_upload_baseline_defaults
+
+        apply_upload_baseline_defaults(result)
+    except Exception as e:
+        logger.debug("upload baseline defaults skipped for %s: %s", user_id, e)
 
     return result
 

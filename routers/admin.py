@@ -66,7 +66,9 @@ from services.admin_kpi_reliability import (
 )
 from services.canonical_engagement import ROLLUP_VERSION, compute_admin_engagement_totals
 from services import metric_definitions as metric_definitions_svc
-from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
+from services.ml_hub_config import get_ml_hub_urls, hub_public_page_exists, ml_hub_huggingface_dict
+from services.ml_engine import load_engine_state, run_ml_engine_cycle
+from services.ml_engine_config import get_ml_engine_config, ml_engine_public_dict
 from services.ml_observability import hf_write_token
 from services.wallet_disputes import admin_patch_wallet_dispute, list_admin_wallet_disputes
 from stages.emails import (
@@ -140,6 +142,21 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
 
     hf_links = ml_hub_huggingface_dict()
     hub_urls = get_ml_hub_urls()
+    dataset_url = hub_urls.get("dataset_url") or ""
+    space_url = hub_urls.get("trackio_space_url") or ""
+    local_trackio_db = False
+    if trackio_project:
+        try:
+            from trackio.utils import TRACKIO_DIR
+
+            db_file = TRACKIO_DIR / f"{trackio_project}.db"
+            local_trackio_db = db_file.is_file() and db_file.stat().st_size > 0
+        except Exception:
+            fallback = (
+                Path.home() / ".cache" / "huggingface" / "trackio" / f"{trackio_project}.db"
+            )
+            local_trackio_db = fallback.is_file() and fallback.stat().st_size > 0
+
     summary: Dict[str, Any] = {
         "as_of": datetime.now(timezone.utc).isoformat(),
         "local": {
@@ -154,8 +171,10 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
             **hf_links,
         },
         "hub_pages": {
-            "dataset_url_configured": bool(hub_urls.get("dataset_url")),
-            "trackio_space_url_configured": bool(hub_urls.get("trackio_space_url")),
+            "dataset_url_configured": bool(dataset_url),
+            "trackio_space_url_configured": bool(space_url),
+            "dataset_reachable": bool(dataset_url and hub_public_page_exists(dataset_url)),
+            "trackio_space_reachable": bool(space_url and hub_public_page_exists(space_url)),
         },
         "trackio": {
             "project_configured": bool(trackio_project),
@@ -163,6 +182,19 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
             "space_configured": bool(trackio_space),
             "space_id": trackio_space,
             "package_importable": trackio_package_importable,
+            "local_project_db_exists": local_trackio_db,
+        },
+        "ml_hub": {
+            "hf_dataset_page": bool(dataset_url),
+            "hf_trackio_space": bool(space_url),
+            "hf_stack_ready": bool(
+                hf_token
+                and dataset_url
+                and space_url
+                and trackio_project
+                and trackio_space
+                and trackio_package_importable
+            ),
         },
     }
 
@@ -221,7 +253,41 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
         db["error"] = str(e)
 
     summary["database"] = db
+    engine_cfg = get_ml_engine_config()
+    engine_state = load_engine_state()
+    last_run = engine_state.get("last_run") if isinstance(engine_state.get("last_run"), dict) else {}
+    summary["ml_engine"] = {
+        **ml_engine_public_dict(engine_cfg),
+        "last_run_ok": last_run.get("ok"),
+        "last_run_at": last_run.get("finished_at") or last_run.get("started_at"),
+        "last_run_mode": last_run.get("mode"),
+        "last_run_error": last_run.get("error"),
+        "last_hf_job_url": (last_run.get("steps") or {}).get("hf_jobs_train", {}).get("job_url"),
+    }
     return summary
+
+
+@router.get("/ml/engine-status")
+async def ml_engine_status(user: dict = Depends(require_admin)):
+    """Automation engine config + last cycle result (no secrets)."""
+    state = load_engine_state()
+    cfg = get_ml_engine_config()
+    return {
+        "config": ml_engine_public_dict(cfg),
+        "state": {
+            "updated_at": state.get("updated_at"),
+            "last_run": state.get("last_run"),
+        },
+    }
+
+
+@router.post("/ml/engine-run")
+async def ml_engine_run(user: dict = Depends(require_admin)):
+    """Trigger one full ML engine cycle (dataset → train → eval → Trackio)."""
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database not ready")
+    result = await run_ml_engine_cycle(core.state.db_pool, force=True)
+    return result
 
 
 @router.get("/ml/observability-trends")

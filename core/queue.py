@@ -18,6 +18,7 @@ from core.config import (
     PUBLISH_NORMAL_QUEUE,
 )
 from core.helpers import _now_utc
+from core.upload_baseline_defaults import serialize_job_payload
 from stages.entitlements import PRIORITY_QUEUE_CLASSES
 
 logger = logging.getLogger("uploadm8-api")
@@ -64,10 +65,9 @@ async def enqueue_job(
     job_data["lane"]           = lane
     job_data["priority_class"] = priority_class
 
-    # user_preferences snapshots can include UUID / datetime / Decimal values
-    # from asyncpg (e.g. trill_public_name_reviewed_by). default=str keeps the
-    # queue payload JSON-safe without losing information for the worker.
-    payload = json.dumps(job_data, default=str)
+    # Coerce asyncpg UUID/datetime values before json.dumps (default=str alone
+    # is not used on all worker enqueue paths).
+    payload = serialize_job_payload(job_data)
     upload_id = job_data.get("upload_id", "?")
 
     # One extra retry on transient socket errors. The Retry policy on the

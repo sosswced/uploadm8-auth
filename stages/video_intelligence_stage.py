@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional
 
 from .errors import SkipStage
 from .context import JobContext
+from .ai_service_costs import user_pref_ai_service_enabled
 from services.provider_error_trace import append_provider_error
 
 logger = logging.getLogger("uploadm8-worker")
@@ -545,6 +546,16 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
 
     if not VIDEO_INTELLIGENCE_STAGE_ENABLED:
         raise SkipStage("Video Intelligence stage disabled via env")
+
+    tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
+    tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
+    if not user_pref_ai_service_enabled(
+        ctx.user_settings or {},
+        "video_intelligence",
+        default=True,
+        allowed_services=tier_allowed_set,
+    ):
+        raise SkipStage("Video Intelligence disabled in upload preferences (aiServiceVideoAnalyzer)")
 
     dur = _ctx_duration_sec(ctx)
     if VIDEO_INTELLIGENCE_MAX_DURATION_SEC > 0:

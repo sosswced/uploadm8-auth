@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .context import JobContext
 from .errors import SkipStage
+from .ai_service_costs import user_pref_ai_service_enabled
 from .ffmpeg_env import resolve_ffmpeg_executable
 from services.provider_error_trace import append_provider_error
 
@@ -910,6 +911,16 @@ async def run_vision_stage(ctx: JobContext) -> JobContext:
             "GCP credentials not configured (set GOOGLE_APPLICATION_CREDENTIALS, "
             "GCP_SERVICE_ACCOUNT_JSON, a file under /etc/secrets, or one social-media-up-*.json in repo root)"
         )
+
+    tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
+    tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
+    if not user_pref_ai_service_enabled(
+        ctx.user_settings or {},
+        "vision_google",
+        default=True,
+        allowed_services=tier_allowed_set,
+    ):
+        raise SkipStage("Vision disabled in upload preferences (aiServiceFrameInspector)")
 
     try:
         video_path: Optional[Path] = None

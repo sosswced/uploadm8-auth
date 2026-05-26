@@ -398,6 +398,7 @@ def build_ffmpeg_command(
     reframe_action: str,
     *,
     force_duration_trim_sec: Optional[float] = None,
+    tiktok_cover_offset_sec: Optional[float] = None,
 ) -> list:
     """Build platform-specific FFmpeg command"""
     spec = get_platform_spec(platform)
@@ -473,6 +474,15 @@ def build_ffmpeg_command(
         "-bufsize", str(int(spec["max_bitrate_video"].replace("M", "")) * 2) + "M",
     ])
 
+    if platform == "tiktok" and tiktok_cover_offset_sec is not None:
+        from stages.tiktok_cover_burn import extend_tiktok_transcode_x264_args
+
+        extend_tiktok_transcode_x264_args(
+            cmd,
+            cover_offset_sec=float(tiktok_cover_offset_sec),
+            fps=float(info.fps or 30.0),
+        )
+
     # -- Frame rate capping --
     if info.fps > spec["max_fps"]:
         cmd.extend(["-r", str(spec["max_fps"])])
@@ -532,6 +542,7 @@ async def transcode_video(
     upload_id: str = None,
     *,
     force_duration_trim_sec: Optional[float] = None,
+    tiktok_cover_offset_sec: Optional[float] = None,
 ) -> Path:
     """Transcode a video to a platform-specific format.
     
@@ -546,6 +557,7 @@ async def transcode_video(
         platform,
         reframe_action,
         force_duration_trim_sec=force_duration_trim_sec,
+        tiktok_cover_offset_sec=tiktok_cover_offset_sec,
     )
 
     cmd_preview = " ".join(cmd[:15]) + "..."
@@ -735,13 +747,28 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
                 logger.info(f"{platform} needs transcode: {reason}")
 
             output_path = ctx.temp_dir / f"transcoded_{platform}.mp4"
+            tiktok_cover_off = None
+            if platform == "tiktok":
+                from stages.tiktok_cover_burn import resolve_tiktok_cover_offset_sec
+
+                tiktok_cover_off = resolve_tiktok_cover_offset_sec(ctx.output_artifacts)
             await transcode_video(
                 input_video, output_path, platform, info, reframe_action,
                 db_pool=db_pool, upload_id=str(ctx.upload_id) if ctx.upload_id else None,
+                tiktok_cover_offset_sec=tiktok_cover_off,
             )
 
             ctx.platform_videos[platform] = output_path
             transcoded_any = True
+            if platform == "tiktok" and tiktok_cover_off is not None:
+                from stages.tiktok_cover_burn import store_tiktok_transcode_keyframe_artifacts
+
+                store_tiktok_transcode_keyframe_artifacts(
+                    ctx.output_artifacts,
+                    offset_sec=tiktok_cover_off,
+                    fps=float(info.fps or 30.0),
+                    duration_sec=float(info.duration or 0.0),
+                )
         else:
             logger.info(f"{platform}: video is already compatible, using original")
             ctx.platform_videos[platform] = input_video

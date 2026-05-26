@@ -88,7 +88,9 @@ async def ensure_stream_group(redis: Any, stream_key: str, group: str = DEFAULT_
 async def xadd_process_job(redis: Any, list_key: str, job_data: dict) -> Optional[str]:
     """Append job to the stream backing list_key. Returns message id."""
     stream = stream_key_for_list(list_key)
-    payload = json.dumps(job_data, default=str)
+    from core.upload_baseline_defaults import serialize_job_payload
+
+    payload = serialize_job_payload(job_data)
     maxlen = int(os.environ.get("REDIS_JOB_STREAM_MAXLEN", "0") or 0)
     kw: Dict[str, Any] = {STREAM_FIELD: payload}
     try:
@@ -105,7 +107,9 @@ async def xadd_process_job(redis: Any, list_key: str, job_data: dict) -> Optiona
 
 async def lpush_process_job(redis: Any, list_key: str, job_data: dict) -> bool:
     try:
-        await redis.lpush(list_key, json.dumps(job_data, default=str))
+        from core.upload_baseline_defaults import serialize_job_payload
+
+        await redis.lpush(list_key, serialize_job_payload(job_data))
         return True
     except Exception as e:
         logger.error("lpush failed queue=%s: %s", list_key, e)

@@ -77,6 +77,7 @@ def main() -> int:
         "verify",
         "unit",
         "tiers",
+        "settings",
         "consistency",
         "router-lint",
         "stress",
@@ -110,6 +111,13 @@ def main() -> int:
             "tests/test_api_entitlements_smoke.py",
             "tests/test_thumbnail_studio_personas_pikzels_api.py",
         ]
+    elif mode == "settings":
+        targets = [
+            "tests/test_settings_combinatorics.py",
+            "tests/test_upload_job_payload.py",
+            "tests/test_upload_preferences_runtime.py",
+        ]
+        pytest_tail = ["-m", "not slow"] + pytest_tail
     else:
         targets = ["tests/"]
 

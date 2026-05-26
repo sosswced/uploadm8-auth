@@ -152,6 +152,21 @@ async def post_me_content_insights_apply(
     return {"ok": True, "applied": patch}
 
 
+@router.get("/api/me/ai-insights")
+async def get_me_ai_insights(user: dict = Depends(get_current_user)):
+    """Customer AI Insights hub — platforms, attribution, channel memory, studio usage, coach."""
+    from services.ai_insights_hub import ai_insights_hub_fallback, build_ai_insights_hub
+
+    pool = core.state.db_pool
+    if pool is None:
+        return ai_insights_hub_fallback(error="database_unavailable")
+    try:
+        return await build_ai_insights_hub(pool, user["id"])
+    except Exception:
+        logger.exception("GET /api/me/ai-insights failed user_id=%s", user.get("id"))
+        return ai_insights_hub_fallback(error="insights_unavailable")
+
+
 @router.get("/api/me/coach")
 async def get_me_coach(user: dict = Depends(get_current_user)):
     """Personalized upload, thumbnail, and wallet suggestions (your history plus broad averages)."""

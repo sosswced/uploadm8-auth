@@ -2060,6 +2060,8 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
                         "account_id": getattr(result, "account_id", None),
                         "account_username": getattr(result, "account_username", None),
                         "error_code": result.error_code,
+                        "http_status": getattr(result, "http_status", None),
+                        "error_message": (result.error_message or "")[:1000] or None,
                         "attempt_id": attempt_id,
                     },
                     user_id=str(ctx.user_id) if ctx.user_id else None,

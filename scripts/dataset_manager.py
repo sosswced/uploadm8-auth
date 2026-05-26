@@ -34,6 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 load_dotenv(_REPO_ROOT / ".env")
 
 from services.ml_observability import hf_env_status, hf_write_token
+from services.hf_dataset_export import coerce_dataframe_for_hf, coerce_rows_for_hf
 
 
 def _require_hf_token() -> str:
@@ -61,7 +62,10 @@ def _push_file(repo_id: str, input_path: str, split: str, private: bool) -> None
         raise SystemExit(f"Input not found: {input_path}")
 
     if p.suffix.lower() == ".parquet":
-        ds = Dataset.from_parquet(str(p))
+        import pandas as pd
+
+        df = coerce_dataframe_for_hf(pd.read_parquet(str(p)))
+        ds = Dataset.from_pandas(df, preserve_index=False)
     elif p.suffix.lower() == ".jsonl":
         ds = Dataset.from_json(str(p))
     elif p.suffix.lower() == ".csv":

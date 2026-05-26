@@ -33,6 +33,8 @@ import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def _die(msg: str, code: int = 1) -> None:
@@ -52,36 +54,74 @@ emoji: 📈
 colorFrom: gray
 colorTo: green
 sdk: gradio
-sdk_version: 4.44.1
-python_version: "3.10"
 app_file: app.py
 pinned: false
 license: mit
+tags:
+ - trackio
+datasets:
+ - cedy243/uploadm8-promo-targeting-v1
 ---
 
 # UploadM8 + Trackio
 
-This Space is reserved for experiment dashboards. Deploy Trackio from the
-[Trackio project](https://github.com/tracking-ai/trackio) or replace `app.py` with your own
-Gradio app, then set `TRACKIO_SPACE_ID` / `UM8_TRACKIO_SPACE_URL` in UploadM8.
+Live experiment dashboard for **uploadm8-ml** runs logged from UploadM8 training jobs
+(`TRACKIO_PROJECT` / `TRACKIO_SPACE_ID` in the API `.env`).
 """
 
-# Gradio 4.44 imports HfFolder from huggingface_hub; hub 1.0+ removed it. HF Spaces often ship hub 1.x
-# while README sdk_version keeps Gradio 4.x — pin hub <1 so oauth imports succeed.
-_SPACE_REQUIREMENTS = """gradio==4.44.1
-huggingface_hub>=0.26.0,<1.0.0
+# Trackio ships its own Starlette dashboard (trackio.show). Do not pin legacy Gradio 4.x here —
+# HF still installs Gradio for sdk:gradio Spaces, but app.py uses Trackio only.
+_SPACE_REQUIREMENTS = """trackio[spaces,mcp]>=0.25.0,<1.0.0
+pyarrow>=21.0
 """
 
-_SPACE_APP = '''"""Minimal Gradio app so the Space builds; replace with Trackio or your UI."""
-import gradio as gr
+_SPACE_APP = '''"""UploadM8 Trackio experiment dashboard on Hugging Face Spaces."""
+import os
 
-with gr.Blocks(title="UploadM8 Trackio") as demo:
-    gr.Markdown(
-        "## UploadM8 — Trackio\\n\\n"
-        "Placeholder Space. When you are ready, deploy Trackio here or wire "
-        "`UM8_TRACKIO_SPACE_URL` in UploadM8 to this Space URL."
-    )
+import trackio
+from trackio.sqlite_storage import SQLiteStorage
+
+# Space containers are ephemeral — restore SQLite from the HF Bucket before serving.
+SQLiteStorage.load_from_dataset()
+
+_project = (os.environ.get("TRACKIO_PROJECT") or "uploadm8-ml").strip()
+trackio.show(project=_project or None, open_browser=False)
 '''
+
+# Writable inside HF Docker without a paid persistent volume. Metrics persist in TRACKIO_BUCKET_ID.
+_TRACKIO_DIR_ON_SPACE = "/app/trackio"
+
+
+def _trackio_bucket_id(space_id: str) -> str:
+    return f"{space_id}-bucket"
+
+
+def _configure_trackio_space(api, space_id: str, *, token: str, project: str) -> None:
+    """Wire bucket vars, secrets, and optional /data volume for Trackio on Spaces."""
+    bucket_id = _trackio_bucket_id(space_id)
+    try:
+        import trackio
+        from trackio.bucket_storage import create_bucket_if_not_exists
+        from trackio.deploy import _ensure_bucket_mounted_at_data
+
+        create_bucket_if_not_exists(bucket_id, private=None)
+        try:
+            _ensure_bucket_mounted_at_data(space_id, bucket_id, hf_api=api)
+        except Exception as exc:
+            print(f"[warn] bucket volume attach skipped: {exc}")
+    except ImportError:
+        print("[warn] trackio not installed locally; skipping bucket create/mount")
+
+    import huggingface_hub
+
+    for key, value in (
+        ("TRACKIO_DIR", _TRACKIO_DIR_ON_SPACE),
+        ("TRACKIO_BUCKET_ID", bucket_id),
+        ("TRACKIO_PROJECT", project),
+    ):
+        huggingface_hub.add_space_variable(space_id, key, value)
+    huggingface_hub.add_space_secret(space_id, "HF_TOKEN", token)
+    print(f"[ok] space vars: TRACKIO_DIR={_TRACKIO_DIR_ON_SPACE}, bucket={bucket_id}, project={project}")
 
 
 def main() -> None:
@@ -103,26 +143,70 @@ def main() -> None:
         default=(os.environ.get("UM8_TRACKIO_SPACE_PATH") or "").strip(),
         help="Hub Space repo id for Trackio (e.g. org/uploadm8-trackio). Default: UM8_TRACKIO_SPACE_PATH",
     )
+    p.add_argument(
+        "--model-repo",
+        default=(os.environ.get("UM8_HF_MODEL_REPO") or "").strip(),
+        help="Hub model repo for eval results (e.g. org/uploadm8-promo-uplift). Default: UM8_HF_MODEL_REPO",
+    )
     p.add_argument("--private", action="store_true", help="Create private repos.")
+    p.add_argument(
+        "--sync-trackio",
+        action="store_true",
+        help="After Space upload, sync local uploadm8-ml metrics to the Space bucket.",
+    )
     args = p.parse_args()
 
     token = _hf_write_token()
     if not token:
         _die("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required (write token).")
 
-    if not args.dataset_repo and not args.trackio_space:
+    if not args.dataset_repo and not args.trackio_space and not args.model_repo:
         _die(
-            "Provide --dataset-repo and/or --trackio-space, or set "
-            "UM8_HF_DATASET_REPO / UM8_TRACKIO_SPACE_PATH in the environment."
+            "Provide --dataset-repo, --trackio-space, and/or --model-repo, or set "
+            "UM8_HF_DATASET_REPO / UM8_TRACKIO_SPACE_PATH / UM8_HF_MODEL_REPO in the environment."
         )
 
     from huggingface_hub import HfApi
+
+    from services.ml_eval_hub import ensure_model_repo, push_dataset_eval_yaml
 
     api = HfApi(token=token)
 
     if args.dataset_repo:
         api.create_repo(args.dataset_repo, repo_type="dataset", private=args.private, exist_ok=True)
+        try:
+            push_dataset_eval_yaml(args.dataset_repo)
+            print(f"[ok] dataset eval.yaml uploaded")
+        except Exception as exc:
+            print(f"[warn] eval.yaml upload: {exc}", file=sys.stderr)
         print(f"[ok] dataset repo: https://huggingface.co/datasets/{args.dataset_repo}")
+
+    if args.model_repo:
+        ensure_model_repo(args.model_repo, private=args.private)
+        readme = f"""---
+license: mit
+tags:
+- uploadm8
+- promo-targeting
+- tabular
+datasets:
+- {args.dataset_repo or 'your-org/promo-targeting-v1'}
+---
+
+# UploadM8 Promo Uplift Model
+
+Baseline promo-targeting uplift model trained by the UploadM8 ML engine.
+Evaluation metrics are published under `.eval_results/` per
+[Hugging Face eval results](https://huggingface.co/docs/hub/eval-results).
+"""
+        api.upload_file(
+            path_or_fileobj=readme.encode("utf-8"),
+            path_in_repo="README.md",
+            repo_id=args.model_repo,
+            repo_type="model",
+            commit_message="UploadM8 ML engine: model card scaffold",
+        )
+        print(f"[ok] model repo: https://huggingface.co/{args.model_repo}")
 
     if args.trackio_space:
         api.create_repo(
@@ -142,10 +226,27 @@ def main() -> None:
                 path_in_repo=path_in_repo,
                 repo_id=args.trackio_space,
                 repo_type="space",
+                commit_message="UploadM8 Trackio dashboard: bucket restore on startup",
             )
+        project = (os.environ.get("TRACKIO_PROJECT") or "uploadm8-ml").strip()
+        _configure_trackio_space(api, args.trackio_space, token=token, project=project)
+        if args.sync_trackio:
+            try:
+                import trackio
+
+                trackio.sync(
+                    project=project,
+                    space_id=args.trackio_space,
+                    force=True,
+                    bucket_id=_trackio_bucket_id(args.trackio_space),
+                )
+                print(f"[ok] synced local Trackio project '{project}' to bucket")
+            except Exception as exc:
+                print(f"[warn] trackio sync failed: {exc}", file=sys.stderr)
         print(f"[ok] space repo: https://huggingface.co/spaces/{args.trackio_space}")
 
-    print("\nNext: set UM8_HF_DATASET_REPO / UM8_TRACKIO_SPACE_PATH (or *_URL) in .env and restart the API.")
+    print("\nNext: set UM8_HF_DATASET_REPO, UM8_HF_MODEL_REPO, UM8_TRACKIO_SPACE_PATH in .env,")
+    print("      UM8_ML_ENGINE_ENABLED=1, then restart the API.")
 
 
 if __name__ == "__main__":

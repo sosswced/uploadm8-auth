@@ -35,6 +35,7 @@ if str(_REPO_ROOT) not in sys.path:
 load_dotenv(_REPO_ROOT / ".env")
 
 from services.ml_observability import OptionalTrackioRun, hf_env_status, hf_write_token
+from services.hf_dataset_export import coerce_dataframe_for_hf
 
 
 PROMO_SQL = """
@@ -176,11 +177,18 @@ async def _fetch_dataset(dsn: str, lookback_days: int, limit: int) -> pd.DataFra
     return pd.DataFrame.from_records([dict(r) for r in rows])
 
 
+def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    return coerce_dataframe_for_hf(df)
+
+
 def _write_local(df: pd.DataFrame, output: str) -> None:
     out = Path(output)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.suffix.lower() != ".parquet":
         raise SystemExit("Output must be .parquet for phase-1 baseline")
+    df = _prepare_df(df)
     df.to_parquet(out, index=False)
     print(f"Wrote {len(df)} rows to {out}")
 
@@ -192,7 +200,7 @@ def _maybe_push_hf(df: pd.DataFrame, repo_id: str, split: str, private: bool) ->
     token = hf_write_token()
     if not token:
         raise SystemExit("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required for push")
-    ds = Dataset.from_pandas(df, preserve_index=False)
+    ds = Dataset.from_pandas(_prepare_df(df), preserve_index=False)
     ds.push_to_hub(repo_id, token=token, split=split, private=private)
     print(f"Pushed {len(ds)} rows to {repo_id} ({split})")
 

@@ -221,6 +221,7 @@ async def lifespan(app: FastAPI):
         logger.warning("vehicle makes seed check failed: %s", e)
 
     trill_maintenance_task = None
+    ml_engine_task = None
     if core.state.db_pool:
         import asyncio
         from services.trill_background import run_trill_maintenance_loop
@@ -230,6 +231,13 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Trill maintenance loop started")
 
+        from services.ml_engine_background import run_ml_engine_loop
+
+        ml_engine_task = asyncio.create_task(
+            run_ml_engine_loop(core.state.db_pool, core.state.redis_client)
+        )
+        logger.info("ML engine loop started")
+
     yield
 
     if trill_maintenance_task:
@@ -238,6 +246,15 @@ async def lifespan(app: FastAPI):
         trill_maintenance_task.cancel()
         try:
             await trill_maintenance_task
+        except _asyncio.CancelledError:
+            pass
+
+    if ml_engine_task:
+        import asyncio as _asyncio
+
+        ml_engine_task.cancel()
+        try:
+            await ml_engine_task
         except _asyncio.CancelledError:
             pass
 

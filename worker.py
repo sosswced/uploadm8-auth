@@ -676,14 +676,19 @@ async def _maybe_burn_tiktok_styled_cover(ctx: JobContext, upload_id: str) -> No
 
     from stages.tiktok_cover_burn import (
         burn_tiktok_styled_cover,
+        resolve_keyframe_hint,
         resolve_tiktok_cover_offset_sec,
         tiktok_burn_enabled,
+        tiktok_cover_burn_mode,
     )
 
     platforms = [str(p).lower() for p in (ctx.platforms or [])]
     if "tiktok" not in platforms:
         return
-    if not tiktok_burn_enabled(getattr(ctx, "user_settings", None) or {}):
+    if not tiktok_burn_enabled(
+        getattr(ctx, "user_settings", None) or {},
+        getattr(ctx, "entitlements", None),
+    ):
         return
 
     pm_json = (ctx.output_artifacts or {}).get("platform_thumbnail_map", "{}")
@@ -694,6 +699,16 @@ async def _maybe_burn_tiktok_styled_cover(ctx: JobContext, upload_id: str) -> No
     thumb_raw = platform_map.get("tiktok") if isinstance(platform_map, dict) else None
     if not thumb_raw:
         return
+
+    render_method = str((ctx.output_artifacts or {}).get("thumbnail_render_method") or "").strip()
+    if render_method not in ("studio_renderer", "template", "ai_edit"):
+        logger.info(
+            "[%s] TikTok cover burn skipped — no styled tiktok thumb (render_method=%r)",
+            upload_id,
+            render_method or None,
+        )
+        return
+
     thumb_path = _Path(str(thumb_raw))
     if not thumb_path.exists():
         return
@@ -707,19 +722,47 @@ async def _maybe_burn_tiktok_styled_cover(ctx: JobContext, upload_id: str) -> No
 
     offset = resolve_tiktok_cover_offset_sec(ctx.output_artifacts)
     out_path = ctx.temp_dir / f"tiktok_burn_{upload_id}.mp4"
-    ok = await burn_tiktok_styled_cover(video_path, thumb_path, out_path, offset)
-    if not ok:
+    vi = getattr(ctx, "video_info", None) or {}
+    keyframe_hint = resolve_keyframe_hint(ctx.output_artifacts)
+
+    logger.info(
+        "[%s] TikTok styled cover burn starting at %.2fs mode=%s tier=%s",
+        upload_id,
+        offset,
+        tiktok_cover_burn_mode(),
+        getattr(getattr(ctx, "entitlements", None), "tier", "?"),
+    )
+    result = await burn_tiktok_styled_cover(
+        video_path,
+        thumb_path,
+        out_path,
+        offset,
+        work_dir=ctx.temp_dir / f"tiktok_burn_work_{upload_id}",
+        video_fps=float(vi.get("fps") or 0) or None,
+        video_duration=float(vi.get("duration") or 0) or None,
+        keyframe_hint=keyframe_hint,
+    )
+    if not result.ok:
+        if result.error:
+            logger.warning("[%s] TikTok cover burn failed mode=%s: %s", upload_id, result.mode, result.error[:200])
         return
 
     ctx.platform_videos["tiktok"] = out_path
     arts = ctx.output_artifacts
     arts["tiktok_cover_burned"] = "true"
     arts["tiktok_cover_burn_offset_seconds"] = str(offset)
+    arts["tiktok_cover_burn_mode"] = result.mode
+    arts["tiktok_cover_burn_elapsed_sec"] = f"{result.elapsed_sec:.3f}"
+    if result.window:
+        arts["tiktok_cover_keyframe_window"] = json.dumps(result.window)
     logger.info(
-        "[%s] TikTok styled cover burned at %.2fs → %s",
+        "[%s] TikTok styled cover burned at %.2fs mode=%s elapsed=%.2fs → %s window=%s",
         upload_id,
         offset,
+        result.mode,
+        result.elapsed_sec,
         out_path.name,
+        result.window,
     )
 
 
@@ -760,12 +803,20 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
             logger.info(f"[{ctx.upload_id}] Transcode [{canonical}] shared by {group_platforms}: {', '.join(reasons)}")
             output_path = ctx.temp_dir / f"transcoded_{canonical}.mp4"
             try:
+                tiktok_cover_off = None
+                if canonical == "tiktok":
+                    from stages.tiktok_cover_burn import (
+                        resolve_tiktok_cover_offset_sec,
+                    )
+
+                    tiktok_cover_off = resolve_tiktok_cover_offset_sec(ctx.output_artifacts)
                 cmd = build_ffmpeg_command(
                     source_video,
                     output_path,
                     info,
                     canonical,
                     reframe_action,
+                    tiktok_cover_offset_sec=tiktok_cover_off,
                 )
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -782,6 +833,15 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
 
                 sz_mb = output_path.stat().st_size / 1024 / 1024
                 logger.info(f"[{ctx.upload_id}] Transcode done [{canonical}]: {sz_mb:.1f}MB → {group_platforms}")
+                if canonical == "tiktok" and tiktok_cover_off is not None:
+                    from stages.tiktok_cover_burn import store_tiktok_transcode_keyframe_artifacts
+
+                    store_tiktok_transcode_keyframe_artifacts(
+                        ctx.output_artifacts,
+                        offset_sec=tiktok_cover_off,
+                        fps=float(info.fps or 30.0),
+                        duration_sec=float(info.duration or 0.0),
+                    )
                 for p in group_platforms:
                     ctx.platform_videos[p] = output_path
 
@@ -982,6 +1042,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         await db_stage.merge_pikzels_thumbnail_persona_id(db_pool, user_id, user_settings)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
         entitlements = get_entitlements_from_user(user_record, overrides)
+
+        from core.upload_baseline_defaults import apply_free_tier_processing_defaults
+
+        if getattr(entitlements, "tier", "") == "free":
+            apply_free_tier_processing_defaults(user_settings)
 
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
         _merge_job_preferences(ctx, job_data)
@@ -3347,12 +3412,18 @@ async def _build_process_job_payload(
         await db_stage.merge_pikzels_thumbnail_persona_id(db_pool, user_id, user_settings)
         overrides = await db_stage.load_user_entitlement_overrides(db_pool, user_id)
         ent = get_entitlements_from_user(user_record, overrides)
+        from core.upload_baseline_defaults import (
+            apply_upload_baseline_defaults,
+            sanitize_settings_for_job_payload,
+        )
+
+        apply_upload_baseline_defaults(user_settings, tier=ent.tier)
         payload = {
             "upload_id": str(upload_id),
             "user_id": str(user_id),
             "job_id": job_id,
             "deferred": deferred,
-            "preferences": user_settings or {},
+            "preferences": sanitize_settings_for_job_payload(user_settings),
             "plan_features": {
                 "ai": ent.can_ai,
                 "priority": ent.can_priority,
@@ -3384,7 +3455,9 @@ async def enqueue_process_lane_job(payload: dict) -> bool:
         "enqueued_at": _now_utc().isoformat(),
     }
     try:
-        await redis_client.lpush(q, json.dumps(body))
+        from core.upload_baseline_defaults import serialize_job_payload
+
+        await redis_client.lpush(q, serialize_job_payload(body))
         logger.info(f"[{payload.get('upload_id')}] Enqueued process lane → {q}")
         return True
     except Exception as e:
@@ -3406,7 +3479,9 @@ async def enqueue_publish_lane_job(payload: dict) -> bool:
         "enqueued_at": _now_utc().isoformat(),
     }
     try:
-        await redis_client.lpush(q, json.dumps(body))
+        from core.upload_baseline_defaults import serialize_job_payload
+
+        await redis_client.lpush(q, serialize_job_payload(body))
         logger.info(f"[{payload.get('upload_id')}] Enqueued publish lane → {q}")
         return True
     except Exception as e:

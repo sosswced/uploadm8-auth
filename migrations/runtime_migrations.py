@@ -1600,6 +1600,82 @@ async def run_migrations(db_pool):
                 SET hud = FALSE, updated_at = NOW()
                 WHERE hud IS TRUE;
             """),
+            (1081, """
+                CREATE INDEX IF NOT EXISTS idx_uploads_trill_scored_user_created
+                    ON uploads (user_id, created_at DESC)
+                    WHERE trill_score IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_uploads_user_vehicle_make_trill
+                    ON uploads (user_id, vehicle_make_id, created_at DESC)
+                    WHERE vehicle_make_id IS NOT NULL AND trill_score IS NOT NULL;
+            """),
+            (1082, """
+                -- Normalize legacy flat trill_metadata into nested telemetry.* (see services.trill_access.backfill_trill_metadata_evidence)
+                UPDATE uploads u
+                SET
+                    trill_metadata = COALESCE(u.trill_metadata, '{}'::jsonb) || jsonb_build_object(
+                        'telemetry',
+                        COALESCE(u.trill_metadata->'telemetry', '{}'::jsonb) || jsonb_strip_nulls(jsonb_build_object(
+                            'mid_lat', COALESCE(
+                                NULLIF(btrim(u.trill_metadata#>>'{telemetry,mid_lat}'), ''),
+                                NULLIF(u.trill_metadata->>'place_lat', ''),
+                                NULLIF(u.trill_metadata->>'start_lat', '')
+                            ),
+                            'mid_lon', COALESCE(
+                                NULLIF(btrim(u.trill_metadata#>>'{telemetry,mid_lon}'), ''),
+                                NULLIF(u.trill_metadata->>'place_lon', ''),
+                                NULLIF(u.trill_metadata->>'start_lon', '')
+                            ),
+                            'start_lat', COALESCE(
+                                NULLIF(btrim(u.trill_metadata#>>'{telemetry,start_lat}'), ''),
+                                NULLIF(u.trill_metadata->>'start_lat', ''),
+                                NULLIF(u.trill_metadata->>'place_lat', '')
+                            ),
+                            'start_lon', COALESCE(
+                                NULLIF(btrim(u.trill_metadata#>>'{telemetry,start_lon}'), ''),
+                                NULLIF(u.trill_metadata->>'start_lon', ''),
+                                NULLIF(u.trill_metadata->>'place_lon', '')
+                            ),
+                            'max_speed_mmph', COALESCE(
+                                NULLIF(btrim(u.trill_metadata#>>'{telemetry,max_speed_mph}'), ''),
+                                NULLIF(u.trill_metadata->>'max_speed_mph', '')
+                            ),
+                            'total_distance_miles', COALESCE(
+                                NULLIF(btrim(u.trill_metadata#>>'{telemetry,total_distance_miles}'), ''),
+                                NULLIF(u.trill_metadata->>'distance_miles', '')
+                            )
+                        ))
+                    ),
+                    updated_at = NOW()
+                WHERE u.trill_score IS NOT NULL
+                  AND u.status = ANY(ARRAY['completed','succeeded','partial']::varchar[])
+                  AND u.trill_metadata IS NOT NULL
+                  AND (
+                      u.trill_metadata ? 'place_lat'
+                      OR u.trill_metadata ? 'place_lon'
+                      OR u.trill_metadata ? 'start_lat'
+                      OR u.trill_metadata ? 'start_lon'
+                      OR u.trill_metadata ? 'max_speed_mph'
+                      OR u.trill_metadata ? 'distance_miles'
+                      OR u.trill_metadata ? 'trill_score'
+                      OR (u.trill_metadata ? 'trill' AND NOT (u.trill_metadata ? 'telemetry'))
+                  );
+            """),
+            (1083, """
+                -- creator_lite renamed from launch in app/Stripe catalog; constraint still listed launch only.
+                ALTER TABLE users DROP CONSTRAINT IF EXISTS users_subscription_tier_check;
+                ALTER TABLE users ADD CONSTRAINT users_subscription_tier_check
+                    CHECK (subscription_tier = ANY (ARRAY[
+                        'free'::text,
+                        'launch'::text,
+                        'creator_lite'::text,
+                        'creator_pro'::text,
+                        'studio'::text,
+                        'agency'::text,
+                        'friends_family'::text,
+                        'lifetime'::text,
+                        'master_admin'::text
+                    ]));
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

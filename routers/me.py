@@ -118,6 +118,10 @@ class ApplyContentInsightsBody(BaseModel):
     strategy_key: str | None = Field(
         None, description="Optional override; default is current top-ranked attribution key"
     )
+    platform: str | None = Field(
+        None,
+        description="Apply synthesized meta setup for this platform (tiktok, youtube, instagram, facebook)",
+    )
 
 
 @router.get("/api/me/content-insights")
@@ -138,30 +142,42 @@ async def post_me_content_insights_apply(
     """
     if not body.confirm:
         raise HTTPException(status_code=400, detail="Set confirm=true to apply optimized settings")
+    from services.content_insights import resolve_insights_recommendation
+
     async with core.state.db_pool.acquire() as conn:
         insights = await build_user_content_insights(conn, user["id"])
-    rec = insights.get("recommended") if isinstance(insights, dict) else None
     try:
-        patch = merge_preferences_patch_for_apply(rec or {}, body.strategy_key)
+        rec = resolve_insights_recommendation(
+            insights if isinstance(insights, dict) else {},
+            strategy_key_override=body.strategy_key,
+            platform=body.platform,
+        )
+        patch = merge_preferences_patch_for_apply(rec, None)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if not patch:
         raise HTTPException(status_code=400, detail="No preference fields to apply for this strategy")
     async with core.state.db_pool.acquire() as conn:
         await save_user_content_preferences(conn, user, patch)
-    return {"ok": True, "applied": patch}
+    return {
+        "ok": True,
+        "applied": patch,
+        "platform": (body.platform or "").lower().strip() or None,
+        "source": rec.get("source"),
+    }
 
 
 @router.get("/api/me/ai-insights")
+@router.get("/api/me/smart-insights")
 async def get_me_ai_insights(user: dict = Depends(get_current_user)):
-    """Customer AI Insights hub — platforms, attribution, channel memory, studio usage, coach."""
+    """Customer Smart Insights hub — platforms, attribution, channel memory, studio usage, coach."""
     from services.ai_insights_hub import ai_insights_hub_fallback, build_ai_insights_hub
 
     pool = core.state.db_pool
     if pool is None:
         return ai_insights_hub_fallback(error="database_unavailable")
     try:
-        return await build_ai_insights_hub(pool, user["id"])
+        return await build_ai_insights_hub(pool, user["id"], user=user)
     except Exception:
         logger.exception("GET /api/me/ai-insights failed user_id=%s", user.get("id"))
         return ai_insights_hub_fallback(error="insights_unavailable")

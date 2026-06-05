@@ -605,6 +605,27 @@ VOICE_PROFILES: Dict[str, str] = {
     ),
 }
 
+# Caption STYLE = structural architecture of the line (how it is built). Topic-agnostic;
+# every fact/number/word still comes from the evidence blocks, never invented.
+STYLE_DIRECTIVES: Dict[str, str] = {
+    "story": (
+        "Build a 3-beat micro-arc — setup (earliest visible beat) → turn (the peak moment: "
+        "top speed, climax object, landmark, or loudest audio cue) → payoff (a late beat that "
+        "resolves or reframes). Connective momentum between beats; no bullet fragments. "
+        "Open and close on a different beat than the other variants so each reads like a fresh retelling."
+    ),
+    "punchy": (
+        "Front-load the single most arresting concrete fact in the first 3 words (number, place, "
+        "named object, speed). One or two short telegraphic lines; cut every connective and hedge. "
+        "Impact, then stop — no narrative ramp. Rotate which evidence token leads across variants."
+    ),
+    "factual": (
+        "Lead with the single most impressive verifiable data point in the evidence (peak MPH, a count, "
+        "a spec, a precise place/road, a date, an artist/title). Data-forward, zero fluff, no adjectives "
+        "the evidence does not support: state the metric, then one tight grounded line of context."
+    ),
+}
+
 
 def _detect_category_from_text(text: str) -> Optional[str]:
     """Scan a text string for category keyword signals. Returns first match or None."""
@@ -951,6 +972,8 @@ def _build_narrative_prompt(
         voice_key = "default"
     voice_instruction = VOICE_PROFILES[voice_key]
 
+    style_instruction = STYLE_DIRECTIVES.get(caption_style) or STYLE_DIRECTIVES["story"]
+
     # ── Multi-frame narrative instruction ────────────────────────────────────
     if num_frames > 1:
         frame_instruction = (
@@ -1193,7 +1216,7 @@ from what is actually in the video and context blocks (not like a corporate soci
 
 TONE DIRECTIVE ({caption_tone.upper()}): {tone_instruction}
 VOICE PROFILE ({voice_key.upper()}): {voice_instruction}
-CAPTION STYLE: {caption_style.upper()} — follow this style strictly.
+CAPTION STYLE ({caption_style.upper()} — {caption_length}): {style_instruction} Follow this structure strictly.
 {f"PLATFORM NOTE: {platform_note}" if platform_note else ""}
 
 HOW TONE + VOICE + CATEGORY FIT TOGETHER:

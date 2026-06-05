@@ -27,6 +27,7 @@ from services.thumbnail_personas_list import list_thumbnail_studio_personas
 from stages.entitlements import get_entitlements_for_tier
 from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
 from core.upload_baseline_defaults import UPLOAD_PREF_STRIP_KEYS, apply_upload_baseline_defaults
+from core.upload_preference_configurator import configurator_meta_for_tier, preview_pref_change
 from stages.tiktok_cover_burn import default_tiktok_burn_styled_cover_pref
 
 logger = logging.getLogger(__name__)
@@ -575,6 +576,7 @@ async def get_user_preferences(
             out["tiktokBurnStyledCoverTierDefault"] = default_tiktok_burn_styled_cover_pref(ent)
             out["tiktokBurnStyledCoverAvailable"] = tier_slug != "free"
             out["tiktokBurnStyledCoverFast"] = tier_slug not in ("free",)
+            out["prefConfiguratorMeta"] = configurator_meta_for_tier(tier_slug)
             if include_personas:
                 try:
                     plist = await list_thumbnail_studio_personas(conn, user["id"])
@@ -606,9 +608,6 @@ async def get_user_preferences(
         })
 
 
-# ============================================================
-# POST /api/settings/preferences
-# ============================================================
 @router.post("/api/settings/preferences")
 async def save_user_preferences(
     payload: dict = Body(...),
@@ -623,6 +622,36 @@ async def save_user_preferences(
     """
     async with core.state.db_pool.acquire() as conn:
         return await save_user_content_preferences(conn, user, payload)
+
+
+@router.post("/api/settings/preferences/preview-change")
+async def preview_upload_preference_change(
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user_readonly),
+):
+    """
+    Preview enable/disable cascade for a single upload preference toggle.
+    Powers Settings confirm/deny modals (configurator UX).
+    """
+    key = str(payload.get("key") or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Missing preference key.")
+    new_value = bool(payload.get("newValue"))
+    prefs = payload.get("prefs") or payload.get("currentPrefs") or {}
+    if not isinstance(prefs, dict):
+        raise HTTPException(status_code=400, detail="prefs must be an object.")
+    tier_slug = str(user.get("subscription_tier") or "free")
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            tier_row = await conn.fetchrow(
+                "SELECT subscription_tier FROM users WHERE id = $1", user["id"]
+            )
+            if tier_row and tier_row.get("subscription_tier"):
+                tier_slug = str(tier_row["subscription_tier"])
+    except Exception as e:
+        logger.debug("preview-change tier lookup: %s", e)
+    preview = preview_pref_change(key, new_value, prefs, tier=tier_slug)
+    return preview.to_dict()
 
 
 # ============================================================
@@ -644,7 +673,7 @@ async def save_user_preferences_put(
 async def get_channel_visual_catalog(user: dict = Depends(get_current_user)):
     """
     What UploadM8 has learned from this creator's uploads (Google Vision + VI buckets).
-    Powers Settings → "What UploadM8 knows about my channel" and HF ML export.
+    Powers Smart insights → "What UploadM8 knows about your channel" and HF ML export.
     """
     from services.thumbnail_niches import normalize_niche
     from services.visual_entity_memory import fetch_channel_catalog_detail

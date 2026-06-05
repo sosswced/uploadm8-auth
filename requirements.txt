@@ -67,6 +67,7 @@ numpy>=1.24.0,<3.0.0
 
 # ── M8 publish-hour prior training (HistGradientBoostingRegressor) ──────────
 scikit-learn>=1.8.0,<2.0.0
+joblib>=1.3.0,<2.0.0
 # Optional: m8_publish_hour_model.py imports SHAP only when available.
 # Omit from base requirements because Windows/Python 3.14 often builds it from source.
 

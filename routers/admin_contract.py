@@ -1439,8 +1439,8 @@ async def email_jobs_run(body: EmailJobRunBody, user: dict = Depends(require_adm
 
     response: Dict[str, Any] = {"ok": True, "job": job, "ran": []}
 
-    # 1. Marketing tick (kept compatible with the previous behaviour)
-    if job in ("marketing_execution", "marketing_touchpoints", "all"):
+    # 1. Marketing campaign tick (admin-authored campaigns)
+    if job in ("marketing_execution", "all"):
         try:
             async with core.state.db_pool.acquire() as conn:
                 response["marketing_execution"] = await run_marketing_execution_tick(conn)
@@ -1448,6 +1448,18 @@ async def email_jobs_run(body: EmailJobRunBody, user: dict = Depends(require_adm
         except Exception as e:
             logger.exception("marketing_execution tick failed: %s", e)
             response["marketing_execution_error"] = str(e)
+
+    # 1b. Personalized multi-channel touchpoints (AI-generated lifecycle/upsell ads).
+    #     Self-gates on MARKETING_AUTOMATION_ENABLED inside the runner.
+    if job in ("marketing_touchpoints", "all"):
+        try:
+            from services.marketing_touchpoint_runner import run_touchpoint_cycle
+
+            response["marketing_touchpoints"] = await run_touchpoint_cycle(core.state.db_pool)
+            response["ran"].append("marketing_touchpoints")
+        except Exception as e:
+            logger.exception("marketing_touchpoints cycle failed: %s", e)
+            response["marketing_touchpoints_error"] = str(e)
 
     # 2. Admin email jobs (the four buttons in the admin UI + 'all')
     if job in ADMIN_EMAIL_JOBS or job == "all":

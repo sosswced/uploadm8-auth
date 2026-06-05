@@ -4,6 +4,7 @@
 #   "pandas>=2.0.0,<3.0.0",
 #   "pyarrow>=15.0.0",
 #   "scikit-learn>=1.4.0,<2.0.0",
+#   "joblib>=1.3.0,<2.0.0",
 #   "python-dotenv>=1.0.0,<2.0.0",
 #   "trackio>=0.25.0,<1.0.0",
 # ]
@@ -12,7 +13,7 @@
 Train and evaluate a minimal promo-targeting uplift baseline.
 
 Input: parquet produced by build_promo_training_dataset.py
-Output: JSON report with AUC/PR/lift@k and threshold suggestions.
+Output: JSON report with AUC/PR/lift@k and threshold suggestions; joblib model artifact.
 """
 
 from __future__ import annotations
@@ -23,15 +24,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+import joblib
 import pandas as pd
 from dotenv import load_dotenv
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -39,27 +36,17 @@ if str(_REPO_ROOT) not in sys.path:
 load_dotenv(_REPO_ROOT / ".env")
 
 from services.ml_observability import OptionalTrackioRun
-
-
-FEATURES_NUM = [
-    "sent_dow_utc",
-    "sent_hour_utc",
-    "put_balance",
-    "aic_balance",
-    "uploads_30d",
-    "avg_views_30d",
-    "avg_engagement_pct_30d",
-    "content_items_30d",
-    "pci_avg_views_30d",
-]
-
-FEATURES_CAT = [
-    "channel",
-    "delivery_status",
-    "subscription_tier",
-]
-
-TARGET = "converted_7d"
+from services.promo_targeting_features import (
+    FEATURES_CAT,
+    FEATURES_NUM,
+    TARGET_CONVERTED,
+    TARGET_ENGAGED,
+)
+from services.promo_targeting_train import (
+    build_promo_pipeline,
+    pick_target_column,
+    recommend_score_threshold,
+)
 
 
 def _safe_lift_at_k(y_true: pd.Series, y_score: pd.Series, k: float) -> float:
@@ -93,57 +80,36 @@ def _threshold_table(y_true: pd.Series, y_score: pd.Series) -> List[Dict[str, An
     return out
 
 
-def _build_pipeline() -> Pipeline:
-    num_pipe = Pipeline(
-        steps=[
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler()),
-        ]
-    )
-    cat_pipe = Pipeline(
-        steps=[
-            ("impute", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ]
-    )
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", num_pipe, FEATURES_NUM),
-            ("cat", cat_pipe, FEATURES_CAT),
-        ]
-    )
-    clf = LogisticRegression(max_iter=400, class_weight="balanced")
-    return Pipeline(steps=[("pre", pre), ("clf", clf)])
-
-
 def _run(args: argparse.Namespace) -> Dict[str, Any]:
     path = Path(args.input)
     if not path.exists():
         raise SystemExit(f"Input dataset not found: {path}")
 
     df = pd.read_parquet(path)
-    if TARGET not in df.columns:
-        raise SystemExit(f"Missing target column: {TARGET}")
+    target_col, used_fallback = pick_target_column(df, TARGET_CONVERTED, TARGET_ENGAGED)
+    if target_col not in df.columns:
+        raise SystemExit(f"Missing target column: {target_col}")
     if len(df) < 8:
         raise SystemExit(f"Need more rows to train baseline (got {len(df)})")
-    class_count = int(df[TARGET].nunique())
+    class_count = int(df[target_col].nunique())
     if class_count < 2:
         return {
             "task": "promo_targeting_uplift_baseline",
             "status": "insufficient_label_variance",
             "message": "Target has only one class; add more mixed conversion outcomes before supervised training.",
             "rows": int(len(df)),
-            "positive_rate": float(df[TARGET].mean()) if len(df) else 0.0,
+            "positive_rate": float(df[target_col].mean()) if len(df) else 0.0,
             "unique_classes": class_count,
+            "target_column": target_col,
         }
 
     X = df[FEATURES_NUM + FEATURES_CAT].copy()
-    y = df[TARGET].astype(int).copy()
+    y = df[target_col].astype(int).copy()
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.35, random_state=42, stratify=y
     )
-    pipe = _build_pipeline()
+    pipe = build_promo_pipeline()
     pipe.fit(X_train, y_train)
     p_test = pd.Series(pipe.predict_proba(X_test)[:, 1], index=y_test.index)
 
@@ -152,19 +118,32 @@ def _run(args: argparse.Namespace) -> Dict[str, Any]:
     lift_10 = _safe_lift_at_k(y_test, p_test, 0.10)
     lift_20 = _safe_lift_at_k(y_test, p_test, 0.20)
     thresholds = _threshold_table(y_test, p_test)
+    rec_threshold = recommend_score_threshold(y_test, p_test)
+
+    model_path = Path(args.model_out)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(pipe, model_path)
 
     report: Dict[str, Any] = {
         "task": "promo_targeting_uplift_baseline",
+        "status": "ok",
         "model": "logistic_regression_balanced_v1",
+        "target_column": target_col,
+        "label_fallback_used": used_fallback,
         "train_rows": int(len(X_train)),
         "test_rows": int(len(X_test)),
+        "rows": int(len(df)),
+        "positive_rate": float(df[target_col].mean()),
         "base_positive_rate_test": float(y_test.mean()),
         "roc_auc": auc,
         "average_precision": ap,
         "lift_at_10pct": lift_10,
         "lift_at_20pct": lift_20,
         "threshold_suggestions": thresholds,
+        "recommended_score_threshold": rec_threshold,
+        "default_score_threshold": rec_threshold,
         "feature_columns": FEATURES_NUM + FEATURES_CAT,
+        "model_path": str(model_path),
     }
     return report
 
@@ -173,6 +152,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Train promo uplift baseline model.")
     parser.add_argument("--input", default="data/ml/promo_targeting_train_v1.parquet")
     parser.add_argument("--report-out", default="data/ml/promo_targeting_baseline_report.json")
+    parser.add_argument("--model-out", default="data/ml/promo_uplift_model.joblib")
     args = parser.parse_args()
 
     track = OptionalTrackioRun("promo_targeting_baseline_train")
@@ -186,6 +166,10 @@ def main() -> int:
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
     print(f"Report written to {out}")
+    if report.get("status") == "ok":
+        from services.promo_targeting_model import invalidate_cache
+
+        invalidate_cache()
     return 0
 
 

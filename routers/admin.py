@@ -66,7 +66,13 @@ from services.admin_kpi_reliability import (
 )
 from services.canonical_engagement import ROLLUP_VERSION, compute_admin_engagement_totals
 from services import metric_definitions as metric_definitions_svc
-from services.ml_hub_config import get_ml_hub_urls, hub_public_page_exists, ml_hub_huggingface_dict
+from services.ml_hub_config import (
+    check_hub_pages_parallel,
+    get_ml_hub_urls,
+    get_observability_cache,
+    ml_hub_huggingface_dict,
+    set_observability_cache,
+)
 from services.ml_engine import load_engine_state, run_ml_engine_cycle
 from services.ml_engine_config import get_ml_engine_config, ml_engine_public_dict
 from services.ml_observability import hf_write_token
@@ -123,11 +129,21 @@ def _tier_list_price_usd(tier: Any) -> float:
 
 
 @router.get("/ml/observability-overview")
-async def ml_observability_overview(user: dict = Depends(require_admin)):
+async def ml_observability_overview(
+    user: dict = Depends(require_admin),
+    mode: str = Query("full", pattern="^(full|strip)$"),
+):
     """
     Single-pane status for local ML artifacts + HF + Trackio wiring.
     No secrets are returned; only boolean/config health and local paths.
+
+    ``mode=strip`` skips Hugging Face HTTP probes (companion panel). ``mode=full`` probes Hub pages.
+    Responses are cached in-process for ~10 minutes per mode.
     """
+    cached = get_observability_cache(mode)
+    if cached is not None:
+        return cached
+
     root = Path(__file__).resolve().parents[1]
     dataset_path = root / "data" / "ml" / "promo_targeting_train_v1.parquet"
     baseline_report_path = root / "data" / "ml" / "promo_targeting_baseline_report.json"
@@ -157,8 +173,25 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
             )
             local_trackio_db = fallback.is_file() and fallback.stat().st_size > 0
 
+    if mode == "strip":
+        hub_pages = {
+            "dataset_url_configured": bool(dataset_url),
+            "trackio_space_url_configured": bool(space_url),
+            "dataset_reachable": bool(dataset_url),
+            "trackio_space_reachable": bool(space_url),
+        }
+    else:
+        dataset_ok, space_ok = await check_hub_pages_parallel(dataset_url, space_url)
+        hub_pages = {
+            "dataset_url_configured": bool(dataset_url),
+            "trackio_space_url_configured": bool(space_url),
+            "dataset_reachable": bool(dataset_url and dataset_ok),
+            "trackio_space_reachable": bool(space_url and space_ok),
+        }
+
     summary: Dict[str, Any] = {
         "as_of": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
         "local": {
             "repo_root": str(root),
             "dataset_path": str(dataset_path),
@@ -170,12 +203,7 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
             "token_configured": bool(hf_token),
             **hf_links,
         },
-        "hub_pages": {
-            "dataset_url_configured": bool(dataset_url),
-            "trackio_space_url_configured": bool(space_url),
-            "dataset_reachable": bool(dataset_url and hub_public_page_exists(dataset_url)),
-            "trackio_space_reachable": bool(space_url and hub_public_page_exists(space_url)),
-        },
+        "hub_pages": hub_pages,
         "trackio": {
             "project_configured": bool(trackio_project),
             "project": trackio_project,
@@ -227,43 +255,49 @@ async def ml_observability_overview(user: dict = Depends(require_admin)):
             except Exception:
                 db["visual_entity_catalog_count"] = 0
                 db["visual_entity_creator_count"] = 0
-            lr = await conn.fetchrow(
-                """
-                SELECT id::text AS id, trained_at, model_version, train_row_count, val_mae_log1p_views,
-                       COALESCE(related_ops_incident_ids, ARRAY[]::uuid[]) AS related_ops_incident_ids
-                FROM m8_model_runs
-                ORDER BY trained_at DESC
-                LIMIT 1
-                """
-            )
-            if lr:
-                db["latest_m8_model_run"] = {
-                    "id": lr["id"],
-                    "trained_at": lr["trained_at"].isoformat() if lr.get("trained_at") else None,
-                    "model_version": lr["model_version"],
-                    "train_row_count": int(lr["train_row_count"] or 0),
-                    "val_mae_log1p_views": float(lr["val_mae_log1p_views"])
-                    if lr.get("val_mae_log1p_views") is not None
-                    else None,
-                    "related_ops_incident_ids": [str(x) for x in (lr["related_ops_incident_ids"] or [])],
-                }
-            else:
-                db["latest_m8_model_run"] = None
+            if mode == "full":
+                lr = await conn.fetchrow(
+                    """
+                    SELECT id::text AS id, trained_at, model_version, train_row_count, val_mae_log1p_views,
+                           COALESCE(related_ops_incident_ids, ARRAY[]::uuid[]) AS related_ops_incident_ids
+                    FROM m8_model_runs
+                    ORDER BY trained_at DESC
+                    LIMIT 1
+                    """
+                )
+                if lr:
+                    db["latest_m8_model_run"] = {
+                        "id": lr["id"],
+                        "trained_at": lr["trained_at"].isoformat() if lr.get("trained_at") else None,
+                        "model_version": lr["model_version"],
+                        "train_row_count": int(lr["train_row_count"] or 0),
+                        "val_mae_log1p_views": float(lr["val_mae_log1p_views"])
+                        if lr.get("val_mae_log1p_views") is not None
+                        else None,
+                        "related_ops_incident_ids": [
+                            str(x) for x in (lr["related_ops_incident_ids"] or [])
+                        ],
+                    }
+                else:
+                    db["latest_m8_model_run"] = None
     except Exception as e:
         db["error"] = str(e)
 
     summary["database"] = db
-    engine_cfg = get_ml_engine_config()
-    engine_state = load_engine_state()
-    last_run = engine_state.get("last_run") if isinstance(engine_state.get("last_run"), dict) else {}
-    summary["ml_engine"] = {
-        **ml_engine_public_dict(engine_cfg),
-        "last_run_ok": last_run.get("ok"),
-        "last_run_at": last_run.get("finished_at") or last_run.get("started_at"),
-        "last_run_mode": last_run.get("mode"),
-        "last_run_error": last_run.get("error"),
-        "last_hf_job_url": (last_run.get("steps") or {}).get("hf_jobs_train", {}).get("job_url"),
-    }
+    if mode == "full":
+        engine_cfg = get_ml_engine_config()
+        engine_state = load_engine_state()
+        last_run = engine_state.get("last_run") if isinstance(engine_state.get("last_run"), dict) else {}
+        summary["ml_engine"] = {
+            **ml_engine_public_dict(engine_cfg),
+            "last_run_ok": last_run.get("ok"),
+            "last_run_at": last_run.get("finished_at") or last_run.get("started_at"),
+            "last_run_mode": last_run.get("mode"),
+            "last_run_error": last_run.get("error"),
+            "last_hf_job_url": (last_run.get("steps") or {}).get("hf_jobs_train", {}).get("job_url"),
+        }
+
+    set_observability_cache(mode, summary)
     return summary
 
 

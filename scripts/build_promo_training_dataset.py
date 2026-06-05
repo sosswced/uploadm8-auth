@@ -78,14 +78,50 @@ platform_perf_30d AS (
 label_7d AS (
     SELECT
         tp.touchpoint_id,
-        CASE WHEN EXISTS (
-            SELECT 1
-            FROM revenue_tracking rt
-            WHERE rt.user_id = tp.user_id
-              AND rt.created_at >= tp.effective_sent_at
-              AND rt.created_at < tp.effective_sent_at + INTERVAL '7 days'
-              AND COALESCE(rt.amount, 0) > 0
+        CASE WHEN (
+            EXISTS (
+                SELECT 1
+                FROM revenue_tracking rt
+                WHERE rt.user_id = tp.user_id
+                  AND rt.created_at >= tp.effective_sent_at
+                  AND rt.created_at < tp.effective_sent_at + INTERVAL '7 days'
+                  AND COALESCE(rt.amount, 0) > 0
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM marketing_events me
+                WHERE me.user_id = tp.user_id
+                  AND me.created_at >= tp.effective_sent_at
+                  AND me.created_at < tp.effective_sent_at + INTERVAL '7 days'
+                  AND me.event_type = 'converted'
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM marketing_events me
+                WHERE me.user_id = tp.user_id
+                  AND me.created_at >= tp.effective_sent_at
+                  AND me.created_at < tp.effective_sent_at + INTERVAL '7 days'
+                  AND me.event_type = 'clicked'
+            )
         ) THEN 1 ELSE 0 END AS converted_7d,
+        CASE WHEN (
+            EXISTS (
+                SELECT 1
+                FROM revenue_tracking rt
+                WHERE rt.user_id = tp.user_id
+                  AND rt.created_at >= tp.effective_sent_at
+                  AND rt.created_at < tp.effective_sent_at + INTERVAL '7 days'
+                  AND COALESCE(rt.amount, 0) > 0
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM marketing_events me
+                WHERE me.user_id = tp.user_id
+                  AND me.created_at >= tp.effective_sent_at
+                  AND me.created_at < tp.effective_sent_at + INTERVAL '7 days'
+                  AND me.event_type IN ('converted', 'clicked', 'campaign_email_open')
+            )
+        ) THEN 1 ELSE 0 END AS engaged_7d,
         COALESCE((
             SELECT SUM(COALESCE(rt2.amount, 0))::double precision
             FROM revenue_tracking rt2
@@ -112,6 +148,7 @@ SELECT
     COALESCE(pp.content_items_30d, 0)::int AS content_items_30d,
     COALESCE(pp.pci_avg_views_30d, 0)::double precision AS pci_avg_views_30d,
     l7.converted_7d,
+    l7.engaged_7d,
     l7.revenue_7d
 FROM touchpoints tp
 LEFT JOIN users u ON u.id = tp.user_id
@@ -120,6 +157,108 @@ LEFT JOIN user_uploads_30d uu ON uu.user_id = tp.user_id
 LEFT JOIN platform_perf_30d pp ON pp.user_id = tp.user_id
 LEFT JOIN label_7d l7 ON l7.touchpoint_id = tp.touchpoint_id
 ORDER BY tp.touchpoint_at DESC
+LIMIT $2::int
+"""
+
+USER_SNAPSHOT_SQL = """
+WITH active_users AS (
+    SELECT DISTINCT u.id AS user_id
+    FROM users u
+    JOIN uploads up ON up.user_id = u.id
+    WHERE up.created_at >= (NOW() - ($1::int || ' days')::interval)
+      AND up.status IN ('completed', 'succeeded')
+      AND COALESCE(u.role, '') NOT IN ('master_admin')
+),
+user_uploads_30d AS (
+    SELECT
+        u.user_id,
+        COUNT(*)::int AS uploads_30d,
+        AVG(COALESCE(u.views, 0))::double precision AS avg_views_30d,
+        AVG(
+            CASE
+                WHEN COALESCE(u.views, 0) > 0
+                THEN ((COALESCE(u.likes, 0) + COALESCE(u.comments, 0) + COALESCE(u.shares, 0))::double precision / u.views::double precision) * 100.0
+                ELSE 0.0
+            END
+        )::double precision AS avg_engagement_pct_30d
+    FROM uploads u
+    WHERE u.created_at >= (NOW() - INTERVAL '30 days')
+    GROUP BY u.user_id
+),
+platform_perf_30d AS (
+    SELECT
+        pci.user_id,
+        COUNT(*)::int AS content_items_30d,
+        AVG(COALESCE(pci.views, 0))::double precision AS pci_avg_views_30d
+    FROM platform_content_items pci
+    WHERE pci.published_at >= (NOW() - INTERVAL '30 days')
+    GROUP BY pci.user_id
+),
+labels_30d AS (
+    SELECT
+        au.user_id,
+        CASE WHEN (
+            COALESCE((
+                SELECT SUM(COALESCE(rt.amount, 0))
+                FROM revenue_tracking rt
+                WHERE rt.user_id = au.user_id
+                  AND rt.created_at >= NOW() - INTERVAL '30 days'
+            ), 0) > 0
+            OR EXISTS (
+                SELECT 1 FROM marketing_events me
+                WHERE me.user_id = au.user_id
+                  AND me.created_at >= NOW() - INTERVAL '30 days'
+                  AND me.event_type = 'converted'
+            )
+        ) THEN 1 ELSE 0 END AS converted_7d,
+        CASE WHEN (
+            COALESCE((
+                SELECT SUM(COALESCE(rt.amount, 0))
+                FROM revenue_tracking rt
+                WHERE rt.user_id = au.user_id
+                  AND rt.created_at >= NOW() - INTERVAL '30 days'
+            ), 0) > 0
+            OR EXISTS (
+                SELECT 1 FROM marketing_events me
+                WHERE me.user_id = au.user_id
+                  AND me.created_at >= NOW() - INTERVAL '30 days'
+                  AND me.event_type IN ('converted', 'clicked', 'campaign_email_open')
+            )
+        ) THEN 1 ELSE 0 END AS engaged_7d,
+        COALESCE((
+            SELECT SUM(COALESCE(rt.amount, 0))::double precision
+            FROM revenue_tracking rt
+            WHERE rt.user_id = au.user_id
+              AND rt.created_at >= NOW() - INTERVAL '30 days'
+        ), 0.0) AS revenue_7d
+    FROM active_users au
+)
+SELECT
+    ('user:' || au.user_id::text) AS touchpoint_id,
+    au.user_id,
+    'snapshot' AS channel,
+    'active_user' AS delivery_status,
+    NOW() AS touchpoint_at,
+    EXTRACT(DOW FROM NOW())::int AS sent_dow_utc,
+    EXTRACT(HOUR FROM NOW())::int AS sent_hour_utc,
+    COALESCE(w.put_balance, 0)::int AS put_balance,
+    COALESCE(w.aic_balance, 0)::int AS aic_balance,
+    COALESCE(u.subscription_tier, 'free') AS subscription_tier,
+    COALESCE(uu.uploads_30d, 0)::int AS uploads_30d,
+    COALESCE(uu.avg_views_30d, 0)::double precision AS avg_views_30d,
+    COALESCE(uu.avg_engagement_pct_30d, 0)::double precision AS avg_engagement_pct_30d,
+    COALESCE(pp.content_items_30d, 0)::int AS content_items_30d,
+    COALESCE(pp.pci_avg_views_30d, 0)::double precision AS pci_avg_views_30d,
+    l.converted_7d,
+    l.engaged_7d,
+    l.revenue_7d
+FROM active_users au
+JOIN users u ON u.id = au.user_id
+LEFT JOIN wallets w ON w.user_id = au.user_id
+LEFT JOIN user_uploads_30d uu ON uu.user_id = au.user_id
+LEFT JOIN platform_perf_30d pp ON pp.user_id = au.user_id
+LEFT JOIN labels_30d l ON l.user_id = au.user_id
+ORDER BY l.converted_7d DESC, l.engaged_7d DESC, au.user_id
 LIMIT $2::int
 """
 
@@ -146,6 +285,13 @@ SELECT
       WHEN COALESCE(mol.label_json->>'selected_variant', '') <> '' THEN 1
       ELSE 0
     END AS converted_7d,
+    CASE
+      WHEN COALESCE((mol.label_json->>'conversion')::double precision, 0) > 0 THEN 1
+      WHEN COALESCE((mol.label_json->>'revenue_7d')::double precision, 0) > 0 THEN 1
+      WHEN COALESCE(mol.label_json->>'email_open', '') IN ('true', '1') THEN 1
+      WHEN COALESCE(mol.label_json->>'selected_variant', '') <> '' THEN 1
+      ELSE 0
+    END AS engaged_7d,
     GREATEST(
       COALESCE((mol.label_json->>'revenue_7d')::double precision, 0),
       COALESCE((mol.label_json->>'conversion')::double precision, 0)
@@ -169,12 +315,31 @@ def _require_database_url() -> str:
 async def _fetch_dataset(dsn: str, lookback_days: int, limit: int) -> pd.DataFrame:
     conn = await asyncpg.connect(dsn)
     try:
-        rows = await conn.fetch(PROMO_SQL, int(lookback_days), int(limit))
-        if not rows:
-            rows = await conn.fetch(FALLBACK_PROMO_SQL, int(lookback_days), int(limit))
+        touch_rows = await conn.fetch(PROMO_SQL, int(lookback_days), int(limit))
+        snap_limit = max(500, int(limit) // 2)
+        snap_rows = await conn.fetch(USER_SNAPSHOT_SQL, int(lookback_days), snap_limit)
+        if not touch_rows and not snap_rows:
+            touch_rows = await conn.fetch(FALLBACK_PROMO_SQL, int(lookback_days), int(limit))
+        records = [dict(r) for r in touch_rows] + [dict(r) for r in snap_rows]
+        df = pd.DataFrame.from_records(records)
+        if df.empty:
+            return df
+        if "engaged_7d" not in df.columns:
+            df["engaged_7d"] = df.get("converted_7d", 0)
+        # Prefer real touchpoint rows over snapshot duplicates per user.
+        if "touchpoint_id" in df.columns and "user_id" in df.columns:
+            sort_cols = ["converted_7d", "engaged_7d"]
+            if "touchpoint_at" in df.columns:
+                sort_cols.append("touchpoint_at")
+            df = df.sort_values(
+                by=sort_cols,
+                ascending=[False] * len(sort_cols),
+                na_position="last",
+            )
+            df = df.drop_duplicates(subset=["user_id"], keep="first")
+        return df.head(int(limit))
     finally:
         await conn.close()
-    return pd.DataFrame.from_records([dict(r) for r in rows])
 
 
 def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:

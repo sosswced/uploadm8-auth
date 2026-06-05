@@ -510,6 +510,205 @@ def _style_prompt(style: str, tone: str) -> str:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Elite, UI-keyed creative directives for the M8 engine.
+#
+# WHY: the settings page exposes 3 caption styles, 4 tones, and 6 voices/personas.
+# Previously M8 collapsed all of them into one generic sentence (`_style_prompt`)
+# and a 3-way persona (`_persona_system_prompt`), so distinct UI selections produced
+# near-identical copy. These libraries are keyed on the RAW UI values so every
+# selection injects a structurally different blueprint into the prompt — making
+# output visibly change with each choice while staying evidence-grounded.
+#
+# Contract for every directive: topic-agnostic delivery only. Vocabulary, stakes,
+# and specifics MUST come from the Scene Graph evidence, never invented.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Caption STYLE = the structural architecture of the line (how it is built).
+M8_STYLE_DIRECTIVES: Dict[str, Dict[str, str]] = {
+    "story": {
+        "label": "STORY — narrative arc",
+        "blueprint": (
+            "Build a 3-beat micro-arc straight from scene_graph.timeline: "
+            "(1) SETUP — open on the earliest grounded beat (place / first on-screen text / opening label); "
+            "(2) TURN — pivot on the peak beat (top MPH, climax object, landmark, or loudest audio cue); "
+            "(3) PAYOFF — close on a late beat that resolves or reframes. "
+            "Caption length 150–280 characters. Connective momentum between beats; no bullet fragments. "
+            "Each variant must enter and exit the arc at a different beat so the 5 variants feel like 5 retellings, "
+            "not one caption reworded."
+        ),
+    },
+    "punchy": {
+        "label": "PUNCHY — hook in first 3 words",
+        "blueprint": (
+            "Front-load the single most arresting CONCRETE fact in the first 3 words "
+            "(a number, a place, a named object, a speed). One or two short lines, telegraphic rhythm, "
+            "cut every connective and hedge ('just', 'really', 'kind of'). Under 120 characters. "
+            "No narrative ramp — impact then stop. Across the 5 variants, rotate WHICH evidence token leads "
+            "(speed → place → object → audio → trill) so no two hooks open on the same word class."
+        ),
+    },
+    "factual": {
+        "label": "FACTUAL — lead with the strongest stat",
+        "blueprint": (
+            "Lead with the single most impressive VERIFIABLE data point in the evidence — peak MPH, a count, "
+            "a spec, a precise place/road, a date, an artist/title. Data-forward, zero fluff, no adjectives that "
+            "evidence does not support. 100–200 characters. State the metric, then one tight line of grounded context. "
+            "Across the 5 variants, lead with a different verified figure/spec each time; never repeat the same "
+            "headline metric as variant 1."
+        ),
+    },
+}
+
+# Caption TONE = the emotional register / energy the copy is delivered in.
+M8_TONE_DIRECTIVES: Dict[str, Dict[str, str]] = {
+    "authentic": {
+        "label": "AUTHENTIC — real talk, first-person, no fluff",
+        "register": (
+            "Human and direct; first-person or close second-person; plain words over marketing speak. "
+            "Sound like a real person who was actually there. One honest observation beats a manufactured hook. "
+            "Ban influencer filler ('okay guys', 'here's the thing', 'let me tell you'). No exclamation inflation."
+        ),
+    },
+    "hype": {
+        "label": "HYPE — high energy, power words, stop-the-scroll",
+        "register": (
+            "High momentum and conviction: strong verbs, tight clauses, forward pull, occasional emphatic word — "
+            "still believable. Scale the intensity to the actual subject (a quiet craft gets urgent clarity, not "
+            "party-bro shouting). Every spike of energy must trace to something literally on screen or in the audio. "
+            "Never invent stakes the footage does not earn."
+        ),
+    },
+    "cinematic": {
+        "label": "CINEMATIC — poetic, atmospheric, film-trailer feel",
+        "register": (
+            "Scene-led, sensory language: light, shadow, motion, scale, texture — only what the frames support. "
+            "Present tense where it heightens immediacy; trailer-like rhythm without melodrama or clichés that could "
+            "apply to any clip. Every image must tether to a visible detail or a spoken line. Restraint over purple prose."
+        ),
+    },
+    "calm": {
+        "label": "CALM — measured, confident, let the footage speak",
+        "register": (
+            "Measured, breathable pacing; let concrete details carry the weight. Understatement over exclamation; "
+            "cool, trustworthy register. No urgency theatrics. Confidence shown through specificity, not volume."
+        ),
+    },
+}
+
+# Caption VOICE / PERSONA = who is speaking (diction, point of view, sign-off).
+M8_VOICE_DIRECTIVES: Dict[str, Dict[str, str]] = {
+    "default": {
+        "label": "DEFAULT — balanced, platform-friendly creator",
+        "persona": (
+            "Balanced creator voice: clear hook, specific middle, satisfying close. Confident but not performative. "
+            "Match slang and terminology to what the content actually is (chef terms for food, dev terms for code, "
+            "driver terms for a drive). Neutral, broadly likeable point of view."
+        ),
+    },
+    "mentor": {
+        "label": "MENTOR — wise, educational, authority",
+        "persona": (
+            "Experienced guide: 'you'-oriented, encouraging, zero condescension. Imply expertise through precise "
+            "specifics, never a credentials flex. When the clip teaches or demonstrates anything, land one usable "
+            "takeaway. Calm authority — the voice of someone who has done this many times."
+        ),
+    },
+    "hypebeast": {
+        "label": "HYPEBEAST — all-caps energy, slang, viral",
+        "persona": (
+            "Peak short-form energy: clipped sentences, rhythm, street/viral cadence, sparing ALL-CAPS on the one "
+            "word that matters. Slang only when it fits the subject and platform — never empty viral filler "
+            "('this is insane', 'no way'). All the hype must trace to a real on-screen or audio moment."
+        ),
+    },
+    "best_friend": {
+        "label": "BEST FRIEND — casual, real, relatable",
+        "persona": (
+            "Warm, unfiltered peer texting you about something cool: conversational fragments OK, light self-aware "
+            "humor when the content allows, relatable aside. Never mean-spirited or faux-chaos. Reads like a friend, "
+            "not a brand. Second-person ('you') and shared-moment framing welcome."
+        ),
+    },
+    "teacher": {
+        "label": "TEACHER — clear, informative, structured",
+        "persona": (
+            "Educator clarity: one central idea, a logical mini-arc, minimal jargon unless the visuals clearly expect "
+            "it. If the clip is not instructional, still be precise — teach what happened or what to notice in the "
+            "footage, not an unrelated life lesson. Structure and signposting over flourish."
+        ),
+    },
+    "cinematic_narrator": {
+        "label": "CINEMATIC — film narrator, epic, atmospheric",
+        "persona": (
+            "Third-person / omniscient trailer narrator: declarative, image-stacking, slightly elevated register. "
+            "Anchored to real events in the clip — no epic narration of nothing happening. Reserve the biggest "
+            "flourish for the genuine peak in the footage. Think voiceover, not influencer."
+        ),
+    },
+}
+
+# Strategy-slug → UI-voice fallback, so policy/strategy persona overrides still
+# resolve to one of the rich UI voice directives instead of going generic.
+_M8_PERSONA_SLUG_TO_VOICE_UI: Dict[str, str] = {
+    "storyteller": "cinematic_narrator",
+    "creator_coach": "mentor",
+    "hype_friend": "hypebeast",
+    "expert_analyst": "teacher",
+}
+
+
+def _m8_style_directive(style_ui: str) -> Dict[str, str]:
+    return M8_STYLE_DIRECTIVES.get((style_ui or "").lower().strip(), M8_STYLE_DIRECTIVES["story"])
+
+
+def _m8_tone_directive(tone_ui: str) -> Dict[str, str]:
+    return M8_TONE_DIRECTIVES.get((tone_ui or "").lower().strip(), M8_TONE_DIRECTIVES["authentic"])
+
+
+def _m8_voice_directive(voice_ui: str) -> Dict[str, str]:
+    v = (voice_ui or "").lower().strip().replace("-", "_")
+    if v in M8_VOICE_DIRECTIVES:
+        return M8_VOICE_DIRECTIVES[v]
+    # voice_ui may actually be a collapsed strategy persona slug — remap it.
+    mapped = _M8_PERSONA_SLUG_TO_VOICE_UI.get(v)
+    if mapped and mapped in M8_VOICE_DIRECTIVES:
+        return M8_VOICE_DIRECTIVES[mapped]
+    return M8_VOICE_DIRECTIVES["default"]
+
+
+def _m8_creative_directive_block(style_ui: str, tone_ui: str, voice_ui: str) -> str:
+    """Compose the three UI-keyed directives into one elite, self-differentiating
+    creative brief. This is the primary driver of how copy reads, so that every
+    distinct combination of (style, tone, voice) produces visibly different output.
+    """
+    style = _m8_style_directive(style_ui)
+    tone = _m8_tone_directive(tone_ui)
+    voice = _m8_voice_directive(voice_ui)
+    return f"""━━ CREATOR VOICE OPERATING SYSTEM (user-selected — this is the PRIMARY driver of how copy reads) ━━
+These three knobs are SEPARATE and compose together. They are delivery only — every fact, name, number, and
+piece of vocabulary still comes from the Scene Graph evidence, never invented.
+
+CAPTION STYLE → {style['label']}
+  {style['blueprint']}
+
+CAPTION TONE → {tone['label']}
+  {tone['register']}
+
+CAPTION VOICE / PERSONA → {voice['label']}
+  {voice['persona']}
+
+COMPOSITION RULES (non-negotiable):
+- STYLE controls the structure/architecture, TONE controls the emotional register, VOICE controls who is speaking
+  (diction + point of view). Apply all three at once; do not let one silently override another.
+- If this exact (style, tone, voice) were changed by even one knob, the resulting copy MUST read noticeably
+  different — different opening rhythm, sentence length, and word choice — not the same caption reskinned.
+- Do NOT fall back to a neutral house voice. The selected voice's diction and point of view must be audible
+  in every variant.
+- Stay evidence-grounded: the persona is HOW it is said; the Scene Graph is WHAT is said.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+
+
 def _task_prompt(generate_title: bool, generate_caption: bool, generate_hashtags: bool) -> str:
     return (
         f"Task switches: title={'on' if generate_title else 'off'}, "
@@ -843,10 +1042,9 @@ SCENE GRAPH (evidence - do not invent beyond it; you may interpret visually grou
 
 CATEGORY: {category}
 USER ACCOUNT SETTINGS (UI): caption_style={caption_style} caption_tone={caption_tone} caption_voice={caption_voice_ui}
-EFFECTIVE STRATEGY (user-seeded, policy rules may override per platform): style={base_style} tone={base_tone} persona={base_persona}
+EFFECTIVE STRATEGY (policy/ML context — per-platform nuance only, NOT a license to flatten the user's voice): style={base_style} tone={base_tone} persona={base_persona}
 {_user_brand_directive(ctx)}
-{_persona_system_prompt(base_persona)}
-{_style_prompt(base_style, base_tone)}
+{_m8_creative_directive_block(caption_style, caption_tone, caption_voice_ui)}
 {_task_prompt(generate_title, generate_caption, generate_hashtags)}
 
 {fusion}

@@ -188,16 +188,25 @@ license: mit
 tags:
 - uploadm8
 - promo-targeting
+- content-success
 - tabular
 datasets:
 - {args.dataset_repo or 'your-org/promo-targeting-v1'}
 ---
 
-# UploadM8 Promo Uplift Model
+# UploadM8 ML Hub Models
 
-Baseline promo-targeting uplift model trained by the UploadM8 ML engine.
-Evaluation metrics are published under `.eval_results/` per
-[Hugging Face eval results](https://huggingface.co/docs/hub/eval-results).
+Models trained by the UploadM8 ML engine, sharing one dataset repo (separate splits):
+
+- **Promo uplift** (`split: train`) — touchpoint conversion uplift.
+  Eval: `.eval_results/uploadm8_promo_uplift.yaml`, metrics: `uploadm8_metrics.json`.
+- **Content success / hottest topic** (`split: content_success`) — learns which
+  topic, packaging, and upload-flow choices drive the strongest per-platform
+  engagement (likes/comments/shares/views per video) and ranks the hottest content.
+  Eval: `.eval_results/uploadm8_content_success.yaml`, metrics + ranked topics:
+  `uploadm8_content_metrics.json`.
+
+Evaluation metrics follow [Hugging Face eval results](https://huggingface.co/docs/hub/eval-results).
 """
         api.upload_file(
             path_or_fileobj=readme.encode("utf-8"),

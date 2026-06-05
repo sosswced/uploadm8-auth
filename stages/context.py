@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from core.helpers import coerce_hashtag_list, sanitize_hashtag_body, strip_stray_hashtag_json_blob
+from core.helpers import coerce_hashtag_list, coerce_jsonb_dict, sanitize_hashtag_body, strip_stray_hashtag_json_blob
 
 from .entitlements import Entitlements
 
@@ -860,16 +860,7 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
     ) or None
     ctx.ai_hashtags = coerce_hashtag_list(upload_record.get("ai_generated_hashtags") or upload_record.get("ai_hashtags") or [])
 
-    artifacts_raw = upload_record.get("output_artifacts") or {}
-    if isinstance(artifacts_raw, str):
-        try:
-            artifacts = json.loads(artifacts_raw)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            artifacts = {}
-    elif isinstance(artifacts_raw, dict):
-        artifacts = dict(artifacts_raw)
-    else:
-        artifacts = {}
+    artifacts = coerce_jsonb_dict(upload_record.get("output_artifacts"), default={})
     if artifacts:
         ctx.output_artifacts = {str(k): str(v) for k, v in artifacts.items() if v is not None}
 

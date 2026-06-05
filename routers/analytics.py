@@ -31,7 +31,8 @@ from services.canonical_engagement import (
     engagement_time_window_for_overview_days,
     engagement_window_api_dict,
 )
-from services.trill_vehicle_filter import trill_vehicle_where_fragment
+from services.trill_vehicle_filter import build_trill_vehicle_filter
+from services.trill_access import TRILL_SCORED_PREDICATE
 from services.white_label import company_slug, load_effective_brand_context
 from services.tiktok_api import tiktok_video_list_url
 
@@ -490,6 +491,8 @@ async def get_analytics(
     range: str = "30d",
     trill_vehicle_make: Optional[str] = Query(None, max_length=120),
     trill_vehicle_model: Optional[str] = Query(None, max_length=120),
+    trill_vehicle_make_id: Optional[int] = Query(None, ge=1),
+    trill_vehicle_model_id: Optional[int] = Query(None, ge=1),
     user: dict = Depends(get_current_user_readonly),
 ):
     # Align range presets with canonical_engagement (includes 90d, half-open UTC windows).
@@ -542,7 +545,14 @@ async def get_analytics(
         )
 
         trill_stats = None
-        vf_sql, vf_vals = trill_vehicle_where_fragment(3, trill_vehicle_make, trill_vehicle_model)
+        vf_sql, vf_vals = await build_trill_vehicle_filter(
+            conn,
+            3,
+            trill_vehicle_make,
+            trill_vehicle_model,
+            make_id=trill_vehicle_make_id,
+            model_id=trill_vehicle_model_id,
+        )
         try:
             trill_data = await conn.fetchrow(
                 f"""
@@ -550,12 +560,24 @@ async def get_analytics(
                     COUNT(*)::int AS trill_uploads,
                     COALESCE(AVG(trill_score), 0)::decimal AS avg_score,
                     COALESCE(MAX(trill_score), 0)::decimal AS max_score,
-                    COALESCE(MAX(max_speed_mph), 0)::decimal AS max_speed_mph,
-                    COALESCE(SUM(distance_miles), 0)::decimal AS total_distance_miles
+                    COALESCE(MAX(
+                        COALESCE(
+                            u.max_speed_mph,
+                            NULLIF(btrim(u.trill_metadata#>>'{{telemetry,max_speed_mph}}'), '')::numeric,
+                            NULLIF(btrim(u.trill_metadata#>>'{{max_speed_mph}}'), '')::numeric
+                        )
+                    ), 0)::decimal AS max_speed_mph,
+                    COALESCE(SUM(
+                        COALESCE(
+                            u.distance_miles,
+                            NULLIF(btrim(u.trill_metadata#>>'{{telemetry,total_distance_miles}}'), '')::numeric,
+                            NULLIF(btrim(u.trill_metadata#>>'{{distance_miles}}'), '')::numeric
+                        )
+                    ), 0)::decimal AS total_distance_miles
                 FROM uploads u
                 WHERE u.user_id = $1
                 AND u.created_at >= $2
-                AND u.trill_score IS NOT NULL
+                AND {TRILL_SCORED_PREDICATE.strip()}
                 {vf_sql}
                 """,
                 uid,
@@ -571,7 +593,7 @@ async def get_analytics(
                     WHERE u.user_id = $1
                     AND u.created_at >= $2
                     AND speed_bucket IS NOT NULL
-                    AND u.trill_score IS NOT NULL
+                    AND {TRILL_SCORED_PREDICATE.strip()}
                     {vf_sql}
                     GROUP BY speed_bucket
                     """,
@@ -636,7 +658,7 @@ async def get_analytics(
                         FROM uploads u
                         WHERE u.user_id = $1
                           AND u.created_at >= $2
-                          AND u.trill_score IS NOT NULL
+                          AND {TRILL_SCORED_PREDICATE.strip()}
                           {vf_sql}
                         ORDER BY u.created_at DESC
                         LIMIT 100
@@ -678,7 +700,7 @@ async def get_analytics(
                                    COUNT(*)::int AS cnt,
                                    MAX(u.trill_score)::float AS best_trill
                             FROM uploads u
-                            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.trill_score IS NOT NULL
+                            WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_SCORED_PREDICATE.strip()}
                             {vf_sql}
                             GROUP BY 1
                             ORDER BY cnt DESC
@@ -698,7 +720,7 @@ async def get_analytics(
                                    COUNT(*)::int AS cnt,
                                    MAX(u.trill_score)::float AS best_trill
                             FROM uploads u
-                            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.trill_score IS NOT NULL
+                            WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_SCORED_PREDICATE.strip()}
                               AND u.trill_metadata ? 'vehicle'
                               {vf_sql}
                             GROUP BY 1, 2
@@ -718,7 +740,7 @@ async def get_analytics(
                                    u.trill_score::float AS trill_score,
                                    COALESCE(NULLIF(btrim(u.title), ''), u.filename) AS disp_title
                             FROM uploads u
-                            WHERE u.user_id = $1 AND u.created_at >= $2 AND u.trill_score IS NOT NULL
+                            WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_SCORED_PREDICATE.strip()}
                             {vf_sql}
                             ORDER BY COALESCE(u.max_speed_mph,
                                 NULLIF(btrim(u.trill_metadata#>>'{{telemetry,max_speed_mph}}'), '')::numeric

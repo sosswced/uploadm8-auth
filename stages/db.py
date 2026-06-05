@@ -18,6 +18,7 @@ from core.helpers import (
     _safe_col,
     coerce_jsonb_dict,
     coerce_jsonb_list,
+    coerce_processed_assets_map,
     merge_platform_hashtag_overlay,
 )
 from core.sql_allowlist import (
@@ -41,7 +42,14 @@ async def load_upload_record(pool: asyncpg.Pool, upload_id: str) -> Optional[dic
     """Load an upload record by ID."""
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM uploads WHERE id = $1", upload_id)
-        return dict(row) if row else None
+        if not row:
+            return None
+        out = dict(row)
+        if "output_artifacts" in out:
+            out["output_artifacts"] = coerce_jsonb_dict(out.get("output_artifacts"), default={})
+        if out.get("processed_assets") is not None:
+            out["processed_assets"] = coerce_processed_assets_map(out.get("processed_assets"))
+        return out
 
 
 async def load_user(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
@@ -1560,7 +1568,7 @@ async def load_processed_assets(pool: asyncpg.Pool, upload_id: str) -> Dict[str,
                 upload_id,
             )
             if val:
-                return json.loads(val) if isinstance(val, str) else dict(val)
+                return coerce_processed_assets_map(val)
         except asyncpg.exceptions.UndefinedColumnError:
             pass
 
@@ -1571,7 +1579,7 @@ async def load_processed_assets(pool: asyncpg.Pool, upload_id: str) -> Dict[str,
                 upload_id,
             )
             if val:
-                return json.loads(val) if isinstance(val, str) else dict(val)
+                return coerce_processed_assets_map(val)
         except Exception:
             pass
 

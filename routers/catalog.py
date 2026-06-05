@@ -12,6 +12,7 @@ import core.state
 from core.config import R2_BUCKET_NAME
 from core.deps import get_current_user, get_current_user_readonly_no_wallet
 from core.r2 import _normalize_r2_key, get_s3_client
+from core.media_mirror import is_hotlink_blocked_image_url
 from services.catalog_sync import get_catalog_aggregate, sync_catalog_for_user
 from services.platform_metrics_ui import parse_iso_ts
 from services.upload_engagement import title_and_metrics_from_upload_platform_results
@@ -165,7 +166,7 @@ async def get_catalog_content(
             SELECT pci.id, pci.platform, pci.account_id, pci.platform_video_id, pci.upload_id, pci.source,
                    pci.content_kind, pci.title, pci.published_at, pci.thumbnail_url, pci.platform_url,
                    pci.duration_seconds, pci.views, pci.likes, pci.comments, pci.shares, pci.metrics_synced_at,
-                   pci.created_at,
+                   pci.created_at, pci.extra,
                    u.title AS upload_title, u.thumbnail_r2_key, u.platform_results AS upload_pr,
                    u.views AS upload_views, u.likes AS upload_likes, u.comments AS upload_comments, u.shares AS upload_shares,
                    u.platforms AS upload_platforms,
@@ -198,6 +199,17 @@ async def get_catalog_content(
     for i, d in enumerate(row_dicts):
         if d.get("thumbnail_r2_key"):
             nk = _normalize_r2_key(d["thumbnail_r2_key"])
+            if nk:
+                keys_to_sign.append((i, nk))
+        extra_raw = d.get("extra") or {}
+        if isinstance(extra_raw, str):
+            try:
+                extra_raw = json.loads(extra_raw)
+            except Exception:
+                extra_raw = {}
+        pci_r2 = (extra_raw.get("thumbnail_r2_key") or "").strip() if isinstance(extra_raw, dict) else ""
+        if pci_r2:
+            nk = _normalize_r2_key(pci_r2)
             if nk:
                 keys_to_sign.append((i, nk))
     if keys_to_sign:
@@ -252,7 +264,11 @@ async def get_catalog_content(
         if isinstance(cap_raw, str) and cap_raw.strip():
             cap_t = cap_raw.strip().split("\n")[0][:500]
         title_out = raw_title or up_t or pr_t or ai_t or fn_t or cap_t or None
-        thumb_out = (r.get("thumbnail_url") or "").strip() or thumb_urls.get(idx)
+        thumb_out = thumb_urls.get(idx)
+        if not thumb_out:
+            raw_thumb = (r.get("thumbnail_url") or "").strip()
+            if raw_thumb and not is_hotlink_blocked_image_url(raw_thumb):
+                thumb_out = raw_thumb
         acct_label = (
             (r.get("token_account_name") or "").strip()
             or (r.get("token_account_username") or "").strip()

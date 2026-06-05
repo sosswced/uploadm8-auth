@@ -269,6 +269,37 @@ def coerce_jsonb_dict(val: object, *, default: dict | None = None) -> dict:
     return fallback
 
 
+def coerce_processed_assets_map(val: object) -> dict[str, str]:
+    """Normalize ``uploads.processed_assets`` JSONB to ``{platform: r2_key}``."""
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return {
+            str(k): str(v)
+            for k, v in val.items()
+            if v is not None and str(v).strip()
+        }
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return {}
+        try:
+            return coerce_processed_assets_map(json.loads(s))
+        except Exception:
+            return {}
+    if isinstance(val, list):
+        out: dict[str, str] = {}
+        for item in val:
+            if not isinstance(item, dict):
+                continue
+            plat = item.get("platform") or item.get("name")
+            key = item.get("r2_key") or item.get("key") or item.get("path")
+            if plat and key:
+                out[str(plat)] = str(key)
+        return out
+    return {}
+
+
 def platform_hashtag_map_has_any_tags(m: object) -> bool:
     """True if a platform->tags dict has at least one non-empty tag list."""
     if not isinstance(m, dict):

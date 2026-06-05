@@ -134,11 +134,14 @@ def resolve_tiktok_cover_offset_sec(output_artifacts: Optional[dict]) -> float:
 
 
 def tiktok_transcode_keyframe_force_value(cover_offset_sec: float, fps: float) -> str:
-    """FFmpeg ``-force_key_frames`` value: pin cover + regular GOP spacing."""
-    gop = tiktok_transcode_gop_sec()
+    """FFmpeg ``-force_key_frames`` value: pin cover timestamp (GOP via ``-g``)."""
     cover = max(0.0, float(cover_offset_sec))
-    # Pin the cover timestamp and every gop seconds thereafter.
-    return f"{cover:.3f},expr:gte(t,n_forced*{gop:g})"
+    # Cover pin only — comma+expr mixes break on some production FFmpeg builds
+    # (Invalid keyframe time: expr:gte(t). Regular spacing comes from -g/-keyint_min.
+    if _env_bool("TIKTOK_TRANSCODE_FORCE_KEYFRAMES_EXPR", False):
+        gop = tiktok_transcode_gop_sec()
+        return f"{cover:.3f},expr:gte(t,n_forced*{int(gop)})"
+    return f"{cover:.3f}"
 
 
 def tiktok_transcode_gop_frames(fps: float) -> int:
@@ -151,6 +154,7 @@ def extend_tiktok_transcode_x264_args(cmd: list, *, cover_offset_sec: float, fps
     if not tiktok_transcode_force_keyframes_enabled():
         return
     gop_frames = tiktok_transcode_gop_frames(fps)
+    cover = max(0.0, float(cover_offset_sec))
     insert_at = len(cmd)
     for i, tok in enumerate(cmd):
         if tok == "-c:v" and i + 1 < len(cmd) and cmd[i + 1] == "libx264":
@@ -161,9 +165,9 @@ def extend_tiktok_transcode_x264_args(cmd: list, *, cover_offset_sec: float, fps
         str(gop_frames),
         "-keyint_min",
         str(gop_frames),
-        "-force_key_frames",
-        tiktok_transcode_keyframe_force_value(cover_offset_sec, fps),
     ]
+    if cover > 0.001:
+        extra.extend(["-force_key_frames", tiktok_transcode_keyframe_force_value(cover_offset_sec, fps)])
     for j, item in enumerate(extra):
         cmd.insert(insert_at + j, item)
 

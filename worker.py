@@ -230,7 +230,7 @@ ASYNC_PUBLISH_QUEUE = (os.environ.get("ASYNC_PUBLISH_QUEUE", "false").lower() in
 STALE_JOB_RECOVERY_ENABLED = (os.environ.get("STALE_JOB_RECOVERY_ENABLED", "true").lower() in ("1", "true", "yes", "on"))
 STALE_JOB_RECOVERY_INTERVAL_SEC = max(60, int(os.environ.get("STALE_JOB_RECOVERY_INTERVAL_SEC", "300")))
 STALE_QUEUED_MINUTES = max(15, int(os.environ.get("STALE_QUEUED_MINUTES", "45")))
-STALE_PROCESSING_MINUTES = int(os.environ.get("STALE_PROCESSING_MINUTES", "0"))  # 0 = do not auto-fail processing
+STALE_PROCESSING_MINUTES = int(os.environ.get("STALE_PROCESSING_MINUTES", "20"))  # 0 = disable processing recovery
 STALE_PROCESSING_RECOVER_CHECKPOINT = (
     os.environ.get("STALE_PROCESSING_RECOVER_CHECKPOINT", "true").lower() in ("1", "true", "yes", "on")
 )
@@ -1678,6 +1678,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                             f"{r['platform']}:{r['http_label']}"
                             for r in rows[:4]
                         )[:80]
+                        pikzels_payment_required = all(
+                            str(r.get("http_label") or "") == "402" for r in rows
+                        )
                         try:
                             await record_operational_incident(
                                 db_pool,
@@ -1698,8 +1701,8 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                                 },
                                 user_id=str(user_id) if user_id else None,
                                 upload_id=str(upload_id),
-                                alert_email=True,
-                                alert_discord=True,
+                                alert_email=not pikzels_payment_required,
+                                alert_discord=not pikzels_payment_required,
                             )
                         except Exception as _pfe:
                             logger.debug(f"[{upload_id}] pikzels ops_incident emit failed: {_pfe}")
@@ -1956,6 +1959,12 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
         await maybe_cancel(ctx, "caption")
 
+        if resume_stage in (None, "post_telemetry", "post_transcode", "post_audio"):
+            try:
+                await pipeline_checkpoint.save_post_caption_checkpoint(db_pool, ctx)
+            except Exception as _cp4:
+                logger.debug(f"[{upload_id}] post_caption checkpoint skipped: {_cp4}")
+
         # ============================================================
         # STAGE 13: Upload processed files to R2
         # ============================================================
@@ -2102,12 +2111,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         logger.info(f"[{upload_id}] Pipeline cancelled")
         # ── Release wallet hold on failure ───────────────────────────────────
         try:
-            put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
-            user_id_str = str(ctx.user_id) if ctx.user_id else None
-            if user_id_str and (put_cost > 0 or aic_cost > 0):
-                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
+            if ctx:
+                put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
+                user_id_str = str(ctx.user_id) if ctx.user_id else None
+                if user_id_str and (put_cost > 0 or aic_cost > 0):
+                    await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
         except Exception as wallet_err:
-            logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
+            logger.error(f"[{upload_id}] Wallet release failed: {wallet_err}")
         # User comms — cancellation is a terminal state (publish never ran).
         if ctx:
             try:
@@ -2133,12 +2143,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
         # ── Release wallet hold on failure ───────────────────────────────────
         try:
-            put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
-            user_id_str = str(ctx.user_id) if ctx.user_id else None
-            if user_id_str and (put_cost > 0 or aic_cost > 0):
-                await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
+            if ctx:
+                put_cost, aic_cost = await _get_upload_costs(ctx.upload_id)
+                user_id_str = str(ctx.user_id) if ctx.user_id else None
+                if user_id_str and (put_cost > 0 or aic_cost > 0):
+                    await _release_tokens(ctx.upload_id, user_id_str, put_cost, aic_cost, reason="upload_failed_refund")
         except Exception as wallet_err:
-            logger.error(f"[{ctx.upload_id}] Wallet release failed: {wallet_err}")
+            logger.error(f"[{upload_id}] Wallet release failed: {wallet_err}")
         await notify_admin_error("pipeline_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
         # User comms + admin upload-status incident on full-pipeline crash
         if ctx:
@@ -2650,11 +2661,9 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         await db_stage.mark_processing_started(db_pool, ctx)
 
         # Restore platform_videos from processed_assets stored in DB
-        processed_assets_json = upload_record.get("processed_assets") or "{}"
-        try:
-            processed_assets: Dict[str, str] = json.loads(processed_assets_json)
-        except Exception:
-            processed_assets = {}
+        from core.helpers import coerce_processed_assets_map
+
+        processed_assets = coerce_processed_assets_map(upload_record.get("processed_assets"))
 
         if not processed_assets:
             logger.error(f"[{upload_id}] No processed_assets found — cannot publish")
@@ -3658,13 +3667,20 @@ async def run_stale_job_recovery_loop() -> None:
                                 stg = str((cp or {}).get("stage") or "").lower()
                                 if (
                                     cp
-                                    and stg in ("post_transcode", "post_audio")
+                                    and stg in ("post_transcode", "post_audio", "post_caption")
                                     and pipeline_checkpoint.checkpoint_matches_upload(cp, ur)
                                 ):
                                     try:
-                                        recover_ok = await pipeline_checkpoint.verify_transcode_r2_keys(
+                                        transcode_ok = await pipeline_checkpoint.verify_transcode_r2_keys(
                                             dict(cp.get("transcode_r2") or {})
                                         )
+                                        if stg == "post_caption":
+                                            thumb_ok = bool(
+                                                (cp.get("thumbnail_r2_key") or ur.get("thumbnail_r2_key") or "").strip()
+                                            )
+                                            recover_ok = transcode_ok and thumb_ok
+                                        else:
+                                            recover_ok = transcode_ok
                                     except Exception:
                                         recover_ok = False
 
@@ -3704,6 +3720,39 @@ async def run_stale_job_recovery_loop() -> None:
                                     f"[{up}] stale checkpoint recovery: enqueue failed — leaving status=processing"
                                 )
                                 continue
+
+                        # No checkpoint (or verify failed): full re-process beats leaving a zombie row.
+                        ur = ur or await db_stage.load_upload_record(db_pool, up)
+                        deferred = False
+                        if ur:
+                            deferred = str(ur.get("schedule_mode") or "immediate").lower() in (
+                                "scheduled",
+                                "smart",
+                            )
+                        full_payload = await _build_process_job_payload(
+                            up,
+                            uid,
+                            deferred=deferred,
+                            job_id=f"stale-recover-full-{up}",
+                        )
+                        if full_payload and await enqueue_process_lane_job(full_payload):
+                            async with db_pool.acquire() as uconn:
+                                await uconn.execute(
+                                    """
+                                    UPDATE uploads
+                                       SET status = 'queued',
+                                           processing_started_at = NULL,
+                                           error_code = NULL,
+                                           error_detail = NULL,
+                                           updated_at = NOW()
+                                     WHERE id = $1 AND status = 'processing'
+                                    """,
+                                    up,
+                                )
+                            logger.warning(
+                                f"[{up}] stale recovery: full re-enqueue (processing>{STALE_PROCESSING_MINUTES}m)"
+                            )
+                            continue
 
                         async with db_pool.acquire() as uconn:
                             tag = await uconn.execute(
@@ -3749,8 +3798,13 @@ async def run_stale_job_recovery_loop() -> None:
 async def _process_one_job(job_json: str) -> None:
     try:
         job_data = json.loads(job_json)
+        while isinstance(job_data, str):
+            job_data = json.loads(job_data)
     except json.JSONDecodeError as e:
         logger.error(f"Invalid job JSON: {e}")
+        return
+    if not isinstance(job_data, dict):
+        logger.error(f"Invalid job payload type: {type(job_data).__name__}")
         return
     async with _process_semaphore:
         try:

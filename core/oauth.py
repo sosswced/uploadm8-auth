@@ -172,49 +172,10 @@ async def mirror_oauth_profile_image_to_r2(user_id: str, platform: str, avatar_u
     TikTok / Meta CDNs often block or expire browser hotlinks; storing a private R2 key
     lets ``resolve_stored_account_avatar_url`` presign stable GET URLs for platforms.html.
     """
-    from core.config import R2_BUCKET_NAME
-    from core.r2 import put_object_bytes
+    from core.media_mirror import mirror_external_image_to_r2
 
-    url = str(avatar_url or "").strip()
-    if not url.startswith(("http://", "https://")):
-        return None
-    if not (R2_BUCKET_NAME or "").strip():
-        return None
     plat = "".join(c for c in str(platform).lower() if c.isalnum()) or "unk"
     uid = str(user_id).strip()
     if not uid:
         return None
-    try:
-        async with httpx.AsyncClient(timeout=18.0, follow_redirects=True) as client:
-            resp = await client.get(
-                url,
-                headers={
-                    "User-Agent": "UploadM8/1.0 (oauth-avatar-mirror)",
-                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                },
-            )
-        if resp.status_code >= 400:
-            logger.debug("mirror_oauth_avatar HTTP %s url=%s", resp.status_code, url[:100])
-            return None
-        raw = resp.content or b""
-        if not raw or len(raw) > 5 * 1024 * 1024:
-            return None
-        ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-        ext = "jpg"
-        if "png" in ct or raw[:8] == b"\x89PNG\r\n\x1a\n":
-            ext = "png"
-        elif "webp" in ct:
-            ext = "webp"
-        elif "gif" in ct or raw[:6] in (b"GIF87a", b"GIF89a"):
-            ext = "gif"
-        elif raw[:3] == b"\xff\xd8\xff":
-            ext = "jpg"
-        elif ct and not (ct.startswith("image/") or ct == "application/octet-stream"):
-            return None
-        upload_ct = ct if ct.startswith("image/") else f"image/{ext}"
-        key = f"platform-avatars/{uid}/{plat}/{secrets.token_hex(10)}.{ext}"
-        await asyncio.to_thread(put_object_bytes, key, bytes(raw), upload_ct)
-        return key
-    except Exception as e:
-        logger.debug("mirror_oauth_profile_image_to_r2 failed url=%s err=%s", url[:100], e)
-        return None
+    return await mirror_external_image_to_r2(f"platform-avatars/{uid}/{plat}", avatar_url)

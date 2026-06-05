@@ -86,7 +86,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
     },
     "creator_lite": {
         "name": "Creator Lite", "price": 12, "price_annual": 120,
-        "put_daily": 20, "put_monthly": 600, "aic_monthly": 200,
+        "put_daily": 20, "put_monthly": 600, "aic_monthly": 220,
         "max_accounts": 10, "max_accounts_per_platform": 3, "per_platform": 3,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,
@@ -114,7 +114,7 @@ TIER_CONFIG: Dict[str, Dict[str, Any]] = {
     },
     "studio": {
         "name": "Studio", "price": 79, "price_annual": 790,
-        "put_daily": 150, "put_monthly": 6000, "aic_monthly": 2000,
+        "put_daily": 150, "put_monthly": 6500, "aic_monthly": 2000,
         "max_accounts": 75, "max_accounts_per_platform": 20, "per_platform": 20,
         "watermark": False, "ads": False, "ai": True,
         "scheduling": True, "webhooks": True, "white_label": False,

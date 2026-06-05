@@ -45,6 +45,7 @@ from . import r2 as r2_stage
 from .image_format import ensure_jpeg_file, sniff_image_format
 
 from services.publish_metadata_gate import assert_publish_metadata_gate
+from core.helpers import coerce_processed_assets_map
 
 
 async def _publish_cancelled(ctx: JobContext) -> bool:
@@ -343,6 +344,37 @@ def _tiktok_force_private_unaudited_enabled() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def _tiktok_unaudited_private_only_error(body: str) -> bool:
+    return "unaudited_client_can_only_post_to_private_accounts" in (body or "")
+
+
+async def _tiktok_init_direct_post(
+    client: httpx.AsyncClient,
+    *,
+    access_token: str,
+    post_info: dict,
+    file_size: int,
+    chunk_size: int,
+    total_chunk_count: int,
+) -> httpx.Response:
+    return await client.post(
+        "https://open.tiktokapis.com/v2/post/publish/video/init/",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+        },
+        json={
+            "post_info": post_info,
+            "source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": file_size,
+                "chunk_size": chunk_size,
+                "total_chunk_count": total_chunk_count,
+            },
+        },
+    )
+
+
 # =====================================================================
 # Token Encryption (used by this stage + verify_stage)
 # =====================================================================
@@ -634,7 +666,7 @@ def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
     # Try from output_artifacts stored during upload stage
     try:
         assets_json = ctx.output_artifacts.get("processed_assets", "{}")
-        assets = json.loads(assets_json) if isinstance(assets_json, str) else assets_json
+        assets = coerce_processed_assets_map(assets_json)
         r2_key = assets.get(platform)
     except Exception:
         pass
@@ -1042,22 +1074,34 @@ async def publish_to_tiktok(
 
         async with httpx.AsyncClient(timeout=120) as client:
             # Step 1: Initialize upload
-            init_resp = await client.post(
-                "https://open.tiktokapis.com/v2/post/publish/video/init/",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json; charset=UTF-8"
-                },
-                json={
-                    "post_info": post_info,
-                    "source_info": {
-                        "source": "FILE_UPLOAD",
-                        "video_size": file_size,
-                        "chunk_size": chunk_size,
-                        "total_chunk_count": total_chunk_count,
-                    }
-                }
+            init_resp = await _tiktok_init_direct_post(
+                client,
+                access_token=access_token,
+                post_info=post_info,
+                file_size=file_size,
+                chunk_size=chunk_size,
+                total_chunk_count=total_chunk_count,
             )
+
+            if (
+                init_resp.status_code != 200
+                and _tiktok_unaudited_private_only_error(init_resp.text)
+                and post_info.get("privacy_level") != "SELF_ONLY"
+            ):
+                logger.info(
+                    "TikTok: unaudited app — retrying init with privacy_level=SELF_ONLY "
+                    "(was %s)",
+                    post_info.get("privacy_level"),
+                )
+                post_info = {**post_info, "privacy_level": "SELF_ONLY"}
+                init_resp = await _tiktok_init_direct_post(
+                    client,
+                    access_token=access_token,
+                    post_info=post_info,
+                    file_size=file_size,
+                    chunk_size=chunk_size,
+                    total_chunk_count=total_chunk_count,
+                )
 
             if init_resp.status_code != 200:
                 return PlatformResult(

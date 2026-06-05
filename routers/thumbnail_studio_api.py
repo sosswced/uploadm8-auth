@@ -77,6 +77,21 @@ from stages.notify_stage import notify_user_pikzels_generation
 from services.hydration_from_upload_row import hydration_context_from_upload_row
 from services.upload_pikzels_frame import append_hydration_to_prompt, load_upload_frame_jpeg_base64
 from services.ml_marketing import record_outcome_label, record_thumbnail_studio_engine_ml_batch
+from services.pikzels_analyzer import (
+    RECOMMENDATION_STATUSES,
+    apply_fix_to_analysis,
+    batch_score_user_uploads,
+    export_analysis_ab_pack,
+    fetch_actionable_recommendations,
+    fetch_score_trend,
+    generate_titles_for_analysis,
+    get_analysis_for_user,
+    get_latest_analysis_for_upload,
+    list_analyses,
+    persist_score_analysis,
+    save_fix_as_upload_thumbnail,
+    update_recommendation_status,
+)
 from services.wallet_marketing import _user_campaign_features
 
 logger = logging.getLogger("uploadm8-api")
@@ -2247,7 +2262,26 @@ async def ts_pikzels_from_upload_frame(
         upload_id=str(uid),
         source_image_url=score_src,
     )
-    return data if status < 400 else data | {"http_status": status}
+    out = data if status < 400 else data | {"http_status": status}
+    if status < 400 and isinstance(data, dict):
+        try:
+            async with core.state.db_pool.acquire() as conn:
+                analysis = await persist_score_analysis(
+                    conn,
+                    user_id=str(user["id"]),
+                    upload_id=str(uid),
+                    frame_source=body.frame_source,
+                    title=sc_title,
+                    response_data=data,
+                    persona_id=body.persona,
+                )
+            if isinstance(out, dict):
+                out = dict(out)
+                out["analysis"] = analysis
+                out["analysis_id"] = analysis.get("analysis_id")
+        except Exception:
+            logger.warning("pikzels analyzer persist score failed", exc_info=True)
+    return out
 
 
 @router.post("/api/thumbnail-studio/pikzels-v2/titles")
@@ -2329,6 +2363,262 @@ async def ts_pikzels_update_pikzonality(
     status, data = await pikzels_v2_patch(V2_PIKZONALITY_BY_ID.replace("{id}", pikzonality_id), payload)
     await _studio_usage_log(user["id"], "pikzonality_update", status, _pikzels_telemetry_meta(body))
     return data if status < 400 else data | {"http_status": status}
+
+
+class PikzelsAnalyzerStatusBody(BaseModel):
+    status: Literal["open", "saved", "applied", "dismissed", "done"] = "saved"
+
+
+class PikzelsAnalyzerApplyFixBody(BaseModel):
+    persona: Optional[str] = None
+    use_targeted_prompt: bool = True
+    re_score: bool = True
+
+
+class PikzelsAnalyzerBatchScoreBody(BaseModel):
+    limit: int = Field(default=15, ge=1, le=30)
+    persona: Optional[str] = None
+    rescore_recent: bool = False
+
+
+@router.get("/api/thumbnail-studio/pikzels-analyzer/analyses")
+async def ts_pikzels_analyzer_list(
+    upload_id: Optional[str] = Query(default=None, max_length=64),
+    status: Optional[str] = Query(default=None, max_length=24),
+    limit: int = Query(30, ge=1, le=100),
+    user: dict = Depends(get_current_user_readonly),
+):
+    """List persisted Pikzels analyzer runs (newest first)."""
+    if status and status not in RECOMMENDATION_STATUSES:
+        raise HTTPException(400, detail="invalid status")
+    async with core.state.db_pool.acquire() as conn:
+        rows = await list_analyses(
+            conn,
+            user_id=str(user["id"]),
+            upload_id=upload_id,
+            status=status,
+            limit=limit,
+        )
+    return {"analyses": rows, "limit": limit}
+
+
+@router.get("/api/thumbnail-studio/pikzels-analyzer/analyses/{analysis_id}")
+async def ts_pikzels_analyzer_get(
+    analysis_id: str,
+    user: dict = Depends(get_current_user_readonly),
+):
+    async with core.state.db_pool.acquire() as conn:
+        row = await get_analysis_for_user(conn, str(user["id"]), analysis_id)
+    if not row:
+        raise HTTPException(404, detail="analysis not found")
+    return row
+
+
+@router.get("/api/thumbnail-studio/pikzels-analyzer/uploads/{upload_id}/latest")
+async def ts_pikzels_analyzer_latest_for_upload(
+    upload_id: str,
+    user: dict = Depends(get_current_user_readonly),
+):
+    """Restore the most recent analyzer result for an upload after page refresh."""
+    async with core.state.db_pool.acquire() as conn:
+        row = await get_latest_analysis_for_upload(conn, str(user["id"]), upload_id)
+    if not row:
+        return {"analysis": None}
+    return {"analysis": row}
+
+
+@router.patch("/api/thumbnail-studio/pikzels-analyzer/analyses/{analysis_id}")
+async def ts_pikzels_analyzer_patch_status(
+    analysis_id: str,
+    body: PikzelsAnalyzerStatusBody,
+    user: dict = Depends(get_current_user),
+):
+    async with core.state.db_pool.acquire() as conn:
+        row = await update_recommendation_status(
+            conn,
+            user_id=str(user["id"]),
+            analysis_id=analysis_id,
+            status=body.status,
+        )
+    if not row:
+        raise HTTPException(404, detail="analysis not found")
+    return row
+
+
+@router.post("/api/thumbnail-studio/pikzels-analyzer/analyses/{analysis_id}/save-recommendation")
+async def ts_pikzels_analyzer_save_recommendation(
+    analysis_id: str,
+    user: dict = Depends(get_current_user),
+):
+    async with core.state.db_pool.acquire() as conn:
+        row = await update_recommendation_status(
+            conn,
+            user_id=str(user["id"]),
+            analysis_id=analysis_id,
+            status="saved",
+        )
+    if not row:
+        raise HTTPException(404, detail="analysis not found")
+    return row
+
+
+@router.post("/api/thumbnail-studio/pikzels-analyzer/analyses/{analysis_id}/apply-fix")
+async def ts_pikzels_analyzer_apply_fix(
+    analysis_id: str,
+    body: PikzelsAnalyzerApplyFixBody,
+    user: dict = Depends(get_current_user),
+):
+    await _pikzels_debit(user["id"], "one_click_fix")
+    if body.persona:
+        async with core.state.db_pool.acquire() as conn:
+            if not await _user_owns_pikzels_pikzonality(conn, str(user["id"]), "persona", body.persona):
+                raise HTTPException(
+                    403,
+                    detail={
+                        "code": "pikzels_pikzonality_not_owned",
+                        "message": "That Pikzels persona is not registered to your account.",
+                    },
+                )
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            row = await apply_fix_to_analysis(
+                conn,
+                user_id=str(user["id"]),
+                analysis_id=analysis_id,
+                persona=body.persona,
+                use_targeted_prompt=body.use_targeted_prompt,
+                re_score=body.re_score,
+            )
+    except ValueError as e:
+        code = str(e)
+        if code == "analysis_not_found":
+            raise HTTPException(404, detail=code) from e
+        raise HTTPException(502, detail=code) from e
+    await _studio_usage_log(
+        user["id"],
+        "pikzels_analyzer_apply_fix",
+        200,
+        {"analysis_id": analysis_id, "persona": body.persona},
+    )
+    return row
+
+
+@router.post("/api/thumbnail-studio/pikzels-analyzer/analyses/{analysis_id}/save-as-thumbnail")
+async def ts_pikzels_analyzer_save_thumbnail(
+    analysis_id: str,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            out = await save_fix_as_upload_thumbnail(
+                conn,
+                user_id=str(user["id"]),
+                analysis_id=analysis_id,
+            )
+    except ValueError as e:
+        code = str(e)
+        if code == "analysis_not_found":
+            raise HTTPException(404, detail=code) from e
+        raise HTTPException(400, detail=code) from e
+    await _studio_usage_log(
+        user["id"],
+        "pikzels_analyzer_save_thumbnail",
+        200,
+        {"analysis_id": analysis_id, "upload_id": out.get("upload_id")},
+    )
+    return out
+
+
+@router.post("/api/thumbnail-studio/pikzels-analyzer/analyses/{analysis_id}/generate-titles")
+async def ts_pikzels_analyzer_generate_titles(
+    analysis_id: str,
+    user: dict = Depends(get_current_user),
+):
+    await _pikzels_debit(user["id"], "titles")
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            row = await generate_titles_for_analysis(
+                conn,
+                user_id=str(user["id"]),
+                analysis_id=analysis_id,
+            )
+    except ValueError as e:
+        code = str(e)
+        if code == "analysis_not_found":
+            raise HTTPException(404, detail=code) from e
+        raise HTTPException(502, detail=code) from e
+    await _studio_usage_log(user["id"], "pikzels_analyzer_titles", 200, {"analysis_id": analysis_id})
+    return row
+
+
+@router.get("/api/thumbnail-studio/pikzels-analyzer/score-trend")
+async def ts_pikzels_analyzer_score_trend(
+    days: int = Query(90, ge=7, le=365),
+    limit: int = Query(60, ge=1, le=200),
+    user: dict = Depends(get_current_user_readonly),
+):
+    async with core.state.db_pool.acquire() as conn:
+        trend = await fetch_score_trend(conn, user_id=str(user["id"]), days=days, limit=limit)
+    return trend
+
+
+@router.get("/api/thumbnail-studio/pikzels-analyzer/recommendations")
+async def ts_pikzels_analyzer_recommendations(
+    limit: int = Query(12, ge=1, le=50),
+    user: dict = Depends(get_current_user_readonly),
+):
+    """Cross-surface actionable recommendations (saved to-dos + low-score open analyses)."""
+    async with core.state.db_pool.acquire() as conn:
+        feed = await fetch_actionable_recommendations(conn, user_id=str(user["id"]), limit=limit)
+    return feed
+
+
+@router.post("/api/thumbnail-studio/pikzels-analyzer/batch-score")
+async def ts_pikzels_analyzer_batch_score(
+    body: PikzelsAnalyzerBatchScoreBody,
+    user: dict = Depends(get_current_user),
+):
+    """Score recent uploads and return them ranked weakest-first."""
+
+    async def _debit_score() -> None:
+        await _pikzels_debit(user["id"], "score")
+
+    async with core.state.db_pool.acquire() as conn:
+        result = await batch_score_user_uploads(
+            conn,
+            user_id=str(user["id"]),
+            limit=body.limit,
+            persona_id=body.persona,
+            rescore_recent=body.rescore_recent,
+            on_before_score=_debit_score,
+        )
+    return result
+
+
+@router.get("/api/thumbnail-studio/pikzels-analyzer/analyses/{analysis_id}/ab-export")
+async def ts_pikzels_analyzer_ab_export(
+    analysis_id: str,
+    user: dict = Depends(get_current_user),
+):
+    """ZIP comparison pack for one analyzer run (before/after scores + metadata)."""
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            out = await export_analysis_ab_pack(
+                conn,
+                user_id=str(user["id"]),
+                analysis_id=analysis_id,
+            )
+    except ValueError as e:
+        code = str(e)
+        if code == "analysis_not_found":
+            raise HTTPException(404, detail="analysis not found") from e
+        if code == "r2_not_configured":
+            raise HTTPException(503, detail="Object storage is not configured; cannot build export pack.") from e
+        raise HTTPException(400, detail=code) from e
+    except Exception as e:
+        logger.warning("pikzels analyzer ab-export failed analysis=%s: %s", analysis_id, e)
+        raise HTTPException(503, detail="Could not build comparison pack.") from e
+    return out
 
 
 @router.delete("/api/thumbnail-studio/pikzels-v2/pikzonality/{pikzonality_id}")

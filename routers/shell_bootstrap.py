@@ -2,10 +2,11 @@
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 
 import core.state
 from core.deps import get_current_user_readonly
+from routers.uploads import _schedule_thumbnail_repair
 from services.shell_bootstrap import _allowed_upload_view, shell_bootstrap_payload
 
 router = APIRouter(prefix="/api/shell", tags=["shell"])
@@ -13,6 +14,7 @@ router = APIRouter(prefix="/api/shell", tags=["shell"])
 
 @router.get("/bootstrap")
 async def get_shell_bootstrap(
+    background_tasks: BackgroundTasks,
     context: str = Query("dashboard", pattern="^(dashboard|queue)$"),
     upload_limit: int = Query(200, ge=1, le=500),
     upload_view: Optional[str] = Query(None, description="Same as GET /api/uploads view= (pending, processing, …)"),
@@ -32,7 +34,8 @@ async def get_shell_bootstrap(
     if pool is None:
         raise HTTPException(503, detail="Database unavailable")
 
-    return await shell_bootstrap_payload(
+    uid = str(user.get("billing_user_id") or user["id"])
+    payload = await shell_bootstrap_payload(
         pool,
         user,
         context=context,
@@ -40,3 +43,6 @@ async def get_shell_bootstrap(
         upload_view=upload_view,
         meta=meta,
     )
+    uploads = payload.get("uploads") if isinstance(payload, dict) else None
+    _schedule_thumbnail_repair(background_tasks, uid, uploads if isinstance(uploads, list) else [])
+    return payload

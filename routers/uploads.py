@@ -9,12 +9,14 @@ import json
 import logging
 import os
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import asyncio
 
+import asyncpg
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
 
 import core.state
 from core.audit import log_system_event
@@ -51,12 +53,15 @@ from services.thumbnail_regenerate import (
 )
 from services.uploads_handlers import (
     ALLOWED_VIDEO_TYPES,
+    collect_thumbnail_repair_ids,
     complete_upload_transaction,
     compute_smart_schedule_display,
     fetch_upload_detail,
     fetch_upload_queue_stats,
     fetch_user_uploads_list,
     presign_create_upload,
+    repair_upload_thumbnails_batch,
+    stream_upload_thumbnail_bytes,
 )
 from services.retry_policy import (
     MAX_USER_RETRIES_DEFAULT,
@@ -65,6 +70,7 @@ from services.retry_policy import (
     classify_retry_error,
     get_retry_count,
     split_platform_results,
+    upload_is_stale_processing,
 )
 
 logger = logging.getLogger("uploadm8-api")
@@ -463,8 +469,26 @@ async def cancel_upload(upload_id: str, request: Request, user: dict = Depends(g
             return {"status": "cancelled"}
 
 
+def _schedule_thumbnail_repair(background_tasks: BackgroundTasks, user_id: str, payload: Any) -> None:
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("uploads"), list):
+        items = payload["uploads"]
+    else:
+        items = []
+    repair_ids = collect_thumbnail_repair_ids(items)
+    if repair_ids and core.state.db_pool:
+        background_tasks.add_task(
+            repair_upload_thumbnails_batch,
+            core.state.db_pool,
+            user_id,
+            repair_ids,
+        )
+
+
 @router.get("")
 async def get_uploads(
+    background_tasks: BackgroundTasks,
     status: Optional[str] = None,
     view: Optional[str] = None,
     limit: int = 50,
@@ -488,9 +512,10 @@ async def get_uploads(
       - status_label: human-readable label for display (fixes ? succeeded, ? staged)
       - thumbnail_url, platform_results, hashtags, etc.
     """
-    return await fetch_user_uploads_list(
+    uid = str(user.get("billing_user_id") or user["id"])
+    payload = await fetch_user_uploads_list(
         core.state.db_pool,
-        str(user.get("billing_user_id") or user["id"]),
+        uid,
         status=status,
         view=view,
         limit=limit,
@@ -498,6 +523,39 @@ async def get_uploads(
         trill_only=trill_only,
         meta=meta,
         workspace_id=(user.get("workspace") or {}).get("id"),
+    )
+    _schedule_thumbnail_repair(background_tasks, uid, payload)
+    return payload
+
+
+@router.get("/{upload_id}/thumbnail")
+async def get_upload_thumbnail(
+    upload_id: str,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user_readonly),
+):
+    """Stream the upload card thumbnail from R2 (stable URL, no presign expiry)."""
+    uid = str(user.get("billing_user_id") or user["id"])
+    try:
+        raw, content_type, etag_key = await stream_upload_thumbnail_bytes(
+            core.state.db_pool, uid, upload_id
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404 and core.state.db_pool:
+            background_tasks.add_task(
+                repair_upload_thumbnails_batch,
+                core.state.db_pool,
+                uid,
+                [upload_id],
+            )
+        raise
+    return Response(
+        content=raw,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "ETag": f'"{etag_key}"',
+        },
     )
 
 
@@ -783,7 +841,43 @@ def _plat_token_resolution_maps(
     return token_map_by_plat_account, plat_account_row_map, platform_token_rows
 
 
-async def _sync_upload_analytics_core(user: dict, upload_id: str) -> dict:
+_sync_analytics_running: set[str] = set()
+
+
+async def _warm_user_platform_oauth_tokens(user_id: str) -> None:
+    """Refresh each connected platform token once per batch (cached in platform_oauth_refresh)."""
+    uid = str(user_id)
+    async with core.state.db_pool.acquire() as conn:
+        token_rows = await conn.fetch(
+            "SELECT id, platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+            uid,
+        )
+    for tr in token_rows:
+        try:
+            dec = decrypt_blob(tr["token_blob"])
+            if not dec:
+                continue
+            if tr["platform"] == "instagram" and not dec.get("ig_user_id") and tr["account_id"]:
+                dec["ig_user_id"] = str(tr["account_id"])
+            if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
+                dec["page_id"] = str(tr["account_id"])
+            await refresh_decrypted_token_for_row(
+                tr["platform"],
+                dec,
+                db_pool=core.state.db_pool,
+                user_id=uid,
+                token_row_id=str(tr["id"]),
+            )
+        except Exception:
+            pass
+
+
+async def _sync_upload_analytics_core(
+    user: dict,
+    upload_id: str,
+    *,
+    skip_token_refresh: bool = False,
+) -> dict:
     """
     Shared implementation for per-upload analytics sync.
     Raises HTTPException(404) if the upload does not exist for this user.
@@ -832,13 +926,14 @@ async def _sync_upload_analytics_core(user: dict, upload_id: str) -> dict:
                 if tr["platform"] == "facebook" and not dec.get("page_id") and tr["account_id"]:
                     dec["page_id"] = str(tr["account_id"])
                 token_id = str(tr["id"])
-                dec = await refresh_decrypted_token_for_row(
-                    tr["platform"],
-                    dec,
-                    db_pool=core.state.db_pool,
-                    user_id=uid,
-                    token_row_id=token_id,
-                )
+                if not skip_token_refresh:
+                    dec = await refresh_decrypted_token_for_row(
+                        tr["platform"],
+                        dec,
+                        db_pool=core.state.db_pool,
+                        user_id=uid,
+                        token_row_id=token_id,
+                    )
                 token_map_by_id[token_id] = dec
                 plat_norm = str(tr.get("platform") or "").lower()
                 if plat_norm:
@@ -971,14 +1066,29 @@ async def _sync_upload_analytics_core(user: dict, upload_id: str) -> dict:
 
 
 async def _background_sync_uploads_analytics(user_id: str, upload_ids: list[str]) -> None:
-    for up_id in upload_ids:
+    uid = str(user_id)
+    if uid in _sync_analytics_running:
+        logger.info("sync-analytics/all: skip duplicate batch for user %s", uid[:8])
+        return
+    _sync_analytics_running.add(uid)
+    try:
         try:
-            await _sync_upload_analytics_core({"id": user_id}, up_id)
-        except HTTPException:
-            pass
+            await _warm_user_platform_oauth_tokens(uid)
         except Exception as e:
-            logger.warning("sync-analytics/all upload=%s: %s", up_id, e)
-        await asyncio.sleep(0.35)
+            logger.warning("sync-analytics/all token warm user=%s: %s", uid[:8], e)
+        user_stub = {"id": uid}
+        for up_id in upload_ids:
+            try:
+                await _sync_upload_analytics_core(
+                    user_stub, up_id, skip_token_refresh=True
+                )
+            except HTTPException:
+                pass
+            except Exception as e:
+                logger.warning("sync-analytics/all upload=%s: %s", up_id, e)
+            await asyncio.sleep(0.35)
+    finally:
+        _sync_analytics_running.discard(uid)
 
 
 async def _background_sync_uploads_thumbnails(user_id: str, upload_ids: list[str]) -> None:
@@ -997,21 +1107,25 @@ async def sync_all_upload_analytics(
     async_mode=true queues work and returns immediately.
     """
     uid = str(user["id"])
-    async with core.state.db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id FROM uploads
-            WHERE user_id = $1::uuid
-              AND status = ANY($2::varchar[])
-              AND platform_results IS NOT NULL
-              AND platform_results::text NOT IN ('null', '[]', '{}')
-            ORDER BY analytics_synced_at ASC NULLS FIRST, created_at DESC
-            LIMIT $3
-            """,
-            uid,
-            ["completed", "succeeded", "partial"],
-            max_uploads,
-        )
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id FROM uploads
+                WHERE user_id = $1::uuid
+                  AND status = ANY($2::varchar[])
+                  AND platform_results IS NOT NULL
+                  AND platform_results::text NOT IN ('null', '[]', '{}')
+                ORDER BY analytics_synced_at ASC NULLS FIRST, created_at DESC
+                LIMIT $3
+                """,
+                uid,
+                ["completed", "succeeded", "partial"],
+                max_uploads,
+            )
+    except (TimeoutError, OSError, asyncio.TimeoutError, asyncpg.PostgresConnectionError) as e:
+        logger.warning("sync-analytics/all: database unavailable user=%s: %s", uid[:8], e)
+        raise HTTPException(503, "Analytics sync temporarily unavailable — try again shortly") from e
     ids = [str(r["id"]) for r in rows]
 
     if async_mode:
@@ -1179,11 +1293,13 @@ async def retry_upload(
             raise HTTPException(404, "Upload not found")
 
         current_status = (upload["status"] or "").lower()
-        if current_status not in _RETRYABLE_STATUSES:
+        stale_processing_retry = current_status == "processing" and upload_is_stale_processing(upload)
+        if current_status not in _RETRYABLE_STATUSES and not stale_processing_retry:
             raise HTTPException(
                 400,
                 f"Upload status '{current_status}' is not retryable. "
-                f"Allowed: {', '.join(_RETRYABLE_STATUSES)}.",
+                f"Allowed: {', '.join(_RETRYABLE_STATUSES)}"
+                + (" or stale processing (20+ min without progress)." if current_status == "processing" else "."),
             )
 
         # ── Pre-flight: block deterministic re-failures with a clear hint ──

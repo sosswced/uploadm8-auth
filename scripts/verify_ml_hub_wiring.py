@@ -41,6 +41,7 @@ def main() -> int:
     print(f"  TRACKIO_PROJECT:  {'set' if trackio_proj else '(unset)'}")
     print(f"  TRACKIO_SPACE_ID: {'set' if trackio_space else '(unset)'}")
     print(f"  ML engine:        {'enabled' if engine.enabled else 'disabled'} | stack_ready={engine.stack_ready}")
+    print(f"  content-success:  {'on' if eng.get('run_content_success') else 'off'} (split=content_success on the dataset repo)")
     if engine.use_hf_jobs:
         print(f"  HF Jobs:          flavor={engine.jobs_flavor} timeout={engine.jobs_timeout}")
 

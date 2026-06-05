@@ -926,6 +926,11 @@ def pikzels_studio_eligible_for_styled_thumbnail(
     """
     ready = studio_renderer_enabled()
     can_custom = bool(getattr(entitlements, "can_custom_thumbnails", False) if entitlements else False)
+    can_ai_style = bool(getattr(entitlements, "can_ai_thumbnail_styling", False) if entitlements else False)
+
+    # Creator Lite and below: local template renderer only (no Pikzels API — avoids 402 noise).
+    if ready and can_custom and not can_ai_style:
+        return False
 
     auto_on = bool(us.get("auto_thumbnails") or us.get("autoThumbnails"))
     if require_auto_thumbnails and not auto_on:

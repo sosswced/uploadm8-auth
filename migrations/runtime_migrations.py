@@ -13,6 +13,50 @@ import logging
 
 logger = logging.getLogger("uploadm8-api")
 
+# v1083 — keep in one place; also used by ensure_subscription_tier_constraint().
+SUBSCRIPTION_TIER_CHECK_SQL = """
+    -- creator_lite renamed from launch in app/Stripe catalog; constraint may still list launch only.
+    ALTER TABLE users DROP CONSTRAINT IF EXISTS users_subscription_tier_check;
+    ALTER TABLE users ADD CONSTRAINT users_subscription_tier_check
+        CHECK (subscription_tier = ANY (ARRAY[
+            'free'::text,
+            'launch'::text,
+            'creator_lite'::text,
+            'creator_pro'::text,
+            'studio'::text,
+            'agency'::text,
+            'friends_family'::text,
+            'lifetime'::text,
+            'master_admin'::text
+        ]));
+"""
+
+
+async def ensure_subscription_tier_constraint(conn) -> bool:
+    """Idempotent repair: allow ``creator_lite`` on users.subscription_tier."""
+    try:
+        defn = await conn.fetchval(
+            """
+            SELECT pg_get_constraintdef(c.oid)
+            FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            WHERE t.relname = 'users' AND c.conname = 'users_subscription_tier_check'
+            """
+        )
+    except Exception as e:
+        logger.warning("ensure_subscription_tier_constraint: could not read constraint: %s", e)
+        defn = None
+    if defn and "creator_lite" in str(defn):
+        return False
+    await conn.execute(SUBSCRIPTION_TIER_CHECK_SQL)
+    logger.info("ensure_subscription_tier_constraint: applied creator_lite tier check")
+    return True
+
+
+async def ensure_subscription_tier_constraint_pool(db_pool) -> bool:
+    async with db_pool.acquire() as conn:
+        return await ensure_subscription_tier_constraint(conn)
+
 # v1066 — must match scripts/001_catalog_products.sql (DDL + INSERT … ON CONFLICT DO NOTHING).
 CATALOG_PRODUCTS_BOOTSTRAP_SQL = r"""
 CREATE TABLE IF NOT EXISTS catalog_products (
@@ -1660,21 +1704,76 @@ async def run_migrations(db_pool):
                       OR (u.trill_metadata ? 'trill' AND NOT (u.trill_metadata ? 'telemetry'))
                   );
             """),
-            (1083, """
-                -- creator_lite renamed from launch in app/Stripe catalog; constraint still listed launch only.
-                ALTER TABLE users DROP CONSTRAINT IF EXISTS users_subscription_tier_check;
-                ALTER TABLE users ADD CONSTRAINT users_subscription_tier_check
-                    CHECK (subscription_tier = ANY (ARRAY[
-                        'free'::text,
-                        'launch'::text,
-                        'creator_lite'::text,
-                        'creator_pro'::text,
-                        'studio'::text,
-                        'agency'::text,
-                        'friends_family'::text,
-                        'lifetime'::text,
-                        'master_admin'::text
-                    ]));
+            (1083, SUBSCRIPTION_TIER_CHECK_SQL),
+            (1084, """
+                -- Stripe webhook idempotency hardening.
+                -- 1. Collapse duplicate revenue rows that slipped in before the
+                --    unique index existed (keeps the earliest physical row).
+                DELETE FROM revenue_tracking a
+                USING revenue_tracking b
+                WHERE a.stripe_event_id IS NOT NULL
+                  AND a.stripe_event_id = b.stripe_event_id
+                  AND a.ctid > b.ctid;
+
+                -- 2. One revenue row per Stripe event — arbiter for ON CONFLICT.
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_revenue_tracking_stripe_event
+                    ON revenue_tracking (stripe_event_id)
+                    WHERE stripe_event_id IS NOT NULL;
+
+                -- 3. Monthly-refill dedup ledger (used by _do_monthly_refill).
+                CREATE TABLE IF NOT EXISTS stripe_invoice_log (
+                    invoice_id   TEXT PRIMARY KEY,
+                    user_id      UUID,
+                    tier_slug    TEXT,
+                    put_credited INT  DEFAULT 0,
+                    aic_credited INT  DEFAULT 0,
+                    period_start TIMESTAMPTZ,
+                    period_end   TIMESTAMPTZ,
+                    created_at   TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                -- 4. Event-level idempotency for the billing webhook.
+                CREATE TABLE IF NOT EXISTS processed_stripe_events (
+                    event_id     TEXT PRIMARY KEY,
+                    event_type   TEXT,
+                    processed_at TIMESTAMPTZ DEFAULT NOW()
+                );
+
+                -- 5. Fast dedup lookups for top-up credits keyed on session id.
+                CREATE INDEX IF NOT EXISTS idx_token_ledger_stripe_event
+                    ON token_ledger (stripe_event_id)
+                    WHERE stripe_event_id IS NOT NULL;
+            """),
+            (1085, """
+                CREATE TABLE IF NOT EXISTS pikzels_thumbnail_analyses (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    upload_id UUID NOT NULL REFERENCES uploads(id) ON DELETE CASCADE,
+                    main_score DOUBLE PRECISION,
+                    subscores_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    suggestion TEXT NOT NULL DEFAULT '',
+                    recommendation_status VARCHAR(24) NOT NULL DEFAULT 'open'
+                        CHECK (recommendation_status IN ('open', 'saved', 'applied', 'dismissed', 'done')),
+                    frame_source VARCHAR(32) NOT NULL DEFAULT 'primary_thumbnail',
+                    title VARCHAR(200),
+                    response_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    fix_image_url TEXT,
+                    fix_r2_key VARCHAR(512),
+                    fix_score DOUBLE PRECISION,
+                    fix_subscores_json JSONB,
+                    fix_response_json JSONB,
+                    generated_titles_json JSONB,
+                    persona_id VARCHAR(128),
+                    parent_analysis_id UUID REFERENCES pikzels_thumbnail_analyses(id) ON DELETE SET NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_pikzels_analyses_user_upload
+                    ON pikzels_thumbnail_analyses(user_id, upload_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_pikzels_analyses_user_status
+                    ON pikzels_thumbnail_analyses(user_id, recommendation_status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_pikzels_analyses_user_created
+                    ON pikzels_thumbnail_analyses(user_id, created_at DESC);
             """),
         ]
 
@@ -1687,3 +1786,5 @@ async def run_migrations(db_pool):
                 except Exception as e:
                     logger.error(f"Migration v{version} failed: {e}")
                     raise
+
+        await ensure_subscription_tier_constraint(conn)

@@ -45,7 +45,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -126,6 +126,9 @@ async def lifespan(app: FastAPI):
     init_enc_keys()
     if STRIPE_SECRET_KEY:
         stripe.api_key = STRIPE_SECRET_KEY
+        # Pin the API version so SDK upgrades can't silently change response
+        # shapes (e.g. the Basil move of current_period_* / invoice.subscription).
+        stripe.api_version = "2025-03-31.basil"
 
     core.state.db_pool = await asyncpg.create_pool(
         DATABASE_URL, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX, init=_init_asyncpg_codecs
@@ -222,6 +225,7 @@ async def lifespan(app: FastAPI):
 
     trill_maintenance_task = None
     ml_engine_task = None
+    marketing_automation_task = None
     if core.state.db_pool:
         import asyncio
         from services.trill_background import run_trill_maintenance_loop
@@ -237,6 +241,13 @@ async def lifespan(app: FastAPI):
             run_ml_engine_loop(core.state.db_pool, core.state.redis_client)
         )
         logger.info("ML engine loop started")
+
+        from services.marketing_automation_background import run_marketing_automation_loop
+
+        marketing_automation_task = asyncio.create_task(
+            run_marketing_automation_loop(core.state.db_pool, core.state.redis_client)
+        )
+        logger.info("Marketing automation loop started (self-gates on MARKETING_AUTOMATION_ENABLED)")
 
     yield
 
@@ -255,6 +266,15 @@ async def lifespan(app: FastAPI):
         ml_engine_task.cancel()
         try:
             await ml_engine_task
+        except _asyncio.CancelledError:
+            pass
+
+    if marketing_automation_task:
+        import asyncio as _asyncio
+
+        marketing_automation_task.cancel()
+        try:
+            await marketing_automation_task
         except _asyncio.CancelledError:
             pass
 
@@ -492,6 +512,27 @@ async def health():
 
 # Static HTML/JS/CSS — same process as API (cookie auth, no cross-origin for local dev).
 if SERVE_FRONTEND_STATIC and FRONTEND_STATIC_DIR.is_dir():
+    _SMART_LEGACY_REDIRECTS = {
+        "ai-insights.html": "smart-insights.html",
+        "ai-insights": "smart-insights.html",
+        "admin-upload-ai-trace.html": "admin-upload-smart-trace.html",
+        "admin-upload-ai-trace": "admin-upload-smart-trace.html",
+        "ai-social-media-scheduler.html": "smart-social-media-scheduler.html",
+        "ai-social-media-scheduler": "smart-social-media-scheduler.html",
+        "ai-thumbnail-generator-for-youtube.html": "smart-thumbnail-generator-for-youtube.html",
+        "ai-thumbnail-generator-for-youtube": "smart-thumbnail-generator-for-youtube.html",
+    }
+
+    for _legacy, _target in _SMART_LEGACY_REDIRECTS.items():
+
+        def _make_legacy_redirect(dest=_target):
+            async def _legacy_redirect_handler():
+                return RedirectResponse(url=f"/{dest}", status_code=301)
+
+            return _legacy_redirect_handler
+
+        app.add_api_route(f"/{_legacy}", _make_legacy_redirect(), methods=["GET"])
+
     app.mount(
         "/",
         StaticFiles(directory=str(FRONTEND_STATIC_DIR), html=True),

@@ -10,7 +10,7 @@ from typing import Optional
 from urllib.parse import quote, urlencode, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 import core.state
@@ -28,7 +28,7 @@ from core.config import (
     FACEBOOK_CLIENT_ID,
     FACEBOOK_CLIENT_SECRET,
 )
-from core.deps import get_current_user_readonly
+from core.deps import get_current_user_readonly_no_wallet
 from core.oauth import (
     get_oauth_redirect_uri,
     mirror_oauth_profile_image_to_r2,
@@ -51,21 +51,13 @@ logger = logging.getLogger("uploadm8-api")
 router = APIRouter(tags=["oauth"])
 
 
-async def _oauth_user(
-    request: Request,
-    authorization: Optional[str] = Header(None),
-):
-    # Start only needs auth + user id; skip last_active_at / daily_refill (faster under DB load).
-    return await get_current_user_readonly(request, authorization)
-
-
 @router.get("/api/oauth/{platform}/start")
 async def oauth_start(
     platform: str,
     parent_origin: Optional[str] = Query(None),
     force_login: bool = Query(False, description="Force account chooser/reauth where provider supports it"),
     reconnect_account_id: Optional[str] = Query(None, description="Existing platform_tokens.id to reconnect"),
-    user: dict = Depends(_oauth_user),
+    user: dict = Depends(get_current_user_readonly_no_wallet),
 ):
     """Start OAuth flow for a platform.
 
@@ -180,10 +172,10 @@ async def oauth_start(
 
 
 @router.get("/api/oauth/meta/config")
-async def meta_oauth_config_public():
+async def meta_oauth_config():
     """
     Which Meta OAuth scope bundle the server requests (for App Review demos vs production).
-    Does not expose app secrets.
+    Does not expose app secrets. Public read — platforms UI only displays this for master admins.
     """
     return {
         "meta_oauth_mode": meta_oauth_mode(),

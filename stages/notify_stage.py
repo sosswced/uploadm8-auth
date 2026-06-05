@@ -1751,16 +1751,69 @@ async def notify_admin_error(error_type: str, details: dict, db_pool=None):
     await _send_discord_webhook(webhook, embeds=[embed])
 
 
+async def _live_worker_count(db_pool=None) -> int:
+    if not db_pool:
+        return 0
+    try:
+        async with db_pool.acquire() as conn:
+            n = await conn.fetchval(
+                """
+                SELECT COUNT(*)::int FROM worker_heartbeat
+                WHERE last_seen_at > NOW() - INTERVAL '30 seconds'
+                """
+            )
+            return int(n or 0)
+    except Exception:
+        return 0
+
+
+def _worker_instance_context() -> dict:
+    import os
+    return {
+        "instance": os.environ.get("RENDER_INSTANCE_ID") or os.environ.get("WORKER_ID") or "unknown",
+        "service": os.environ.get("RENDER_SERVICE_NAME") or os.environ.get("WORKER_LANE") or "worker",
+        "region": os.environ.get("RENDER_REGION") or os.environ.get("AWS_REGION") or "—",
+    }
+
+
+async def _worker_scale_embed(db_pool, event: str) -> dict:
+    ctx = _worker_instance_context()
+    live = await _live_worker_count(db_pool)
+    if event == "start":
+        projected = live + 1
+        headline = "🟢 UploadM8 Worker started"
+        if projected > 1:
+            headline = f"📈 Scale up — {projected} worker(s) active"
+    else:
+        projected = max(0, live - 1)
+        headline = "🔴 UploadM8 Worker stopped"
+        if live > 1:
+            headline = f"📉 Scale down — {projected} worker(s) remaining"
+    return {
+        "content": headline,
+        "embeds": [{
+            "title": "Worker fleet",
+            "color": 0x22C55E if event == "start" else 0xEF4444,
+            "fields": [
+                {"name": "Instance", "value": str(ctx["instance"])[:64], "inline": True},
+                {"name": "Service", "value": str(ctx["service"])[:64], "inline": True},
+                {"name": "Region", "value": str(ctx["region"])[:32], "inline": True},
+                {"name": "Live workers (30s)", "value": str(live), "inline": True},
+                {"name": "Projected", "value": str(projected), "inline": True},
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }],
+    }
+
+
 async def notify_admin_worker_start(db_pool=None):
     """Notify admin that worker has started."""
     webhook = await _get_admin_webhook(db_pool)
     if not webhook:
         return
-    
-    await _send_discord_webhook(
-        webhook,
-        content="🟢 UploadM8 Worker started"
-    )
+
+    payload = await _worker_scale_embed(db_pool, "start")
+    await _send_discord_webhook(webhook, content=payload.get("content"), embeds=payload.get("embeds"))
 
 
 async def notify_admin_worker_stop(db_pool=None):
@@ -1768,11 +1821,9 @@ async def notify_admin_worker_stop(db_pool=None):
     webhook = await _get_admin_webhook(db_pool)
     if not webhook:
         return
-    
-    await _send_discord_webhook(
-        webhook,
-        content="🔴 UploadM8 Worker stopped"
-    )
+
+    payload = await _worker_scale_embed(db_pool, "stop")
+    await _send_discord_webhook(webhook, content=payload.get("content"), embeds=payload.get("embeds"))
 
 
 async def notify_admin_daily_summary(data: dict, db_pool=None):

@@ -6,8 +6,9 @@ Stripe checkout, portal, session retrieval, and webhook handling.
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
+import asyncpg
 import stripe
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 
@@ -27,6 +28,7 @@ from core.notifications import notify_mrr, notify_topup
 import core.state
 from services.billing_service_weights import fetch_service_weights_map
 from core.wallet import credit_wallet, ledger_entry
+from migrations.runtime_migrations import ensure_subscription_tier_constraint
 from routers.preferences import get_user_prefs_for_upload
 from stages.ai_service_costs import compute_presign_put_aic_costs
 from stages.entitlements import (
@@ -34,6 +36,7 @@ from stages.entitlements import (
     get_effective_tier_config,
     get_effective_topup_products,
     get_entitlements_for_tier,
+    normalize_tier,
 )
 from stages.emails import (
     send_subscription_started_email,
@@ -53,6 +56,157 @@ logger = logging.getLogger("uploadm8-api")
 router = APIRouter(prefix="/api/billing", tags=["billing"])
 
 
+def _webhook_tier(lookup_key: str, *, fallback: str = "free") -> str:
+    """Map Stripe lookup_key → canonical tier slug (launch→creator_lite, etc.)."""
+    lk = (lookup_key or "").strip().lower()
+    if lk in STRIPE_LOOKUP_TO_TIER:
+        return normalize_tier(STRIPE_LOOKUP_TO_TIER[lk])
+    return normalize_tier(fallback)
+
+
+def _stripe_field(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a field from a Stripe object or plain dict (Basil+ API safe)."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    getter = getattr(obj, "get", None)
+    if callable(getter):
+        try:
+            val = getter(key)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return getattr(obj, key, default)
+
+
+def _subscription_items_data(sub: Any) -> List[Any]:
+    items = _stripe_field(sub, "items")
+    if items is None:
+        return []
+    data = _stripe_field(items, "data")
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _subscription_price_lookup_key(sub: Any) -> str:
+    for item in _subscription_items_data(sub):
+        price = _stripe_field(item, "price")
+        if price is None:
+            continue
+        lk = str(_stripe_field(price, "lookup_key") or "").strip().lower()
+        if lk:
+            return lk
+    return ""
+
+
+def _subscription_period_timestamps(sub: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Billing period unix timestamps.
+
+    Stripe API 2025-03-31 (Basil) moved ``current_period_*`` from Subscription to
+    SubscriptionItem; read both so webhooks work across API versions.
+    """
+    start = _stripe_field(sub, "current_period_start")
+    end = _stripe_field(sub, "current_period_end")
+    if start is not None and end is not None:
+        return int(start), int(end)
+    for item in _subscription_items_data(sub):
+        if start is None:
+            start = _stripe_field(item, "current_period_start")
+        if end is None:
+            end = _stripe_field(item, "current_period_end")
+        if start is not None and end is not None:
+            break
+    return (
+        int(start) if start is not None else None,
+        int(end) if end is not None else None,
+    )
+
+
+def _subscription_period_datetimes(sub: Any) -> Tuple[datetime, datetime]:
+    start_ts, end_ts = _subscription_period_timestamps(sub)
+    period_start = (
+        datetime.fromtimestamp(start_ts, tz=timezone.utc) if start_ts else _now_utc()
+    )
+    period_end = (
+        datetime.fromtimestamp(end_ts, tz=timezone.utc) if end_ts else _now_utc()
+    )
+    return period_start, period_end
+
+
+def _invoice_subscription_id(invoice: Any) -> Optional[str]:
+    """
+    Resolve the subscription id from an Invoice across API versions.
+
+    Pre-Basil:            invoice.subscription
+    Basil+ (2025-03-31):  invoice.parent.subscription_details.subscription
+    """
+    def _as_id(val: Any) -> Optional[str]:
+        if not val:
+            return None
+        if isinstance(val, str):
+            return val
+        return _stripe_field(val, "id")
+
+    sub_id = _as_id(_stripe_field(invoice, "subscription"))
+    if sub_id:
+        return sub_id
+    parent = _stripe_field(invoice, "parent")
+    details = _stripe_field(parent, "subscription_details") if parent is not None else None
+    return _as_id(_stripe_field(details, "subscription")) if details is not None else None
+
+
+async def _event_already_processed(conn, event_id: Optional[str]) -> bool:
+    """True if this Stripe event.id was already handled (idempotency fast-path)."""
+    if not event_id:
+        return False
+    try:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM processed_stripe_events WHERE event_id = $1", event_id
+        )
+        return row is not None
+    except Exception as e:
+        logger.warning("stripe webhook: dedup lookup failed for %s: %s", event_id, e)
+        return False
+
+
+async def _mark_event_processed(conn, event_id: Optional[str], event_type: str) -> None:
+    """Record a successfully handled event so a later retry short-circuits."""
+    if not event_id:
+        return
+    try:
+        await conn.execute(
+            "INSERT INTO processed_stripe_events (event_id, event_type) VALUES ($1, $2) "
+            "ON CONFLICT (event_id) DO NOTHING",
+            event_id, event_type,
+        )
+    except Exception as e:
+        logger.warning("stripe webhook: failed to mark event %s processed: %s", event_id, e)
+
+
+async def _ensure_tier_constraint(conn) -> None:
+    try:
+        await ensure_subscription_tier_constraint(conn)
+    except Exception as e:
+        logger.warning("billing: tier constraint ensure failed: %s", e)
+
+
+async def _execute_user_tier_update(conn, sql: str, tier: str, *params):
+    """Run a tier UPDATE; repair constraint and retry once on check violation."""
+    await _ensure_tier_constraint(conn)
+    try:
+        return await conn.execute(sql, tier, *params)
+    except asyncpg.CheckViolationError as e:
+        if "users_subscription_tier_check" not in str(e):
+            raise
+        logger.warning("billing: tier check rejected %r — repairing constraint and retrying", tier)
+        await ensure_subscription_tier_constraint(conn)
+        return await conn.execute(sql, tier, *params)
+
+
 # ============================================================
 # Routes
 # ============================================================
@@ -67,7 +221,7 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
         if data.kind == "subscription":
             existing_sub_id  = user.get("stripe_subscription_id")
             existing_status  = user.get("subscription_status")
-            if existing_sub_id and existing_status in ("active", "trialing"):
+            if existing_sub_id and existing_status in ("active", "trialing", "past_due"):
                 # User already has an active sub — send straight to billing portal
                 # so they can upgrade/downgrade there rather than creating a duplicate
                 try:
@@ -91,7 +245,7 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
 
     if data.kind == "subscription":
         # Resolve trial days from entitlements (7 days for all paid tiers)
-        tier = STRIPE_LOOKUP_TO_TIER.get(data.lookup_key, "free")
+        tier = _webhook_tier(data.lookup_key)
         ent  = get_entitlements_for_tier(tier)
         trial_days = ent.trial_days  # 0 for free/internal, 7 for paid
 
@@ -186,16 +340,20 @@ async def get_billing_session(
     if mode == "subscription":
         sub = sess.get("subscription")
         if isinstance(sub, dict):
-            sub_status            = sub.get("status")        # active | trialing | past_due
-            trial_end_ts          = sub.get("trial_end")     # unix ts or None
-            current_period_end_ts = sub.get("current_period_end")
+            sub_status            = _stripe_field(sub, "status")
+            trial_end_ts          = _stripe_field(sub, "trial_end")
+            _, current_period_end_ts = _subscription_period_timestamps(sub)
             try:
-                price      = sub["items"]["data"][0]["price"]
-                lookup_key = price.get("lookup_key", "")
-                tier       = STRIPE_LOOKUP_TO_TIER.get(lookup_key)
-                if not tier:
+                lookup_key = _subscription_price_lookup_key(sub)
+                price = None
+                items = _subscription_items_data(sub)
+                if items:
+                    price = _stripe_field(items[0], "price")
+                lk = (lookup_key or "").strip().lower()
+                tier = _webhook_tier(lookup_key) if lk in STRIPE_LOOKUP_TO_TIER else None
+                if not tier and price:
                     # Fallback: try to match by product name
-                    prod_id = price.get("product")
+                    prod_id = _stripe_field(price, "product")
                     if prod_id:
                         prod = stripe.Product.retrieve(prod_id)
                         plan_name = prod.get("name", "")
@@ -408,6 +566,19 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(400, f"Invalid signature: {e}")
 
     etype = event.type
+    event_id = _stripe_field(event, "id")
+
+    # Preflight: repair the tier constraint and short-circuit duplicate deliveries.
+    # Stripe re-sends events on timeout; the per-operation idempotency below makes
+    # reprocessing safe, but this avoids redundant Stripe API calls and emails.
+    try:
+        async with core.state.db_pool.acquire() as _pre_conn:
+            await _ensure_tier_constraint(_pre_conn)
+            if await _event_already_processed(_pre_conn, event_id):
+                logger.info("stripe webhook: duplicate event %s (%s) — skipping", event_id, etype)
+                return {"status": "duplicate", "event_id": event_id}
+    except Exception as e:
+        logger.warning("stripe webhook: preflight check failed: %s", e)
 
     # ── checkout.session.completed ──────────────────────────────────────
     if etype == "checkout.session.completed":
@@ -422,17 +593,24 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             uname = (user_row["name"] if user_row else None) or "there"
 
             if session.mode == "subscription":
-                sub = stripe.Subscription.retrieve(session.subscription)
-                lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
-                tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
+                sub = stripe.Subscription.retrieve(
+                    session.subscription,
+                    expand=["items.data.price"],
+                )
+                lookup_key = _subscription_price_lookup_key(sub)
+                tier = _webhook_tier(lookup_key)
                 ent  = get_entitlements_for_tier(tier)
-                status = sub.status
+                status = _stripe_field(sub, "status")
 
-                period_start = datetime.fromtimestamp(sub.current_period_start, tz=timezone.utc) if sub.get("current_period_start") else _now_utc()
-                period_end   = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
-                trial_end    = datetime.fromtimestamp(sub.trial_end, tz=timezone.utc) if sub.get("trial_end") else None
+                period_start, period_end = _subscription_period_datetimes(sub)
+                trial_ts = _stripe_field(sub, "trial_end")
+                trial_end = (
+                    datetime.fromtimestamp(trial_ts, tz=timezone.utc) if trial_ts else None
+                )
 
-                await conn.execute("""
+                await _execute_user_tier_update(
+                    conn,
+                    """
                     UPDATE users SET
                         subscription_tier      = $1,
                         stripe_subscription_id = $2,
@@ -441,23 +619,30 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                         trial_end              = $5,
                         updated_at             = NOW()
                     WHERE id = $6
-                """, tier, session.subscription, status, period_end, trial_end, user_id)
+                    """,
+                    tier,
+                    session.subscription,
+                    status,
+                    period_end,
+                    trial_end,
+                    user_id,
+                )
 
                 # Seed wallet for first period / trial — deduped by invoice id
-                refill_ref = sub.get("latest_invoice") or session.id
+                refill_ref = _stripe_field(sub, "latest_invoice") or session.id
                 await _do_monthly_refill(conn, user_id, tier, ent, refill_ref, period_start, period_end)
 
                 amount = (session.amount_total or 0) / 100
                 await conn.execute(
                     "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
-                    "VALUES ($1,$2,'subscription',$3,$4) ON CONFLICT DO NOTHING",
+                    "VALUES ($1,$2,'subscription',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
                     user_id, amount, session.id, tier
                 )
                 background_tasks.add_task(notify_mrr, amount, email, tier, status)
 
                 # ── Welcome email: trial vs paid ──────────────────────────────
                 if trial_end:
-                    trial_days = sub.get("trial_period_days") or 14
+                    trial_days = _stripe_field(sub, "trial_period_days") or 14
                     background_tasks.add_task(
                         send_trial_started_email,
                         email, uname, tier,
@@ -472,6 +657,18 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     )
 
             elif session.mode == "payment":
+                # Idempotency: credit_wallet stamps token_ledger.stripe_event_id with
+                # session.id, so a re-delivered checkout.session.completed must not
+                # re-credit the wallet (the credit path is not otherwise idempotent).
+                already_credited = await conn.fetchval(
+                    "SELECT 1 FROM token_ledger "
+                    "WHERE stripe_event_id = $1 AND reason = 'topup_purchase' LIMIT 1",
+                    session.id,
+                )
+                if already_credited:
+                    logger.info("topup already credited for session %s — skipping", session.id)
+                    return {"status": "topup_already_processed"}
+
                 meta = session.metadata or {}
                 lookup_key = str(meta.get("lookup_key") or "").strip().lower()
                 prod = get_effective_topup_products().get(lookup_key) if lookup_key else None
@@ -500,7 +697,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     amount = (session.amount_total or 0) / 100
                     await conn.execute(
                         "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
-                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT DO NOTHING",
+                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
                         user_id, amount, session.id, f"{wallet_type}_{amount_tokens}",
                     )
                     background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
@@ -529,7 +726,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     amount = (session.amount_total or 0) / 100
                     await conn.execute(
                         "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
-                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT DO NOTHING",
+                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
                         user_id, amount, session.id, f"bundle_{lookup_key}",
                     )
                     tok_label = f"{put_total} PUT + {aic_total} AIC"
@@ -562,7 +759,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                     amount = (session.amount_total or 0) / 100
                     await conn.execute(
                         "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
-                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT DO NOTHING",
+                        "VALUES ($1,$2,'topup',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
                         user_id, amount, session.id, f"{wallet_type}_{amount_tokens}",
                     )
                     background_tasks.add_task(notify_topup, amount, email, wallet_type, total)
@@ -574,7 +771,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     # ── invoice.paid — monthly wallet refill on every renewal ──────────
     elif etype == "invoice.paid":
         invoice = event.data.object
-        sub_id  = invoice.get("subscription")
+        sub_id  = _invoice_subscription_id(invoice)
         if not sub_id:
             return {"status": "no_subscription"}
 
@@ -589,23 +786,29 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             user_id = str(user_row["id"])
             email   = user_row["email"]
             uname   = user_row["name"] or "there"
-            sub = stripe.Subscription.retrieve(sub_id)
-            lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
-            tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, user_row["subscription_tier"] or "free")
+            sub = stripe.Subscription.retrieve(sub_id, expand=["items.data.price"])
+            lookup_key = _subscription_price_lookup_key(sub)
+            tier = _webhook_tier(lookup_key, fallback=user_row["subscription_tier"] or "free")
             ent  = get_entitlements_for_tier(tier)
 
             period_start = datetime.fromtimestamp(invoice.period_start, tz=timezone.utc)
             period_end   = datetime.fromtimestamp(invoice.period_end, tz=timezone.utc)
             invoice_id   = invoice.id
 
-            await conn.execute("""
+            await _execute_user_tier_update(
+                conn,
+                """
                 UPDATE users SET
                     subscription_tier   = $1,
                     subscription_status = 'active',
                     current_period_end  = $2,
                     updated_at          = NOW()
                 WHERE id = $3
-            """, tier, period_end, user_id)
+                """,
+                tier,
+                period_end,
+                user_id,
+            )
 
             # Monthly wallet refill — deduped by invoice_id
             await _do_monthly_refill(conn, user_id, tier, ent, invoice_id, period_start, period_end)
@@ -613,7 +816,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             amount = (invoice.amount_paid or 0) / 100
             await conn.execute(
                 "INSERT INTO revenue_tracking (user_id, amount, source, stripe_event_id, plan) "
-                "VALUES ($1,$2,'renewal',$3,$4) ON CONFLICT DO NOTHING",
+                "VALUES ($1,$2,'renewal',$3,$4) ON CONFLICT (stripe_event_id) DO NOTHING",
                 user_id, amount, invoice_id, tier
             )
             background_tasks.add_task(notify_mrr, amount, email, tier, "renewal")
@@ -629,9 +832,9 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     elif etype == "customer.subscription.updated":
         sub = event.data.object
         async with core.state.db_pool.acquire() as conn:
-            lookup_key = sub["items"]["data"][0]["price"].get("lookup_key", "")
-            new_tier = STRIPE_LOOKUP_TO_TIER.get(lookup_key, "free")
-            period_end = datetime.fromtimestamp(sub.current_period_end, tz=timezone.utc)
+            lookup_key = _subscription_price_lookup_key(sub)
+            new_tier = _webhook_tier(lookup_key)
+            _, period_end = _subscription_period_datetimes(sub)
 
             # Fetch user before updating so we have old_tier for comparison
             user_row = await conn.fetchrow(
@@ -639,14 +842,21 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             )
             old_tier = user_row["subscription_tier"] if user_row else new_tier
 
-            await conn.execute("""
+            await _execute_user_tier_update(
+                conn,
+                """
                 UPDATE users SET
                     subscription_tier   = $1,
                     subscription_status = $2,
                     current_period_end  = $3,
                     updated_at          = NOW()
                 WHERE stripe_subscription_id = $4
-            """, new_tier, sub.status, period_end, sub.id)
+                """,
+                new_tier,
+                _stripe_field(sub, "status"),
+                period_end,
+                _stripe_field(sub, "id"),
+            )
 
             # Send tier change email only when tier actually changed
             if user_row and old_tier != new_tier:
@@ -669,7 +879,7 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     # ── invoice.payment_failed — notify user to update payment method ────
     elif etype == "invoice.payment_failed":
         inv = event.data.object
-        sub_id = inv.get("subscription")
+        sub_id = _invoice_subscription_id(inv)
         if sub_id:
             async with core.state.db_pool.acquire() as conn:
                 user_row = await conn.fetchrow(
@@ -756,9 +966,12 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                 _name     = user_row["name"] or "there"
                 _old_tier = user_row["subscription_tier"] or "free"
                 _trial_end = user_row.get("trial_end")
-                _access_until = datetime.fromtimestamp(
-                    sub.current_period_end, tz=timezone.utc
-                ).strftime("%B %d, %Y") if sub.get("current_period_end") else "now"
+                _end_ts = _subscription_period_timestamps(sub)[1]
+                _access_until = (
+                    datetime.fromtimestamp(_end_ts, tz=timezone.utc).strftime("%B %d, %Y")
+                    if _end_ts
+                    else "now"
+                )
 
                 if _trial_end and _trial_end > _now_utc():
                     background_tasks.add_task(
@@ -770,6 +983,12 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
                         send_subscription_cancelled_email,
                         _email, _name, _old_tier, _access_until,
                     )
+
+    # Record the event last: if handling above raised, the event is NOT marked,
+    # so a Stripe retry reprocesses it (per-operation idempotency dedups the
+    # writes that already succeeded).
+    async with core.state.db_pool.acquire() as _done_conn:
+        await _mark_event_processed(_done_conn, event_id, etype)
 
     return {"status": "ok"}
 

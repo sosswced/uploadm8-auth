@@ -27,11 +27,12 @@ import logging
 import os
 import re
 import tempfile
+import time as _time
 from datetime import datetime, timedelta, timezone
 from math import radians, sin, cos, sqrt, atan2
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 import core.state
@@ -43,12 +44,12 @@ from core.config import (
     TRILL_SYSTEM_PROMPT,
     ADMIN_DISCORD_WEBHOOK_URL,
 )
-from core.deps import get_current_user, get_verified_user_id, require_verified_user_on_conn
+from core.deps import get_current_user, get_verified_user_id, require_verified_user_on_conn, require_master_admin
+from services.trill_access import TRILL_ROUTE_PREDICATE, TRILL_SCORED_PREDICATE, trill_map_lat_sql, trill_map_lon_sql
 from core.r2 import get_s3_client
 from core.notifications import discord_notify
 from services.ops_incidents import record_operational_incident
 from core.wallet import credit_wallet
-from services.trill_access import TRILL_ROUTE_PREDICATE
 from services.trill_engagement import (
     add_rival,
     archive_due_seasons,
@@ -71,12 +72,36 @@ from services.trill_engagement import (
     remove_rival,
     resolve_user_from_public_id,
 )
-from services.trill_vehicle_filter import trill_vehicle_where_fragment
+from services.trill_vehicle_filter import build_trill_vehicle_filter
 from services.vehicle_catalog import fetch_vehicle_labels
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/trill", tags=["trill"])
+
+_LEADERBOARD_CACHE: dict[str, tuple[float, dict]] = {}
+_LEADERBOARD_CACHE_TTL_SEC = 30.0
+
+
+async def _leaderboard_badge_and_rival_followup(
+    uid_str: str,
+    since: datetime,
+    viewer_stats: dict,
+) -> None:
+    """Badge awards (landmark scan) — must not block GET /leaderboard."""
+    pool = core.state.db_pool
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await evaluate_and_award_badges(
+                conn,
+                uid_str,
+                viewer_stats=viewer_stats,
+                since=since,
+            )
+    except Exception as e:
+        logger.debug("trill leaderboard followup: %s", e)
 
 
 # ============================================================
@@ -608,7 +633,7 @@ async def trill_onboarding_state(user: dict = Depends(get_current_user)):
                     SELECT EXISTS (
                         SELECT 1 FROM uploads u
                         WHERE u.user_id = $1
-                        AND {TRILL_ROUTE_PREDICATE.strip()}
+                        AND {TRILL_SCORED_PREDICATE.strip()}
                     )
                     """,
                     uid,
@@ -674,7 +699,7 @@ def _lb_meta_state_sql(alias: str = "u") -> str:
         NULLIF(btrim({t}#>>'{{telemetry,location_state}}'), ''),
         NULLIF(btrim({t}#>>'{{state_usps}}'), ''),
         NULLIF(btrim({t}#>>'{flat_state}'), '')
-    )), ''), '')"""
+    )), '')"""
 
 
 def _lb_meta_place_sql(alias: str = "u") -> str:
@@ -684,7 +709,7 @@ def _lb_meta_place_sql(alias: str = "u") -> str:
         NULLIF(btrim({t}#>>'{{telemetry,location_display}}'), ''),
         NULLIF(btrim({t}#>>'{{place_name}}'), ''),
         NULLIF(btrim({t}#>>'{{telemetry,location_city}}'), '')
-    )), ''), '')"""
+    )), '')"""
 
 
 def _lb_meta_lat_sql(alias: str = "u") -> str:
@@ -730,18 +755,22 @@ def _leaderboard_driver_handle(user_id: str, trill_public_name, status: str) -> 
 
 def _leaderboard_speed_expr(alias: str = "u") -> str:
     a = alias
+    t = f"{a}.trill_metadata"
     return f"""COALESCE(
         {a}.max_speed_mph,
-        NULLIF(btrim({a}.trill_metadata#>>'{{telemetry,max_speed_mph}}'), '')::double precision,
+        NULLIF(btrim({t}#>>'{{telemetry,max_speed_mph}}'), '')::double precision,
+        NULLIF(btrim({t}#>>'{{max_speed_mph}}'), '')::double precision,
         0.0
     )"""
 
 
 def _leaderboard_distance_expr(alias: str = "u") -> str:
     a = alias
+    t = f"{a}.trill_metadata"
     return f"""COALESCE(
         {a}.distance_miles,
-        NULLIF(btrim({a}.trill_metadata#>>'{{telemetry,total_distance_miles}}'), '')::double precision,
+        NULLIF(btrim({t}#>>'{{telemetry,total_distance_miles}}'), '')::double precision,
+        NULLIF(btrim({t}#>>'{{distance_miles}}'), '')::double precision,
         0.0
     )"""
 
@@ -764,6 +793,7 @@ async def trill_leaderboard_regions(
 
 @router.get("/leaderboard")
 async def trill_leaderboard(
+    background_tasks: BackgroundTasks,
     range: str = Query("30d"),
     sort: str = Query("best_trill"),
     limit: int = Query(50, ge=1, le=100),
@@ -772,6 +802,10 @@ async def trill_leaderboard(
 ):
     """Community leaderboard — opted-in users only; aggregates (no route geometry)."""
     uid = user_id
+    cache_key = f"{uid}:{range}:{sort}:{region or ''}:{limit}"
+    cached = _LEADERBOARD_CACHE.get(cache_key)
+    if cached and (_time.time() - cached[0]) < _LEADERBOARD_CACHE_TTL_SEC:
+        return cached[1]
     since = _trill_since_dt(range)
     sort_key = (sort or "best_trill").strip()
     if sort_key not in _LEADERBOARD_SORTS:
@@ -813,7 +847,7 @@ async def trill_leaderboard(
                     SELECT EXISTS (
                         SELECT 1 FROM uploads u
                         WHERE u.user_id = $1
-                        AND {TRILL_ROUTE_PREDICATE.strip()}
+                        AND {TRILL_SCORED_PREDICATE.strip()}
                     )
                     """,
                     uid,
@@ -846,7 +880,7 @@ async def trill_leaderboard(
                     FROM uploads u
                     WHERE u.user_id = $1
                       AND u.created_at >= $2
-                      AND {TRILL_ROUTE_PREDICATE.strip()}
+                      AND {TRILL_SCORED_PREDICATE.strip()}
                     """,
                     uid,
                     since,
@@ -859,7 +893,7 @@ async def trill_leaderboard(
                     INNER JOIN user_preferences pref ON pref.user_id = u.user_id
                         AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
                     WHERE u.created_at >= $1
-                      AND {TRILL_ROUTE_PREDICATE.strip()}
+                      AND {TRILL_SCORED_PREDICATE.strip()}
                     GROUP BY 1
                     """,
                     since,
@@ -882,7 +916,7 @@ async def trill_leaderboard(
                         INNER JOIN user_preferences pref ON pref.user_id = u.user_id
                             AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
                         WHERE u.created_at >= $1
-                          AND {TRILL_ROUTE_PREDICATE.strip()}
+                          AND {TRILL_SCORED_PREDICATE.strip()}
                           AND ($3::text IS NULL OR UPPER(TRIM({state_x})) = $3)
                     ),
                     agg AS (
@@ -941,11 +975,14 @@ async def trill_leaderboard(
                     if challenge_completion:
                         rp = int(challenge_completion.get("reward_put") or 0)
                         ra = int(challenge_completion.get("reward_aic") or 0)
-                        if rp > 0:
-                            await credit_wallet(conn, uid, "put", rp, "trill_weekly_challenge")
-                        if ra > 0:
-                            await credit_wallet(conn, uid, "aic", ra, "trill_weekly_challenge")
-                        await award_badge(conn, uid, "challenge_champ", presented_by="UploadM8 Challenge Desk")
+                        try:
+                            if rp > 0:
+                                await credit_wallet(conn, uid, "put", rp, "trill_weekly_challenge")
+                            if ra > 0:
+                                await credit_wallet(conn, uid, "aic", ra, "trill_weekly_challenge")
+                            await award_badge(conn, uid, "challenge_champ", presented_by="UploadM8 Challenge Desk")
+                        except Exception as _ce:
+                            logger.warning("trill challenge reward skipped: %s", _ce)
                 hall_of_fame = await fetch_hall_of_fame(conn)
                 rank_by_uid = {str(r["user_id"]): int(r["rank"]) for r in rows}
                 rival_handles = {}
@@ -973,17 +1010,6 @@ async def trill_leaderboard(
                 v_runs = int(viewer_row["run_count"] or 0) if viewer_row else 0
                 v_speed = round(float(viewer_row["best_speed"] or 0), 1) if viewer_row else 0.0
                 try:
-                    await evaluate_and_award_badges(
-                        conn,
-                        uid_str,
-                        viewer_stats={
-                            "best_trill": v_best,
-                            "rank": viewer_rank,
-                            "run_count": v_runs,
-                            "best_speed": v_speed,
-                        },
-                        since=since,
-                    )
                     viewer_badges = (await fetch_badges_for_users(conn, [uid_str])).get(uid_str, [])
                     viewer_badge_collection = await fetch_user_badge_collection(conn, uid_str)
                     if opted_in and viewer_rank is not None and rival_handles:
@@ -995,12 +1021,49 @@ async def trill_leaderboard(
                             viewer_rank,
                             rival_handles,
                             db_pool=core.state.db_pool,
+                            defer_external_notify=True,
                         )
+                    background_tasks.add_task(
+                        _leaderboard_badge_and_rival_followup,
+                        uid_str,
+                        since,
+                        {
+                            "best_trill": v_best,
+                            "rank": viewer_rank,
+                            "run_count": v_runs,
+                            "best_speed": v_speed,
+                        },
+                    )
                 except Exception:
                     viewer_badges = []
                     viewer_badge_collection = []
     except Exception as e:
         logger.warning("trill leaderboard: %s", e)
+        bucket_dist = {b: 0 for b in ("gloryBoy", "euphoric", "sendIt", "spirited", "chill")}
+        for br in bucket_rows or []:
+            b = (br["bucket"] or "unknown").strip()
+            if b in bucket_dist:
+                bucket_dist[b] = int(br["cnt"] or 0)
+        partial_viewer: dict = {}
+        if viewer_row is not None or pref_row is not None:
+            v_best = float(viewer_row["best_trill"] or 0) if viewer_row else 0.0
+            v_runs = int(viewer_row["run_count"] or 0) if viewer_row else 0
+            partial_viewer = {
+                "opted_in": opted_in,
+                "on_board": False,
+                "rank": None,
+                "run_count": v_runs,
+                "best_trill_score": round(v_best, 1),
+                "avg_trill_score": round(float(viewer_row["avg_trill"] or 0), 1) if viewer_row else 0.0,
+                "best_speed_mph": round(float(viewer_row["best_speed"] or 0), 1) if viewer_row else 0.0,
+                "total_distance_miles": round(float(viewer_row["total_distance"] or 0), 1) if viewer_row else 0.0,
+                "percentile": None,
+                "display_name_status": str((pref_row or {}).get("trill_public_name_status") or "none"),
+                "public_name": (pref_row or {}).get("trill_public_name") if pref_row else None,
+                "chase_targets": [],
+                "badges": viewer_badges or [],
+                "badge_collection": viewer_badge_collection or [],
+            }
         return {
             "unlocked": viewer_unlocked,
             "map_unlocked": viewer_unlocked,
@@ -1008,9 +1071,9 @@ async def trill_leaderboard(
             "sort": sort_key,
             "rows": [],
             "summary": {},
-            "viewer": {},
+            "viewer": partial_viewer,
             "highlights": {},
-            "bucket_distribution": {},
+            "bucket_distribution": bucket_dist,
             "error": str(e),
         }
 
@@ -1025,7 +1088,7 @@ async def trill_leaderboard(
             "viewer": {},
             "highlights": {},
             "bucket_distribution": {},
-            "message": "Complete a map-backed Trill upload to unlock the community leaderboard.",
+            "message": "Complete an upload with a Trill score to unlock the community leaderboard.",
         }
 
     bucket_dist = {b: 0 for b in ("gloryBoy", "euphoric", "sendIt", "spirited", "chill")}
@@ -1088,6 +1151,41 @@ async def trill_leaderboard(
             uid_row = str(r["user_id"])
             out_rows[i]["recent_scores"] = scores_map.get(uid_row, [])
             out_rows[i]["badges"] = badges_map.get(uid_row, [])
+
+    if opted_in and viewer_row and int(viewer_row["run_count"] or 0) > 0 and not any(x.get("is_you") for x in out_rows):
+        handle, anon, approved = _leaderboard_driver_handle(
+            uid_str,
+            (pref_row or {}).get("trill_public_name"),
+            str((pref_row or {}).get("trill_public_name_status") or "none"),
+        )
+        v_best_row = float(viewer_row["best_trill"] or 0)
+        inject_rank = viewer_rank if viewer_rank is not None else 1
+        out_rows.append(
+            {
+                "rank": inject_rank,
+                "public_id": public_driver_id(uid_str),
+                "driver_handle": handle,
+                "driver_handle_anonymous": anon,
+                "has_public_name": approved,
+                "is_you": True,
+                "is_rival": False,
+                "run_count": int(viewer_row["run_count"] or 0),
+                "best_trill_score": v_best_row,
+                "avg_trill_score": round(float(viewer_row["avg_trill"] or 0), 1),
+                "best_speed_mph": float(viewer_row["best_speed"] or 0),
+                "total_distance_miles": round(float(viewer_row["total_distance"] or 0), 1),
+                "best_bucket": None,
+                "best_run_place": None,
+                "best_run_state": None,
+                "best_run_region": None,
+                "best_run_lat": None,
+                "best_run_lon": None,
+                "recent_scores": scores_map.get(uid_str, []),
+                "badges": badges_map.get(uid_str, viewer_badges),
+            }
+        )
+        if viewer_rank is None:
+            viewer_rank = inject_rank
 
     driver_count = len(out_rows)
     total_runs = sum(int(r["run_count"] or 0) for r in out_rows)
@@ -1162,7 +1260,7 @@ async def trill_leaderboard(
             "completed": bool(challenge_completion),
         }
 
-    return {
+    payload = {
         "unlocked": True,
         "map_unlocked": True,
         "range": range,
@@ -1179,6 +1277,8 @@ async def trill_leaderboard(
         "rival_max": 3,
         "rows": out_rows,
     }
+    _LEADERBOARD_CACHE[cache_key] = (_time.time(), payload)
+    return payload
 
 
 @router.get("/map-feed")
@@ -1186,14 +1286,25 @@ async def trill_map_feed(
     range: str = Query("30d"),
     trill_vehicle_make: Optional[str] = Query(None, max_length=120),
     trill_vehicle_model: Optional[str] = Query(None, max_length=120),
+    trill_vehicle_make_id: Optional[int] = Query(None, ge=1),
+    trill_vehicle_model_id: Optional[int] = Query(None, ge=1),
     user: dict = Depends(get_current_user),
 ):
     """Pins for the signed-in user only (no full GPS arrays)."""
     uid = user["id"]
     since = _trill_since_dt(range)
-    vf_sql, vf_vals = trill_vehicle_where_fragment(3, trill_vehicle_make, trill_vehicle_model)
     try:
         async with core.state.db_pool.acquire() as conn:
+            vf_sql, vf_vals = await build_trill_vehicle_filter(
+                conn,
+                3,
+                trill_vehicle_make,
+                trill_vehicle_model,
+                make_id=trill_vehicle_make_id,
+                model_id=trill_vehicle_model_id,
+            )
+            lat_x = trill_map_lat_sql("u")
+            lon_x = trill_map_lon_sql("u")
             rows = await conn.fetch(
                 f"""
                 SELECT
@@ -1202,30 +1313,21 @@ async def trill_map_feed(
                     u.trill_score,
                     u.speed_bucket,
                     u.status,
-                    COALESCE(
-                        NULLIF(btrim(u.trill_metadata#>>'{{telemetry,mid_lat}}'), '')::double precision,
-                        NULLIF(btrim(u.trill_metadata#>>'{{telemetry,start_lat}}'), '')::double precision
-                    ) AS lat,
-                    COALESCE(
-                        NULLIF(btrim(u.trill_metadata#>>'{{telemetry,mid_lon}}'), '')::double precision,
-                        NULLIF(btrim(u.trill_metadata#>>'{{telemetry,start_lon}}'), '')::double precision
-                    ) AS lon,
+                    {lat_x} AS lat,
+                    {lon_x} AS lon,
                     NULLIF(btrim(u.trill_metadata#>>'{{telemetry,gazetteer_place_name}}'), '') AS gazetteer_place,
+                    NULLIF(btrim(u.trill_metadata#>>'{{place_name}}'), '') AS gazetteer_place_legacy,
                     NULLIF(btrim(u.trill_metadata#>>'{{telemetry,padus_unit_name}}'), '') AS padus_unit,
                     COALESCE(
                         (NULLIF(btrim(u.trill_metadata#>>'{{telemetry,near_padus}}'), ''))::boolean,
+                        (NULLIF(btrim(u.trill_metadata#>>'{{near_padus}}'), ''))::boolean,
                         FALSE
                     ) AS near_padus
                 FROM uploads u
                 WHERE u.user_id = $1
                   AND u.created_at >= $2
-                  AND u.trill_score IS NOT NULL
-                  AND (
-                    COALESCE(
-                        NULLIF(btrim(u.trill_metadata#>>'{{telemetry,mid_lat}}'), '')::double precision,
-                        NULLIF(btrim(u.trill_metadata#>>'{{telemetry,start_lat}}'), '')::double precision
-                    ) IS NOT NULL
-                  )
+                  AND {TRILL_SCORED_PREDICATE.strip()}
+                  AND ({lat_x}) IS NOT NULL
                   {vf_sql}
                 ORDER BY u.created_at DESC
                 LIMIT 200
@@ -1251,7 +1353,7 @@ async def trill_map_feed(
                 "trill_score": float(r["trill_score"]) if r["trill_score"] is not None else None,
                 "speed_bucket": r["speed_bucket"],
                 "status": r["status"],
-                "gazetteer_place": r["gazetteer_place"],
+                "gazetteer_place": r["gazetteer_place"] or r.get("gazetteer_place_legacy"),
                 "padus_unit": r["padus_unit"],
                 "near_padus": bool(r["near_padus"]),
             }
@@ -1299,9 +1401,11 @@ async def trill_route_downsample(upload_id: str, user: dict = Depends(get_curren
         p = pts[i]
         if not isinstance(p, dict):
             continue
+        la_raw = p.get("lat", p.get("latitude"))
+        lo_raw = p.get("lon", p.get("lng", p.get("longitude")))
         try:
-            la = float(p.get("lat"))
-            lo = float(p.get("lon"))
+            la = float(la_raw)
+            lo = float(lo_raw)
         except (TypeError, ValueError):
             continue
         spd = p.get("speed_mph")
@@ -1535,7 +1639,7 @@ async def trill_driver_profile(public_id: str, range: str = Query("30d"), user: 
                    COALESCE(MAX(max_speed_mph), 0)::float AS best_speed,
                    COALESCE(SUM(distance_miles), 0)::float AS total_distance
             FROM uploads u
-            WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_ROUTE_PREDICATE.strip()}
+            WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_SCORED_PREDICATE.strip()}
             """,
             target_uid,
             since,
@@ -1546,7 +1650,7 @@ async def trill_driver_profile(public_id: str, range: str = Query("30d"), user: 
                    trill_score::float, max_speed_mph::float, created_at
             FROM uploads u
             WHERE u.user_id = $1 AND u.created_at >= $2 AND u.trill_score IS NOT NULL
-              AND {TRILL_ROUTE_PREDICATE.strip()}
+              AND {TRILL_SCORED_PREDICATE.strip()}
             ORDER BY trill_score DESC NULLS LAST
             LIMIT 8
             """,
@@ -1578,4 +1682,54 @@ async def trill_driver_profile(public_id: str, range: str = Query("30d"), user: 
             }
             for u in uploads
         ],
+    }
+
+
+@router.get("/qualification-debug")
+async def trill_qualification_debug(
+    user_id: Optional[str] = Query(None, max_length=64),
+    limit: int = Query(25, ge=1, le=100),
+    _admin: dict = Depends(require_master_admin),
+):
+    """Master admin: why uploads fail leaderboard route predicate."""
+    uid = (user_id or "").strip()
+    if not uid:
+        raise HTTPException(400, "user_id query param required")
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                    u.id,
+                    u.status,
+                    u.trill_score,
+                    COALESCE(jsonb_array_length(COALESCE(u.trill_metadata->'telemetry'->'points', '[]'::jsonb)), 0) AS point_count,
+                    NULLIF(btrim(u.trill_metadata#>>'{{telemetry,mid_lat}}'), '') IS NOT NULL AS has_mid_lat,
+                    NULLIF(btrim(u.trill_metadata#>>'{{telemetry,mid_lon}}'), '') IS NOT NULL AS has_mid_lon,
+                    ({TRILL_SCORED_PREDICATE.strip()}) AS qualifies_scored,
+                    ({TRILL_ROUTE_PREDICATE.strip()}) AS qualifies_route
+                FROM uploads u
+                WHERE u.user_id = $1
+                ORDER BY u.created_at DESC
+                LIMIT $2
+                """,
+                uid,
+                limit,
+            )
+            pref = await conn.fetchrow(
+                """
+                SELECT COALESCE(trill_leaderboard_opt_in, FALSE) AS opted_in,
+                       trill_public_name_status
+                FROM user_preferences WHERE user_id = $1
+                """,
+                uid,
+            )
+    except Exception as e:
+        logger.warning("trill qualification-debug: %s", e)
+        raise HTTPException(500, "Could not load qualification debug") from e
+    return {
+        "user_id": uid,
+        "opted_in": bool(pref and pref["opted_in"]),
+        "display_name_status": (pref and pref["trill_public_name_status"]) or None,
+        "uploads": [dict(r) for r in rows],
     }

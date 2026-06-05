@@ -11,8 +11,10 @@ so env overrides never drift between surfaces.
 
 from __future__ import annotations
 
+import asyncio
 import os
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 HUB_DOCS_JOBS = "https://huggingface.co/docs/huggingface_hub/guides/jobs"
 DATASETS_HUB_DOC = "https://huggingface.co/docs/datasets"
@@ -30,6 +32,21 @@ def _env(name: str, default: str = "") -> str:
     return v if v else default
 
 
+def _parse_hub_page_response(status_code: int, body: str) -> bool:
+    if status_code in (401, 403):
+        return True
+    text = (body or "")[:12000].lower()
+    if "can't find the page" in text:
+        return False
+    if "<title>" in text:
+        title = text.split("<title>", 1)[1].split("</title>", 1)[0]
+        if title.strip().startswith("404") and "hugging face" in title:
+            return False
+    if status_code >= 400:
+        return False
+    return True
+
+
 def hub_public_page_exists(url: str) -> bool:
     """
     Best-effort check that a Hub dataset/space URL is not a generic 404 page.
@@ -40,6 +57,8 @@ def hub_public_page_exists(url: str) -> bool:
     u = (url or "").strip()
     if not u.startswith("https://huggingface.co/"):
         return False
+    if os.environ.get("UM8_ML_OBSERVABILITY_SKIP_HF_PROBE", "").strip() == "1":
+        return True
     try:
         import httpx
 
@@ -49,21 +68,60 @@ def hub_public_page_exists(url: str) -> bool:
             timeout=8.0,
             headers={"User-Agent": "UploadM8-MLHubCheck/1.0"},
         )
-        # Private repos often return 401 with a generic HTML shell — still configured.
-        if r.status_code in (401, 403):
-            return True
-        body = (r.text or "")[:12000].lower()
-        if "can't find the page" in body:
-            return False
-        if "<title>" in body:
-            title = body.split("<title>", 1)[1].split("</title>", 1)[0]
-            if title.strip().startswith("404") and "hugging face" in title:
-                return False
-        if r.status_code >= 400:
-            return False
-        return True
+        return _parse_hub_page_response(r.status_code, r.text or "")
     except Exception:
         return True
+
+
+async def hub_public_page_exists_async(url: str) -> bool:
+    """Non-blocking Hub page probe for async routes."""
+    u = (url or "").strip()
+    if not u.startswith("https://huggingface.co/"):
+        return False
+    if os.environ.get("UM8_ML_OBSERVABILITY_SKIP_HF_PROBE", "").strip() == "1":
+        return True
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+            r = await client.get(u, headers={"User-Agent": "UploadM8-MLHubCheck/1.0"})
+        return _parse_hub_page_response(r.status_code, r.text or "")
+    except Exception:
+        return True
+
+
+async def check_hub_pages_parallel(dataset_url: str, space_url: str) -> Tuple[bool, bool]:
+    """Probe dataset + space URLs concurrently (max ~8s, not 16s sequential)."""
+    ds, sp = await asyncio.gather(
+        hub_public_page_exists_async(dataset_url or ""),
+        hub_public_page_exists_async(space_url or ""),
+    )
+    return bool(ds), bool(sp)
+
+
+_OBSERVABILITY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+OBSERVABILITY_CACHE_TTL_SEC = int(os.environ.get("UM8_ML_OBSERVABILITY_CACHE_SEC", "600") or "600")
+
+
+def get_observability_cache(mode: str) -> Optional[Dict[str, Any]]:
+    key = f"observability:{mode}"
+    entry = _OBSERVABILITY_CACHE.get(key)
+    if not entry:
+        return None
+    expires_at, payload = entry
+    if time.time() >= expires_at:
+        _OBSERVABILITY_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def set_observability_cache(mode: str, payload: Dict[str, Any]) -> None:
+    key = f"observability:{mode}"
+    _OBSERVABILITY_CACHE[key] = (time.time() + OBSERVABILITY_CACHE_TTL_SEC, payload)
+
+
+def clear_observability_cache() -> None:
+    _OBSERVABILITY_CACHE.clear()
 
 
 def get_ml_hub_urls() -> Dict[str, Optional[str]]:

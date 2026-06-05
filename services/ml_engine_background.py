@@ -40,9 +40,12 @@ async def run_ml_engine_loop(pool, redis_client=None) -> None:
                     result.get("m8_model_run_id"),
                 )
             elif not result.get("skipped"):
+                build_step = (result.get("steps") or {}).get("build_dataset") or {}
+                build_tail = (build_step.get("stderr_tail") or build_step.get("stdout_tail") or "").strip()
                 logger.warning(
-                    "ml engine cycle failed: %s",
+                    "ml engine cycle failed: %s%s",
                     result.get("error") or result.get("reason"),
+                    f" | build: {build_tail[-400:]}" if build_tail else "",
                 )
         except asyncio.CancelledError:
             raise

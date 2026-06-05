@@ -20,14 +20,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
 
 import asyncpg
 import pandas as pd
-from datasets import Dataset
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -314,12 +316,23 @@ def _require_database_url() -> str:
 
 async def _fetch_dataset(dsn: str, lookback_days: int, limit: int) -> pd.DataFrame:
     conn = await asyncpg.connect(dsn)
+    touch_rows = []
+    snap_rows = []
     try:
-        touch_rows = await conn.fetch(PROMO_SQL, int(lookback_days), int(limit))
+        try:
+            touch_rows = await conn.fetch(PROMO_SQL, int(lookback_days), int(limit))
+        except Exception as e:
+            logger.warning("promo touchpoint SQL failed: %s", e)
         snap_limit = max(500, int(limit) // 2)
-        snap_rows = await conn.fetch(USER_SNAPSHOT_SQL, int(lookback_days), snap_limit)
+        try:
+            snap_rows = await conn.fetch(USER_SNAPSHOT_SQL, int(lookback_days), snap_limit)
+        except Exception as e:
+            logger.warning("promo user snapshot SQL failed: %s", e)
         if not touch_rows and not snap_rows:
-            touch_rows = await conn.fetch(FALLBACK_PROMO_SQL, int(lookback_days), int(limit))
+            try:
+                touch_rows = await conn.fetch(FALLBACK_PROMO_SQL, int(lookback_days), int(limit))
+            except Exception as e:
+                logger.warning("promo ml_outcome_labels fallback SQL failed: %s", e)
         records = [dict(r) for r in touch_rows] + [dict(r) for r in snap_rows]
         df = pd.DataFrame.from_records(records)
         if df.empty:
@@ -359,12 +372,21 @@ def _write_local(df: pd.DataFrame, output: str) -> None:
 
 
 def _maybe_push_hf(df: pd.DataFrame, repo_id: str, split: str, private: bool) -> None:
+    if df.empty:
+        print(f"Skipping HF push to {repo_id}: dataset is empty")
+        return
     ok, reason = hf_env_status(require_write_token=True)
     if not ok:
         raise SystemExit(f"HF env check failed: {reason}")
     token = hf_write_token()
     if not token:
         raise SystemExit("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required for push")
+    try:
+        from datasets import Dataset
+    except ImportError as e:
+        raise SystemExit(
+            "datasets package is required for --push-to (pip install 'datasets>=2.20.0')"
+        ) from e
     ds = Dataset.from_pandas(_prepare_df(df), preserve_index=False)
     ds.push_to_hub(repo_id, token=token, split=split, private=private)
     print(f"Pushed {len(ds)} rows to {repo_id} ({split})")
@@ -384,8 +406,10 @@ async def _run(args: argparse.Namespace) -> None:
     pos_rate = float(df["converted_7d"].mean()) if len(df) else 0.0
     track.log({"rows": int(len(df)), "positive_rate": pos_rate})
     _write_local(df, args.output)
-    if args.push_to:
+    if args.push_to and len(df):
         _maybe_push_hf(df, args.push_to, args.split, args.private)
+    elif args.push_to:
+        print(f"Skipping HF push to {args.push_to}: dataset is empty")
     track.finish()
 
 
@@ -401,8 +425,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _build_parser().parse_args()
-    asyncio.run(_run(args))
+    try:
+        asyncio.run(_run(args))
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("promo dataset build failed")
+        return 1
     return 0
 
 

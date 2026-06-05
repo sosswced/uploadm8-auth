@@ -90,7 +90,14 @@ def _run(args: argparse.Namespace) -> Dict[str, Any]:
     if target_col not in df.columns:
         raise SystemExit(f"Missing target column: {target_col}")
     if len(df) < 8:
-        raise SystemExit(f"Need more rows to train baseline (got {len(df)})")
+        return {
+            "task": "promo_targeting_uplift_baseline",
+            "status": "insufficient_rows",
+            "message": f"Need more rows to train baseline (got {len(df)})",
+            "rows": int(len(df)),
+            "positive_rate": float(df[target_col].mean()) if len(df) else 0.0,
+            "target_column": target_col,
+        }
     class_count = int(df[target_col].nunique())
     if class_count < 2:
         return {

@@ -39,7 +39,6 @@ from typing import Any, Dict, List
 
 import asyncpg
 import pandas as pd
-from datasets import Dataset
 from dotenv import load_dotenv
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -104,12 +103,21 @@ def _write_local(df: pd.DataFrame, output: str) -> None:
 
 
 def _maybe_push_hf(df: pd.DataFrame, repo_id: str, split: str, private: bool) -> None:
+    if df.empty:
+        print(f"Skipping HF push to {repo_id}: dataset is empty")
+        return
     ok, reason = hf_env_status(require_write_token=True)
     if not ok:
         raise SystemExit(f"HF env check failed: {reason}")
     token = hf_write_token()
     if not token:
         raise SystemExit("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required for push")
+    try:
+        from datasets import Dataset
+    except ImportError as e:
+        raise SystemExit(
+            "datasets package is required for --push-to (pip install 'datasets>=2.20.0')"
+        ) from e
     ds = Dataset.from_pandas(_prepare_df(df), preserve_index=False)
     ds.push_to_hub(repo_id, token=token, split=split, private=private)
     print(f"Pushed {len(ds)} rows to {repo_id} ({split})")

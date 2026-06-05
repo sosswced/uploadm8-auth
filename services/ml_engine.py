@@ -254,7 +254,15 @@ async def run_ml_engine_cycle(
         build = await asyncio.to_thread(_step_build_dataset, c)
         result["steps"]["build_dataset"] = build
         if not build.get("ok"):
+            detail = (build.get("stderr_tail") or build.get("stdout_tail") or "").strip()
             result["error"] = "dataset build failed"
+            if detail:
+                result["build_detail"] = detail[-800:]
+                logger.warning(
+                    "ml engine dataset build failed (rc=%s): %s",
+                    build.get("returncode"),
+                    detail[-1200:],
+                )
             return result
 
         if c.use_hf_jobs:
@@ -278,7 +286,7 @@ async def run_ml_engine_cycle(
 
             report = _read_report(c.local_report_path)
             result["report"] = report
-            if report.get("status") == "insufficient_label_variance":
+            if report.get("status") in ("insufficient_label_variance", "insufficient_rows"):
                 result["ok"] = True
                 result["warning"] = report.get("message")
             elif int(report.get("train_rows") or 0) < c.min_train_rows:

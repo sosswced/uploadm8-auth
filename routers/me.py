@@ -177,7 +177,7 @@ async def get_me_ai_insights(user: dict = Depends(get_current_user)):
     if pool is None:
         return ai_insights_hub_fallback(error="database_unavailable")
     try:
-        return await build_ai_insights_hub(pool, user["id"], user=user)
+        return await build_ai_insights_hub(pool, user["id"])
     except Exception:
         logger.exception("GET /api/me/ai-insights failed user_id=%s", user.get("id"))
         return ai_insights_hub_fallback(error="insights_unavailable")

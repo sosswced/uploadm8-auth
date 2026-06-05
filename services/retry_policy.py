@@ -16,7 +16,7 @@ that's owned by ``core/wallet.py`` and the worker's pipeline cost-attribution.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -195,3 +195,24 @@ def split_platform_results(
         seen.add(n)
         deduped.append(n)
     return succeeded, deduped
+
+
+STALE_PROCESSING_MINUTES_DEFAULT = 20
+
+
+def upload_is_stale_processing(upload_row: Any, *, minutes: int | None = None) -> bool:
+    """True when status=processing and updated_at has not moved for ``minutes``."""
+    status = (
+        (upload_row.get("status") if isinstance(upload_row, dict) else upload_row["status"])
+        or ""
+    ).lower()
+    if status != "processing":
+        return False
+    updated = upload_row.get("updated_at") if isinstance(upload_row, dict) else upload_row["updated_at"]
+    if not updated:
+        return False
+    threshold = minutes if minutes is not None else STALE_PROCESSING_MINUTES_DEFAULT
+    now = datetime.now(timezone.utc)
+    if getattr(updated, "tzinfo", None) is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return (now - updated) > timedelta(minutes=threshold)

@@ -33,6 +33,7 @@ from services.canonical_engagement import (
 )
 from services.trill_vehicle_filter import build_trill_vehicle_filter
 from services.trill_access import TRILL_SCORED_PREDICATE
+from services.uploads_handlers import fetch_user_uploads_list
 from services.white_label import company_slug, load_effective_brand_context
 from services.tiktok_api import tiktok_video_list_url
 
@@ -1108,6 +1109,41 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
         return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={fname}"})
     except ImportError:
         raise HTTPException(500, "Excel export not available")
+
+_TOP_CONTENT_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
+
+
+@router.get("/api/analytics/top-content")
+async def analytics_top_content(
+    range: str = Query("30d"),
+    limit: int = Query(100, ge=1, le=100),
+    user: dict = Depends(get_current_user_readonly),
+):
+    """Top performing completed uploads, ranked by views (server-side, slim).
+
+    Replaces the old client-side fetch-500-then-sort path: filters to completed,
+    sorts by views desc, applies the range window, and returns a slim projection.
+    """
+    days = _TOP_CONTENT_RANGE_DAYS.get((range or "30d").strip().lower())
+    since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+    uid = str(user.get("billing_user_id") or user["id"])
+    items = await fetch_user_uploads_list(
+        core.state.db_pool,
+        uid,
+        status=None,
+        view="completed",
+        limit=limit,
+        offset=0,
+        trill_only=False,
+        meta=False,
+        workspace_id=(user.get("workspace") or {}).get("id"),
+        sort="views",
+        order="desc",
+        since=since,
+        slim=True,
+    )
+    return {"items": items if isinstance(items, list) else []}
+
 
 @router.get("/api/analytics/overview")
 async def analytics_overview(

@@ -77,6 +77,8 @@ async def shell_bootstrap_payload(
     upload_limit: int,
     upload_view: Optional[str],
     meta: bool,
+    range: str = "30d",
+    platform: str = "all",
 ) -> dict[str, Any]:
     """
     context=dashboard: dashboard_stats + uploads + platforms (queue_stats omitted).
@@ -89,6 +91,14 @@ async def shell_bootstrap_payload(
     plan = get_plan(user.get("subscription_tier", "free"))
     wallet = user.get("wallet") or {}
     view = _allowed_upload_view(upload_view)
+
+    if context == "upload":
+        return await _upload_bootstrap_payload(user)
+
+    if context == "kpi":
+        return await _kpi_bootstrap_payload(
+            pool, user, range=range, upload_limit=upload_limit, platform=platform
+        )
 
     uploads_coro = fetch_user_uploads_list(
         pool,
@@ -138,4 +148,101 @@ async def shell_bootstrap_payload(
             "platforms": platforms_payload,
         }
 
-    raise ValueError("context must be dashboard or queue")
+    raise ValueError("context must be dashboard, queue, upload or kpi")
+
+
+def _ok(value: Any) -> Any:
+    """Coerce a gather(return_exceptions=True) slot to None on failure so the
+    frontend can fall back per-field instead of losing the whole bootstrap."""
+    if isinstance(value, BaseException):
+        logger.warning("shell_bootstrap sub-call failed: %s", value)
+        return None
+    return value
+
+
+async def _upload_bootstrap_payload(user: dict[str, Any]) -> dict[str, Any]:
+    """context=upload: preferences + platform accounts + groups (matches upload page loaders).
+
+    Calls the existing read handlers directly (they each acquire their own
+    connection, so ``asyncio.gather`` runs them concurrently). Per-field None on
+    failure lets the frontend fall back to the individual endpoints.
+    """
+    from routers.groups import get_groups
+    from routers.platforms import get_platform_accounts
+    from routers.preferences import get_user_preferences
+
+    results = await asyncio.gather(
+        get_user_preferences(include_personas=False, user=user),
+        get_platform_accounts(user=user),
+        get_groups(user=user),
+        return_exceptions=True,
+    )
+    preferences, platform_accounts, groups = (_ok(r) for r in results)
+    return {
+        "context": "upload",
+        "preferences": preferences,
+        "platform_accounts": platform_accounts,
+        "groups": groups,
+    }
+
+
+_KPI_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365, "all": 3650}
+
+
+async def _kpi_bootstrap_payload(
+    pool: Any,
+    user: dict[str, Any],
+    *,
+    range: str,
+    upload_limit: int,
+    platform: str = "all",
+) -> dict[str, Any]:
+    """context=kpi: analytics overview + range analytics + uploads(meta) + content insights.
+
+    Each sub-call acquires its own connection so ``asyncio.gather`` collapses the
+    serial phase barrier in kpi.html's loadData into a single round-trip.
+    """
+    from routers.analytics import analytics_overview, get_analytics
+    from services.content_insights import build_user_content_insights
+
+    uid_billing = str(user.get("billing_user_id") or user["id"])
+    uid_plain = str(user["id"])
+    days = _KPI_RANGE_DAYS.get((range or "30d").strip().lower(), 30)
+    workspace_id = (user.get("workspace") or {}).get("id")
+
+    async def _insights() -> Any:
+        async with pool.acquire() as conn:
+            return await build_user_content_insights(conn, uid_plain)
+
+    results = await asyncio.gather(
+        analytics_overview(days=days, platform=platform or "all", user=user),
+        get_analytics(
+            range=range,
+            trill_vehicle_make=None,
+            trill_vehicle_model=None,
+            trill_vehicle_make_id=None,
+            trill_vehicle_model_id=None,
+            user=user,
+        ),
+        fetch_user_uploads_list(
+            pool,
+            uid_billing,
+            status=None,
+            view=None,
+            limit=upload_limit,
+            offset=0,
+            trill_only=False,
+            meta=True,
+            workspace_id=workspace_id,
+        ),
+        _insights(),
+        return_exceptions=True,
+    )
+    overview, analytics, uploads, insights = (_ok(r) for r in results)
+    return {
+        "context": "kpi",
+        "analytics_overview": overview,
+        "analytics": analytics,
+        "uploads": uploads,
+        "content_insights": insights,
+    }

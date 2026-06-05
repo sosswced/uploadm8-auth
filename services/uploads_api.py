@@ -30,14 +30,14 @@ def _parse_platform_results_items(upload_row: dict) -> list:
     if isinstance(raw, dict):
         return [{"platform": k, **v} for k, v in raw.items() if isinstance(v, dict)]
     if isinstance(raw, list):
-        return list(raw)
+        return [x for x in raw if isinstance(x, dict)]
     return []
 
 
 def _platform_items_already_enriched(items: list) -> bool:
     if not items:
         return True
-    successful = [e for e in items if e.get("success") is not False]
+    successful = [e for e in items if isinstance(e, dict) and e.get("success") is not False]
     return bool(
         successful
         and all(
@@ -68,6 +68,8 @@ def _resolve_platform_result_avatars(items: list, *, presign: bool = False) -> l
 def _merge_platform_entries(items: list, token_map: dict, platform_fallback: dict) -> list:
     enriched = []
     for entry in items:
+        if not isinstance(entry, dict):
+            continue
         p = (entry.get("platform") or "").lower()
 
         stored_token_id = entry.get("token_row_id") or ""

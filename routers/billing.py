@@ -791,9 +791,19 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
             tier = _webhook_tier(lookup_key, fallback=user_row["subscription_tier"] or "free")
             ent  = get_entitlements_for_tier(tier)
 
-            period_start = datetime.fromtimestamp(invoice.period_start, tz=timezone.utc)
-            period_end   = datetime.fromtimestamp(invoice.period_end, tz=timezone.utc)
-            invoice_id   = invoice.id
+            inv_period_start = _stripe_field(invoice, "period_start")
+            inv_period_end = _stripe_field(invoice, "period_end")
+            period_start = (
+                datetime.fromtimestamp(inv_period_start, tz=timezone.utc)
+                if inv_period_start is not None
+                else _now_utc()
+            )
+            period_end = (
+                datetime.fromtimestamp(inv_period_end, tz=timezone.utc)
+                if inv_period_end is not None
+                else _now_utc()
+            )
+            invoice_id = _stripe_field(invoice, "id")
 
             await _execute_user_tier_update(
                 conn,

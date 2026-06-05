@@ -1948,7 +1948,8 @@ async def _maybe_notify_pikzels_discord(
 
 async def _pikzels_debit(user_id: str, op: str) -> str:
     put, aic, meta = estimate_pikzels_v2_call_cost(op)
-    ref = f"pikzels:{uuid.uuid4()}"
+    # token_ledger.upload_id is UUID — plain id only (reason carries pikzels_v2_*).
+    ref = str(uuid.uuid4())
     async with core.state.db_pool.acquire() as conn:
         ok = await atomic_debit_tokens(
             conn, str(user_id), put, aic, ref, reason=f"pikzels_v2_{op}"

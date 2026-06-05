@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncio
@@ -495,6 +496,10 @@ async def get_uploads(
     offset: int = 0,
     trill_only: bool = False,
     meta: bool = False,
+    sort: Optional[str] = Query(None, pattern="^(created_at|views|engagement)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    days: Optional[int] = Query(None, ge=1, le=3650),
+    slim: bool = False,
     user: dict = Depends(get_current_user_readonly),
 ):
     """
@@ -513,18 +518,30 @@ async def get_uploads(
       - thumbnail_url, platform_results, hashtags, etc.
     """
     uid = str(user.get("billing_user_id") or user["id"])
+    since = None
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+    # Cap the alternate-sort path so a views/engagement scan can't pull an
+    # unbounded payload; default (created_at) path keeps the caller's limit.
+    effective_limit = min(limit, 200) if sort in ("views", "engagement") else limit
     payload = await fetch_user_uploads_list(
         core.state.db_pool,
         uid,
         status=status,
         view=view,
-        limit=limit,
+        limit=effective_limit,
         offset=offset,
         trill_only=trill_only,
         meta=meta,
         workspace_id=(user.get("workspace") or {}).get("id"),
+        sort=sort,
+        order=order,
+        since=since,
+        slim=slim,
     )
-    _schedule_thumbnail_repair(background_tasks, uid, payload)
+    # Slim payloads skip thumbnail enrichment, so there is nothing to repair.
+    if not slim:
+        _schedule_thumbnail_repair(background_tasks, uid, payload)
     return payload
 
 

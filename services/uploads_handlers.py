@@ -1171,6 +1171,30 @@ async def complete_upload_transaction(conn, upload_id: str, user_id: str, body: 
     }
 
 
+def _build_slim_upload_item(d: dict) -> dict:
+    """Minimal projection for analytics top-content (no enrichment / presign)."""
+    ai_title = (d.get("ai_generated_title") or d.get("ai_title") or "") or ""
+    raw_title = (d.get("title") or "").strip()
+    title = (
+        ai_title
+        if ai_title and is_placeholder_upload_title(raw_title, d.get("filename") or "")
+        else (raw_title or ai_title)
+    )
+    return {
+        "id": str(d.get("id")),
+        "title": title,
+        "filename": d.get("filename"),
+        "platforms": list(d.get("platforms") or []),
+        "status": d.get("status") or "",
+        "created_at": d.get("created_at").isoformat() if d.get("created_at") else None,
+        "completed_at": d.get("completed_at").isoformat() if d.get("completed_at") else None,
+        "views": int(d.get("views") or 0),
+        "likes": int(d.get("likes") or 0),
+        "comments": int(d.get("comments") or 0),
+        "shares": int(d.get("shares") or 0),
+    }
+
+
 async def fetch_user_uploads_list(
     pool,
     user_id: str,
@@ -1184,56 +1208,77 @@ async def fetch_user_uploads_list(
     workspace_id: Optional[str] = None,
     presign_r2_thumbnails: bool = False,
     presign_platform_avatars: bool = False,
+    sort: Optional[str] = None,
+    order: str = "desc",
+    since: Any = None,
+    slim: bool = False,
 ) -> Union[list, dict]:
     cols = await _load_uploads_columns(pool)
 
-    wanted = [
-        "id",
-        "filename",
-        "platforms",
-        "status",
-        "privacy",
-        "title",
-        "caption",
-        "hashtags",
-        "scheduled_time",
-        "created_at",
-        "completed_at",
-        "put_reserved",
-        "aic_reserved",
-        "error_code",
-        "error_detail",
-        "thumbnail_r2_key",
-        "r2_key",
-        "processed_r2_key",
-        "user_preferences",
-        "platform_results",
-        "file_size",
-        "processing_started_at",
-        "processing_finished_at",
-        "updated_at",
-        "processing_stage",
-        "processing_progress",
-        "views",
-        "likes",
-        "comments",
-        "shares",
-        "schedule_mode",
-        "schedule_metadata",
-        "video_url",
-        "ai_title",
-        "ai_caption",
-        "ai_generated_title",
-        "ai_generated_caption",
-        "ai_generated_hashtags",
-        "target_accounts",
-        "trill_score",
-        "speed_bucket",
-        "trill_metadata",
-        "output_artifacts",
-        "created_by_user_id",
-        "workspace_id",
-    ]
+    if slim:
+        wanted = [
+            "id",
+            "filename",
+            "title",
+            "ai_title",
+            "ai_generated_title",
+            "platforms",
+            "status",
+            "created_at",
+            "completed_at",
+            "views",
+            "likes",
+            "comments",
+            "shares",
+        ]
+    else:
+        wanted = [
+            "id",
+            "filename",
+            "platforms",
+            "status",
+            "privacy",
+            "title",
+            "caption",
+            "hashtags",
+            "scheduled_time",
+            "created_at",
+            "completed_at",
+            "put_reserved",
+            "aic_reserved",
+            "error_code",
+            "error_detail",
+            "thumbnail_r2_key",
+            "r2_key",
+            "processed_r2_key",
+            "user_preferences",
+            "platform_results",
+            "file_size",
+            "processing_started_at",
+            "processing_finished_at",
+            "updated_at",
+            "processing_stage",
+            "processing_progress",
+            "views",
+            "likes",
+            "comments",
+            "shares",
+            "schedule_mode",
+            "schedule_metadata",
+            "video_url",
+            "ai_title",
+            "ai_caption",
+            "ai_generated_title",
+            "ai_generated_caption",
+            "ai_generated_hashtags",
+            "target_accounts",
+            "trill_score",
+            "speed_bucket",
+            "trill_metadata",
+            "output_artifacts",
+            "created_by_user_id",
+            "workspace_id",
+        ]
     select_cols = _pick_cols(wanted, cols) or ["id", "filename", "platforms", "status", "created_at"]
     if workspace_id:
         select_sql = f"SELECT {', '.join(select_cols)} FROM uploads WHERE workspace_id = $1::uuid"
@@ -1273,8 +1318,32 @@ async def fetch_user_uploads_list(
         select_sql += " AND trill_score IS NOT NULL"
         count_sql += " AND trill_score IS NOT NULL"
 
+    if since is not None and "created_at" in cols:
+        params.append(since)
+        count_params.append(since)
+        select_sql += f" AND created_at >= ${len(params)}"
+        count_sql += f" AND created_at >= ${len(count_params)}"
+
     params.extend([limit, offset])
-    select_sql += f" ORDER BY created_at DESC LIMIT ${len(params) - 1} OFFSET ${len(params)}"
+    limit_ph = len(params) - 1
+    offset_ph = len(params)
+    # Default path stays byte-for-byte identical (created_at DESC). Alternate sorts
+    # are opt-in via sort= and require the metric columns to exist.
+    if sort in ("views", "engagement") and "views" in cols:
+        order_dir = "ASC" if str(order).lower() == "asc" else "DESC"
+        if sort == "views":
+            order_col = "views"
+        else:
+            order_col = (
+                "((COALESCE(likes,0)+COALESCE(comments,0)+COALESCE(shares,0))::float "
+                "/ NULLIF(views,0))"
+            )
+        select_sql += (
+            f" ORDER BY {order_col} {order_dir} NULLS LAST, created_at DESC "
+            f"LIMIT ${limit_ph} OFFSET ${offset_ph}"
+        )
+    else:
+        select_sql += f" ORDER BY created_at DESC LIMIT ${limit_ph} OFFSET ${offset_ph}"
 
     s3 = None
     out: List[dict] = []
@@ -1283,6 +1352,13 @@ async def fetch_user_uploads_list(
         total = await conn.fetchval(count_sql, *count_params) if meta else None
 
         row_dicts = [dict(r) for r in rows]
+
+        if slim:
+            slim_out = [_build_slim_upload_item(d) for d in row_dicts]
+            if not meta:
+                return slim_out
+            return {"uploads": slim_out, "total": int(total or 0), "limit": limit, "offset": offset}
+
         enriched_pr = await enrich_platform_results_batch(
             conn, row_dicts, str(user_id), presign_avatars=presign_platform_avatars
         )

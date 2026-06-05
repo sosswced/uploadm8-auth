@@ -1202,28 +1202,35 @@ async def marketing_ai_generate(
 ):
     rk = str(payload.get("range") or payload.get("range_key") or "30d")
     objective = str(payload.get("objective") or "revenue_growth")
-    async with core.state.db_pool.acquire() as conn:
-        metrics_bundle = await build_ai_truth_metrics(conn, rk)
-        plan, used_ai, _dbg = await generate_marketing_plan(payload, metrics_bundle)
-        conf = float((plan.get("game_plan") or {}).get("confidence_score") or 62.0)
-        truth_snapshot = {
-            "metrics_used": metrics_bundle,
-            "metric_sources": [
-                {"metric_group": "live", "sql_source": "services.growth_intelligence.build_ai_truth_metrics"}
-            ],
-        }
-        await _persist_ai_decision(
-            conn,
-            action="generate",
-            status="ok",
-            objective=objective,
-            range_key=rk,
-            confidence=conf,
-            used_openai=used_ai,
-            truth_snapshot=truth_snapshot,
-            plan=plan,
-        )
-    return {"plan": plan, "used_openai": used_ai}
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            metrics_bundle = await build_ai_truth_metrics(conn, rk)
+            plan, used_ai, _dbg = await generate_marketing_plan(payload, metrics_bundle)
+            conf = float((plan.get("game_plan") or {}).get("confidence_score") or 62.0)
+            truth_snapshot = {
+                "metrics_used": metrics_bundle,
+                "metric_sources": [
+                    {"metric_group": "live", "sql_source": "services.growth_intelligence.build_ai_truth_metrics"}
+                ],
+            }
+            try:
+                await _persist_ai_decision(
+                    conn,
+                    action="generate",
+                    status="ok",
+                    objective=objective,
+                    range_key=rk,
+                    confidence=conf,
+                    used_openai=used_ai,
+                    truth_snapshot=truth_snapshot,
+                    plan=plan,
+                )
+            except Exception as pe:
+                logger.warning("marketing_ai_generate persist: %s", pe)
+        return {"plan": plan, "used_openai": used_ai}
+    except Exception as e:
+        logger.exception("POST /api/admin/marketing/ai/generate failed")
+        raise HTTPException(status_code=500, detail=f"AI plan generation failed: {e}") from e
 
 
 @marketing_router.post("/ai/deploy")
@@ -1233,89 +1240,117 @@ async def marketing_ai_deploy(
 ):
     rk = str(payload.get("range") or payload.get("range_key") or "30d")
     objective = str(payload.get("objective") or "revenue_growth")
-    async with core.state.db_pool.acquire() as conn:
-        metrics_bundle = await build_ai_truth_metrics(conn, rk)
-        plan, used_ai, _dbg = await generate_marketing_plan(payload, metrics_bundle)
-        suggested = plan.get("suggested_campaign") or {}
-        cid = uuid.uuid4()
-        targeting = {
-            "tiers": suggested.get("tiers") or [],
-            "min_uploads_30d": suggested.get("min_uploads_30d") or 0,
-            "min_enterprise_fit_score": suggested.get("min_enterprise_fit_score") or 0,
-            "min_nudge_ctr_pct": suggested.get("min_nudge_ctr_pct") or 0,
-            "require_no_revenue_7d": bool(suggested.get("require_no_revenue_7d")),
-        }
-        ch_ins = (suggested.get("channel") or "in_app")[:50]
-        ch_low = ch_ins.strip().lower()
-        # In-app and discount nudges do not use outbound templates; activate immediately so
-        # wallet opportunities and promo CTAs match live data without an extra draft step.
-        initial_status = "active" if ch_low in ("in_app", "discount") else "draft"
-        await conn.execute(
-            """
-            INSERT INTO marketing_campaigns (
-                id, name, objective, channel, status, estimated_audience, schedule_at,
-                targeting, notes, created_by, range_key
+    force_deploy = bool(payload.get("force_deploy"))
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            metrics_bundle = await build_ai_truth_metrics(conn, rk)
+            plan, used_ai, _dbg = await generate_marketing_plan(payload, metrics_bundle)
+            confidence = float((plan.get("game_plan") or {}).get("confidence_score") or 72.0)
+            min_conf = 55.0
+            if confidence < min_conf and not force_deploy:
+                blocked = {
+                    "confidence_score": confidence,
+                    "blocked_reasons": [
+                        f"Plan confidence {confidence:.1f} is below the {min_conf:.0f} deploy threshold. "
+                        "Set Force Deploy to Yes or run Generate AI Plan again."
+                    ],
+                    "action": "deploy",
+                    "status": "blocked",
+                    "created_at": _now_iso(),
+                    "used_openai": used_ai,
+                }
+                return {
+                    "status": "blocked",
+                    "decision": blocked,
+                    "plan": plan,
+                    "used_openai": used_ai,
+                }
+            suggested = plan.get("suggested_campaign") or {}
+            cid = uuid.uuid4()
+            targeting = {
+                "tiers": suggested.get("tiers") or [],
+                "min_uploads_30d": suggested.get("min_uploads_30d") or 0,
+                "min_enterprise_fit_score": suggested.get("min_enterprise_fit_score") or 0,
+                "min_nudge_ctr_pct": suggested.get("min_nudge_ctr_pct") or 0,
+                "require_no_revenue_7d": bool(suggested.get("require_no_revenue_7d")),
+            }
+            ch_ins = (suggested.get("channel") or "in_app")[:50]
+            ch_low = ch_ins.strip().lower()
+            # In-app and discount nudges do not use outbound templates; activate immediately so
+            # wallet opportunities and promo CTAs match live data without an extra draft step.
+            initial_status = "active" if ch_low in ("in_app", "discount") else "draft"
+            await conn.execute(
+                """
+                INSERT INTO marketing_campaigns (
+                    id, name, objective, channel, status, estimated_audience, schedule_at,
+                    targeting, notes, created_by, range_key
+                )
+                VALUES ($1, $2, $3, $4, $10, $5, NULL, $6::jsonb, $7, $8::uuid, $9)
+                """,
+                cid,
+                (suggested.get("name") or "AI campaign")[:500],
+                (suggested.get("objective") or objective)[:8000],
+                ch_ins,
+                120,
+                json.dumps(targeting),
+                (suggested.get("notes") or "")[:8000],
+                str(user["id"]) if user.get("id") else None,
+                rk[:32],
+                initial_status,
             )
-            VALUES ($1, $2, $3, $4, $10, $5, NULL, $6::jsonb, $7, $8::uuid, $9)
-            """,
-            cid,
-            (suggested.get("name") or "AI campaign")[:500],
-            (suggested.get("objective") or objective)[:8000],
-            ch_ins,
-            120,
-            json.dumps(targeting),
-            (suggested.get("notes") or "")[:8000],
-            str(user["id"]) if user.get("id") else None,
-            rk[:32],
-            initial_status,
-        )
-        decision = {
-            "confidence_score": float((plan.get("game_plan") or {}).get("confidence_score") or 72.0),
-            "blocked_reasons": [],
-            "action": "deploy",
-            "status": "ok",
+            decision = {
+                "confidence_score": confidence,
+                "blocked_reasons": [],
+                "action": "deploy",
+                "status": "ok",
+                "created_at": _now_iso(),
+                "used_openai": used_ai,
+            }
+            truth_snapshot = {
+                "metrics_used": metrics_bundle,
+                "metric_sources": [
+                    {"metric_group": "live", "sql_source": "services.growth_intelligence.build_ai_truth_metrics"}
+                ],
+            }
+            try:
+                await _persist_ai_decision(
+                    conn,
+                    action="deploy",
+                    status="deployed",
+                    objective=str(suggested.get("objective") or objective),
+                    range_key=rk,
+                    confidence=float(decision["confidence_score"]),
+                    used_openai=used_ai,
+                    truth_snapshot=truth_snapshot,
+                    plan=plan,
+                )
+            except Exception as pe:
+                logger.warning("marketing_ai_deploy persist: %s", pe)
+        ch_out = str(suggested.get("channel") or "in_app")[:50]
+        st_out = "active" if ch_out.strip().lower() in ("in_app", "discount") else "draft"
+        campaign = {
+            "id": str(cid),
+            "name": suggested.get("name") or "AI campaign",
+            "objective": suggested.get("objective") or objective,
+            "channel": ch_out,
+            "status": st_out,
+            "estimated_audience": 120,
+            "schedule_at": None,
+            "targeting": targeting,
+            "range_key": rk[:32],
             "created_at": _now_iso(),
+        }
+        return {
+            "status": "deployed",
+            "decision": decision,
+            "plan": plan,
+            "deployed_campaign": campaign,
+            "snapshot": {"campaign_id": str(cid)},
             "used_openai": used_ai,
         }
-        truth_snapshot = {
-            "metrics_used": metrics_bundle,
-            "metric_sources": [
-                {"metric_group": "live", "sql_source": "services.growth_intelligence.build_ai_truth_metrics"}
-            ],
-        }
-        await _persist_ai_decision(
-            conn,
-            action="deploy",
-            status="deployed",
-            objective=str(suggested.get("objective") or objective),
-            range_key=rk,
-            confidence=float(decision["confidence_score"]),
-            used_openai=used_ai,
-            truth_snapshot=truth_snapshot,
-            plan=plan,
-        )
-    ch_out = str(suggested.get("channel") or "in_app")[:50]
-    st_out = "active" if ch_out.strip().lower() in ("in_app", "discount") else "draft"
-    campaign = {
-        "id": str(cid),
-        "name": suggested.get("name") or "AI campaign",
-        "objective": suggested.get("objective") or objective,
-        "channel": ch_out,
-        "status": st_out,
-        "estimated_audience": 120,
-        "schedule_at": None,
-        "targeting": targeting,
-        "range_key": rk[:32],
-        "created_at": _now_iso(),
-    }
-    return {
-        "status": "deployed",
-        "decision": decision,
-        "plan": plan,
-        "deployed_campaign": campaign,
-        "snapshot": {"campaign_id": str(cid)},
-        "used_openai": used_ai,
-    }
+    except Exception as e:
+        logger.exception("POST /api/admin/marketing/ai/deploy failed")
+        raise HTTPException(status_code=500, detail=f"AI campaign deploy failed: {e}") from e
 
 
 @ml_router.get("/priors/latest")

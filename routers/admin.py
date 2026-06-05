@@ -77,6 +77,7 @@ from services.ml_engine import load_engine_state, run_ml_engine_cycle
 from services.ml_engine_config import get_ml_engine_config, ml_engine_public_dict
 from services.ml_observability import hf_write_token
 from services.wallet_disputes import admin_patch_wallet_dispute, list_admin_wallet_disputes
+from services.catalog_sync_job import run_billing_catalog_sync_job
 from stages.emails import (
     send_email_change_email,
     send_admin_reset_password_email,

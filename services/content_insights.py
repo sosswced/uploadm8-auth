@@ -62,6 +62,234 @@ def _is_user_recommendable_strategy_key(strategy_key: str) -> bool:
     return bool(parse_content_attribution_key(strategy_key or ""))
 
 
+CAPTION_INSIGHT_PLATFORMS = frozenset({"tiktok", "youtube", "instagram", "facebook"})
+
+_FACTOR_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("caption_style", "captionStyle", "caption style"),
+    ("caption_tone", "captionTone", "tone"),
+    ("caption_voice", "captionVoice", "voice"),
+)
+
+
+def _aggregate_factor_performance_from_rows(
+    rows: List[Any],
+    *,
+    lookback_days: int,
+    min_samples_per_value: int,
+    platform: str,
+) -> Dict[str, Any]:
+    """Turn strategy_key rollup rows into per-factor ranked lists."""
+    min_samples_per_value = max(2, min(int(min_samples_per_value or 4), 50))
+    acc: Dict[str, Dict[str, Dict[str, float]]] = {
+        f[0]: defaultdict(lambda: {"samples": 0.0, "eng_weight": 0.0, "view_weight": 0.0, "setups": 0.0, "ci": 0.0})
+        for f in _FACTOR_FIELDS
+    }
+    total_samples = 0
+    for r in rows or []:
+        sk = str(r["strategy_key"] or "")
+        parsed = parse_content_attribution_key(sk)
+        if not parsed:
+            continue
+        s = float(int(r["samples"] or 0))
+        ew = _finite(r["eng_weight"])
+        vw = _finite(r["view_weight"])
+        ci = _finite(r["max_ci95_high"])
+        total_samples += int(s)
+        for field, _camel, _label in _FACTOR_FIELDS:
+            val = parsed.get(field)
+            if not val:
+                continue
+            a = acc[field][str(val)]
+            a["samples"] += s
+            a["eng_weight"] += ew
+            a["view_weight"] += vw
+            a["setups"] += 1.0
+            a["ci"] = max(a["ci"], ci)
+
+    out: Dict[str, Any] = {
+        "lookback_days": int(max(30, min(int(lookback_days or 120), 730))),
+        "platform": platform,
+        "total_samples": total_samples,
+    }
+    for field, _camel, _label in _FACTOR_FIELDS:
+        ranked: List[Dict[str, Any]] = []
+        bucket = acc[field]
+        tot_s = sum(a["samples"] for a in bucket.values())
+        tot_ew = sum(a["eng_weight"] for a in bucket.values())
+        factor_avg = (tot_ew / tot_s) if tot_s > 0 else 0.0
+        for val, a in bucket.items():
+            if a["samples"] < min_samples_per_value:
+                continue
+            wm = (a["eng_weight"] / a["samples"]) if a["samples"] > 0 else 0.0
+            wv = (a["view_weight"] / a["samples"]) if a["samples"] > 0 else 0.0
+            lift = wm - factor_avg
+            lift_pct = ((wm / factor_avg - 1.0) * 100.0) if factor_avg > 0 else 0.0
+            ranked.append(
+                {
+                    "value": val,
+                    "samples": int(a["samples"]),
+                    "distinct_setups": int(a["setups"]),
+                    "weighted_mean_engagement_pct": round(wm, 4),
+                    "weighted_mean_views": round(wv, 1),
+                    "ci95_high_pct": round(a["ci"], 4),
+                    "lift_vs_factor_avg_pts": round(lift, 4),
+                    "lift_vs_factor_avg_pct": round(lift_pct, 2),
+                }
+            )
+        ranked.sort(key=lambda x: (-x["weighted_mean_engagement_pct"], -x["samples"], x["value"]))
+        out[field] = {
+            "factor_avg_engagement_pct": round(factor_avg, 4),
+            "values_with_signal": len(ranked),
+            "ranked": ranked,
+        }
+    return out
+
+
+async def fetch_factor_performance(
+    conn,
+    user_id: uuid.UUID,
+    lookback_days: int = 120,
+    min_samples_per_value: int = 4,
+    platform: str = "all",
+) -> Dict[str, Any]:
+    """Sample-weighted engagement per individual caption factor value."""
+    lookback = max(30, min(int(lookback_days or 120), 730))
+    plat = (platform or "all").lower().strip()
+    rows = await conn.fetch(
+        """
+        SELECT strategy_key,
+               SUM(samples)::bigint AS samples,
+               SUM(mean_engagement * samples::double precision) AS eng_weight,
+               SUM(mean_views * samples::double precision) AS view_weight,
+               MAX(ci95_high)::double precision AS max_ci95_high
+          FROM upload_quality_scores_daily
+         WHERE user_id = $1::uuid
+           AND day >= (CURRENT_DATE - $2::int)
+           AND strategy_key LIKE 'v1|%'
+           AND platform = $3::varchar
+         GROUP BY strategy_key
+        """,
+        user_id,
+        lookback,
+        plat,
+    )
+    return _aggregate_factor_performance_from_rows(
+        list(rows or []),
+        lookback_days=lookback,
+        min_samples_per_value=min_samples_per_value,
+        platform=plat,
+    )
+
+
+def synthesize_meta_setup(
+    factor_perf: Dict[str, Any],
+    *,
+    min_factors: int = 2,
+    require_positive_lift: bool = True,
+    platform_label: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Compose a recommended meta setup from the best individual factor values."""
+    if not isinstance(factor_perf, dict):
+        return None
+    patch: Dict[str, Any] = {}
+    chosen: List[Dict[str, Any]] = []
+    summary_bits: List[str] = []
+    confidence_samples = 0
+    for field, camel, label in _FACTOR_FIELDS:
+        node = factor_perf.get(field) or {}
+        ranked = node.get("ranked") or []
+        if not ranked:
+            continue
+        top = ranked[0]
+        if require_positive_lift and len(ranked) > 1 and top.get("lift_vs_factor_avg_pts", 0.0) <= 0.0:
+            continue
+        patch[camel] = top["value"]
+        confidence_samples += int(top.get("samples") or 0)
+        chosen.append(
+            {
+                "factor": field,
+                "label": label,
+                "value": top["value"],
+                "weighted_mean_engagement_pct": top.get("weighted_mean_engagement_pct"),
+                "samples": top.get("samples"),
+                "lift_vs_factor_avg_pct": top.get("lift_vs_factor_avg_pct"),
+            }
+        )
+        lift = top.get("lift_vs_factor_avg_pct") or 0.0
+        lift_txt = f" (+{lift:.0f}% vs your avg)" if lift > 0 else ""
+        summary_bits.append(f"{label} “{top['value']}”{lift_txt}")
+
+    if len(patch) < max(1, int(min_factors)):
+        return None
+
+    plat = (platform_label or factor_perf.get("platform") or "").strip()
+    plat_prefix = f"On {plat.title()}: " if plat and plat != "all" else ""
+    scope = f"for {plat} " if plat and plat != "all" else "across your uploads "
+
+    return {
+        "strategy_key": None,
+        "source": "factor_synthesis",
+        "platform": plat or "all",
+        "summary": plat_prefix + "Synthesized from your best-performing factors: " + ", ".join(summary_bits),
+        "confidence_note": (
+            f"Composed from {confidence_samples} scored day-buckets {scope}"
+            "by learning each caption factor independently (so we can recommend before any "
+            "single exact combo has enough repeats)."
+        ),
+        "factors": chosen,
+        "preferences_patch": patch,
+    }
+
+
+async def fetch_meta_setups_by_platform(
+    conn,
+    user_id: uuid.UUID,
+    lookback_days: int = 120,
+    min_platform_total_samples: int = 8,
+    min_samples_per_value: int = 3,
+) -> Dict[str, Any]:
+    """Synthesized caption meta setup per platform (style + tone + voice winners)."""
+    lookback = max(30, min(int(lookback_days or 120), 730))
+    min_platform_total_samples = max(4, min(int(min_platform_total_samples or 8), 500))
+    plat_rows = await conn.fetch(
+        """
+        SELECT platform, SUM(samples)::bigint AS total_samples
+          FROM upload_quality_scores_daily
+         WHERE user_id = $1::uuid
+           AND day >= (CURRENT_DATE - $2::int)
+           AND strategy_key LIKE 'v1|%'
+           AND platform <> 'all'
+         GROUP BY platform
+        HAVING SUM(samples) >= $3::int
+         ORDER BY total_samples DESC
+        """,
+        user_id,
+        lookback,
+        min_platform_total_samples,
+    )
+    platforms: Dict[str, Any] = {}
+    for r in plat_rows or []:
+        pl = str(r["platform"] or "").lower().strip()
+        if pl not in CAPTION_INSIGHT_PLATFORMS:
+            continue
+        try:
+            fp = await fetch_factor_performance(
+                conn,
+                user_id,
+                lookback_days=lookback,
+                min_samples_per_value=min_samples_per_value,
+                platform=pl,
+            )
+            meta = synthesize_meta_setup(fp, min_factors=2)
+            if meta:
+                meta["platform"] = pl
+                meta["platform_total_samples"] = int(r["total_samples"] or 0)
+                platforms[pl] = meta
+        except Exception as e:
+            logger.debug("fetch_meta_setups_by_platform %s: %s", pl, e)
+    return {"lookback_days": lookback, "platforms": platforms}
+
+
 async def fetch_ranked_strategies(conn, user_id: uuid.UUID, lookback_days: int = 120) -> List[Dict[str, Any]]:
     rows = await conn.fetch(
         """
@@ -76,6 +304,7 @@ async def fetch_ranked_strategies(conn, user_id: uuid.UUID, lookback_days: int =
          WHERE user_id = $1::uuid
            AND day >= (CURRENT_DATE - $2::int)
            AND strategy_key LIKE 'v1|%'
+           AND platform = 'all'
          GROUP BY strategy_key
         HAVING SUM(samples) >= 3
          ORDER BY weighted_mean_engagement DESC NULLS LAST
@@ -327,6 +556,9 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
             "ok": False,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "ranked_strategies": [],
+            "factor_performance": {},
+            "meta_setup": None,
+            "meta_setup_by_platform": {"lookback_days": 0, "platforms": {}},
             "hashtag_traction": None,
             "anomaly": None,
             "recommended": None,
@@ -351,12 +583,31 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("fetch_hashtag_traction: %s", e)
 
+    factor_performance: Dict[str, Any] = {}
+    try:
+        factor_performance = await fetch_factor_performance(conn, uid, lookback_days=120)
+    except Exception as e:
+        logger.warning("fetch_factor_performance: %s", e)
+
+    meta_setup_synth: Optional[Dict[str, Any]] = None
+    try:
+        meta_setup_synth = synthesize_meta_setup(factor_performance)
+    except Exception as e:
+        logger.debug("synthesize_meta_setup: %s", e)
+
+    meta_setup_by_platform: Dict[str, Any] = {"lookback_days": 0, "platforms": {}}
+    try:
+        meta_setup_by_platform = await fetch_meta_setups_by_platform(conn, uid, lookback_days=120)
+    except Exception as e:
+        logger.warning("fetch_meta_setups_by_platform: %s", e)
+
     recommended = None
     narrative_parts: List[str] = []
     if ranked:
         top = ranked[0]
         recommended = {
             "strategy_key": top["strategy_key"],
+            "source": "exact_combo",
             "summary": top["summary"],
             "confidence_note": (
                 f"Based on {top['samples']} scored day-buckets in the last ~120 days "
@@ -373,10 +624,46 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
             narrative_parts.append(
                 f"Runner-up: {second['summary']} at ~{second['weighted_mean_engagement_pct']:.2f}%."
             )
+    elif meta_setup_synth:
+        recommended = dict(meta_setup_synth)
+        narrative_parts.append(
+            "No single exact packaging combo has enough repeats yet, but factor-by-factor "
+            f"your numbers favor: {', '.join(f['label'] + ' “' + str(f['value']) + '”' for f in meta_setup_synth.get('factors') or [])}. "
+            "Lock these in to converge on your meta setup faster."
+        )
     else:
         narrative_parts.append(
             "Not enough attributed uploads yet — publish a few more videos with AI captions enabled "
             "so we can compare which styles resonate."
+        )
+
+    for field, _camel, label in _FACTOR_FIELDS:
+        node = (factor_performance or {}).get(field) or {}
+        rk = node.get("ranked") or []
+        if len(rk) >= 2 and rk[0].get("lift_vs_factor_avg_pct", 0.0) >= 10.0:
+            narrative_parts.append(
+                f"Best {label}: “{rk[0]['value']}” (~{rk[0]['weighted_mean_engagement_pct']:.2f}% engagement, "
+                f"+{rk[0]['lift_vs_factor_avg_pct']:.0f}% vs your average across {rk[0]['samples']} samples)."
+            )
+
+    plat_metas = (meta_setup_by_platform or {}).get("platforms") or {}
+    if len(plat_metas) >= 2:
+        bits = []
+        for pl, meta in sorted(plat_metas.items(), key=lambda x: -int(x[1].get("platform_total_samples") or 0)):
+            patch = meta.get("preferences_patch") or {}
+            style = patch.get("captionStyle") or "—"
+            tone = patch.get("captionTone") or "—"
+            voice = patch.get("captionVoice") or "—"
+            bits.append(f"{pl}: {style} + {tone} + {voice}")
+        narrative_parts.append(
+            "Per-platform meta setups differ — your winning caption mix is not one-size-fits-all: "
+            + "; ".join(bits[:4])
+            + ". Apply a platform-specific setup from Smart Insights when you mostly post there."
+        )
+    elif len(plat_metas) == 1:
+        pl, meta = next(iter(plat_metas.items()))
+        narrative_parts.append(
+            f"Strongest platform-specific signal on {pl}: {meta.get('summary') or 'see per-platform card below'}."
         )
 
     suggested_hashtags: List[str] = []
@@ -422,11 +709,49 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
         "ok": True,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "ranked_strategies": ranked,
+        "factor_performance": factor_performance,
+        "meta_setup": meta_setup_synth,
+        "meta_setup_by_platform": meta_setup_by_platform,
         "hashtag_traction": hashtag_traction,
         "anomaly": anomaly,
         "recommended": recommended,
         "narrative": " ".join(n for n in narrative_parts if n).strip(),
     }
+
+
+
+def resolve_insights_recommendation(
+    insights: Dict[str, Any],
+    *,
+    strategy_key_override: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Pick the recommendation row to apply (global, per-platform synthesis, or explicit key)."""
+    if strategy_key_override:
+        parsed = parse_content_attribution_key(strategy_key_override.strip())
+        if not parsed:
+            raise ValueError("Could not parse strategy_key")
+        return {
+            "strategy_key": strategy_key_override.strip(),
+            "source": "strategy_key_override",
+            "preferences_patch": preferences_patch_from_parsed_attribution(parsed),
+        }
+    pl = (platform or "").lower().strip()
+    if pl:
+        if pl not in CAPTION_INSIGHT_PLATFORMS:
+            raise ValueError(f"Unsupported platform '{pl}'")
+        by_plat = (insights.get("meta_setup_by_platform") or {}).get("platforms") or {}
+        rec = by_plat.get(pl)
+        if not isinstance(rec, dict) or not rec.get("preferences_patch"):
+            raise ValueError(
+                f"Not enough {pl} uploads yet to synthesize a platform meta setup — "
+                "publish a few more attributed posts to that platform."
+            )
+        return rec
+    rec = insights.get("recommended") if isinstance(insights, dict) else None
+    if not isinstance(rec, dict) or not rec.get("preferences_patch"):
+        raise ValueError("No recommendation available to apply")
+    return rec
 
 
 def merge_preferences_patch_for_apply(

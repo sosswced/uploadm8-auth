@@ -982,15 +982,21 @@ async def fetch_m8_historical_signals(
                     plats,
                     lookback_days,
                 )
+                from services.ml_strategy_utils import empirical_bayes_mean
+
                 for r in pri_rows or []:
+                    wm = float(r["weighted_mean_engagement"] or 0.0)
+                    samples = int(r["samples"] or 0)
                     pri_top.append(
                         {
                             "strategy_key": str(r["strategy_key"] or ""),
-                            "samples": int(r["samples"] or 0),
-                            "weighted_mean_engagement": float(r["weighted_mean_engagement"] or 0.0),
+                            "samples": samples,
+                            "weighted_mean_engagement": wm,
+                            "shrunk_mean_engagement": empirical_bayes_mean(wm, samples),
                             "max_ci95_high": float(r["max_ci95_high"] or 0.0),
                         }
                     )
+                pri_top.sort(key=lambda row: -(row.get("shrunk_mean_engagement") or 0.0))
             except asyncpg.exceptions.UndefinedTableError:
                 pass
             except Exception as e:

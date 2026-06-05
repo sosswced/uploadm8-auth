@@ -430,3 +430,29 @@ async def refresh_all_users_platform_metrics_cache(pool: asyncpg.Pool) -> int:
     results = await asyncio.gather(*[_run(uid) for uid in user_ids], return_exceptions=False)
     refreshed = sum(1 for x in results if x)
     return refreshed
+
+
+PLATFORM_METRICS_CACHE_INTERVAL_SEC = max(
+    600,
+    int(os.environ.get("PLATFORM_METRICS_CACHE_INTERVAL_SEC", "21600") or 21600),
+)
+
+
+async def run_platform_metrics_cache_loop(pool: asyncpg.Pool) -> None:
+    """
+    Worker background loop: refresh ``platform_metrics_cache`` for all connected users.
+
+    Docstring at module top references worker scheduled refresh; analytics router
+    reads the DB cache via GET /api/analytics/platform-metrics/cached.
+    """
+    await asyncio.sleep(180)
+    while True:
+        try:
+            refreshed = await refresh_all_users_platform_metrics_cache(pool)
+            if refreshed:
+                logger.info("[platform-metrics-job] refreshed %s user cache(s)", refreshed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[platform-metrics-job] loop error: %s", exc)
+        await asyncio.sleep(PLATFORM_METRICS_CACHE_INTERVAL_SEC)

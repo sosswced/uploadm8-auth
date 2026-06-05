@@ -3174,6 +3174,18 @@ async def run_kpi_collector_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# PLATFORM METRICS CACHE LOOP
+# ---------------------------------------------------------------------------
+
+async def run_platform_metrics_cache_loop() -> None:
+    """Refresh platform_metrics_cache for all OAuth-connected users (worker background)."""
+    from services.platform_metrics_job import run_platform_metrics_cache_loop as _service_loop
+
+    logger.info("[platform-metrics-cache] delegating to services.platform_metrics_job")
+    await _service_loop(db_pool)
+
+
+# ---------------------------------------------------------------------------
 # SCHEDULER LOOP
 # ---------------------------------------------------------------------------
 
@@ -4053,6 +4065,7 @@ async def main() -> None:
             ("verification_loop", lambda: run_verification_loop(db_pool, shutdown_event)),
             ("analytics_sync", run_analytics_sync_loop),
             ("kpi_collector", run_kpi_collector_loop),
+            ("platform_metrics_cache", run_platform_metrics_cache_loop),
         ]
     )
 

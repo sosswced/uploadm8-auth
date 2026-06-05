@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -369,7 +370,17 @@ async def resolve_user_from_public_id(conn: Any, public_id: str) -> Optional[str
     return None
 
 
+_badge_defs_synced_at: float = 0.0
+_badge_defs_sync_interval_sec = 300.0
+_current_season_cached_slug: Optional[str] = None
+_current_season_cached_id: int = 0
+
+
 async def ensure_badge_definitions(conn: Any) -> None:
+    global _badge_defs_synced_at
+    now = time.time()
+    if now - _badge_defs_synced_at < _badge_defs_sync_interval_sec:
+        return
     for b in BADGE_SEED:
         await conn.execute(
             """
@@ -391,6 +402,7 @@ async def ensure_badge_definitions(conn: Any) -> None:
             b["category"],
             b["sort_order"],
         )
+    _badge_defs_synced_at = now
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -863,7 +875,10 @@ def current_season_slug(dt: Optional[datetime] = None) -> str:
 
 
 async def ensure_current_season(conn: Any) -> int:
+    global _current_season_cached_slug, _current_season_cached_id
     slug = current_season_slug()
+    if _current_season_cached_slug == slug and _current_season_cached_id:
+        return _current_season_cached_id
     start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if start.month == 12:
         end = start.replace(year=start.year + 1, month=1)
@@ -880,7 +895,11 @@ async def ensure_current_season(conn: Any) -> int:
         start,
         end,
     )
-    return int(row["id"]) if row else 0
+    season_id = int(row["id"]) if row else 0
+    if season_id:
+        _current_season_cached_slug = slug
+        _current_season_cached_id = season_id
+    return season_id
 
 
 async def fetch_hall_of_fame(conn: Any, limit: int = 24) -> List[Dict]:

@@ -80,7 +80,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/trill", tags=["trill"])
 
 _LEADERBOARD_CACHE: dict[str, tuple[float, dict]] = {}
-_LEADERBOARD_CACHE_TTL_SEC = 30.0
+_LEADERBOARD_CACHE_TTL_SEC = 120.0
 
 
 async def _leaderboard_badge_and_rival_followup(

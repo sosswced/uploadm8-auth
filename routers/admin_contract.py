@@ -51,6 +51,7 @@ from services.marketing_execution import (
 )
 from services.marketing_image import generate_marketing_image
 from services.marketing_strategist import generate_marketing_plan
+from services.marketing_strategist_presets import strategist_presets_payload
 from services.wallet_marketing import _user_campaign_features
 from stages.entitlements import normalize_tier
 from services.admin_email_jobs import (
@@ -1193,6 +1194,11 @@ async def _persist_ai_decision(
         json.dumps(truth_snapshot),
         json.dumps(plan),
     )
+
+
+@marketing_router.get("/ai/presets")
+async def marketing_ai_presets(user: dict = Depends(require_admin)):
+    return strategist_presets_payload()
 
 
 @marketing_router.post("/ai/generate")

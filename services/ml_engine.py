@@ -248,7 +248,11 @@ async def run_ml_engine_cycle(
         if c.run_quality_scoring and pool is not None:
             from services.ml_scoring_job import run_ml_scoring_cycle
 
-            qs = await run_ml_scoring_cycle(pool, lookback_days=c.quality_scoring_lookback_days)
+            qs = await run_ml_scoring_cycle(
+                pool,
+                lookback_days=c.quality_scoring_lookback_days,
+                emit_trackio=False,
+            )
             result["steps"]["quality_scoring"] = {"ok": qs is not None, "rows": qs}
 
         build = await asyncio.to_thread(_step_build_dataset, c)

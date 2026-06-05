@@ -172,18 +172,35 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
         return int(n or 0)
 
 
-async def run_ml_scoring_cycle(pool: asyncpg.Pool, lookback_days: int = 180) -> Optional[int]:
-    track = OptionalTrackioRun("ml_quality_scoring_cycle")
-    track.start(config={"lookback_days": int(lookback_days)})
+async def run_ml_scoring_cycle(
+    pool: asyncpg.Pool,
+    lookback_days: int = 180,
+    *,
+    emit_trackio: bool = True,
+) -> Optional[int]:
+    """
+    Recompute daily quality scores.
+
+    ``emit_trackio`` should be ``False`` when called from within another active
+    Trackio run (e.g. ``run_ml_engine_cycle``). Starting/finishing a nested run
+    would tear down the parent's global trackio session and trigger
+    "Call trackio.init() before trackio.log()" warnings.
+    """
+    track = OptionalTrackioRun("ml_quality_scoring_cycle") if emit_trackio else None
+    if track is not None:
+        track.start(config={"lookback_days": int(lookback_days)})
     try:
         n = await recompute_quality_scores(pool, lookback_days=lookback_days)
         logger.info("[ml-scoring] recompute complete | rows=%s lookback_days=%s", n, lookback_days)
-        track.log({"rows_recomputed": int(n or 0), "lookback_days": int(lookback_days), "status": 1})
+        if track is not None:
+            track.log({"rows_recomputed": int(n or 0), "lookback_days": int(lookback_days), "status": 1})
         return n
     except Exception as e:
         logger.warning("[ml-scoring] cycle failed: %s", e)
-        track.log({"status": 0, "error": str(e)[:300], "lookback_days": int(lookback_days)})
+        if track is not None:
+            track.log({"status": 0, "error": str(e)[:300], "lookback_days": int(lookback_days)})
         return None
     finally:
-        track.finish()
+        if track is not None:
+            track.finish()
 

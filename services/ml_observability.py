@@ -98,3 +98,7 @@ class OptionalTrackioRun:
             self._trackio.finish()
         except Exception as e:
             logger.warning("trackio finish failed: %s", e)
+        finally:
+            # Mark inactive so a second finish()/log() is a safe no-op and we never
+            # call into a torn-down global trackio run.
+            self._enabled = False

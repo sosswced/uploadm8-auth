@@ -17,7 +17,7 @@ import asyncio
 import asyncpg
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response
 
 import core.state
 from core.audit import log_system_event
@@ -60,6 +60,7 @@ from services.uploads_handlers import (
     fetch_upload_detail,
     fetch_upload_queue_stats,
     fetch_user_uploads_list,
+    posted_thumbnail_fallback_for_upload,
     presign_create_upload,
     repair_upload_thumbnails_batch,
     stream_upload_thumbnail_bytes,
@@ -551,20 +552,32 @@ async def get_upload_thumbnail(
     background_tasks: BackgroundTasks,
     user: dict = Depends(get_current_user_readonly),
 ):
-    """Stream the upload card thumbnail from R2 (stable URL, no presign expiry)."""
+    """
+    Stream the upload card thumbnail from R2 (stable URL, no presign expiry).
+
+    When R2 objects are missing, redirects to the live platform cover URL when available
+    and queues background regeneration.
+    """
     uid = str(user.get("billing_user_id") or user["id"])
+    pool = core.state.db_pool
     try:
         raw, content_type, etag_key = await stream_upload_thumbnail_bytes(
-            core.state.db_pool, uid, upload_id
+            pool, uid, upload_id
         )
     except HTTPException as exc:
-        if exc.status_code == 404 and core.state.db_pool:
+        if exc.status_code != 404:
+            raise
+        fallback = None
+        if pool:
+            fallback = await posted_thumbnail_fallback_for_upload(pool, uid, upload_id)
             background_tasks.add_task(
                 repair_upload_thumbnails_batch,
-                core.state.db_pool,
+                pool,
                 uid,
                 [upload_id],
             )
+        if fallback:
+            return RedirectResponse(url=fallback, status_code=302)
         raise
     return Response(
         content=raw,

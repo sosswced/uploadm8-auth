@@ -68,7 +68,7 @@ from services.growth_intelligence import (
     coach_endpoint_fallback,
     m8_engine_identity_payload,
 )
-from services.content_insights import build_user_content_insights, merge_preferences_patch_for_apply
+from services.content_insights import build_optimize_settings_plan, build_user_content_insights, merge_preferences_patch_for_apply
 from services.user_preferences_persist import save_user_content_preferences
 from services.wallet_page_response import fetch_me_wallet_endpoint_data
 from services.wallet_ledger_query import build_wallet_ledger_payload
@@ -129,6 +129,44 @@ async def get_me_content_insights(user: dict = Depends(get_current_user)):
     """Ranked settings buckets vs engagement + anomaly hints (from attributed uploads)."""
     async with core.state.db_pool.acquire() as conn:
         return await build_user_content_insights(conn, user["id"])
+
+
+@router.get("/api/me/content-insights/optimize-preview")
+async def get_me_content_insights_optimize_preview(user: dict = Depends(get_current_user)):
+    """ML-backed preview of settings changes (attribution + packaging + hashtag signals)."""
+    async with core.state.db_pool.acquire() as conn:
+        return await build_optimize_settings_plan(conn, user["id"])
+
+
+@router.post("/api/me/content-insights/optimize-settings")
+async def post_me_content_insights_optimize_settings(
+    body: ApplyContentInsightsBody,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Apply stat-backed settings optimization after user confirms in Smart Insights modal.
+    Merges content attribution, packaging rollups, and hashtag ML into preferences.
+    """
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="Set confirm=true to apply optimized settings")
+    async with core.state.db_pool.acquire() as conn:
+        plan = await build_optimize_settings_plan(conn, user["id"])
+    if not plan.get("ok") or not plan.get("patch"):
+        raise HTTPException(
+            status_code=400,
+            detail=plan.get("message") or "Not enough ML signal to optimize settings yet",
+        )
+    patch = dict(plan["patch"])
+    async with core.state.db_pool.acquire() as conn:
+        await save_user_content_preferences(conn, user, patch)
+    return {
+        "ok": True,
+        "applied": patch,
+        "changes": plan.get("changes") or [],
+        "summary": plan.get("summary") or "",
+        "narrative": plan.get("narrative") or "",
+        "ml_sources": plan.get("ml_sources") or [],
+    }
 
 
 @router.post("/api/me/content-insights/apply-optimized")

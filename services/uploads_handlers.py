@@ -345,6 +345,39 @@ def mirrored_platform_thumbnail_r2_keys(platform_results: Any) -> Dict[str, str]
     return out
 
 
+def resolve_upload_thumbnail_r2_keys_ordered(
+    *,
+    thumbnail_r2_key: Optional[str],
+    output_artifacts: Any,
+    platform_results: Any,
+    upload_platforms: Optional[List[str]] = None,
+) -> List[str]:
+    """All candidate R2 keys for thumbnail streaming, best-first."""
+    artifacts = artifact_platform_thumbnail_r2_keys(output_artifacts)
+    platforms = [str(p).lower() for p in (upload_platforms or []) if p]
+    order = platforms + [p for p in PLATFORM_THUMB_PRIORITY if p not in platforms]
+    seen: set[str] = set()
+    keys: List[str] = []
+
+    def _add(k: Optional[str]) -> None:
+        s = str(k or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            keys.append(s)
+
+    for plat in order:
+        _add(artifacts.get(plat))
+    for k in artifacts.values():
+        _add(k)
+    _add(thumbnail_r2_key)
+    mirrored = mirrored_platform_thumbnail_r2_keys(platform_results)
+    for plat in order:
+        _add(mirrored.get(plat))
+    for k in mirrored.values():
+        _add(k)
+    return keys
+
+
 def resolve_upload_thumbnail_r2_key(
     *,
     thumbnail_r2_key: Optional[str],
@@ -353,28 +386,32 @@ def resolve_upload_thumbnail_r2_key(
     upload_platforms: Optional[List[str]] = None,
 ) -> Optional[str]:
     """Best R2 object key for card/detail thumbnail streaming."""
-    artifacts = artifact_platform_thumbnail_r2_keys(output_artifacts)
-    platforms = [str(p).lower() for p in (upload_platforms or []) if p]
-    order = platforms + [p for p in PLATFORM_THUMB_PRIORITY if p not in platforms]
-    for plat in order:
-        k = artifacts.get(plat)
-        if k:
-            return k
-    for k in artifacts.values():
-        if k:
-            return k
-    sk = str(thumbnail_r2_key or "").strip()
-    if sk:
-        return sk
-    mirrored = mirrored_platform_thumbnail_r2_keys(platform_results)
-    for plat in order:
-        k = mirrored.get(plat)
-        if k:
-            return k
-    for k in mirrored.values():
-        if k:
-            return k
-    return None
+    keys = resolve_upload_thumbnail_r2_keys_ordered(
+        thumbnail_r2_key=thumbnail_r2_key,
+        output_artifacts=output_artifacts,
+        platform_results=platform_results,
+        upload_platforms=upload_platforms,
+    )
+    return keys[0] if keys else None
+
+
+def posted_thumbnail_browser_url(
+    *,
+    output_artifacts: Any,
+    platform_results: Any,
+    upload_platforms: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Browser-safe live platform cover URL (YouTube/TikTok CDN, etc.)."""
+    platform_results_norm = _normalize_platform_results_detail(platform_results)
+    posted_urls = posted_platform_thumbnail_urls_from_results(platform_results_norm)
+    return browser_safe_thumbnail_url(
+        pick_primary_thumbnail_url(
+            posted=posted_urls,
+            artifact_platform_urls={},
+            r2_presigned=None,
+            upload_platforms=list(upload_platforms or []),
+        )
+    )
 
 
 def card_thumbnail_url(
@@ -389,18 +426,29 @@ def card_thumbnail_url(
     """
     URL for queue/dashboard <img src>.
 
-    Prefer first-party proxy when any R2 key exists; otherwise browser-safe CDN URL.
+    Prefer live platform CDN covers when published (avoids 404 proxy spam), then the
+    stable first-party proxy when an R2 key exists, then artifact presigns.
     """
     uid = str(upload_id or "").strip()
+    platforms_list = list(upload_platforms or [])
+    platform_results_norm = _normalize_platform_results_detail(platform_results)
+
+    posted_direct = posted_thumbnail_browser_url(
+        output_artifacts=output_artifacts,
+        platform_results=platform_results_norm,
+        upload_platforms=platforms_list,
+    )
+    if posted_direct:
+        return posted_direct
+
     if resolve_upload_thumbnail_r2_key(
         thumbnail_r2_key=thumbnail_r2_key,
         output_artifacts=output_artifacts,
-        platform_results=platform_results,
-        upload_platforms=upload_platforms,
+        platform_results=platform_results_norm,
+        upload_platforms=platforms_list,
     ):
         return upload_card_thumbnail_href(uid) if uid else None
 
-    platform_results_norm = _normalize_platform_results_detail(platform_results)
     sk = str(thumbnail_r2_key or "").strip()
     r2_thumb_url = None
     if sk and presign_r2_thumbnails:
@@ -413,7 +461,7 @@ def card_thumbnail_url(
             posted=posted_urls,
             artifact_platform_urls=plat_thumb_urls,
             r2_presigned=r2_thumb_url,
-            upload_platforms=list(upload_platforms or []),
+            upload_platforms=platforms_list,
         )
     )
 
@@ -436,13 +484,12 @@ def thumbnail_storage_missing_flag(
 
     Proxy card URLs (``/api/uploads/{id}/thumbnail``) backed by the primary key — not
     artifacts or mirrored platform thumbs — are flagged so bootstrap repair runs even
-    when ``thumbnail_url`` is present.
+    when ``thumbnail_url`` is present. Also flags when we fell back to a platform CDN
+    cover but the primary ``thumbnail_r2_key`` still needs regeneration in R2.
     """
     sk = str(primary_sk or "").strip()
     if not sk:
         return False
-    if not thumbnail_url:
-        return True
     uid = str(upload_id or "").strip()
     if not uid:
         return False
@@ -454,10 +501,20 @@ def thumbnail_storage_missing_flag(
     )
     if resolved != sk:
         return False
-    return thumbnail_url == upload_card_thumbnail_href(uid)
+    proxy_href = upload_card_thumbnail_href(uid)
+    if not thumbnail_url:
+        return True
+    if thumbnail_url == proxy_href:
+        return True
+    # Showing a platform CDN fallback while primary R2 key is still on record.
+    return bool(posted_thumbnail_browser_url(
+        output_artifacts=output_artifacts,
+        platform_results=platform_results,
+        upload_platforms=upload_platforms,
+    ))
 
 
-def collect_thumbnail_repair_ids(items: List[dict], *, limit: int = 5) -> List[str]:
+def collect_thumbnail_repair_ids(items: List[dict], *, limit: int = 15) -> List[str]:
     """Upload ids needing primary thumbnail repair (bounded; scans full list)."""
     ids: List[str] = []
     for item in items:
@@ -479,10 +536,10 @@ async def repair_upload_thumbnails_batch(
     user_id: str,
     upload_ids: List[str],
 ) -> None:
-    """Background: verify R2 object for primary thumb; regenerate when missing (max 5)."""
+    """Background: verify R2 object for primary thumb; regenerate when missing (max 15)."""
     from services.thumbnail_regenerate import ensure_upload_thumbnail_resident
 
-    uids = [str(x).strip() for x in (upload_ids or []) if str(x).strip()][:5]
+    uids = [str(x).strip() for x in (upload_ids or []) if str(x).strip()][:15]
     if not uids:
         return
     try:
@@ -553,6 +610,32 @@ async def repair_upload_thumbnails_batch(
         )
 
 
+async def posted_thumbnail_fallback_for_upload(
+    pool: Any,
+    user_id: str,
+    upload_id: str,
+) -> Optional[str]:
+    """Browser-safe platform cover URL when R2 streaming is unavailable."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT output_artifacts, platform_results, platforms
+            FROM uploads
+            WHERE id = $1 AND user_id = $2
+            """,
+            upload_id,
+            user_id,
+        )
+    if not row:
+        return None
+    d = dict(row)
+    return posted_thumbnail_browser_url(
+        output_artifacts=d.get("output_artifacts"),
+        platform_results=d.get("platform_results"),
+        upload_platforms=list(d.get("platforms") or []),
+    )
+
+
 async def stream_upload_thumbnail_bytes(
     pool: Any,
     user_id: str,
@@ -562,6 +645,7 @@ async def stream_upload_thumbnail_bytes(
     Load thumbnail bytes for GET /api/uploads/{id}/thumbnail.
 
     Returns (body, content_type, etag_key). Raises HTTPException 404 when missing.
+    Tries all candidate R2 keys (platform artifacts, primary, mirrored) before 404.
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -576,17 +660,16 @@ async def stream_upload_thumbnail_bytes(
     if not row:
         raise HTTPException(status_code=404, detail="Upload not found")
     d = dict(row)
-    r2_key = resolve_upload_thumbnail_r2_key(
+    candidate_keys = resolve_upload_thumbnail_r2_keys_ordered(
         thumbnail_r2_key=d.get("thumbnail_r2_key"),
         output_artifacts=d.get("output_artifacts"),
         platform_results=d.get("platform_results"),
         upload_platforms=list(d.get("platforms") or []),
     )
-    if not r2_key:
+    if not candidate_keys:
         raise HTTPException(status_code=404, detail="Thumbnail not available")
-    norm_key = _normalize_r2_key(r2_key)
 
-    def _read() -> Optional[tuple[bytes, str]]:
+    def _read_key(norm_key: str) -> Optional[tuple[bytes, str]]:
         if not r2_object_exists(norm_key):
             return None
         obj = get_s3_client().get_object(Bucket=R2_BUCKET_NAME, Key=norm_key)
@@ -599,11 +682,14 @@ async def stream_upload_thumbnail_bytes(
             ct = "image/jpeg"
         return raw, ct
 
-    read_out = await asyncio.to_thread(_read)
-    if not read_out:
-        raise HTTPException(status_code=404, detail="Thumbnail not available")
-    raw, ct = read_out
-    return raw, ct, norm_key
+    for r2_key in candidate_keys:
+        norm_key = _normalize_r2_key(r2_key)
+        read_out = await asyncio.to_thread(_read_key, norm_key)
+        if read_out:
+            raw, ct = read_out
+            return raw, ct, norm_key
+
+    raise HTTPException(status_code=404, detail="Thumbnail not available")
 
 
 def merged_platform_thumbnail_urls(

@@ -768,3 +768,384 @@ def merge_preferences_patch_for_apply(
     if not patch:
         raise ValueError("No recommendation available to apply")
     return dict(patch)
+
+
+PREF_FIELD_LABELS: Dict[str, str] = {
+    "captionStyle": "Caption style",
+    "captionTone": "Caption tone",
+    "captionVoice": "Caption voice / persona",
+    "captionFrameCount": "Caption frame count",
+    "styledThumbnails": "Styled thumbnails",
+    "autoCaptions": "Auto captions",
+    "autoThumbnails": "Auto thumbnails",
+    "aiHashtagsEnabled": "AI hashtags",
+    "aiHashtagCount": "AI hashtag count",
+    "aiHashtagStyle": "AI hashtag style",
+    "thumbnailSelectionMode": "Thumbnail frame selection",
+    "thumbnailRenderPipeline": "Thumbnail render pipeline",
+    "thumbnailDefaultPersonaId": "Default thumbnail persona",
+    "alwaysHashtags": "Always-include hashtags",
+}
+
+_VALID_PIPELINES = frozenset({"auto", "studio_renderer", "ai_edit", "template", "none"})
+_VALID_SELECTION = frozenset({"ai", "sharpness"})
+
+
+def _pref_display_value(key: str, val: Any) -> str:
+    if val is None:
+        return "—"
+    if key == "alwaysHashtags" and isinstance(val, list):
+        return ", ".join(str(x) for x in val[:8]) or "—"
+    if isinstance(val, bool):
+        return "On" if val else "Off"
+    return str(val)
+
+
+def _current_pref_value(prefs: Dict[str, Any], key: str) -> Any:
+    nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy") or {}
+    if not isinstance(nested, dict):
+        nested = {}
+    snake_map = {
+        "captionStyle": "caption_style",
+        "captionTone": "caption_tone",
+        "captionVoice": "caption_voice",
+        "thumbnailSelectionMode": "thumbnail_selection_mode",
+        "thumbnailRenderPipeline": "thumbnail_render_pipeline",
+        "thumbnailDefaultPersonaId": "thumbnail_default_persona_id",
+    }
+    if key in prefs:
+        return prefs[key]
+    snake = snake_map.get(key)
+    if snake and snake in prefs:
+        return prefs[snake]
+    if key in nested:
+        return nested[key]
+    if snake and snake in nested:
+        return nested[snake]
+    return None
+
+
+def _normalize_pipeline_value(raw: str) -> Optional[str]:
+    v = str(raw or "").strip().lower()
+    if v in _VALID_PIPELINES:
+        return v
+    if v in ("studio", "renderer", "studio_renderer"):
+        return "studio_renderer"
+    return None
+
+
+def _normalize_selection_value(raw: str) -> Optional[str]:
+    v = str(raw or "").strip().lower()
+    if v in _VALID_SELECTION:
+        return v
+    if v in ("sharp", "sharpness", "sharpest"):
+        return "sharpness"
+    if v in ("ai", "auto", "smart"):
+        return "ai"
+    return None
+
+
+async def _fetch_user_preferences_raw(conn, user_id: uuid.UUID) -> Dict[str, Any]:
+    row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1::uuid", user_id)
+    if not row:
+        return {}
+    raw = row.get("preferences") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+async def _lookup_persona_id(conn, user_id: uuid.UUID, name_or_voice: str) -> Optional[str]:
+    needle = str(name_or_voice or "").strip()
+    if not needle or len(needle) > 120:
+        return None
+    row = await conn.fetchrow(
+        """
+        SELECT id::text FROM creator_personas
+         WHERE user_id = $1::uuid
+           AND (LOWER(name) = LOWER($2) OR LOWER(COALESCE(profile_json->>'voice', '')) = LOWER($2))
+         ORDER BY created_at DESC
+         LIMIT 1
+        """,
+        user_id,
+        needle,
+    )
+    return str(row["id"]) if row else None
+
+
+def _packaging_dimension_patches(
+    packaging: Dict[str, Any],
+) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Map packaging rollup winners to preference keys + rationale rows."""
+    patch: Dict[str, Any] = {}
+    notes: List[Dict[str, Any]] = []
+    by_dim = (packaging or {}).get("by_dimension") or {}
+
+    dim_map = (
+        ("pipeline", "thumbnailRenderPipeline", _normalize_pipeline_value, "packaging_ml"),
+        ("selection", "thumbnailSelectionMode", _normalize_selection_value, "packaging_ml"),
+    )
+    for dim, pref_key, normalizer, source in dim_map:
+        rows = by_dim.get(dim) or []
+        if not rows:
+            continue
+        top = rows[0]
+        norm = normalizer(str(top.get("value") or ""))
+        if not norm:
+            continue
+        patch[pref_key] = norm
+        notes.append(
+            {
+                "field": pref_key,
+                "source": source,
+                "rationale": (
+                    f"Packaging ML ranked “{top.get('value')}” as your top {dim} "
+                    f"(~{float(top.get('mean_engagement_pct') or 0):.2f}% engagement across "
+                    f"{int(top.get('uploads') or 0)} attributed uploads)."
+                ),
+                "stats": {
+                    "mean_engagement_pct": float(top.get("mean_engagement_pct") or 0),
+                    "uploads": int(top.get("uploads") or 0),
+                    "dimension": dim,
+                },
+            }
+        )
+
+    persona_rows = by_dim.get("persona") or []
+    if persona_rows:
+        top_p = persona_rows[0]
+        pname = str(top_p.get("value") or "").strip()
+        if pname and pname not in ("—", "general", ""):
+            patch["_persona_name_hint"] = pname
+            notes.append(
+                {
+                    "field": "captionVoice",
+                    "source": "packaging_ml",
+                    "rationale": (
+                        f"Persona/voice “{pname}” led packaging engagement "
+                        f"(~{float(top_p.get('mean_engagement_pct') or 0):.2f}% across "
+                        f"{int(top_p.get('uploads') or 0)} uploads)."
+                    ),
+                    "stats": {
+                        "mean_engagement_pct": float(top_p.get("mean_engagement_pct") or 0),
+                        "uploads": int(top_p.get("uploads") or 0),
+                        "dimension": "persona",
+                    },
+                }
+            )
+
+    combos = (packaging or {}).get("combos") or []
+    if combos:
+        top_combo = combos[0]
+        parts = top_combo.get("parts") or {}
+        notes.insert(
+            0,
+            {
+                "field": "_combo",
+                "source": "packaging_ml",
+                "rationale": (
+                    f"Best template/persona combo: {top_combo.get('label') or 'top packaging'} "
+                    f"(~{float(top_combo.get('mean_engagement_pct') or 0):.2f}% engagement, "
+                    f"{int(top_combo.get('uploads') or 0)} uploads)."
+                ),
+                "stats": {
+                    "mean_engagement_pct": float(top_combo.get("mean_engagement_pct") or 0),
+                    "uploads": int(top_combo.get("uploads") or 0),
+                    "parts": parts,
+                },
+            },
+        )
+        for dim, pref_key, normalizer, _src in dim_map:
+            if pref_key in patch:
+                continue
+            norm = normalizer(str(parts.get(dim) or ""))
+            if norm:
+                patch[pref_key] = norm
+
+    return patch, notes
+
+
+async def build_optimize_settings_plan(conn, user_id) -> Dict[str, Any]:
+    """
+    Stat-backed settings optimization: merges content attribution, factor synthesis,
+    packaging rollups, and hashtag traction into a previewable patch + change log.
+    """
+    try:
+        uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+    except (ValueError, TypeError):
+        return {"ok": False, "message": "Invalid user", "changes": [], "patch": {}}
+
+    from services.ai_insights_hub import fetch_packaging_variant_rollups
+
+    insights = await build_user_content_insights(conn, uid)
+    packaging = await fetch_packaging_variant_rollups(conn, uid, days=120)
+    current = await _fetch_user_preferences_raw(conn, uid)
+
+    patch: Dict[str, Any] = {}
+    rationale_notes: List[Dict[str, Any]] = []
+    ml_sources: List[str] = []
+
+    try:
+        rec = resolve_insights_recommendation(insights if isinstance(insights, dict) else {})
+        base_patch = dict(rec.get("preferences_patch") or {})
+        patch.update(base_patch)
+        src = str(rec.get("source") or "content_attribution")
+        ml_sources.append(src)
+        if rec.get("summary"):
+            rationale_notes.append(
+                {
+                    "field": "_strategy",
+                    "source": src,
+                    "rationale": str(rec.get("summary")),
+                    "stats": {"confidence_note": rec.get("confidence_note")},
+                }
+            )
+        for field, camel, label in _FACTOR_FIELDS:
+            if camel not in base_patch:
+                continue
+            node = (insights.get("factor_performance") or {}).get(field) or {}
+            rk = node.get("ranked") or []
+            top = rk[0] if rk else None
+            if top:
+                rationale_notes.append(
+                    {
+                        "field": camel,
+                        "source": "factor_ml",
+                        "rationale": (
+                            f"Content attribution ML: best {label} “{top.get('value')}” "
+                            f"(~{float(top.get('weighted_mean_engagement_pct') or 0):.2f}% engagement, "
+                            f"{int(top.get('samples') or 0)} scored samples"
+                            + (
+                                f", +{float(top.get('lift_vs_factor_avg_pct') or 0):.0f}% vs your {label} average"
+                                if top.get("lift_vs_factor_avg_pct")
+                                else ""
+                            )
+                            + ")."
+                        ),
+                        "stats": dict(top),
+                    }
+                )
+    except ValueError:
+        pass
+
+    pack_patch, pack_notes = _packaging_dimension_patches(packaging)
+    for k, v in pack_patch.items():
+        if k.startswith("_"):
+            continue
+        if k not in patch:
+            patch[k] = v
+    rationale_notes.extend(pack_notes)
+    if pack_notes:
+        ml_sources.append("packaging_ml")
+
+    persona_hint = patch.pop("_persona_name_hint", None) or pack_patch.get("_persona_name_hint")
+    if persona_hint:
+        pid = await _lookup_persona_id(conn, uid, persona_hint)
+        if pid:
+            patch["thumbnailDefaultPersonaId"] = pid
+        elif persona_hint and "captionVoice" not in patch:
+            patch["captionVoice"] = persona_hint
+
+    ht = (insights.get("hashtag_traction") or {}) if isinstance(insights, dict) else {}
+    top_ht = ht.get("top_by_engagement") or []
+    if top_ht and not patch.get("aiHashtagsEnabled"):
+        patch["aiHashtagsEnabled"] = True
+        ml_sources.append("hashtag_ml")
+        rationale_notes.append(
+            {
+                "field": "aiHashtagsEnabled",
+                "source": "hashtag_ml",
+                "rationale": (
+                    "Hashtag traction ML found tags that outperform your baseline — enabling AI hashtags "
+                    "so new posts can discover similar winners. Top: "
+                    + ", ".join(
+                        f"#{x['hashtag']} (~{float(x.get('mean_engagement_pct') or 0):.2f}%)"
+                        for x in top_ht[:3]
+                    )
+                    + "."
+                ),
+                "stats": {"top_tags": top_ht[:5]},
+            }
+        )
+
+    if not patch:
+        return {
+            "ok": False,
+            "message": (
+                insights.get("narrative")
+                if isinstance(insights, dict) and insights.get("narrative")
+                else "Not enough attributed uploads yet — publish a few more with AI captions on."
+            ),
+            "changes": [],
+            "patch": {},
+            "narrative": insights.get("narrative") if isinstance(insights, dict) else "",
+            "ml_sources": [],
+            "readiness": "building",
+        }
+
+    changes: List[Dict[str, Any]] = []
+    seen_fields: set[str] = set()
+    for note in rationale_notes:
+        field = note.get("field")
+        if not field or field.startswith("_") or field in seen_fields:
+            continue
+        if field not in patch:
+            continue
+        before = _current_pref_value(current, field)
+        after = patch[field]
+        if before == after:
+            continue
+        seen_fields.add(field)
+        changes.append(
+            {
+                "field": field,
+                "label": PREF_FIELD_LABELS.get(field, field),
+                "before": _pref_display_value(field, before),
+                "after": _pref_display_value(field, after),
+                "source": note.get("source") or "ml",
+                "rationale": note.get("rationale") or "",
+                "stats": note.get("stats") or {},
+            }
+        )
+
+    for field, after in patch.items():
+        if field in seen_fields or field.startswith("_"):
+            continue
+        before = _current_pref_value(current, field)
+        if before == after:
+            continue
+        changes.append(
+            {
+                "field": field,
+                "label": PREF_FIELD_LABELS.get(field, field),
+                "before": _pref_display_value(field, before),
+                "after": _pref_display_value(field, after),
+                "source": "content_attribution",
+                "rationale": "Recommended from your top-performing packaging attribution bucket.",
+                "stats": {},
+            }
+        )
+
+    readiness = "ready" if len(changes) >= 2 else ("emerging" if changes else "building")
+    summary_bits = [c["label"] + ": " + c["after"] for c in changes[:6]]
+
+    return {
+        "ok": bool(changes),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "readiness": readiness,
+        "message": (
+            f"{len(changes)} setting(s) can be optimized from your upload ML signals."
+            if changes
+            else "Your settings already match the top ML recommendations."
+        ),
+        "summary": "; ".join(summary_bits) if summary_bits else "",
+        "narrative": insights.get("narrative") if isinstance(insights, dict) else "",
+        "ml_sources": list(dict.fromkeys(ml_sources)),
+        "patch": patch,
+        "changes": changes,
+        "packaging_samples": int(packaging.get("uploads_with_attribution") or 0),
+        "attribution_strategies": len((insights.get("ranked_strategies") or []) if isinstance(insights, dict) else []),
+    }

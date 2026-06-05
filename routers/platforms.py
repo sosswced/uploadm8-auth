@@ -19,6 +19,7 @@ from services.platform_accounts import (
     serialize_platform_account_flat,
 )
 from services.platform_profile_refresh import refresh_platform_token_profile
+from services.accounts_hub_insights import build_accounts_hub_insights
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -51,6 +52,25 @@ async def get_platforms(user: dict = Depends(get_current_user_readonly)):
         "max_accounts": plan.get("max_accounts", 1),
         "can_add_more": total < plan.get("max_accounts", 1),
     }
+
+
+@router.get("/api/accounts/hub-insights")
+async def get_accounts_hub_insights(user: dict = Depends(get_current_user_readonly)):
+    """ML/AI bundle for Account Groups and Connected Accounts pages."""
+    try:
+        return await build_accounts_hub_insights(core.state.db_pool, str(user["id"]))
+    except Exception as e:
+        logger.warning("accounts hub-insights failed user_id=%s: %s", user.get("id"), e)
+        return {
+            "ok": False,
+            "m8_engine": {},
+            "platform_engagement": [],
+            "group_suggestions": [],
+            "platform_metrics": {},
+            "per_account_metrics": {},
+            "per_account_uploads": {},
+            "meta_hints": [],
+        }
 
 
 @router.get("/api/platform-accounts")

@@ -50,6 +50,7 @@ from services.marketing_execution import (
     _user_matches_campaign,
 )
 from services.marketing_image import generate_marketing_image
+from services.marketing_strategist import generate_marketing_plan
 from services.wallet_marketing import _user_campaign_features
 from stages.entitlements import normalize_tier
 from services.admin_email_jobs import (

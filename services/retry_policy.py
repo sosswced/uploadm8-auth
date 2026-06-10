@@ -199,6 +199,80 @@ def split_platform_results(
 
 STALE_PROCESSING_MINUTES_DEFAULT = 20
 
+# Worker-initiated auto-retries (immediate uploads with transient failures).
+MAX_AUTO_RETRIES_DEFAULT = 3
+AUTO_RETRY_BACKOFF_MINUTES: Tuple[int, ...] = (2, 5, 15)
+
+
+def get_auto_retry_count(output_artifacts: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(output_artifacts, dict):
+        return 0
+    section = output_artifacts.get("auto_retry")
+    if isinstance(section, dict):
+        try:
+            return int(section.get("count") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def auto_retry_backoff_minutes(prior_count: int) -> int:
+    idx = max(0, min(int(prior_count or 0), len(AUTO_RETRY_BACKOFF_MINUTES) - 1))
+    return AUTO_RETRY_BACKOFF_MINUTES[idx]
+
+
+def bump_auto_retry_metadata(
+    output_artifacts: Optional[Dict[str, Any]],
+    *,
+    error_code: Optional[str],
+) -> Dict[str, Any]:
+    base: Dict[str, Any] = dict(output_artifacts or {})
+    section = base.get("auto_retry") if isinstance(base.get("auto_retry"), dict) else {}
+    new_count = int(section.get("count") or 0) + 1
+    now_iso = datetime.now(timezone.utc).isoformat()
+    base["auto_retry"] = {
+        "count": new_count,
+        "last_at": now_iso,
+        "last_error_code": error_code,
+    }
+    return base
+
+
+def should_auto_retry_upload(
+    upload_row: Any,
+    *,
+    max_retries: int = MAX_AUTO_RETRIES_DEFAULT,
+) -> bool:
+    """True when worker may re-queue a failed immediate upload with a transient error."""
+    status = (
+        (upload_row.get("status") if isinstance(upload_row, dict) else upload_row["status"])
+        or ""
+    ).lower()
+    if status != "failed":
+        return False
+    mode = (
+        (upload_row.get("schedule_mode") if isinstance(upload_row, dict) else upload_row["schedule_mode"])
+        or "immediate"
+    ).strip().lower()
+    if mode != "immediate":
+        return False
+    error_code = (
+        upload_row.get("error_code") if isinstance(upload_row, dict) else upload_row["error_code"]
+    )
+    if not is_transient_error(error_code):
+        return False
+    arts = (
+        upload_row.get("output_artifacts") if isinstance(upload_row, dict) else upload_row["output_artifacts"]
+    )
+    if isinstance(arts, str):
+        try:
+            import json
+
+            arts = json.loads(arts)
+        except Exception:
+            arts = {}
+    return get_auto_retry_count(arts if isinstance(arts, dict) else None) < max_retries
+
 
 def upload_is_stale_processing(upload_row: Any, *, minutes: int | None = None) -> bool:
     """True when status=processing and updated_at has not moved for ``minutes``."""

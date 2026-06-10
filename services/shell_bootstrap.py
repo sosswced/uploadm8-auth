@@ -9,7 +9,32 @@ from typing import Any, Mapping, Optional
 from core.helpers import get_plan
 from core.r2 import resolve_stored_account_avatar_url
 from services.dashboard_user_stats import dashboard_stats_for_user
-from services.uploads_handlers import UPLOAD_VIEW_STATUS, fetch_upload_queue_stats, fetch_user_uploads_list
+from services.upload.schedule_guard import bootstrap_repair_user_schedules
+from services.uploads_handlers import (
+    UPLOAD_VIEW_STATUS,
+    _dt_iso,
+    fetch_upload_queue_stats,
+    fetch_user_uploads_list,
+)
+
+BOOTSTRAP_SCHEDULE_REPAIR_TIMEOUT_SEC = 8.0
+
+
+async def _bootstrap_schedule_repair(pool: Any, user_id: str) -> dict[str, int] | None:
+    try:
+        return await asyncio.wait_for(
+            bootstrap_repair_user_schedules(pool, user_id, limit=30),
+            timeout=BOOTSTRAP_SCHEDULE_REPAIR_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "shell_bootstrap schedule repair timed out after %.0fs user=%s",
+            BOOTSTRAP_SCHEDULE_REPAIR_TIMEOUT_SEC,
+            user_id,
+        )
+    except Exception:
+        logger.exception("shell_bootstrap schedule repair failed user=%s", user_id)
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +80,7 @@ async def _fetch_platforms_bundle(pool: Any, user_id: str, plan: Mapping[str, An
                 "avatar": resolve_stored_account_avatar_url(acc["account_avatar"], presign=False),
                 "is_primary": acc["is_primary"],
                 "status": "active",
-                "connected_at": acc["created_at"].isoformat() if acc["created_at"] else None,
+                "connected_at": _dt_iso(acc["created_at"]),
             }
         )
 
@@ -87,7 +112,7 @@ async def shell_bootstrap_payload(
     Uses ``asyncio.gather`` so each sub-call may ``pool.acquire()`` on its own connection
     (Sentry: multiple ``pg_advisory_unlock_all`` spans are pool returns, not app advisory locks).
     """
-    uid = str(user["id"])
+    uid = str(user.get("billing_user_id") or user["id"])
     plan = get_plan(user.get("subscription_tier", "free"))
     wallet = user.get("wallet") or {}
     view = _allowed_upload_view(upload_view)
@@ -114,6 +139,8 @@ async def shell_bootstrap_payload(
     )
     platforms_coro = _fetch_platforms_bundle(pool, uid, plan)
 
+    schedule_repair = await _bootstrap_schedule_repair(pool, uid)
+
     if context == "dashboard":
         stats_coro = dashboard_stats_for_user(pool, user, plan, wallet)
         try:
@@ -129,23 +156,32 @@ async def shell_bootstrap_payload(
             "queue_stats": None,
             "uploads": uploads_payload,
             "platforms": platforms_payload,
+            "schedule_repair": schedule_repair,
         }
 
     if context == "queue":
+
         qs_coro = fetch_upload_queue_stats(pool, uid)
-        try:
-            uploads_payload, platforms_payload, queue_stats = await asyncio.gather(
-                uploads_coro, platforms_coro, qs_coro
-            )
-        except Exception:
-            logger.exception("shell_bootstrap queue gather failed user=%s", uid)
-            raise
+        results = await asyncio.gather(
+            uploads_coro, platforms_coro, qs_coro, return_exceptions=True
+        )
+        uploads_payload = _ok(results[0])
+        platforms_payload = _ok(results[1])
+        queue_stats = _ok(results[2])
+        if uploads_payload is None and queue_stats is None:
+            raise RuntimeError("queue bootstrap: uploads and queue_stats both failed")
         return {
             "context": "queue",
             "dashboard_stats": None,
-            "queue_stats": queue_stats,
-            "uploads": uploads_payload,
+            "queue_stats": queue_stats or {
+                "processing": 0,
+                "completed": 0,
+                "partial": 0,
+                "failed": 0,
+            },
+            "uploads": uploads_payload if uploads_payload is not None else [],
             "platforms": platforms_payload,
+            "schedule_repair": schedule_repair,
         }
 
     raise ValueError("context must be dashboard, queue, upload or kpi")
@@ -186,7 +222,7 @@ async def _upload_bootstrap_payload(user: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-_KPI_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365, "all": 3650}
+_KPI_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "365d": 365, "1y": 365, "all": 3650}
 
 
 async def _kpi_bootstrap_payload(

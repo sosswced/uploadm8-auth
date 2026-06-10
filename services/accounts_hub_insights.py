@@ -236,11 +236,15 @@ def _next_actions(
             }
         )
     elif coverage.get("ungrouped_accounts", 0) > 0:
+        n_ungrouped = int(coverage["ungrouped_accounts"])
         actions.append(
             {
                 "id": "group_ungrouped_accounts",
                 "label": "Group remaining accounts",
-                "detail": f"{coverage['ungrouped_accounts']} connected account is not in a group yet.",
+                "detail": (
+                    f"{n_ungrouped} connected account{'s are' if n_ungrouped != 1 else ' is'} "
+                    "not in a group yet."
+                ),
                 "href": "groups.html",
                 "priority": "medium",
             }

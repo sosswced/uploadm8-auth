@@ -440,7 +440,7 @@ async def run_scheduled_publish_alerts(
     job = "scheduled_publish_alerts"
     run_id = await _start_run(pool, job, triggered_by)
     sent = skipped = errors = 0
-    upcoming_sent = stuck_sent = 0
+    upcoming_sent = stuck_sent = stuck_staged_sent = 0
 
     try:
         async with pool.acquire() as conn:
@@ -535,9 +535,58 @@ async def run_scheduled_publish_alerts(
                     logger.warning("scheduled stuck alert failed for upload %s: %s", r["id"], e)
                     errors += 1
 
+            # ── Stuck staged (past scheduled_time but never entered processing)
+            stuck_staged = await conn.fetch(
+                f"""
+                SELECT u.id, u.user_id, u.filename, u.scheduled_time,
+                       us.email, us.name, u.error_code, u.error_detail
+                FROM uploads u
+                JOIN users us ON us.id = u.user_id
+                LEFT JOIN user_preferences up ON up.user_id = u.user_id
+                WHERE u.status = 'staged'
+                  AND u.scheduled_time IS NOT NULL
+                  AND u.scheduled_time < NOW() - INTERVAL '{STUCK_THRESHOLD_MINUTES} minutes'
+                  AND COALESCE(up.email_notifications, TRUE) = TRUE
+                  AND us.status = 'active'
+                  AND us.email IS NOT NULL AND us.email <> ''
+                  AND COALESCE(u.output_artifacts->>'staged_stuck_alert_sent', '') = ''
+                """
+            )
+
+            for r in stuck_staged:
+                try:
+                    await send_scheduled_publish_alert_email(
+                        email=r["email"],
+                        name=r["name"] or "there",
+                        filename=r["filename"] or "your upload",
+                        scheduled_at_label=r["scheduled_time"].strftime("%B %d, %Y %H:%M UTC"),
+                        status="stuck",
+                        reason=(
+                            r["error_detail"]
+                            or r["error_code"]
+                            or "Upload is staged but processing never started"
+                        ),
+                        upload_id=str(r["id"]),
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE uploads
+                        SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb)
+                                            || jsonb_build_object('staged_stuck_alert_sent', NOW()::text)
+                        WHERE id = $1
+                        """,
+                        r["id"],
+                    )
+                    sent += 1
+                    stuck_staged_sent += 1
+                except Exception as e:
+                    logger.warning("staged stuck alert failed for upload %s: %s", r["id"], e)
+                    errors += 1
+
         summary = {
             "upcoming_sent":     upcoming_sent,
             "stuck_sent":        stuck_sent,
+            "stuck_staged_sent": stuck_staged_sent,
             "upcoming_window_h": UPCOMING_WINDOW_HOURS,
             "stuck_threshold_m": STUCK_THRESHOLD_MINUTES,
         }

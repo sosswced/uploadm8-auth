@@ -32,26 +32,45 @@ def main() -> int:
     eng = ml_engine_public_dict(engine)
 
     print("UploadM8 ML hub wiring (no secrets printed)")
+    print("  [promo-targeting bucket]")
     print(f"  dataset_repo:     {urls.get('dataset_repo') or '(unset)'}")
     print(f"  model_repo:       {urls.get('model_repo') or eng.get('model_repo') or '(unset)'}")
     print(f"  dataset_url:      {'set' if urls.get('dataset_url') else '(unset)'}")
+    print("  [content-success bucket]")
+    print(f"  content_dataset_repo: {urls.get('content_dataset_repo') or '(unset)'}")
+    print(f"  content_model_repo:   {urls.get('content_model_repo') or '(unset)'}")
+    print(f"  content-success:      {'on' if engine.run_content_success else 'off'} | content_stack_ready={engine.content_stack_ready}")
+    print("  [shared]")
     print(f"  trackio_space:    {urls.get('trackio_space_path') or '(unset)'}")
     print(f"  trackio_space_url: {'set' if urls.get('trackio_space_url') else '(unset)'}")
     print(f"  HF_TOKEN:         {'configured' if hf_ok else 'not configured'} ({hf_reason})")
     print(f"  TRACKIO_PROJECT:  {'set' if trackio_proj else '(unset)'}")
     print(f"  TRACKIO_SPACE_ID: {'set' if trackio_space else '(unset)'}")
     print(f"  ML engine:        {'enabled' if engine.enabled else 'disabled'} | stack_ready={engine.stack_ready}")
-    print(f"  content-success:  {'on' if eng.get('run_content_success') else 'off'} (split=content_success on the dataset repo)")
     if engine.use_hf_jobs:
         print(f"  HF Jobs:          flavor={engine.jobs_flavor} timeout={engine.jobs_timeout}")
 
-    if urls.get("dataset_url") and urls.get("trackio_space_url") and hf_ok and engine.model_repo:
-        print("\n[ok] Hub URLs, model repo, and HF token look ready for the ML engine.")
-        return 0
+    promo_ready = bool(urls.get("dataset_repo") and engine.model_repo)
+    content_ready = bool(
+        engine.run_content_success
+        and urls.get("content_dataset_repo")
+        and urls.get("content_model_repo")
+    )
+    if promo_ready and hf_ok:
+        print("\n[ok] Promo bucket wired (dataset + model repo + HF token).")
+    if content_ready and hf_ok:
+        print("[ok] Content-success bucket wired (separate dataset + model repo).")
+    elif engine.run_content_success:
+        print("[warn] Content loop enabled but UM8_HF_CONTENT_DATASET_REPO / UM8_HF_CONTENT_MODEL_REPO unset.")
+
+    if urls.get("dataset_url") and urls.get("trackio_space_url") and hf_ok and promo_ready:
+        if not engine.run_content_success or content_ready:
+            print("[ok] Hub URLs, model repo(s), and HF token look ready for the ML engine.")
+            return 0
     if urls.get("dataset_url") and urls.get("trackio_space_url") and hf_ok:
-        print("\n[warn] Set UM8_HF_MODEL_REPO and UM8_ML_ENGINE_ENABLED=1 for full automation.")
+        print("\n[warn] Set UM8_HF_MODEL_REPO (and content repos if UM8_ML_ENGINE_RUN_CONTENT_SUCCESS=1), UM8_ML_ENGINE_ENABLED=1.")
         return 1
-    print("\n[warn] Set UM8_HF_DATASET_REPO (or *_URL), UM8_TRACKIO_SPACE_PATH (or *_URL), and HF_TOKEN in .env, then restart the API.")
+    print("\n[warn] Set UM8_HF_DATASET_REPO, UM8_TRACKIO_SPACE_PATH, HF_TOKEN in .env, then restart the API.")
     return 1
 
 

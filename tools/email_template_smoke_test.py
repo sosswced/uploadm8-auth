@@ -22,7 +22,14 @@ Captured = Tuple[str, str, str]
 captured: List[Captured] = []
 
 
-async def _fake_send_email(to: str, subject: str, html: str, from_addr: str = None, reply_to: str = None) -> None:
+async def _fake_send_email(
+    to: str,
+    subject: str,
+    html: str,
+    from_addr: str = None,
+    reply_to: str = None,
+    **_: Any,
+) -> None:
     assert to and "@" in to, f"invalid recipient: {to!r}"
     assert subject, "empty subject"
     assert subject.strip() == subject, f"subject has leading/trailing spaces: {subject!r}"
@@ -76,9 +83,9 @@ async def main() -> None:
         "welcome",
         auth.send_welcome_email("user@example.com", "Taylor"),
     )
-    results["fully_signed_up_guide"] = await _invoke(
-        "fully_signed_up_guide",
-        auth.send_fully_signed_up_guide_email("user@example.com", "Taylor", "creator_pro", 1200, 350, 12, 3),
+    results["post_verification_welcome"] = await _invoke(
+        "post_verification_welcome",
+        auth.send_post_verification_welcome_email("user@example.com", "Taylor"),
     )
     results["password_reset"] = await _invoke(
         "password_reset",
@@ -101,21 +108,9 @@ async def main() -> None:
             "https://app.uploadm8.com/verify-email.html?token=verify123",
         ),
     )
-    results["admin_email_change_old_notice"] = await _invoke(
-        "admin_email_change_old_notice",
-        auth.send_admin_email_change_notice_to_old_email("old@example.com", "new@example.com", "Taylor"),
-    )
-    results["user_email_change_old_notice"] = await _invoke(
-        "user_email_change_old_notice",
-        auth.send_user_email_change_notice_to_old_email("old@example.com", "new@example.com", "Taylor"),
-    )
     results["admin_reset_password"] = await _invoke(
         "admin_reset_password",
         auth.send_admin_reset_password_email("user@example.com", "Taylor", "TempP@ss123"),
-    )
-    results["login_anomaly"] = await _invoke(
-        "login_anomaly",
-        auth.send_login_anomaly_email("user@example.com", "Taylor", "203.0.113.10", "US", "Mozilla/5.0", "198.51.100.20"),
     )
 
     # Billing
@@ -160,10 +155,6 @@ async def main() -> None:
         "topup_receipt",
         billing_changes.send_topup_receipt_email("user@example.com", "Taylor", "put", 250, 9.99, 1500, "pi_123", bonus_tokens=62),
     )
-    results["refund_receipt"] = await _invoke(
-        "refund_receipt",
-        billing_changes.send_refund_receipt_email("user@example.com", "Taylor", 9.99, "usd", "ch_123", "requested_by_customer", "refund"),
-    )
 
     # Upload emails
     results["upload_completed"] = await _invoke(
@@ -207,9 +198,6 @@ async def main() -> None:
             "up_123",
             "publish",
             "My Clip",
-            "Caption here",
-            ["tag1", "tag2"],
-            platform_results,
         ),
     )
     results["scheduled_publish_alert"] = await _invoke(
@@ -233,10 +221,6 @@ async def main() -> None:
     results["admin_tier_switch"] = await _invoke(
         "admin_tier_switch",
         admin_actions.send_admin_tier_switch_email("user@example.com", "Taylor", "creator_lite", "studio", "manual promotion", True),
-    )
-    results["admin_account_status"] = await _invoke(
-        "admin_account_status",
-        admin_actions.send_admin_account_status_email("user@example.com", "Taylor", "banned", "policy violation"),
     )
     results["friends_family"] = await _invoke(
         "friends_family",

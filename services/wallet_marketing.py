@@ -427,7 +427,10 @@ async def build_wallet_marketing_payload(
             type_="put_warning",
             severity="warning",
             title="Running low on PUT allowance",
-            body=f"About {int(round(burn_put * 100))}% of this period's PUT credits are used. Consider topping up before you hit the limit.",
+            body=(
+                f"About {int(round(burn_put * 100))}% of this period's PUT credits are used. "
+                "Consider topping up before you hit the limit, or open Token balances to review per-upload charges."
+            ),
             cta_label="Top up",
             cta_link=links["topup"],
         )
@@ -460,7 +463,10 @@ async def build_wallet_marketing_payload(
                 type_="aic_warning",
                 severity="warning",
                 title="Running low on AI credits",
-                body=f"Roughly {int(round(burn_aic * 100))}% of this period's AIC is used. Stock up before long posting sessions.",
+                body=(
+                    f"Roughly {int(round(burn_aic * 100))}% of this period's AIC is used. "
+                    "Stock up before long posting sessions, or open Token balances to see AI line items per upload."
+                ),
                 cta_label="Top up AIC",
                 cta_link=links["topup"],
             )

@@ -40,6 +40,17 @@ from services.ml_observability import OptionalTrackioRun, hf_env_status, hf_writ
 from services.hf_dataset_export import coerce_dataframe_for_hf
 
 
+# Primary path: the curated view (services/ml_feature_registry.py governs columns).
+# Filtered by last_activity_at so the lookback window applies uniformly to both
+# real touchpoints and active-user snapshots.
+VIEW_PROMO_SQL = """
+SELECT *
+FROM v_promo_targeting_features
+WHERE last_activity_at >= (NOW() - ($1::int || ' days')::interval)
+ORDER BY touchpoint_at DESC
+LIMIT $2::int
+"""
+
 PROMO_SQL = """
 WITH touchpoints AS (
     SELECT
@@ -238,11 +249,13 @@ labels_30d AS (
 SELECT
     ('user:' || au.user_id::text) AS touchpoint_id,
     au.user_id,
+    'snapshot' AS row_source,
+    1::int AS is_snapshot,
     'snapshot' AS channel,
     'active_user' AS delivery_status,
     NOW() AS touchpoint_at,
-    EXTRACT(DOW FROM NOW())::int AS sent_dow_utc,
-    EXTRACT(HOUR FROM NOW())::int AS sent_hour_utc,
+    NULL::int AS sent_dow_utc,
+    NULL::int AS sent_hour_utc,
     COALESCE(w.put_balance, 0)::int AS put_balance,
     COALESCE(w.aic_balance, 0)::int AS aic_balance,
     COALESCE(u.subscription_tier, 'free') AS subscription_tier,
@@ -314,7 +327,40 @@ def _require_database_url() -> str:
     return dsn
 
 
+def _dedupe_promo(df: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if "engaged_7d" not in df.columns:
+        df["engaged_7d"] = df.get("converted_7d", 0)
+    # Prefer real touchpoint rows over snapshot duplicates per user.
+    if "touchpoint_id" in df.columns and "user_id" in df.columns:
+        sort_cols = ["converted_7d", "engaged_7d"]
+        if "touchpoint_at" in df.columns:
+            sort_cols.append("touchpoint_at")
+        df = df.sort_values(
+            by=sort_cols,
+            ascending=[False] * len(sort_cols),
+            na_position="last",
+        )
+        df = df.drop_duplicates(subset=["user_id"], keep="first")
+    return df.head(int(limit))
+
+
 async def _fetch_dataset(dsn: str, lookback_days: int, limit: int) -> pd.DataFrame:
+    conn = await asyncpg.connect(dsn)
+    try:
+        # Primary path: curated view.
+        try:
+            view_rows = await conn.fetch(VIEW_PROMO_SQL, int(lookback_days), int(limit))
+            if view_rows:
+                df = pd.DataFrame.from_records([dict(r) for r in view_rows])
+                return _dedupe_promo(df, limit)
+        except Exception as e:
+            logger.warning("promo view query failed, falling back to inline SQL: %s", e)
+    finally:
+        await conn.close()
+
+    # Fallback path: inline assembly (view missing or empty).
     conn = await asyncpg.connect(dsn)
     touch_rows = []
     snap_rows = []
@@ -337,20 +383,7 @@ async def _fetch_dataset(dsn: str, lookback_days: int, limit: int) -> pd.DataFra
         df = pd.DataFrame.from_records(records)
         if df.empty:
             return df
-        if "engaged_7d" not in df.columns:
-            df["engaged_7d"] = df.get("converted_7d", 0)
-        # Prefer real touchpoint rows over snapshot duplicates per user.
-        if "touchpoint_id" in df.columns and "user_id" in df.columns:
-            sort_cols = ["converted_7d", "engaged_7d"]
-            if "touchpoint_at" in df.columns:
-                sort_cols.append("touchpoint_at")
-            df = df.sort_values(
-                by=sort_cols,
-                ascending=[False] * len(sort_cols),
-                na_position="last",
-            )
-            df = df.drop_duplicates(subset=["user_id"], keep="first")
-        return df.head(int(limit))
+        return _dedupe_promo(df, limit)
     finally:
         await conn.close()
 

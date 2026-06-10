@@ -1775,6 +1775,211 @@ async def run_migrations(db_pool):
                 CREATE INDEX IF NOT EXISTS idx_pikzels_analyses_user_created
                     ON pikzels_thumbnail_analyses(user_id, created_at DESC);
             """),
+            # Curated ML feature views: one tidy schema per learning loop ("bucket"),
+            # governed by services/ml_feature_registry.py. Build scripts SELECT from
+            # these so feature engineering (joins, age-normalization, leakage fixes)
+            # lives in one documented place.
+            (1087, """
+                CREATE INDEX IF NOT EXISTS idx_mtd_user_segment_chan_sent
+                    ON marketing_touchpoint_deliveries (user_id, channel, (COALESCE(meta->>'segment_key', '')))
+                    WHERE status = 'sent';
+            """),
+            (1088, """
+                -- marketing_events may predate v1033 (CREATE IF NOT EXISTS skipped payload column).
+                ALTER TABLE marketing_events ADD COLUMN IF NOT EXISTS payload JSONB DEFAULT '{}'::jsonb;
+                UPDATE marketing_events SET payload = '{}'::jsonb WHERE payload IS NULL;
+            """),
+            (1089, """
+                ALTER TABLE uploads ADD COLUMN IF NOT EXISTS pipeline_manifest JSONB DEFAULT NULL;
+                CREATE TABLE IF NOT EXISTS upload_funnel_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    upload_id UUID NOT NULL,
+                    event TEXT NOT NULL,
+                    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    details JSONB NOT NULL DEFAULT '{}'::jsonb
+                );
+                CREATE INDEX IF NOT EXISTS idx_upload_funnel_events_upload_ts
+                    ON upload_funnel_events (upload_id, ts);
+            """),
+            (1086, """
+                CREATE OR REPLACE VIEW v_promo_targeting_features AS
+                WITH uu30 AS (
+                    SELECT u.user_id,
+                        COUNT(*)::int AS uploads_30d,
+                        AVG(COALESCE(u.views, 0))::double precision AS avg_views_30d,
+                        AVG(CASE WHEN COALESCE(u.views, 0) > 0
+                            THEN ((COALESCE(u.likes,0)+COALESCE(u.comments,0)+COALESCE(u.shares,0))::double precision / u.views::double precision) * 100.0
+                            ELSE 0.0 END)::double precision AS avg_engagement_pct_30d
+                    FROM uploads u
+                    WHERE u.created_at >= NOW() - INTERVAL '30 days'
+                    GROUP BY u.user_id
+                ),
+                uu_prev30 AS (
+                    SELECT u.user_id,
+                        COUNT(*)::int AS uploads_prev30d,
+                        AVG(COALESCE(u.views, 0))::double precision AS avg_views_prev30d
+                    FROM uploads u
+                    WHERE u.created_at >= NOW() - INTERVAL '60 days'
+                      AND u.created_at <  NOW() - INTERVAL '30 days'
+                    GROUP BY u.user_id
+                ),
+                pp30 AS (
+                    SELECT pci.user_id,
+                        COUNT(*)::int AS content_items_30d,
+                        AVG(COALESCE(pci.views, 0))::double precision AS pci_avg_views_30d
+                    FROM platform_content_items pci
+                    WHERE pci.published_at >= NOW() - INTERVAL '30 days'
+                    GROUP BY pci.user_id
+                ),
+                uact AS (
+                    SELECT user_id, MAX(created_at) AS last_upload_at FROM uploads GROUP BY user_id
+                ),
+                mhist AS (
+                    SELECT user_id, COUNT(*)::int AS prior_touchpoints,
+                        MAX(COALESCE(sent_at, created_at)) AS last_touchpoint_at
+                    FROM marketing_touchpoint_deliveries GROUP BY user_id
+                ),
+                mev AS (
+                    SELECT user_id,
+                        SUM(CASE WHEN event_type = 'campaign_email_open' THEN 1 ELSE 0 END)::int AS opens_all,
+                        SUM(CASE WHEN event_type = 'clicked' THEN 1 ELSE 0 END)::int AS clicks_all
+                    FROM marketing_events GROUP BY user_id
+                ),
+                tp AS (
+                    SELECT mtd.id AS touchpoint_id, mtd.user_id, mtd.channel,
+                        mtd.status AS delivery_status, mtd.created_at AS touchpoint_at,
+                        COALESCE(mtd.sent_at, mtd.created_at) AS effective_sent_at
+                    FROM marketing_touchpoint_deliveries mtd
+                ),
+                tp_rows AS (
+                    SELECT
+                        tp.touchpoint_id::text AS touchpoint_id,
+                        tp.user_id,
+                        'touchpoint'::text AS row_source,
+                        0::int AS is_snapshot,
+                        tp.channel::varchar AS channel,
+                        tp.delivery_status::varchar AS delivery_status,
+                        tp.touchpoint_at,
+                        tp.effective_sent_at AS last_activity_at,
+                        EXTRACT(DOW FROM tp.effective_sent_at)::int AS sent_dow_utc,
+                        EXTRACT(HOUR FROM tp.effective_sent_at)::int AS sent_hour_utc,
+                        COALESCE(w.put_balance, 0)::int AS put_balance,
+                        COALESCE(w.aic_balance, 0)::int AS aic_balance,
+                        COALESCE(u.subscription_tier, 'free')::varchar AS subscription_tier,
+                        COALESCE(uu30.uploads_30d, 0)::int AS uploads_30d,
+                        COALESCE(uu30.avg_views_30d, 0)::double precision AS avg_views_30d,
+                        COALESCE(uu30.avg_engagement_pct_30d, 0)::double precision AS avg_engagement_pct_30d,
+                        COALESCE(pp30.content_items_30d, 0)::int AS content_items_30d,
+                        COALESCE(pp30.pci_avg_views_30d, 0)::double precision AS pci_avg_views_30d,
+                        COALESCE(mhist.prior_touchpoints, 0)::int AS prior_touchpoints,
+                        COALESCE(mev.opens_all, 0)::int AS opens_all,
+                        COALESCE(mev.clicks_all, 0)::int AS clicks_all,
+                        (EXTRACT(EPOCH FROM (NOW() - mhist.last_touchpoint_at)) / 86400.0)::double precision AS days_since_last_touchpoint,
+                        (EXTRACT(EPOCH FROM (NOW() - u.created_at)) / 86400.0)::double precision AS account_age_days,
+                        (EXTRACT(EPOCH FROM (NOW() - uact.last_upload_at)) / 86400.0)::double precision AS days_since_last_upload,
+                        (COALESCE(uu30.uploads_30d, 0) - COALESCE(uu_prev30.uploads_prev30d, 0))::double precision AS uploads_trend_30d,
+                        (COALESCE(uu30.avg_views_30d, 0) - COALESCE(uu_prev30.avg_views_prev30d, 0))::double precision AS views_trend_30d,
+                        CASE WHEN (
+                            EXISTS (SELECT 1 FROM revenue_tracking rt WHERE rt.user_id = tp.user_id AND rt.created_at >= tp.effective_sent_at AND rt.created_at < tp.effective_sent_at + INTERVAL '7 days' AND COALESCE(rt.amount,0) > 0)
+                            OR EXISTS (SELECT 1 FROM marketing_events me WHERE me.user_id = tp.user_id AND me.created_at >= tp.effective_sent_at AND me.created_at < tp.effective_sent_at + INTERVAL '7 days' AND me.event_type = 'converted')
+                            OR EXISTS (SELECT 1 FROM marketing_events me WHERE me.user_id = tp.user_id AND me.created_at >= tp.effective_sent_at AND me.created_at < tp.effective_sent_at + INTERVAL '7 days' AND me.event_type = 'clicked')
+                        ) THEN 1 ELSE 0 END AS converted_7d,
+                        CASE WHEN (
+                            EXISTS (SELECT 1 FROM revenue_tracking rt WHERE rt.user_id = tp.user_id AND rt.created_at >= tp.effective_sent_at AND rt.created_at < tp.effective_sent_at + INTERVAL '7 days' AND COALESCE(rt.amount,0) > 0)
+                            OR EXISTS (SELECT 1 FROM marketing_events me WHERE me.user_id = tp.user_id AND me.created_at >= tp.effective_sent_at AND me.created_at < tp.effective_sent_at + INTERVAL '7 days' AND me.event_type IN ('converted','clicked','campaign_email_open'))
+                        ) THEN 1 ELSE 0 END AS engaged_7d,
+                        COALESCE((SELECT SUM(COALESCE(rt2.amount,0))::double precision FROM revenue_tracking rt2 WHERE rt2.user_id = tp.user_id AND rt2.created_at >= tp.effective_sent_at AND rt2.created_at < tp.effective_sent_at + INTERVAL '7 days'), 0.0) AS revenue_7d
+                    FROM tp
+                    LEFT JOIN users u ON u.id = tp.user_id
+                    LEFT JOIN wallets w ON w.user_id = tp.user_id
+                    LEFT JOIN uu30 ON uu30.user_id = tp.user_id
+                    LEFT JOIN uu_prev30 ON uu_prev30.user_id = tp.user_id
+                    LEFT JOIN pp30 ON pp30.user_id = tp.user_id
+                    LEFT JOIN uact ON uact.user_id = tp.user_id
+                    LEFT JOIN mhist ON mhist.user_id = tp.user_id
+                    LEFT JOIN mev ON mev.user_id = tp.user_id
+                ),
+                active_users AS (
+                    SELECT DISTINCT u.id AS user_id
+                    FROM users u
+                    JOIN uploads up ON up.user_id = u.id
+                    WHERE up.status IN ('completed','succeeded')
+                      AND COALESCE(u.role, '') NOT IN ('master_admin')
+                ),
+                snap_rows AS (
+                    SELECT
+                        ('user:' || au.user_id::text)::text AS touchpoint_id,
+                        au.user_id,
+                        'snapshot'::text AS row_source,
+                        1::int AS is_snapshot,
+                        'snapshot'::varchar AS channel,
+                        'active_user'::varchar AS delivery_status,
+                        NOW() AS touchpoint_at,
+                        uact.last_upload_at AS last_activity_at,
+                        NULL::int AS sent_dow_utc,
+                        NULL::int AS sent_hour_utc,
+                        COALESCE(w.put_balance, 0)::int AS put_balance,
+                        COALESCE(w.aic_balance, 0)::int AS aic_balance,
+                        COALESCE(u.subscription_tier, 'free')::varchar AS subscription_tier,
+                        COALESCE(uu30.uploads_30d, 0)::int AS uploads_30d,
+                        COALESCE(uu30.avg_views_30d, 0)::double precision AS avg_views_30d,
+                        COALESCE(uu30.avg_engagement_pct_30d, 0)::double precision AS avg_engagement_pct_30d,
+                        COALESCE(pp30.content_items_30d, 0)::int AS content_items_30d,
+                        COALESCE(pp30.pci_avg_views_30d, 0)::double precision AS pci_avg_views_30d,
+                        COALESCE(mhist.prior_touchpoints, 0)::int AS prior_touchpoints,
+                        COALESCE(mev.opens_all, 0)::int AS opens_all,
+                        COALESCE(mev.clicks_all, 0)::int AS clicks_all,
+                        (EXTRACT(EPOCH FROM (NOW() - mhist.last_touchpoint_at)) / 86400.0)::double precision AS days_since_last_touchpoint,
+                        (EXTRACT(EPOCH FROM (NOW() - u.created_at)) / 86400.0)::double precision AS account_age_days,
+                        (EXTRACT(EPOCH FROM (NOW() - uact.last_upload_at)) / 86400.0)::double precision AS days_since_last_upload,
+                        (COALESCE(uu30.uploads_30d, 0) - COALESCE(uu_prev30.uploads_prev30d, 0))::double precision AS uploads_trend_30d,
+                        (COALESCE(uu30.avg_views_30d, 0) - COALESCE(uu_prev30.avg_views_prev30d, 0))::double precision AS views_trend_30d,
+                        CASE WHEN (
+                            COALESCE((SELECT SUM(COALESCE(rt.amount,0)) FROM revenue_tracking rt WHERE rt.user_id = au.user_id AND rt.created_at >= NOW() - INTERVAL '30 days'), 0) > 0
+                            OR EXISTS (SELECT 1 FROM marketing_events me WHERE me.user_id = au.user_id AND me.created_at >= NOW() - INTERVAL '30 days' AND me.event_type = 'converted')
+                        ) THEN 1 ELSE 0 END AS converted_7d,
+                        CASE WHEN (
+                            COALESCE((SELECT SUM(COALESCE(rt.amount,0)) FROM revenue_tracking rt WHERE rt.user_id = au.user_id AND rt.created_at >= NOW() - INTERVAL '30 days'), 0) > 0
+                            OR EXISTS (SELECT 1 FROM marketing_events me WHERE me.user_id = au.user_id AND me.created_at >= NOW() - INTERVAL '30 days' AND me.event_type IN ('converted','clicked','campaign_email_open'))
+                        ) THEN 1 ELSE 0 END AS engaged_7d,
+                        COALESCE((SELECT SUM(COALESCE(rt.amount,0))::double precision FROM revenue_tracking rt WHERE rt.user_id = au.user_id AND rt.created_at >= NOW() - INTERVAL '30 days'), 0.0) AS revenue_7d
+                    FROM active_users au
+                    JOIN users u ON u.id = au.user_id
+                    LEFT JOIN wallets w ON w.user_id = au.user_id
+                    LEFT JOIN uu30 ON uu30.user_id = au.user_id
+                    LEFT JOIN uu_prev30 ON uu_prev30.user_id = au.user_id
+                    LEFT JOIN pp30 ON pp30.user_id = au.user_id
+                    LEFT JOIN uact ON uact.user_id = au.user_id
+                    LEFT JOIN mhist ON mhist.user_id = au.user_id
+                    LEFT JOIN mev ON mev.user_id = au.user_id
+                )
+                SELECT * FROM tp_rows
+                UNION ALL
+                SELECT * FROM snap_rows;
+
+                CREATE OR REPLACE VIEW v_content_success_base AS
+                SELECT
+                    pci.upload_id,
+                    pci.user_id,
+                    LOWER(pci.platform)::varchar AS platform,
+                    pci.published_at,
+                    pci.duration_seconds::double precision AS duration_seconds,
+                    GREATEST(0.0, EXTRACT(EPOCH FROM (COALESCE(pci.metrics_synced_at, NOW()) - pci.published_at)) / 86400.0)::double precision AS age_days,
+                    COALESCE(urs.object_track_count, 0)::int AS object_track_count,
+                    COALESCE(urs.person_segment_count, 0)::int AS person_segment_count,
+                    COALESCE(urs.text_detection_count, 0)::int AS text_detection_count,
+                    COALESCE(urs.logo_count, 0)::int AS logo_count,
+                    COALESCE(urs.has_people, FALSE) AS has_people,
+                    COALESCE(urs.coverage_seconds, 0)::double precision AS coverage_seconds,
+                    COALESCE(urs.hydration_score, 0)::double precision AS hydration_score,
+                    u.title,
+                    u.caption,
+                    COALESCE(array_length(u.hashtags, 1), 0)::int AS hashtag_count
+                FROM platform_content_items pci
+                LEFT JOIN upload_recognition_summary urs ON urs.upload_id = pci.upload_id
+                LEFT JOIN uploads u ON u.id = pci.upload_id
+                WHERE pci.upload_id IS NOT NULL;
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

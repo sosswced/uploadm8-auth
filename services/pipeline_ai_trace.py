@@ -18,8 +18,34 @@ def _env_bool(name: str, default: str) -> bool:
     return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
 
 
-def ai_trace_enabled() -> bool:
-    return _env_bool("AI_TRACE_ENABLED", "false")
+def ai_trace_enabled(*, tier: Optional[str] = None) -> bool:
+    if _env_bool("AI_TRACE_ENABLED", "false"):
+        return True
+    from core.pipeline_env_defaults import env_str
+
+    tiers_raw = env_str(
+        "AI_TRACE_TIERS",
+        "pro,studio,agency,master_admin,friends_family",
+    ).strip().lower()
+    if tiers_raw and tier:
+        allowed = {t.strip() for t in tiers_raw.split(",") if t.strip()}
+        if (tier or "").strip().lower() in allowed:
+            return True
+    return False
+
+
+def ai_trace_enabled_for_ctx(ctx) -> bool:
+    tier = ""
+    try:
+        ent = getattr(ctx, "entitlements", None)
+        if ent is not None:
+            tier = str(getattr(ent, "tier", "") or "")
+    except Exception:
+        tier = ""
+    arts = getattr(ctx, "output_artifacts", None) or {}
+    if isinstance(arts, dict) and str(arts.get("ai_trace_requested") or "").lower() in ("1", "true", "yes"):
+        return True
+    return ai_trace_enabled(tier=tier)
 
 
 def ai_trace_preview_chars() -> int:
@@ -61,7 +87,9 @@ def record_ai_pipeline_trace(
     *,
     log: Optional[logging.Logger] = None,
 ) -> None:
-    if not ai_trace_enabled():
+    if ctx is not None and not ai_trace_enabled_for_ctx(ctx):
+        return
+    if ctx is None and not ai_trace_enabled():
         return
     safe = truncate_ai_trace_payload(payload)
     entry = {
@@ -92,7 +120,7 @@ async def emit_ai_pipeline_summary(
     log: logging.Logger,
     db_pool: Optional[Any] = None,
 ) -> None:
-    if ctx is None or not ai_trace_enabled() or not ai_trace_pipeline_summary_enabled():
+    if ctx is None or not ai_trace_enabled_for_ctx(ctx) or not ai_trace_pipeline_summary_enabled():
         return
     events = list(getattr(ctx, "pipeline_ai_trace", None) or [])
     uid = str(upload_id or getattr(ctx, "upload_id", "") or "")

@@ -15,7 +15,7 @@ from core.helpers import _safe_col
 from core.r2 import resolve_user_profile_avatar_url
 from core.sql_allowlist import assert_set_fragments_columns, USERS_UPDATE_COLUMNS_ME, USERS_UPDATE_COLUMNS_PROFILE
 from core.models import ProfileUpdate, ProfileUpdateSettings
-from services.workspace import ensure_personal_workspace
+from services.workspace import ensure_personal_workspace, workspace_capabilities
 from stages.entitlements import get_entitlements_from_user, entitlements_to_dict
 
 logger = logging.getLogger("uploadm8-api")
@@ -30,7 +30,7 @@ def build_me_response(user: dict) -> dict:
     role = user.get("role", "user")
 
     avatar_r2_key = user.get("avatar_r2_key")
-    avatar_signed_url = resolve_user_profile_avatar_url(avatar_r2_key) or None
+    avatar_signed_url = resolve_user_profile_avatar_url(avatar_r2_key, presign=True) or None
 
     raw_name = user.get("name")
     first = (user.get("first_name") or "").strip()
@@ -86,6 +86,7 @@ def build_me_response(user: dict) -> dict:
     ws = user.get("workspace")
     if isinstance(ws, dict):
         out["workspace"] = ws
+    out["workspace_capabilities"] = workspace_capabilities(user)
     return out
 
 

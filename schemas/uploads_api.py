@@ -22,7 +22,8 @@ class UploadInit(BaseModel):
     schedule_mode: str = "immediate"  # immediate | scheduled | smart
     has_telemetry: bool = False
     use_ai: bool = False
-    smart_schedule_days: int = 7  # How many days to spread uploads across
+    smart_schedule_days: int = 14  # How many days to spread uploads across
+    smart_schedule_seed: Optional[str] = None
     duration_seconds: Optional[float] = None
     thumbnail_count: Optional[int] = None
     vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")

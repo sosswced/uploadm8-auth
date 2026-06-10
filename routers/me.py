@@ -73,9 +73,14 @@ from services.user_preferences_persist import save_user_content_preferences
 from services.wallet_page_response import fetch_me_wallet_endpoint_data
 from services.wallet_ledger_query import build_wallet_ledger_payload
 from services.wallet_disputes import create_wallet_dispute, list_user_wallet_disputes
+from services.workspace import require_can_manage_billing, require_can_edit_settings, resolve_billing_user_id
 from services.white_label import (
+    branding_payload_for_user,
     get_white_label_settings_or_defaults,
+    resolve_white_label_logo_url,
     upsert_white_label_settings,
+    white_label_owner_user_id,
+    _require_white_label_manage,
 )
 from stages.entitlements import get_entitlements_from_user
 
@@ -108,6 +113,10 @@ async def get_me(user_id: str = Depends(get_verified_user_id)):
     user, thumbnail_personas = await fetch_me_endpoint_data(pool, user_id)
     payload = build_me_response(user)
     payload["thumbnail_personas"] = thumbnail_personas
+    async with pool.acquire() as conn:
+        branding = await branding_payload_for_user(conn, user)
+        if branding:
+            payload["branding"] = branding
     return payload
 
 
@@ -211,14 +220,34 @@ async def get_me_ai_insights(user: dict = Depends(get_current_user)):
     """Customer Smart Insights hub — platforms, attribution, channel memory, studio usage, coach."""
     from services.ai_insights_hub import ai_insights_hub_fallback, build_ai_insights_hub
 
+    uid = user.get("id")
     pool = core.state.db_pool
     if pool is None:
-        return ai_insights_hub_fallback(error="database_unavailable")
+        payload = ai_insights_hub_fallback(error="database_unavailable")
+        logger.warning(
+            "GET /api/me/smart-insights degraded user_id=%s error=%s",
+            uid,
+            payload.get("error"),
+        )
+        return payload
     try:
-        return await build_ai_insights_hub(pool, user["id"])
+        payload = await build_ai_insights_hub(pool, uid, user=user)
+        if not payload.get("ok"):
+            logger.warning(
+                "GET /api/me/smart-insights degraded user_id=%s error=%s",
+                uid,
+                payload.get("error"),
+            )
+        return payload
     except Exception:
-        logger.exception("GET /api/me/ai-insights failed user_id=%s", user.get("id"))
-        return ai_insights_hub_fallback(error="insights_unavailable")
+        logger.exception("GET /api/me/ai-insights failed user_id=%s", uid)
+        payload = ai_insights_hub_fallback(error="insights_unavailable")
+        logger.warning(
+            "GET /api/me/smart-insights degraded user_id=%s error=%s",
+            uid,
+            payload.get("error"),
+        )
+        return payload
 
 
 @router.get("/api/me/coach")
@@ -330,6 +359,7 @@ async def update_profile_settings(data: ProfileUpdateSettings, user: dict = Depe
 @router.put("/api/settings/preferences/legacy")
 async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depends(get_current_user)):
     """Update user preferences (notifications, theme, hashtags, etc.)"""
+    require_can_edit_settings(user)
     async with core.state.db_pool.acquire() as conn:
         # Ensure user_settings row exists
         await conn.execute(
@@ -465,7 +495,7 @@ async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_c
 
         from core.r2 import resolve_user_profile_avatar_url
 
-        avatar_url = resolve_user_profile_avatar_url(r2_key) or r2_presign_get_url(r2_key)
+        avatar_url = resolve_user_profile_avatar_url(r2_key, presign=True) or r2_presign_get_url(r2_key)
 
         logger.info(f"Avatar uploaded for user {user['id']}: {r2_key}")
         return {"success": True, "r2_key": r2_key, "avatar_url": avatar_url, "avatarUrl": avatar_url}
@@ -596,6 +626,8 @@ async def delete_account(
         then full deletion when Stripe sends subscription.deleted.
     """
     user_id = str(user["id"])
+    billing_id = resolve_billing_user_id(user)
+    is_workspace_member = billing_id != user_id
     ip_addr = request.headers.get("X-Forwarded-For", request.client.host if request.client else None)
 
     if user.get("role") == "master_admin":
@@ -614,6 +646,55 @@ async def delete_account(
             user.get("name", ""),
             ip_addr,
         )
+
+        if is_workspace_member:
+            await conn.execute(
+                """
+                UPDATE workspace_members SET status = 'removed'
+                WHERE user_id = $1::uuid AND status = 'active'
+                """,
+                user_id,
+            )
+            member_row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+            if not member_row:
+                raise HTTPException(404, "User not found")
+            result = await _execute_account_deletion(
+                conn,
+                dict(member_row),
+                ip_addr=ip_addr,
+                initiated_by="account_deletion",
+                background_tasks=background_tasks,
+            )
+            await conn.execute(
+                """
+                UPDATE account_deletion_log
+                SET completed_at = NOW(), r2_keys_deleted = $2, tokens_revoked = $3,
+                    stripe_cancelled = $4, rows_deleted = $5
+                WHERE id = $1
+                """,
+                deletion_log_id,
+                result["r2_deleted"],
+                result["tokens_revoked"],
+                False,
+                json.dumps(result["rows_deleted"]),
+            )
+            logger.info(
+                "[DELETION COMPLETE] workspace_member=%s r2=%s tokens=%s",
+                user_id,
+                result["r2_deleted"],
+                result["tokens_revoked"],
+            )
+            return JSONResponse(
+                content={
+                    "status": "account_deleted",
+                    "message": "Your team member account was removed from the workspace.",
+                    "summary": {
+                        "r2_objects_deleted": result["r2_deleted"],
+                        "platform_tokens_revoked": result["tokens_revoked"],
+                        "rows_deleted": result["rows_deleted"],
+                    },
+                }
+            )
 
         stripe_sub_id = user.get("stripe_subscription_id")
         has_active_paid_sub = bool(stripe_sub_id and STRIPE_SECRET_KEY)
@@ -800,15 +881,20 @@ async def create_my_wallet_dispute(
 
 @router.post("/api/wallet/topup")
 async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_user)):
+    require_can_manage_billing(user)
     product = get_effective_topup_products().get(data.lookup_key)
     if not product: raise HTTPException(400, "Invalid product")
 
+    bill_id = resolve_billing_user_id(user)
     async with core.state.db_pool.acquire() as conn:
-        customer_id = user.get("stripe_customer_id")
+        owner = await conn.fetchrow("SELECT email, name, stripe_customer_id FROM users WHERE id = $1", bill_id)
+        if not owner:
+            raise HTTPException(404, "Billing account not found")
+        customer_id = owner.get("stripe_customer_id")
         if not customer_id:
-            customer = stripe.Customer.create(email=user["email"], name=user["name"])
+            customer = stripe.Customer.create(email=owner["email"], name=owner.get("name") or owner["email"])
             customer_id = customer.id
-            await conn.execute("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", customer_id, user["id"])
+            await conn.execute("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", customer_id, bill_id)
 
     prices = stripe.Price.list(lookup_keys=[data.lookup_key], active=True)
     if not prices.data: raise HTTPException(400, "Price not found")
@@ -820,7 +906,7 @@ async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_u
         success_url=STRIPE_SUCCESS_URL,
         cancel_url=STRIPE_CANCEL_URL,
         metadata={
-            "user_id": str(user["id"]),
+            "user_id": bill_id,
             "lookup_key": data.lookup_key,
             "wallet": product.get("wallet", "put"),
             "amount": str(product.get("amount", 0)),
@@ -830,10 +916,12 @@ async def wallet_topup(data: CheckoutRequest, user: dict = Depends(get_current_u
 
 @router.post("/api/wallet/transfer")
 async def wallet_transfer(data: TransferRequest, user: dict = Depends(get_current_user)):
+    require_can_manage_billing(user)
     if not user.get("flex_enabled"):
         raise HTTPException(403, "Flex add-on required for transfers")
+    bill_id = resolve_billing_user_id(user)
     async with core.state.db_pool.acquire() as conn:
-        success = await transfer_tokens(conn, user["id"], data.from_platform, data.to_platform, data.amount)
+        success = await transfer_tokens(conn, bill_id, data.from_platform, data.to_platform, data.amount)
     if not success: raise HTTPException(400, "Transfer failed - insufficient balance")
     return {"status": "transferred", "amount": data.amount, "burn": int(data.amount * 0.02)}
 
@@ -922,7 +1010,14 @@ async def get_white_label(user: dict = Depends(get_current_user)):
             {"code": "feature_white_label", "message": "White label requires Agency plan."},
         )
     async with core.state.db_pool.acquire() as conn:
-        settings = await get_white_label_settings_or_defaults(conn, str(user["id"]))
+        settings = await get_white_label_settings_or_defaults(conn, white_label_owner_user_id(user))
+        settings["can_manage"] = bool(
+            ent.can_white_label
+            and (
+                not isinstance(user.get("workspace"), dict)
+                or str((user.get("workspace") or {}).get("role") or "").lower() in ("owner", "admin")
+            )
+        )
     return settings
 
 
@@ -932,6 +1027,33 @@ async def put_white_label(body: WhiteLabelUpdate, user: dict = Depends(get_curre
     async with core.state.db_pool.acquire() as conn:
         settings = await upsert_white_label_settings(conn, user, payload)
     return settings
+
+
+@router.post("/api/me/white-label/logo")
+async def upload_white_label_logo(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    _require_white_label_manage(user)
+    allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid file type. Use JPEG, PNG, GIF, WebP, or SVG.")
+    content = await file.read()
+    if len(content) > 2 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Logo must be 2MB or smaller.")
+    ext = file.filename.split(".")[-1].lower() if file.filename and "." in file.filename else "png"
+    owner_id = white_label_owner_user_id(user)
+    r2_key = f"white-label/{owner_id}/logo.{ext}"
+    s3 = get_s3_client()
+    if not R2_BUCKET_NAME:
+        raise HTTPException(status_code=500, detail="Missing R2_BUCKET_NAME")
+    s3.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=r2_key,
+        Body=content,
+        ContentType=file.content_type or "image/png",
+    )
+    async with core.state.db_pool.acquire() as conn:
+        settings = await upsert_white_label_settings(conn, user, {"logo_url": r2_key})
+    logo_url = resolve_white_label_logo_url(r2_key)
+    return {"success": True, "r2_key": r2_key, "logo_url": logo_url, "settings": settings}
 
 
 # Base columns that exist in user_settings from migration 5 (before 707)
@@ -949,6 +1071,7 @@ _SETTINGS_EXTENDED_FIELDS = [
 @router.put("/api/settings")
 async def update_settings(data: SettingsUpdate, user: dict = Depends(get_current_user)):
     """Update user settings including Trill thresholds"""
+    require_can_edit_settings(user)
     all_fields = _SETTINGS_BASE_FIELDS + _SETTINGS_EXTENDED_FIELDS
     updates, params = [], [user["id"]]
 
@@ -1044,6 +1167,7 @@ async def test_user_discord_webhook(data: dict, user: dict = Depends(get_current
     """Send a test message to the user's Discord webhook (for Settings page Test Webhook button).
     Accepts webhookUrl or webhook_url in body. If empty, uses the user's saved webhook from settings.
     The same saved URL is used when admin sends via 'Send to user webhooks'."""
+    require_can_edit_settings(user)
     webhook_url = (data.get("webhookUrl") or data.get("webhook_url") or "").strip()
     if not webhook_url:
         async with core.state.db_pool.acquire() as conn:
@@ -1132,6 +1256,7 @@ async def _validate_thumbnail_default_persona_row(conn, merged: dict, user_id) -
 @router.put("/api/me/preferences")
 async def update_preferences(request: Request, user: dict = Depends(get_current_user)):
     """Update user preferences including hashtag settings"""
+    require_can_edit_settings(user)
     prefs = await request.json()
 
     # Validate and sanitize hashtag data (string-safe; avoids list('#tag') char-splitting)

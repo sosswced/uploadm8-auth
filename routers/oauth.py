@@ -44,6 +44,7 @@ from services.meta_oauth import (
     meta_instagram_oauth_scope,
     meta_oauth_mode,
 )
+from services.workspace import require_can_manage_platforms, resolve_billing_user_id
 from stages.entitlements import can_user_connect_platform
 
 logger = logging.getLogger("uploadm8-api")
@@ -69,6 +70,10 @@ async def oauth_start(
     if platform not in OAUTH_CONFIG:
         raise HTTPException(400, f"Unsupported platform: {platform}")
 
+    require_can_manage_platforms(user)
+    platform_user_id = resolve_billing_user_id(user)
+    actor_user_id = str(user["id"])
+
     # Account limits are enforced in the OAuth callback on *new* rows only, so users at the limit
     # can still reconnect (UPDATE) existing platform identities.
 
@@ -88,7 +93,7 @@ async def oauth_start(
                   AND revoked_at IS NULL
                 """,
                 reconnect_account_id,
-                str(user["id"]),
+                platform_user_id,
                 platform,
             )
         if not reconnect_target:
@@ -98,9 +103,10 @@ async def oauth_start(
     if platform == "tiktok":
         tiktok_code_verifier, tiktok_code_challenge = tiktok_pkce_verifier_and_challenge()
 
-    # Store state with user info
+    # Store state with workspace platform owner + acting member
     state_payload: dict = {
-        "user_id": str(user["id"]),
+        "user_id": platform_user_id,
+        "actor_user_id": actor_user_id,
         "platform": platform,
         "created_at": _now_utc().isoformat(),
         "parent_origin": sanitize_oauth_parent_origin(parent_origin),

@@ -20,10 +20,28 @@ from core.helpers import _load_uploads_columns, _now_utc, _pick_cols, _safe_col,
 from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragments_columns
 from core.r2 import get_s3_client, _normalize_r2_key, resolve_stored_account_avatar_url
 from core.models import SmartScheduleOnlyUpdate
+from services.upload.list_detail import _upload_error_message
+from services.upload.status import CANCELLABLE_STATUSES, is_requeueable_upload
 from services.uploads_handlers import SCHEDULED_PIPELINE_STATUSES, scheduled_in_clause
-from services.shell_bootstrap import _fetch_platforms_bundle
+from services.shell_bootstrap import _bootstrap_schedule_repair, _fetch_platforms_bundle, _ok
+from services.upload.schedule_guard import schedule_slot_iso
 
 logger = logging.getLogger(__name__)
+
+_CANCELLABLE_SET = frozenset(CANCELLABLE_STATUSES)
+
+
+def _is_cancellable(status: str) -> bool:
+    return (status or "").lower() in _CANCELLABLE_SET
+
+
+def _processing_window_minutes() -> int:
+    import os
+
+    try:
+        return max(1, int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15")))
+    except (TypeError, ValueError):
+        return 15
 
 
 def _presign_thumbnail_r2_key(thumb_key: Any) -> Optional[str]:
@@ -55,42 +73,36 @@ def _smart_schedule_from_upload_row(upload: dict) -> Optional[dict]:
 
 
 async def _scheduled_stats_row(conn: Any, uid: str) -> dict[str, int]:
-    """One query for pending / today / week (replaces three COUNT round-trips)."""
-    now = _now_utc()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = today_start + timedelta(days=1)
-    week_end = now + timedelta(days=7)
+    """Pending / today / week — counts any smart slot in the window, not just scheduled_time."""
+    from services.schedule_slots import compute_scheduled_stats
+
     ph, statuses = scheduled_in_clause(2)
-    n = len(statuses)
-    today_start_idx = 2 + n
-    row = await conn.fetchrow(
+    rows = await conn.fetch(
         f"""
-        SELECT
-            COUNT(*)::int AS pending,
-            COUNT(*) FILTER (
-                WHERE scheduled_time >= ${today_start_idx}
-                  AND scheduled_time < ${today_start_idx + 1}
-            )::int AS today,
-            COUNT(*) FILTER (
-                WHERE scheduled_time >= ${today_start_idx + 2}
-                  AND scheduled_time < ${today_start_idx + 3}
-            )::int AS week
+        SELECT scheduled_time, schedule_mode, schedule_metadata
         FROM uploads
         WHERE user_id = $1
           AND status IN ({ph})
         """,
         uid,
         *statuses,
-        today_start,
-        today_end,
-        now,
-        week_end,
     )
-    return {
-        "pending": int((row["pending"] if row else 0) or 0),
-        "today": int((row["today"] if row else 0) or 0),
-        "week": int((row["week"] if row else 0) or 0),
-    }
+    payload = []
+    for row in rows:
+        sm = row.get("schedule_metadata")
+        if sm and isinstance(sm, str):
+            try:
+                sm = json.loads(sm)
+            except Exception:
+                sm = None
+        payload.append(
+            {
+                "scheduled_time": row.get("scheduled_time"),
+                "schedule_mode": row.get("schedule_mode"),
+                "schedule_metadata": sm,
+            }
+        )
+    return compute_scheduled_stats(payload, now=_now_utc())
 
 
 async def _scheduled_upload_list_for_user(
@@ -195,6 +207,12 @@ async def _scheduled_upload_list_for_user(
                     "schedule_mode": upload.get("schedule_mode") or "scheduled",
                     "smart_schedule": smart_schedule,
                     "is_editable": upload["status"] in SCHEDULED_PIPELINE_STATUSES,
+                    "is_cancellable": _is_cancellable(upload["status"]),
+                    "is_requeueable": is_requeueable_upload(
+                        str(upload.get("status") or ""), upload.get("error_code")
+                    ),
+                    "error_code": upload.get("error_code"),
+                    "error": _upload_error_message(dict(upload)),
                     "created_at": upload["created_at"].isoformat()
                     if upload.get("created_at")
                     else None,
@@ -216,6 +234,8 @@ _SCHEDULED_LIST_COLS = [
     "timezone",
     "schedule_mode",
     "schedule_metadata",
+    "error_code",
+    "error_detail",
 ]
 
 _SCHEDULED_DETAIL_COLS = [
@@ -232,6 +252,8 @@ _SCHEDULED_DETAIL_COLS = [
     "created_at",
     "schedule_mode",
     "schedule_metadata",
+    "error_code",
+    "error_detail",
 ]
 
 
@@ -275,24 +297,18 @@ router = APIRouter(prefix="/api/scheduled", tags=["scheduled"])
 
 
 # ------------------------------------------------------------------
-# GET /api/scheduled  — list scheduled uploads
+# GET /api/scheduled  — removed; use /bootstrap or /list
 # ------------------------------------------------------------------
 @router.get("")
-async def get_scheduled(user: dict = Depends(get_current_user)):
-    """Get scheduled uploads — canonical SCHEDULED_PIPELINE_STATUSES bucket."""
-    placeholders, statuses = scheduled_in_clause(2)
-    async with core.state.db_pool.acquire() as conn:
-        uploads = await conn.fetch(
-            f"""
-            SELECT * FROM uploads
-            WHERE user_id = $1
-              AND status IN ({placeholders})
-            ORDER BY scheduled_time ASC NULLS LAST, created_at ASC
-            """,
-            user["id"],
-            *statuses,
-        )
-    return [{"id": str(u["id"]), "filename": u["filename"], "platforms": u["platforms"], "status": u["status"], "title": u["title"], "scheduled_time": u["scheduled_time"].isoformat() if u["scheduled_time"] else None, "created_at": u["created_at"].isoformat() if u["created_at"] else None, "schedule_mode": u["schedule_mode"]} for u in uploads]
+async def get_scheduled_removed():
+    raise HTTPException(
+        410,
+        detail={
+            "code": "endpoint_removed",
+            "message": "GET /api/scheduled was removed. Use GET /api/scheduled/bootstrap or GET /api/scheduled/list.",
+            "successor": "/api/scheduled/bootstrap",
+        },
+    )
 
 
 # ------------------------------------------------------------------
@@ -329,6 +345,8 @@ async def get_scheduled_bootstrap(user: dict = Depends(get_current_user_readonly
         async with pool.acquire() as conn:
             return await _scheduled_stats_row(conn, uid)
 
+    schedule_repair = await _bootstrap_schedule_repair(pool, uid)
+
     try:
         stats, uploads, platforms = await asyncio.gather(
             _stats(),
@@ -339,15 +357,24 @@ async def get_scheduled_bootstrap(user: dict = Depends(get_current_user_readonly
                 presign_account_avatars=False,
             ),
             _fetch_platforms_bundle(pool, uid, plan),
+            return_exceptions=True,
         )
     except Exception:
         logger.exception("get_scheduled_bootstrap failed user_id=%s", uid)
         raise
 
+    stats = _ok(stats)
+    uploads = _ok(uploads)
+    platforms = _ok(platforms)
+    if stats is None and uploads is None:
+        raise HTTPException(503, "Scheduled bootstrap unavailable")
+
     return {
-        "stats": stats,
-        "uploads": uploads,
+        "stats": stats or {},
+        "uploads": uploads if uploads is not None else [],
         "platforms": platforms,
+        "processing_window_minutes": _processing_window_minutes(),
+        "schedule_repair": schedule_repair,
     }
 
 
@@ -374,6 +401,80 @@ async def get_scheduled_list(
     except Exception:
         logger.exception("get_scheduled_list failed user_id=%s", uid)
         raise
+
+
+def _infer_smart_spread_days(schedule_metadata: Any, default: int = 14) -> int:
+    """Guess spread window from existing smart slots (for recalculate)."""
+    from services.deferred_publish_schedule import parse_schedule_metadata
+
+    slots = parse_schedule_metadata(schedule_metadata)
+    if not slots:
+        return default
+    today = _now_utc().date()
+    max_off = 0
+    for dt in slots.values():
+        max_off = max(max_off, (dt.date() - today).days)
+    return max(7, min(730, max(default, max_off + 1)))
+
+
+# ------------------------------------------------------------------
+# POST /api/scheduled/{upload_id}/recalculate-smart
+# ------------------------------------------------------------------
+@router.post("/{upload_id:uuid}/recalculate-smart")
+async def recalculate_smart_schedule(upload_id: UUID, user: dict = Depends(get_current_user)):
+    """Recompute per-platform smart times (respects blocked days, excludes this upload)."""
+    uid_str = str(upload_id)
+    bill_id = str(user.get("billing_user_id") or user["id"])
+    async with core.state.db_pool.acquire() as conn:
+        upload = await conn.fetchrow(
+            """
+            SELECT id, status, schedule_mode, platforms, schedule_metadata, user_id
+            FROM uploads
+            WHERE id = $1 AND user_id = $2
+            """,
+            uid_str,
+            user["id"],
+        )
+        if not upload:
+            raise HTTPException(404, "Scheduled upload not found")
+        if (upload.get("schedule_mode") or "").lower() != "smart":
+            raise HTTPException(400, "Recalculate is only available for smart-scheduled uploads")
+        if upload["status"] not in SCHEDULED_PIPELINE_STATUSES:
+            raise HTTPException(400, "Cannot recalculate schedule for an upload that is no longer editable")
+
+        platforms = list(upload["platforms"] or [])
+        if not platforms:
+            raise HTTPException(400, "Upload has no platforms")
+
+        num_days = _infer_smart_spread_days(upload.get("schedule_metadata"))
+        from services.upload.schedule_guard import build_smart_schedule_for_upload
+
+        smart = await build_smart_schedule_for_upload(
+            conn,
+            bill_id,
+            platforms,
+            num_days=num_days,
+            exclude_upload_id=uid_str,
+            random_seed=str(uuid.uuid4()),
+        )
+        if not smart:
+            raise HTTPException(
+                500,
+                detail={
+                    "code": "schedule_generation_failed",
+                    "message": "Could not generate new smart schedule times.",
+                },
+            )
+        sm = {p: schedule_slot_iso(dt) for p, dt in smart.items()}
+        await _apply_smart_schedule(conn, uid_str, user["id"], sm)
+
+    scheduled_min = min(smart.values()).isoformat() if smart else None
+    return {
+        "status": "updated",
+        "id": uid_str,
+        "smart_schedule": sm,
+        "scheduled_time": scheduled_min,
+    }
 
 
 # ------------------------------------------------------------------
@@ -439,6 +540,12 @@ async def get_scheduled_upload(upload_id: UUID, user: dict = Depends(get_current
         "schedule_metadata": sm,
         "smart_schedule": sm,  # alias for scheduled.html saveScheduledUpload()
         "is_editable": upload.get("status") in SCHEDULED_PIPELINE_STATUSES,
+        "is_cancellable": _is_cancellable(upload.get("status") or ""),
+        "is_requeueable": is_requeueable_upload(
+            str(upload.get("status") or ""), upload.get("error_code")
+        ),
+        "error_code": upload.get("error_code"),
+        "error": _upload_error_message(dict(upload)),
         "created_at": upload["created_at"].isoformat() if upload.get("created_at") else None,
     }
 
@@ -594,8 +701,14 @@ async def cancel_scheduled_upload(upload_id: UUID, user: dict = Depends(get_curr
         # deleting them mid-publish risks double-spending refunded tokens. Users
         # see those rows in the scheduled list (is_editable=True for metadata
         # edits) but cannot fully cancel — this is by design.
-        if upload["status"] not in ('pending', 'scheduled', 'queued'):
-            raise HTTPException(400, "Cannot cancel upload that is already processing or completed")
+        if upload["status"] not in _CANCELLABLE_SET:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "not_cancellable",
+                    "message": "Cannot cancel upload that is already processing or completed",
+                },
+            )
 
         # Refund reserved tokens if any
         if upload["put_reserved"] > 0 or upload["aic_reserved"] > 0:

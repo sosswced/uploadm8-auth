@@ -71,6 +71,14 @@ def _load_report() -> Dict[str, Any]:
     return _cached["report"]
 
 
+def reload_model() -> None:
+    with _cache_lock:
+        _cached["pipeline"] = None
+        _cached["report"] = None
+        _cached["model_mtime"] = None
+        _cached["report_mtime"] = None
+
+
 def _load_pipeline():
     import joblib
 
@@ -161,6 +169,11 @@ def score_features(features: Dict[str, Any]) -> Tuple[float, str]:
     return _toy_propensity_score(features), "propensity_v1_toy"
 
 
+_VIEW_SNAPSHOT_SQL = (
+    "SELECT * FROM v_promo_targeting_features WHERE touchpoint_id = $1 LIMIT 1"
+)
+
+
 async def score_user_propensity(
     conn: asyncpg.Connection,
     user_id: str,
@@ -169,6 +182,17 @@ async def score_user_propensity(
     range_key: str = "30d",
     channel: str = "email",
 ) -> Tuple[float, str]:
+    # Preferred path: the curated view's snapshot row gives exact train/serve
+    # parity (same SQL the training dataset is built from).
+    try:
+        rec = await conn.fetchrow(_VIEW_SNAPSHOT_SQL, f"user:{user_id}")
+    except Exception as e:  # noqa: BLE001 - view may be absent; fall back below
+        logger.warning("promo view snapshot fetch failed: %s", e)
+        rec = None
+    if rec is not None:
+        return score_features(dict(rec))
+
+    # Fallback path: assemble from live campaign features.
     from services.wallet_marketing import _user_campaign_features
 
     feats = await _user_campaign_features(conn, user_id, range_key)
@@ -189,9 +213,6 @@ async def score_user_propensity(
 
 def ml_targeting_enabled() -> bool:
     """When on, campaign/touchpoint sends respect trained propensity thresholds."""
-    raw = (os.environ.get("MARKETING_ML_TARGETING_ENABLED") or "").strip().lower()
-    if raw in ("0", "false", "no", "off"):
-        return False
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    return model_ready()
+    from core.pipeline_env_defaults import env_bool
+
+    return env_bool("MARKETING_ML_TARGETING_ENABLED", default=True)

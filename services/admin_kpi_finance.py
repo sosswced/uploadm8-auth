@@ -11,10 +11,14 @@ import logging
 import math
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger("uploadm8.admin_kpi_finance")
+
+_PROVIDER_COSTS_CACHE_TTL_S = 90.0
+_provider_costs_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 # cost_tracking.category → admin KPI provider bucket
 _GOOGLE_CATEGORIES = frozenset({
@@ -394,6 +398,12 @@ async def build_admin_costs_summary(
 
 
 async def build_provider_costs_payload(conn, *, range_key: str | None) -> Dict[str, Any]:
+    cache_key = range_key or "30d"
+    now_mono = time.monotonic()
+    cached = _provider_costs_cache.get(cache_key)
+    if cached and (now_mono - cached[0]) < _PROVIDER_COSTS_CACHE_TTL_S:
+        return dict(cached[1])
+
     since, until = window_from_range_key(range_key)
     by_cat = await fetch_cost_categories_window(conn, since, until)
     buckets = _bucket_totals(by_cat)
@@ -532,7 +542,7 @@ async def build_provider_costs_payload(conn, *, range_key: str | None) -> Dict[s
         for cat, meta in sorted(by_cat.items())
     ]
 
-    return {
+    result = {
         "range": range_key or "30d",
         "window_start": since.isoformat(),
         "window_end": until.isoformat(),
@@ -567,6 +577,8 @@ async def build_provider_costs_payload(conn, *, range_key: str | None) -> Dict[s
             "pikzels_note": "Set KPI_PIKZELS_USD_PER_CALL or KPI_PIKZELS_MONTHLY_COST; usage from studio_usage_events",
         },
     }
+    _provider_costs_cache[cache_key] = (time.monotonic(), result)
+    return result
 
 
 async def build_cost_tracker_payload(conn, *, range_key: str | None) -> Dict[str, Any]:

@@ -153,6 +153,49 @@ async def marketing_accounts(
         return {"range": range, "q": q, "accounts": []}
 
 
+@marketing_router.get("/touchpoint-deliveries")
+async def marketing_touchpoint_deliveries(
+    limit: int = Query(200, ge=1, le=500),
+    channel: str = Query("email"),
+    segment_key: str = Query("high_tier_platform_headroom_v1"),
+    status: str = Query(""),
+    user: dict = Depends(require_admin),
+):
+    """Outbound automation log — who was emailed / nudged and when (dedupe audit)."""
+    from services.marketing_touchpoint_runner import fetch_touchpoint_delivery_log
+
+    st = (status or "").strip().lower() or None
+    ch = (channel or "").strip().lower() or None
+    seg = (segment_key or "").strip() or None
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            items = await fetch_touchpoint_delivery_log(
+                conn,
+                limit=limit,
+                channel=ch,
+                segment_key=seg,
+                status=st,
+            )
+            last_run = await conn.fetchrow(
+                """
+                SELECT started_at, finished_at, users_messaged, email_sent, skipped_dedupe, status
+                FROM marketing_automation_runs
+                WHERE segment_key = $1 OR segment_key IS NULL
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                seg,
+            )
+        return {
+            "items": items,
+            "count": len(items),
+            "last_run": dict(last_run) if last_run else None,
+        }
+    except Exception as e:
+        logger.warning("touchpoint_deliveries: %s", e)
+        return {"items": [], "count": 0, "error": str(e)}
+
+
 @marketing_router.get("/campaigns")
 async def marketing_campaigns_list(limit: int = Query(100, ge=1, le=500), user: dict = Depends(require_admin)):
     async with core.state.db_pool.acquire() as conn:

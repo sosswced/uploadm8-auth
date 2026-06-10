@@ -83,6 +83,26 @@ _LEADERBOARD_CACHE: dict[str, tuple[float, dict]] = {}
 _LEADERBOARD_CACHE_TTL_SEC = 120.0
 
 
+def leaderboard_serve_from_cache(
+    cache: dict[str, tuple[float, dict]],
+    cache_key: str,
+    *,
+    now: float | None = None,
+    ttl_sec: float = _LEADERBOARD_CACHE_TTL_SEC,
+) -> dict | None:
+    """Return cached leaderboard payload; strip one-shot rival_alerts so toasts do not replay."""
+    cached = cache.get(cache_key)
+    if not cached:
+        return None
+    ts, payload = cached
+    t = now if now is not None else _time.time()
+    if (t - ts) >= ttl_sec:
+        return None
+    resp = dict(payload)
+    resp["rival_alerts"] = []
+    return resp
+
+
 async def _leaderboard_badge_and_rival_followup(
     uid_str: str,
     since: datetime,
@@ -803,9 +823,9 @@ async def trill_leaderboard(
     """Community leaderboard — opted-in users only; aggregates (no route geometry)."""
     uid = user_id
     cache_key = f"{uid}:{range}:{sort}:{region or ''}:{limit}"
-    cached = _LEADERBOARD_CACHE.get(cache_key)
-    if cached and (_time.time() - cached[0]) < _LEADERBOARD_CACHE_TTL_SEC:
-        return cached[1]
+    cached_resp = leaderboard_serve_from_cache(_LEADERBOARD_CACHE, cache_key)
+    if cached_resp is not None:
+        return cached_resp
     since = _trill_since_dt(range)
     sort_key = (sort or "best_trill").strip()
     if sort_key not in _LEADERBOARD_SORTS:
@@ -997,7 +1017,9 @@ async def trill_leaderboard(
                 uid_str = str(uid)
                 user_ids = [str(r["user_id"]) for r in rows]
                 if user_ids:
-                    scores_map = await fetch_recent_scores_batch(conn, user_ids, since)
+                    scores_map = await fetch_recent_scores_batch(
+                        conn, user_ids, since, route_backed_only=False
+                    )
                     badges_map = await fetch_badges_for_users(conn, user_ids)
 
                 viewer_rank = None

@@ -13,18 +13,28 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from stages.entitlements import get_entitlements_for_tier, normalize_tier
 from services.growth_intelligence import fetch_user_engagement_snapshot
+from services.marketing_compliance import (
+    assert_channel_rate_ok,
+    is_suppressed,
+    user_discord_marketing_allowed,
+    user_email_marketing_allowed,
+)
 from stages.emails.base import (
     FRONTEND_URL,
+    MAIL_FROM_HELLO,
+    SUPPORT_EMAIL,
     cta_button,
     email_shell,
     intro_row,
     mailgun_ready,
+    sanitize_email_subject,
     send_email,
 )
 
@@ -40,7 +50,10 @@ MARKETING_AUTOMATION_ENABLED = os.environ.get("MARKETING_AUTOMATION_ENABLED", ""
 )
 MARKETING_AUTOMATION_INTERVAL_SEC = int(os.environ.get("MARKETING_AUTOMATION_INTERVAL_SEC", str(4 * 3600)))
 MARKETING_AUTOMATION_MAX_USERS = int(os.environ.get("MARKETING_AUTOMATION_MAX_USERS", "80"))
-MARKETING_AUTOMATION_DEDUPE_DAYS = int(os.environ.get("MARKETING_AUTOMATION_DEDUPE_DAYS", "14"))
+MARKETING_AUTOMATION_DEDUPE_DAYS = int(os.environ.get("MARKETING_AUTOMATION_DEDUPE_DAYS", "90"))
+MARKETING_AUTOMATION_DEDUPE_ONCE_SEGMENT = os.environ.get(
+    "MARKETING_AUTOMATION_DEDUPE_ONCE_SEGMENT", "true"
+).strip().lower() in ("1", "true", "yes", "on")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_TOUCHPOINT_MODEL", "gpt-4o-mini")
@@ -70,20 +83,72 @@ def _qualifies(tier: str, n_conn: int, max_ac: int, per_pf: int) -> bool:
     return False
 
 
-async def _recent_touchpoint(conn, user_id: str) -> bool:
-    row = await conn.fetchval(
+async def _should_skip_touchpoint(
+    conn,
+    user_id: str,
+    channel: str,
+    segment_key: str,
+    n_conn: int,
+) -> Tuple[bool, str]:
+    """
+    Skip repeat automation for the same user/segment/channel.
+
+    Rules (in order):
+    - pending outbound for this channel + segment
+    - prior sent at same or higher connection count (user did not add accounts)
+    - within dedupe window OR one-shot segment mode (default)
+    """
+    rows = await conn.fetch(
         """
-        SELECT 1 FROM marketing_touchpoint_deliveries
+        SELECT status, sent_at, created_at,
+               COALESCE(meta->>'segment_key', '') AS seg,
+               COALESCE((meta->>'connected')::int, -1) AS prev_conn
+        FROM marketing_touchpoint_deliveries
         WHERE user_id = $1::uuid
-          AND meta->>'segment_key' = $2
-          AND created_at >= NOW() - ($3::int * INTERVAL '1 day')
-        LIMIT 1
+          AND channel = $2
+          AND status IN ('sent', 'pending')
+          AND (
+            COALESCE(meta->>'segment_key', '') = $3
+            OR (meta->>'segment_key' IS NULL AND $3 = $4)
+          )
+        ORDER BY COALESCE(sent_at, created_at) DESC
+        LIMIT 8
         """,
         user_id,
+        channel,
+        segment_key,
         SEGMENT_KEY,
-        MARKETING_AUTOMATION_DEDUPE_DAYS,
     )
-    return row is not None
+    if not rows:
+        return False, ""
+
+    for row in rows:
+        st = str(row["status"] or "").lower()
+        if st == "pending":
+            return True, "pending_outbound"
+
+        prev_conn = int(row["prev_conn"] or -1)
+        if prev_conn >= 0 and n_conn > prev_conn:
+            continue
+
+        if MARKETING_AUTOMATION_DEDUPE_ONCE_SEGMENT and st == "sent":
+            # Legacy rows without meta.connected (-1) still dedupe; new send allowed when user added accounts.
+            if prev_conn < 0 or n_conn <= prev_conn:
+                return True, "already_sent_segment"
+            continue
+
+        ref = row["sent_at"] or row["created_at"]
+        if ref is not None:
+            try:
+                if ref.tzinfo is None:
+                    ref = ref.replace(tzinfo=timezone.utc)
+                age_days = (datetime.now(timezone.utc) - ref).total_seconds() / 86400.0
+            except Exception:
+                age_days = MARKETING_AUTOMATION_DEDUPE_DAYS
+            if age_days < MARKETING_AUTOMATION_DEDUPE_DAYS:
+                return True, f"dedupe_{int(age_days)}d"
+
+    return False, ""
 
 
 async def _fetch_discord_webhook(conn, user_id: str) -> Optional[str]:
@@ -120,12 +185,17 @@ async def _synthesize_copy(
             f" Your recent posts average ~{er:.2f}% engagement (likes+comments+shares vs views) — "
             "more connected channels help you scale what's already working."
         )
+    tier_label = tier.replace("_", " ")
+    first = (name.split()[0] if name else "there").strip()
     base = {
-        "email_subject": f"{name.split()[0] if name else 'Hey'} — use your {tier.replace('_', ' ')} account slots",
+        "email_subject": sanitize_email_subject(
+            f"{first}, connect more YouTube, TikTok, and Instagram accounts on UploadM8",
+            brand_prefix=False,
+        ),
         "email_body_plain": (
-            f"Your {tier.replace('_', ' ')} plan supports up to {max_ac} connected channels "
-            f"({n_conn} active logins today). Cross-posting more accounts usually lifts reach — "
-            f"add another YouTube, TikTok, Instagram, or Facebook login in UploadM8."
+            f"Hi {first}, your {tier_label} plan includes up to {max_ac} connected social accounts "
+            f"({n_conn} connected today). Link another YouTube, TikTok, Instagram, or Facebook channel "
+            f"in UploadM8 to publish the same video to more platforms."
             + eng_hint
         ),
         "in_app_title": "Connect more platforms on your plan",
@@ -165,13 +235,17 @@ async def _synthesize_copy(
                         {
                             "role": "system",
                             "content": (
-                                "You write concise SaaS lifecycle marketing. Output JSON with keys: "
-                                "email_subject (string), email_body_plain (string, <=520 chars), "
+                                "You write concise SaaS lifecycle email copy for UploadM8 (multi-platform video publishing). "
+                                "Output JSON with keys: "
+                                "email_subject (string, <=72 chars), email_body_plain (string, <=520 chars), "
                                 "in_app_title (string), in_app_body (string, <=320 chars), "
                                 "discord_text (string, markdown, <=400 chars). "
-                                "Tone: helpful, not hype. Mention connecting more social accounts. "
-                                "If engagement_30d has samples, you may briefly reference strong or weak "
-                                "likes/comments/shares vs views — never fabricate numbers."
+                                "Subject rules: include 'UploadM8', mention YouTube/TikTok/Instagram when relevant, "
+                                "no ALL CAPS, no emoji, no exclamation marks, no spam phrases like "
+                                "'Act now', 'Limited time', 'Enhance your reach'. Sound like a helpful product email. "
+                                "Body: plain language about connecting more platform accounts. "
+                                "If engagement_30d has samples, you may briefly reference likes/comments/shares vs views "
+                                "— never fabricate numbers."
                             ),
                         },
                         {"role": "user", "content": json.dumps(payload)},
@@ -188,6 +262,8 @@ async def _synthesize_copy(
             for k in base:
                 if parsed.get(k):
                     base[k] = str(parsed[k])[: 800 if k == "email_body_plain" else 400]
+            if base.get("email_subject"):
+                base["email_subject"] = sanitize_email_subject(base["email_subject"])
         return base, True
     except Exception as e:
         logger.warning("touchpoint OpenAI failed: %s", e)
@@ -250,14 +326,44 @@ async def run_touchpoint_cycle(pool) -> Dict[str, Any]:
             evaluated += 1
             if not _qualifies(tier_n, n_conn, ent.max_accounts, ent.max_accounts_per_platform):
                 continue
-            if await _recent_touchpoint(conn, uid):
+
+            deliver_email = want_email
+            deliver_discord = want_discord
+            deliver_in_app = want_in_app
+            for ch in ("email", "discord", "in_app"):
+                if ch == "email" and not want_email:
+                    continue
+                if ch == "discord" and not want_discord:
+                    continue
+                if ch == "in_app" and not want_in_app:
+                    continue
+                skip, _reason = await _should_skip_touchpoint(conn, uid, ch, SEGMENT_KEY, n_conn)
+                if skip:
+                    out["skipped_dedupe"] += 1
+                    if ch == "email":
+                        deliver_email = False
+                    elif ch == "discord":
+                        deliver_discord = False
+                    else:
+                        deliver_in_app = False
+
+            if not deliver_email and not deliver_discord and not deliver_in_app:
+                continue
+
+            if deliver_email and await is_suppressed(conn, uid, "email"):
+                deliver_email = False
                 out["skipped_dedupe"] += 1
+            if deliver_discord and await is_suppressed(conn, uid, "discord"):
+                deliver_discord = False
+                out["skipped_dedupe"] += 1
+
+            if not deliver_email and not deliver_discord and not deliver_in_app:
                 continue
 
             name = (r["name"] or "there").strip()
             email = (r["email"] or "").strip()
-            if not email:
-                continue
+            if not email and deliver_email:
+                deliver_email = False
 
             touched_any = False
             eng_ctx = await fetch_user_engagement_snapshot(conn, uid)
@@ -282,7 +388,7 @@ async def run_touchpoint_cycle(pool) -> Dict[str, Any]:
             }
 
             # In-app: replace prior pending rows for this user/channel
-            if want_in_app:
+            if deliver_in_app:
                 await conn.execute(
                     """
                     DELETE FROM marketing_touchpoint_deliveries
@@ -305,52 +411,64 @@ async def run_touchpoint_cycle(pool) -> Dict[str, Any]:
                 out["in_app_written"] += 1
                 touched_any = True
 
-            if want_email and mailgun_ready():
-                body_html = email_shell(
-                    intro_row(fields["email_subject"], html.escape(fields["email_body_plain"]))
-                    + cta_button("Open Platforms", f"{FRONTEND_URL.rstrip('/')}/platforms.html"),
-                    preheader_text=fields["email_subject"][:120],
-                )
-                eid = uuid.uuid4()
-                await conn.execute(
-                    """
-                    INSERT INTO marketing_touchpoint_deliveries (
-                        id, user_id, channel, subject, body_text, body_html, status, meta
+            if deliver_email and mailgun_ready() and email and await user_email_marketing_allowed(conn, uid):
+                ok_rate, rate_msg = await assert_channel_rate_ok(conn, "email")
+                if not ok_rate:
+                    logger.info("touchpoint email rate cap: %s", rate_msg)
+                else:
+                    body_html = email_shell(
+                        intro_row(fields["email_subject"], html.escape(fields["email_body_plain"]))
+                        + cta_button("Open Platforms", f"{FRONTEND_URL.rstrip('/')}/platforms.html"),
+                        preheader_text=fields["email_subject"][:120],
                     )
-                    VALUES ($1::uuid, $2::uuid, 'email', $3, $4, $5, 'pending', $6::jsonb)
-                    """,
-                    eid,
-                    uid,
-                    fields["email_subject"][:500],
-                    fields["email_body_plain"],
-                    body_html,
-                    json.dumps({**meta_base, "phase": "queued"}),
-                )
-                try:
-                    await send_email(email, fields["email_subject"][:500], body_html)
+                    eid = uuid.uuid4()
                     await conn.execute(
                         """
-                        UPDATE marketing_touchpoint_deliveries
-                        SET status = 'sent', sent_at = NOW()
-                        WHERE id = $1::uuid
+                        INSERT INTO marketing_touchpoint_deliveries (
+                            id, user_id, channel, subject, body_text, body_html, status, meta
+                        )
+                        VALUES ($1::uuid, $2::uuid, 'email', $3, $4, $5, 'pending', $6::jsonb)
                         """,
                         eid,
+                        uid,
+                        fields["email_subject"][:500],
+                        fields["email_body_plain"],
+                        body_html,
+                        json.dumps({**meta_base, "phase": "queued"}),
                     )
-                    out["email_sent"] += 1
-                    touched_any = True
-                except Exception as ex:
-                    logger.warning("touchpoint email fail user=%s: %s", uid, ex)
-                    await conn.execute(
-                        """
-                        UPDATE marketing_touchpoint_deliveries
-                        SET status = 'failed', error_detail = $2
-                        WHERE id = $1::uuid
-                        """,
-                        eid,
-                        str(ex)[:500],
-                    )
+                    try:
+                        await send_email(
+                            email,
+                            fields["email_subject"][:500],
+                            body_html,
+                            from_addr=MAIL_FROM_HELLO,
+                            reply_to=SUPPORT_EMAIL,
+                            category="marketing",
+                            tags=["touchpoint", SEGMENT_KEY],
+                        )
+                        await conn.execute(
+                            """
+                            UPDATE marketing_touchpoint_deliveries
+                            SET status = 'sent', sent_at = NOW()
+                            WHERE id = $1::uuid
+                            """,
+                            eid,
+                        )
+                        out["email_sent"] += 1
+                        touched_any = True
+                    except Exception as ex:
+                        logger.warning("touchpoint email fail user=%s: %s", uid, ex)
+                        await conn.execute(
+                            """
+                            UPDATE marketing_touchpoint_deliveries
+                            SET status = 'failed', error_detail = $2
+                            WHERE id = $1::uuid
+                            """,
+                            eid,
+                            str(ex)[:500],
+                        )
 
-            if want_discord:
+            if deliver_discord and await user_discord_marketing_allowed(conn, uid):
                 wh = await _fetch_discord_webhook(conn, uid)
                 if wh and wh.startswith("http"):
                     did = uuid.uuid4()
@@ -436,6 +554,71 @@ async def run_touchpoint_cycle(pool) -> Dict[str, Any]:
         out["in_app_written"],
         out["skipped_dedupe"],
     )
+    return out
+
+
+async def fetch_touchpoint_delivery_log(
+    conn,
+    *,
+    limit: int = 200,
+    channel: Optional[str] = None,
+    segment_key: Optional[str] = None,
+    status: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Admin log of automation / touchpoint sends (dedupe audit)."""
+    lim = max(1, min(int(limit or 200), 500))
+    clauses = ["1=1"]
+    params: List[Any] = []
+    idx = 1
+    if channel:
+        clauses.append(f"mtd.channel = ${idx}")
+        params.append(str(channel)[:32])
+        idx += 1
+    if segment_key:
+        clauses.append(
+            f"(mtd.meta->>'segment_key' = ${idx} OR (mtd.meta->>'segment_key' IS NULL AND ${idx} = '{SEGMENT_KEY}'))"
+        )
+        params.append(str(segment_key)[:96])
+        idx += 1
+    if status:
+        clauses.append(f"mtd.status = ${idx}")
+        params.append(str(status)[:32])
+        idx += 1
+    params.append(lim)
+    rows = await conn.fetch(
+        f"""
+        SELECT mtd.id, mtd.user_id, mtd.channel, mtd.subject, mtd.status,
+               mtd.sent_at, mtd.created_at, mtd.error_detail, mtd.meta,
+               u.email, u.name,
+               COALESCE((mtd.meta->>'connected')::int, -1) AS connected_at_send
+        FROM marketing_touchpoint_deliveries mtd
+        JOIN users u ON u.id = mtd.user_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY COALESCE(mtd.sent_at, mtd.created_at) DESC
+        LIMIT ${idx}
+        """,
+        *params,
+    )
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        meta = r["meta"] if isinstance(r["meta"], dict) else {}
+        out.append(
+            {
+                "id": str(r["id"]),
+                "user_id": str(r["user_id"]),
+                "email": r["email"],
+                "name": r["name"],
+                "channel": r["channel"],
+                "subject": r["subject"],
+                "status": r["status"],
+                "sent_at": r["sent_at"].isoformat() if r.get("sent_at") else None,
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "error_detail": r["error_detail"],
+                "segment_key": (meta or {}).get("segment_key") or SEGMENT_KEY,
+                "tier": (meta or {}).get("tier"),
+                "connected_at_send": int(r["connected_at_send"] or -1),
+            }
+        )
     return out
 
 

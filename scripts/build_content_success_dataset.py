@@ -49,6 +49,7 @@ load_dotenv(_REPO_ROOT / ".env")
 from services.ml_observability import OptionalTrackioRun, hf_env_status, hf_write_token
 from services.hf_dataset_export import coerce_dataframe_for_hf
 from services.content_success_features import build_labeled_dataframe
+from services.ml_feature_registry import active_cat, active_num
 
 UPLOADS_SQL = """
 SELECT
@@ -85,6 +86,78 @@ async def _fetch(dsn: str, lookback_days: int, limit: int) -> List[Dict[str, Any
     finally:
         await conn.close()
     return [dict(r) for r in rows]
+
+
+CONTENT_BASE_SQL = """
+SELECT *
+FROM v_content_success_base
+WHERE upload_id = ANY($1::uuid[])
+"""
+
+
+async def _merge_base_features(dsn: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Left-merge curated per-(upload x platform) signals (age, duration, recognition)."""
+    if df.empty or "upload_id" not in df.columns:
+        return df
+    upload_ids = [str(x) for x in df["upload_id"].dropna().unique().tolist()]
+    if not upload_ids:
+        return df
+    conn = await asyncpg.connect(dsn)
+    try:
+        rows = await conn.fetch(CONTENT_BASE_SQL, upload_ids)
+    except Exception as e:  # noqa: BLE001 - view may not exist yet; keep base df
+        print(f"Skipping content base-feature merge: {e}")
+        return df
+    finally:
+        await conn.close()
+    if not rows:
+        return df
+    base = pd.DataFrame.from_records([dict(r) for r in rows])
+    if base.empty:
+        return df
+    base["upload_id"] = base["upload_id"].astype(str)
+    base["platform"] = base["platform"].astype(str).str.lower()
+    df = df.copy()
+    df["upload_id"] = df["upload_id"].astype(str)
+    df["platform"] = df["platform"].astype(str).str.lower()
+    # Avoid clobbering existing columns (e.g. platform) on merge.
+    overlap = [c for c in base.columns if c in df.columns and c not in ("upload_id", "platform")]
+    base = base.drop(columns=overlap)
+    return df.merge(base, on=["upload_id", "platform"], how="left")
+
+
+def _finalize_content_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive age-normalized + text-shape features and guarantee all model columns."""
+    if df.empty:
+        return df
+    df = df.copy()
+
+    age = pd.to_numeric(df.get("age_days"), errors="coerce") if "age_days" in df.columns else None
+    views = pd.to_numeric(df.get("views"), errors="coerce").fillna(0.0)
+    if age is not None:
+        df["views_per_day"] = views / age.clip(lower=1.0)
+    else:
+        df["views_per_day"] = views  # no published_at available; fall back to raw views
+
+    if "title" in df.columns:
+        df["title_len"] = df["title"].fillna("").astype(str).str.len()
+    if "caption" in df.columns:
+        df["caption_len"] = df["caption"].fillna("").astype(str).str.len()
+
+    # Recognition booleans → ints for the numeric pipeline.
+    if "has_people" in df.columns:
+        df["has_people"] = df["has_people"].fillna(False).astype(int)
+
+    # Guarantee every active model column exists (cold DB / missing view → NaN).
+    for col in active_num("content"):
+        if col not in df.columns:
+            df[col] = float("nan")
+    for col in active_cat("content"):
+        if col not in df.columns:
+            df[col] = None
+
+    # Drop raw text we only needed for lengths.
+    return df.drop(columns=[c for c in ("title", "caption") if c in df.columns])
 
 
 def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -136,6 +209,8 @@ async def _run(args: argparse.Namespace) -> None:
     dsn = _require_database_url()
     upload_rows = await _fetch(dsn, lookback_days=args.lookback_days, limit=args.limit)
     df = build_labeled_dataframe(upload_rows)
+    df = await _merge_base_features(dsn, df)
+    df = _finalize_content_features(df)
     hot_rate = float(df["is_hot"].mean()) if len(df) else 0.0
     track.log(
         {
@@ -157,7 +232,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=250000)
     p.add_argument("--output", default="data/ml/content_success_train_v1.parquet")
     p.add_argument("--push-to", default="")
-    p.add_argument("--split", default="content_success")
+    p.add_argument("--split", default="train")
     p.add_argument("--private", action="store_true")
     return p
 

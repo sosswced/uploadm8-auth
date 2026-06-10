@@ -13,8 +13,13 @@ from core.sql_allowlist import ACCOUNT_GROUPS_UPDATE_COLUMNS, assert_set_fragmen
 from core.models import AccountGroupIn, AccountGroupUpdate, GroupUpsert
 from services.account_groups import validate_account_ids_for_user
 from services.platform_accounts import fetch_group_upload_counts
+from services.workspace import require_can_edit_settings, resolve_billing_user_id
 
 router = APIRouter(prefix="/api/groups", tags=["groups"])
+
+
+def _groups_owner_id(user: dict) -> str:
+    return resolve_billing_user_id(user)
 
 
 def _group_payload(g, uploads_count: int = 0) -> dict:
@@ -33,6 +38,7 @@ def _group_payload(g, uploads_count: int = 0) -> dict:
 
 @router.get("")
 async def get_groups(user: dict = Depends(get_current_user)):
+    owner_id = _groups_owner_id(user)
     async with core.state.db_pool.acquire() as conn:
         groups = await conn.fetch(
             """
@@ -41,14 +47,15 @@ async def get_groups(user: dict = Depends(get_current_user)):
             WHERE user_id = $1
             ORDER BY created_at DESC
             """,
-            user["id"],
+            owner_id,
         )
-        upload_counts = await fetch_group_upload_counts(conn, user["id"])
+        upload_counts = await fetch_group_upload_counts(conn, owner_id)
     return [_group_payload(g, upload_counts.get(str(g["id"]), 0)) for g in groups]
 
 
 @router.get("/{group_id}")
 async def get_group(group_id: str, user: dict = Depends(get_current_user)):
+    owner_id = _groups_owner_id(user)
     async with core.state.db_pool.acquire() as conn:
         g = await conn.fetchrow(
             """
@@ -57,16 +64,18 @@ async def get_group(group_id: str, user: dict = Depends(get_current_user)):
             WHERE id = $1 AND user_id = $2
             """,
             group_id,
-            user["id"],
+            owner_id,
         )
         if not g:
             raise HTTPException(404, "Group not found")
-        upload_counts = await fetch_group_upload_counts(conn, user["id"])
+        upload_counts = await fetch_group_upload_counts(conn, owner_id)
     return _group_payload(g, upload_counts.get(str(g["id"]), 0))
 
 
 @router.post("")
 async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_user)):
+    require_can_edit_settings(user)
+    owner_id = _groups_owner_id(user)
     name = (payload.name or "").strip()
     if not name:
         raise HTTPException(400, "name is required")
@@ -74,7 +83,7 @@ async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_us
     account_ids = payload.account_ids if payload.account_ids is not None else (payload.members or [])
 
     async with core.state.db_pool.acquire() as conn:
-        account_ids = await validate_account_ids_for_user(conn, str(user["id"]), account_ids)
+        account_ids = await validate_account_ids_for_user(conn, owner_id, account_ids)
     group_id = str(uuid.uuid4())
 
     async with core.state.db_pool.acquire() as conn:
@@ -84,7 +93,7 @@ async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_us
             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
             """,
             group_id,
-            user["id"],
+            owner_id,
             name,
             payload.description,
             account_ids,
@@ -104,9 +113,11 @@ async def create_group(payload: GroupUpsert, user: dict = Depends(get_current_us
 
 @router.put("/{group_id}")
 async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends(get_current_user)):
+    require_can_edit_settings(user)
+    owner_id = _groups_owner_id(user)
     _GROUP_COLS = ACCOUNT_GROUPS_UPDATE_COLUMNS
     updates = []
-    params = [group_id, user["id"]]
+    params = [group_id, owner_id]
 
     if payload.name is not None:
         updates.append(f"{_safe_col('name', _GROUP_COLS)} = ${len(params)+1}")
@@ -131,7 +142,7 @@ async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends
     async with core.state.db_pool.acquire() as conn:
         if pending_account_ids is not None:
             pending_account_ids = await validate_account_ids_for_user(
-                conn, str(user["id"]), pending_account_ids
+                conn, owner_id, pending_account_ids
             )
             updates.insert(-1, f"{_safe_col('account_ids', _GROUP_COLS)} = ${len(params)+1}")
             params.append(pending_account_ids)
@@ -139,7 +150,7 @@ async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends
         row = await conn.fetchrow(
             "SELECT id FROM account_groups WHERE id = $1 AND user_id = $2",
             group_id,
-            user["id"],
+            owner_id,
         )
         if not row:
             raise HTTPException(404, "Group not found")
@@ -156,6 +167,8 @@ async def update_group(group_id: str, payload: GroupUpsert, user: dict = Depends
 
 @router.delete("/{group_id}")
 async def delete_group(group_id: str, user: dict = Depends(get_current_user)):
+    require_can_edit_settings(user)
+    owner_id = _groups_owner_id(user)
     async with core.state.db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM account_groups WHERE id = $1 AND user_id = $2", group_id, user["id"])
+        await conn.execute("DELETE FROM account_groups WHERE id = $1 AND user_id = $2", group_id, owner_id)
     return {"status": "deleted"}

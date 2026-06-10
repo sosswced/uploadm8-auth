@@ -129,10 +129,107 @@ def billing_user_id(ctx: Optional[WorkspaceContext], fallback_user_id: str) -> s
     return str(fallback_user_id)
 
 
+def resolve_billing_user_id(user: dict) -> str:
+    """Owner wallet / platform token row for workspace members."""
+    return str(user.get("billing_user_id") or user["id"])
+
+
+def workspace_role_from_user(user: dict) -> str:
+    ws = user.get("workspace")
+    if isinstance(ws, dict) and ws.get("role"):
+        return str(ws["role"]).lower()
+    return "owner"
+
+
 def can_upload_in_workspace(ctx: Optional[WorkspaceContext]) -> bool:
     if not ctx:
         return True
     return ctx.role in ("owner", "admin", "editor")
+
+
+def can_upload_from_user(user: dict) -> bool:
+    role = workspace_role_from_user(user)
+    return role in ("owner", "admin", "editor")
+
+
+def can_manage_platforms(user: dict) -> bool:
+    return workspace_role_from_user(user) in ("owner", "admin")
+
+
+def can_manage_billing(user: dict) -> bool:
+    return workspace_role_from_user(user) in ("owner", "admin")
+
+
+def can_manage_team(user: dict) -> bool:
+    return workspace_role_from_user(user) in ("owner", "admin")
+
+
+def can_edit_account_settings(user: dict) -> bool:
+    return workspace_role_from_user(user) in ("owner", "admin", "editor")
+
+
+def workspace_capabilities(user: dict) -> dict[str, bool]:
+    role = workspace_role_from_user(user)
+    return {
+        "role": role,
+        "can_upload": role in ("owner", "admin", "editor"),
+        "can_manage_platforms": role in ("owner", "admin"),
+        "can_manage_billing": role in ("owner", "admin"),
+        "can_manage_team": role in ("owner", "admin"),
+        "can_edit_settings": role in ("owner", "admin", "editor"),
+    }
+
+
+def require_can_manage_platforms(user: dict) -> None:
+    if not can_manage_platforms(user):
+        raise HTTPException(
+            403,
+            {
+                "code": "workspace_role_forbidden",
+                "message": "Only workspace owners and admins can connect or disconnect platform accounts.",
+            },
+        )
+
+
+def require_can_manage_billing(user: dict) -> None:
+    if not can_manage_billing(user):
+        raise HTTPException(
+            403,
+            {
+                "code": "workspace_role_forbidden",
+                "message": "Only workspace owners and admins can manage billing.",
+            },
+        )
+
+
+def require_can_edit_settings(user: dict) -> None:
+    if not can_edit_account_settings(user):
+        raise HTTPException(
+            403,
+            {
+                "code": "workspace_role_forbidden",
+                "message": "Viewers have read-only access to workspace settings.",
+            },
+        )
+
+
+def apply_owner_billing_profile(user_dict: dict, owner_row: dict) -> dict:
+    """Stripe/subscription fields follow workspace owner for members."""
+    bill_id = str(user_dict.get("billing_user_id") or user_dict["id"])
+    if bill_id == str(user_dict["id"]):
+        return user_dict
+    for key in (
+        "stripe_customer_id",
+        "stripe_subscription_id",
+        "subscription_status",
+        "subscription_tier",
+        "flex_enabled",
+        "current_period_end",
+        "trial_end",
+    ):
+        if key in owner_row:
+            user_dict[key] = owner_row[key]
+    return user_dict
 
 
 async def count_active_seats(conn, workspace_id: str) -> int:
@@ -237,6 +334,26 @@ async def create_workspace_invite(
     if existing:
         raise HTTPException(400, "User is already a workspace member")
 
+    pending = await conn.fetchrow(
+        """
+        SELECT id::text AS id FROM workspace_invites
+        WHERE workspace_id = $1::uuid AND LOWER(email) = $2
+          AND accepted_at IS NULL AND expires_at > NOW()
+        LIMIT 1
+        """,
+        ctx.workspace_id,
+        email_lc,
+    )
+    if pending:
+        raise HTTPException(
+            400,
+            {
+                "code": "invite_already_pending",
+                "message": "An invite is already pending for this email. Resend or cancel it first.",
+                "invite_id": pending["id"],
+            },
+        )
+
     raw = secrets.token_urlsafe(32)
     token_hash = _hash_invite_token(raw)
     expires = datetime.now(timezone.utc) + timedelta(hours=INVITE_TTL_HOURS)
@@ -273,8 +390,16 @@ async def accept_workspace_invite(conn, user: dict, raw_token: str) -> Dict[str,
         raise HTTPException(400, "Invite expired")
 
     user_email = (user.get("email") or "").strip().lower()
-    if user_email != (inv["email"] or "").strip().lower():
-        raise HTTPException(403, "Invite email does not match your account")
+    invite_email = (inv["email"] or "").strip().lower()
+    if user_email != invite_email:
+        raise HTTPException(
+            403,
+            {
+                "code": "invite_email_mismatch",
+                "message": f"Sign in with {invite_email} to accept this invite.",
+                "expected_email": invite_email,
+            },
+        )
 
     owner = await conn.fetchrow(
         "SELECT * FROM users WHERE id = (SELECT owner_user_id FROM workspaces WHERE id = $1::uuid)",
@@ -308,6 +433,47 @@ async def accept_workspace_invite(conn, user: dict, raw_token: str) -> Dict[str,
     return {"workspace_id": inv["workspace_id"], "role": inv["role"]}
 
 
+async def list_pending_workspace_invites(conn, workspace_id: str) -> List[Dict[str, Any]]:
+    rows = await conn.fetch(
+        """
+        SELECT id::text AS id, email, role, expires_at, created_at
+        FROM workspace_invites
+        WHERE workspace_id = $1::uuid
+          AND accepted_at IS NULL
+          AND expires_at > NOW()
+        ORDER BY created_at DESC
+        """,
+        workspace_id,
+    )
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "email": r["email"],
+                "role": r["role"],
+                "expires_at": r["expires_at"].isoformat() if r.get("expires_at") else None,
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+            }
+        )
+    return out
+
+
+async def revoke_workspace_invite(conn, ctx: WorkspaceContext, invite_id: str) -> None:
+    if ctx.role not in ("owner", "admin"):
+        raise HTTPException(403, "Only workspace owners and admins can cancel invites")
+    result = await conn.execute(
+        """
+        DELETE FROM workspace_invites
+        WHERE id = $1::uuid AND workspace_id = $2::uuid AND accepted_at IS NULL
+        """,
+        invite_id,
+        ctx.workspace_id,
+    )
+    if result == "DELETE 0":
+        raise HTTPException(404, "Invite not found or already accepted")
+
+
 async def revoke_workspace_member(conn, ctx: WorkspaceContext, member_user_id: str) -> None:
     if ctx.role not in ("owner", "admin"):
         raise HTTPException(403, "Only workspace owners and admins can remove members")
@@ -321,6 +487,84 @@ async def revoke_workspace_member(conn, ctx: WorkspaceContext, member_user_id: s
         ctx.workspace_id,
         member_user_id,
     )
+
+
+async def update_workspace_member_role(
+    conn,
+    ctx: WorkspaceContext,
+    member_user_id: str,
+    role: str,
+) -> None:
+    if ctx.role not in ("owner", "admin"):
+        raise HTTPException(403, "Only workspace owners and admins can change member roles")
+    role = (role or "").lower()
+    if role not in VALID_INVITE_ROLES:
+        raise HTTPException(400, f"Invalid role: {role}")
+    if str(member_user_id) == ctx.owner_user_id:
+        raise HTTPException(400, "Cannot change the workspace owner role")
+    if ctx.role == "admin" and role == "admin":
+        target = await conn.fetchval(
+            "SELECT role FROM workspace_members WHERE workspace_id = $1::uuid AND user_id = $2::uuid",
+            ctx.workspace_id,
+            member_user_id,
+        )
+        if str(target) == "admin" and str(member_user_id) != ctx.member_user_id:
+            raise HTTPException(403, "Admins cannot change other admins' roles")
+    updated = await conn.execute(
+        """
+        UPDATE workspace_members SET role = $3
+        WHERE workspace_id = $1::uuid AND user_id = $2::uuid AND role <> 'owner' AND status = 'active'
+        """,
+        ctx.workspace_id,
+        member_user_id,
+        role,
+    )
+    if updated == "UPDATE 0":
+        raise HTTPException(404, "Member not found")
+
+
+async def rename_workspace(conn, ctx: WorkspaceContext, name: str) -> str:
+    if ctx.role not in ("owner", "admin"):
+        raise HTTPException(403, "Only workspace owners and admins can rename the workspace")
+    clean = (name or "").strip()[:120] or "My Workspace"
+    await conn.execute(
+        "UPDATE workspaces SET name = $2 WHERE id = $1::uuid",
+        ctx.workspace_id,
+        clean,
+    )
+    return clean
+
+
+async def resend_workspace_invite(conn, ctx: WorkspaceContext, invite_id: str) -> tuple[str, str]:
+    if ctx.role not in ("owner", "admin"):
+        raise HTTPException(403, "Only workspace owners and admins can resend invites")
+    row = await conn.fetchrow(
+        """
+        SELECT id::text AS id, email, role
+        FROM workspace_invites
+        WHERE id = $1::uuid AND workspace_id = $2::uuid
+          AND accepted_at IS NULL AND expires_at > NOW()
+        """,
+        invite_id,
+        ctx.workspace_id,
+    )
+    if not row:
+        raise HTTPException(404, "Invite not found or expired")
+    raw = secrets.token_urlsafe(32)
+    token_hash = _hash_invite_token(raw)
+    expires = datetime.now(timezone.utc) + timedelta(hours=INVITE_TTL_HOURS)
+    await conn.execute(
+        """
+        UPDATE workspace_invites
+        SET token_hash = $3, expires_at = $4
+        WHERE id = $1::uuid AND workspace_id = $2::uuid
+        """,
+        invite_id,
+        ctx.workspace_id,
+        token_hash,
+        expires,
+    )
+    return raw, str(row["id"])
 
 
 async def switch_active_workspace(conn, user_id: str, workspace_id: str) -> None:

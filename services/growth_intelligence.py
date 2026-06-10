@@ -1024,7 +1024,7 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
                 "title": "Turn on AI captions & hashtag assist",
                 "body": "When both are off, you leave searchable text on the table. Enable in Settings → Preferences.",
                 "cta_label": "Open Settings",
-                "cta_href": "/settings.html#preferences-panel",
+                "cta_href": "/settings.html#preferences",
                 "confidence": 0.74,
                 "source": "settings_gap",
             }
@@ -1050,8 +1050,8 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
         smart_offer = {
             "headline": "AI credits are running thin",
             "body": "Thumbnail Studio and vision captions spend AIC. Top up or upgrade before the next batch.",
-            "cta_label": "Billing & tokens",
-            "cta_href": "/settings.html#billing-panel",
+            "cta_label": "View token balances",
+            "cta_href": "/settings.html#token-balances",
             "variant": "low_aic",
             "confidence": 0.77,
         }
@@ -1077,6 +1077,50 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
         except (TypeError, ValueError):
             return 0.0
         return -v if math.isfinite(v) else 0.0
+
+    try:
+        async with pool.acquire() as c:
+            raw_hints = await c.fetchval(
+                """
+                SELECT output_artifacts->'coach_hints'
+                FROM uploads
+                WHERE user_id = $1::uuid
+                  AND output_artifacts ? 'coach_hints'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                uid,
+            )
+        if raw_hints:
+            parsed = json.loads(raw_hints) if isinstance(raw_hints, str) else raw_hints
+            if isinstance(parsed, str) and parsed.strip():
+                try:
+                    parsed = json.loads(parsed)
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, list):
+                for h in parsed[:3]:
+                    msg = ""
+                    hint_id = "upload_coach_hint"
+                    if isinstance(h, dict):
+                        msg = str(h.get("message") or h.get("text") or h.get("hint") or "").strip()
+                        hint_id = str(h.get("id") or hint_id)
+                    elif isinstance(h, str):
+                        msg = h.strip()
+                    if not msg:
+                        continue
+                    suggestions.append(
+                        {
+                            "id": hint_id,
+                            "severity": "info",
+                            "title": "Upload packaging tip",
+                            "body": msg[:500],
+                            "confidence": 0.72,
+                            "source": "upload_evidence",
+                        }
+                    )
+    except Exception:
+        logger.debug("coach_hints hydrate skipped user_id=%s", user_id)
 
     suggestions.sort(key=_suggestion_sort_key)
 

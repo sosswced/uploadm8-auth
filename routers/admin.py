@@ -75,6 +75,7 @@ from services.ml_hub_config import (
 )
 from services.ml_engine import load_engine_state, run_ml_engine_cycle
 from services.ml_engine_config import get_ml_engine_config, ml_engine_public_dict
+from services.ml_feature_registry import catalog as _ml_feature_registry_catalog
 from services.ml_observability import hf_write_token
 from services.wallet_disputes import admin_patch_wallet_dispute, list_admin_wallet_disputes
 from services.catalog_sync_job import run_billing_catalog_sync_job
@@ -148,6 +149,8 @@ async def ml_observability_overview(
     root = Path(__file__).resolve().parents[1]
     dataset_path = root / "data" / "ml" / "promo_targeting_train_v1.parquet"
     baseline_report_path = root / "data" / "ml" / "promo_targeting_baseline_report.json"
+    content_dataset_path = root / "data" / "ml" / "content_success_train_v1.parquet"
+    content_report_path = root / "data" / "ml" / "content_success_report.json"
 
     hf_token = hf_write_token()
     trackio_project = (os.environ.get("TRACKIO_PROJECT") or "").strip()
@@ -199,6 +202,10 @@ async def ml_observability_overview(
             "dataset_exists": dataset_path.exists(),
             "baseline_report_path": str(baseline_report_path),
             "baseline_report_exists": baseline_report_path.exists(),
+            "content_dataset_path": str(content_dataset_path),
+            "content_dataset_exists": content_dataset_path.exists(),
+            "content_report_path": str(content_report_path),
+            "content_report_exists": content_report_path.exists(),
         },
         "huggingface": {
             "token_configured": bool(hf_token),
@@ -295,11 +302,95 @@ async def ml_observability_overview(
             "last_run_at": last_run.get("finished_at") or last_run.get("started_at"),
             "last_run_mode": last_run.get("mode"),
             "last_run_error": last_run.get("error"),
+            "cycle_status": last_run.get("cycle_status"),
+            "promo_status": last_run.get("status"),
+            "content_status": (last_run.get("content") or {}).get("status"),
+            "blocked_on_data": last_run.get("cycle_status") == "blocked_on_data",
             "last_hf_job_url": (last_run.get("steps") or {}).get("hf_jobs_train", {}).get("job_url"),
         }
+        summary["feature_catalog_count"] = len(_ml_feature_registry_catalog())
 
     set_observability_cache(mode, summary)
     return summary
+
+
+def _read_local_json_report(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+async def _champion_for_task(conn: asyncpg.Connection, task: str) -> Optional[Dict[str, Any]]:
+    row = await conn.fetchrow(
+        """
+        SELECT id::text AS id, trained_at, model_version, train_row_count, metrics
+        FROM m8_model_runs
+        WHERE train_config->>'task' = $1
+        ORDER BY trained_at DESC
+        LIMIT 1
+        """,
+        task,
+    )
+    if not row:
+        return None
+    raw = row.get("metrics")
+    metrics: Dict[str, Any] = {}
+    if raw not in (None, ""):
+        try:
+            metrics = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception:
+            metrics = {}
+    return {
+        "id": row["id"],
+        "trained_at": row["trained_at"].isoformat() if row.get("trained_at") else None,
+        "model_version": row.get("model_version"),
+        "train_row_count": int(row.get("train_row_count") or 0),
+        "roc_auc": metrics.get("roc_auc"),
+        "average_precision": metrics.get("average_precision"),
+        "status": metrics.get("status"),
+    }
+
+
+@router.get("/ml/feature-catalog")
+async def admin_ml_feature_catalog(
+    user: dict = Depends(require_admin), loop: Optional[str] = Query(None)
+):
+    """Feature registry grouped by loop — single source of truth for ML columns."""
+    lp = (loop or "").strip().lower()
+    if lp and lp not in ("promo", "content"):
+        raise HTTPException(400, "loop must be promo or content")
+    return {"features": _ml_feature_registry_catalog(lp or None)}
+
+
+@router.get("/ml/loop-reports")
+async def ml_loop_reports(user: dict = Depends(require_admin)):
+    """Latest per-loop training reports + content rankings (local artifacts)."""
+    root = Path(__file__).resolve().parents[1]
+    promo_path = root / "data" / "ml" / "promo_targeting_baseline_report.json"
+    content_path = root / "data" / "ml" / "content_success_report.json"
+    promo = _read_local_json_report(promo_path)
+    content = _read_local_json_report(content_path)
+    out: Dict[str, Any] = {
+        "promo": {k: v for k, v in (promo or {}).items() if k != "threshold_suggestions"} if promo else None,
+        "content": None,
+        "content_rankings": {},
+    }
+    if content:
+        out["content"] = {k: v for k, v in content.items() if k != "rankings"}
+        out["content_rankings"] = content.get("rankings") or {}
+    champions: Dict[str, Any] = {}
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            champions["promo"] = await _champion_for_task(conn, "promo_targeting_uplift_baseline")
+            champions["content"] = await _champion_for_task(conn, "content_success_hotness")
+    except Exception as e:
+        champions["error"] = str(e)[:200]
+    out["champions"] = champions
+    return out
 
 
 @router.get("/ml/engine-status")
@@ -307,12 +398,19 @@ async def ml_engine_status(user: dict = Depends(require_admin)):
     """Automation engine config + last cycle result (no secrets)."""
     state = load_engine_state()
     cfg = get_ml_engine_config()
+    last_run = state.get("last_run") if isinstance(state.get("last_run"), dict) else {}
     return {
         "config": ml_engine_public_dict(cfg),
         "state": {
             "updated_at": state.get("updated_at"),
-            "last_run": state.get("last_run"),
+            "last_run": last_run,
         },
+        "cycle_status": last_run.get("cycle_status"),
+        "promo_status": last_run.get("status"),
+        "content_status": (last_run.get("content") or {}).get("status"),
+        "blocked_on_data": last_run.get("cycle_status") == "blocked_on_data"
+        or last_run.get("status") == "blocked_on_data"
+        or (last_run.get("content") or {}).get("status") == "blocked_on_data",
     }
 
 
@@ -1625,10 +1723,26 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
 
         admin_eng = await compute_admin_engagement_totals(
-            conn, window_start=since, window_end_exclusive=until,
+            conn,
+            window_start=since,
+            window_end_exclusive=until,
+            pool=core.state.db_pool,
         )
         reliability = await fetch_admin_reliability_metrics(conn, since, until)
         attach = await fetch_admin_attach_metrics(conn, since, until)
+
+    upload_pipeline_funnel: dict = {}
+    try:
+        from services.upload_funnel_metrics import funnel_conversion_summary
+
+        lookback_days = max(1, int(minutes / (24 * 60)))
+        upload_pipeline_funnel = await funnel_conversion_summary(
+            core.state.db_pool, lookback_days=lookback_days
+        )
+    except Exception:
+        upload_pipeline_funnel = {"error": "unavailable"}
+
+    refunds_total, refunds_count = await fetch_stripe_refunds_window(since, until)
 
     return {
         "total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": mrr_by_tier,
@@ -1641,7 +1755,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "topup_revenue": float(revenue["topups"]) if revenue else 0,
         "topup_count": int(revenue["topup_cnt"] or 0) if revenue else 0,
         "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
-        "refunds": 0, "refund_count": 0,
+        "refunds": refunds_total, "refund_count": refunds_count,
         "openai_cost": openai_cost, "openai_calls": openai_calls,
         "google_cloud_cost": google_cloud_cost, "pikzels_cost": pikzels_cost, "pikzels_calls": pikzels_calls,
         "twelvelabs_cost": twelvelabs_cost, "serpapi_cost": serpapi_cost, "other_provider_cost": other_provider_cost,
@@ -1656,6 +1770,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "gross_margin": round(gross_margin, 1), "gross_margin_change": 0,
         "funnel_signups": new_users, "funnel_connected": funnel_connected, "funnel_uploaded": funnel_uploaded,
         "funnel_signup_connect": round(funnel_signup_connect, 1), "funnel_connect_upload": round(funnel_connect_upload, 1),
+        "upload_pipeline_funnel": upload_pipeline_funnel,
         "free_to_paid_rate": round((paid_users / max(total_users, 1)) * 100, 1), "free_to_paid_change": 0,
         "cancellations": cancellations, "cancellation_rate": round((cancellations / max(paid_users, 1)) * 100, 1),
         "failed_payments": 0, "payment_failure_rate": 0,
@@ -1789,6 +1904,14 @@ async def kpi_funnels(user: dict = Depends(require_admin)):
         flex_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE flex_enabled = TRUE")
         churned = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= NOW() - INTERVAL '30 days'")
 
+    upload_pipeline_funnel: dict = {}
+    try:
+        from services.upload_funnel_metrics import funnel_conversion_summary
+
+        upload_pipeline_funnel = await funnel_conversion_summary(core.state.db_pool, lookback_days=30)
+    except Exception:
+        upload_pipeline_funnel = {"error": "unavailable"}
+
     return {
         "signup_to_upload_24h": {"signups": signups_24h, "uploads": first_uploads_24h, "rate": (first_uploads_24h / max(signups_24h, 1)) * 100},
         "free_to_paid": {"free": total_free, "paid": converted, "rate": (converted / max(total_free + converted, 1)) * 100},
@@ -1796,6 +1919,7 @@ async def kpi_funnels(user: dict = Depends(require_admin)):
         "topup_adoption": {"users": topup_users, "total": total_uploaders, "rate": (topup_users / max(total_uploaders, 1)) * 100},
         "flex_adoption": {"users": flex_users},
         "churn_30d": churned,
+        "upload_pipeline_funnel": upload_pipeline_funnel,
     }
 
 
@@ -2303,13 +2427,49 @@ async def get_admin_settings(user: dict = Depends(require_master_admin)):
 
 @router.put("/settings")
 async def update_admin_settings(settings: dict, user: dict = Depends(require_master_admin)):
-    if "watermark_burn_text" in settings:
-        from stages.db import sanitize_watermark_burn_text
+    wm_keys = {
+        "watermark_burn_text",
+        "watermark_size_scale",
+        "watermark_opacity",
+        "watermark_position",
+        "watermark_text_color",
+        "watermark_font_weight",
+    }
+    if wm_keys.intersection(settings):
+        from stages.db import (
+            sanitize_watermark_burn_text,
+            sanitize_watermark_font_weight,
+            sanitize_watermark_opacity,
+            sanitize_watermark_position,
+            sanitize_watermark_size_scale,
+            sanitize_watermark_text_color,
+        )
 
         settings = dict(settings)
-        settings["watermark_burn_text"] = sanitize_watermark_burn_text(
-            settings.get("watermark_burn_text")
-        )
+        if "watermark_burn_text" in settings:
+            settings["watermark_burn_text"] = sanitize_watermark_burn_text(
+                settings.get("watermark_burn_text")
+            )
+        if "watermark_size_scale" in settings:
+            settings["watermark_size_scale"] = sanitize_watermark_size_scale(
+                settings.get("watermark_size_scale")
+            )
+        if "watermark_opacity" in settings:
+            settings["watermark_opacity"] = sanitize_watermark_opacity(
+                settings.get("watermark_opacity")
+            )
+        if "watermark_position" in settings:
+            settings["watermark_position"] = sanitize_watermark_position(
+                settings.get("watermark_position")
+            )
+        if "watermark_text_color" in settings:
+            settings["watermark_text_color"] = sanitize_watermark_text_color(
+                settings.get("watermark_text_color")
+            )
+        if "watermark_font_weight" in settings:
+            settings["watermark_font_weight"] = sanitize_watermark_font_weight(
+                settings.get("watermark_font_weight")
+            )
     core.state.admin_settings_cache.update(settings)
     async with core.state.db_pool.acquire() as conn:
         await conn.execute("UPDATE admin_settings SET settings_json = $1, updated_at = NOW() WHERE id = 1", json.dumps(core.state.admin_settings_cache))
@@ -3237,7 +3397,7 @@ def _clip_text(v: Any, *, max_chars: int = 16_000) -> str:
     return s[: max_chars - len("...[truncated]")] + "...[truncated]"
 
 
-def _extract_ai_artifact_subset(output_artifacts: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_ai_artifact_subset(output_artifacts: Any) -> Dict[str, Any]:
     """Return only AI/hydration-relevant artifact keys to keep payload focused."""
     if not isinstance(output_artifacts, dict):
         return {}
@@ -3411,13 +3571,26 @@ def _collect_upload_diagnostics(
     }
 
 
+def _coerce_output_artifacts_dict(raw: Any) -> Dict[str, Any]:
+    """``uploads.output_artifacts`` should be a JSON object; tolerate list/null legacy rows."""
+    val: Any = raw
+    if val is None:
+        val = {}
+    elif not isinstance(val, dict):
+        val = _safe_json(val, {})
+    if isinstance(val, dict):
+        return val
+    # Legacy rows stored as JSON arrays or other shapes — avoid .keys() crashes.
+    return {}
+
+
 def _serialize_upload_ai_trace_row(
     row: Dict[str, Any],
     *,
     include_events: bool,
     include_raw_artifacts: bool,
 ) -> Dict[str, Any]:
-    output_artifacts = _safe_json(row.get("output_artifacts"), {}) or {}
+    output_artifacts = _coerce_output_artifacts_dict(row.get("output_artifacts"))
     ai_trace_blob, _ = _parse_artifact_json_with_error(output_artifacts, "ai_pipeline_trace_v1")
     hydration_payload, _ = _parse_artifact_json_with_error(output_artifacts, "hydration_payload")
     thumbnail_trace, _ = _parse_artifact_json_with_error(output_artifacts, "thumbnail_trace")

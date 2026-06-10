@@ -4,34 +4,39 @@ from __future__ import annotations
 
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder
 
 from services.promo_targeting_features import FEATURES_CAT, FEATURES_NUM
 
+# Model identifier persisted in the report + m8_model_runs.
+PROMO_MODEL_VERSION = "hist_gradient_boosting_v2"
+
 
 def build_promo_pipeline() -> Pipeline:
-    num_pipe = Pipeline(
-        steps=[
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler()),
-        ]
-    )
+    # Gradient-boosted trees handle NaN natively and need no scaling; categoricals
+    # are one-hot encoded (dense, since HGB does not accept sparse input).
     cat_pipe = Pipeline(
         steps=[
             ("impute", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
         ]
     )
     pre = ColumnTransformer(
         transformers=[
-            ("num", num_pipe, FEATURES_NUM),
+            ("num", "passthrough", FEATURES_NUM),
             ("cat", cat_pipe, FEATURES_CAT),
         ]
     )
-    clf = LogisticRegression(max_iter=400, class_weight="balanced")
+    clf = HistGradientBoostingClassifier(
+        max_iter=300,
+        learning_rate=0.06,
+        l2_regularization=1.0,
+        class_weight="balanced",
+        random_state=42,
+    )
     return Pipeline(steps=[("pre", pre), ("clf", clf)])
 
 

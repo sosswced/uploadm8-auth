@@ -15,31 +15,16 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+from services.ml_feature_registry import active_cat, active_num, label
+
 SHORTFORM_PLATFORMS = frozenset({"tiktok", "youtube", "instagram", "facebook"})
 SUCCESS_STATUSES = frozenset({"published", "succeeded", "success", "completed", "partial"})
 
 # Upload-flow CHOICES only — engagement metrics are the label and must never be features.
-FEATURES_NUM = [
-    "m8_engine",
-    "ai_hashtags_enabled",
-    "ai_hashtag_count",
-    "caption_frame_count",
-    "sent_dow_utc",
-    "sent_hour_utc",
-    "is_shortform",
-]
-FEATURES_CAT = [
-    "platform",
-    "content_category",
-    "primary_hashtag",
-    "caption_style",
-    "caption_tone",
-    "caption_voice",
-    "hashtag_style",
-    "thumbnail_selection_mode",
-    "thumbnail_render_pipeline",
-]
-TARGET = "is_hot"
+# Derived from the feature registry (single source of truth).
+FEATURES_NUM = active_num("content")
+FEATURES_CAT = active_cat("content")
+TARGET = label("content")
 
 
 def _as_dict(raw: Any) -> Dict[str, Any]:
@@ -151,15 +136,25 @@ def _base_features(row: Dict[str, Any]) -> Dict[str, Any]:
     # Postgres EXTRACT(DOW): Sun=0..Sat=6 (Python Mon=0..Sun=6)
     sent_dow_pg = ((int(created.weekday()) + 1) % 7) if created is not None else -1
     sent_hour = int(created.hour) if created is not None else -1
+
+    def _cat(key: str) -> Optional[str]:
+        # Explicit null when the choice was not captured, so the model can learn
+        # "missing" via has_attribution rather than from a plausible fake default.
+        v = snap.get(key)
+        if v is None or str(v).strip() == "":
+            return None
+        return str(v).strip().lower()
+
     return {
-        "content_category": str(snap.get("content_category") or "general").lower(),
+        "content_category": _cat("content_category"),
+        # Kept for ranking surfaces only; deprecated as a model feature.
         "primary_hashtag": _primary_hashtag(snap, row.get("hashtags")),
-        "caption_style": str(snap.get("caption_style") or "story").lower(),
-        "caption_tone": str(snap.get("caption_tone") or "authentic").lower(),
-        "caption_voice": str(snap.get("caption_voice") or "default").lower(),
-        "hashtag_style": str(snap.get("hashtag_style") or "mixed").lower(),
-        "thumbnail_selection_mode": str(snap.get("thumbnail_selection_mode") or "na").lower(),
-        "thumbnail_render_pipeline": str(snap.get("thumbnail_render_pipeline") or "na").lower(),
+        "caption_style": _cat("caption_style"),
+        "caption_tone": _cat("caption_tone"),
+        "caption_voice": _cat("caption_voice"),
+        "hashtag_style": _cat("hashtag_style"),
+        "thumbnail_selection_mode": _cat("thumbnail_selection_mode"),
+        "thumbnail_render_pipeline": _cat("thumbnail_render_pipeline"),
         "m8_engine": _bool_int(snap.get("m8_engine")),
         "ai_hashtags_enabled": _bool_int(snap.get("ai_hashtags_enabled")),
         "ai_hashtag_count": int(snap.get("ai_hashtag_count") or 0),
@@ -236,7 +231,14 @@ def build_records(upload_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def label_hotness(df):  # type: ignore[no-untyped-def]
-    """Blended within-user percentile of engagement_rate + views → top tercile is hot."""
+    """
+    Blended percentile of engagement_rate + views → top tercile is hot.
+
+    Uses a within-user percentile when the user has 2+ scored uploads, and falls
+    back to a cross-user, per-platform percentile for single-upload users so they
+    are not all forced to ``is_hot = 0`` (which previously starved the label of
+    positive variance during cold-start).
+    """
     import pandas as pd
 
     if df is None or df.empty:
@@ -244,14 +246,23 @@ def label_hotness(df):  # type: ignore[no-untyped-def]
             df[col] = []
         return df
 
-    def _rank(group):
-        if group.notna().sum() <= 1:
-            return pd.Series(0.5, index=group.index)
-        return group.rank(pct=True, method="average").fillna(0.0)
-
     df = df.copy()
-    df["views_pct"] = df.groupby("user_id")["views"].transform(_rank)
-    df["engagement_pct"] = df.groupby("user_id")["engagement_rate_pct"].transform(_rank)
+
+    def _wu_rank(group):
+        if group.notna().sum() <= 1:
+            return pd.Series(float("nan"), index=group.index)
+        return group.rank(pct=True, method="average")
+
+    user_counts = df.groupby("user_id")["views"].transform("size")
+    use_wu = user_counts >= 2
+
+    wu_views = df.groupby("user_id")["views"].transform(_wu_rank)
+    wu_eng = df.groupby("user_id")["engagement_rate_pct"].transform(_wu_rank)
+    cu_views = df.groupby("platform")["views"].rank(pct=True, method="average")
+    cu_eng = df.groupby("platform")["engagement_rate_pct"].rank(pct=True, method="average")
+
+    df["views_pct"] = wu_views.where(use_wu, cu_views).fillna(0.5)
+    df["engagement_pct"] = wu_eng.where(use_wu, cu_eng).fillna(0.5)
     df["hotness_score"] = (0.6 * df["engagement_pct"] + 0.4 * df["views_pct"]).round(5)
     df["is_hot"] = (df["hotness_score"] >= (2.0 / 3.0)).astype(int)
     return df

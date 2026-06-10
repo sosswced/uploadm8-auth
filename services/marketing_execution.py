@@ -418,6 +418,27 @@ async def run_marketing_execution_tick(
                 summary["skipped"] += 1
                 continue
 
+            ml_score = None
+            ml_model = None
+            try:
+                from services.promo_targeting_model import ml_targeting_enabled, score_user_propensity
+
+                if ml_targeting_enabled():
+                    ml_score, ml_model = await score_user_propensity(
+                        conn,
+                        uid,
+                        subscription_tier=tier,
+                        range_key=range_key,
+                    )
+                    min_score = float(targeting.get("ml_min_score") or os.environ.get("UM8_PROMO_MIN_SCORE") or 0.35)
+                    if ml_score < min_score:
+                        summary["skipped"] += 1
+                        summary.setdefault("skipped_ml_targeting", 0)
+                        summary["skipped_ml_targeting"] += 1
+                        continue
+            except Exception as ml_e:
+                logger.debug("ml targeting skip check failed: %s", ml_e)
+
             tier_norm = normalize_tier(tier or "free")
             promo_image_url = ""
             promo_variant_id = ""
@@ -548,13 +569,21 @@ async def run_marketing_execution_tick(
                                 "variant_id": promo_variant_id or None,
                                 "run_id": str(run_id),
                                 "promo_variant_id": promo_variant_id,
+                                "ml_propensity_score": ml_score,
+                                "ml_model": ml_model,
                             }
                         ),
                         cid,
                     )
                     if mailgun_ready():
                         try:
-                            await send_email(email, subject, html_send)
+                            await send_email(
+                                email,
+                                subject,
+                                html_send,
+                                category="marketing",
+                                tags=["campaign", str(cid)[:36]],
+                            )
                             await conn.execute(
                                 """
                                 UPDATE marketing_touchpoint_deliveries

@@ -3,7 +3,7 @@
 # dependencies = [
 #   "pandas>=2.0.0,<3.0.0",
 #   "pyarrow>=15.0.0",
-#   "scikit-learn>=1.4.0,<2.0.0",
+#   "scikit-learn>=1.8.0,<2.0.0",
 #   "python-dotenv>=1.0.0,<2.0.0",
 #   "trackio>=0.25.0,<1.0.0",
 # ]
@@ -33,12 +33,12 @@ from typing import Any, Dict
 import pandas as pd
 from dotenv import load_dotenv
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, ndcg_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -46,12 +46,15 @@ if str(_REPO_ROOT) not in sys.path:
 load_dotenv(_REPO_ROOT / ".env")
 
 from services.ml_observability import OptionalTrackioRun
+from services.ml_cv import build_user_groups, grouped_oof_predict, grouped_oof_regress
 from services.content_success_features import (
     FEATURES_CAT,
     FEATURES_NUM,
     TARGET,
     content_rankings,
 )
+
+CONTENT_MODEL_VERSION = "hist_gradient_boosting_v2"
 
 
 def _safe_lift_at_k(y_true: pd.Series, y_score: pd.Series, k: float) -> float:
@@ -66,27 +69,47 @@ def _safe_lift_at_k(y_true: pd.Series, y_score: pd.Series, k: float) -> float:
     return float(top_rate / base) if base > 0 else 0.0
 
 
-def _build_pipeline() -> Pipeline:
-    num_pipe = Pipeline(
-        steps=[
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler()),
-        ]
-    )
+def _build_preprocessor() -> ColumnTransformer:
+    # Trees handle NaN natively; categoricals one-hot encoded (dense for HGB).
     cat_pipe = Pipeline(
         steps=[
             ("impute", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore", max_categories=40)),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=40)),
         ]
     )
-    pre = ColumnTransformer(
+    return ColumnTransformer(
         transformers=[
-            ("num", num_pipe, FEATURES_NUM),
+            ("num", "passthrough", FEATURES_NUM),
             ("cat", cat_pipe, FEATURES_CAT),
         ]
     )
-    clf = LogisticRegression(max_iter=500, class_weight="balanced")
-    return Pipeline(steps=[("pre", pre), ("clf", clf)])
+
+
+def _build_pipeline() -> Pipeline:
+    clf = HistGradientBoostingClassifier(
+        max_iter=300, learning_rate=0.06, l2_regularization=1.0,
+        class_weight="balanced", random_state=42,
+    )
+    return Pipeline(steps=[("pre", _build_preprocessor()), ("clf", clf)])
+
+
+def _build_regressor() -> Pipeline:
+    reg = HistGradientBoostingRegressor(
+        max_iter=300, learning_rate=0.06, l2_regularization=1.0, random_state=42,
+    )
+    return Pipeline(steps=[("pre", _build_preprocessor()), ("reg", reg)])
+
+
+def _ndcg_at_k(relevance: pd.Series, scores: pd.Series, k: int) -> float:
+    rel = relevance.to_numpy(dtype=float).reshape(1, -1)
+    sc = scores.to_numpy(dtype=float).reshape(1, -1)
+    if rel.shape[1] < 2:
+        return 0.0
+    kk = min(int(k), rel.shape[1])
+    try:
+        return float(ndcg_score(rel, sc, k=kk))
+    except Exception:
+        return 0.0
 
 
 def _run(args: argparse.Namespace) -> Dict[str, Any]:
@@ -97,7 +120,7 @@ def _run(args: argparse.Namespace) -> Dict[str, Any]:
     df = pd.read_parquet(path)
     base: Dict[str, Any] = {
         "task": "content_success_hotness",
-        "model": "logistic_regression_balanced_v1",
+        "model": CONTENT_MODEL_VERSION,
         "rows": int(len(df)),
     }
     if TARGET not in df.columns or len(df) < 8:
@@ -115,35 +138,73 @@ def _run(args: argparse.Namespace) -> Dict[str, Any]:
         base["rankings"] = rankings
         return base
 
-    X = df[FEATURES_NUM + FEATURES_CAT].copy()
-    y = df[TARGET].astype(int).copy()
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
-    )
-    pipe = _build_pipeline()
-    pipe.fit(X_train, y_train)
-    p_test = pd.Series(pipe.predict_proba(X_test)[:, 1], index=y_test.index)
+    # Guarantee every model column exists even if a fallback build path omitted some.
+    X = df.reindex(columns=FEATURES_NUM + FEATURES_CAT).reset_index(drop=True).copy()
+    y = df[TARGET].astype(int).reset_index(drop=True).copy()
+    groups = build_user_groups(df, len(df))
+
+    # Leakage-free evaluation: out-of-fold predictions grouped by user.
+    oof = grouped_oof_predict(_build_pipeline, X, y, groups)
+    if oof is not None:
+        cv_mode = "group_kfold_user"
+        mask = oof.notna()
+        y_eval = y[mask]
+        p_eval = oof[mask]
+    else:
+        cv_mode = "holdout_stratified"
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.3, random_state=42, stratify=y
+        )
+        pipe = _build_pipeline()
+        pipe.fit(X_train, y_train)
+        y_eval = y_test
+        p_eval = pd.Series(pipe.predict_proba(X_test)[:, 1], index=y_test.index)
+
+    # Regression head on continuous hotness_score → ranking quality (NDCG@k),
+    # since "hottest content" is fundamentally a ranking problem.
+    ndcg_block: Dict[str, Any] = {}
+    if "hotness_score" in df.columns:
+        hot = pd.to_numeric(df["hotness_score"], errors="coerce").fillna(0.0).reset_index(drop=True)
+        oof_reg = grouped_oof_regress(_build_regressor, X, hot, groups)
+        if oof_reg is not None:
+            m = oof_reg.notna()
+            ndcg_block = {
+                "regression_cv_mode": "group_kfold_user",
+                "regression_eval_rows": int(m.sum()),
+                "ndcg_at_10": _ndcg_at_k(hot[m], oof_reg[m], 10),
+                "ndcg_at_20": _ndcg_at_k(hot[m], oof_reg[m], 20),
+            }
+
+    final_model = _build_pipeline()
+    final_model.fit(X, y)
 
     report: Dict[str, Any] = {
         **base,
         "status": "ok",
-        "train_rows": int(len(X_train)),
-        "test_rows": int(len(X_test)),
-        "base_positive_rate_test": float(y_test.mean()),
-        "roc_auc": float(roc_auc_score(y_test, p_test)),
-        "average_precision": float(average_precision_score(y_test, p_test)),
-        "lift_at_10pct": _safe_lift_at_k(y_test, p_test, 0.10),
-        "lift_at_20pct": _safe_lift_at_k(y_test, p_test, 0.20),
+        "cv_mode": cv_mode,
+        "n_user_groups": int(groups.nunique()),
+        "train_rows": int(len(X)),
+        "eval_rows": int(len(y_eval)),
+        "base_positive_rate_test": float(y_eval.mean()),
+        "roc_auc": float(roc_auc_score(y_eval, p_eval)),
+        "average_precision": float(average_precision_score(y_eval, p_eval)),
+        "lift_at_10pct": _safe_lift_at_k(y_eval, p_eval, 0.10),
+        "lift_at_20pct": _safe_lift_at_k(y_eval, p_eval, 0.20),
+        **ndcg_block,
         "feature_columns": FEATURES_NUM + FEATURES_CAT,
         "rankings": rankings,
+        "final_model": final_model,
     }
     return report
 
 
 def main() -> int:
+    import joblib
+
     parser = argparse.ArgumentParser(description="Train content-success / hottest-topic model.")
     parser.add_argument("--input", default="data/ml/content_success_train_v1.parquet")
     parser.add_argument("--report-out", default="data/ml/content_success_report.json")
+    parser.add_argument("--model-out", default="data/ml/content_success_model.joblib")
     args = parser.parse_args()
 
     track = OptionalTrackioRun("content_success_train")
@@ -151,6 +212,12 @@ def main() -> int:
     report = _run(args)
     track.log({k: v for k, v in report.items() if k != "rankings"})
     track.finish()
+
+    model = report.pop("final_model", None)
+    if model is not None and report.get("status") == "ok":
+        model_path = Path(args.model_out)
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model, model_path)
 
     out = Path(args.report_out)
     out.parent.mkdir(parents=True, exist_ok=True)

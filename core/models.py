@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from typing import Optional, List, Literal, Dict
 from datetime import datetime
 
@@ -69,9 +69,7 @@ class UserPreferencesUpdate(BaseModel):
     trill_map_sharing_opt_in: bool = Field(False, alias="trillMapSharingOptIn")
     trill_welcome_modal_mark_seen: bool = Field(False, alias="trillWelcomeModalMarkSeen")
 
-    class Config:
-        populate_by_name = True
-        extra = "ignore"
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 
 # ============================================================
@@ -115,7 +113,11 @@ class UploadInit(BaseModel):
     schedule_mode: str = "immediate"  # immediate | scheduled | smart
     has_telemetry: bool = False
     use_ai: bool = False
-    smart_schedule_days: int = 7  # How many days to spread uploads across
+    smart_schedule_days: int = 14  # How many days to spread uploads across
+    smart_schedule_seed: Optional[str] = Field(
+        None,
+        description="Client seed so pre-presign preview matches final smart slots",
+    )
     vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
     vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
     # Per-upload thumbnail studio / Pikzels / persona (mirrors upload.html presign body)
@@ -125,9 +127,10 @@ class UploadInit(BaseModel):
     thumbnail_use_persona: Optional[bool] = None
     thumbnail_persona_id: Optional[str] = None
     thumbnail_persona_strength: Optional[int] = Field(default=None, ge=0, le=100)
+    # TikTok Content Posting API export settings (required when tiktok in platforms)
+    tiktok_post_settings: Optional[dict] = Field(default=None, alias="tiktokPostSettings")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class SettingsUpdate(BaseModel):
@@ -142,8 +145,7 @@ class SettingsUpdate(BaseModel):
     default_hashtag_count: Optional[int] = None
     always_use_hashtags: Optional[bool] = None
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 class CheckoutRequest(BaseModel):
     lookup_key: str
@@ -233,8 +235,7 @@ class UploadUpdate(BaseModel):
     vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
     vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 class ColorPreferencesUpdate(BaseModel):
     tiktok_color: Optional[str] = None
@@ -269,8 +270,7 @@ class CompleteUploadBody(BaseModel):
     vehicle_make_id: Optional[int] = Field(None, alias="vehicleMakeId")
     vehicle_model_id: Optional[int] = Field(None, alias="vehicleModelId")
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 
 # ============================================================

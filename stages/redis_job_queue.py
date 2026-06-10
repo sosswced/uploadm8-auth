@@ -32,12 +32,9 @@ DEFAULT_GROUP = os.environ.get("REDIS_JOB_STREAM_GROUP", "uploadm8_process")
 
 
 def use_redis_streams() -> bool:
-    return os.environ.get("REDIS_JOB_USE_STREAMS", "true").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    from core.pipeline_env_defaults import env_bool
+
+    return env_bool("REDIS_JOB_USE_STREAMS", default=True)
 
 
 def stream_key_for_list(list_key: str) -> str:
@@ -229,7 +226,11 @@ _USER_SLOT_PREFIX = "uploadm8:user_process_slots:"
 
 
 def user_process_cap(priority_class: str) -> int:
-    raw = int(os.environ.get("USER_PROCESS_MAX_PARALLEL", "3") or 0)
+    from core.pipeline_env_defaults import env_int
+
+    raw = env_int("USER_PROCESS_MAX_PARALLEL", default=3)
+    if raw < 0:
+        raw = 0
     if raw <= 0:
         return 0  # unlimited
     pc = (priority_class or "p4").lower()

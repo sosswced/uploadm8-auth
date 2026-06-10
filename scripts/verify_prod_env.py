@@ -30,6 +30,11 @@ PROD_RECOMMENDED = (
     "FRONTEND_URL",
     "ALLOWED_ORIGINS",
     "TOKEN_ENC_KEYS",
+    "MAILGUN_API_KEY",
+    "MAILGUN_DOMAIN",
+    "MAIL_FROM",
+    "MAIL_FROM_HELLO",
+    "MAIL_PHYSICAL_ADDRESS",
 )
 OAUTH_ANY = (
     ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"),
@@ -163,9 +168,23 @@ def main() -> int:
         "STRIPE_SECRET_KEY",
         "SENTRY_DSN",
         "MAILGUN_API_KEY",
+        "MAILGUN_DOMAIN",
+        "MAIL_FROM",
+        "MAIL_FROM_HELLO",
+        "MAILGUN_DISABLE_TRACKING",
+        "MAIL_LOGO_URL",
         "OPENAI_API_KEY",
     ):
         print(f"  [prod] {k}: {_status(k)}")
+
+    mail_from = os.environ.get("MAIL_FROM", "")
+    if mail_from and "auth.uploadm8.com" in mail_from:
+        warnings.append("MAIL_FROM uses auth.uploadm8.com — use hello@uploadm8.com for inbox placement")
+    if mail_from and "no-reply@" in mail_from.lower():
+        warnings.append("MAIL_FROM uses no-reply — hello@uploadm8.com is recommended for transactional mail")
+    mg_domain = os.environ.get("MAILGUN_DOMAIN", "")
+    if mg_domain and "uploadm8.com" not in mg_domain:
+        warnings.append("MAILGUN_DOMAIN does not look like an uploadm8.com Mailgun domain")
 
     try:
         from core import config

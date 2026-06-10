@@ -77,10 +77,16 @@ async def enqueue_job(
     # client-level retry kicks in. A second attempt forces a fresh connection.
     for attempt in (1, 2):
         try:
-            await core.state.redis_client.lpush(queue, payload)
+            from stages.redis_job_queue import enqueue_process_job, use_redis_streams
+
+            ok = await enqueue_process_job(core.state.redis_client, queue, job_data)
+            if not ok:
+                return False
+            if not use_redis_streams():
+                pass  # enqueue_process_job already LPUSH when streams off
             logger.debug(
                 f"[{upload_id}] Enqueued -> {queue} "
-                f"(lane={lane} priority_class={priority_class})"
+                f"(lane={lane} priority_class={priority_class} streams={use_redis_streams()})"
             )
             return True
         except _TRANSIENT_REDIS_ERRORS as e:

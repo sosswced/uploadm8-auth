@@ -259,14 +259,17 @@ class JobContext:
     caption: str = ""
     hashtags: List[str] = field(default_factory=list)
     privacy: str = "public"
+    # TikTok Content Posting API export choices (per-account map under by_account)
+    tiktok_post_settings: Dict[str, Any] = field(default_factory=dict)
     reframe_mode: str = "auto"  # auto | pad | crop | none
     # Scheduled publish (uploads.scheduled_time) — used for deferred/staged user comms.
     scheduled_time: Optional[datetime] = None
 
     entitlements: Optional[Entitlements] = None
     user_settings: Dict[str, Any] = field(default_factory=dict)
-    # Free-tier burn-in label (from admin_settings + worker; watermark_stage reads this).
+    # Free-tier burn-in settings (from admin_settings + worker; watermark_stage reads these).
     watermark_text: Optional[str] = None
+    watermark_settings: Dict[str, Any] = field(default_factory=dict)
 
     temp_dir: Optional[Path] = None
     local_video_path: Optional[Path] = None
@@ -340,6 +343,10 @@ class JobContext:
     finished_at: Optional[datetime] = None
     errors: List[Dict[str, Any]] = field(default_factory=list)
     cancel_requested: bool = False
+
+    # Smart deferred publish: when set, publish_stage only attempts these platforms
+    # (lowercase names) and skips targets already present in platform_results.
+    deferred_publish_platform_filter: Optional[set] = None
 
     # Explicit error tracking
     error_code: Optional[str] = None
@@ -920,6 +927,21 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
             ctx.vehicle_model_id = int(ctx.vehicle_model_id)
     except (TypeError, ValueError):
         ctx.vehicle_model_id = None
+
+    uprefs = coerce_jsonb_dict(upload_record.get("user_preferences"), default={})
+    if uprefs:
+        raw_tt = uprefs.get("tiktok_post_settings") or uprefs.get("tiktokPostSettings")
+        if isinstance(raw_tt, dict):
+            ctx.tiktok_post_settings = raw_tt
+        for key in (
+            "thumbnail_pikzels_enabled",
+            "thumbnailPikzelsEnabled",
+            "thumbnail_studio_engine_enabled",
+            "thumbnailStudioEngineEnabled",
+        ):
+            if key in uprefs and uprefs[key] is not None:
+                ctx.user_settings[key] = uprefs[key]
+
     return ctx
 
 

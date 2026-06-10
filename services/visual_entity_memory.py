@@ -8,6 +8,7 @@ this creator has shown before — dashcam, vlog, cooking, camping, fishing, etc.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,108 @@ _PERSIST_BUCKETS = tuple(
 
 def _normalize_entity(name: str) -> str:
     return re.sub(r"\s+", " ", str(name or "").strip().lower())[:200]
+
+
+_VEHICLE_TOKENS = frozenset(
+    {
+        "car",
+        "cars",
+        "truck",
+        "trucks",
+        "vehicle",
+        "vehicles",
+        "motorcycle",
+        "motorcycles",
+        "bus",
+        "suv",
+        "van",
+        "boat",
+        "boats",
+        "ship",
+        "ships",
+    }
+)
+
+
+def _flat_from_recognition_summary_row(row: Any) -> Dict[str, List[str]]:
+    """Build catalog_flat from persisted summary when recognition_flat was never stored."""
+    raw = row.get("raw_summary")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if isinstance(raw, dict):
+        nested = raw.get("recognition_flat")
+        if isinstance(nested, dict) and nested:
+            return {k: list(v) for k, v in nested.items() if isinstance(v, list) and v}
+
+    flat: Dict[str, List[str]] = {}
+    objs = [str(x).strip() for x in (row.get("top_objects") or []) if str(x).strip()]
+    if objs:
+        flat["objects"] = objs[:32]
+        vehicles = [o for o in objs if _normalize_entity(o) in _VEHICLE_TOKENS]
+        if vehicles:
+            flat["vehicles"] = vehicles[:32]
+    logos = [str(x).strip() for x in (row.get("top_logos") or []) if str(x).strip()]
+    if logos:
+        flat["brands"] = logos[:32]
+    text = [str(x).strip() for x in (row.get("top_text") or []) if str(x).strip()]
+    if text:
+        flat["signage"] = text[:32]
+    return flat
+
+
+async def backfill_catalog_from_recognition_summaries(db_pool, user_id: str) -> int:
+    """
+    Repair empty user_visual_entity_catalog from upload_recognition_summary rows
+    (uploads processed before catalog upsert or without recognition_flat in raw_summary).
+    """
+    if not db_pool or not user_id:
+        return 0
+    try:
+        async with db_pool.acquire() as conn:
+            has_catalog = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM user_visual_entity_catalog WHERE user_id = $1::uuid)",
+                user_id,
+            )
+            if has_catalog:
+                return 0
+            rows = await conn.fetch(
+                """
+                SELECT upload_id::text AS upload_id, raw_summary, top_objects, top_logos, top_text
+                FROM upload_recognition_summary
+                WHERE user_id = $1::uuid
+                ORDER BY updated_at DESC
+                LIMIT 200
+                """,
+                user_id,
+            )
+        if not rows:
+            return 0
+        touched = 0
+        for row in rows:
+            flat = _flat_from_recognition_summary_row(row)
+            if not flat:
+                continue
+            touched += await upsert_catalog_entities(
+                db_pool,
+                user_id=user_id,
+                upload_id=str(row["upload_id"]),
+                catalog_flat=flat,
+                category="general",
+            )
+        if touched:
+            logger.info(
+                "[visual_entity_memory] backfilled catalog user=%s from %d summaries (~%d entity rows)",
+                user_id,
+                len(rows),
+                touched,
+            )
+        return touched
+    except Exception as e:
+        logger.debug("[visual_entity_memory] catalog backfill: %s", str(e)[:160])
+        return 0
 
 
 async def upsert_catalog_entities(
@@ -184,6 +287,8 @@ async def fetch_channel_catalog_detail(
             "last_seen_at": None,
             "buckets": [],
         }
+
+    await backfill_catalog_from_recognition_summaries(db_pool, user_id)
 
     order = niche_bucket_order(category)
     seen_bucket_keys: set = set()

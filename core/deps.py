@@ -60,17 +60,23 @@ async def _attach_workspace_context(conn, user: dict, request: Optional[Request]
     out = {**user, "wallet": wallet}
     if ctx:
         owner = ctx.owner_row
+        ws_name = await conn.fetchval(
+            "SELECT name FROM workspaces WHERE id = $1::uuid",
+            ctx.workspace_id,
+        )
         out["workspace"] = {
             "id": ctx.workspace_id,
             "owner_user_id": ctx.owner_user_id,
             "role": ctx.role,
-            "name": owner.get("name") or owner.get("email"),
+            "name": (ws_name or "My Workspace").strip() or "My Workspace",
         }
         out["billing_user_id"] = billing_id
-        # Entitlements/tier follow workspace owner for members
         if billing_id != user_id:
             out["subscription_tier"] = owner.get("subscription_tier")
             out["flex_enabled"] = owner.get("flex_enabled")
+            from services.workspace import apply_owner_billing_profile
+
+            out = apply_owner_billing_profile(out, owner)
     else:
         out["billing_user_id"] = user_id
     return out
@@ -171,7 +177,9 @@ async def get_current_user_readonly_no_wallet(
                     "code": "email_not_verified",
                 },
             )
-        return {**dict(user), "wallet": None}
+        user_dict = dict(user)
+        user_dict = await _attach_workspace_context(conn, user_dict, request)
+        return {**user_dict, "wallet": None}
 
 
 async def require_admin(user: dict = Depends(get_current_user)):

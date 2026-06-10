@@ -4,7 +4,7 @@ UploadM8 Transcode Stage - Platform-specific video transcoding
 Creates separate, optimized video files for each target platform.
 Each platform gets its own properly formatted MP4 with correct:
   - Aspect ratio (9:16 vertical via pad/crop based on reframe_mode)
-  - Resolution (1080x1920 default; optional 2160x3840 for YouTube via TRANSCODE_YOUTUBE_4K)
+  - Resolution (1080x1920 default; 2160x3840 when source is 4K-class and TRANSCODE_PRESERVE_HD_TIER is on)
   - Duration (trimmed to platform max)
   - Codec (H.264 High + AAC-LC)
   - Frame rate (capped per platform)
@@ -34,15 +34,14 @@ _FFMPEG_THREADS_DEFAULT = max(
 )
 FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", str(_FFMPEG_THREADS_DEFAULT)))
 
-# Encode quality (override without code changes)
-TRANSCODE_X264_CRF = (os.environ.get("TRANSCODE_X264_CRF", "20").strip() or "20")
-TRANSCODE_X264_PRESET = (os.environ.get("TRANSCODE_X264_PRESET", "medium").strip() or "medium")
-TRANSCODE_YOUTUBE_4K = os.environ.get("TRANSCODE_YOUTUBE_4K", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+# Encode quality (override without code changes). Preset affects encoder CPU time, not target resolution.
+# Hybrid default: preset fast + CRF 19 ≈ medium + CRF 20 visual quality at ~25–35% faster encode (good for scaled workers).
+TRANSCODE_X264_CRF = (os.environ.get("TRANSCODE_X264_CRF", "19").strip() or "19")
+TRANSCODE_X264_PRESET = (os.environ.get("TRANSCODE_X264_PRESET", "fast").strip() or "fast")
+
+# HD tier preservation: 1080p+ sources stay at 1080x1920 minimum; 4K-class sources use 2160x3840.
+# TRANSCODE_YOUTUBE_4K: auto (default) | true | false — auto enables 4K YouTube when source qualifies.
+# TRANSCODE_VERTICAL_4K_ALL_PLATFORMS: when true (default), 4K-class sources use 2160x3840 on all vertical platforms.
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,13 +136,40 @@ _YOUTUBE_4K_OVERRIDES = {
     "level": "5.1",
 }
 
+_PLATFORM_4K_VIDEO_BITRATE = {
+    "youtube": "40M",
+    "tiktok": "20M",
+    "instagram": "20M",
+    "facebook": "20M",
+}
 
-def get_platform_spec(platform: str) -> dict:
-    """Return platform transcode spec, applying optional YouTube 4K overrides."""
-    base = PLATFORM_SPECS.get(platform) or PLATFORM_SPECS["tiktok"]
-    if platform == "youtube" and TRANSCODE_YOUTUBE_4K:
-        return {**base, **_YOUTUBE_4K_OVERRIDES}
-    return base
+# 1080p-class dashcam / phone footage — higher caps preserve OSD text and road detail.
+_PLATFORM_1080_VIDEO_BITRATE = {
+    "youtube": "18M",
+    "tiktok": "16M",
+    "instagram": "14M",
+    "facebook": "14M",
+}
+
+
+def _env_truthy(name: str, default: str = "true") -> bool:
+    v = (os.environ.get(name) or default).strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _youtube_4k_mode() -> str:
+    return (os.environ.get("TRANSCODE_YOUTUBE_4K") or "auto").strip().lower()
+
+
+PRESERVE_HD_TIER = _env_truthy("TRANSCODE_PRESERVE_HD_TIER", "true")
+
+
+def _apply_vertical_4k_spec(base: dict, platform: str) -> dict:
+    return {
+        **base,
+        **_YOUTUBE_4K_OVERRIDES,
+        "max_bitrate_video": _PLATFORM_4K_VIDEO_BITRATE.get(platform, "20M"),
+    }
 
 
 def _scale_filter(
@@ -198,6 +224,131 @@ class VideoInfo:
         if self.height == 0:
             return 0
         return self.width / self.height
+
+
+def source_hd_tier(info: VideoInfo) -> str:
+    """Classify source resolution: 4k (2160+ long edge), 1080p, or standard."""
+    short = min(info.width, info.height)
+    long = max(info.width, info.height)
+    if long >= 2160 and short >= 1080:
+        return "4k"
+    if short >= 1080:
+        return "1080p"
+    return "standard"
+
+
+def get_platform_spec(platform: str, info: Optional[VideoInfo] = None) -> dict:
+    """Return platform transcode spec with source-aware 1080p / 4K targets and bitrates."""
+    base = PLATFORM_SPECS.get(platform) or PLATFORM_SPECS["tiktok"]
+    if info is None:
+        if platform == "youtube" and _youtube_4k_mode() in ("1", "true", "yes", "on"):
+            return {**base, **_YOUTUBE_4K_OVERRIDES}
+        return base
+
+    tier = source_hd_tier(info)
+    spec = dict(base)
+
+    if PRESERVE_HD_TIER and tier == "1080p":
+        boosted = _PLATFORM_1080_VIDEO_BITRATE.get(platform)
+        if boosted:
+            spec["max_bitrate_video"] = boosted
+
+    if not PRESERVE_HD_TIER:
+        return spec
+
+    if tier != "4k":
+        return spec
+
+    yt_mode = _youtube_4k_mode()
+    use_4k = False
+    if platform == "youtube":
+        if yt_mode not in ("0", "false", "no", "off"):
+            use_4k = True
+    elif _env_truthy("TRANSCODE_VERTICAL_4K_ALL_PLATFORMS", "true"):
+        use_4k = True
+
+    if use_4k:
+        return _apply_vertical_4k_spec(spec, platform)
+    return spec
+
+
+def resolve_x264_encode_params(info: VideoInfo) -> Tuple[str, str, Optional[str]]:
+    """
+    Source-tier x264 settings: sharper CRF + fast preset for 1080p/4K dashcam-class sources;
+    faster preset for smaller phone clips on scaled worker fleets.
+    """
+    tier = source_hd_tier(info)
+    preset = TRANSCODE_X264_PRESET
+    crf = TRANSCODE_X264_CRF
+    tune_raw = (os.environ.get("TRANSCODE_X264_TUNE") or "").strip()
+    tune: Optional[str] = tune_raw or None
+
+    if tier == "4k":
+        crf = (os.environ.get("TRANSCODE_X264_CRF_4K") or "18").strip() or "18"
+        preset = (os.environ.get("TRANSCODE_X264_PRESET_4K") or preset).strip() or preset
+        if not tune and _env_truthy("TRANSCODE_DASHCAM_TUNE_FILM", "true"):
+            tune = "film"
+    elif tier == "1080p":
+        crf = (os.environ.get("TRANSCODE_X264_CRF_1080") or "19").strip() or "19"
+        preset = (os.environ.get("TRANSCODE_X264_PRESET_1080") or preset).strip() or preset
+        if not tune and _env_truthy("TRANSCODE_DASHCAM_TUNE_FILM", "true"):
+            tune = "film"
+    else:
+        crf = (os.environ.get("TRANSCODE_X264_CRF_STANDARD") or crf).strip() or crf
+        preset = (os.environ.get("TRANSCODE_X264_PRESET_STANDARD") or "faster").strip() or "faster"
+
+    return preset, crf, tune
+
+
+def analyze_transcode_needs(
+    info: VideoInfo,
+    platform: str,
+    reframe_action: str,
+) -> Tuple[List[str], List[str]]:
+    """Split reasons into video vs audio so we can stream-copy video when only audio needs work."""
+    spec = get_platform_spec(platform, info) if platform in PLATFORM_SPECS else None
+    if not spec:
+        return [], []
+
+    video_reasons: List[str] = []
+    audio_reasons: List[str] = []
+
+    if reframe_action in ("pad", "crop"):
+        video_reasons.append(f"reframe={reframe_action} to {spec['target_width']}x{spec['target_height']}")
+
+    if info.video_codec.lower() not in ("h264", "avc"):
+        video_reasons.append(f"video codec is {info.video_codec}, needs h264")
+
+    if info.pixel_format != "yuv420p":
+        video_reasons.append(f"pixel format is {info.pixel_format}, needs yuv420p")
+
+    if reframe_action == "none":
+        max_w = spec["target_width"]
+        max_h = spec["target_height"]
+        if info.is_landscape:
+            max_w = max(spec["target_width"], spec["target_height"])
+            max_h = min(spec["target_width"], spec["target_height"])
+        if info.width > max_w or info.height > max_h:
+            video_reasons.append(f"resolution {info.width}x{info.height} exceeds max {max_w}x{max_h}")
+
+    if info.fps > spec["max_fps"]:
+        video_reasons.append(f"fps {info.fps:.1f} exceeds max {spec['max_fps']}")
+
+    if info.rotation != 0:
+        video_reasons.append(f"has {info.rotation} degree rotation to apply")
+
+    if not info.audio_codec:
+        audio_reasons.append("no audio stream — mux silent stereo")
+    elif info.audio_codec.lower() != "aac":
+        audio_reasons.append(f"audio codec is {info.audio_codec}, needs aac")
+    elif info.sample_rate and info.sample_rate != spec["sample_rate"]:
+        audio_reasons.append(f"sample rate {info.sample_rate} needs {spec['sample_rate']}")
+
+    if spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
+        # -t trim works with stream copy; not a video reencode reason by itself.
+        pass
+
+    return video_reasons, audio_reasons
 
 
 async def get_video_info(video_path: Path) -> VideoInfo:
@@ -336,54 +487,12 @@ def needs_transcode(
     platform: str,
     reframe_action: str,
 ) -> Tuple[bool, List[str]]:
-    """Check if video needs transcoding for the target platform"""
-    spec = get_platform_spec(platform) if platform in PLATFORM_SPECS else None
-    if not spec:
-        return False, []
-
-    reasons = []
-
-    # Check if reframing is needed (aspect ratio change)
-    if reframe_action in ("pad", "crop"):
-        reasons.append(f"reframe={reframe_action} to {spec['target_width']}x{spec['target_height']}")
-
-    # Check codec
-    if info.video_codec.lower() not in ("h264", "avc"):
-        reasons.append(f"video codec is {info.video_codec}, needs h264")
-
-    if info.audio_codec and info.audio_codec.lower() != "aac":
-        reasons.append(f"audio codec is {info.audio_codec}, needs aac")
-
-    # Check pixel format
-    if info.pixel_format != "yuv420p":
-        reasons.append(f"pixel format is {info.pixel_format}, needs yuv420p")
-
-    # Check resolution (even without reframe, may need downscale)
-    if reframe_action == "none":
-        max_w = spec["target_width"]
-        max_h = spec["target_height"]
-        if info.is_landscape:
-            max_w = max(spec["target_width"], spec["target_height"])
-            max_h = min(spec["target_width"], spec["target_height"])
-        if info.width > max_w or info.height > max_h:
-            reasons.append(f"resolution {info.width}x{info.height} exceeds max {max_w}x{max_h}")
-
-    # Check fps
-    if info.fps > spec["max_fps"]:
-        reasons.append(f"fps {info.fps:.1f} exceeds max {spec['max_fps']}")
-
-    # Check duration
-    if spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
+    """Check if any transcode/mux work is needed for the target platform."""
+    v_reasons, a_reasons = analyze_transcode_needs(info, platform, reframe_action)
+    reasons = list(v_reasons) + list(a_reasons)
+    spec = get_platform_spec(platform, info) if platform in PLATFORM_SPECS else None
+    if spec and spec["max_duration"] > 0 and info.duration > spec["max_duration"]:
         reasons.append(f"duration {info.duration:.1f}s exceeds max {spec['max_duration']}s")
-
-    # Check audio sample rate
-    if info.sample_rate and info.sample_rate != spec["sample_rate"]:
-        reasons.append(f"sample rate {info.sample_rate} needs {spec['sample_rate']}")
-
-    # Check rotation
-    if info.rotation != 0:
-        reasons.append(f"has {info.rotation} degree rotation to apply")
-
     return len(reasons) > 0, reasons
 
 
@@ -399,9 +508,10 @@ def build_ffmpeg_command(
     *,
     force_duration_trim_sec: Optional[float] = None,
     tiktok_cover_offset_sec: Optional[float] = None,
+    watermark_vf: Optional[str] = None,
 ) -> list:
     """Build platform-specific FFmpeg command"""
-    spec = get_platform_spec(platform)
+    spec = get_platform_spec(platform, info)
 
     needs_silent_audio = not info.audio_codec
 
@@ -457,24 +567,51 @@ def build_ffmpeg_command(
 
         vf_filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
 
+    if watermark_vf:
+        vf_filters.append(watermark_vf)
+
     vf_filters.append("format=yuv420p")
 
-    if vf_filters:
+    v_reasons, a_reasons = analyze_transcode_needs(info, platform, reframe_action)
+    trim_needed = (
+        force_duration_trim_sec is not None
+        and force_duration_trim_sec > 0
+        and info.duration > force_duration_trim_sec
+    ) or (
+        spec["max_duration"] > 0 and info.duration > spec["max_duration"]
+    )
+    video_copy = (
+        not v_reasons
+        and not needs_silent_audio
+        and (bool(a_reasons) or trim_needed)
+    )
+
+    if vf_filters and not video_copy:
         cmd.extend(["-vf", ",".join(vf_filters)])
 
     # -- Video codec settings --
-    cmd.extend([
-        "-c:v", "libx264",
-        "-threads", str(FFMPEG_THREADS),
-        "-preset", TRANSCODE_X264_PRESET,
-        "-crf", TRANSCODE_X264_CRF,
-        "-profile:v", spec.get("profile", "high"),
-        "-level", spec.get("level", "4.1"),
-        "-maxrate", spec["max_bitrate_video"],
-        "-bufsize", str(int(spec["max_bitrate_video"].replace("M", "")) * 2) + "M",
-    ])
+    if video_copy:
+        cmd.extend(["-c:v", "copy"])
+        if a_reasons:
+            logger.info(f"{platform}: stream-copying video (audio re-encode only)")
+        else:
+            logger.info(f"{platform}: stream-copying video and audio (trim/mux only)")
+    else:
+        x264_preset, x264_crf, x264_tune = resolve_x264_encode_params(info)
+        cmd.extend([
+            "-c:v", "libx264",
+            "-threads", str(FFMPEG_THREADS),
+            "-preset", x264_preset,
+            "-crf", x264_crf,
+            "-profile:v", spec.get("profile", "high"),
+            "-level", spec.get("level", "4.1"),
+            "-maxrate", spec["max_bitrate_video"],
+            "-bufsize", str(int(spec["max_bitrate_video"].replace("M", "")) * 2) + "M",
+        ])
+        if x264_tune:
+            cmd.extend(["-tune", x264_tune])
 
-    if platform == "tiktok" and tiktok_cover_offset_sec is not None:
+    if platform == "tiktok" and tiktok_cover_offset_sec is not None and not video_copy:
         from stages.tiktok_cover_burn import extend_tiktok_transcode_x264_args
 
         extend_tiktok_transcode_x264_args(
@@ -483,11 +620,11 @@ def build_ffmpeg_command(
             fps=float(info.fps or 30.0),
         )
 
-    # -- Frame rate capping --
-    if info.fps > spec["max_fps"]:
+    # -- Frame rate capping (re-encode only) --
+    if not video_copy and info.fps > spec["max_fps"]:
         cmd.extend(["-r", str(spec["max_fps"])])
 
-    # -- Duration trimming --
+    # -- Duration trimming (works with stream copy) --
     trim_to: Optional[float] = None
     if force_duration_trim_sec and force_duration_trim_sec > 0 and info.duration > force_duration_trim_sec:
         trim_to = max(1.0, force_duration_trim_sec - 0.5)
@@ -501,12 +638,15 @@ def build_ffmpeg_command(
     # command when needs_silent_audio is True.  We now either encode the real
     # audio stream or map+encode the synthetic silent stream.
     if not needs_silent_audio:
-        cmd.extend([
-            "-c:a", "aac",
-            "-b:a", spec["max_bitrate_audio"],
-            "-ar", str(spec["sample_rate"]),
-            "-ac", "2",                  # Force stereo
-        ])
+        if not a_reasons:
+            cmd.extend(["-c:a", "copy"])
+        else:
+            cmd.extend([
+                "-c:a", "aac",
+                "-b:a", spec["max_bitrate_audio"],
+                "-ar", str(spec["sample_rate"]),
+                "-ac", "2",                  # Force stereo
+            ])
     else:
         # Map video from input 0, audio from anullsrc input 1
         cmd.extend([
@@ -520,11 +660,10 @@ def build_ffmpeg_command(
         ])
 
     # -- Output container settings --
-    cmd.extend([
-        "-movflags", "+faststart",       # Enable progressive download / streaming
-        "-pix_fmt", "yuv420p",
-        str(output_path)
-    ])
+    out_tail = ["-movflags", "+faststart", str(output_path)]
+    if not video_copy:
+        out_tail = ["-pix_fmt", "yuv420p"] + out_tail
+    cmd.extend(out_tail)
 
     return cmd
 
@@ -543,6 +682,7 @@ async def transcode_video(
     *,
     force_duration_trim_sec: Optional[float] = None,
     tiktok_cover_offset_sec: Optional[float] = None,
+    watermark_vf: Optional[str] = None,
 ) -> Path:
     """Transcode a video to a platform-specific format.
     
@@ -558,6 +698,7 @@ async def transcode_video(
         reframe_action,
         force_duration_trim_sec=force_duration_trim_sec,
         tiktok_cover_offset_sec=tiktok_cover_offset_sec,
+        watermark_vf=watermark_vf,
     )
 
     cmd_preview = " ".join(cmd[:15]) + "..."
@@ -629,7 +770,7 @@ async def transcode_video(
         logger.info(f"Transcode complete for {platform}: {out_size_mb:.1f}MB")
 
         # Warn if output exceeds platform file size limit
-        spec = PLATFORM_SPECS.get(platform, {})
+        spec = get_platform_spec(platform, info)
         max_mb = spec.get("max_file_mb", 0)
         if max_mb > 0 and out_size_mb > max_mb:
             logger.warning(
@@ -673,9 +814,25 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
     reframe_mode = getattr(ctx, "reframe_mode", "auto") or "auto"
 
     # -- Step 1: Analyze input video --
-    # Use watermarked source if watermark stage ran before transcode
+    # Use watermarked source if watermark stage ran before transcode (legacy path).
+    # WATERMARK_SINGLE_PASS burns drawtext inside each platform transcode instead.
     input_video = ctx.local_video_path
-    if ctx.processed_video_path and ctx.processed_video_path.exists():
+    watermark_vf: Optional[str] = None
+    single_pass_wm = bool(getattr(ctx, "watermark_single_pass", False))
+    if (
+        single_pass_wm
+        and ctx.entitlements
+        and ctx.entitlements.can_watermark
+    ):
+        try:
+            from stages.watermark_stage import build_watermark_vf_for_transcode
+
+            watermark_vf = await build_watermark_vf_for_transcode(ctx, input_video)
+            if watermark_vf:
+                logger.info("[%s] WATERMARK_SINGLE_PASS: burn-in during transcode", ctx.upload_id)
+        except Exception as e:
+            logger.warning("[%s] single-pass watermark filter skipped: %s", ctx.upload_id, e)
+    elif ctx.processed_video_path and ctx.processed_video_path.exists():
         input_video = ctx.processed_video_path
         logger.info(f"Using processed video as transcode input: {input_video.name}")
 
@@ -687,7 +844,7 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
     logger.info(
         f"Video: {info.width}x{info.height}, {info.duration:.1f}s, {info.fps:.1f}fps, "
         f"codec={info.video_codec}, pix_fmt={info.pixel_format}, rotation={info.rotation}, "
-        f"file_size={file_mb:.1f}MB"
+        f"file_size={file_mb:.1f}MB, hd_tier={source_hd_tier(info)}"
     )
     logger.info(f"Analyzing video for platforms: {platforms}, reframe_mode={reframe_mode}")
 
@@ -701,6 +858,7 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
         "audio_codec": info.audio_codec,
         "orientation": orientation,
         "file_size": info.file_size,
+        "hd_tier": source_hd_tier(info),
     }
 
     # -- Step 2: Per-platform transcode --
@@ -713,7 +871,7 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
             ctx.platform_videos[platform] = ctx.local_video_path
             continue
 
-        spec = get_platform_spec(platform)
+        spec = get_platform_spec(platform, info)
 
         # Resolve what reframe action to take for this platform
         reframe_action = resolve_reframe_action(info, reframe_mode, platform)
@@ -745,6 +903,16 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
         if needs_tc:
             for reason in reasons:
                 logger.info(f"{platform} needs transcode: {reason}")
+            v_r, a_r = analyze_transcode_needs(info, platform, reframe_action)
+            trim_only = not v_r and not a_r
+            if trim_only:
+                logger.info(f"{platform}: stream-copy trim/mux (preserving source pixels)")
+            elif v_r:
+                preset, crf, tune = resolve_x264_encode_params(info)
+                logger.info(
+                    f"{platform} encode profile: preset={preset} crf={crf} tune={tune or 'default'} "
+                    f"hd_tier={source_hd_tier(info)} maxrate={spec.get('max_bitrate_video')}"
+                )
 
             output_path = ctx.temp_dir / f"transcoded_{platform}.mp4"
             tiktok_cover_off = None
@@ -756,6 +924,7 @@ async def run_transcode_stage(ctx: JobContext, db_pool=None) -> JobContext:
                 input_video, output_path, platform, info, reframe_action,
                 db_pool=db_pool, upload_id=str(ctx.upload_id) if ctx.upload_id else None,
                 tiktok_cover_offset_sec=tiktok_cover_off,
+                watermark_vf=watermark_vf,
             )
 
             ctx.platform_videos[platform] = output_path

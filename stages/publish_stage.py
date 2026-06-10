@@ -45,6 +45,12 @@ from . import r2 as r2_stage
 from .image_format import ensure_jpeg_file, sniff_image_format
 
 from services.publish_metadata_gate import assert_publish_metadata_gate
+from services.tiktok_api import (
+    resolve_tiktok_post_settings_for_account,
+    tiktok_force_private_unaudited,
+    tiktok_post_info_from_settings,
+    validate_tiktok_post_settings,
+)
 from core.helpers import coerce_processed_assets_map
 
 
@@ -87,6 +93,8 @@ IG_HASHTAG_COMMENT_MAX = 1900
 
 # Presigned URL expiry for Meta uploads (1 hour)
 PRESIGNED_URL_EXPIRY = 3600
+# Meta Graph multipart uploads often 413 above ~100MB — prefer file_url when larger.
+FACEBOOK_MULTIPART_MAX_BYTES = 95 * 1024 * 1024
 
 # YouTube Shorts + Content ID: catalogue/copyright-protected audio is not allowed in Shorts
 # that are 60 seconds or longer (YouTube surfaces this after upload). When our ACR stack flags
@@ -335,13 +343,13 @@ def resolve_privacy_level(canonical: str, platform: str) -> str:
 
 
 def _tiktok_force_private_unaudited_enabled() -> bool:
-    """When true, TikTok Direct Post uses ``SELF_ONLY`` regardless of upload privacy.
+    """When true, TikTok Direct Post uses ``SELF_ONLY`` regardless of user privacy choice.
 
-    Use for TikTok apps pending production audit (public posts may be rejected).
-    Env: ``TIKTOK_FORCE_PRIVATE_UNAUDITED`` = 1/true/yes/on.
+    Default: true while ``TIKTOK_APP_AUDITED`` is unset (app pending TikTok audit).
+    After audit passes, set ``TIKTOK_APP_AUDITED=1``. Optional override:
+    ``TIKTOK_FORCE_PRIVATE_UNAUDITED=1``.
     """
-    v = (os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    return tiktok_force_private_unaudited()
 
 
 def _tiktok_unaudited_private_only_error(body: str) -> bool:
@@ -647,45 +655,134 @@ def _tiktok_post_title(ctx: JobContext) -> str:
     return _utf16_clip(caption, 2200)
 
 
+def _tiktok_export_is_hashtag_only(text: str) -> bool:
+    """True when export caption is only hashtag tokens (user prefilled tags, AI prose pending)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    parts = [p for p in re.split(r"[\s\n]+", t) if p]
+    if not parts:
+        return False
+    return all(p.startswith("#") and len(p) > 1 for p in parts)
+
+
+def _tiktok_ai_prose(ctx: JobContext) -> str:
+    """Prose-only TikTok caption from worker AI / user metadata (no hashtag merge)."""
+    cap = (_get_caption(ctx, "tiktok") or "").strip()
+    if cap:
+        return strip_stray_hashtag_json_blob(cap)
+    return (_get_title(ctx, "tiktok") or "").strip()
+
+
+def _resolve_tiktok_publish_title(ctx: JobContext, export_title: str) -> str:
+    """
+    Prefer user-edited export caption; fall back to worker-built caption.
+    Hashtag-only export text gets AI prose prepended so batch/settings-tag flows keep AI captions.
+    """
+    saved = (export_title or "").strip()
+    if not saved:
+        return _tiktok_post_title(ctx)
+    if _tiktok_export_is_hashtag_only(saved):
+        prose = _tiktok_ai_prose(ctx)
+        if prose:
+            return _utf16_clip(f"{prose}\n\n{saved}", 2200)
+    return _utf16_clip(saved, 2200)
+
+
 def _build_full_caption(ctx: JobContext) -> str:
     """Backward-compat alias — no platform-specific hashtags."""
     return _build_platform_caption(ctx, platform="")
 
 
-def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
-    """Get a publicly accessible URL for the platform's video.
+def _collect_processed_r2_keys(ctx: JobContext, platform: str) -> list[str]:
+    """Ordered R2 key candidates for a platform's processed MP4 (deduped)."""
+    keys: list[str] = []
+    seen: set[str] = set()
 
-    Priority:
-      1. R2 public URL (if R2_PUBLIC_URL configured)
-      2. R2 presigned URL (always works, expires in 1 hour)
-      3. None (no URL available)
-    """
-    # Check if we have a processed asset R2 key for this platform
-    r2_key = None
+    def _add(key: Optional[str]) -> None:
+        k = (key or "").strip()
+        if k and k not in seen and not k.startswith("thumb_"):
+            seen.add(k)
+            keys.append(k)
 
-    # Try from output_artifacts stored during upload stage
+    assets_sources: list[object] = []
     try:
-        assets_json = ctx.output_artifacts.get("processed_assets", "{}")
-        assets = coerce_processed_assets_map(assets_json)
-        r2_key = assets.get(platform)
+        assets_sources.append(ctx.output_artifacts.get("processed_assets", "{}"))
     except Exception:
         pass
+    upload_rec = getattr(ctx, "upload_record", None)
+    if isinstance(upload_rec, dict):
+        assets_sources.append(upload_rec.get("processed_assets"))
 
-    # Fallback: construct expected key
-    if not r2_key:
-        r2_key = f"processed/{ctx.user_id}/{ctx.upload_id}/{platform}.mp4"
+    for raw in assets_sources:
+        try:
+            assets = coerce_processed_assets_map(raw)
+            _add(assets.get(platform))
+            _add(assets.get("default"))
+        except Exception:
+            continue
 
-    # Try public URL first (fastest, no expiry)
+    _add(getattr(ctx, "processed_r2_key", None))
+    _add(f"processed/{ctx.user_id}/{ctx.upload_id}/{platform}.mp4")
+    _add(f"processed/{ctx.user_id}/{ctx.upload_id}/default.mp4")
+    return keys
+
+
+def _presigned_url_for_r2_key(r2_key: str) -> Optional[str]:
     public_url = r2_stage.get_public_url(r2_key)
     if public_url:
         return public_url
-
-    # Fall back to presigned URL (always works)
     try:
         return r2_stage.generate_presigned_url(r2_key, expires=PRESIGNED_URL_EXPIRY)
     except Exception as e:
-        logger.warning(f"Could not generate presigned URL for {platform}: {e}")
+        logger.debug("Presign failed for %s: %s", r2_key, e)
         return None
+
+
+def _get_video_public_url(ctx: JobContext, platform: str) -> Optional[str]:
+    """Get a publicly accessible URL for the platform's video.
+
+    Tries each known processed R2 key (platform, default, DB snapshot) until
+    a public CDN URL or presigned GET URL succeeds.
+    """
+    for r2_key in _collect_processed_r2_keys(ctx, platform):
+        url = _presigned_url_for_r2_key(r2_key)
+        if url:
+            logger.info("[%s] Resolved %s video URL via r2_key=%s", ctx.upload_id, platform, r2_key)
+            return url
+    logger.warning(
+        "[%s] No hosted video URL for %s (tried keys: %s)",
+        ctx.upload_id,
+        platform,
+        _collect_processed_r2_keys(ctx, platform),
+    )
+    return None
+
+
+def _facebook_file_too_large_message(
+    file_size: int,
+    upload_mode: str,
+    *,
+    missing_url: bool = False,
+) -> str:
+    size_mb = file_size / 1024 / 1024
+    limit_mb = FACEBOOK_MULTIPART_MAX_BYTES / 1024 / 1024
+    if missing_url:
+        return (
+            f"Video is {size_mb:.1f} MB — above Facebook's {limit_mb:.0f} MB direct-upload limit. "
+            "UploadM8 could not build a hosted file URL for Meta to fetch from storage. "
+            "Retry shortly or contact support if this persists."
+        )
+    if upload_mode.startswith("file_url"):
+        return (
+            f"Video is {size_mb:.1f} MB — Facebook rejected the full-quality hosted file URL (HTTP 413). "
+            "UploadM8 preserves your 1080p/4K transcode; Meta may still cap ingest size for this page. "
+            "Try publishing to Instagram/YouTube, or contact support if this persists."
+        )
+    return (
+        f"Video is {size_mb:.1f} MB — too large for Facebook's direct browser-style upload "
+        f"(limit ~{limit_mb:.0f} MB). UploadM8 publishes full-quality files via a hosted URL when possible."
+    )
 
 
 # =====================================================================
@@ -1017,6 +1114,7 @@ async def publish_to_tiktok(
     ctx: JobContext,
     token_data: dict,
     db_pool=None,
+    token_row_id: str | None = None,
 ) -> PlatformResult:
     """Publish video to TikTok using Content Posting API v2.
 
@@ -1035,7 +1133,48 @@ async def publish_to_tiktok(
         )
 
     # TikTok Direct Post: `post_info.title` is the full caption (max 2200 UTF-16 runes).
-    tiktok_title = _tiktok_post_title(ctx)
+    tt_settings = resolve_tiktok_post_settings_for_account(
+        getattr(ctx, "tiktok_post_settings", None) or (ctx.user_settings or {}).get("tiktok_post_settings"),
+        str(token_row_id or ""),
+    )
+    if not tt_settings:
+        return PlatformResult(
+            platform="tiktok",
+            success=False,
+            error_code="TIKTOK_EXPORT_SETTINGS_MISSING",
+            error_message=(
+                "TikTok posting settings were not saved for this upload. "
+                "Re-upload with the Post to TikTok export form completed."
+            ),
+        )
+    tt_errors = validate_tiktok_post_settings(tt_settings)
+    if tt_errors:
+        return PlatformResult(
+            platform="tiktok",
+            success=False,
+            error_code="TIKTOK_EXPORT_SETTINGS_INVALID",
+            error_message=tt_errors[0],
+        )
+
+    max_dur = tt_settings.get("max_video_post_duration_sec")
+    if max_dur:
+        try:
+            max_sec = int(max_dur)
+            vid_dur = float((ctx.video_info or {}).get("duration") or 0.0)
+            if vid_dur > 0 and vid_dur > max_sec:
+                return PlatformResult(
+                    platform="tiktok",
+                    success=False,
+                    error_code="TIKTOK_VIDEO_TOO_LONG",
+                    error_message=(
+                        f"Video is {vid_dur:.0f}s but this TikTok account allows "
+                        f"at most {max_sec}s. Shorten the clip or pick another account."
+                    ),
+                )
+        except (TypeError, ValueError):
+            pass
+
+    tiktok_title = _resolve_tiktok_publish_title(ctx, (tt_settings.get("title") or "").strip())
 
     try:
         file_size = video_path.stat().st_size
@@ -1048,28 +1187,29 @@ async def publish_to_tiktok(
             file_size, chunk_size, total_chunk_count,
         )
 
-        tiktok_privacy = resolve_privacy_level(
-            getattr(ctx, "privacy", None) or "public",
-            "tiktok",
-        )
+        tiktok_privacy = str(tt_settings.get("privacy_level") or "").strip()
+        privacy_overridden_unaudited = False
         if _tiktok_force_private_unaudited_enabled():
             if tiktok_privacy != "SELF_ONLY":
                 logger.info(
-                    "TikTok: TIKTOK_FORCE_PRIVATE_UNAUDITED — clamping privacy_level %s → SELF_ONLY",
+                    "TikTok: TIKTOK_FORCE_PRIVATE_UNAUDITED — clamping privacy_level %s → SELF_ONLY "
+                    "(user was informed of this at upload time; video will be private until audit passes)",
                     tiktok_privacy,
                 )
+                privacy_overridden_unaudited = True
             tiktok_privacy = "SELF_ONLY"
 
         cover_ms = _tiktok_cover_timestamp_ms(ctx)
-        post_info = {
-            "title": tiktok_title,
-            "privacy_level": tiktok_privacy,
-            "video_cover_timestamp_ms": cover_ms,
-        }
+        post_info = tiktok_post_info_from_settings(tt_settings, title=tiktok_title)
+        post_info["video_cover_timestamp_ms"] = cover_ms
+        # Apply the (possibly clamped) privacy level after building post_info from settings
+        post_info["privacy_level"] = tiktok_privacy
         logger.info(
-            "TikTok: video_cover_timestamp_ms=%s (%.2fs)",
+            "TikTok: video_cover_timestamp_ms=%s (%.2fs) privacy=%s unaudited_clamp=%s",
             cover_ms,
             cover_ms / 1000.0,
+            post_info.get("privacy_level"),
+            privacy_overridden_unaudited,
         )
 
         async with httpx.AsyncClient(timeout=120) as client:
@@ -1170,8 +1310,12 @@ async def publish_to_tiktok(
                 publish_id=publish_id,
                 verify_status="pending",
                 response_payload={
-                    "tiktok_privacy_level": tiktok_privacy,
+                    "tiktok_privacy_level": post_info.get("privacy_level"),
+                    "tiktok_privacy_overridden_unaudited": privacy_overridden_unaudited,
                     "upload_privacy": (getattr(ctx, "privacy", None) or "public"),
+                    "tiktok_disable_comment": post_info.get("disable_comment"),
+                    "tiktok_disable_duet": post_info.get("disable_duet"),
+                    "tiktok_disable_stitch": post_info.get("disable_stitch"),
                 },
             )
 
@@ -1777,32 +1921,75 @@ async def publish_to_facebook(
     description = _build_platform_caption(ctx, "facebook")
     fb_privacy_value = resolve_privacy_level(getattr(ctx, "privacy", None) or "public", "facebook")
     fb_privacy_param = {"value": fb_privacy_value}  # FB Graph API format: {"value": "EVERYONE"}
+    file_size = video_path.stat().st_size if video_path and video_path.exists() else 0
+    endpoint = f"https://graph.facebook.com/{META_API_VERSION}/{page_id}/videos"
+    post_params = {
+        "access_token": access_token,
+        "description": description[:5000] if description else "",
+        "privacy": json.dumps(fb_privacy_param),
+    }
+
+    must_use_file_url = file_size > FACEBOOK_MULTIPART_MAX_BYTES
+    if not video_url:
+        video_url = _get_video_public_url(ctx, "facebook")
+    if must_use_file_url and not video_url:
+        msg = _facebook_file_too_large_message(file_size, "none", missing_url=True)
+        logger.error("Facebook publish blocked: %s", msg)
+        return PlatformResult(
+            platform="facebook",
+            success=False,
+            error_code="FILE_TOO_LARGE",
+            error_message=msg,
+        )
 
     try:
         async with httpx.AsyncClient(timeout=300) as client:
-            # Prefer binary upload (simpler, works without public URL)
-            if video_path and video_path.exists():
+            prefer_url = bool(video_url) and (
+                must_use_file_url
+                or not (video_path and video_path.exists())
+            )
+            resp = None
+            upload_mode = "none"
+
+            if prefer_url and video_url:
+                upload_mode = "file_url"
+                resp = await client.post(
+                    endpoint,
+                    params={**post_params, "file_url": video_url},
+                )
+            elif video_path and video_path.exists():
+                upload_mode = "multipart"
                 with open(video_path, "rb") as f:
                     files = {"source": ("video.mp4", f, "video/mp4")}
-                    resp = await client.post(
-                        f"https://graph.facebook.com/{META_API_VERSION}/{page_id}/videos",
-                        params={
-                            "access_token": access_token,
-                            "description": description[:5000] if description else "",
-                            "privacy": json.dumps(fb_privacy_param),
-                        },
-                        files=files,
-                    )
+                    resp = await client.post(endpoint, params=post_params, files=files)
+                if resp.status_code == 413:
+                    if video_url:
+                        logger.warning(
+                            "Facebook multipart 413 (%.1f MB) — retrying with file_url",
+                            file_size / 1024 / 1024,
+                        )
+                        upload_mode = "file_url_retry"
+                        resp = await client.post(
+                            endpoint,
+                            params={**post_params, "file_url": video_url},
+                        )
+                    else:
+                        video_url = _get_video_public_url(ctx, "facebook")
+                        if video_url:
+                            logger.warning(
+                                "Facebook multipart 413 (%.1f MB) — resolved file_url on retry",
+                                file_size / 1024 / 1024,
+                            )
+                            upload_mode = "file_url_late"
+                            resp = await client.post(
+                                endpoint,
+                                params={**post_params, "file_url": video_url},
+                            )
             elif video_url:
-                # URL-based upload (fallback)
+                upload_mode = "file_url"
                 resp = await client.post(
-                    f"https://graph.facebook.com/{META_API_VERSION}/{page_id}/videos",
-                    params={
-                        "access_token": access_token,
-                        "file_url": video_url,
-                        "description": description[:5000] if description else "",
-                        "privacy": json.dumps(fb_privacy_param),
-                    },
+                    endpoint,
+                    params={**post_params, "file_url": video_url},
                 )
             else:
                 return PlatformResult(
@@ -1813,13 +2000,27 @@ async def publish_to_facebook(
                 )
 
             if resp.status_code != 200:
-                error_body = resp.text[:300]
+                error_body = (resp.text or "").strip()[:300]
+                is_too_large = resp.status_code == 413
+                if is_too_large:
+                    msg = _facebook_file_too_large_message(
+                        file_size,
+                        upload_mode,
+                        missing_url=False,
+                    )
+                elif error_body:
+                    msg = f"Facebook upload failed (HTTP {resp.status_code}): {error_body}"
+                else:
+                    msg = (
+                        f"Facebook upload failed (HTTP {resp.status_code}, mode={upload_mode}). "
+                        "Check Meta token/page permissions or try again."
+                    )
                 return PlatformResult(
                     platform="facebook",
                     success=False,
                     http_status=resp.status_code,
-                    error_code="UPLOAD_FAILED",
-                    error_message=f"Upload failed: {error_body}"
+                    error_code="FILE_TOO_LARGE" if is_too_large else "UPLOAD_FAILED",
+                    error_message=msg,
                 )
 
             video_id = resp.json().get("id")
@@ -1880,6 +2081,31 @@ async def publish_to_facebook(
 
 
 # =====================================================================
+# Publish target resolution (shared by publish_stage + deferred scheduler)
+# =====================================================================
+
+async def resolve_publish_targets(ctx: JobContext, db_pool) -> list[tuple[str, str | None]]:
+    """Build (platform, token_id) publish targets for an upload."""
+    publish_targets: list[tuple[str, str | None]] = []
+    if ctx.target_accounts:
+        for token_id in ctx.target_accounts:
+            raw = await db_stage.load_platform_token_by_id(db_pool, token_id)
+            if raw and isinstance(raw, dict):
+                plat = raw.get("_platform", "")
+                if plat:
+                    publish_targets.append((plat, token_id))
+                    continue
+            logger.warning(f"target_account {token_id}: token not found or revoked — skipping")
+        if not publish_targets:
+            logger.warning(
+                f"All target_accounts invalid for upload {ctx.upload_id}, falling back to one per platform"
+            )
+    if not publish_targets:
+        publish_targets = [(p, None) for p in ctx.platforms]
+    return publish_targets
+
+
+# =====================================================================
 # Stage Entry Point
 # =====================================================================
 
@@ -1921,6 +2147,23 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
 
     init_enc_keys()
 
+    # Hydrate processed_assets from DB when publish runs after deferred handoff
+    if db_pool and not coerce_processed_assets_map(
+        ctx.output_artifacts.get("processed_assets", "{}")
+    ):
+        try:
+            upload_row = await db_stage.load_upload_record(db_pool, str(ctx.upload_id))
+            if upload_row:
+                db_assets = coerce_processed_assets_map(upload_row.get("processed_assets"))
+                if db_assets:
+                    ctx.output_artifacts["processed_assets"] = json.dumps(db_assets)
+                    if not getattr(ctx, "processed_r2_key", None):
+                        ctx.processed_r2_key = db_assets.get("default") or next(
+                            iter(db_assets.values()), None
+                        )
+        except Exception as e:
+            logger.debug("[%s] processed_assets DB hydrate skipped: %s", ctx.upload_id, e)
+
     # Token DB key mapping (platform -> token table platform key)
     platform_to_db_key = {
         "tiktok": "tiktok",
@@ -1930,33 +2173,31 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
     }
 
     # Build publish targets: list of (platform, token_id_or_None)
-    #
-    # LOGIC: Users select platforms AND which accounts within each platform.
-    # The frontend must send target_accounts = [platform_tokens.id, ...] for the
-    # selected accounts. Only those accounts receive the upload.
-    #
-    # When target_accounts is provided: publish to those specific accounts only.
-    # When empty (legacy): one publish per platform using most-recent token.
-    publish_targets: list[tuple[str, str | None]] = []
-    if ctx.target_accounts:
-        for token_id in ctx.target_accounts:
-            raw = await db_stage.load_platform_token_by_id(db_pool, token_id)
-            if raw and isinstance(raw, dict):
-                plat = raw.get("_platform", "")
-                if plat:
-                    publish_targets.append((plat, token_id))
-                    continue
-            logger.warning(f"target_account {token_id}: token not found or revoked — skipping")
-        if not publish_targets:
-            logger.warning(f"All target_accounts invalid for upload {ctx.upload_id}, falling back to one per platform")
-    if not publish_targets:
-        publish_targets = [(p, None) for p in ctx.platforms]
+    publish_targets = await resolve_publish_targets(ctx, db_pool)
 
-    logger.info(f"Publishing to {len(publish_targets)} target(s)")
+    plat_filter = getattr(ctx, "deferred_publish_platform_filter", None)
+    if plat_filter is not None:
+        plat_filter = {str(p).strip().lower() for p in plat_filter if str(p).strip()}
+        publish_targets = [
+            (p, tid) for p, tid in publish_targets if str(p).strip().lower() in plat_filter
+        ]
 
-    assert_publish_metadata_gate(ctx, publish_targets)
+    from services.deferred_publish_schedule import publish_target_already_done
 
-    for platform, token_id in publish_targets:
+    pending_targets = [
+        (p, tid)
+        for p, tid in publish_targets
+        if not publish_target_already_done(ctx, p, tid)
+    ]
+    if not pending_targets:
+        logger.info(f"[{ctx.upload_id}] Deferred publish: no pending targets in this batch")
+        return ctx
+
+    logger.info(f"Publishing to {len(pending_targets)} target(s)")
+
+    assert_publish_metadata_gate(ctx, pending_targets)
+
+    for platform, token_id in pending_targets:
         # Per-target cancel check — once a single platform has been posted we
         # don't try to "unpost" it (those APIs don't support that), but we DO
         # stop attempting any further platforms so the user's stop click
@@ -2037,7 +2278,9 @@ async def run_publish_stage(ctx: JobContext, db_pool) -> JobContext:
         result = None
         try:
             if platform == "tiktok":
-                result = await publish_to_tiktok(video_file, ctx, token_data, db_pool=db_pool)
+                result = await publish_to_tiktok(
+                    video_file, ctx, token_data, db_pool=db_pool, token_row_id=token_id
+                )
 
             elif platform == "youtube":
                 result = await publish_to_youtube(video_file, ctx, token_data, db_pool=db_pool)

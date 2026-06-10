@@ -3,7 +3,7 @@
 # dependencies = [
 #   "pandas>=2.0.0,<3.0.0",
 #   "pyarrow>=15.0.0",
-#   "scikit-learn>=1.4.0,<2.0.0",
+#   "scikit-learn>=1.8.0,<2.0.0",
 #   "joblib>=1.3.0,<2.0.0",
 #   "python-dotenv>=1.0.0,<2.0.0",
 #   "trackio>=0.25.0,<1.0.0",
@@ -36,6 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
 load_dotenv(_REPO_ROOT / ".env")
 
 from services.ml_observability import OptionalTrackioRun
+from services.ml_cv import build_user_groups, fit_calibrated, grouped_oof_predict
 from services.promo_targeting_features import (
     FEATURES_CAT,
     FEATURES_NUM,
@@ -43,6 +44,7 @@ from services.promo_targeting_features import (
     TARGET_ENGAGED,
 )
 from services.promo_targeting_train import (
+    PROMO_MODEL_VERSION,
     build_promo_pipeline,
     pick_target_column,
     recommend_score_threshold,
@@ -110,38 +112,55 @@ def _run(args: argparse.Namespace) -> Dict[str, Any]:
             "target_column": target_col,
         }
 
-    X = df[FEATURES_NUM + FEATURES_CAT].copy()
-    y = df[target_col].astype(int).copy()
+    # Guarantee every model column exists even if a fallback build path omitted some.
+    X = df.reindex(columns=FEATURES_NUM + FEATURES_CAT).reset_index(drop=True).copy()
+    y = df[target_col].astype(int).reset_index(drop=True).copy()
+    groups = build_user_groups(df, len(df))
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.35, random_state=42, stratify=y
-    )
-    pipe = build_promo_pipeline()
-    pipe.fit(X_train, y_train)
-    p_test = pd.Series(pipe.predict_proba(X_test)[:, 1], index=y_test.index)
+    # Leakage-free evaluation: out-of-fold predictions grouped by user.
+    oof = grouped_oof_predict(build_promo_pipeline, X, y, groups)
+    if oof is not None:
+        cv_mode = "group_kfold_user"
+        mask = oof.notna()
+        y_eval = y[mask]
+        p_eval = oof[mask]
+    else:
+        cv_mode = "holdout_stratified"
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.35, random_state=42, stratify=y
+        )
+        pipe = build_promo_pipeline()
+        pipe.fit(X_train, y_train)
+        y_eval = y_test
+        p_eval = pd.Series(pipe.predict_proba(X_test)[:, 1], index=y_test.index)
 
-    auc = float(roc_auc_score(y_test, p_test))
-    ap = float(average_precision_score(y_test, p_test))
-    lift_10 = _safe_lift_at_k(y_test, p_test, 0.10)
-    lift_20 = _safe_lift_at_k(y_test, p_test, 0.20)
-    thresholds = _threshold_table(y_test, p_test)
-    rec_threshold = recommend_score_threshold(y_test, p_test)
+    auc = float(roc_auc_score(y_eval, p_eval))
+    ap = float(average_precision_score(y_eval, p_eval))
+    lift_10 = _safe_lift_at_k(y_eval, p_eval, 0.10)
+    lift_20 = _safe_lift_at_k(y_eval, p_eval, 0.20)
+    thresholds = _threshold_table(y_eval, p_eval)
+    rec_threshold = recommend_score_threshold(y_eval, p_eval)
 
+    # Final model: calibrated probabilities, fit on all rows.
+    final_model, calibration = fit_calibrated(build_promo_pipeline, X, y)
     model_path = Path(args.model_out)
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(pipe, model_path)
+    joblib.dump(final_model, model_path)
 
     report: Dict[str, Any] = {
         "task": "promo_targeting_uplift_baseline",
         "status": "ok",
-        "model": "logistic_regression_balanced_v1",
+        "model": PROMO_MODEL_VERSION,
+        "calibration": calibration,
+        "cv_mode": cv_mode,
+        "n_user_groups": int(groups.nunique()),
         "target_column": target_col,
         "label_fallback_used": used_fallback,
-        "train_rows": int(len(X_train)),
-        "test_rows": int(len(X_test)),
+        "train_rows": int(len(X)),
+        "eval_rows": int(len(y_eval)),
         "rows": int(len(df)),
         "positive_rate": float(df[target_col].mean()),
-        "base_positive_rate_test": float(y_test.mean()),
+        "base_positive_rate_test": float(y_eval.mean()),
         "roc_auc": auc,
         "average_precision": ap,
         "lift_at_10pct": lift_10,

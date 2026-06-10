@@ -75,7 +75,8 @@ def write_baseline() -> None:
     print(f"Wrote {BASELINE_PATH}")
 
 
-def lint() -> int:
+def collect_lint_errors() -> tuple[list[str], dict[str, list[str]]]:
+    """Return aggregate errors and per-router messages keyed by ``routers/foo.py``."""
     baseline = load_baseline()
     defaults = baseline.get("defaults") or {}
     def_max_lines = int(defaults.get("max_lines", 400))
@@ -83,7 +84,12 @@ def lint() -> int:
     files_cap: dict = baseline.get("files") or {}
 
     errors: list[str] = []
+    per_file: dict[str, list[str]] = {}
     seen: set[str] = set()
+
+    def _add(rel: str, msg: str) -> None:
+        errors.append(msg)
+        per_file.setdefault(rel, []).append(msg)
 
     for path in sorted(ROUTERS.glob("*.py")):
         if path.name == "__init__.py":
@@ -101,21 +107,27 @@ def lint() -> int:
             max_lines = def_max_lines
             max_db = def_max_db
             if n > max_lines or d > max_db:
-                errors.append(
+                _add(
+                    rel,
                     f"{rel}: not in baseline — {n} lines (cap {max_lines}), "
                     f"{d} db-touch lines (cap {max_db}). Add an entry to tools/router_lint_baseline.json "
-                    f"or shrink the router / move SQL to services/."
+                    f"or shrink the router / move SQL to services/.",
                 )
                 continue
         if n > max_lines:
-            errors.append(f"{rel}: {n} lines exceeds cap {max_lines}")
+            _add(rel, f"{rel}: {n} lines exceeds cap {max_lines}")
         if d > max_db:
-            errors.append(f"{rel}: {d} db-touch lines exceeds cap {max_db}")
+            _add(rel, f"{rel}: {d} db-touch lines exceeds cap {max_db}")
 
     stale = set(files_cap.keys()) - seen
     for rel in sorted(stale):
-        errors.append(f"Baseline references missing file: {rel}")
+        _add(rel, f"Baseline references missing file: {rel}")
 
+    return errors, per_file
+
+
+def lint() -> int:
+    errors, _ = collect_lint_errors()
     if errors:
         print("Router lint failed:", file=sys.stderr)
         for e in errors:

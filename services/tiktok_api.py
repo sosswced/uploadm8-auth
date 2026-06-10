@@ -6,6 +6,7 @@ Docs: video list / video query use ?fields= in the query string, not the JSON bo
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Mapping, Optional, Tuple
 from urllib.parse import quote
 
@@ -36,6 +37,41 @@ TIKTOK_VIDEO_LIST_FIELDS = (
     "view_count,like_count,comment_count,share_count,create_time"
 )
 TIKTOK_VIDEO_QUERY_FIELDS = "id,view_count,like_count,comment_count,share_count"
+
+TIKTOK_CREATOR_INFO_URL = "https://open.tiktokapis.com/v2/post/publish/creator_info/query/"
+
+TIKTOK_PRIVACY_LABELS: dict[str, str] = {
+    "PUBLIC_TO_EVERYONE": "Everyone",
+    "MUTUAL_FOLLOW_FRIENDS": "Friends",
+    "FOLLOWER_OF_CREATOR": "Followers",
+    "SELF_ONLY": "Only me",
+}
+
+TIKTOK_KNOWN_PRIVACY_LEVELS = frozenset(TIKTOK_PRIVACY_LABELS.keys())
+
+TIKTOK_MUSIC_USAGE_CONFIRMATION_URL = (
+    "https://www.tiktok.com/legal/page/global/music-usage-confirmation/en"
+)
+TIKTOK_BRANDED_CONTENT_POLICY_URL = "https://www.tiktok.com/legal/page/global/bc-policy/en"
+
+
+def tiktok_app_audited() -> bool:
+    """True after TikTok Content Posting API audit passes. Set ``TIKTOK_APP_AUDITED=1``."""
+    v = (os.environ.get("TIKTOK_APP_AUDITED") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def tiktok_unaudited_mode() -> bool:
+    """Apps pending TikTok audit must show private-only UX and clamp posts to SELF_ONLY."""
+    return not tiktok_app_audited()
+
+
+def tiktok_force_private_unaudited() -> bool:
+    """Clamp Direct Post privacy to SELF_ONLY while unaudited (or when force flag set)."""
+    if tiktok_unaudited_mode():
+        return True
+    v = (os.environ.get("TIKTOK_FORCE_PRIVATE_UNAUDITED") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def tiktok_video_list_url() -> str:
@@ -225,3 +261,176 @@ async def fetch_tiktok_user_profile_for_oauth(
 
     logger.warning("TikTok user/info (basic) failed: %s", hint)
     return tiktok_identity_from_user_object({})
+
+
+def normalize_tiktok_creator_info(body: Any) -> dict:
+    """Normalize /v2/post/publish/creator_info/query/ response for the export UI."""
+    if not isinstance(body, dict):
+        return {}
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return {}
+    privacy_opts = data.get("privacy_level_options") or []
+    if not isinstance(privacy_opts, list):
+        privacy_opts = []
+    privacy_opts = [str(x).strip() for x in privacy_opts if str(x).strip()]
+    max_dur = data.get("max_video_post_duration_sec")
+    try:
+        max_dur = int(max_dur) if max_dur is not None else None
+    except (TypeError, ValueError):
+        max_dur = None
+    return {
+        "creator_avatar_url": str(data.get("creator_avatar_url") or "").strip(),
+        "creator_username": str(data.get("creator_username") or "").strip(),
+        "creator_nickname": str(data.get("creator_nickname") or "").strip(),
+        "privacy_level_options": privacy_opts,
+        "privacy_level_labels": {
+            code: TIKTOK_PRIVACY_LABELS.get(code, code.replace("_", " ").title())
+            for code in privacy_opts
+        },
+        "comment_disabled": bool(data.get("comment_disabled")),
+        "duet_disabled": bool(data.get("duet_disabled")),
+        "stitch_disabled": bool(data.get("stitch_disabled")),
+        "max_video_post_duration_sec": max_dur,
+    }
+
+
+async def fetch_tiktok_creator_info(
+    client: httpx.AsyncClient,
+    access_token: str,
+) -> tuple[dict, Optional[str]]:
+    """
+    Query creator info required before rendering TikTok export UI.
+    Returns (normalized_creator_info, error_message_or_none).
+    """
+    if not access_token or not str(access_token).strip():
+        return {}, "Missing TikTok access token"
+    headers = {
+        "Authorization": f"Bearer {access_token.strip()}",
+        "Content-Type": "application/json; charset=UTF-8",
+    }
+    try:
+        resp = await client.post(TIKTOK_CREATOR_INFO_URL, headers=headers, json={})
+        try:
+            body = resp.json() if resp.content else {}
+        except Exception:
+            body = {}
+        env_err = tiktok_envelope_error(body)
+        if resp.status_code != 200 or env_err:
+            hint = env_err or (resp.text or "")[:300]
+            return {}, f"TikTok creator_info failed ({resp.status_code}): {hint}"
+        info = normalize_tiktok_creator_info(body)
+        if not info.get("privacy_level_options"):
+            return {}, "TikTok creator_info returned no privacy_level_options"
+        return info, None
+    except Exception as e:
+        return {}, f"TikTok creator_info exception: {type(e).__name__}: {e}"
+
+
+def _coerce_bool(val: Any, default: bool = False) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return bool(val)
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
+def normalize_tiktok_post_settings(raw: Any) -> dict:
+    """
+    Normalize client payload for one TikTok account export form.
+    Keys match TikTok Direct Post post_info mapping in publish_stage.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    allowed_raw = raw.get("allowed_privacy_levels") or raw.get("privacy_level_options") or []
+    allowed: list[str] = []
+    if isinstance(allowed_raw, (list, tuple)):
+        allowed = [str(x).strip() for x in allowed_raw if str(x).strip()]
+    max_dur = raw.get("max_video_post_duration_sec")
+    try:
+        max_dur_int = int(max_dur) if max_dur is not None else None
+    except (TypeError, ValueError):
+        max_dur_int = None
+    out = {
+        "privacy_level": str(raw.get("privacy_level") or "").strip(),
+        "allowed_privacy_levels": allowed,
+        "max_video_post_duration_sec": max_dur_int,
+        "allow_comment": _coerce_bool(raw.get("allow_comment"), False),
+        "allow_duet": _coerce_bool(raw.get("allow_duet"), False),
+        "allow_stitch": _coerce_bool(raw.get("allow_stitch"), False),
+        "commercial_disclosure_enabled": _coerce_bool(
+            raw.get("commercial_disclosure_enabled"), False
+        ),
+        "brand_organic": _coerce_bool(raw.get("brand_organic"), False),
+        "brand_content": _coerce_bool(raw.get("brand_content"), False),
+        "title": str(raw.get("title") or "").strip(),
+        "user_consent": _coerce_bool(raw.get("user_consent"), False),
+    }
+    if not out["commercial_disclosure_enabled"]:
+        out["brand_organic"] = False
+        out["brand_content"] = False
+    return out
+
+
+def validate_tiktok_post_settings(settings: Mapping[str, Any]) -> list[str]:
+    """Return human-readable validation errors (empty list = OK)."""
+    s = normalize_tiktok_post_settings(settings)
+    errors: list[str] = []
+    if not s.get("privacy_level"):
+        errors.append("Select who can view this TikTok post.")
+    elif s["privacy_level"] not in TIKTOK_KNOWN_PRIVACY_LEVELS:
+        errors.append("Invalid TikTok privacy level.")
+    else:
+        allowed = s.get("allowed_privacy_levels") or []
+        if allowed and s["privacy_level"] not in allowed:
+            errors.append("Selected privacy level is not available for this TikTok account.")
+    if not s.get("user_consent"):
+        errors.append("Confirm TikTok posting consent before publishing.")
+    if s.get("commercial_disclosure_enabled"):
+        if not s.get("brand_organic") and not s.get("brand_content"):
+            errors.append(
+                "You need to indicate if your content promotes yourself, a third party, or both."
+            )
+        if s.get("brand_content") and s.get("privacy_level") == "SELF_ONLY":
+            errors.append("Branded content visibility cannot be set to private.")
+    return errors
+
+
+def resolve_tiktok_post_settings_for_account(
+    raw_settings: Any,
+    account_id: str,
+) -> Optional[dict]:
+    """Look up per-account TikTok export settings saved on the upload."""
+    if not isinstance(raw_settings, dict):
+        return None
+    by_account = raw_settings.get("by_account")
+    if isinstance(by_account, dict):
+        entry = by_account.get(str(account_id))
+        if isinstance(entry, dict):
+            return normalize_tiktok_post_settings(entry)
+    if raw_settings.get("privacy_level"):
+        return normalize_tiktok_post_settings(raw_settings)
+    return None
+
+
+def tiktok_post_info_from_settings(settings: Mapping[str, Any], *, title: str) -> dict:
+    """Map export UI settings to TikTok Direct Post ``post_info`` fields."""
+    s = normalize_tiktok_post_settings(settings)
+    post_info: dict[str, Any] = {
+        "title": title,
+        "privacy_level": s["privacy_level"],
+        "disable_comment": not s["allow_comment"],
+        "disable_duet": not s["allow_duet"],
+        "disable_stitch": not s["allow_stitch"],
+    }
+    if s["commercial_disclosure_enabled"]:
+        post_info["brand_organic_toggle"] = bool(s["brand_organic"])
+        post_info["brand_content_toggle"] = bool(s["brand_content"])
+    return post_info

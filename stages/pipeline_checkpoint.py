@@ -395,6 +395,49 @@ async def save_post_caption_checkpoint(pool, ctx: JobContext) -> None:
     logger.info(f"[{upload_id}] Checkpoint promoted: post_caption")
 
 
+async def save_post_publish_checkpoint(pool, ctx: JobContext) -> None:
+    """Persist per-platform publish snapshot for partial retry resume."""
+    from stages import db as db_stage
+
+    upload_id = ctx.upload_id
+    platform_results = []
+    for r in getattr(ctx, "platform_results", None) or []:
+        platform_results.append(
+            {
+                "platform": getattr(r, "platform", None),
+                "success": getattr(r, "success", None),
+                "token_row_id": getattr(r, "token_row_id", None),
+                "platform_video_id": getattr(r, "platform_video_id", None),
+                "platform_url": getattr(r, "platform_url", None),
+                "error_code": getattr(r, "error_code", None),
+                "error_message": getattr(r, "error_message", None),
+            }
+        )
+    processed_assets = {}
+    arts = getattr(ctx, "output_artifacts", None) or {}
+    if isinstance(arts, dict):
+        raw_pa = arts.get("processed_assets")
+        if isinstance(raw_pa, str):
+            try:
+                processed_assets = json.loads(raw_pa) or {}
+            except Exception:
+                processed_assets = {}
+        elif isinstance(raw_pa, dict):
+            processed_assets = dict(raw_pa)
+
+    resume = {
+        "v": CHECKPOINT_VERSION,
+        "stage": "post_publish",
+        "source_r2_key": ctx.source_r2_key or "",
+        "platforms_norm": norm_platforms(ctx.platforms),
+        "platform_results": platform_results,
+        "processed_assets": processed_assets,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await merge_output_artifacts_patch(pool, upload_id, {RESUME_KEY: resume})
+    logger.info(f"[{upload_id}] Checkpoint saved: post_publish ({len(platform_results)} results)")
+
+
 async def try_resume_from_checkpoint(
     pool,
     job_data: dict,
@@ -421,8 +464,43 @@ async def try_resume_from_checkpoint(
         return None, None
 
     stage = (cp.get("stage") or "").strip().lower()
-    if stage not in ("post_telemetry", "post_transcode", "post_audio", "post_caption"):
+    if stage not in ("post_telemetry", "post_transcode", "post_audio", "post_caption", "post_publish"):
         return None, None
+
+    if stage == "post_publish":
+        retry_mode = str(job_data.get("retry_mode") or "").strip().lower()
+        if retry_mode != "partial":
+            return None, None
+        holder = tempfile.TemporaryDirectory()
+        temp_dir = Path(holder.name)
+        ctx.temp_dir = temp_dir
+        pa = cp.get("processed_assets") or {}
+        if isinstance(pa, str):
+            try:
+                pa = json.loads(pa) or {}
+            except Exception:
+                pa = {}
+        if isinstance(pa, dict):
+            ctx.output_artifacts = dict(getattr(ctx, "output_artifacts", None) or {})
+            ctx.output_artifacts["processed_assets"] = json.dumps(pa)
+        pr = cp.get("platform_results") or []
+        if isinstance(pr, list):
+            from stages.context import PlatformResult
+
+            ctx.platform_results = [
+                PlatformResult(
+                    platform=str(x.get("platform") or ""),
+                    success=bool(x.get("success")),
+                    token_row_id=x.get("token_row_id"),
+                    platform_video_id=x.get("platform_video_id"),
+                    platform_url=x.get("platform_url"),
+                    error_code=x.get("error_code"),
+                    error_message=x.get("error_message"),
+                )
+                for x in pr
+                if isinstance(x, dict) and x.get("platform")
+            ]
+        return "post_publish", holder
 
     # ── post_telemetry: re-download source, restore telemetry snapshot ──
     if stage == "post_telemetry":

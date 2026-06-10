@@ -23,6 +23,7 @@ from core.config import (
 )
 from core.deps import get_current_user
 from core.helpers import _now_utc, _tier_is_upgrade
+from services.workspace import can_manage_billing, require_can_manage_billing, resolve_billing_user_id
 from core.models import CheckoutRequest
 from core.notifications import notify_mrr, notify_topup
 import core.state
@@ -213,31 +214,40 @@ async def _execute_user_tier_update(conn, sql: str, tier: str, *params):
 
 @router.post("/checkout")
 async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_current_user)):
+    require_can_manage_billing(user)
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing not configured")
 
+    bill_id = resolve_billing_user_id(user)
     async with core.state.db_pool.acquire() as conn:
+        bill_user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", bill_id)
+        if not bill_user:
+            raise HTTPException(404, "Billing account not found")
+        bill_user = dict(bill_user)
         # ── Double-subscribe guard ────────────────────────────────────
         if data.kind == "subscription":
-            existing_sub_id  = user.get("stripe_subscription_id")
-            existing_status  = user.get("subscription_status")
+            existing_sub_id  = bill_user.get("stripe_subscription_id")
+            existing_status  = bill_user.get("subscription_status")
             if existing_sub_id and existing_status in ("active", "trialing", "past_due"):
                 # User already has an active sub — send straight to billing portal
                 # so they can upgrade/downgrade there rather than creating a duplicate
                 try:
                     portal = stripe.billing_portal.Session.create(
-                        customer=user["stripe_customer_id"],
+                        customer=bill_user.get("stripe_customer_id"),
                         return_url=f"{FRONTEND_URL}/settings.html#billing",
                     )
                     return {"checkout_url": portal.url, "session_id": None, "portal_redirect": True}
                 except Exception:
                     pass  # Fall through to new checkout if portal fails
 
-        customer_id = user.get("stripe_customer_id")
+        customer_id = bill_user.get("stripe_customer_id")
         if not customer_id:
-            customer = stripe.Customer.create(email=user["email"], name=user.get("name") or user["email"])
+            customer = stripe.Customer.create(
+                email=bill_user["email"],
+                name=bill_user.get("name") or bill_user["email"],
+            )
             customer_id = customer.id
-            await conn.execute("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", customer_id, user["id"])
+            await conn.execute("UPDATE users SET stripe_customer_id = $1 WHERE id = $2", customer_id, bill_id)
 
     prices = stripe.Price.list(lookup_keys=[data.lookup_key], active=True)
     if not prices.data:
@@ -256,12 +266,12 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
             success_url           = STRIPE_SUCCESS_URL,
             cancel_url            = STRIPE_CANCEL_URL,
             allow_promotion_codes = True,
-            metadata              = {"user_id": str(user["id"]), "tier": tier},
+            metadata              = {"user_id": bill_id, "tier": tier},
         )
         if trial_days > 0:
             session_params["subscription_data"] = {
                 "trial_period_days": trial_days,
-                "metadata": {"user_id": str(user["id"]), "tier": tier},
+                "metadata": {"user_id": bill_id, "tier": tier},
             }
 
         session = stripe.checkout.Session.create(**session_params)
@@ -278,7 +288,7 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
             success_url = STRIPE_SUCCESS_URL,
             cancel_url  = STRIPE_CANCEL_URL,
             metadata    = {
-                "user_id": str(user["id"]),
+                "user_id": bill_id,
                 "lookup_key": data.lookup_key,
                 "wallet":  product.get("wallet", "put"),
                 "amount":  str(product.get("amount", 0)),
@@ -289,8 +299,13 @@ async def create_checkout(data: CheckoutRequest, user: dict = Depends(get_curren
 
 @router.post("/portal")
 async def create_portal(user: dict = Depends(get_current_user)):
-    if not user.get("stripe_customer_id"): raise HTTPException(400, "No billing account")
-    session = stripe.billing_portal.Session.create(customer=user["stripe_customer_id"], return_url=f"{FRONTEND_URL}/settings.html")
+    require_can_manage_billing(user)
+    if not user.get("stripe_customer_id"):
+        raise HTTPException(400, "No billing account")
+    session = stripe.billing_portal.Session.create(
+        customer=user["stripe_customer_id"],
+        return_url=f"{FRONTEND_URL}/settings.html",
+    )
     return {"portal_url": session.url}
 
 @router.get("/session")
@@ -319,9 +334,10 @@ async def get_billing_session(
     except Exception as e:
         raise HTTPException(502, f"Stripe API error: {e}")
 
-    # Security: session must belong to this user (metadata.user_id match)
+    # Security: session must belong to this workspace billing account
     meta_user_id = (sess.get("metadata") or {}).get("user_id")
-    if meta_user_id and str(meta_user_id) != str(user.get("id")):
+    bill_id = resolve_billing_user_id(user)
+    if meta_user_id and str(meta_user_id) != str(bill_id):
         raise HTTPException(403, "This session does not belong to your account")
 
     mode           = sess.get("mode")            # "subscription" | "payment"
@@ -497,7 +513,7 @@ async def billing_upload_estimate(body: UploadCostEstimateRequest, user: dict = 
 async def billing_subscription_actions(user: dict = Depends(get_current_user)):
     st = str(user.get("subscription_status") or "").lower()
     sid = user.get("stripe_subscription_id")
-    can = bool(sid and st in ("active", "trialing", "past_due"))
+    can = bool(sid and st in ("active", "trialing", "past_due") and can_manage_billing(user))
     return {"can_manage_subscription": can}
 
 
@@ -507,6 +523,7 @@ async def billing_subscription_action(
     user: dict = Depends(get_current_user),
 ):
     """Stripe Customer Portal flows + subscription maintenance (best-effort)."""
+    require_can_manage_billing(user)
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Billing not configured")
     cid = user.get("stripe_customer_id")

@@ -194,14 +194,19 @@ async def _upsert_user_rollup_daily(
 
 
 def _import_fetchers():
-    """Lazy import from app — keeps worker startup light."""
-    import app as app_module
+    """Lazy import — fetchers live in routers.analytics (not app.py)."""
+    from routers.analytics import (
+        _fetch_facebook_metrics,
+        _fetch_instagram_metrics,
+        _fetch_tiktok_metrics,
+        _fetch_youtube_metrics,
+    )
 
     return (
-        app_module._fetch_tiktok_metrics,
-        app_module._fetch_youtube_metrics,
-        app_module._fetch_instagram_metrics,
-        app_module._fetch_facebook_metrics,
+        _fetch_tiktok_metrics,
+        _fetch_youtube_metrics,
+        _fetch_instagram_metrics,
+        _fetch_facebook_metrics,
     )
 
 

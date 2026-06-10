@@ -12,13 +12,12 @@ from typing import Any, Dict, List, Optional
 
 from services.ml_observability import hf_write_token
 
-EVAL_YAML = """name: UploadM8 ML Hub
+# Each learning loop owns its own dataset repo ("bucket") with a single clean
+# schema, so all metrics reference split: train within that repo.
+EVAL_YAML = """name: UploadM8 Promo Targeting
 description: >
-  UploadM8 training/eval tables exported from the app DB. Two loops share this
-  dataset repo (separate splits / "buckets"):
-    * promo targeting uplift (marketing_touchpoint_deliveries + ml_outcome_labels) — split: train
-    * content success / hottest-topic (per upload x platform engagement + upload-flow
-      topic features from uploads.platform_results + output_artifacts) — split: content_success
+  Promo-targeting uplift training/eval table exported from the UploadM8 app DB
+  (marketing_touchpoint_deliveries + active-user snapshots + ml_outcome_labels).
 evaluation_framework: uploadm8
 
 tasks:
@@ -31,15 +30,25 @@ tasks:
   - id: promo_uplift_lift_at_10pct
     config: default
     split: train
+"""
+
+CONTENT_EVAL_YAML = """name: UploadM8 Content Success
+description: >
+  Content-success / hottest-topic training/eval table — one row per
+  (upload x platform) with per-platform engagement labels and upload-flow / topic
+  features from uploads.platform_results + output_artifacts.
+evaluation_framework: uploadm8
+
+tasks:
   - id: content_success_roc_auc
     config: default
-    split: content_success
+    split: train
   - id: content_success_average_precision
     config: default
-    split: content_success
+    split: train
   - id: content_success_lift_at_10pct
     config: default
-    split: content_success
+    split: train
 """
 
 
@@ -58,7 +67,7 @@ def ensure_model_repo(repo_id: str, *, private: bool = False) -> None:
 
 
 def push_dataset_eval_yaml(dataset_repo: str) -> None:
-    """Upload ``eval.yaml`` so the dataset can act as an UploadM8 benchmark."""
+    """Upload ``eval.yaml`` so the promo dataset can act as an UploadM8 benchmark."""
     from huggingface_hub import HfApi
 
     api = HfApi(token=_require_token())
@@ -68,6 +77,20 @@ def push_dataset_eval_yaml(dataset_repo: str) -> None:
         repo_id=dataset_repo,
         repo_type="dataset",
         commit_message="UploadM8: add promo targeting eval.yaml benchmark spec",
+    )
+
+
+def push_content_dataset_eval_yaml(dataset_repo: str) -> None:
+    """Upload ``eval.yaml`` for the content-success dataset bucket."""
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=_require_token())
+    api.upload_file(
+        path_or_fileobj=CONTENT_EVAL_YAML.encode("utf-8"),
+        path_in_repo="eval.yaml",
+        repo_id=dataset_repo,
+        repo_type="dataset",
+        commit_message="UploadM8: add content-success eval.yaml benchmark spec",
     )
 
 

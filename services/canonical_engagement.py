@@ -27,6 +27,7 @@ Time windows: optional half-open UTC ``[window_start, window_end_exclusive)`` on
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -45,6 +46,9 @@ logger = logging.getLogger("uploadm8.canonical_engagement")
 # Bump when merge semantics or API shape changes (clients / exports can branch on this).
 ROLLUP_VERSION = 2
 SLOW_ROLLUP_WARN_MS = 2000.0
+_ADMIN_ENGAGEMENT_CACHE_TTL_S = 90.0
+_ADMIN_ROLLUP_CONCURRENCY = 6
+_admin_engagement_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 _ENG_KEYS = ("views", "likes", "comments", "shares")
 # Defensive cap for JSON / UI (Postgres BIGINT can exceed JS safe int).
@@ -78,6 +82,7 @@ ANALYTICS_RANGE_MINUTES: Dict[str, int] = {
     "30d": 43200,
     "90d": 129600,
     "6m": 262800,
+    "365d": 525600,
     "1y": 525600,
 }
 
@@ -652,19 +657,35 @@ def merge_upload_and_catalog_engagement(
     return out
 
 
+def _admin_engagement_cache_key(
+    window_start: Optional[datetime],
+    window_end_exclusive: Optional[datetime],
+) -> str:
+    ws_s = window_start.isoformat() if window_start is not None else ""
+    we_s = window_end_exclusive.isoformat() if window_end_exclusive is not None else ""
+    return f"{ws_s}|{we_s}"
+
+
 async def compute_admin_engagement_totals(
     conn: "asyncpg.Connection",
     *,
     window_start: Optional[datetime],
     window_end_exclusive: Optional[datetime],
+    pool: Optional["asyncpg.Pool"] = None,
 ) -> Dict[str, Any]:
     """
     Global admin engagement: sum per-tenant canonical rollups over distinct users
     active in the upload window. Also returns raw upload-column sums for crosswalk.
     """
-    t0 = time.perf_counter()
     ws = window_start
     we = window_end_exclusive
+    cache_key = _admin_engagement_cache_key(ws, we)
+    now_mono = time.monotonic()
+    cached = _admin_engagement_cache.get(cache_key)
+    if cached and (now_mono - cached[0]) < _ADMIN_ENGAGEMENT_CACHE_TTL_S:
+        return dict(cached[1])
+
+    t0 = time.perf_counter()
     raw_params: List[Any] = []
     raw_where = ["status IN ('completed', 'succeeded', 'partial')"]
     if ws is not None:
@@ -703,22 +724,45 @@ async def compute_admin_engagement_totals(
 
     total = _zero_vec()
     tenants = 0
-    for ur in uid_rows or []:
-        uid = str(ur["user_id"] or "").strip()
-        if not uid:
-            continue
+    uids = [str(ur["user_id"] or "").strip() for ur in uid_rows or []]
+    uids = [u for u in uids if u]
+
+    async def _rollup_one(uid: str) -> Optional[Dict[str, Any]]:
         try:
-            cr = await compute_canonical_engagement_rollup(
+            if pool is not None:
+                async with pool.acquire() as rollup_conn:
+                    return await compute_canonical_engagement_rollup(
+                        rollup_conn,
+                        uid,
+                        window_start=ws,
+                        window_end_exclusive=we,
+                        platform=None,
+                    )
+            return await compute_canonical_engagement_rollup(
                 conn,
                 uid,
                 window_start=ws,
                 window_end_exclusive=we,
                 platform=None,
             )
-            total = _vec_add(total, {k: int(cr.get(k) or 0) for k in _ENG_KEYS})
-            tenants += 1
         except Exception as e:
             logger.debug("admin engagement skip user %s: %s", uid[:8], e)
+            return None
+
+    if pool is not None and len(uids) > 1:
+        sem = asyncio.Semaphore(_ADMIN_ROLLUP_CONCURRENCY)
+        async def _bounded(uid: str) -> Optional[Dict[str, Any]]:
+            async with sem:
+                return await _rollup_one(uid)
+        rollups = await asyncio.gather(*(_bounded(uid) for uid in uids))
+    else:
+        rollups = [await _rollup_one(uid) for uid in uids]
+
+    for cr in rollups:
+        if not cr:
+            continue
+        total = _vec_add(total, {k: int(cr.get(k) or 0) for k in _ENG_KEYS})
+        tenants += 1
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
     if latency_ms >= SLOW_ROLLUP_WARN_MS:
@@ -728,7 +772,7 @@ async def compute_admin_engagement_totals(
             latency_ms,
         )
 
-    return {
+    result = {
         "views": _clamp_nonneg(total["views"]),
         "likes": _clamp_nonneg(total["likes"]),
         "comments": _clamp_nonneg(total["comments"]),
@@ -748,3 +792,5 @@ async def compute_admin_engagement_totals(
             "latency_ms": round(latency_ms, 2),
         },
     }
+    _admin_engagement_cache[cache_key] = (time.monotonic(), result)
+    return result

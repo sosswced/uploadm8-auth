@@ -23,8 +23,11 @@ CURRENT_KEY_ID = "v1"
 admin_settings_cache: Dict[str, Any] = {
     "demo_data_enabled": False,
     "billing_mode": BILLING_MODE,
-    # Free-tier FFmpeg drawtext string (master admin editable; worker reads DB each job).
+    # Free-tier FFmpeg drawtext (master admin editable; worker reads DB each job).
     "watermark_burn_text": "Upload M8",
+    "watermark_size_scale": 100,
+    "watermark_opacity": 0.85,
+    "watermark_position": "bottom-right",
 }
 
 # Master-admin catalog overrides (merged with stages/entitlements TIER_CONFIG + TOPUP_PRODUCTS).

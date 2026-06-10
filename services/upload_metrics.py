@@ -11,11 +11,15 @@ User-facing **headline** engagement is ``services.canonical_engagement.compute_c
 ``SUM(views)`` for speed. **success_rate** uses ``SUCCESSFUL_STATUS_SQL_IN``.
 
 API prose for ``metric_definitions`` JSON lives in ``services.metric_definitions`` (single canonical copy).
+
+Durable upload pipeline funnel (presign → R2 → worker → terminal) lives in
+``services.upload_funnel_metrics.funnel_conversion_summary``.
 """
 
 from __future__ import annotations
 
 from services.platform_channels import CANONICAL_PUBLISH_PLATFORMS
+from services.upload_funnel_metrics import funnel_conversion_summary  # noqa: F401
 
 SUCCESSFUL_UPLOAD_STATUSES: tuple[str, ...] = ("completed", "succeeded", "partial")
 

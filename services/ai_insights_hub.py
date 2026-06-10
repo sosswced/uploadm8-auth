@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -18,10 +19,32 @@ from services.growth_intelligence import (
     fetch_user_pikzels_studio_usage,
     parse_range_since_until,
 )
+from core.helpers import coerce_jsonb_dict
+from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
 from services.thumbnail_niches import normalize_niche
 from services.visual_entity_memory import fetch_channel_catalog_detail
 
 logger = logging.getLogger("uploadm8.ai_insights_hub")
+
+
+def fetch_content_success_rankings() -> Dict[str, Any]:
+    """Latest content-success rankings from local ML report (admin/train cycle)."""
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("content_success_report.json", "content_success_baseline_report.json"):
+        p = root / "data" / "ml" / name
+        if not p.is_file():
+            continue
+        try:
+            rep = json.loads(p.read_text(encoding="utf-8"))
+            rankings = rep.get("rankings") or {}
+            if rankings:
+                return rankings
+        except Exception:
+            continue
+    return {}
 
 
 def _prefs_summary(prefs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -419,7 +442,7 @@ def ai_insights_hub_fallback(*, error: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-async def build_ai_insights_hub(pool: Any, user_id) -> Dict[str, Any]:
+async def build_ai_insights_hub(pool: Any, user_id, user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
         uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
     except (ValueError, TypeError):
@@ -439,15 +462,21 @@ async def build_ai_insights_hub(pool: Any, user_id) -> Dict[str, Any]:
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1::uuid", uid)
         if row:
-            prefs = row.get("preferences") or {}
-            if isinstance(prefs, dict):
-                nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy")
-                if isinstance(nested, dict) and nested.get("audience_niche"):
-                    category = normalize_niche(str(nested["audience_niche"]))
+            prefs = coerce_jsonb_dict(row.get("preferences"))
+            nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy")
+            if isinstance(nested, dict) and nested.get("audience_niche"):
+                category = normalize_niche(str(nested["audience_niche"]))
         return await fetch_channel_catalog_detail(pool, user_id=str(uid), category=category, limit_per_bucket=12)
 
     async def _studio(c):
-        return await fetch_user_pikzels_studio_usage(c, str(uid), since, until)
+        usage = await fetch_user_pikzels_studio_usage(c, str(uid), since, until)
+        try:
+            from services.pikzels_analyzer import fetch_analyzer_summary
+
+            analyzer = await fetch_analyzer_summary(c, user_id=str(uid), days=90)
+        except Exception:
+            analyzer = {}
+        return {**usage, "analyzer": analyzer or {}}
 
     async def _prefs(c):
         return await _fetch_prefs_and_personas(c, uid)
@@ -524,7 +553,7 @@ async def build_ai_insights_hub(pool: Any, user_id) -> Dict[str, Any]:
         {"id": "scheduled", "label": "Scheduled", "href": "scheduled.html", "icon": "fas fa-calendar-alt", "hint": "Rhythm and peak windows"},
     ]
 
-    return {
+    out: Dict[str, Any] = {
         "ok": True,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "readiness": readiness,
@@ -542,5 +571,24 @@ async def build_ai_insights_hub(pool: Any, user_id) -> Dict[str, Any]:
         "current_setup": prefs_block.get("setup") or {},
         "persona_count": prefs_block.get("persona_count") or 0,
         "coach_suggestions": (coach or {}).get("suggestions") or [],
+        "content_rankings": fetch_content_success_rankings(),
         "playbook": playbook,
     }
+    role = str((user or {}).get("role") or "").strip().lower()
+    if role in ("admin", "master_admin"):
+        hub_urls = get_ml_hub_urls()
+        hf = ml_hub_huggingface_dict()
+        out["ml_hub"] = {
+            "dataset_repo": hub_urls.get("dataset_repo"),
+            "dataset_url": hub_urls.get("dataset_url"),
+            "trackio_space_url": hub_urls.get("trackio_space_url"),
+            "hf_sync_enabled": os.environ.get("UM8_HF_SYNC_VISUAL_ENTITIES", "").strip().lower()
+            in ("1", "true", "yes"),
+            "docs": {
+                "datasets": hf.get("datasets_hub"),
+                "trainer": hf.get("trl_docs"),
+                "jobs": hf.get("hub_docs_jobs"),
+                "evaluation": hf.get("evaluation_doc"),
+            },
+        }
+    return out

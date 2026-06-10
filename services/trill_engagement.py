@@ -11,7 +11,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from services.trill_access import TRILL_ROUTE_PREDICATE
+from services.trill_access import TRILL_ROUTE_PREDICATE, TRILL_SCORED_PREDICATE
 
 logger = logging.getLogger(__name__)
 
@@ -381,27 +381,40 @@ async def ensure_badge_definitions(conn: Any) -> None:
     now = time.time()
     if now - _badge_defs_synced_at < _badge_defs_sync_interval_sec:
         return
-    for b in BADGE_SEED:
-        await conn.execute(
-            """
-            INSERT INTO trill_badge_definitions (slug, title, description, icon, tier, category, sort_order)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (slug) DO UPDATE SET
-                title = EXCLUDED.title,
-                description = EXCLUDED.description,
-                icon = EXCLUDED.icon,
-                tier = EXCLUDED.tier,
-                category = EXCLUDED.category,
-                sort_order = EXCLUDED.sort_order
-            """,
-            b["slug"],
-            b["title"],
-            b.get("description") or b["title"],
-            b["icon"],
-            b["tier"],
-            b["category"],
-            b["sort_order"],
+    seed_slugs = [b["slug"] for b in BADGE_SEED]
+    try:
+        seeded = await conn.fetchval(
+            "SELECT COUNT(*)::int FROM trill_badge_definitions WHERE slug = ANY($1::text[])",
+            seed_slugs,
         )
+        if (seeded or 0) >= len(seed_slugs):
+            _badge_defs_synced_at = now
+            return
+    except Exception as e:
+        logger.debug("badge definition count check skipped: %s", e)
+    sql = """
+        INSERT INTO trill_badge_definitions (slug, title, description, icon, tier, category, sort_order)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (slug) DO UPDATE SET
+            title = EXCLUDED.title,
+            description = EXCLUDED.description,
+            icon = EXCLUDED.icon,
+            tier = EXCLUDED.tier,
+            category = EXCLUDED.category,
+            sort_order = EXCLUDED.sort_order
+    """
+    async with conn.transaction():
+        for b in BADGE_SEED:
+            await conn.execute(
+                sql,
+                b["slug"],
+                b["title"],
+                b.get("description") or b["title"],
+                b["icon"],
+                b["tier"],
+                b["category"],
+                b["sort_order"],
+            )
     _badge_defs_synced_at = now
 
 
@@ -423,6 +436,8 @@ def _badge_row_to_dict(r: Any) -> Dict[str, Any]:
             meta = json.loads(meta)
         except Exception:
             meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
     earned = r.get("earned_at")
     earned_iso = earned.isoformat() if earned else None
     earned_date = None
@@ -816,9 +831,14 @@ async def fetch_recent_scores_batch(
     user_ids: Sequence[str],
     since: datetime,
     limit_per_user: int = 7,
+    *,
+    route_backed_only: bool = True,
 ) -> Dict[str, List[float]]:
     if not user_ids:
         return {}
+    scored_predicate = (
+        TRILL_ROUTE_PREDICATE.strip() if route_backed_only else TRILL_SCORED_PREDICATE.strip()
+    )
     rows = await conn.fetch(
         f"""
         SELECT user_id::text, trill_score::float AS score, created_at
@@ -828,7 +848,7 @@ async def fetch_recent_scores_batch(
             FROM uploads u
             WHERE u.user_id = ANY($1::uuid[])
               AND u.created_at >= $2
-              AND {TRILL_ROUTE_PREDICATE.strip()}
+              AND {scored_predicate}
         ) sub
         WHERE rn <= $3
         ORDER BY user_id, created_at ASC

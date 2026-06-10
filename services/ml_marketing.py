@@ -181,7 +181,10 @@ async def fetch_marketing_conversion_proxy(
         WHERE created_at >= NOW() - ($1::int * INTERVAL '1 day')
           AND NULLIF(TRIM(payload->>'campaign_id'), '') IS NOT NULL
         GROUP BY 1
-        ORDER BY (email_sent + discord_sent) DESC NULLS LAST
+        ORDER BY (
+            COUNT(*) FILTER (WHERE event_type = 'campaign_email_sent')
+          + COUNT(*) FILTER (WHERE event_type = 'campaign_discord_prompt')
+        ) DESC NULLS LAST
         LIMIT $2
         """,
         days,

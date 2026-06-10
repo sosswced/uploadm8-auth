@@ -638,7 +638,7 @@ ERROR_DISCORD_WEBHOOK_URL = os.environ.get("ERROR_DISCORD_WEBHOOK_URL", "")
 
 MAILGUN_API_KEY = os.environ.get("MAILGUN_API_KEY", "")
 MAILGUN_DOMAIN = os.environ.get("MAILGUN_DOMAIN", "")
-MAIL_FROM = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
+MAIL_FROM = os.environ.get("MAIL_FROM", "UploadM8 <hello@uploadm8.com>")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
 
 _PLATFORM_LABELS = {

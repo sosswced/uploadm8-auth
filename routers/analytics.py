@@ -50,6 +50,7 @@ _RANGE_PRESETS_MINUTES = {
     "30d": 30 * 24 * 60,
     "90d": 90 * 24 * 60,
     "6m": 180 * 24 * 60,
+    "365d": 365 * 24 * 60,
     "1y": 365 * 24 * 60,
 }
 
@@ -819,15 +820,25 @@ async def get_analytics(
     completed = int(stats["completed"] or 0) if stats else 0
     success_rate_pct = round((completed / max(total, 1)) * 100, 1) if total else 0.0
     eng_window = engagement_window_api_dict(start=win_start, end_exclusive=win_end)
+    canon_views = int(cr.get("views") or 0)
+    canon_likes = int(cr.get("likes") or 0)
+    canon_comments = int(cr.get("comments") or 0)
+    canon_shares = int(cr.get("shares") or 0)
+    engagement_rate_pct = (
+        round(100.0 * (canon_likes + canon_comments + canon_shares) / max(canon_views, 1), 2)
+        if canon_views > 0
+        else 0.0
+    )
 
     result = {
         "total_uploads": total,
         "completed": completed,
         "success_rate_pct": success_rate_pct,
-        "views": int(cr.get("views") or 0),
-        "likes": int(cr.get("likes") or 0),
-        "comments": int(cr.get("comments") or 0),
-        "shares": int(cr.get("shares") or 0),
+        "views": canon_views,
+        "likes": canon_likes,
+        "comments": canon_comments,
+        "shares": canon_shares,
+        "engagement_rate_pct": engagement_rate_pct,
         "put_used": stats["put_used"] if stats else 0,
         "aic_used": stats["aic_used"] if stats else 0,
         "daily": [{"date": str(d["date"]), "uploads": d["uploads"]} for d in daily],

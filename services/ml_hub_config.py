@@ -142,6 +142,27 @@ def get_ml_hub_urls() -> Dict[str, Optional[str]]:
     if not trackio_space_url and trackio_space_path:
         trackio_space_url = f"https://huggingface.co/spaces/{trackio_space_path}"
 
+    # Content-success loop owns its own dataset + model "bucket" (separate schema).
+    content_dataset_repo = _env("UM8_HF_CONTENT_DATASET_REPO")
+    content_model_repo = _env("UM8_HF_CONTENT_MODEL_REPO")
+    promo_owner = ""
+    for repo in (dataset_repo, _env("UM8_HF_MODEL_REPO")):
+        if repo and "/" in repo:
+            promo_owner = repo.split("/", 1)[0]
+            break
+    if promo_owner:
+        if not content_dataset_repo:
+            content_dataset_repo = f"{promo_owner}/uploadm8-content-success-v1"
+        if not content_model_repo:
+            content_model_repo = f"{promo_owner}/uploadm8-content-success-model-v1"
+
+    content_dataset_url = _env("UM8_HF_CONTENT_DATASET_URL")
+    if not content_dataset_url and content_dataset_repo:
+        content_dataset_url = f"https://huggingface.co/datasets/{content_dataset_repo}"
+    content_model_url = _env("UM8_HF_CONTENT_MODEL_URL")
+    if not content_model_url and content_model_repo:
+        content_model_url = f"https://huggingface.co/{content_model_repo}"
+
     return {
         "dataset_repo": dataset_repo or None,
         "trackio_space_path": trackio_space_path or None,
@@ -156,6 +177,10 @@ def get_ml_hub_urls() -> Dict[str, Optional[str]]:
                 else None
             )
         ),
+        "content_dataset_repo": content_dataset_repo or None,
+        "content_dataset_url": content_dataset_url or None,
+        "content_model_repo": content_model_repo or None,
+        "content_model_url": content_model_url or None,
     }
 
 
@@ -169,6 +194,10 @@ def ml_hub_huggingface_dict() -> Dict[str, Any]:
         "trackio_space_path": u["trackio_space_path"],
         "model_repo": u.get("model_repo"),
         "model_url": u.get("model_url"),
+        "content_dataset_repo": u.get("content_dataset_repo"),
+        "content_dataset_url": u.get("content_dataset_url"),
+        "content_model_repo": u.get("content_model_repo"),
+        "content_model_url": u.get("content_model_url"),
         "hub_docs_jobs": HUB_DOCS_JOBS,
         "datasets_hub": DATASETS_HUB_DOC,
         "trl_docs": TRL_ROOT_DOC,
@@ -211,10 +240,23 @@ def _ecosystem_entries(urls: Dict[str, Optional[str]]) -> List[Dict[str, Any]]:
         },
         {
             "id": "datasets",
-            "label": "Hugging Face Datasets",
-            "role": "Versioned training and evaluation tables (promo targeting and related).",
+            "label": "Promo targeting dataset",
+            "role": "Versioned promo-targeting uplift training table (split: train).",
             "url": dataset_url,
             "placeholder": dataset_ph,
+        },
+        {
+            "id": "content_datasets",
+            "label": "Content success dataset",
+            "role": "Separate bucket for content-success / hottest-topic rows (split: train).",
+            "url": _resolved_hub_link(
+                (urls.get("content_dataset_url") or "").strip(),
+                fallback_doc=DATASET_CREATE_DOC,
+            )[0],
+            "placeholder": _resolved_hub_link(
+                (urls.get("content_dataset_url") or "").strip(),
+                fallback_doc=DATASET_CREATE_DOC,
+            )[1],
         },
         {
             "id": "evaluation",
@@ -245,6 +287,7 @@ def build_ml_hub_public_response() -> Dict[str, Any]:
     urls_raw = get_ml_hub_urls()
     urls_for_eco: Dict[str, Optional[str]] = {
         "dataset_url": urls_raw.get("dataset_url"),
+        "content_dataset_url": urls_raw.get("content_dataset_url"),
         "trackio_space_url": urls_raw.get("trackio_space_url"),
     }
     return {
@@ -252,6 +295,7 @@ def build_ml_hub_public_response() -> Dict[str, Any]:
         "setup_guide_anchor": "guide.html#feat-hf-assets-setup",
         "configured": {
             "hf_dataset_page": bool(urls_raw.get("dataset_url")),
+            "hf_content_dataset_page": bool(urls_raw.get("content_dataset_url")),
             "hf_trackio_space": bool(urls_raw.get("trackio_space_url")),
         },
         "huggingface": ml_hub_huggingface_dict(),

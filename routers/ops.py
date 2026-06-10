@@ -14,6 +14,8 @@ from core.config import (
     PRIORITY_JOB_QUEUE,
     PROCESS_NORMAL_QUEUE,
     PROCESS_PRIORITY_QUEUE,
+    PUBLISH_NORMAL_QUEUE,
+    PUBLISH_PRIORITY_QUEUE,
     UPLOAD_JOB_QUEUE,
 )
 from services.ops_readiness import run_readiness_checks
@@ -53,6 +55,56 @@ async def api_v1_contract():
             "/api/v1/billing/checkout",
         ],
         "auth_note": "Bearer header or HttpOnly access cookie (credentials: include).",
+    }
+
+
+@router.get("/api/ops/worker-health")
+async def worker_health():
+    """Worker lane + queue depth snapshot for Render split deployments."""
+    redis_queues: dict = {}
+    if core.state.redis_client:
+        try:
+            from stages.redis_job_queue import (
+                list_lengths,
+                process_stream_keys_ordered,
+                stream_lengths,
+                use_redis_streams,
+            )
+
+            lp = [
+                PROCESS_PRIORITY_QUEUE,
+                PROCESS_NORMAL_QUEUE,
+                PRIORITY_JOB_QUEUE,
+                UPLOAD_JOB_QUEUE,
+                PUBLISH_PRIORITY_QUEUE,
+                PUBLISH_NORMAL_QUEUE,
+            ]
+            redis_queues["use_streams"] = use_redis_streams()
+            redis_queues["lists"] = await list_lengths(core.state.redis_client, lp)
+            if use_redis_streams():
+                from stages.redis_job_queue import stream_key_for_list
+
+                sk = process_stream_keys_ordered(
+                    PROCESS_PRIORITY_QUEUE,
+                    PROCESS_NORMAL_QUEUE,
+                    PRIORITY_JOB_QUEUE,
+                    UPLOAD_JOB_QUEUE,
+                ) + [
+                    stream_key_for_list(PUBLISH_PRIORITY_QUEUE),
+                    stream_key_for_list(PUBLISH_NORMAL_QUEUE),
+                ]
+                redis_queues["streams"] = await stream_lengths(core.state.redis_client, sk)
+        except (RedisError, ImportError, TypeError, ValueError) as e:
+            redis_queues["error"] = str(e)
+    worker_lane = (os.environ.get("WORKER_LANE") or "full").strip().lower()
+    return {
+        "worker_lane": worker_lane,
+        "worker_concurrency": int(os.environ.get("WORKER_CONCURRENCY", "3") or 3),
+        "publish_concurrency": int(os.environ.get("PUBLISH_CONCURRENCY", "5") or 5),
+        "heavy_pipeline_slots": int(os.environ.get("WORKER_HEAVY_PIPELINE_SLOTS", "1") or 1),
+        "async_publish_queue": os.environ.get("ASYNC_PUBLISH_QUEUE", "false"),
+        "redis_queues": redis_queues,
+        "timestamp": _now_utc().isoformat(),
     }
 
 

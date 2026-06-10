@@ -24,25 +24,38 @@ DESIGN v2 UPGRADES:
 """
 
 import os
+import re
 import logging
-import html
+import html as html_module
 import httpx
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 logger = logging.getLogger("uploadm8-worker")
 
 # ── Env config ────────────────────────────────────────────────────────────────
 MAILGUN_API_KEY = os.environ.get("MAILGUN_API_KEY", "")
 MAILGUN_DOMAIN  = os.environ.get("MAILGUN_DOMAIN", "")
-MAIL_FROM       = os.environ.get("MAIL_FROM", "UploadM8 <no-reply@uploadm8.com>")
+FRONTEND_URL    = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
+# Prefer hello@ / support@ over bare no-reply — better inbox placement for onboarding.
+MAIL_FROM       = os.environ.get("MAIL_FROM", "UploadM8 <hello@uploadm8.com>")
 MAIL_FROM_SUPPORT = os.environ.get("MAIL_FROM_SUPPORT", "UploadM8 Support <support@uploadm8.com>")
 MAIL_FROM_HELLO   = os.environ.get("MAIL_FROM_HELLO", "UploadM8 <hello@uploadm8.com>")
-FRONTEND_URL    = os.environ.get("FRONTEND_URL", "https://app.uploadm8.com")
+MAIL_PHYSICAL_ADDRESS = os.environ.get(
+    "MAIL_PHYSICAL_ADDRESS",
+    "UploadM8 · 548 Market St PMB · San Francisco, CA 94104",
+).strip()
+# Disable Mailgun open/click tracking on transactional mail (redirect wrappers hurt spam scores).
+MAILGUN_DISABLE_TRACKING = os.environ.get("MAILGUN_DISABLE_TRACKING", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 # ── Brand constants ───────────────────────────────────────────────────────────
-SUPPORT_EMAIL = "support@uploadm8.com"
-LOGO_URL      = "https://app.uploadm8.com/images/logo.png"
+SUPPORT_EMAIL = os.environ.get("SUPPORT_EMAIL", "support@uploadm8.com").strip() or "support@uploadm8.com"
+LOGO_URL      = os.environ.get(
+    "MAIL_LOGO_URL",
+    f"{FRONTEND_URL.rstrip('/')}/images/logo.png",
+).strip()
 
 URL_DASHBOARD    = f"{FRONTEND_URL}/dashboard.html"
 URL_SETTINGS     = f"{FRONTEND_URL}/settings.html"
@@ -83,17 +96,111 @@ def mailgun_ready() -> bool:
     return bool(MAILGUN_API_KEY and MAILGUN_DOMAIN)
 
 
-async def send_email(to: str, subject: str, html: str, from_addr: str = None, reply_to: str = None) -> None:
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\u2600-\u27BF"
+    "\uFE0F"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def sanitize_email_subject(subject: str, *, brand_prefix: bool = True) -> str:
+    """
+    Strip emoji / shouty punctuation and ensure brand token for inbox filters.
+    """
+    s = _EMOJI_RE.sub("", str(subject or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"!{2,}", ".", s)
+    s = s[:78].strip(" .")
+    if brand_prefix and "uploadm8" not in s.lower():
+        s = f"UploadM8 — {s}" if s else "UploadM8"
+    return s or "UploadM8"
+
+
+def html_to_plain_text(html: str) -> str:
+    """Rough HTML → plain text for multipart MIME (spam filters expect text part)."""
+    if not html:
+        return ""
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", "", html)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n\n", text)
+    text = re.sub(r"(?i)</tr\s*>", "\n", text)
+    text = re.sub(r"(?i)</h[1-6]\s*>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html_module.unescape(text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _mailgun_tracking_flags(category: str) -> dict:
+    cat = (category or "transactional").strip().lower()
+    if cat == "marketing":
+        if os.environ.get("MAILGUN_MARKETING_TRACKING", "no").strip().lower() in ("1", "true", "yes", "on"):
+            return {}
+        return {"o:tracking": "no", "o:tracking-clicks": "no", "o:tracking-opens": "no"}
+    if MAILGUN_DISABLE_TRACKING:
+        return {"o:tracking": "no", "o:tracking-clicks": "no", "o:tracking-opens": "no"}
+    return {}
+
+
+def _list_unsubscribe_headers(category: str) -> dict:
+    if (category or "").strip().lower() != "marketing":
+        return {}
+    unsub = URL_UNSUBSCRIBE
+    return {
+        "h:List-Unsubscribe": f"<{unsub}>, <mailto:{SUPPORT_EMAIL}?subject=unsubscribe>",
+        "h:List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    }
+
+
+async def send_email(
+    to: str,
+    subject: str,
+    html: str,
+    from_addr: str = None,
+    reply_to: str = None,
+    text: Optional[str] = None,
+    category: str = "transactional",
+    tags: Optional[List[str]] = None,
+) -> None:
     """Low-level Mailgun sender. All email modules call this.
+
+    Sends multipart HTML + plain text, optional List-Unsubscribe for marketing,
+    and disables click/open tracking by default on transactional mail.
 
     On failure (non-200 response or network exception) records an
     ``operational_incidents`` row so the admin incidents page surfaces email
     delivery problems. The send_email contract (never raise) is preserved.
     """
     sender = from_addr or MAIL_FROM
-    data = {"from": sender, "to": to, "subject": subject, "html": html}
+    clean_subject = sanitize_email_subject(subject, brand_prefix=True)
+    plain = (text or html_to_plain_text(html)).strip()
+    if MAIL_PHYSICAL_ADDRESS and plain:
+        plain += f"\n\n—\n{MAIL_PHYSICAL_ADDRESS}\n{URL_UNSUBSCRIBE}"
+
+    data = {
+        "from": sender,
+        "to": to,
+        "subject": clean_subject,
+        "html": html,
+        "text": plain or clean_subject,
+    }
     if reply_to:
         data["h:Reply-To"] = reply_to
+    else:
+        data["h:Reply-To"] = SUPPORT_EMAIL
+
+    data.update(_mailgun_tracking_flags(category))
+    data.update(_list_unsubscribe_headers(category))
+
+    tag_list = [t.strip() for t in (tags or []) if t and str(t).strip()]
+    if not tag_list:
+        tag_list = [category or "transactional"]
+    data["o:tag"] = tag_list[:3]
+
     if not mailgun_ready():
         logger.info(f"Email skipped (Mailgun not configured): {to} | {subject}")
         return
@@ -115,7 +222,7 @@ async def send_email(to: str, subject: str, html: str, from_addr: str = None, re
             except Exception:
                 fail_body = ""
         else:
-            logger.info(f"Email sent → {to}: {subject}")
+            logger.info(f"Email sent → {to}: {clean_subject}")
     except Exception as e:
         logger.warning(f"Mailgun error: {e}")
         fail_kind = f"mailgun_exception_{type(e).__name__}"
@@ -133,7 +240,7 @@ async def send_email(to: str, subject: str, html: str, from_addr: str = None, re
                     pool,
                     source="email",
                     incident_type=fail_kind[:120],
-                    subject=f"Email send failed → {to}: {subject}"[:2000],
+                    subject=f"Email send failed → {to}: {clean_subject}"[:2000],
                     body=fail_body,
                     details={
                         "to": to,
@@ -240,9 +347,9 @@ def email_shell(
     bc = brand or BrandContext.uploadm8_default()
     grad = bc.header_gradient() if brand else gradient
     logo_src = bc.logo_url or LOGO_URL
-    logo_alt = html.escape(bc.company_name or "UploadM8", quote=True)
-    footer_brand = html.escape(bc.footer_name or "UploadM8", quote=False)
-    page_title = html.escape(bc.product_name or "UploadM8", quote=False)
+    logo_alt = html_module.escape(bc.company_name or "UploadM8", quote=True)
+    footer_brand = html_module.escape(bc.footer_name or "UploadM8", quote=False)
+    page_title = html_module.escape(bc.product_name or "UploadM8", quote=False)
 
     header = (
         f'<tr><td style="background:{grad};padding:34px 40px 30px;text-align:center;">'
@@ -264,19 +371,25 @@ def email_shell(
         '</div></td></tr>'
     )
 
+    physical_line = (
+        f'<p style="margin:0 0 8px;color:#4b5563;font-size:11px;line-height:1.45;">'
+        f'{html_module.escape(MAIL_PHYSICAL_ADDRESS)}</p>'
+        if MAIL_PHYSICAL_ADDRESS else ""
+    )
     footer = (
         '<tr><td style="padding:26px 40px 24px;text-align:center;'
         'border-top:1px solid rgba(255,255,255,0.06);">'
-        f'<p style="margin:0 0 6px;color:#4b5563;font-size:13px;">'
-        f'&#169; 2025 {footer_brand} &middot; All rights reserved</p>'
-        f'<p style="margin:0 0 8px;color:#4b5563;font-size:12px;">Need help? '
-        f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
-        f'{SUPPORT_EMAIL}</a></p>'
-        f'<p style="margin:0;color:#374151;font-size:11px;">'
-        f'<a href="{URL_UNSUBSCRIBE}" style="color:#4b5563;text-decoration:underline;">Manage email preferences</a>'
-        f' &middot; '
-        f'<a href="{FRONTEND_URL}" style="color:#4b5563;text-decoration:underline;">app.uploadm8.com</a>'
-        f'</p>'
+        + f'<p style="margin:0 0 6px;color:#4b5563;font-size:13px;">'
+        + f'&#169; 2026 {footer_brand} &middot; All rights reserved</p>'
+        + physical_line
+        + f'<p style="margin:0 0 8px;color:#4b5563;font-size:12px;">Need help? '
+        + f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#f97316;text-decoration:none;">'
+        + f'{SUPPORT_EMAIL}</a></p>'
+        + f'<p style="margin:0;color:#374151;font-size:11px;">'
+        + f'<a href="{URL_UNSUBSCRIBE}" style="color:#4b5563;text-decoration:underline;">Manage email preferences</a>'
+        + f' &middot; '
+        + f'<a href="{FRONTEND_URL}" style="color:#4b5563;text-decoration:underline;">app.uploadm8.com</a>'
+        + f'</p>'
         + extra_footer
         + '</td></tr>'
     )
@@ -285,6 +398,8 @@ def email_shell(
         '<!DOCTYPE html><html lang="en"><head>'
         '<meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1.0">'
+        '<meta name="x-apple-disable-message-reformatting">'
+        '<meta name="format-detection" content="telephone=no,address=no,email=no,date=no">'
         f'<title>{page_title}</title>'
         '</head>'
         '<body style="margin:0;padding:0;background-color:#0f0f0f;'
@@ -462,12 +577,13 @@ def plan_change_visual(old_tier: str, new_tier: str, hex_new: str = "#f97316") -
 
 
 def platform_logos_row() -> str:
-    """TikTok / YouTube / Instagram / Facebook logo strip. v2: bordered badge squares."""
+    """TikTok / YouTube / Instagram / Facebook — self-hosted icons (no third-party CDNs)."""
+    base = FRONTEND_URL.rstrip("/")
     logos = [
-        ("#1a1a1a", "https://logo.clearbit.com/tiktok.com",    "TikTok"),
-        ("#ff0000", "https://logo.clearbit.com/youtube.com",   "YouTube"),
-        ("#c13584", "https://logo.clearbit.com/instagram.com", "Instagram"),
-        ("#1877f2", "https://logo.clearbit.com/facebook.com",  "Facebook"),
+        ("#1a1a1a", f"{base}/images/platforms/tiktok.png", "TikTok"),
+        ("#ff0000", f"{base}/images/platforms/youtube.png", "YouTube"),
+        ("#c13584", f"{base}/images/platforms/instagram.png", "Instagram"),
+        ("#1877f2", f"{base}/images/platforms/facebook.png", "Facebook"),
     ]
     cells = "".join(
         f'<td style="padding:0 8px;text-align:center;">'

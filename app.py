@@ -83,8 +83,11 @@ from migrations.runtime_migrations import run_migrations
 # ── Router imports ───────────────────────────────────────────────────────────
 from routers.auth import router as auth_router
 from routers.me import router as me_router
-from routers.uploads import router as uploads_router
+from routers.uploads_analytics import router as uploads_analytics_router
+from routers.uploads_lifecycle import router as uploads_lifecycle_router
+from routers.uploads_read import router as uploads_read_router
 from routers.scheduled import router as scheduled_router
+from routers.scheduling import router as scheduling_router
 from routers.preferences import router as preferences_router
 from routers.groups import router as groups_router
 from routers.workspace import router as workspace_router
@@ -137,6 +140,24 @@ async def lifespan(app: FastAPI):
     logger.info("Database connected")
 
     await run_migrations(core.state.db_pool)
+
+    try:
+        from services.upload_funnel import set_funnel_db_pool
+
+        set_funnel_db_pool(core.state.db_pool)
+    except Exception as e:
+        logger.debug("upload funnel db pool init skipped: %s", e)
+
+    try:
+        from services.ml_model_sync import sync_ml_models_from_hub
+        from services.promo_targeting_model import reload_model as reload_promo_model
+        from services.content_success_model import reload_model as reload_content_model
+
+        sync_ml_models_from_hub()
+        reload_promo_model()
+        reload_content_model()
+    except Exception as e:
+        logger.debug("ml model reload skipped: %s", e)
 
     try:
         async with core.state.db_pool.acquire() as conn:
@@ -469,8 +490,11 @@ async def security_headers(request: Request, call_next):
 # ============================================================
 app.include_router(auth_router)
 app.include_router(me_router)
-app.include_router(uploads_router)
+app.include_router(uploads_read_router)
+app.include_router(uploads_analytics_router)
+app.include_router(uploads_lifecycle_router)
 app.include_router(scheduled_router)
+app.include_router(scheduling_router)
 app.include_router(preferences_router)
 app.include_router(groups_router)
 app.include_router(workspace_router)

@@ -89,8 +89,22 @@ def user_avatar_redirect_path(stored_key: str | None) -> str:
     return f"/user-avatars/{uid}/{filename}"
 
 
-def resolve_user_profile_avatar_url(avatar_r2_key: str | None) -> str:
-    """Redirect path for profile avatars — no R2 presign on the hot path."""
+def resolve_user_profile_avatar_url(avatar_r2_key: str | None, *, presign: bool = False) -> str:
+    """
+    Profile avatar URL for API responses.
+
+    ``presign=False`` (default): same-origin ``/user-avatars/...`` redirect path.
+    ``presign=True``: short-lived R2 GET URL for ``<img src>`` (bearer-only / E2E sessions
+    cannot send Authorization on image requests).
+    """
+    if presign:
+        k = (avatar_r2_key or "").strip()
+        if not k.startswith("avatars/"):
+            return ""
+        try:
+            return generate_presigned_download_url(k, ttl=3600) or ""
+        except Exception:
+            return ""
     return user_avatar_redirect_path(avatar_r2_key)
 
 

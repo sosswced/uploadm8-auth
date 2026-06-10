@@ -8,27 +8,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from stages.entitlements import normalize_tier
+from services.ml_feature_registry import active_cat, active_num, label, label_fallback
 
-FEATURES_NUM: List[str] = [
-    "sent_dow_utc",
-    "sent_hour_utc",
-    "put_balance",
-    "aic_balance",
-    "uploads_30d",
-    "avg_views_30d",
-    "avg_engagement_pct_30d",
-    "content_items_30d",
-    "pci_avg_views_30d",
-]
+# Derived from the feature registry (single source of truth) so training,
+# runtime scoring, and the curated views never drift.
+FEATURES_NUM: List[str] = active_num("promo")
+FEATURES_CAT: List[str] = active_cat("promo")
 
-FEATURES_CAT: List[str] = [
-    "channel",
-    "delivery_status",
-    "subscription_tier",
-]
-
-TARGET_CONVERTED = "converted_7d"
-TARGET_ENGAGED = "engaged_7d"
+TARGET_CONVERTED = label("promo")
+TARGET_ENGAGED = label_fallback("promo") or "engaged_7d"
 
 
 def features_row_for_user(
@@ -58,6 +46,7 @@ def features_row_for_user(
     return {
         "sent_dow_utc": int(now.weekday()),
         "sent_hour_utc": int(now.hour),
+        "is_snapshot": 1,
         "put_balance": int(campaign_features.get("put_balance") or 0),
         "aic_balance": int(campaign_features.get("aic_balance") or 0),
         "uploads_30d": uploads,
@@ -65,6 +54,16 @@ def features_row_for_user(
         "avg_engagement_pct_30d": eng_rate,
         "content_items_30d": content_items,
         "pci_avg_views_30d": pci_views,
+        # Marketing history / tenure / recency / trend (best-effort; the view path
+        # in score_user_propensity provides exact parity when available).
+        "prior_touchpoints": int(campaign_features.get("prior_touchpoints") or 0),
+        "opens_all": int(campaign_features.get("opens_all") or 0),
+        "clicks_all": int(campaign_features.get("clicks_all") or 0),
+        "days_since_last_touchpoint": float(campaign_features.get("days_since_last_touchpoint") or 0.0),
+        "account_age_days": float(campaign_features.get("account_age_days") or 0.0),
+        "days_since_last_upload": float(campaign_features.get("days_since_last_upload") or 0.0),
+        "uploads_trend_30d": float(campaign_features.get("uploads_trend_30d") or 0.0),
+        "views_trend_30d": float(campaign_features.get("views_trend_30d") or 0.0),
         "channel": (channel or "email")[:32],
         "delivery_status": (delivery_status or "runtime_score")[:64],
         "subscription_tier": tier,

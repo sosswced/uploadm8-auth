@@ -148,6 +148,16 @@ def main() -> None:
         default=(os.environ.get("UM8_HF_MODEL_REPO") or "").strip(),
         help="Hub model repo for eval results (e.g. org/uploadm8-promo-uplift). Default: UM8_HF_MODEL_REPO",
     )
+    p.add_argument(
+        "--content-dataset-repo",
+        default=(os.environ.get("UM8_HF_CONTENT_DATASET_REPO") or "").strip(),
+        help="Hub dataset repo for the content-success bucket (e.g. org/content-success-v1). Default: UM8_HF_CONTENT_DATASET_REPO",
+    )
+    p.add_argument(
+        "--content-model-repo",
+        default=(os.environ.get("UM8_HF_CONTENT_MODEL_REPO") or "").strip(),
+        help="Hub model repo for content-success eval results. Default: UM8_HF_CONTENT_MODEL_REPO",
+    )
     p.add_argument("--private", action="store_true", help="Create private repos.")
     p.add_argument(
         "--sync-trackio",
@@ -160,15 +170,25 @@ def main() -> None:
     if not token:
         _die("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required (write token).")
 
-    if not args.dataset_repo and not args.trackio_space and not args.model_repo:
+    if (
+        not args.dataset_repo
+        and not args.trackio_space
+        and not args.model_repo
+        and not args.content_dataset_repo
+        and not args.content_model_repo
+    ):
         _die(
-            "Provide --dataset-repo, --trackio-space, and/or --model-repo, or set "
-            "UM8_HF_DATASET_REPO / UM8_TRACKIO_SPACE_PATH / UM8_HF_MODEL_REPO in the environment."
+            "Provide --dataset-repo, --trackio-space, --model-repo, --content-dataset-repo, "
+            "and/or --content-model-repo, or set the matching UM8_HF_* env vars."
         )
 
     from huggingface_hub import HfApi
 
-    from services.ml_eval_hub import ensure_model_repo, push_dataset_eval_yaml
+    from services.ml_eval_hub import (
+        ensure_model_repo,
+        push_content_dataset_eval_yaml,
+        push_dataset_eval_yaml,
+    )
 
     api = HfApi(token=token)
 
@@ -188,23 +208,17 @@ license: mit
 tags:
 - uploadm8
 - promo-targeting
-- content-success
 - tabular
 datasets:
 - {args.dataset_repo or 'your-org/promo-targeting-v1'}
 ---
 
-# UploadM8 ML Hub Models
+# UploadM8 Promo Targeting Model
 
-Models trained by the UploadM8 ML engine, sharing one dataset repo (separate splits):
+Promo-targeting uplift model trained by the UploadM8 ML engine (`split: train`):
+touchpoint conversion uplift over user activity + wallet + tier features.
 
-- **Promo uplift** (`split: train`) — touchpoint conversion uplift.
-  Eval: `.eval_results/uploadm8_promo_uplift.yaml`, metrics: `uploadm8_metrics.json`.
-- **Content success / hottest topic** (`split: content_success`) — learns which
-  topic, packaging, and upload-flow choices drive the strongest per-platform
-  engagement (likes/comments/shares/views per video) and ranks the hottest content.
-  Eval: `.eval_results/uploadm8_content_success.yaml`, metrics + ranked topics:
-  `uploadm8_content_metrics.json`.
+Eval: `.eval_results/uploadm8_promo_uplift.yaml`, metrics: `uploadm8_metrics.json`.
 
 Evaluation metrics follow [Hugging Face eval results](https://huggingface.co/docs/hub/eval-results).
 """
@@ -213,9 +227,55 @@ Evaluation metrics follow [Hugging Face eval results](https://huggingface.co/doc
             path_in_repo="README.md",
             repo_id=args.model_repo,
             repo_type="model",
-            commit_message="UploadM8 ML engine: model card scaffold",
+            commit_message="UploadM8 ML engine: promo model card scaffold",
         )
         print(f"[ok] model repo: https://huggingface.co/{args.model_repo}")
+
+    if args.content_dataset_repo:
+        api.create_repo(
+            args.content_dataset_repo, repo_type="dataset", private=args.private, exist_ok=True
+        )
+        try:
+            push_content_dataset_eval_yaml(args.content_dataset_repo)
+            print("[ok] content dataset eval.yaml uploaded")
+        except Exception as exc:
+            print(f"[warn] content eval.yaml upload: {exc}", file=sys.stderr)
+        print(
+            f"[ok] content dataset repo: https://huggingface.co/datasets/{args.content_dataset_repo}"
+        )
+
+    if args.content_model_repo:
+        ensure_model_repo(args.content_model_repo, private=args.private)
+        content_readme = f"""---
+license: mit
+tags:
+- uploadm8
+- content-success
+- tabular
+datasets:
+- {args.content_dataset_repo or 'your-org/content-success-v1'}
+---
+
+# UploadM8 Content Success Model
+
+Content-success / hottest-topic model trained by the UploadM8 ML engine
+(`split: train`). Learns which topic, packaging, and upload-flow choices drive the
+strongest per-platform engagement (likes/comments/shares/views per video) and ranks
+the hottest content.
+
+Eval: `.eval_results/uploadm8_content_success.yaml`, metrics + ranked topics:
+`uploadm8_content_metrics.json`.
+
+Evaluation metrics follow [Hugging Face eval results](https://huggingface.co/docs/hub/eval-results).
+"""
+        api.upload_file(
+            path_or_fileobj=content_readme.encode("utf-8"),
+            path_in_repo="README.md",
+            repo_id=args.content_model_repo,
+            repo_type="model",
+            commit_message="UploadM8 ML engine: content model card scaffold",
+        )
+        print(f"[ok] content model repo: https://huggingface.co/{args.content_model_repo}")
 
     if args.trackio_space:
         api.create_repo(

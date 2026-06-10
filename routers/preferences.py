@@ -23,6 +23,7 @@ from core.helpers import (
 from core.sql_allowlist import USER_COLOR_PREFERENCES_UPDATE_COLUMNS, assert_set_fragments_columns
 from core.models import ColorPreferencesUpdate, UserPreferencesUpdate
 from services.user_preferences_persist import save_user_content_preferences
+from services.workspace import require_can_edit_settings
 from services.thumbnail_personas_list import list_thumbnail_studio_personas
 from stages.entitlements import get_entitlements_for_tier
 from services.ml_hub_config import get_ml_hub_urls, ml_hub_huggingface_dict
@@ -78,6 +79,7 @@ async def update_color_preferences(
     user: dict = Depends(get_current_user)
 ):
     """Update user's custom color preferences"""
+    require_can_edit_settings(user)
     async with core.state.db_pool.acquire() as conn:
         # Check if preferences exist
         exists = await conn.fetchval(
@@ -620,6 +622,7 @@ async def save_user_preferences(
     ``user_preferences``, syncs Trill/discord into ``user_settings``, and merges
     caption fields into ``users.preferences`` for the worker.
     """
+    require_can_edit_settings(user)
     async with core.state.db_pool.acquire() as conn:
         return await save_user_content_preferences(conn, user, payload)
 

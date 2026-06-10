@@ -8,8 +8,8 @@ Pipeline order (critical — DO NOT REORDER):
   4.  Transcode       — Deduplicated per-platform MP4s (+ ffprobe → ctx.video_info)
   5.  Audio context   — Whisper / ACR / YAMNet / GPT summary (feeds M8)
   6.  Vision          — Google Cloud Vision on sampled frames (labels/OCR/landmarks)
-  7.  Twelve Labs     — Optional full-video scene understanding
-  8.  Video Intel     — Always-on GCP Video Intelligence hydration (when credentials/limits allow)
+  7.  Video Intel     — GCP Video Intelligence (before Twelve Labs so TL skip gate works)
+  8.  Twelve Labs     — Optional full-video scene understanding (skipped when VI is rich)
   9.  Dashcam OSD     — OCR of on-screen dashcam text (pref on); backfill telemetry when no .map
   10. Thumbnail       — Extract frame from FINAL processed video
   11. Caption         — M8 / LLM title+caption+hashtags (uses steps 2–9)
@@ -71,13 +71,20 @@ CONCURRENCY:
   Scheduler loop runs as a separate asyncio task, not a job slot.
 
 WATERMARK (free tier — full-file FFmpeg re-encode before transcode):
-  WATERMARK_X264_PRESET (default: veryfast) and WATERMARK_X264_CRF (default: 23)
-  tune CPU time; intermediate file is re-encoded again in transcode. For long
-  clips, try preset=faster or ultrafast if the worker is queue-bound.
+  Admin settings: watermark_burn_text, watermark_size_scale (50–200%),
+  watermark_opacity, watermark_position. Font size auto-scales to video resolution.
+  Env overrides: WATERMARK_TEXT, WATERMARK_SIZE_SCALE, WATERMARK_OPACITY,
+  WATERMARK_POSITION. WATERMARK_X264_PRESET (default: veryfast) and
+  WATERMARK_X264_CRF (default: 23) tune CPU time; intermediate file is
+  re-encoded again in transcode.
 
-TRANSCODE quality:
-  TRANSCODE_X264_CRF (default: 20), TRANSCODE_X264_PRESET (default: medium)
-  TRANSCODE_YOUTUBE_4K (default: false) — 2160x3840 + 40M cap for YouTube only
+TRANSCODE quality (hybrid speed + dashcam detail on scaled workers):
+  TRANSCODE_X264_PRESET (default: fast), TRANSCODE_X264_CRF (default: 19)
+  Tier overrides: TRANSCODE_X264_CRF_1080=19, TRANSCODE_X264_CRF_4K=18, PRESET_STANDARD=faster
+  TRANSCODE_DASHCAM_TUNE_FILM (default: true) — film tune on 1080p/4K sources
+  TRANSCODE_PRESERVE_HD_TIER (default: true) — 1080p/4K targets + higher max bitrates for HD sources
+  TRANSCODE_YOUTUBE_4K (default: auto), TRANSCODE_VERTICAL_4K_ALL_PLATFORMS (default: true)
+  Video stream-copy when only audio/trim needs work (preserves original pixels)
 """
 
 import os
@@ -144,6 +151,9 @@ from stages.emails import (
     send_low_token_warning_email,
 )
 from services.pipeline_ai_trace import emit_ai_pipeline_summary, record_ai_pipeline_trace
+from stages.pipeline_manifest import init_pipeline_diag, diag_step, finalize_pipeline_diag
+from stages import pipeline_stage_budgets as stage_budgets
+from stages.pipeline_runner import persist_pipeline_manifest
 
 try:
     from dotenv import load_dotenv
@@ -197,14 +207,23 @@ ANALYTICS_SYNC_BATCH    = int(os.environ.get("ANALYTICS_SYNC_BATCH_SIZE", "20"))
 # Only re-sync uploads whose analytics_synced_at is older than this many hours
 ANALYTICS_RESYNC_HOURS  = int(os.environ.get("ANALYTICS_RESYNC_HOURS", "6"))
 
-# ── Per-stage timeouts (seconds) ─────────────────────────────────
-# Each outer wrap is intentionally larger than the stage's own internal
-# subprocess/HTTP timeout, so the inner cleanup runs first and the outer
-# wait_for is the safety net against truly wedged stages.
-STAGE_TIMEOUT_WATERMARK = int(os.environ.get("STAGE_TIMEOUT_WATERMARK_SECONDS", "660"))   # 11 min
-STAGE_TIMEOUT_TRANSCODE = int(os.environ.get("STAGE_TIMEOUT_TRANSCODE_SECONDS", "1800"))  # 30 min across all platforms
-STAGE_TIMEOUT_THUMBNAIL = int(os.environ.get("STAGE_TIMEOUT_THUMBNAIL_SECONDS", "120"))   # 2 min
-STAGE_TIMEOUT_PUBLISH   = int(os.environ.get("STAGE_TIMEOUT_PUBLISH_SECONDS",   "900"))   # 15 min (Meta/TikTok large uploads)
+# ── Per-stage timeouts (seconds) — see stages/pipeline_stage_budgets.py ──
+STAGE_TIMEOUT_WATERMARK = int(stage_budgets.stage_timeout_watermark())
+STAGE_TIMEOUT_TRANSCODE = int(stage_budgets.stage_timeout_transcode()) or 1800
+STAGE_TIMEOUT_THUMBNAIL = int(stage_budgets.stage_timeout_thumbnail())
+STAGE_TIMEOUT_PUBLISH = int(stage_budgets.stage_timeout_publish())
+STAGE_TIMEOUT_AUDIO = int(stage_budgets.stage_timeout_audio())
+STAGE_TIMEOUT_VISION = int(stage_budgets.stage_timeout_vision())
+STAGE_TIMEOUT_VI = int(stage_budgets.stage_timeout_video_intelligence())
+STAGE_TIMEOUT_TWELVELABS = int(stage_budgets.stage_timeout_twelvelabs())
+STAGE_TIMEOUT_CAPTION = int(stage_budgets.stage_timeout_caption())
+
+from core.pipeline_env_defaults import env_bool, env_int
+
+WATERMARK_SINGLE_PASS = env_bool("WATERMARK_SINGLE_PASS", default=True)
+TWELVE_LABS_PARALLEL = env_bool("TWELVE_LABS_PARALLEL", default=True)
+WORKER_HEAVY_PIPELINE_SLOTS = max(1, env_int("WORKER_HEAVY_PIPELINE_SLOTS", default=1))
+REDIS_JOB_LEGACY_DRAIN = env_bool("REDIS_JOB_LEGACY_DRAIN", default=True)
 
 # ── Worker heartbeat ─────────────────────────────────────────────
 # Writes a liveness row every N seconds so admin can see if the worker
@@ -587,6 +606,7 @@ shutdown_event: Optional[asyncio.Event] = None
 # Keeping them separate means a 10-minute transcode CANNOT block
 # a 10-second TikTok API publish call.
 _process_semaphore: Optional[asyncio.Semaphore] = None
+_heavy_semaphore: Optional[asyncio.Semaphore] = None
 _publish_semaphore: Optional[asyncio.Semaphore] = None
 # Legacy alias — some internal helpers still reference _job_semaphore
 _job_semaphore: Optional[asyncio.Semaphore] = None
@@ -648,10 +668,10 @@ async def maybe_cancel(ctx: JobContext, stage: str):
 # Transcode Deduplication
 # ---------------------------------------------------------------------------
 
-def _platform_spec_fingerprint(platform: str) -> str:
+def _platform_spec_fingerprint(platform: str, info=None) -> str:
     from stages.transcode_stage import get_platform_spec
 
-    spec = get_platform_spec(platform)
+    spec = get_platform_spec(platform, info)
     return (
         f"{spec.get('video_codec', 'h264')}"
         f"_{spec.get('target_width', 1080)}"
@@ -659,13 +679,15 @@ def _platform_spec_fingerprint(platform: str) -> str:
         f"_{spec.get('max_fps', 30)}fps"
         f"_{spec.get('max_duration', 9999)}s"
         f"_{spec.get('sample_rate', 44100)}hz"
+        f"_{spec.get('max_bitrate_video', '12M')}"
+        f"_{spec.get('profile', 'high')}"
     )
 
 
-def _group_platforms_by_spec(platforms: List[str]) -> Dict[str, List[str]]:
+def _group_platforms_by_spec(platforms: List[str], info=None) -> Dict[str, List[str]]:
     groups: Dict[str, List[str]] = {}
     for p in platforms:
-        fp = _platform_spec_fingerprint(p)
+        fp = _platform_spec_fingerprint(p, info)
         groups.setdefault(fp, []).append(p)
     return groups
 
@@ -791,23 +813,25 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
         logger.warning(f"[{ctx.upload_id}] ffprobe failed: {e} — using standard transcode")
         return await run_transcode_stage(ctx)
 
-    groups = _group_platforms_by_spec(platforms)
+    groups = _group_platforms_by_spec(platforms, info)
     reframe_mode = getattr(ctx, "reframe_mode", "auto") or "auto"
     ctx.platform_videos = {}
-    for fingerprint, group_platforms in groups.items():
+
+    async def _transcode_one_group(group_platforms: List[str]) -> Dict[str, Path]:
         canonical = group_platforms[0]
         reframe_action = resolve_reframe_action(info, reframe_mode, canonical)
         needs_tc, reasons = needs_transcode(info, canonical, reframe_action)
+        out: Dict[str, Path] = {}
 
         if needs_tc:
-            logger.info(f"[{ctx.upload_id}] Transcode [{canonical}] shared by {group_platforms}: {', '.join(reasons)}")
+            logger.info(
+                f"[{ctx.upload_id}] Transcode [{canonical}] shared by {group_platforms}: {', '.join(reasons)}"
+            )
             output_path = ctx.temp_dir / f"transcoded_{canonical}.mp4"
             try:
                 tiktok_cover_off = None
                 if canonical == "tiktok":
-                    from stages.tiktok_cover_burn import (
-                        resolve_tiktok_cover_offset_sec,
-                    )
+                    from stages.tiktok_cover_burn import resolve_tiktok_cover_offset_sec
 
                     tiktok_cover_off = resolve_tiktok_cover_offset_sec(ctx.output_artifacts)
                 cmd = build_ffmpeg_command(
@@ -826,13 +850,17 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                 _, stderr = await proc.communicate()
 
                 if proc.returncode != 0 or not output_path.exists():
-                    logger.error(f"[{ctx.upload_id}] FFmpeg failed [{canonical}]: {stderr.decode()[-300:]}")
+                    logger.error(
+                        f"[{ctx.upload_id}] FFmpeg failed [{canonical}]: {stderr.decode()[-300:]}"
+                    )
                     for p in group_platforms:
-                        ctx.platform_videos[p] = source_video
-                    continue
+                        out[p] = source_video
+                    return out
 
                 sz_mb = output_path.stat().st_size / 1024 / 1024
-                logger.info(f"[{ctx.upload_id}] Transcode done [{canonical}]: {sz_mb:.1f}MB → {group_platforms}")
+                logger.info(
+                    f"[{ctx.upload_id}] Transcode done [{canonical}]: {sz_mb:.1f}MB → {group_platforms}"
+                )
                 if canonical == "tiktok" and tiktok_cover_off is not None:
                     from stages.tiktok_cover_burn import store_tiktok_transcode_keyframe_artifacts
 
@@ -843,16 +871,33 @@ async def _run_deduplicated_transcode(ctx: JobContext) -> JobContext:
                         duration_sec=float(info.duration or 0.0),
                     )
                 for p in group_platforms:
-                    ctx.platform_videos[p] = output_path
-
+                    out[p] = output_path
             except Exception as e:
                 logger.error(f"[{ctx.upload_id}] Transcode error [{canonical}]: {e}")
                 for p in group_platforms:
-                    ctx.platform_videos[p] = source_video
+                    out[p] = source_video
         else:
             logger.info(f"[{ctx.upload_id}] Platforms {group_platforms} already compatible")
             for p in group_platforms:
-                ctx.platform_videos[p] = source_video
+                out[p] = source_video
+        return out
+
+    group_lists = list(groups.values())
+    if len(group_lists) > 1:
+        group_results = await asyncio.gather(
+            *[_transcode_one_group(gp) for gp in group_lists],
+            return_exceptions=True,
+        )
+        for gp, gr in zip(group_lists, group_results):
+            if isinstance(gr, Exception):
+                logger.error(f"[{ctx.upload_id}] Transcode group failed: {gr}")
+                for p in gp:
+                    ctx.platform_videos[p] = source_video
+            else:
+                ctx.platform_videos.update(gr)
+    else:
+        for group_platforms in group_lists:
+            ctx.platform_videos.update(await _transcode_one_group(group_platforms))
 
     if ctx.platform_videos:
         first = ctx.platform_videos.get(platforms[0])
@@ -1050,6 +1095,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
         _merge_job_preferences(ctx, job_data)
+        init_pipeline_diag(ctx, upload_record, is_deferred=is_deferred)
+        if WATERMARK_SINGLE_PASS:
+            setattr(ctx, "watermark_single_pass", True)
         ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
@@ -1095,15 +1143,23 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             if hasattr(ctx, "caption_frames") and ctx.caption_frames > ent.max_caption_frames:
                 ctx.caption_frames = ent.max_caption_frames
 
-            # Free tier: burn-in text from admin_settings (master-editable), DB each job.
+            # Free tier: burn-in settings from admin_settings (master-editable), DB each job.
             if ent.can_watermark:
-                ctx.watermark_text = await db_stage.load_watermark_burn_text(db_pool)
+                wm_settings = await db_stage.load_watermark_settings(db_pool)
+                ctx.watermark_settings = wm_settings
+                ctx.watermark_text = wm_settings["text"]
 
             # Enforce AI depth
             if not ent.can_ai and hasattr(ctx, "use_ai"):
                 ctx.use_ai = False
 
         await db_stage.mark_processing_started(db_pool, ctx)
+        try:
+            from services.upload_funnel import emit_upload_funnel_event
+
+            emit_upload_funnel_event(str(upload_id), "worker_started", {})
+        except Exception:
+            pass
         # Record processing_started_at for staged jobs
         try:
             async with db_pool.acquire() as conn:
@@ -1137,10 +1193,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             ctx.temp_dir = Path(temp_dir.name)
 
             video_local = ctx.temp_dir / ctx.filename
-            await r2_stage.download_file(ctx.source_r2_key, video_local)
-            ctx.local_video_path = video_local
 
-            if ctx.telemetry_r2_key:
+            async def _download_video() -> None:
+                await r2_stage.download_file(ctx.source_r2_key, video_local)
+
+            async def _download_telemetry() -> None:
+                if not ctx.telemetry_r2_key:
+                    return
                 try:
                     telem_local = ctx.temp_dir / "telemetry.map"
                     await r2_stage.download_file(ctx.telemetry_r2_key, telem_local)
@@ -1157,6 +1216,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                             "telemetry_download_error": str(e)[:500],
                         },
                     )
+
+            await asyncio.gather(_download_video(), _download_telemetry())
+            ctx.local_video_path = video_local
 
             if ctx.telemetry_r2_key and ctx.local_telemetry_path:
                 _merge_telemetry_ingest_artifact(
@@ -1273,7 +1335,7 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         skip_encode_stages = resume_stage in ("post_transcode", "post_audio", "post_caption")
 
         # ============================================================
-        # STAGE 3: Watermark
+        # STAGE 3: Watermark (skipped when WATERMARK_SINGLE_PASS — burn in transcode)
         # ============================================================
         if not skip_encode_stages:
             try:
@@ -1281,16 +1343,30 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except Exception as e:
                 logger.debug(f"[{upload_id}] Trill metadata persist skipped: {e}")
 
-            try:
-                ctx = await asyncio.wait_for(run_watermark_stage(ctx), timeout=STAGE_TIMEOUT_WATERMARK)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[{upload_id}] Watermark timed out after {STAGE_TIMEOUT_WATERMARK}s — continuing without watermark"
+            if not WATERMARK_SINGLE_PASS:
+                diag_step(ctx, stage="watermark", status="started", provider="ffmpeg")
+                try:
+                    ctx = await asyncio.wait_for(run_watermark_stage(ctx), timeout=STAGE_TIMEOUT_WATERMARK)
+                    diag_step(ctx, stage="watermark", status="ok", provider="ffmpeg")
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[{upload_id}] Watermark timed out after {STAGE_TIMEOUT_WATERMARK}s — continuing without watermark"
+                    )
+                    diag_step(ctx, stage="watermark", status="failed", provider="ffmpeg", reason="timeout")
+                except SkipStage as e:
+                    logger.info(f"[{upload_id}] Watermark skipped: {e.reason}")
+                    diag_step(ctx, stage="watermark", status="skipped", provider="ffmpeg", reason=e.reason)
+                except StageError as e:
+                    logger.warning(f"[{upload_id}] Watermark error: {e.message}")
+                    diag_step(ctx, stage="watermark", status="failed", provider="ffmpeg", reason=e.message)
+            else:
+                diag_step(
+                    ctx,
+                    stage="watermark",
+                    status="skipped",
+                    provider="ffmpeg",
+                    reason="WATERMARK_SINGLE_PASS — burn in transcode",
                 )
-            except SkipStage as e:
-                logger.info(f"[{upload_id}] Watermark skipped: {e.reason}")
-            except StageError as e:
-                logger.warning(f"[{upload_id}] Watermark error: {e.message}")
             await maybe_cancel(ctx, "watermark")
 
             # ============================================================
@@ -1331,18 +1407,28 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # STAGE 6–10: Multimodal context (audio, vision, TL, VI, dashcam OSD — feeds M8/captions)
         # ============================================================
         _multimodal_strict_gaps: List[str] = []
-        if resume_stage == "post_audio":
-            ac = ctx.audio_context or {}
-            _ai_trace(ctx, upload_id, "audio", {
-                "status": "ok",
-                "resume": True,
-                "transcript_chars": len((ctx.ai_transcript or ac.get("transcript") or "").strip()),
-                "music_detected": bool(ac.get("music_detected")),
-                "yamnet_events": len(ac.get("yamnet_events") or []),
-            })
-        else:
+        _multimodal_parallel = (
+            os.environ.get("MULTIMODAL_PARALLEL", "true").lower() not in ("0", "false", "no", "off")
+        )
+
+        async def _run_audio_multimodal() -> None:
+            nonlocal ctx
+            diag_step(ctx, stage="audio", status="started", provider="openai/whisper")
+            if resume_stage == "post_audio":
+                ac = ctx.audio_context or {}
+                _ai_trace(ctx, upload_id, "audio", {
+                    "status": "ok",
+                    "resume": True,
+                    "transcript_chars": len((ctx.ai_transcript or ac.get("transcript") or "").strip()),
+                    "music_detected": bool(ac.get("music_detected")),
+                    "yamnet_events": len(ac.get("yamnet_events") or []),
+                })
+                return
             try:
-                ctx = await run_audio_context_stage(ctx)
+                ctx = await asyncio.wait_for(
+                    run_audio_context_stage(ctx),
+                    timeout=STAGE_TIMEOUT_AUDIO or None,
+                )
                 ac = ctx.audio_context or {}
                 _ai_trace(ctx, upload_id, "audio", {
                     "status": "ok",
@@ -1356,7 +1442,174 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except StageError as e:
                 logger.warning(f"[{upload_id}] Audio context error: {e.message}")
                 _ai_trace(ctx, upload_id, "audio", {"status": "error", "reason": e.message})
+
+        async def _run_vision_multimodal() -> None:
+            nonlocal ctx
+            diag_step(ctx, stage="vision", status="started", provider="google_vision")
+            try:
+                ctx = await asyncio.wait_for(
+                    run_vision_stage(ctx),
+                    timeout=STAGE_TIMEOUT_VISION or None,
+                )
+                vis = ctx.vision_context or {}
+                _ai_trace(ctx, upload_id, "vision", {
+                    "status": "ok",
+                    "labels": len(vis.get("label_names") or []) if isinstance(vis, dict) else 0,
+                    "ocr_chars": len((vis.get("ocr_text") or "").strip()) if isinstance(vis, dict) else 0,
+                    "landmarks": len(vis.get("landmark_names") or []) if isinstance(vis, dict) else 0,
+                })
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Vision skipped: {e.reason}")
+                _ai_trace(ctx, upload_id, "vision", {"status": "skipped", "reason": e.reason})
+                if (
+                    _google_multimodal_strict_enabled()
+                    and VISION_STAGE_ENABLED
+                    and _strict_multimodal_gap_reason(str(e.reason or ""))
+                ):
+                    _multimodal_strict_gaps.append(f"vision:{e.reason}")
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Vision error: {e.message}")
+                _ai_trace(ctx, upload_id, "vision", {"status": "error", "reason": e.message})
+
+        async def _run_vi_multimodal() -> None:
+            nonlocal ctx
+            _ensure_worker_semaphores()
+            try:
+                async with _heavy_semaphore:
+                    ctx = await asyncio.wait_for(
+                        run_video_intelligence_stage(ctx),
+                        timeout=STAGE_TIMEOUT_VI or None,
+                    )
+                vi = getattr(ctx, "video_intelligence", None) or {}
+                vic = getattr(ctx, "video_intelligence_context", None) or {}
+                verr = ""
+                if isinstance(vic, dict):
+                    verr = str(vic.get("error") or "").strip()
+                    if not verr:
+                        verr = str(vic.get("parse_error") or "").strip()
+                if not verr and isinstance(vi, dict):
+                    verr = str(vi.get("error") or "").strip()
+                vi_trace_status = "failed" if verr else "ok"
+                _ai_trace(ctx, upload_id, "video_intelligence", {
+                    "status": vi_trace_status,
+                    "objects": len(vi.get("object_tracks") or []) if isinstance(vi, dict) else 0,
+                    "logos": len(vi.get("logos") or []) if isinstance(vi, dict) else 0,
+                    "text": len(vi.get("on_screen_text") or []) if isinstance(vi, dict) else 0,
+                    "error": verr[:500] if verr else None,
+                })
+                if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                    try:
+                        ctx.output_artifacts["video_intelligence_status"] = json.dumps(
+                            {
+                                "status": vi_trace_status,
+                                "error": verr[:2000] if verr else None,
+                            },
+                            default=str,
+                        )[:4000]
+                    except Exception:
+                        pass
+                await _persist_diag_artifacts_now("video_intelligence_status")
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Video intelligence skipped: {e.reason}")
+                _ai_trace(ctx, upload_id, "video_intelligence", {"status": "skipped", "reason": e.reason})
+                if (
+                    _google_multimodal_strict_enabled()
+                    and VIDEO_INTELLIGENCE_STAGE_ENABLED
+                    and _strict_multimodal_gap_reason(str(e.reason or ""))
+                ):
+                    _multimodal_strict_gaps.append(f"video_intelligence:{e.reason}")
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Video intelligence error: {e.message}")
+                _ai_trace(ctx, upload_id, "video_intelligence", {"status": "error", "reason": e.message})
+
+            if _google_multimodal_strict_enabled() and VIDEO_INTELLIGENCE_STAGE_ENABLED:
+                vic = getattr(ctx, "video_intelligence_context", None) or {}
+                if isinstance(vic, dict):
+                    verr2 = str(vic.get("error") or "").strip()
+                    if not verr2:
+                        verr2 = str(vic.get("parse_error") or "").strip()
+                    if verr2:
+                        vl = verr2.lower()
+                        gap_on_any_error = (
+                            (os.environ.get("VIDEO_INTELLIGENCE_GAP_ON_ANY_ERROR") or "")
+                            .strip()
+                            .lower()
+                            in ("1", "true", "yes", "on")
+                        )
+                        hard_gap = (
+                            gap_on_any_error
+                            or "403" in vl
+                            or "401" in vl
+                            or "permission denied" in vl
+                            or ("permission" in vl and "denied" in vl)
+                            or "disabled" in vl
+                            or "not been used" in vl
+                            or "has not been enabled" in vl
+                            or "not enabled" in vl
+                            or "billing" in vl
+                            or "quota" in vl
+                            or "invalid credential" in vl
+                            or "unauthenticated" in vl
+                            or ("api" in vl and "not" in vl and "enable" in vl)
+                        )
+                        if hard_gap:
+                            _multimodal_strict_gaps.append(f"video_intelligence:{verr2[:400]}")
+
+            try:
+                from services.recognition_engine import persist_recognition
+
+                vi_payload = getattr(ctx, "video_intelligence", None) or {}
+                if vi_payload and not vi_payload.get("error"):
+                    summary = await persist_recognition(
+                        db_pool,
+                        upload_id=str(ctx.upload_id),
+                        user_id=str(ctx.user_id),
+                        vi_payload=vi_payload,
+                    )
+                    if summary:
+                        setattr(ctx, "recognition_summary", summary)
+            except Exception as rec_e:
+                logger.warning(f"[{upload_id}] recognition persist non-fatal: {rec_e}")
+
+        async def _run_twelvelabs_multimodal() -> None:
+            nonlocal ctx
+            diag_step(ctx, stage="twelvelabs", status="started", provider="twelve_labs")
+            try:
+                ctx = await asyncio.wait_for(
+                    run_twelvelabs_stage(ctx),
+                    timeout=STAGE_TIMEOUT_TWELVELABS or None,
+                )
+                vu = ctx.video_understanding or {}
+                diag_step(ctx, stage="twelvelabs", status="ok", provider="twelve_labs")
+                _ai_trace(ctx, upload_id, "twelvelabs", {
+                    "status": "ok",
+                    "scene_chars": len((vu.get("scene_description") or "").strip()) if isinstance(vu, dict) else 0,
+                    "title_suggestion": (vu.get("title_suggestion") or "") if isinstance(vu, dict) else "",
+                })
+            except asyncio.TimeoutError:
+                logger.warning(f"[{upload_id}] Twelve Labs timed out after {STAGE_TIMEOUT_TWELVELABS}s")
+                diag_step(ctx, stage="twelvelabs", status="failed", provider="twelve_labs", reason="timeout")
+                _ai_trace(ctx, upload_id, "twelvelabs", {"status": "error", "reason": "timeout"})
+            except SkipStage as e:
+                logger.info(f"[{upload_id}] Twelve Labs skipped: {e.reason}")
+                diag_step(ctx, stage="twelvelabs", status="skipped", provider="twelve_labs", reason=e.reason)
+                _ai_trace(ctx, upload_id, "twelvelabs", {"status": "skipped", "reason": e.reason})
+            except StageError as e:
+                logger.warning(f"[{upload_id}] Twelve Labs error: {e.message}")
+                diag_step(ctx, stage="twelvelabs", status="failed", provider="twelve_labs", reason=e.message)
+                _ai_trace(ctx, upload_id, "twelvelabs", {"status": "error", "reason": e.message})
+
+        _mm_tasks = [_run_audio_multimodal(), _run_vision_multimodal(), _run_vi_multimodal()]
+        if _multimodal_parallel and TWELVE_LABS_PARALLEL and resume_stage != "post_audio":
+            _mm_tasks.append(_run_twelvelabs_multimodal())
+        if _multimodal_parallel:
+            await asyncio.gather(*_mm_tasks)
+        else:
+            for _t in _mm_tasks:
+                await _t
+
         await maybe_cancel(ctx, "audio")
+        await maybe_cancel(ctx, "vision")
 
         if resume_stage in (None, "post_telemetry", "post_transcode"):
             try:
@@ -1364,141 +1617,19 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             except Exception as _cp3:
                 logger.debug(f"[{upload_id}] post_audio checkpoint skipped: {_cp3}")
 
-        try:
-            ctx = await run_vision_stage(ctx)
-            vis = ctx.vision_context or {}
-            _ai_trace(ctx, upload_id, "vision", {
-                "status": "ok",
-                "labels": len(vis.get("label_names") or []) if isinstance(vis, dict) else 0,
-                "ocr_chars": len((vis.get("ocr_text") or "").strip()) if isinstance(vis, dict) else 0,
-                "landmarks": len(vis.get("landmark_names") or []) if isinstance(vis, dict) else 0,
-            })
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Vision skipped: {e.reason}")
-            _ai_trace(ctx, upload_id, "vision", {"status": "skipped", "reason": e.reason})
-            if (
-                _google_multimodal_strict_enabled()
-                and VISION_STAGE_ENABLED
-                and _strict_multimodal_gap_reason(str(e.reason or ""))
-            ):
-                _multimodal_strict_gaps.append(f"vision:{e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Vision error: {e.message}")
-            _ai_trace(ctx, upload_id, "vision", {"status": "error", "reason": e.message})
-        await maybe_cancel(ctx, "vision")
-
-        try:
-            ctx = await run_twelvelabs_stage(ctx)
-            vu = ctx.video_understanding or {}
-            _ai_trace(ctx, upload_id, "twelvelabs", {
-                "status": "ok",
-                "scene_chars": len((vu.get("scene_description") or "").strip()) if isinstance(vu, dict) else 0,
-                "title_suggestion": (vu.get("title_suggestion") or "") if isinstance(vu, dict) else "",
-            })
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Twelve Labs skipped: {e.reason}")
-            _ai_trace(ctx, upload_id, "twelvelabs", {"status": "skipped", "reason": e.reason})
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Twelve Labs error: {e.message}")
-            _ai_trace(ctx, upload_id, "twelvelabs", {"status": "error", "reason": e.message})
-        await maybe_cancel(ctx, "twelvelabs")
-
-        try:
-            ctx = await run_video_intelligence_stage(ctx)
-            vi = getattr(ctx, "video_intelligence", None) or {}
-            vic = getattr(ctx, "video_intelligence_context", None) or {}
-            verr = ""
-            if isinstance(vic, dict):
-                verr = str(vic.get("error") or "").strip()
-                if not verr:
-                    verr = str(vic.get("parse_error") or "").strip()
-            if not verr and isinstance(vi, dict):
-                verr = str(vi.get("error") or "").strip()
-            vi_trace_status = "failed" if verr else "ok"
-            _ai_trace(ctx, upload_id, "video_intelligence", {
-                "status": vi_trace_status,
-                "objects": len(vi.get("object_tracks") or []) if isinstance(vi, dict) else 0,
-                "logos": len(vi.get("logos") or []) if isinstance(vi, dict) else 0,
-                "text": len(vi.get("on_screen_text") or []) if isinstance(vi, dict) else 0,
-                "error": verr[:500] if verr else None,
-            })
-            if isinstance(getattr(ctx, "output_artifacts", None), dict):
-                try:
-                    ctx.output_artifacts["video_intelligence_status"] = json.dumps(
-                        {
-                            "status": vi_trace_status,
-                            "error": verr[:2000] if verr else None,
-                        },
-                        default=str,
-                    )[:4000]
-                except Exception:
-                    pass
-            await _persist_diag_artifacts_now("video_intelligence_status")
-        except SkipStage as e:
-            logger.info(f"[{upload_id}] Video intelligence skipped: {e.reason}")
-            _ai_trace(ctx, upload_id, "video_intelligence", {"status": "skipped", "reason": e.reason})
-            if (
-                _google_multimodal_strict_enabled()
-                and VIDEO_INTELLIGENCE_STAGE_ENABLED
-                and _strict_multimodal_gap_reason(str(e.reason or ""))
-            ):
-                _multimodal_strict_gaps.append(f"video_intelligence:{e.reason}")
-        except StageError as e:
-            logger.warning(f"[{upload_id}] Video intelligence error: {e.message}")
-            _ai_trace(ctx, upload_id, "video_intelligence", {"status": "error", "reason": e.message})
-
-        if (
-            _google_multimodal_strict_enabled()
-            and VIDEO_INTELLIGENCE_STAGE_ENABLED
-        ):
-            vic = getattr(ctx, "video_intelligence_context", None) or {}
-            if isinstance(vic, dict):
-                verr2 = str(vic.get("error") or "").strip()
-                if not verr2:
-                    verr2 = str(vic.get("parse_error") or "").strip()
-                if verr2:
-                    vl = verr2.lower()
-                    gap_on_any_error = (
-                        (os.environ.get("VIDEO_INTELLIGENCE_GAP_ON_ANY_ERROR") or "")
-                        .strip()
-                        .lower()
-                        in ("1", "true", "yes", "on")
-                    )
-                    hard_gap = (
-                        gap_on_any_error
-                        or "403" in vl
-                        or "401" in vl
-                        or "permission denied" in vl
-                        or ("permission" in vl and "denied" in vl)
-                        or "disabled" in vl
-                        or "not been used" in vl
-                        or "has not been enabled" in vl
-                        or "not enabled" in vl
-                        or "billing" in vl
-                        or "quota" in vl
-                        or "invalid credential" in vl
-                        or "unauthenticated" in vl
-                        or ("api" in vl and "not" in vl and "enable" in vl)
-                    )
-                    if hard_gap:
-                        _multimodal_strict_gaps.append(f"video_intelligence:{verr2[:400]}")
-
-        try:
-            from services.recognition_engine import persist_recognition
-            vi_payload = getattr(ctx, "video_intelligence", None) or {}
-            if vi_payload and not vi_payload.get("error"):
-                summary = await persist_recognition(
-                    db_pool,
-                    upload_id=str(ctx.upload_id),
-                    user_id=str(ctx.user_id),
-                    vi_payload=vi_payload,
-                )
-                if summary:
-                    setattr(ctx, "recognition_summary", summary)
-        except Exception as rec_e:
-            logger.warning(f"[{upload_id}] recognition persist non-fatal: {rec_e}")
-
         await maybe_cancel(ctx, "video_intelligence")
+
+        if not (_multimodal_parallel and TWELVE_LABS_PARALLEL and resume_stage != "post_audio"):
+            await _run_twelvelabs_multimodal()
+        await maybe_cancel(ctx, "twelvelabs")
+        try:
+            await db_stage.save_pipeline_manifest(
+                db_pool,
+                str(upload_id),
+                finalize_pipeline_diag(ctx, terminal_status="processing"),
+            )
+        except Exception:
+            pass
 
         _log_multimodal_pipeline_survey(upload_id, ctx)
 
@@ -1892,8 +2023,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # ============================================================
         # STAGE 12: Caption + deterministic signal hashtags (geo / vision / ACR)
         # ============================================================
+        diag_step(ctx, stage="caption", status="started", provider="m8/openai")
         try:
-            ctx = await run_caption_stage(ctx, db_pool)
+            ctx = await asyncio.wait_for(
+                run_caption_stage(ctx, db_pool),
+                timeout=STAGE_TIMEOUT_CAPTION or None,
+            )
+            diag_step(ctx, stage="caption", status="ok", provider="m8/openai")
             _ai_trace(ctx, upload_id, "caption", {
                 "status": "ok",
                 "ai_title": str(ctx.ai_title or ""),
@@ -1901,11 +2037,17 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 "ai_hashtag_count": len(ctx.ai_hashtags or []),
                 "m8_platforms": list((ctx.m8_platform_captions or {}).keys()),
             })
+        except asyncio.TimeoutError:
+            logger.warning(f"[{upload_id}] Caption timed out after {STAGE_TIMEOUT_CAPTION}s")
+            diag_step(ctx, stage="caption", status="failed", provider="m8/openai", reason="timeout")
+            _ai_trace(ctx, upload_id, "caption", {"status": "error", "reason": "timeout"})
         except SkipStage as e:
             logger.info(f"[{upload_id}] Caption skipped: {e.reason}")
+            diag_step(ctx, stage="caption", status="skipped", provider="m8/openai", reason=e.reason)
             _ai_trace(ctx, upload_id, "caption", {"status": "skipped", "reason": e.reason})
         except StageError as e:
             logger.warning(f"[{upload_id}] Caption error: {e.message}")
+            diag_step(ctx, stage="caption", status="failed", provider="m8/openai", reason=e.message)
             _ai_trace(ctx, upload_id, "caption", {"status": "error", "reason": e.message})
 
         # Signal hashtags and hydration always run after caption — even when the
@@ -1953,9 +2095,27 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         # the LLM/ranker ignored hydration evidence. Per user policy, the post
         # still ships — these are alerts, not blockers.
         try:
-            await _check_evidence_usage_and_alert(ctx, upload_id, db_pool)
+            hints = await _check_evidence_usage_and_alert(ctx, upload_id, db_pool)
+            if hints and isinstance(getattr(ctx, "output_artifacts", None), dict):
+                import json as _json
+
+                ctx.output_artifacts["coach_hints"] = _json.dumps(hints, default=str)[:8000]
         except Exception as _eu_e:
             logger.debug(f"[{upload_id}] evidence-usage probe failed: {_eu_e}")
+
+        try:
+            from services.content_success_model import score_upload_context
+
+            hot_score, hot_model, hot_band = score_upload_context(ctx)
+            if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                import json as _json2
+
+                ctx.output_artifacts["content_hotness"] = _json2.dumps(
+                    {"score": round(hot_score, 4), "model": hot_model, "band": hot_band},
+                    default=str,
+                )[:2000]
+        except Exception as _hot_e:
+            logger.debug(f"[{upload_id}] content hotness score skipped: {_hot_e}")
 
         await maybe_cancel(ctx, "caption")
 
@@ -2133,6 +2293,12 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 )
             except Exception as _cce:
                 logger.warning(f"[{upload_id}] cancel comms error: {_cce}")
+            try:
+                from services.upload_funnel import emit_funnel_terminal_if_needed
+
+                emit_funnel_terminal_if_needed(str(upload_id), ctx)
+            except Exception:
+                pass
         return False
     except Exception as e:
         logger.exception(f"[{upload_id}] Processing failed: {e}")
@@ -2170,6 +2336,17 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                 await emit_ai_pipeline_summary(ctx, uid, logger, db_pool)
             except Exception:
                 logger.debug("[%s] ai-pipeline-summary emission failed", uid, exc_info=True)
+            try:
+                term = str(getattr(ctx, "state", None) or "processing")
+                await persist_pipeline_manifest(db_pool, uid, ctx, term)
+            except Exception:
+                logger.debug("[%s] pipeline_manifest finalize failed", uid, exc_info=True)
+            try:
+                from services.upload_funnel import emit_funnel_terminal_if_needed
+
+                emit_funnel_terminal_if_needed(uid, ctx)
+            except Exception:
+                logger.debug("[%s] funnel terminal emit failed", uid, exc_info=True)
         if temp_dir:
             try:
                 temp_dir.cleanup()
@@ -2193,7 +2370,7 @@ def _contains_any_token(haystack: str, needles: List[str]) -> List[str]:
     return hits
 
 
-async def _check_evidence_usage_and_alert(ctx: JobContext, upload_id: str, db_pool_) -> None:
+async def _check_evidence_usage_and_alert(ctx: JobContext, upload_id: str, db_pool_) -> List[Dict[str, str]]:
     """Fire ops_incidents for resolved-but-unused PAD-US/gazetteer/speed evidence.
 
     Two incident types (both loud-log + admin Discord/email; post still ships):
@@ -2201,13 +2378,16 @@ async def _check_evidence_usage_and_alert(ctx: JobContext, upload_id: str, db_po
         title/caption/hashtags do not mention any of them.
       - ``evidence_unused``       — telemetry/OSD speed >= 25 mph OR osd
         coverage >= 30% but no MPH/geo/Trill token in final outputs.
+
+    Returns user-facing coach hints for growth_intelligence / queue UI.
     """
+    hints: List[Dict[str, str]] = []
     if not db_pool_:
-        return
+        return hints
     try:
         from services.ops_incidents import record_operational_incident
     except Exception:
-        return
+        return hints
 
     ai_title = (ctx.ai_title or "").strip()
     ai_caption = (ctx.ai_caption or "").strip()
@@ -2265,6 +2445,13 @@ async def _check_evidence_usage_and_alert(ctx: JobContext, upload_id: str, db_po
                     "[%s] geo_signals_unused fired: tokens=%s near_protected=%s",
                     upload_id, geo_tokens, near_protected,
                 )
+                hints.append({
+                    "id": "geo_signals_unused",
+                    "message": (
+                        "Your Trill geo signals were not reflected in the caption. "
+                        "Try scenic boost or regenerate captions."
+                    ),
+                })
             except Exception as e:
                 logger.debug(f"[{upload_id}] geo_signals_unused record failed: {e}")
 
@@ -2334,19 +2521,36 @@ async def _check_evidence_usage_and_alert(ctx: JobContext, upload_id: str, db_po
                     "[%s] evidence_unused fired: speed_tel=%.1f speed_osd=%.1f coverage=%.2f geo=%s trill=%r",
                     upload_id, max_mph_tel, max_mph_osd, coverage_pct, geo_tokens, trill_bucket,
                 )
+                hints.append({
+                    "id": "evidence_unused",
+                    "message": (
+                        "Speed or telemetry evidence was available but not used in your title/caption. "
+                        "Regenerate with Trill-focused settings for a stronger automotive hook."
+                    ),
+                })
             except Exception as e:
                 logger.debug(f"[{upload_id}] evidence_unused record failed: {e}")
+
+    return hints
 
 
 async def run_publish_and_notify(
     ctx: JobContext,
     upload_id: str,
     user_id: str,
+    *,
+    upload_record: Optional[dict] = None,
+    publish_targets: Optional[list] = None,
 ) -> bool:
     """
     Run publish + notify stages and finalize upload status.
     Called by both the immediate pipeline and the deferred publish path.
+
+    For smart deferred uploads, may persist a partial batch and return early
+    while later platform slots remain (``upload_record`` + ``publish_targets``).
     """
+    from services.deferred_publish_schedule import still_has_pending_publish_slots
+
     block_reason = _publish_policy_block_reason(ctx)
     if block_reason:
         logger.error(f"[{upload_id}] Publish blocked by policy ({block_reason[:200]!r})")
@@ -2380,12 +2584,22 @@ async def run_publish_and_notify(
             )
         except Exception as ne:
             logger.warning(f"[{upload_id}] notify after policy-block (non-fatal): {ne}")
+        try:
+            from services.upload_funnel import emit_funnel_terminal_if_needed
+
+            emit_funnel_terminal_if_needed(str(upload_id), ctx)
+        except Exception:
+            pass
         return False
 
     try:
         ctx = await asyncio.wait_for(
             run_publish_stage(ctx, db_pool), timeout=STAGE_TIMEOUT_PUBLISH
         )
+        try:
+            await pipeline_checkpoint.save_post_publish_checkpoint(db_pool, ctx)
+        except Exception as _pp_cp:
+            logger.debug(f"[{upload_id}] post_publish checkpoint skipped: {_pp_cp}")
     except asyncio.TimeoutError:
         logger.error(f"[{upload_id}] Publish timed out after {STAGE_TIMEOUT_PUBLISH}s")
         ctx.mark_error("TIMEOUT", f"Publish stage exceeded {STAGE_TIMEOUT_PUBLISH}s")
@@ -2402,6 +2616,19 @@ async def run_publish_and_notify(
         except Exception:
             pass
         ctx.mark_error(e.code.value, e.message)
+
+    # Smart schedule: more platform slots remain — save batch and stay staged for publish.
+    if upload_record and still_has_pending_publish_slots(
+        upload_record,
+        ctx.platform_results,
+        publish_targets=publish_targets,
+    ):
+        await db_stage.mark_deferred_publish_batch(db_pool, ctx)
+        logger.info(
+            f"[{upload_id}] Smart deferred partial publish saved — "
+            f"waiting for remaining platform slot(s)"
+        )
+        return True
 
     try:
         await run_notify_stage(ctx, db_pool)
@@ -2458,6 +2685,11 @@ async def run_publish_and_notify(
                     :4800
                 ]
             logger.warning("[%s] METADATA_QUALITY_STRICT(degrade): %s", upload_id, mv_list[:12])
+            if isinstance(getattr(ctx, "output_artifacts", None), dict):
+                ctx.output_artifacts["publish_quality_notice"] = (
+                    "Publish shipped with degraded metadata: "
+                    + "; ".join(str(x) for x in mv_list[:6])
+                )[:2000]
     except Exception:
         pass
 
@@ -2576,6 +2808,13 @@ async def run_publish_and_notify(
     if ctx.is_success():
         await db_stage.increment_upload_count(db_pool, user_id)
 
+    try:
+        from services.upload_funnel import emit_funnel_terminal_if_needed
+
+        emit_funnel_terminal_if_needed(str(upload_id), ctx)
+    except Exception:
+        pass
+
     elapsed = (ctx.finished_at - ctx.started_at).total_seconds() if ctx.started_at else 0
     logger.info(
         f"[{upload_id}] Pipeline {ctx.state} in {elapsed:.1f}s | "
@@ -2590,10 +2829,16 @@ async def run_publish_and_notify(
 
 async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
     """
-    Called by the scheduler when a ready_to_publish job hits its scheduled_time.
-    Loads the already-processed assets from DB and runs publish + notify.
-    Does NOT re-download or re-transcode anything.
+    Called by the scheduler when a ready_to_publish job has platform slot(s) due.
+    Loads processed assets and publishes only the due platform batch (smart mode)
+    or all platforms at once (single scheduled_time mode).
     """
+    from services.deferred_publish_schedule import (
+        hydrate_platform_results_into_ctx,
+        platforms_due_for_publish,
+    )
+    from stages.publish_stage import resolve_publish_targets
+
     logger.info(f"[{upload_id}] Deferred publish firing")
     ctx = None
 
@@ -2602,6 +2847,26 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         user_record = await db_stage.load_user(db_pool, user_id)
         if not upload_record or not user_record:
             logger.error(f"[{upload_id}] Records not found for deferred publish")
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE uploads
+                    SET status = 'failed',
+                        error_code = 'INTERNAL',
+                        error_detail = 'Deferred publish could not load upload or user record.',
+                        updated_at = NOW()
+                    WHERE id = $1 AND status = 'processing'
+                    """,
+                    upload_id,
+                )
+            try:
+                await notify_admin_error(
+                    "deferred_publish_records_missing",
+                    {"upload_id": upload_id, "user_id": user_id},
+                    db_pool,
+                )
+            except Exception:
+                pass
             return False
 
         user_settings = await db_stage.load_user_settings(db_pool, user_id)
@@ -2618,9 +2883,45 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
         _merge_job_preferences(ctx, job_data)
         ctx.user_record = user_record
-        ctx.user_record = user_record
         ctx.started_at = _now_utc()
         ctx.state = "processing"
+        try:
+            setattr(ctx, "_db_pool", db_pool)
+        except Exception:
+            pass
+
+        try:
+            resume_stage, _resume_holder = await pipeline_checkpoint.try_resume_from_checkpoint(
+                db_pool, job_data, upload_record, ctx
+            )
+            if resume_stage:
+                logger.info(f"[{upload_id}] Deferred publish checkpoint resume | stage={resume_stage}")
+        except Exception as _cp_e:
+            logger.debug(f"[{upload_id}] deferred publish checkpoint probe skipped: {_cp_e}")
+
+        publish_targets = await resolve_publish_targets(ctx, db_pool)
+        now = _now_utc()
+        due_platforms = platforms_due_for_publish(upload_record, now, publish_targets)
+        if not due_platforms:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE uploads
+                    SET status = 'ready_to_publish', updated_at = NOW()
+                    WHERE id = $1 AND status = 'processing'
+                    """,
+                    upload_id,
+                )
+            logger.debug(
+                f"[{upload_id}] Deferred publish: no platform slots due this cycle"
+            )
+            return True
+
+        hydrate_platform_results_into_ctx(ctx, upload_record.get("platform_results"))
+        ctx.deferred_publish_platform_filter = set(due_platforms)
+        logger.info(
+            f"[{upload_id}] Deferred publish batch platforms={sorted(due_platforms)}"
+        )
         try:
             setattr(ctx, "_db_pool", db_pool)
         except Exception:
@@ -2744,7 +3045,13 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             ctx.output_artifacts["platform_thumbnail_r2_keys"] = json.dumps(platform_thumb_r2_keys)
 
         try:
-            result = await run_publish_and_notify(ctx, upload_id, user_id)
+            result = await run_publish_and_notify(
+                ctx,
+                upload_id,
+                user_id,
+                upload_record=upload_record,
+                publish_targets=publish_targets,
+            )
             return result
         finally:
             try:
@@ -2770,6 +3077,12 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
                 )
             except Exception as _cce:
                 logger.warning(f"[{upload_id}] deferred-publish comms error: {_cce}")
+            try:
+                from services.upload_funnel import emit_funnel_terminal_if_needed
+
+                emit_funnel_terminal_if_needed(str(upload_id), ctx)
+            except Exception:
+                pass
         return False
 
 
@@ -3207,8 +3520,11 @@ async def run_scheduler_loop() -> None:
     2. READY_TO_PUBLISH JOBS — processed, waiting for publish time:
        Finds jobs where:
          status = 'ready_to_publish'
-         AND scheduled_time <= NOW()
-       Fires deferred publish pipeline.
+       Non-smart: scheduled_time <= NOW() → publish all platforms.
+       Smart: each platform slot in schedule_metadata is published when its
+       time arrives; partial results merge into platform_results until all
+       targets are handled, then status → completed/partial/failed.
+       Fires deferred publish pipeline per due batch.
 
     Both dispatch as asyncio tasks governed by _job_semaphore.
     """
@@ -3227,6 +3543,9 @@ async def run_scheduler_loop() -> None:
             process_cutoff = now + timedelta(minutes=PROCESSING_WINDOW_MINUTES)
 
             async with db_pool.acquire() as conn:
+                from services.upload.stuck_recovery import recover_staged_without_schedule
+
+                await recover_staged_without_schedule(conn, db_pool, limit=20)
 
                 # --------------------------------------------------------
                 # CHECK 1: staged jobs entering processing window
@@ -3313,24 +3632,39 @@ async def run_scheduler_loop() -> None:
                         logger.debug(f"[{upload_id}] Processing task dispatched")
 
                 # --------------------------------------------------------
-                # CHECK 2: ready_to_publish jobs past scheduled_time
+                # CHECK 2: ready_to_publish jobs with due platform slot(s)
                 # --------------------------------------------------------
                 ready_jobs = await conn.fetch(
                     """
-                    SELECT u.id AS upload_id, u.user_id, u.scheduled_time
+                    SELECT u.id AS upload_id, u.user_id, u.scheduled_time,
+                           u.schedule_mode, u.schedule_metadata, u.platforms,
+                           u.platform_results, u.target_accounts
                     FROM uploads u
                     WHERE u.status = 'ready_to_publish'
                       AND u.scheduled_time IS NOT NULL
-                      AND u.scheduled_time <= $1
                     ORDER BY u.scheduled_time ASC
-                    LIMIT 50
+                    LIMIT 100
                     """,
-                    now,
                 )
+
+                from services.deferred_publish_schedule import platforms_due_for_publish
 
                 for row in ready_jobs:
                     upload_id = str(row["upload_id"])
                     user_id = str(row["user_id"])
+                    upload_row = dict(row)
+
+                    # Non-smart: require scheduled_time <= now. Smart: per-platform due check.
+                    mode = str(upload_row.get("schedule_mode") or "scheduled").lower()
+                    if mode != "smart":
+                        st = upload_row.get("scheduled_time")
+                        if st is None or st > now:
+                            continue
+                        due = platforms_due_for_publish(upload_row, now)
+                    else:
+                        due = platforms_due_for_publish(upload_row, now)
+                        if not due:
+                            continue
 
                     # Atomically claim
                     updated = await conn.fetchval(
@@ -3346,8 +3680,8 @@ async def run_scheduler_loop() -> None:
                         continue
 
                     logger.info(
-                        f"[{upload_id}] Scheduler: ready_to_publish → publishing NOW "
-                        f"(was scheduled for {row.get('scheduled_time')})"
+                        f"[{upload_id}] Scheduler: ready_to_publish → publishing batch "
+                        f"(platforms={sorted(due)}, schedule_mode={mode})"
                     )
 
                     asyncio.create_task(
@@ -3399,11 +3733,13 @@ async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> 
 
 def _ensure_worker_semaphores() -> None:
     """Initialize lane semaphores once (safe for publish-only or process-only workers)."""
-    global _process_semaphore, _publish_semaphore, _job_semaphore
+    global _process_semaphore, _publish_semaphore, _job_semaphore, _heavy_semaphore
     if _process_semaphore is None:
         _process_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
     if _publish_semaphore is None:
         _publish_semaphore = asyncio.Semaphore(PUBLISH_CONCURRENCY)
+    if _heavy_semaphore is None:
+        _heavy_semaphore = asyncio.Semaphore(WORKER_HEAVY_PIPELINE_SLOTS)
     _job_semaphore = _process_semaphore
 
 
@@ -3476,11 +3812,12 @@ async def enqueue_process_lane_job(payload: dict) -> bool:
         "enqueued_at": _now_utc().isoformat(),
     }
     try:
-        from core.upload_baseline_defaults import serialize_job_payload
+        from stages.redis_job_queue import enqueue_process_job
 
-        await redis_client.lpush(q, serialize_job_payload(body))
-        logger.info(f"[{payload.get('upload_id')}] Enqueued process lane → {q}")
-        return True
+        ok = await enqueue_process_job(redis_client, q, body)
+        if ok:
+            logger.info(f"[{payload.get('upload_id')}] Enqueued process lane → {q}")
+        return ok
     except Exception as e:
         logger.error(f"[{payload.get('upload_id')}] enqueue process lane failed: {e}")
         return False
@@ -3500,11 +3837,12 @@ async def enqueue_publish_lane_job(payload: dict) -> bool:
         "enqueued_at": _now_utc().isoformat(),
     }
     try:
-        from core.upload_baseline_defaults import serialize_job_payload
+        from stages.redis_job_queue import enqueue_process_job
 
-        await redis_client.lpush(q, serialize_job_payload(body))
-        logger.info(f"[{payload.get('upload_id')}] Enqueued publish lane → {q}")
-        return True
+        ok = await enqueue_process_job(redis_client, q, body)
+        if ok:
+            logger.info(f"[{payload.get('upload_id')}] Enqueued publish lane → {q}")
+        return ok
     except Exception as e:
         logger.error(f"[{payload.get('upload_id')}] enqueue publish lane failed: {e}")
         return False
@@ -3536,10 +3874,29 @@ async def publish_jobs() -> None:
     global shutdown_requested, redis_client, _publish_semaphore
 
     _ensure_worker_semaphores()
+    from stages.redis_job_queue import (
+        DEFAULT_GROUP,
+        ensure_stream_group,
+        make_worker_consumer_name,
+        stream_key_for_list,
+        use_redis_streams,
+        xack_message,
+        xreadgroup_one,
+    )
+
     queues = [PUBLISH_PRIORITY_QUEUE, PUBLISH_NORMAL_QUEUE]
+    stream_keys = [stream_key_for_list(q) for q in queues]
+    stream_consumer = make_worker_consumer_name()
+    if use_redis_streams():
+        for sk in stream_keys:
+            try:
+                await ensure_stream_group(redis_client, sk, DEFAULT_GROUP)
+            except Exception as e:
+                logger.warning("publish ensure_stream_group %s: %s", sk, e)
+
     logger.info(
         f"Publish consumer started | publish_concurrency={PUBLISH_CONCURRENCY} | "
-        f"queues={PUBLISH_PRIORITY_QUEUE}, {PUBLISH_NORMAL_QUEUE}"
+        f"queues={PUBLISH_PRIORITY_QUEUE}, {PUBLISH_NORMAL_QUEUE} | streams={use_redis_streams()}"
     )
     consecutive_redis_errors = 0
     active_tasks: List[asyncio.Task] = []
@@ -3547,12 +3904,41 @@ async def publish_jobs() -> None:
     while not shutdown_requested:
         active_tasks = [t for t in active_tasks if not t.done()]
         try:
-            job_raw = await redis_client.brpop(queues, timeout=int(POLL_INTERVAL))
+            job_json = None
+            stream_ack: Optional[Tuple[str, str]] = None
+            if use_redis_streams():
+                got = await xreadgroup_one(
+                    redis_client,
+                    stream_keys,
+                    DEFAULT_GROUP,
+                    stream_consumer,
+                    block_ms=int(POLL_INTERVAL * 1000),
+                )
+                if got:
+                    sk, mid, job_json = got
+                    stream_ack = (sk, mid)
+            if job_json is None and REDIS_JOB_LEGACY_DRAIN:
+                job_raw = await redis_client.brpop(
+                    queues,
+                    timeout=1 if use_redis_streams() else int(POLL_INTERVAL),
+                )
+                if job_raw:
+                    _, job_json = job_raw
             consecutive_redis_errors = 0
-            if not job_raw:
+            if not job_json:
                 continue
-            _, job_json = job_raw
-            task = asyncio.create_task(_publish_one_job(job_json))
+
+            async def _run_publish_and_ack(payload: str, ack: Optional[Tuple[str, str]]) -> None:
+                try:
+                    await _publish_one_job(payload)
+                finally:
+                    if ack and use_redis_streams():
+                        try:
+                            await xack_message(redis_client, ack[0], DEFAULT_GROUP, ack[1])
+                        except Exception as ack_e:
+                            logger.warning("publish xack failed: %s", ack_e)
+
+            task = asyncio.create_task(_run_publish_and_ack(job_json, stream_ack))
             active_tasks.append(task)
         except redis.ReadOnlyError:
             consecutive_redis_errors += 1
@@ -3572,6 +3958,88 @@ async def publish_jobs() -> None:
         logger.info(f"Shutdown: waiting for {len(active_tasks)} in-flight publish jobs...")
         await asyncio.gather(*active_tasks, return_exceptions=True)
     logger.info("Publish consumer stopped")
+
+
+async def run_stream_reclaim_loop() -> None:
+    """
+    Reclaim stale pending Redis Stream messages (worker crash mid-job).
+    """
+    global shutdown_requested, redis_client
+
+    from stages.redis_job_queue import (
+        DEFAULT_GROUP,
+        make_worker_consumer_name,
+        process_stream_keys_ordered,
+        stream_key_for_list,
+        use_redis_streams,
+        xack_message,
+        xautoclaim_batch,
+    )
+
+    if not use_redis_streams():
+        while not shutdown_requested:
+            await asyncio.sleep(30)
+        return
+
+    interval = int(os.environ.get("STREAM_RECLAIM_INTERVAL_SEC", "25") or 25)
+    min_idle = int(os.environ.get("STREAM_RECLAIM_MIN_IDLE_MS", "120000") or 120000)
+    count = int(os.environ.get("STREAM_RECLAIM_COUNT", "8") or 8)
+    consumer = make_worker_consumer_name() + "-reclaim"
+    publish_streams = [
+        stream_key_for_list(PUBLISH_PRIORITY_QUEUE),
+        stream_key_for_list(PUBLISH_NORMAL_QUEUE),
+    ]
+    process_streams = process_stream_keys_ordered(
+        PROCESS_PRIORITY_QUEUE,
+        PROCESS_NORMAL_QUEUE,
+        PRIORITY_JOB_QUEUE,
+        UPLOAD_JOB_QUEUE,
+    )
+    publish_set = set(publish_streams)
+
+    logger.info(
+        "Stream reclaim loop started | interval=%ss min_idle_ms=%s streams=%s",
+        interval,
+        min_idle,
+        len(process_streams) + len(publish_streams),
+    )
+
+    while not shutdown_requested:
+        try:
+            for sk in process_streams + publish_streams:
+                batch = await xautoclaim_batch(
+                    redis_client, sk, DEFAULT_GROUP, consumer, min_idle, count
+                )
+                for mid, job_json in batch:
+                    is_publish = sk in publish_set
+
+                    async def _reclaim_one(
+                        payload: str,
+                        ack_sk: str,
+                        ack_mid: str,
+                        publish_lane: bool,
+                    ) -> None:
+                        try:
+                            if publish_lane:
+                                await _publish_one_job(payload)
+                            else:
+                                await _process_one_job(payload)
+                        finally:
+                            try:
+                                await xack_message(redis_client, ack_sk, DEFAULT_GROUP, ack_mid)
+                            except Exception as ack_e:
+                                logger.warning("reclaim xack failed: %s", ack_e)
+
+                    asyncio.create_task(_reclaim_one(job_json, sk, mid, is_publish))
+            await asyncio.sleep(interval)
+        except (redis.ConnectionError, redis.TimeoutError, OSError) as e:
+            logger.warning("stream reclaim redis error: %s", e)
+            await asyncio.sleep(min(interval, 10))
+        except Exception as e:
+            logger.exception("stream reclaim loop error: %s", e)
+            await asyncio.sleep(interval)
+
+    logger.info("Stream reclaim loop stopped")
 
 
 async def run_stale_job_recovery_loop() -> None:
@@ -3788,6 +4256,37 @@ async def run_stale_job_recovery_loop() -> None:
                                 )
                             except Exception:
                                 pass
+
+                from services.upload.stuck_recovery import (
+                    recover_auto_retry_failed_immediate,
+                    recover_enqueue_failed_pending,
+                    recover_stuck_staged_past_window,
+                )
+
+                async with db_pool.acquire() as conn:
+                    n_enqueue = await recover_enqueue_failed_pending(
+                        conn,
+                        build_payload=_build_process_job_payload,
+                        enqueue=enqueue_process_lane_job,
+                    )
+                    if n_enqueue:
+                        logger.warning("stale recovery: re-enqueued %s ENQUEUE_FAILED pending uploads", n_enqueue)
+
+                    n_auto = await recover_auto_retry_failed_immediate(
+                        conn,
+                        build_payload=_build_process_job_payload,
+                        enqueue=enqueue_process_lane_job,
+                    )
+                    if n_auto:
+                        logger.warning("stale recovery: auto-retried %s failed immediate uploads", n_auto)
+
+                    n_staged = await recover_stuck_staged_past_window(
+                        conn,
+                        build_payload=_build_process_job_payload,
+                        enqueue=enqueue_process_lane_job,
+                    )
+                    if n_staged:
+                        logger.warning("stale recovery: re-dispatched %s overdue staged uploads", n_staged)
         except Exception as e:
             logger.warning(f"Stale job recovery cycle error: {e}")
 
@@ -3818,11 +4317,27 @@ async def _process_one_job(job_json: str) -> None:
     if not isinstance(job_data, dict):
         logger.error(f"Invalid job payload type: {type(job_data).__name__}")
         return
-    async with _process_semaphore:
-        try:
-            await run_processing_pipeline(job_data)
-        except Exception as e:
-            logger.exception(f"Unhandled pipeline exception: {e}")
+    uid = str(job_data.get("user_id") or "")
+    pc = str(job_data.get("priority_class") or "p4")
+    from stages.redis_job_queue import user_process_try_acquire, user_process_release
+
+    if uid and not await user_process_try_acquire(redis_client, uid, pc):
+        logger.info(
+            "[%s] user process slot cap reached — deferring job",
+            job_data.get("upload_id"),
+        )
+        await asyncio.sleep(2.0)
+        await enqueue_process_lane_job(job_data)
+        return
+    try:
+        async with _process_semaphore:
+            try:
+                await run_processing_pipeline(job_data)
+            except Exception as e:
+                logger.exception(f"Unhandled pipeline exception: {e}")
+    finally:
+        if uid:
+            await user_process_release(redis_client, uid)
 
 
 async def process_jobs() -> None:
@@ -3847,24 +4362,76 @@ async def process_jobs() -> None:
         f"Job consumer started | "        f"process_concurrency={WORKER_CONCURRENCY} | "        f"publish_concurrency={PUBLISH_CONCURRENCY} | "        f"process_queues={PROCESS_PRIORITY_QUEUE}, {PROCESS_NORMAL_QUEUE}"
     )
 
+    from stages.redis_job_queue import (
+        DEFAULT_GROUP,
+        ensure_stream_group,
+        legacy_process_list_keys,
+        make_worker_consumer_name,
+        process_stream_keys_ordered,
+        use_redis_streams,
+        xack_message,
+        xreadgroup_one,
+    )
+
     consecutive_redis_errors = 0
     active_tasks: List[asyncio.Task] = []
+    stream_keys = process_stream_keys_ordered(
+        PROCESS_PRIORITY_QUEUE,
+        PROCESS_NORMAL_QUEUE,
+        PRIORITY_JOB_QUEUE,
+        UPLOAD_JOB_QUEUE,
+    )
+    stream_consumer = make_worker_consumer_name()
+    if use_redis_streams():
+        for sk in stream_keys:
+            try:
+                await ensure_stream_group(redis_client, sk, DEFAULT_GROUP)
+            except Exception as e:
+                logger.warning("ensure_stream_group %s: %s", sk, e)
 
     while not shutdown_requested:
         active_tasks = [t for t in active_tasks if not t.done()]
 
         try:
-            job_raw = await redis_client.brpop(
-                all_process_queues,
-                timeout=int(POLL_INTERVAL),
-            )
+            job_json = None
+            stream_ack: Optional[Tuple[str, str]] = None
+
+            if use_redis_streams():
+                got = await xreadgroup_one(
+                    redis_client,
+                    stream_keys,
+                    DEFAULT_GROUP,
+                    stream_consumer,
+                    block_ms=int(POLL_INTERVAL * 1000),
+                )
+                if got:
+                    sk, mid, job_json = got
+                    stream_ack = (sk, mid)
+
+            if job_json is None and REDIS_JOB_LEGACY_DRAIN:
+                job_raw = await redis_client.brpop(
+                    all_process_queues,
+                    timeout=1 if use_redis_streams() else int(POLL_INTERVAL),
+                )
+                if job_raw:
+                    _, job_json = job_raw
+
             consecutive_redis_errors = 0
 
-            if not job_raw:
+            if not job_json:
                 continue
 
-            _, job_json = job_raw
-            task = asyncio.create_task(_process_one_job(job_json))
+            async def _run_and_ack(payload: str, ack: Optional[Tuple[str, str]]) -> None:
+                try:
+                    await _process_one_job(payload)
+                finally:
+                    if ack and use_redis_streams():
+                        try:
+                            await xack_message(redis_client, ack[0], DEFAULT_GROUP, ack[1])
+                        except Exception as ack_e:
+                            logger.warning("xack failed: %s", ack_e)
+
+            task = asyncio.create_task(_run_and_ack(job_json, stream_ack))
             active_tasks.append(task)
 
         except redis.ReadOnlyError:
@@ -4037,6 +4604,24 @@ async def main() -> None:
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=db_min, max_size=db_max)
     logger.info(f"Database connected | pool={db_min}-{db_max}")
 
+    try:
+        from services.upload_funnel import set_funnel_db_pool
+
+        set_funnel_db_pool(db_pool)
+    except Exception:
+        pass
+
+    try:
+        from services.ml_model_sync import sync_ml_models_from_hub
+        from services.promo_targeting_model import reload_model as reload_promo_model
+        from services.content_success_model import reload_model as reload_content_model
+
+        sync_ml_models_from_hub()
+        reload_promo_model()
+        reload_content_model()
+    except Exception:
+        pass
+
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     await redis_client.ping()
     logger.info("Redis connected")
@@ -4058,6 +4643,10 @@ async def main() -> None:
     if ASYNC_PUBLISH_QUEUE or lane == "publish":
         background_loops.append(("publish_jobs", publish_jobs))
     background_loops.append(("scheduler_loop", run_scheduler_loop))
+    from stages.redis_job_queue import use_redis_streams
+
+    if use_redis_streams():
+        background_loops.append(("stream_reclaim", run_stream_reclaim_loop))
     if STALE_JOB_RECOVERY_ENABLED:
         background_loops.append(("stale_recovery", run_stale_job_recovery_loop))
     background_loops.extend(

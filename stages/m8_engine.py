@@ -779,6 +779,7 @@ def _build_m8_prompt(
     *,
     include_evidence_matrix: bool = False,
     caption_voice_ui: str = "default",
+    extra_strategy_block: str = "",
 ) -> str:
     fusion = ""
     try:
@@ -1054,7 +1055,7 @@ EFFECTIVE STRATEGY (policy/ML context — per-platform nuance only, NOT a licens
 {cluster_block}
 {pattern_block}
 {visual_memory_block}
-{strategy_priors_block}
+{strategy_priors_block}{extra_strategy_block}
 PLATFORM RULES:
 {chr(10).join(plat_blocks)}
 {matrix_section}
@@ -2355,6 +2356,16 @@ async def run_m8_caption_engine(
             logger.debug("M8 historical signals skipped: %s", e)
 
     include_mat = m8_evidence_matrix_enabled(ctx.user_settings or {})
+    extra_strategy_block = ""
+    if db_pool and ctx.user_id:
+        try:
+            from stages.m8_strategy_context import build_m8_strategy_context
+
+            extra_strategy_block = await build_m8_strategy_context(
+                db_pool, str(ctx.user_id), ctx
+            )
+        except Exception as e:
+            logger.debug("M8 extra strategy context skipped: %s", e)
     prompt = _build_m8_prompt(
         ctx,
         scene,
@@ -2370,6 +2381,7 @@ async def run_m8_caption_engine(
         strategy=strategy,
         include_evidence_matrix=include_mat,
         caption_voice_ui=str(caption_voice or "default").lower(),
+        extra_strategy_block=extra_strategy_block,
     )
     _trace_m8(ctx, str(ctx.upload_id), "prompt", {
         "model": model,

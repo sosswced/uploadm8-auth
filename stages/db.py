@@ -16,6 +16,7 @@ import asyncpg
 
 from core.helpers import (
     _safe_col,
+    _safe_json,
     coerce_jsonb_dict,
     coerce_jsonb_list,
     coerce_processed_assets_map,
@@ -381,6 +382,34 @@ async def load_user_entitlement_overrides(pool: asyncpg.Pool, user_id: str) -> O
 # Status Updates (used by worker.py)
 # ============================================================
 
+def _platform_results_json(ctx: JobContext) -> Optional[str]:
+    if not ctx.platform_results:
+        return None
+    return json.dumps(
+        [
+            {
+                "platform": r.platform,
+                "success": r.success,
+                "token_row_id": getattr(r, "token_row_id", None),
+                "account_id": getattr(r, "account_id", None),
+                "account_name": getattr(r, "account_name", None),
+                "account_username": getattr(r, "account_username", None),
+                "account_avatar": getattr(r, "account_avatar", None),
+                "platform_video_id": r.platform_video_id,
+                "platform_url": r.platform_url,
+                "publish_id": r.publish_id,
+                "error_code": r.error_code,
+                "error_message": r.error_message,
+                "verify_status": r.verify_status,
+                "http_status": r.http_status,
+                "views": r.views,
+                "likes": r.likes,
+            }
+            for r in ctx.platform_results
+        ]
+    )
+
+
 async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
     """Mark upload as processing."""
     async with pool.acquire() as conn:
@@ -399,31 +428,7 @@ async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
 
 async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
     """Mark upload as completed."""
-    platform_results_json = None
-    if ctx.platform_results:
-        platform_results_json = json.dumps(
-            [
-                {
-                    "platform": r.platform,
-                    "success": r.success,
-                    "token_row_id": getattr(r, "token_row_id", None),
-                    "account_id": getattr(r, "account_id", None),
-                    "account_name": getattr(r, "account_name", None),
-                    "account_username": getattr(r, "account_username", None),
-                    "account_avatar": getattr(r, "account_avatar", None),
-                    "platform_video_id": r.platform_video_id,
-                    "platform_url": r.platform_url,
-                    "publish_id": r.publish_id,
-                    "error_code": r.error_code,
-                    "error_message": r.error_message,
-                    "verify_status": r.verify_status,
-                    "http_status": r.http_status,
-                    "views": r.views,
-                    "likes": r.likes,
-                }
-                for r in ctx.platform_results
-            ]
-        )
+    platform_results_json = _platform_results_json(ctx)
 
     async with pool.acquire() as conn:
         await conn.execute(
@@ -451,11 +456,66 @@ async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
         )
 
 
+async def mark_deferred_publish_batch(pool: asyncpg.Pool, ctx: JobContext) -> None:
+    """
+    Persist partial smart-schedule publish results and return upload to
+    ready_to_publish until every platform slot has been attempted.
+    """
+    platform_results_json = _platform_results_json(ctx)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE uploads
+            SET status = 'ready_to_publish',
+                platform_results = COALESCE($2::jsonb, platform_results),
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            ctx.upload_id,
+            platform_results_json,
+        )
+
+
 async def mark_processing_failed(
     pool: asyncpg.Pool, ctx: JobContext, error_code: str, error_detail: str
 ):
-    """Mark upload as failed with error info."""
+    """Mark upload as failed with error info and ``output_artifacts.failure_phase``."""
+    failure_phase = None
+    try:
+        stage = str(getattr(ctx, "current_stage", None) or getattr(ctx, "processing_stage", None) or "").strip()
+        if not stage and isinstance(getattr(ctx, "output_artifacts", None), dict):
+            stage = str(ctx.output_artifacts.get("last_processing_stage") or "").strip()
+        if stage:
+            failure_phase = stage
+    except Exception:
+        failure_phase = None
+
     async with pool.acquire() as conn:
+        if failure_phase:
+            row = await conn.fetchrow(
+                "SELECT output_artifacts FROM uploads WHERE id = $1",
+                ctx.upload_id,
+            )
+            arts = _safe_json(row.get("output_artifacts") if row else None, {}) or {}
+            if isinstance(arts, dict):
+                arts["failure_phase"] = failure_phase
+                await conn.execute(
+                    """
+                    UPDATE uploads
+                    SET status = 'failed',
+                        error_code = $2,
+                        error_detail = $3,
+                        output_artifacts = $4::jsonb,
+                        processing_finished_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    ctx.upload_id,
+                    error_code,
+                    error_detail,
+                    json.dumps(arts, default=str),
+                )
+                return
         await conn.execute(
             """
             UPDATE uploads
@@ -506,6 +566,26 @@ async def check_cancel_requested(pool: asyncpg.Pool, upload_id: str) -> bool:
         return False
 
 
+async def save_pipeline_manifest(pool: asyncpg.Pool, upload_id: str, manifest: dict) -> None:
+    """Persist structured pipeline diagnostics for queue UI / support."""
+    if not manifest:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET pipeline_manifest = $2::jsonb,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                upload_id,
+                json.dumps(manifest, default=str),
+            )
+    except Exception as e:
+        logger.debug("save_pipeline_manifest failed for %s: %s", upload_id, e)
+
+
 async def update_stage_progress(pool: asyncpg.Pool, upload_id: str, stage: str, progress: int):
     """Write the current pipeline stage and % progress to the DB so the queue screen
     and upload page timer can both display live status.
@@ -514,12 +594,20 @@ async def update_stage_progress(pool: asyncpg.Pool, upload_id: str, stage: str, 
     processingStage / processingProgress to upload.html's polling loop.
     """
     try:
+        from services.upload_funnel import emit_upload_funnel_event
+
+        emit_upload_funnel_event(str(upload_id), f"stage_{stage}", {"progress": progress})
+    except Exception:
+        pass
+    try:
         async with pool.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE uploads
                 SET processing_stage    = $2,
                     processing_progress = $3,
+                    output_artifacts = COALESCE(output_artifacts, '{}'::jsonb)
+                        || jsonb_build_object('last_processing_stage', $2::text),
                     updated_at          = NOW()
                 WHERE id = $1
                 """,
@@ -1487,6 +1575,19 @@ async def load_admin_notification_webhook(pool: asyncpg.Pool) -> Optional[str]:
 
 # ── Free-tier video watermark (drawtext) ───────────────────────────────────
 DEFAULT_WATERMARK_BURN_TEXT = "Upload M8"
+DEFAULT_WATERMARK_SIZE_SCALE = 100
+DEFAULT_WATERMARK_OPACITY = 0.85
+DEFAULT_WATERMARK_POSITION = "bottom-right"
+DEFAULT_WATERMARK_TEXT_COLOR = "#ffffff"
+DEFAULT_WATERMARK_FONT_WEIGHT = "bold"
+WATERMARK_POSITIONS = frozenset({
+    "top-left",
+    "top-center",
+    "top-right",
+    "bottom-left",
+    "bottom-center",
+    "bottom-right",
+})
 
 
 def sanitize_watermark_burn_text(raw: Any) -> str:
@@ -1500,16 +1601,96 @@ def sanitize_watermark_burn_text(raw: Any) -> str:
     return s or DEFAULT_WATERMARK_BURN_TEXT
 
 
-async def load_watermark_burn_text(pool: asyncpg.Pool) -> str:
-    """Load master-admin watermark string from admin_settings (row id=1)."""
+def sanitize_watermark_size_scale(raw: Any) -> int:
+    """Admin size multiplier (% of resolution-scaled baseline)."""
+    try:
+        val = int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_WATERMARK_SIZE_SCALE
+    return max(50, min(200, val))
+
+
+def sanitize_watermark_opacity(raw: Any) -> float:
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_WATERMARK_OPACITY
+    return round(max(0.3, min(1.0, val)), 2)
+
+
+def sanitize_watermark_position(raw: Any) -> str:
+    pos = str(raw or "").strip().lower().replace("_", "-")
+    if pos in WATERMARK_POSITIONS:
+        return pos
+    return DEFAULT_WATERMARK_POSITION
+
+
+def sanitize_watermark_text_color(raw: Any) -> str:
+    """Hex color for FFmpeg drawtext fontcolor (e.g. #ffffff)."""
+    s = str(raw or "").strip()
+    if not s:
+        return DEFAULT_WATERMARK_TEXT_COLOR
+    if not s.startswith("#"):
+        s = f"#{s}"
+    hex_part = s[1:]
+    if len(hex_part) == 3 and all(c in "0123456789abcdefABCDEF" for c in hex_part):
+        expanded = "".join(c * 2 for c in hex_part)
+        return f"#{expanded.lower()}"
+    if len(hex_part) == 6 and all(c in "0123456789abcdefABCDEF" for c in hex_part):
+        return f"#{hex_part.lower()}"
+    return DEFAULT_WATERMARK_TEXT_COLOR
+
+
+def sanitize_watermark_font_weight(raw: Any) -> str:
+    w = str(raw or "").strip().lower()
+    if w in ("normal", "regular", "400"):
+        return "normal"
+    return "bold"
+
+
+def normalize_watermark_settings(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Merge partial admin/worker watermark settings with safe defaults."""
+    src = raw or {}
+    return {
+        "text": sanitize_watermark_burn_text(src.get("text", src.get("watermark_burn_text"))),
+        "size_scale": sanitize_watermark_size_scale(
+            src.get("size_scale", src.get("watermark_size_scale"))
+        ),
+        "opacity": sanitize_watermark_opacity(
+            src.get("opacity", src.get("watermark_opacity"))
+        ),
+        "position": sanitize_watermark_position(
+            src.get("position", src.get("watermark_position"))
+        ),
+        "text_color": sanitize_watermark_text_color(
+            src.get("text_color", src.get("watermark_text_color"))
+        ),
+        "font_weight": sanitize_watermark_font_weight(
+            src.get("font_weight", src.get("watermark_font_weight"))
+        ),
+    }
+
+
+async def load_watermark_settings(pool: asyncpg.Pool) -> Dict[str, Any]:
+    """Load master-admin watermark settings from admin_settings (row id=1)."""
     try:
         async with pool.acquire() as conn:
-            val = await conn.fetchval(
-                "SELECT settings_json->>'watermark_burn_text' FROM admin_settings WHERE id = 1"
+            row = await conn.fetchval(
+                "SELECT settings_json FROM admin_settings WHERE id = 1"
             )
-        return sanitize_watermark_burn_text(val)
+        if isinstance(row, str):
+            row = json.loads(row)
+        if not isinstance(row, dict):
+            row = {}
+        return normalize_watermark_settings(row)
     except Exception:
-        return DEFAULT_WATERMARK_BURN_TEXT
+        return normalize_watermark_settings({})
+
+
+async def load_watermark_burn_text(pool: asyncpg.Pool) -> str:
+    """Backward-compatible text-only loader."""
+    settings = await load_watermark_settings(pool)
+    return settings["text"]
 
 
 # ============================================================

@@ -20,7 +20,7 @@ v2 upgrades:
 
 import logging
 from .base import (
-    send_email, mailgun_ready, MAIL_FROM_SUPPORT,
+    send_email, mailgun_ready, MAIL_FROM_HELLO, MAIL_FROM_SUPPORT,
     email_shell, intro_row, body_row, cta_button, tinted_box,
     check_list, alert_banner, numbered_steps, spacer,
     section_tag, metric_hero, divider_accent,
@@ -54,7 +54,7 @@ async def send_welcome_email(email: str, name: str) -> None:
         body_rows=(
             section_tag("Welcome to the Platform", "#f97316")
             + intro_row(
-                f"Welcome to UploadM8, {name}! &#127881;",
+                f"Welcome to UploadM8, {name}!",
                 "You've just unlocked the fastest way to publish short-form video across "
                 "TikTok, YouTube Shorts, Instagram Reels, and Facebook Reels — simultaneously. "
                 "We dropped some tokens in your wallet to get you started.",
@@ -87,7 +87,14 @@ async def send_welcome_email(email: str, name: str) -> None:
         footer_note="You received this because you created an UploadM8 account.",
     )
 
-    await send_email(email, f"Welcome to UploadM8, {name}! 🎉 Your 30 free tokens are ready", html, from_addr=MAIL_FROM_SUPPORT)
+    await send_email(
+        email,
+        f"Welcome to UploadM8, {name} — your free upload tokens are ready",
+        html,
+        from_addr=MAIL_FROM_HELLO,
+        category="auth",
+        tags=["signup", "welcome"],
+    )
 
 
 async def send_signup_confirmation_email(email: str, name: str, confirm_link: str) -> None:
@@ -102,7 +109,7 @@ async def send_signup_confirmation_email(email: str, name: str, confirm_link: st
         body_rows=(
             section_tag("Verify your email", "#22c55e")
             + intro_row(
-                f"Hi {name} — almost there! &#128075;",
+                f"Hi {name} — almost there!",
                 "Please confirm your email address so we know how to reach you about uploads, "
                 "billing, and security alerts.",
             )
@@ -120,10 +127,12 @@ async def send_signup_confirmation_email(email: str, name: str, confirm_link: st
 
     await send_email(
         email,
-        "Confirm your UploadM8 email",
+        "Confirm your UploadM8 email address",
         html,
-        from_addr=MAIL_FROM_SUPPORT,
+        from_addr=MAIL_FROM_HELLO,
         reply_to=SUPPORT_EMAIL,
+        category="auth",
+        tags=["signup", "verify-email"],
     )
 
 
@@ -144,7 +153,7 @@ async def send_post_verification_welcome_email(email: str, name: str) -> None:
         body_rows=(
             section_tag("Email verified", "#22c55e")
             + intro_row(
-                f"Welcome aboard, {name}! &#127881;",
+                f"Welcome aboard, {name}!",
                 "Your email address is confirmed. Your account is live — open the dashboard to see your tier, "
                 "wallet balances, and everything included with your plan.",
             )
@@ -176,9 +185,11 @@ async def send_post_verification_welcome_email(email: str, name: str) -> None:
 
     await send_email(
         email,
-        f"You're in, {name}! — UploadM8 welcome + Setup Handbook",
+        f"UploadM8 account verified — welcome {name}",
         html,
-        from_addr=MAIL_FROM_SUPPORT,
+        from_addr=MAIL_FROM_HELLO,
+        category="auth",
+        tags=["signup", "verified"],
     )
 
 
@@ -219,7 +230,15 @@ async def send_password_reset_email(email: str, reset_link: str) -> None:
         footer_note="You received this because a password reset was requested for your account.",
     )
 
-    await send_email(email, "Reset your UploadM8 password 🔑", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(
+        email,
+        "UploadM8 password reset link",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+        category="auth",
+        tags=["password-reset"],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,7 +281,15 @@ async def send_password_changed_email(email: str, name: str) -> None:
         footer_note="You received this security alert because your password was changed.",
     )
 
-    await send_email(email, "Your UploadM8 password was changed ⚠️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(
+        email,
+        "UploadM8 security notice — password changed",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+        category="auth",
+        tags=["security", "password-changed"],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,7 +398,15 @@ async def send_email_change_email(
         footer_note="You received this because an email change was requested for your UploadM8 account.",
     )
 
-    await send_email(new_email, "Verify your new UploadM8 email address ✉️", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(
+        new_email,
+        "Verify your new UploadM8 email address",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+        category="auth",
+        tags=["email-change"],
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -430,4 +465,12 @@ async def send_admin_reset_password_email(
         footer_note="You received this because an admin reset your UploadM8 account password.",
     )
 
-    await send_email(email, "Your UploadM8 password has been reset — action required 🔐", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    await send_email(
+        email,
+        "UploadM8 temporary password — sign in and change it",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+        category="auth",
+        tags=["admin-reset"],
+    )

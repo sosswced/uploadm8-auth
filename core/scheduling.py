@@ -12,61 +12,77 @@ Pure helpers live here; SQL aggregation lives in ``services/smart_schedule_insig
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from core.helpers import _now_utc
 
 logger = logging.getLogger("uploadm8-api")
 
+_JITTER_MAX_SECONDS = 30 * 60  # ±30 minutes from anchor
 
 # Platform-specific optimal posting times (in UTC)
 # Based on general social media engagement research
 PLATFORM_OPTIMAL_TIMES = {
     "tiktok": [
-        {"hour": 7, "minute": 0, "weight": 0.8},  # 7 AM - morning scroll
-        {"hour": 12, "minute": 0, "weight": 0.9},  # 12 PM - lunch break
-        {"hour": 15, "minute": 0, "weight": 0.7},  # 3 PM - afternoon break
-        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - evening prime time
-        {"hour": 21, "minute": 0, "weight": 0.95},  # 9 PM - night engagement
-        {"hour": 23, "minute": 0, "weight": 0.6},  # 11 PM - late night
+        {"hour": 7, "minute": 0, "weight": 0.8},
+        {"hour": 12, "minute": 0, "weight": 0.9},
+        {"hour": 15, "minute": 0, "weight": 0.7},
+        {"hour": 19, "minute": 0, "weight": 1.0},
+        {"hour": 21, "minute": 0, "weight": 0.95},
+        {"hour": 23, "minute": 0, "weight": 0.6},
     ],
     "youtube": [
-        {"hour": 12, "minute": 0, "weight": 0.7},  # 12 PM - lunch views
-        {"hour": 14, "minute": 0, "weight": 0.8},  # 2 PM - afternoon
-        {"hour": 17, "minute": 0, "weight": 0.9},  # 5 PM - after work/school
-        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
-        {"hour": 21, "minute": 0, "weight": 0.95},  # 9 PM - evening viewing
+        {"hour": 12, "minute": 0, "weight": 0.7},
+        {"hour": 14, "minute": 0, "weight": 0.8},
+        {"hour": 17, "minute": 0, "weight": 0.9},
+        {"hour": 19, "minute": 0, "weight": 1.0},
+        {"hour": 21, "minute": 0, "weight": 0.95},
     ],
     "instagram": [
-        {"hour": 6, "minute": 0, "weight": 0.7},  # 6 AM - early morning
-        {"hour": 11, "minute": 0, "weight": 0.85},  # 11 AM - mid-morning
-        {"hour": 13, "minute": 0, "weight": 0.9},  # 1 PM - lunch
-        {"hour": 17, "minute": 0, "weight": 0.8},  # 5 PM - commute
-        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
-        {"hour": 21, "minute": 0, "weight": 0.9},  # 9 PM - evening
+        {"hour": 6, "minute": 0, "weight": 0.7},
+        {"hour": 11, "minute": 0, "weight": 0.85},
+        {"hour": 13, "minute": 0, "weight": 0.9},
+        {"hour": 17, "minute": 0, "weight": 0.8},
+        {"hour": 19, "minute": 0, "weight": 1.0},
+        {"hour": 21, "minute": 0, "weight": 0.9},
     ],
     "facebook": [
-        {"hour": 9, "minute": 0, "weight": 0.8},  # 9 AM - morning check
-        {"hour": 11, "minute": 0, "weight": 0.7},  # 11 AM - mid-morning
-        {"hour": 13, "minute": 0, "weight": 0.9},  # 1 PM - lunch break
-        {"hour": 16, "minute": 0, "weight": 0.85},  # 4 PM - afternoon
-        {"hour": 19, "minute": 0, "weight": 1.0},  # 7 PM - prime time
-        {"hour": 20, "minute": 0, "weight": 0.9},  # 8 PM - evening
+        {"hour": 9, "minute": 0, "weight": 0.8},
+        {"hour": 11, "minute": 0, "weight": 0.7},
+        {"hour": 13, "minute": 0, "weight": 0.9},
+        {"hour": 16, "minute": 0, "weight": 0.85},
+        {"hour": 19, "minute": 0, "weight": 1.0},
+        {"hour": 20, "minute": 0, "weight": 0.9},
     ],
 }
 
-# Best days for each platform (0=Monday, 6=Sunday)
 PLATFORM_OPTIMAL_DAYS = {
-    "tiktok": [1, 2, 3, 4],  # Tue, Wed, Thu, Fri - highest engagement
-    "youtube": [3, 4, 5],  # Thu, Fri, Sat - weekend viewing prep
-    "instagram": [0, 1, 2, 4],  # Mon, Tue, Wed, Fri - weekday engagement
-    "facebook": [0, 1, 2, 3],  # Mon, Tue, Wed, Thu - business days
+    "tiktok": [1, 2, 3, 4],
+    "youtube": [3, 4, 5],
+    "instagram": [0, 1, 2, 4],
+    "facebook": [0, 1, 2, 3],
 }
 
 _EPS = 1e-9
+
+
+def _rng_from_seed(seed: Optional[str]) -> random.Random:
+    if not seed:
+        return random.Random()
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    return random.Random(int.from_bytes(digest[:8], "big"))
+
+
+def _resolve_tz(tz_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo((tz_name or "UTC").strip())
+    except Exception:
+        return ZoneInfo("UTC")
 
 
 def static_hour_prior_24(platform: str) -> List[float]:
@@ -80,11 +96,30 @@ def static_hour_prior_24(platform: str) -> List[float]:
     return [x / s for x in w]
 
 
-def _pick_weighted_hour(hour_weights: List[float]) -> int:
+def utc_weights_as_local(
+    utc_weights: List[float],
+    tz: ZoneInfo,
+    ref: datetime,
+) -> List[float]:
+    """Re-index UTC hour weights into the user's local-hour buckets (DST-aware offset at ref)."""
+    aware = ref.replace(tzinfo=timezone.utc) if ref.tzinfo is None else ref.astimezone(timezone.utc)
+    offset = aware.astimezone(tz).utcoffset()
+    offset_h = int((offset.total_seconds() if offset else 0) // 3600)
+    local_w = [0.0] * 24
+    for utc_h, wt in enumerate(utc_weights):
+        local_h = (utc_h + offset_h) % 24
+        local_w[local_h] += max(0.0, float(wt))
+    s = sum(local_w)
+    if s <= _EPS:
+        return utc_weights
+    return [x / s for x in local_w]
+
+
+def _pick_weighted_hour(hour_weights: List[float], rng: random.Random) -> int:
     total = sum(hour_weights)
     if total <= _EPS:
-        return random.randint(0, 23)
-    r = random.uniform(0.0, total)
+        return rng.randint(0, 23)
+    r = rng.uniform(0.0, total)
     c = 0.0
     for h, wt in enumerate(hour_weights):
         c += wt
@@ -93,16 +128,15 @@ def _pick_weighted_hour(hour_weights: List[float]) -> int:
     return 23
 
 
-def _apply_subsecond_jitter(anchor: datetime, now: datetime) -> datetime:
-    """
-    Spread within the chosen UTC hour, then apply a variable symmetric wall-clock
-    offset in whole seconds (not a fixed ±30 minute band).
-    """
-    within_hour = random.randint(0, 3599)
-    out = anchor + timedelta(seconds=within_hour)
-    # Variable outer jitter: different cap every call (roughly 2 min … ~2.5 h half-span).
-    outer_span = random.randint(120, 9000)
-    out += timedelta(seconds=random.randint(-outer_span, outer_span))
+def _apply_subsecond_jitter(
+    anchor: datetime,
+    now: datetime,
+    *,
+    rng: random.Random,
+) -> datetime:
+    """Spread within ±30 minutes of the chosen anchor (stored as UTC)."""
+    jitter = rng.randint(-_JITTER_MAX_SECONDS, _JITTER_MAX_SECONDS)
+    out = anchor + timedelta(seconds=jitter)
     out = out.replace(microsecond=0)
     if out <= now:
         out += timedelta(days=1)
@@ -115,6 +149,7 @@ def _pick_day_offset(
     num_days: int,
     used_days: set,
     blocked_days: Optional[set],
+    rng: random.Random,
 ) -> int:
     optimal_days = PLATFORM_OPTIMAL_DAYS.get(platform, [0, 1, 2, 3, 4])
     available_days: list = []
@@ -134,41 +169,36 @@ def _pick_day_offset(
             if d not in used_days and (blocked_days is None or d not in blocked_days)
         ]
         if not pool:
-            return random.randint(1, num_days)
-        return random.choice(pool)
+            return rng.randint(1, num_days)
+        return rng.choice(pool)
 
-    available_days.sort(key=lambda x: (-x[1], random.random()))
+    available_days.sort(key=lambda x: (-x[1], rng.random()))
     return available_days[0][0]
 
 
 def calculate_smart_schedule(
     platforms: List[str],
-    num_days: int = 7,
+    num_days: int = 14,
     user_timezone: str = "UTC",
     *,
     hour_weights_by_platform: Optional[Dict[str, List[float]]] = None,
     blocked_day_offsets: Optional[set] = None,
+    random_seed: Optional[str] = None,
 ) -> Dict[str, datetime]:
     """
     Calculate smart upload times per platform (UTC).
 
-    ``user_timezone`` is reserved for future locale-aware priors; DB path uses UTC
-    publish hours from ``completed_at`` / ``created_at``.
+    Hour priors are shifted into ``user_timezone`` for slot selection; results are UTC.
 
-    ``hour_weights_by_platform``: optional precomputed length-24 distributions (any
-    positive values; normalized internally). When missing for a platform, static
-    research priors are used.
-
-    ``blocked_day_offsets``: 1-based day indices from ``_now_utc().date()`` to skip
-    (e.g. days that already have scheduled rows for this user).
+    ``random_seed``: when set (e.g. upload_id), preview and presign produce identical slots.
     """
-    del user_timezone  # reserved — priors are UTC until locale pipeline exists
+    tz = _resolve_tz(user_timezone)
+    rng = _rng_from_seed(random_seed)
     now = _now_utc()
     schedule: Dict[str, datetime] = {}
     used_days: set = set()
 
-    platforms_sorted = sorted(platforms)
-    for platform in platforms_sorted:
+    for platform in sorted(platforms):
         hour_weights = None
         if hour_weights_by_platform:
             hour_weights = hour_weights_by_platform.get(platform)
@@ -178,49 +208,66 @@ def calculate_smart_schedule(
             s = sum(max(0.0, float(x)) for x in hour_weights) + _EPS
             hour_weights = [max(0.0, float(x)) / s for x in hour_weights]
 
-        day_offset = _pick_day_offset(now, platform, num_days, used_days, blocked_day_offsets)
+        local_weights = utc_weights_as_local(hour_weights, tz, now)
+
+        day_offset = _pick_day_offset(now, platform, num_days, used_days, blocked_day_offsets, rng)
         used_days.add(day_offset)
 
-        chosen_hour = _pick_weighted_hour(hour_weights)
-        target_date = now + timedelta(days=day_offset)
-        anchor = datetime(
+        chosen_local_hour = _pick_weighted_hour(local_weights, rng)
+        target_date = (now + timedelta(days=day_offset)).date()
+        local_minute = rng.randint(0, 59)
+        local_dt = datetime(
             target_date.year,
             target_date.month,
             target_date.day,
-            chosen_hour,
+            chosen_local_hour,
+            local_minute,
             0,
-            0,
-            tzinfo=timezone.utc,
+            tzinfo=tz,
         )
-        schedule[platform] = _apply_subsecond_jitter(anchor, now)
+        anchor_utc = local_dt.astimezone(timezone.utc)
+        schedule[platform] = _apply_subsecond_jitter(anchor_utc, now, rng=rng)
 
     return schedule
 
 
-async def get_existing_scheduled_days(conn, user_id: str, num_days: int = 7) -> set:
-    """Calendar day offsets (from today) that already have a scheduled_time for this user."""
+async def get_existing_scheduled_days(
+    conn,
+    user_id: str,
+    num_days: int = 14,
+    *,
+    exclude_upload_id: Optional[str] = None,
+) -> set:
+    """Calendar day offsets (from today) that already have a scheduled slot for this user."""
     now = _now_utc()
     end_date = now + timedelta(days=num_days)
 
+    exclude_clause = ""
+    params: list = [user_id, now, end_date]
+    if exclude_upload_id:
+        exclude_clause = "AND id != $4::uuid"
+        params.append(exclude_upload_id)
+
     existing = await conn.fetch(
-        """
-        SELECT DISTINCT DATE(scheduled_time) as sched_date
+        f"""
+        SELECT scheduled_time, schedule_mode, schedule_metadata
         FROM uploads
         WHERE user_id = $1
-        AND scheduled_time >= $2
-        AND scheduled_time <= $3
+        AND (
+            (scheduled_time >= $2 AND scheduled_time <= $3)
+            OR (schedule_mode = 'smart' AND schedule_metadata IS NOT NULL)
+        )
         AND status IN ('pending', 'queued', 'scheduled', 'staged', 'ready_to_publish')
+        {exclude_clause}
     """,
-        user_id,
-        now,
-        end_date,
+        *params,
     )
 
+    from services.schedule_slots import day_offsets_from_today
+
     used_days: set = set()
+    today = now.date()
     for row in existing:
-        if row["sched_date"]:
-            day_diff = (row["sched_date"] - now.date()).days
-            if day_diff > 0:
-                used_days.add(day_diff)
+        used_days |= day_offsets_from_today(dict(row), today=today, num_days=num_days)
 
     return used_days

@@ -60,52 +60,62 @@ async def api_v1_contract():
 
 @router.get("/api/ops/worker-health")
 async def worker_health():
-    """Worker lane + queue depth snapshot for Render split deployments."""
-    redis_queues: dict = {}
-    if core.state.redis_client:
-        try:
-            from stages.redis_job_queue import (
-                list_lengths,
-                process_stream_keys_ordered,
-                stream_lengths,
-                use_redis_streams,
-            )
+    """Worker lane + queue depth + fleet heartbeat snapshot for Render split deployments."""
+    from services.worker_fleet_snapshot import build_worker_fleet_snapshot
 
-            lp = [
-                PROCESS_PRIORITY_QUEUE,
-                PROCESS_NORMAL_QUEUE,
-                PRIORITY_JOB_QUEUE,
-                UPLOAD_JOB_QUEUE,
-                PUBLISH_PRIORITY_QUEUE,
-                PUBLISH_NORMAL_QUEUE,
-            ]
-            redis_queues["use_streams"] = use_redis_streams()
-            redis_queues["lists"] = await list_lengths(core.state.redis_client, lp)
-            if use_redis_streams():
-                from stages.redis_job_queue import stream_key_for_list
-
-                sk = process_stream_keys_ordered(
-                    PROCESS_PRIORITY_QUEUE,
-                    PROCESS_NORMAL_QUEUE,
-                    PRIORITY_JOB_QUEUE,
-                    UPLOAD_JOB_QUEUE,
-                ) + [
-                    stream_key_for_list(PUBLISH_PRIORITY_QUEUE),
-                    stream_key_for_list(PUBLISH_NORMAL_QUEUE),
-                ]
-                redis_queues["streams"] = await stream_lengths(core.state.redis_client, sk)
-        except (RedisError, ImportError, TypeError, ValueError) as e:
-            redis_queues["error"] = str(e)
     worker_lane = (os.environ.get("WORKER_LANE") or "full").strip().lower()
-    return {
+    base = {
         "worker_lane": worker_lane,
         "worker_concurrency": int(os.environ.get("WORKER_CONCURRENCY", "3") or 3),
         "publish_concurrency": int(os.environ.get("PUBLISH_CONCURRENCY", "5") or 5),
         "heavy_pipeline_slots": int(os.environ.get("WORKER_HEAVY_PIPELINE_SLOTS", "1") or 1),
         "async_publish_queue": os.environ.get("ASYNC_PUBLISH_QUEUE", "false"),
-        "redis_queues": redis_queues,
         "timestamp": _now_utc().isoformat(),
     }
+    if core.state.db_pool is not None:
+        fleet = await build_worker_fleet_snapshot(core.state.db_pool, core.state.redis_client)
+        base["fleet"] = fleet.get("fleet")
+        base["workers"] = fleet.get("workers")
+        base["redis_queues"] = fleet.get("redis_queues")
+        base["uploads"] = fleet.get("uploads")
+    else:
+        redis_queues: dict = {}
+        if core.state.redis_client:
+            try:
+                from stages.redis_job_queue import (
+                    list_lengths,
+                    process_stream_keys_ordered,
+                    stream_lengths,
+                    use_redis_streams,
+                )
+
+                lp = [
+                    PROCESS_PRIORITY_QUEUE,
+                    PROCESS_NORMAL_QUEUE,
+                    PRIORITY_JOB_QUEUE,
+                    UPLOAD_JOB_QUEUE,
+                    PUBLISH_PRIORITY_QUEUE,
+                    PUBLISH_NORMAL_QUEUE,
+                ]
+                redis_queues["use_streams"] = use_redis_streams()
+                redis_queues["lists"] = await list_lengths(core.state.redis_client, lp)
+                if use_redis_streams():
+                    from stages.redis_job_queue import stream_key_for_list
+
+                    sk = process_stream_keys_ordered(
+                        PROCESS_PRIORITY_QUEUE,
+                        PROCESS_NORMAL_QUEUE,
+                        PRIORITY_JOB_QUEUE,
+                        UPLOAD_JOB_QUEUE,
+                    ) + [
+                        stream_key_for_list(PUBLISH_PRIORITY_QUEUE),
+                        stream_key_for_list(PUBLISH_NORMAL_QUEUE),
+                    ]
+                    redis_queues["streams"] = await stream_lengths(core.state.redis_client, sk)
+            except (RedisError, ImportError, TypeError, ValueError) as e:
+                redis_queues["error"] = str(e)
+        base["redis_queues"] = redis_queues
+    return base
 
 
 @router.get("/metrics")
@@ -164,6 +174,13 @@ async def metrics(request: Request):
                     redis_queues["streams"] = await stream_lengths(core.state.redis_client, sk)
             except (RedisError, ImportError, TypeError, ValueError) as _rqe:
                 redis_queues["error"] = str(_rqe)
+        worker_fleet = None
+        try:
+            from services.worker_fleet_snapshot import build_worker_fleet_snapshot
+
+            worker_fleet = await build_worker_fleet_snapshot(core.state.db_pool, core.state.redis_client)
+        except Exception:
+            worker_fleet = None
         return {
             "users": {"total": total_users, "active_24h": active_24h},
             "uploads": {
@@ -174,6 +191,8 @@ async def metrics(request: Request):
             },
             "db_pool": {"size": pool_size, "idle": pool_free},
             "redis_job_queues": redis_queues,
+            "worker_fleet": worker_fleet.get("fleet") if worker_fleet else None,
+            "workers": worker_fleet.get("workers") if worker_fleet else None,
             "timestamp": _now_utc().isoformat(),
         }
     except (

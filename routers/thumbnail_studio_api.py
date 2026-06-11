@@ -161,6 +161,53 @@ async def put_thumbnail_studio_youtube_references(
     }
 
 
+@router.get("/api/thumbnail-studio/youtube-preview")
+async def ts_youtube_preview(
+    youtube_url: str = Query(..., min_length=8, max_length=2048),
+    user: dict = Depends(get_current_user_readonly),
+):
+    """Resolve a public YouTube reference before charging for a recreate run."""
+    _ = user
+    url = (youtube_url or "").strip()
+    vid = extract_youtube_video_id(url)
+    if not vid:
+        return {
+            "ok": False,
+            "code": "invalid_url",
+            "video_id": "",
+            "title": "",
+            "thumbnail_url": "",
+            "message": "Paste a valid YouTube watch, Shorts, or youtu.be link.",
+        }
+    title = await fetch_youtube_title(url)
+    thumb_url = youtube_reference_thumbnail_url(vid)
+    available = False
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            r = await client.head(thumb_url)
+            available = r.status_code == 200
+    except Exception as e:
+        logger.debug("youtube-preview head failed vid=%s: %s", vid, e)
+    if not available:
+        try:
+            data_url = await _youtube_reference_thumbnail_as_data_url(vid)
+            available = bool(data_url)
+        except Exception as e:
+            logger.debug("youtube-preview fetch failed vid=%s: %s", vid, e)
+    return {
+        "ok": available,
+        "code": "ok" if available else "youtube_reference_unavailable",
+        "video_id": vid,
+        "title": title,
+        "thumbnail_url": thumb_url if available else "",
+        "message": (
+            ""
+            if available
+            else "We could not load a public thumbnail for this video. Try another public link."
+        ),
+    }
+
+
 async def _resolve_linked_studio_persona_db(
     conn: Any,
     user_id: str,
@@ -582,7 +629,10 @@ async def ts_estimate(body: StudioEstimateBody, user: dict = Depends(get_current
 
 
 @router.get("/api/thumbnail-studio/hydration-context")
-async def ts_hydration_context(user: dict = Depends(get_current_user_readonly)):
+async def ts_hydration_context(
+    user: dict = Depends(get_current_user_readonly),
+    upload_id: Optional[str] = Query(None, max_length=48),
+):
     """
     Latest backend-collected evidence used to hydrate style-recreation variants.
 
@@ -617,10 +667,52 @@ async def ts_hydration_context(user: dict = Depends(get_current_user_readonly)):
             ctx["_score"] = score
             candidates.append(ctx)
     candidates.sort(key=lambda x: int(x.get("_score") or 0), reverse=True)
-    context = candidates[0] if candidates else {}
-    if context:
-        context = {k: v for k, v in context.items() if k != "_score"}
-    return {"hydration_context": context, "candidates": candidates[:5]}
+
+    selected_upload_id = ""
+    want = (upload_id or "").strip()
+    if want:
+        hit = next((c for c in candidates if str(c.get("_upload_id") or "") == want), None)
+        if not hit:
+            async with core.state.db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, filename, title, caption, ai_title, ai_caption,
+                           output_artifacts, trill_metadata, created_at, updated_at
+                    FROM uploads
+                    WHERE id = $1::uuid AND user_id = $2
+                    """,
+                    want,
+                    user["id"],
+                )
+            if row:
+                ctx = hydration_context_from_upload_row(dict(row))
+                score = sum(
+                    1 for k in ("caption", "geo", "latitude", "longitude", "artist", "track") if ctx.get(k)
+                )
+                if score:
+                    ctx["_score"] = score
+                    hit = ctx
+                    candidates = [ctx] + [c for c in candidates if str(c.get("_upload_id") or "") != want]
+        if hit:
+            selected_upload_id = str(hit.get("_upload_id") or want)
+            context = {k: v for k, v in hit.items() if k != "_score"}
+        else:
+            context = {}
+    else:
+        context = candidates[0] if candidates else {}
+        if context:
+            selected_upload_id = str(context.get("_upload_id") or "")
+            context = {k: v for k, v in context.items() if k != "_score"}
+
+    slim_candidates = [
+        {k: v for k, v in c.items() if k != "_score"}
+        for c in candidates[:5]
+    ]
+    return {
+        "hydration_context": context,
+        "candidates": slim_candidates,
+        "selected_upload_id": selected_upload_id,
+    }
 
 
 @router.get("/api/thumbnail-studio/personas")

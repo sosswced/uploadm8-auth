@@ -17,6 +17,7 @@ STREAM_RECLAIM_COUNT      — messages per stream per reclaim tick (default 8)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -281,6 +282,93 @@ async def user_process_release(redis: Any, user_id: str) -> None:
         await redis.eval(_USER_RELEASE_LUA, 1, key)
     except Exception as e:
         logger.debug("user_process_release: %s", e)
+
+
+async def user_process_in_use(redis: Any, user_id: str) -> int:
+    if not user_id:
+        return 0
+    key = _USER_SLOT_PREFIX + str(user_id)
+    try:
+        n = await redis.get(key)
+        return int(n or 0)
+    except Exception:
+        return 0
+
+
+async def user_process_wait_acquire(
+    redis: Any,
+    user_id: str,
+    priority_class: str,
+    *,
+    upload_id: str = "",
+    shutdown_check=None,
+    max_wait_sec: Optional[int] = None,
+) -> bool:
+    """
+    Block until a per-user process slot is available.
+
+    Avoids re-enqueue storms when USER_PROCESS_MAX_PARALLEL is saturated:
+    wait in place (stream message stays pending until ack) instead of
+    LPUSH/XADD duplicates every 2 seconds.
+    """
+    cap = user_process_cap(priority_class)
+    if cap <= 0 or not user_id:
+        return True
+
+    if max_wait_sec is None:
+        max_wait_sec = int(os.environ.get("USER_SLOT_MAX_WAIT_SEC", "900") or 900)
+    backoff = float(os.environ.get("USER_SLOT_WAIT_INITIAL_SEC", "2") or 2)
+    max_backoff = float(os.environ.get("USER_SLOT_WAIT_MAX_SEC", "30") or 30)
+    waited = 0.0
+    attempt = 0
+    logged_wait = False
+
+    while True:
+        if shutdown_check and shutdown_check():
+            return False
+        if await user_process_try_acquire(redis, user_id, priority_class):
+            if logged_wait and upload_id:
+                logger.info(
+                    "[%s] user process slot acquired after %.0fs (cap=%s)",
+                    upload_id,
+                    waited,
+                    cap,
+                )
+            return True
+
+        attempt += 1
+        if waited >= max_wait_sec:
+            logger.warning(
+                "[%s] user process slot cap — gave up after %.0fs (user=%s… cap=%s)",
+                upload_id or "?",
+                waited,
+                str(user_id)[:8],
+                cap,
+            )
+            return False
+
+        if not logged_wait:
+            in_use = await user_process_in_use(redis, user_id)
+            logger.info(
+                "[%s] user process slot cap reached — waiting in place "
+                "(user=%s… in_use=%s/%s)",
+                upload_id or "?",
+                str(user_id)[:8],
+                in_use,
+                cap,
+            )
+            logged_wait = True
+        elif attempt % 8 == 0:
+            logger.debug(
+                "[%s] still waiting for user process slot (%.0fs, cap=%s)",
+                upload_id or "?",
+                waited,
+                cap,
+            )
+
+        await asyncio.sleep(backoff)
+        waited += backoff
+        backoff = min(backoff * 1.4, max_backoff)
 
 
 async def stream_lengths(redis: Any, stream_keys: List[str]) -> Dict[str, int]:

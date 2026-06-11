@@ -1779,6 +1779,21 @@ def _worker_instance_context() -> dict:
 async def _worker_scale_embed(db_pool, event: str) -> dict:
     ctx = _worker_instance_context()
     live = await _live_worker_count(db_pool)
+    mem_line = "—"
+    try:
+        from core.process_stats import sample_memory_mb, worker_config_snapshot
+
+        mem = sample_memory_mb()
+        cfg = worker_config_snapshot()
+        mem_line = (
+            f"{mem.get('rss_mb') or '?'} MB RSS"
+            f" / {mem.get('limit_mb') or '?'} MB limit"
+            f" ({mem.get('pct_of_limit') or '?'}%)"
+        )
+        ctx["worker_concurrency"] = str(cfg.get("worker_concurrency"))
+        ctx["heavy_slots"] = str(cfg.get("heavy_pipeline_slots"))
+    except Exception:
+        pass
     if event == "start":
         projected = live + 1
         headline = "🟢 UploadM8 Worker started"
@@ -1798,6 +1813,8 @@ async def _worker_scale_embed(db_pool, event: str) -> dict:
                 {"name": "Instance", "value": str(ctx["instance"])[:64], "inline": True},
                 {"name": "Service", "value": str(ctx["service"])[:64], "inline": True},
                 {"name": "Region", "value": str(ctx["region"])[:32], "inline": True},
+                {"name": "Memory", "value": mem_line[:64], "inline": False},
+                {"name": "Concurrency", "value": f"process={ctx.get('worker_concurrency', '?')} heavy={ctx.get('heavy_slots', '?')}", "inline": True},
                 {"name": "Live workers (30s)", "value": str(live), "inline": True},
                 {"name": "Projected", "value": str(projected), "inline": True},
             ],

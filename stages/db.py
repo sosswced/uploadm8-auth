@@ -410,20 +410,23 @@ def _platform_results_json(ctx: JobContext) -> Optional[str]:
     )
 
 
-async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext):
-    """Mark upload as processing."""
+async def mark_processing_started(pool: asyncpg.Pool, ctx: JobContext) -> bool:
+    """Mark upload as processing. Only claims rows in queued/staged (never revives failed)."""
     async with pool.acquire() as conn:
-        await conn.execute(
+        tag = await conn.execute(
             """
             UPDATE uploads
             SET status = 'processing',
                 processing_started_at = $2,
+                error_code = NULL,
+                error_detail = NULL,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND status IN ('queued', 'staged')
             """,
             ctx.upload_id,
             ctx.started_at or datetime.now(timezone.utc),
         )
+        return str(tag or "") != "UPDATE 0"
 
 
 async def mark_processing_completed(pool: asyncpg.Pool, ctx: JobContext):
@@ -482,7 +485,12 @@ async def mark_processing_failed(
     """Mark upload as failed with error info and ``output_artifacts.failure_phase``."""
     failure_phase = None
     try:
-        stage = str(getattr(ctx, "current_stage", None) or getattr(ctx, "processing_stage", None) or "").strip()
+        stage = str(
+            getattr(ctx, "current_stage", None)
+            or getattr(ctx, "stage", None)
+            or getattr(ctx, "processing_stage", None)
+            or ""
+        ).strip()
         if not stage and isinstance(getattr(ctx, "output_artifacts", None), dict):
             stage = str(ctx.output_artifacts.get("last_processing_stage") or "").strip()
         if stage:

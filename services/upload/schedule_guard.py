@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 from core.scheduling import calculate_smart_schedule, get_existing_scheduled_days
 from services.smart_schedule_insights import calculate_smart_schedule_data_driven
+from services.upload.r2_storage_guard import ERROR_SOURCE_NOT_IN_R2, SOURCE_NOT_IN_R2_MESSAGE
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -22,6 +23,7 @@ UPLOAD_ERROR_MESSAGES: Dict[str, str] = {
         "This upload has no publish time. Edit the schedule or retry — our team was alerted."
     ),
     ERROR_SCHEDULE_NO_PLATFORMS: "Select at least one platform before scheduling.",
+    ERROR_SOURCE_NOT_IN_R2: SOURCE_NOT_IN_R2_MESSAGE,
     "ENQUEUE_FAILED": (
         "Upload saved but the processing queue was unavailable. We will retry automatically."
     ),

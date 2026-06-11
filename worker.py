@@ -655,9 +655,24 @@ STAGE_PROGRESS = {
 }
 
 
+def _pipeline_failure_code_and_detail(exc: Exception) -> tuple[str, str]:
+    from services.upload.r2_storage_guard import classify_r2_head_not_found
+
+    classified = classify_r2_head_not_found(exc)
+    if classified:
+        return classified
+    return "INTERNAL", str(exc)
+
+
 async def maybe_cancel(ctx: JobContext, stage: str):
     progress = STAGE_PROGRESS.get(stage, 0)
     await db_stage.update_stage_progress(db_pool, ctx.upload_id, stage, progress)
+    try:
+        from services.worker_runtime_state import track_process_stage
+
+        await track_process_stage(str(ctx.upload_id), stage)
+    except Exception:
+        pass
     if await check_cancelled(ctx):
         logger.info(f"[{ctx.upload_id}] Cancel at {stage}")
         await db_stage.mark_cancelled(db_pool, ctx.upload_id)
@@ -1048,6 +1063,9 @@ async def run_processing_pipeline(job_data: dict) -> bool:
     resume_stage: Optional[str] = None
 
     try:
+        from services.worker_runtime_state import track_process_start
+
+        await track_process_start(str(upload_id), stage="init")
         async def _persist_diag_artifacts_now(*keys: str) -> None:
             """Persist selected in-memory artifacts immediately (best-effort)."""
             if not ctx or not isinstance(getattr(ctx, "output_artifacts", None), dict):
@@ -1092,6 +1110,33 @@ async def run_processing_pipeline(job_data: dict) -> bool:
 
         if getattr(entitlements, "tier", "") == "free":
             apply_free_tier_processing_defaults(user_settings)
+
+        from services.upload.r2_storage_guard import (
+            ERROR_SOURCE_NOT_IN_R2,
+            SOURCE_NOT_IN_R2_MESSAGE,
+            upload_source_present_in_r2,
+        )
+
+        if not upload_source_present_in_r2(upload_record):
+            logger.error(
+                f"[{upload_id}] source object missing in R2 at {upload_record.get('r2_key')!r} — aborting pipeline"
+            )
+            ctx = create_context(job_data, upload_record, user_settings, entitlements)
+            ctx.upload_id = upload_id
+            ctx.mark_error(ERROR_SOURCE_NOT_IN_R2, SOURCE_NOT_IN_R2_MESSAGE)
+            ctx.state = "failed"
+            ctx.finished_at = _now_utc()
+            ctx.mark_stage("download")
+            await db_stage.mark_processing_failed(
+                db_pool, ctx, ERROR_SOURCE_NOT_IN_R2, SOURCE_NOT_IN_R2_MESSAGE
+            )
+            try:
+                await notify_upload_terminal(
+                    db_pool, ctx, str(upload_id), status="failed", scene_story=""
+                )
+            except Exception:
+                pass
+            return False
 
         ctx = create_context(job_data, upload_record, user_settings, entitlements)
         _merge_job_preferences(ctx, job_data)
@@ -1153,7 +1198,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             if not ent.can_ai and hasattr(ctx, "use_ai"):
                 ctx.use_ai = False
 
-        await db_stage.mark_processing_started(db_pool, ctx)
+        if not await db_stage.mark_processing_started(db_pool, ctx):
+            logger.warning(
+                f"[{upload_id}] processing claim lost (status not queued/staged) — skipping duplicate/stale job"
+            )
+            return False
         try:
             from services.upload_funnel import emit_upload_funnel_event
 
@@ -2303,10 +2352,11 @@ async def run_processing_pipeline(job_data: dict) -> bool:
     except Exception as e:
         logger.exception(f"[{upload_id}] Processing failed: {e}")
         if ctx:
-            ctx.mark_error("INTERNAL", str(e))
+            err_code, err_detail = _pipeline_failure_code_and_detail(e)
+            ctx.mark_error(err_code, err_detail)
             ctx.state = "failed"
             ctx.finished_at = _now_utc()
-            await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
+            await db_stage.mark_processing_failed(db_pool, ctx, err_code, err_detail)
         # ── Release wallet hold on failure ───────────────────────────────────
         try:
             if ctx:
@@ -2331,6 +2381,13 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         return False
     finally:
         uid = upload_id or (str(ctx.upload_id) if ctx else "")
+        if uid:
+            try:
+                from services.worker_runtime_state import track_process_end
+
+                await track_process_end(str(uid))
+            except Exception:
+                pass
         if ctx:
             try:
                 await emit_ai_pipeline_summary(ctx, uid, logger, db_pool)
@@ -2843,6 +2900,9 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
     ctx = None
 
     try:
+        from services.worker_runtime_state import track_publish_start
+
+        await track_publish_start(str(upload_id), stage="publish")
         upload_record = await db_stage.load_upload_record(db_pool, upload_id)
         user_record = await db_stage.load_user(db_pool, user_id)
         if not upload_record or not user_record:
@@ -3062,10 +3122,11 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
     except Exception as e:
         logger.exception(f"[{upload_id}] Deferred publish failed: {e}")
         if ctx:
-            ctx.mark_error("INTERNAL", str(e))
+            err_code, err_detail = _pipeline_failure_code_and_detail(e)
+            ctx.mark_error(err_code, err_detail)
             ctx.state = "failed"
             ctx.finished_at = _now_utc()
-            await db_stage.mark_processing_failed(db_pool, ctx, "INTERNAL", str(e))
+            await db_stage.mark_processing_failed(db_pool, ctx, err_code, err_detail)
         await notify_admin_error("deferred_publish_failure", {"upload_id": upload_id, "error": str(e)}, db_pool)
         if ctx:
             try:
@@ -3084,6 +3145,13 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             except Exception:
                 pass
         return False
+    finally:
+        try:
+            from services.worker_runtime_state import track_publish_end
+
+            await track_publish_end(str(upload_id))
+        except Exception:
+            pass
 
 
 
@@ -3711,11 +3779,32 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
     Wrapper: run processing pipeline (FFmpeg-heavy) inside the PROCESS semaphore.
     Uses _process_semaphore (WORKER_CONCURRENCY=3 slots by default).
     """
-    async with _process_semaphore:
-        try:
-            await run_processing_pipeline(job_data)
-        except Exception as e:
-            logger.exception(f"[{job_data.get('upload_id')}] Unhandled pipeline error: {e}")
+    uid = str(job_data.get("user_id") or "")
+    pc = str(job_data.get("priority_class") or "p4")
+    upload_id = str(job_data.get("upload_id") or "")
+    from stages.redis_job_queue import user_process_release, user_process_wait_acquire
+
+    if uid and not await user_process_wait_acquire(
+        redis_client,
+        uid,
+        pc,
+        upload_id=upload_id,
+        shutdown_check=lambda: shutdown_requested,
+    ):
+        logger.warning(
+            "[%s] scheduler job skipped — user process slot unavailable",
+            upload_id or "?",
+        )
+        return
+    try:
+        async with _process_semaphore:
+            try:
+                await run_processing_pipeline(job_data)
+            except Exception as e:
+                logger.exception(f"[{job_data.get('upload_id')}] Unhandled pipeline error: {e}")
+    finally:
+        if uid:
+            await user_process_release(redis_client, uid)
 
 
 async def _run_deferred_publish_with_semaphore(upload_id: str, user_id: str) -> None:
@@ -4203,6 +4292,22 @@ async def run_stale_job_recovery_loop() -> None:
 
                         # No checkpoint (or verify failed): full re-process beats leaving a zombie row.
                         ur = ur or await db_stage.load_upload_record(db_pool, up)
+                        if ur and not upload_source_present_in_r2(ur):
+                            from services.upload.r2_storage_guard import (
+                                mark_source_not_in_r2_failed,
+                                SOURCE_NOT_IN_R2_MESSAGE,
+                            )
+
+                            async with db_pool.acquire() as uconn:
+                                await mark_source_not_in_r2_failed(
+                                    uconn,
+                                    up,
+                                    detail=SOURCE_NOT_IN_R2_MESSAGE,
+                                )
+                            logger.error(
+                                f"[{up}] stale recovery: source missing in R2 — marked SOURCE_NOT_IN_R2"
+                            )
+                            continue
                         deferred = False
                         if ur:
                             deferred = str(ur.get("schedule_mode") or "immediate").lower() in (
@@ -4319,15 +4424,37 @@ async def _process_one_job(job_json: str) -> None:
         return
     uid = str(job_data.get("user_id") or "")
     pc = str(job_data.get("priority_class") or "p4")
-    from stages.redis_job_queue import user_process_try_acquire, user_process_release
+    upload_id = str(job_data.get("upload_id") or "")
+    from stages.redis_job_queue import user_process_release, user_process_wait_acquire
 
-    if uid and not await user_process_try_acquire(redis_client, uid, pc):
-        logger.info(
-            "[%s] user process slot cap reached — deferring job",
-            job_data.get("upload_id"),
-        )
-        await asyncio.sleep(2.0)
-        await enqueue_process_lane_job(job_data)
+    if uid and not await user_process_wait_acquire(
+        redis_client,
+        uid,
+        pc,
+        upload_id=upload_id,
+        shutdown_check=lambda: shutdown_requested,
+    ):
+        max_requeue = int(os.environ.get("USER_SLOT_MAX_REQUEUE", "5") or 5)
+        gen = int(job_data.get("_user_slot_wait_gen") or 0) + 1
+        if gen <= max_requeue and not shutdown_requested:
+            job_data["_user_slot_wait_gen"] = gen
+            delay = min(5.0 * gen, 60.0)
+            logger.warning(
+                "[%s] user slot unavailable — requeue attempt %s/%s in %.0fs",
+                upload_id or "?",
+                gen,
+                max_requeue,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            await enqueue_process_lane_job(job_data)
+        else:
+            logger.error(
+                "[%s] user slot wait exhausted — job not requeued (gen=%s shutdown=%s)",
+                upload_id or "?",
+                gen,
+                shutdown_requested,
+            )
         return
     try:
         async with _process_semaphore:
@@ -4490,6 +4617,50 @@ async def _ensure_worker_heartbeat_schema() -> None:
             CREATE INDEX IF NOT EXISTS idx_worker_heartbeat_last_seen
                 ON worker_heartbeat (last_seen_at DESC)
         """)
+        for ddl in (
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS worker_lane TEXT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS service_name TEXT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS region TEXT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS memory_rss_mb REAL",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS memory_peak_mb REAL",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS memory_limit_mb REAL",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS heavy_pipeline_slots INT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS process_slots_in_use INT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS publish_slots_in_use INT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS active_process_jobs JSONB",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS active_publish_jobs JSONB",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS hostname TEXT",
+            "ALTER TABLE worker_heartbeat ADD COLUMN IF NOT EXISTS git_commit TEXT",
+        ):
+            await conn.execute(ddl)
+
+
+def _heartbeat_runtime_snapshot() -> dict:
+    """Collect memory, slot usage, and active jobs for this worker instance."""
+    from core.process_stats import (
+        format_semaphore_slots,
+        render_instance_context,
+        sample_memory_mb,
+        worker_config_snapshot,
+    )
+    from services.worker_runtime_state import snapshot as runtime_snapshot
+
+    mem = sample_memory_mb()
+    cfg = worker_config_snapshot()
+    inst = render_instance_context()
+    jobs = runtime_snapshot()
+    proc_slots = format_semaphore_slots(WORKER_CONCURRENCY, _process_semaphore)
+    pub_slots = format_semaphore_slots(PUBLISH_CONCURRENCY, _publish_semaphore)
+    heavy_slots = format_semaphore_slots(WORKER_HEAVY_PIPELINE_SLOTS, _heavy_semaphore)
+    return {
+        "mem": mem,
+        "cfg": cfg,
+        "inst": inst,
+        "jobs": jobs,
+        "proc_slots": proc_slots,
+        "pub_slots": pub_slots,
+        "heavy_slots": heavy_slots,
+    }
 
 
 async def run_heartbeat_loop() -> None:
@@ -4501,38 +4672,119 @@ async def run_heartbeat_loop() -> None:
     global shutdown_event
     await _ensure_worker_heartbeat_schema()
 
-    version = os.environ.get("RENDER_GIT_COMMIT", "")[:12] or None
+    snap = _heartbeat_runtime_snapshot()
+    version = snap["inst"].get("git_commit") or (
+        os.environ.get("RENDER_GIT_COMMIT", "")[:12] or None
+    )
+    mem_warn_pct = float(os.environ.get("MEMORY_WARN_PCT", "85") or 85)
+    last_mem_warn_at = 0.0
 
     # Upsert started_at on first beat so admin can see worker uptime
     if db_pool:
         try:
             async with db_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO worker_heartbeat
                         (worker_id, last_seen_at, started_at,
-                         worker_concurrency, publish_concurrency, version)
-                    VALUES ($1, NOW(), NOW(), $2, $3, $4)
+                         worker_concurrency, publish_concurrency, version,
+                         worker_lane, service_name, region, hostname, git_commit,
+                         heavy_pipeline_slots, memory_limit_mb)
+                    VALUES ($1, NOW(), NOW(), $2, $3, $4,
+                            $5, $6, $7, $8, $9, $10, $11)
                     ON CONFLICT (worker_id) DO UPDATE SET
                         started_at          = NOW(),
                         worker_concurrency  = EXCLUDED.worker_concurrency,
                         publish_concurrency = EXCLUDED.publish_concurrency,
                         version             = EXCLUDED.version,
+                        worker_lane         = EXCLUDED.worker_lane,
+                        service_name        = EXCLUDED.service_name,
+                        region              = EXCLUDED.region,
+                        hostname            = EXCLUDED.hostname,
+                        git_commit          = EXCLUDED.git_commit,
+                        heavy_pipeline_slots = EXCLUDED.heavy_pipeline_slots,
+                        memory_limit_mb     = EXCLUDED.memory_limit_mb,
                         last_seen_at        = NOW()
-                """, WORKER_ID, WORKER_CONCURRENCY, PUBLISH_CONCURRENCY, version)
+                    """,
+                    WORKER_ID,
+                    WORKER_CONCURRENCY,
+                    PUBLISH_CONCURRENCY,
+                    version,
+                    snap["cfg"]["worker_lane"],
+                    snap["inst"].get("service_name"),
+                    snap["inst"].get("region"),
+                    snap["inst"].get("hostname"),
+                    version,
+                    snap["cfg"]["heavy_pipeline_slots"],
+                    snap["mem"].get("limit_mb"),
+                )
         except Exception as e:
             logger.warning(f"Heartbeat init failed: {e}")
 
     logger.info(
-        f"Heartbeat loop started | worker_id={WORKER_ID} | interval={HEARTBEAT_INTERVAL}s"
+        "Heartbeat loop started | worker_id=%s | interval=%ss | lane=%s | "
+        "process=%s/%s publish=%s/%s heavy=%s/%s | rss=%sMB limit=%sMB",
+        WORKER_ID,
+        HEARTBEAT_INTERVAL,
+        snap["cfg"]["worker_lane"],
+        snap["proc_slots"]["in_use"],
+        snap["proc_slots"]["total"],
+        snap["pub_slots"]["in_use"],
+        snap["pub_slots"]["total"],
+        snap["heavy_slots"]["in_use"],
+        snap["heavy_slots"]["total"],
+        snap["mem"].get("rss_mb"),
+        snap["mem"].get("limit_mb"),
     )
+
+    import time as _time
 
     while not shutdown_requested:
         try:
+            snap = _heartbeat_runtime_snapshot()
+            mem = snap["mem"]
+            jobs = snap["jobs"]
             if db_pool:
                 async with db_pool.acquire() as conn:
                     await conn.execute(
-                        "UPDATE worker_heartbeat SET last_seen_at = NOW() WHERE worker_id = $1",
+                        """
+                        UPDATE worker_heartbeat SET
+                            last_seen_at = NOW(),
+                            memory_rss_mb = $2,
+                            memory_peak_mb = $3,
+                            process_slots_in_use = $4,
+                            publish_slots_in_use = $5,
+                            active_process_jobs = $6::jsonb,
+                            active_publish_jobs = $7::jsonb
+                        WHERE worker_id = $1
+                        """,
                         WORKER_ID,
+                        mem.get("rss_mb"),
+                        mem.get("peak_rss_mb"),
+                        snap["proc_slots"]["in_use"],
+                        snap["pub_slots"]["in_use"],
+                        json.dumps(jobs.get("active_process_jobs") or []),
+                        json.dumps(jobs.get("active_publish_jobs") or []),
+                    )
+            pct = mem.get("pct_of_limit")
+            if pct is not None and pct >= mem_warn_pct:
+                now = _time.monotonic()
+                if now - last_mem_warn_at >= 60:
+                    last_mem_warn_at = now
+                    logger.warning(
+                        "Memory pressure | rss=%sMB peak=%sMB limit=%sMB pct=%s%% | "
+                        "process_slots=%s/%s heavy=%s/%s | active_process=%s active_publish=%s | jobs=%s",
+                        mem.get("rss_mb"),
+                        mem.get("peak_rss_mb"),
+                        mem.get("limit_mb"),
+                        pct,
+                        snap["proc_slots"]["in_use"],
+                        snap["proc_slots"]["total"],
+                        snap["heavy_slots"]["in_use"],
+                        snap["heavy_slots"]["total"],
+                        jobs.get("process_count"),
+                        jobs.get("publish_count"),
+                        [j.get("upload_id") for j in (jobs.get("active_process_jobs") or [])[:5]],
                     )
         except Exception as e:
             # Don't crash the loop on transient DB issues — supervisor would
@@ -4630,9 +4882,36 @@ async def main() -> None:
     _ensure_worker_semaphores()
 
     lane = WORKER_LANE if WORKER_LANE in ("full", "process", "publish") else "full"
+    from core.process_stats import render_instance_context, sample_memory_mb, worker_config_snapshot
+
+    inst = render_instance_context()
+    mem = sample_memory_mb()
+    cfg = worker_config_snapshot()
     logger.info(
-        f"Worker lane={lane} | ASYNC_PUBLISH_QUEUE={ASYNC_PUBLISH_QUEUE} | "
-        f"WORKER_CONCURRENCY={WORKER_CONCURRENCY} | PUBLISH_CONCURRENCY={PUBLISH_CONCURRENCY}"
+        "Worker starting | instance=%s service=%s region=%s commit=%s | "
+        "lane=%s ASYNC_PUBLISH_QUEUE=%s | WORKER_CONCURRENCY=%s PUBLISH_CONCURRENCY=%s "
+        "HEAVY_PIPELINE_SLOTS=%s | rss=%sMB limit=%sMB",
+        inst.get("instance_id"),
+        inst.get("service_name"),
+        inst.get("region"),
+        inst.get("git_commit"),
+        lane,
+        ASYNC_PUBLISH_QUEUE,
+        WORKER_CONCURRENCY,
+        PUBLISH_CONCURRENCY,
+        WORKER_HEAVY_PIPELINE_SLOTS,
+        mem.get("rss_mb"),
+        mem.get("limit_mb"),
+    )
+    logger.info(
+        "Worker env snapshot | profile=%s streams=%s legacy_drain=%s "
+        "poll=%ss heartbeat=%ss stale_recovery=%s",
+        cfg.get("worker_pipeline_profile"),
+        os.environ.get("REDIS_JOB_USE_STREAMS", "false"),
+        REDIS_JOB_LEGACY_DRAIN,
+        POLL_INTERVAL,
+        HEARTBEAT_INTERVAL,
+        STALE_JOB_RECOVERY_ENABLED,
     )
 
     background_loops: List[Tuple[str, Any]] = [

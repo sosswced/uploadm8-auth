@@ -42,6 +42,7 @@ _HARD_BLOCK: Dict[str, str] = {
 
     # Source data is broken -- retrying won't help
     "VALIDATION":           "The upload data failed validation. Edit the upload (or re-upload the source), then retry.",
+    "SOURCE_NOT_IN_R2":     "The video file never finished uploading to storage. Start a new upload with the video file.",
 }
 
 # Codes that are inherently transient -- retrying often succeeds.

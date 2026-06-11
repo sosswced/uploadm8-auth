@@ -2562,39 +2562,24 @@ async def admin_workers_heartbeat(user: dict = Depends(require_master_admin)):
     Liveness rows written by worker heartbeat (see worker.run_heartbeat_loop).
     Table is auto-created by the worker on first run.
     """
+    from services.worker_fleet_snapshot import build_worker_fleet_snapshot
+
     if core.state.db_pool is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
-    try:
-        async with core.state.db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    worker_id,
-                    last_seen_at,
-                    started_at,
-                    worker_concurrency,
-                    publish_concurrency,
-                    version,
-                    EXTRACT(EPOCH FROM (NOW() - last_seen_at))::int AS seconds_since_last_beat,
-                    CASE
-                        WHEN NOW() - last_seen_at < INTERVAL '30 seconds' THEN 'alive'
-                        WHEN NOW() - last_seen_at < INTERVAL '2 minutes' THEN 'stale'
-                        ELSE 'dead'
-                    END AS status
-                FROM worker_heartbeat
-                ORDER BY last_seen_at DESC
-                """
-            )
-    except asyncpg.UndefinedTableError:
-        return {"workers": [], "note": "worker_heartbeat not initialized yet (start a worker)."}
-    out = []
-    for r in rows:
-        d = dict(r)
-        for k, v in list(d.items()):
-            if hasattr(v, "isoformat"):
-                d[k] = v.isoformat()
-        out.append(d)
-    return {"workers": out}
+    payload = await build_worker_fleet_snapshot(core.state.db_pool, core.state.redis_client)
+    if not payload.get("workers"):
+        payload["note"] = "worker_heartbeat not initialized yet (start a worker)."
+    return payload
+
+
+@router.get("/workers/fleet")
+async def admin_workers_fleet(user: dict = Depends(require_master_admin)):
+    """Alias for /workers/heartbeat with full fleet + queue snapshot."""
+    from services.worker_fleet_snapshot import build_worker_fleet_snapshot
+
+    if core.state.db_pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return await build_worker_fleet_snapshot(core.state.db_pool, core.state.redis_client)
 
 
 # ============================================================

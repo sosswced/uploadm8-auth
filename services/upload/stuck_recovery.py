@@ -20,6 +20,12 @@ from services.upload.schedule_guard import (
     mark_schedule_incomplete_failed,
     repair_upload_schedule,
 )
+from services.upload.r2_storage_guard import (
+    ERROR_SOURCE_NOT_IN_R2,
+    SOURCE_NOT_IN_R2_MESSAGE,
+    mark_source_not_in_r2_failed,
+    upload_source_present_in_r2,
+)
 
 logger = logging.getLogger("uploadm8-worker")
 
@@ -146,6 +152,18 @@ async def recover_auto_retry_failed_immediate(
         if recovered >= limit:
             break
         if not should_auto_retry_upload(dict(row), max_retries=max_retries):
+            continue
+        if not upload_source_present_in_r2(dict(row)):
+            await mark_source_not_in_r2_failed(
+                conn,
+                str(row["id"]),
+                detail=SOURCE_NOT_IN_R2_MESSAGE,
+            )
+            logger.error(
+                "[%s] auto-retry skipped: source missing in R2 — marked %s",
+                row["id"],
+                ERROR_SOURCE_NOT_IN_R2,
+            )
             continue
         arts = row.get("output_artifacts")
         if isinstance(arts, str):

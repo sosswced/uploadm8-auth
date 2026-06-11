@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, List
 
 from fastapi import HTTPException
 
 from core.helpers import _safe_col, sanitize_hashtag_body
+from core.r2 import r2_object_exists
 from core.sql_allowlist import UPLOADS_COMPLETE_BODY_COLUMNS, assert_set_fragments_columns
 from routers.preferences import get_user_prefs_for_upload
 
+from services.upload.r2_storage_guard import (
+    ERROR_SOURCE_NOT_IN_R2,
+    mark_source_not_in_r2_failed,
+)
 from services.upload.schedule_guard import (
     ERROR_SCHEDULE_INCOMPLETE,
     UPLOAD_ERROR_MESSAGES,
@@ -146,8 +152,32 @@ async def complete_upload_transaction(conn, upload_id: str, user_id: str, body: 
 
     await validate_upload_row_tiktok_settings(conn, dict(upload))
 
+    upload_dict = dict(upload)
+    r2_key = str(upload_dict.get("r2_key") or "").strip()
+    if not r2_key:
+        detail = UPLOAD_ERROR_MESSAGES[ERROR_SOURCE_NOT_IN_R2]
+        await mark_source_not_in_r2_failed(conn, upload_id, detail=detail)
+        raise HTTPException(
+            409,
+            detail={
+                "code": ERROR_SOURCE_NOT_IN_R2,
+                "message": detail,
+                "hint": "Start a new upload or use Retry from Queue after the video file reaches storage.",
+            },
+        )
+    if not await asyncio.to_thread(r2_object_exists, r2_key):
+        detail = UPLOAD_ERROR_MESSAGES[ERROR_SOURCE_NOT_IN_R2]
+        await mark_source_not_in_r2_failed(conn, upload_id, detail=detail)
+        raise HTTPException(
+            409,
+            detail={
+                "code": ERROR_SOURCE_NOT_IN_R2,
+                "message": detail,
+                "hint": "Upload the video file to storage first, then tap Complete again.",
+            },
+        )
+
     if schedule_mode in ("scheduled", "smart"):
-        upload_dict = dict(upload)
         if not upload_has_schedule(upload_dict):
             ok, _, _ = await repair_upload_schedule(conn, upload_dict)
             if not ok:

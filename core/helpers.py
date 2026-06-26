@@ -102,6 +102,18 @@ def _safe_json(v, default=None):
     return default
 
 
+def coerce_output_artifacts_dict(raw) -> dict:
+    """``uploads.output_artifacts`` should be a JSON object; tolerate list/null legacy rows."""
+    val = raw
+    if val is None:
+        val = {}
+    elif not isinstance(val, dict):
+        val = _safe_json(val, {})
+    if isinstance(val, dict):
+        return val
+    return {}
+
+
 def _valid_uuid(s: str) -> bool:
     """Return True if s is a valid UUID string (avoids 500 when frontend sends 'undefined' etc)."""
     if not s or not isinstance(s, str) or len(s) != 36:

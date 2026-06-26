@@ -1,0 +1,35 @@
+---
+description: UploadM8 backend Python — routers, services, stages, worker pipeline
+globs: "{routers,services,core,stages,api,schemas,migrations,jobs}/**/*.py"
+alwaysApply: false
+---
+
+# Backend Python
+
+## Routers
+
+- New endpoints go in the appropriate `routers/<domain>.py`, not `app.py`.
+- Handlers: validate input → call service → map errors → return response.
+- `tools/lint_routers.py` enforces per-file budgets; regenerate baseline only intentionally.
+
+## Services & core
+
+- DB access patterns live in `services/` and `core/`.
+- Shared upload logic: `services/upload/`.
+- Entitlements and tiers: `stages/entitlements.py`.
+
+## Worker pipeline
+
+- Stage modules in `stages/` — each stage is a focused unit.
+- `worker.py` orchestrates; do not duplicate stage logic in routers.
+
+## Tests
+
+- Unit tests in `tests/test_*.py`.
+- Run: `python run_tests.py unit` (fast) or `python run_tests.py tiers` for entitlement flows.
+- Eval harness: `python scripts/agent/eval_loop.py --mode unit`.
+
+## Migrations
+
+- Add migrations only in `migrations/runtime_migrations.py`.
+- Do not duplicate migration lists in `app.py`.

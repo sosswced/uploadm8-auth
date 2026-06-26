@@ -150,7 +150,9 @@ async def record_operational_incident(
 
     new_id: Optional[uuid.UUID] = None
     try:
-        async with pool.acquire() as conn:
+        from core.db_pool import acquire_db
+
+        async with acquire_db(pool) as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO operational_incidents

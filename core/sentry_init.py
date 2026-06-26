@@ -242,7 +242,12 @@ def _env_name() -> str | None:
         or os.environ.get("ENVIRONMENT")
         or ""
     ).strip()
-    return v or None
+    if v:
+        return v
+    base = (os.environ.get("BASE_URL") or "").strip().lower()
+    if any(h in base for h in ("127.0.0.1", "localhost")):
+        return "development"
+    return None
 
 
 def _release() -> str | None:

@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple
+
+from core.r2 import r2_object_head_status
 
 ERROR_SOURCE_NOT_IN_R2 = "SOURCE_NOT_IN_R2"
+ERROR_STORAGE_CHECK_UNAVAILABLE = "STORAGE_CHECK_UNAVAILABLE"
 
 SOURCE_NOT_IN_R2_MESSAGE = (
     "The video file did not finish uploading to storage. "
     "Re-upload the file, then complete the upload again."
 )
+
+R2HeadStatus = Literal["present", "missing", "unknown"]
 
 
 def upload_row_source_r2_key(upload_row: Any) -> str:
@@ -19,28 +24,20 @@ def upload_row_source_r2_key(upload_row: Any) -> str:
     return str(key or "").strip()
 
 
-def upload_source_present_in_r2(upload_row: Any) -> bool:
-    """True when the row has an r2_key and HeadObject would succeed (sync check)."""
+def upload_source_head_status(upload_row: Any) -> R2HeadStatus:
+    """``present`` / ``missing`` / ``unknown`` — never conflate unknown with missing."""
     key = upload_row_source_r2_key(upload_row)
     if not key:
-        return False
-    try:
-        from core.r2 import r2_object_exists
-
-        return bool(r2_object_exists(key))
-    except Exception:
-        return False
+        return "missing"
+    return r2_object_head_status(key)  # type: ignore[return-value]
 
 
-def classify_r2_head_not_found(exc: BaseException) -> Optional[Tuple[str, str]]:
-    """Map boto HeadObject 404 (missing source object) to a user-facing error code."""
-    msg = str(exc or "")
-    low = msg.lower()
-    if "headobject" not in low:
-        return None
-    if "404" not in msg and "not found" not in low:
-        return None
-    return ERROR_SOURCE_NOT_IN_R2, SOURCE_NOT_IN_R2_MESSAGE
+def upload_source_present_in_r2(upload_row: Any) -> bool:
+    return upload_source_head_status(upload_row) == "present"
+
+
+def upload_source_definitely_missing_in_r2(upload_row: Any) -> bool:
+    return upload_source_head_status(upload_row) == "missing"
 
 
 async def mark_source_not_in_r2_failed(
@@ -63,3 +60,14 @@ async def mark_source_not_in_r2_failed(
         ERROR_SOURCE_NOT_IN_R2,
         text,
     )
+
+
+def classify_r2_head_not_found(exc: BaseException) -> Optional[Tuple[str, str]]:
+    """Map boto HeadObject 404 (missing source object) to a user-facing error code."""
+    msg = str(exc or "")
+    low = msg.lower()
+    if "headobject" not in low:
+        return None
+    if "404" not in msg and "not found" not in low:
+        return None
+    return ERROR_SOURCE_NOT_IN_R2, SOURCE_NOT_IN_R2_MESSAGE

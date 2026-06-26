@@ -1,0 +1,44 @@
+---
+description: UploadM8 agent orchestration — subagents, parallel lanes, eval loops, dynamic workflows
+globs: "{.cursor/**,scripts/agent/**,AGENTS.md,docs/agent-stack.md}"
+alwaysApply: false
+---
+
+# Agent orchestration
+
+## Entry points
+
+| User intent | Command / skill |
+|-------------|-----------------|
+| Fix tests | `/fix-tests`, `uploadm8-eval-loop` |
+| Full cycle | `/ascended-loop`, `uploadm8-agent-orchestrator` |
+| Deep plan | `/ultrathink`, `uploadm8-ultrathink` |
+| Eval-driven feature | `/ultracode`, `uploadm8-ultracode` |
+| Parallel lanes | `/five-windows`, `uploadm8-worktrees` |
+| Both repos | `/multi-repo-ship`, `uploadm8-multi-repo` |
+| CI red | `uploadm8-ascended-ci` |
+| Unsure workflow | `python scripts/agent/dynamic_workflow.py --json` |
+| **Full stack / go live** | **`/trill`**, **`trill`** skill |
+
+## Parallel pattern
+
+One turn, multiple Task subagents:
+
+```
+explore + bugbot + ci-investigator (when CI failing)
+```
+
+## Hooks enforce
+
+- sessionStart → read AGENTS.md
+- afterFileEdit → suggest tests
+- beforeShellExecution → block force-push main, .env staging
+- subagentStop → chain eval_loop after review
+
+## Headless
+
+Long runs: Task with `run_in_background: true` + `subagent_type: shell`.
+
+## Agent-built tooling
+
+Register repeat scripts via `scripts/agent/register_tool.py` and `uploadm8-agent-tooling` skill.

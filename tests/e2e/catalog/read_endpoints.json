@@ -1,0 +1,745 @@
+{
+  "count": 148,
+  "cases": [
+    {
+      "method": "GET",
+      "path": "/api/admin/activity",
+      "summary": "Get Admin Activity"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/all-failures",
+      "summary": "Admin All Failures"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/analytics/overview",
+      "summary": "Admin Analytics Overview"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/analytics/revenue",
+      "summary": "Admin Analytics Revenue"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/analytics/users",
+      "summary": "Admin Analytics Users"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/announcements",
+      "summary": "Get Announcements"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/audit",
+      "summary": "Admin Audit"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/audit/data-integrity",
+      "summary": "Admin Audit Data Integrity"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/billing/catalog",
+      "summary": "Admin Get Billing Catalog"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/billing/effective-tiers",
+      "summary": "Admin Get Effective Tiers"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/billing/service-weights",
+      "summary": "Admin Get Billing Service Weights"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/calculator/pricing",
+      "summary": "Get Admin Calculator Pricing"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/catalog/pricing-requests",
+      "summary": "List Pricing Requests"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/catalog/products",
+      "summary": "List Catalog Products"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/catalog/sync-log",
+      "summary": "Get Sync Log"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/chart/revenue",
+      "summary": "Get Chart Revenue"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/chart/users",
+      "summary": "Get Chart Users"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/countries",
+      "summary": "Get Countries"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/integrations/thumbnail-provider",
+      "summary": "Integrations Thumbnail Provider"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/burn",
+      "summary": "Kpi Burn"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/cost-tracker",
+      "summary": "Kpi Cost Tracker"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/costs",
+      "summary": "Get Kpi Costs"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/funnels",
+      "summary": "Kpi Funnels"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/growth",
+      "summary": "Get Kpi Growth"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/margins",
+      "summary": "Kpi Margins"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/overview",
+      "summary": "Kpi Overview"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/pikzels-template-render",
+      "summary": "Kpi Pikzels Template Render"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/pikzels-v2-usage",
+      "summary": "Kpi Pikzels V2 Usage"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/provider-costs",
+      "summary": "Kpi Provider Costs"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/recognition",
+      "summary": "Get Kpi Recognition"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/reliability",
+      "summary": "Get Kpi Reliability"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/revenue",
+      "summary": "Get Kpi Revenue"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpi/usage",
+      "summary": "Get Kpi Usage"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/kpis",
+      "summary": "Get Admin Kpis"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/leaderboard",
+      "summary": "Get Leaderboard"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/accounts",
+      "summary": "Marketing Accounts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/ai/decisions",
+      "summary": "Marketing Ai Decisions"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/ai/decisions.csv",
+      "summary": "Marketing Ai Decisions Csv"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/ai/presets",
+      "summary": "Marketing Ai Presets"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/ai/truth",
+      "summary": "Marketing Ai Truth"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/approval-tickets",
+      "summary": "Marketing Approval Tickets List"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/campaigns",
+      "summary": "Marketing Campaigns List"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/campaigns/pending-approval/list",
+      "summary": "Marketing Pending Approval List"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/campaigns/00000000-0000-0000-0000-000000000001/audience.csv",
+      "summary": "Marketing Campaign Audience Csv"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/execution/heartbeat",
+      "summary": "Marketing Execution Heartbeat"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/intel",
+      "summary": "Marketing Intel"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/promo-media-defaults",
+      "summary": "Marketing Promo Media Defaults"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/reports/bundle",
+      "summary": "Marketing Reports Bundle"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/reports/conversion-proxy",
+      "summary": "Marketing Reports Conversion Proxy"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/reports/uplift",
+      "summary": "Marketing Reports Uplift"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/marketing/reports/variant-leaderboard",
+      "summary": "Marketing Reports Variant Leaderboard"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/ml/engine-status",
+      "summary": "Ml Engine Status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/ml/feature-catalog",
+      "summary": "Ml Feature Catalog"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/ml/loop-reports",
+      "summary": "Ml Loop Reports"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/ml/observability-overview",
+      "summary": "Ml Observability Overview"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/ml/observability-trends",
+      "summary": "Ml Observability Trends"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/ml/priors/latest",
+      "summary": "Ml Priors Latest"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/ml/variant-leaderboard",
+      "summary": "Ml Variant Leaderboard"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/notification-settings",
+      "summary": "Get Notification Settings"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/operational-incidents",
+      "summary": "Admin Operational Incidents"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/settings",
+      "summary": "Get Admin Settings"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/top-users",
+      "summary": "Get Admin Top Users"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/trill-display-names/pending",
+      "summary": "Admin Trill Display Names Pending"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/upload-ai-trace",
+      "summary": "Admin Upload Ai Trace"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/users",
+      "summary": "Admin Get Users"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/users/0af99456-1002-49f8-8554-e4d4405e5884/wallet",
+      "summary": "Admin Get User Wallet"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/wallet-disputes",
+      "summary": "Admin Wallet Disputes"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/workers/heartbeat",
+      "summary": "Admin Workers Heartbeat"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics",
+      "summary": "Get Analytics"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/export",
+      "summary": "Analytics Export"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/my-avg-processing",
+      "summary": "My Avg Processing"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/overview",
+      "summary": "Analytics Overview"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/pikzels-v2-usage",
+      "summary": "Analytics Pikzels V2 Usage"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/platform-metrics",
+      "summary": "Get Platform Metrics"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/platform-metrics/cached",
+      "summary": "Get Platform Metrics Cached"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/quality-scores",
+      "summary": "Analytics Quality Scores"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/top-content",
+      "summary": "Analytics Top Content"
+    },
+    {
+      "method": "GET",
+      "path": "/api/analytics/upload-counts-by-token",
+      "summary": "Analytics Upload Counts By Token"
+    },
+    {
+      "method": "GET",
+      "path": "/api/billing/overview",
+      "summary": "Billing Overview"
+    },
+    {
+      "method": "GET",
+      "path": "/api/billing/session",
+      "summary": "Get Billing Session"
+    },
+    {
+      "method": "GET",
+      "path": "/api/billing/subscription/actions",
+      "summary": "Billing Subscription Actions"
+    },
+    {
+      "method": "GET",
+      "path": "/api/catalog/aggregate",
+      "summary": "Get Catalog Aggregate Endpoint"
+    },
+    {
+      "method": "GET",
+      "path": "/api/catalog/content",
+      "summary": "Get Catalog Content"
+    },
+    {
+      "method": "GET",
+      "path": "/api/catalog/sync-status",
+      "summary": "Get Catalog Sync Status"
+    },
+    {
+      "method": "GET",
+      "path": "/api/dashboard",
+      "summary": "Get Dashboard Alias"
+    },
+    {
+      "method": "GET",
+      "path": "/api/dashboard/stats",
+      "summary": "Get Dashboard Stats"
+    },
+    {
+      "method": "GET",
+      "path": "/api/entitlements",
+      "summary": "Get Entitlements"
+    },
+    {
+      "method": "GET",
+      "path": "/api/entitlements/thumbnail-studio-formats",
+      "summary": "Get Thumbnail Studio Layout Formats"
+    },
+    {
+      "method": "GET",
+      "path": "/api/entitlements/thumbnail-studio-niches",
+      "summary": "Get Thumbnail Studio Niches"
+    },
+    {
+      "method": "GET",
+      "path": "/api/entitlements/tiers",
+      "summary": "Get Entitlements Tiers"
+    },
+    {
+      "method": "GET",
+      "path": "/api/features/ml-hub",
+      "summary": "Ml Hub Public"
+    },
+    {
+      "method": "GET",
+      "path": "/api/groups",
+      "summary": "Get Groups"
+    },
+    {
+      "method": "GET",
+      "path": "/api/groups/00000000-0000-0000-0000-000000000001",
+      "summary": "Get Group"
+    },
+    {
+      "method": "GET",
+      "path": "/api/me",
+      "summary": "Get Me"
+    },
+    {
+      "method": "GET",
+      "path": "/api/me/ai-insights",
+      "summary": "Get Me Ai Insights"
+    },
+    {
+      "method": "GET",
+      "path": "/api/me/coach",
+      "summary": "Get Me Coach"
+    },
+    {
+      "method": "GET",
+      "path": "/api/me/content-insights",
+      "summary": "Get Me Content Insights"
+    },
+    {
+      "method": "GET",
+      "path": "/api/me/content-insights/optimize-preview",
+      "summary": "Get Me Content Insights Optimize Preview"
+    },
+    {
+      "method": "GET",
+      "path": "/api/me/preferences",
+      "summary": "Get Preferences"
+    },
+    {
+      "method": "GET",
+      "path": "/api/me/smart-insights",
+      "summary": "Get Me Ai Insights"
+    },
+    {
+      "method": "GET",
+      "path": "/api/me/white-label",
+      "summary": "Get White Label"
+    },
+    {
+      "method": "GET",
+      "path": "/api/platforms",
+      "summary": "Get Platforms"
+    },
+    {
+      "method": "GET",
+      "path": "/api/scheduled/list",
+      "summary": "Get Scheduled List"
+    },
+    {
+      "method": "GET",
+      "path": "/api/scheduled/bootstrap",
+      "summary": "Get Scheduled Bootstrap"
+    },
+    {
+      "method": "GET",
+      "path": "/api/scheduled/stats",
+      "summary": "Get Scheduled Stats"
+    },
+    {
+      "method": "GET",
+      "path": "/api/scheduled/0ad8c0a8-a1d1-49dd-841b-1d85630929d6",
+      "summary": "Get Scheduled Upload"
+    },
+    {
+      "method": "GET",
+      "path": "/api/settings",
+      "summary": "Get Settings"
+    },
+    {
+      "method": "GET",
+      "path": "/api/settings/channel-catalog",
+      "summary": "Get Channel Visual Catalog"
+    },
+    {
+      "method": "GET",
+      "path": "/api/settings/preferences",
+      "summary": "Get User Preferences"
+    },
+    {
+      "method": "GET",
+      "path": "/api/shell/bootstrap",
+      "summary": "Get Shell Bootstrap"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/ab-export/00000000-0000-0000-0000-000000000001",
+      "summary": "Ts Ab Export"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/cdn-preview",
+      "summary": "Thumbnail Studio Cdn Preview"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/hydration-context",
+      "summary": "Ts Hydration Context"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/youtube-preview",
+      "summary": "Ts Youtube Preview"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/jobs",
+      "summary": "Ts List Jobs"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/jobs/00000000-0000-0000-0000-000000000001",
+      "summary": "Ts Get Job"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/personas",
+      "summary": "Ts List Personas"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-analyzer/analyses",
+      "summary": "Ts Pikzels Analyzer List"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-analyzer/analyses/00000000-0000-0000-0000-000000000001",
+      "summary": "Ts Pikzels Analyzer Get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-analyzer/analyses/00000000-0000-0000-0000-000000000001/ab-export",
+      "summary": "Ts Pikzels Analyzer Ab Export"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-analyzer/recommendations",
+      "summary": "Ts Pikzels Analyzer Recommendations"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-analyzer/score-trend",
+      "summary": "Ts Pikzels Analyzer Score Trend"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-analyzer/uploads/0ad8c0a8-a1d1-49dd-841b-1d85630929d6/latest",
+      "summary": "Ts Pikzels Analyzer Latest For Upload"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-v2-map",
+      "summary": "Ts Pikzels Map"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-v2/assets",
+      "summary": "Ts Pikzels Assets"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/pikzels-v2/pikzonality/00000000-0000-0000-0000-000000000001",
+      "summary": "Ts Pikzels Poll"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/weekly-digest",
+      "summary": "Ts Weekly Digest"
+    },
+    {
+      "method": "GET",
+      "path": "/api/thumbnail-studio/youtube-references",
+      "summary": "Get Thumbnail Studio Youtube References"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/badges/catalog",
+      "summary": "Trill Badge Catalog"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/badges/me",
+      "summary": "Trill My Badges"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/driver/00000000-0000-0000-0000-000000000001",
+      "summary": "Trill Driver Profile"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/leaderboard",
+      "summary": "Trill Leaderboard"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/leaderboard/regions",
+      "summary": "Trill Leaderboard Regions"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/map-feed",
+      "summary": "Trill Map Feed"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/onboarding-state",
+      "summary": "Trill Onboarding State"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/places",
+      "summary": "Get Trill Places"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/qualification-debug",
+      "summary": "Trill Qualification Debug"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/rivals",
+      "summary": "List Trill Rivals"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trill/route/0ad8c0a8-a1d1-49dd-841b-1d85630929d6",
+      "summary": "Trill Route Downsample"
+    },
+    {
+      "method": "GET",
+      "path": "/api/uploads",
+      "summary": "Get Uploads"
+    },
+    {
+      "method": "GET",
+      "path": "/api/uploads/queue-stats",
+      "summary": "Get Uploads Queue Stats"
+    },
+    {
+      "method": "GET",
+      "path": "/api/uploads/thumbnails/poll",
+      "summary": "Poll Upload Thumbnails"
+    },
+    {
+      "method": "GET",
+      "path": "/api/uploads/0ad8c0a8-a1d1-49dd-841b-1d85630929d6",
+      "summary": "Get Upload Details"
+    },
+    {
+      "method": "GET",
+      "path": "/api/uploads/0ad8c0a8-a1d1-49dd-841b-1d85630929d6/thumbnail",
+      "summary": "Get Upload Thumbnail"
+    },
+    {
+      "method": "GET",
+      "path": "/api/wallet",
+      "summary": "Get Wallet Endpoint"
+    },
+    {
+      "method": "GET",
+      "path": "/api/wallet/disputes",
+      "summary": "List My Wallet Disputes"
+    },
+    {
+      "method": "GET",
+      "path": "/api/wallet/ledger",
+      "summary": "Get Wallet Ledger"
+    },
+    {
+      "method": "GET",
+      "path": "/api/workspace",
+      "summary": "Get Workspace"
+    }
+  ]
+}

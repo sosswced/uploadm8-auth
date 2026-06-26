@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "python .cursor/hooks/session_start.py"
+      }
+    ],
+    "afterFileEdit": [
+      {
+        "command": "python .cursor/hooks/after_edit.py"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "python .cursor/hooks/before_shell.py",
+        "failClosed": false
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "python .cursor/hooks/subagent_stop.py"
+      }
+    ]
+  }
+}

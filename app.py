@@ -134,7 +134,12 @@ async def lifespan(app: FastAPI):
         stripe.api_version = "2025-03-31.basil"
 
     core.state.db_pool = await asyncpg.create_pool(
-        DATABASE_URL, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX, init=_init_asyncpg_codecs
+        DATABASE_URL,
+        min_size=DB_POOL_MIN,
+        max_size=DB_POOL_MAX,
+        init=_init_asyncpg_codecs,
+        max_inactive_connection_lifetime=300,
+        command_timeout=60,
     )
     await _load_uploads_columns(core.state.db_pool)
     logger.info("Database connected")
@@ -345,9 +350,29 @@ async def _cors_safe_500_handler(request: Request, exc: Exception):
     if isinstance(exc, RequestValidationError):
         return await request_validation_exception_handler(request, exc)
 
+    from core.db_pool import is_transient_db_error
+
     origin = request.headers.get("origin", "")
     allowed = ALLOWED_ORIGINS_LIST
     cors_origin = origin if origin in allowed else (allowed[0] if allowed else "*")
+    cors_headers = {
+        "Access-Control-Allow-Origin": cors_origin,
+        "Access-Control-Allow-Credentials": "true",
+    }
+
+    if is_transient_db_error(exc):
+        logger.warning(
+            "Transient database error on %s %s: %s: %s",
+            request.method,
+            request.url.path,
+            type(exc).__name__,
+            exc,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Database temporarily unavailable"},
+            headers=cors_headers,
+        )
 
     logger.error(
         f"Unhandled exception on {request.method} {request.url.path}: "

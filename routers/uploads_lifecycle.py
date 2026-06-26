@@ -10,12 +10,21 @@ from typing import Dict, List, Optional
 import core.state
 from core.audit import log_system_event
 from core.cancel_signal import clear_cancel_signal, signal_cancel
+from core.db_pool import acquire_db
 from core.deps import get_current_user, get_current_user_readonly
 from core.queue import enqueue_job
 from core.r2 import _delete_r2_objects, generate_presigned_upload_url
 from core.wallet import refund_tokens
 from core.models import UploadInit
 from routers.preferences import get_user_prefs_for_upload
+from services.upload.r2_storage_guard import (
+    ERROR_SOURCE_NOT_IN_R2,
+    ERROR_STORAGE_CHECK_UNAVAILABLE,
+    SOURCE_NOT_IN_R2_MESSAGE,
+    upload_source_definitely_missing_in_r2,
+    upload_source_head_status,
+    upload_source_present_in_r2,
+)
 from services.upload.schedule_guard import build_smart_schedule_for_upload, schedule_slot_iso
 from services.scheduling_preview import preview_response_payload
 from services.upload.inline_rescue import inline_rescue_if_stuck
@@ -343,9 +352,9 @@ async def requeue_upload(
 
     Clears error fields and re-runs the /complete transition (enqueue or stage).
     """
-    async with core.state.db_pool.acquire() as conn:
+    async with acquire_db(core.state.db_pool) as conn:
         upload = await conn.fetchrow(
-            "SELECT id, status FROM uploads WHERE id = $1 AND user_id = $2",
+            "SELECT id, status, r2_key FROM uploads WHERE id = $1 AND user_id = $2",
             upload_id,
             user["id"],
         )
@@ -357,6 +366,24 @@ async def requeue_upload(
                 detail={
                     "code": "not_requeueable",
                     "message": "Only pending uploads can be re-queued. Use Retry for failed uploads.",
+                },
+            )
+        head_status = upload_source_head_status(upload)
+        if head_status == "missing":
+            raise HTTPException(
+                409,
+                detail={
+                    "code": ERROR_SOURCE_NOT_IN_R2,
+                    "message": SOURCE_NOT_IN_R2_MESSAGE,
+                    "hint": "Re-upload the video file, then re-queue.",
+                },
+            )
+        if head_status == "unknown":
+            raise HTTPException(
+                503,
+                detail={
+                    "code": ERROR_STORAGE_CHECK_UNAVAILABLE,
+                    "message": "Storage check temporarily unavailable. Try again in a moment.",
                 },
             )
         await conn.execute(

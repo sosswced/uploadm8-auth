@@ -27,6 +27,7 @@ from core.config import (
 import core.state
 from core.upload_preference_dependencies import normalize_preferences_dict
 from core.cookie_auth import clear_auth_cookies
+from core.db_pool import acquire_db
 from core.deps import (
     get_current_user,
     get_current_user_readonly,
@@ -113,7 +114,7 @@ async def get_me(user_id: str = Depends(get_verified_user_id)):
     user, thumbnail_personas = await fetch_me_endpoint_data(pool, user_id)
     payload = build_me_response(user)
     payload["thumbnail_personas"] = thumbnail_personas
-    async with pool.acquire() as conn:
+    async with acquire_db(pool) as conn:
         branding = await branding_payload_for_user(conn, user)
         if branding:
             payload["branding"] = branding

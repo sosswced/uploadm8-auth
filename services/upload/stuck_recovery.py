@@ -24,7 +24,8 @@ from services.upload.r2_storage_guard import (
     ERROR_SOURCE_NOT_IN_R2,
     SOURCE_NOT_IN_R2_MESSAGE,
     mark_source_not_in_r2_failed,
-    upload_source_present_in_r2,
+    upload_source_definitely_missing_in_r2,
+    upload_source_head_status,
 )
 
 logger = logging.getLogger("uploadm8-worker")
@@ -153,7 +154,7 @@ async def recover_auto_retry_failed_immediate(
             break
         if not should_auto_retry_upload(dict(row), max_retries=max_retries):
             continue
-        if not upload_source_present_in_r2(dict(row)):
+        if upload_source_head_status(dict(row)) == "missing":
             await mark_source_not_in_r2_failed(
                 conn,
                 str(row["id"]),

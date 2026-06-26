@@ -1114,10 +1114,18 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         from services.upload.r2_storage_guard import (
             ERROR_SOURCE_NOT_IN_R2,
             SOURCE_NOT_IN_R2_MESSAGE,
-            upload_source_present_in_r2,
+            upload_source_head_status,
         )
 
-        if not upload_source_present_in_r2(upload_record):
+        r2_status = upload_source_head_status(upload_record)
+        if r2_status == "unknown":
+            logger.warning(
+                "[%s] R2 head check inconclusive for %r — deferring job",
+                upload_id,
+                upload_record.get("r2_key"),
+            )
+            return
+        if r2_status == "missing":
             logger.error(
                 f"[{upload_id}] source object missing in R2 at {upload_record.get('r2_key')!r} — aborting pipeline"
             )
@@ -1819,75 +1827,14 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             logger.warning(f"[{upload_id}] Thumbnail error: {e.message}")
             _ai_trace(ctx, upload_id, "thumbnail", {"status": "error", "reason": e.message})
 
-        # ── Pikzels render failures → one admin ops_incident per upload ─────
-        # ``output_artifacts.pikzels_render_failures`` lists per-platform faults.
-        # Emit a single consolidated incident per upload so ops paging dedupes
-        # cleanly but every failed platform stays visible in ``details``.
-        try:
-            arts = ctx.output_artifacts if isinstance(ctx.output_artifacts, dict) else {}
-            raw_pf = arts.get("pikzels_render_failures")
-            if isinstance(raw_pf, str) and raw_pf.strip():
-                failures = json.loads(raw_pf)
-                if isinstance(failures, list) and failures:
-                    from services.ops_incidents import record_operational_incident
+        from services.thumbnail_ops import record_pikzels_render_failures_incident
 
-                    rows: List[Dict[str, Any]] = []
-                    for f in failures:
-                        if not isinstance(f, dict):
-                            continue
-                        plat = str(f.get("platform") or "unknown").lower()
-                        status_code = f.get("http_status")
-                        status_label = str(status_code) if status_code not in (None, "", "unknown") else "unknown"
-                        msg = str(f.get("message") or "")[:1000]
-                        rows.append(
-                            {
-                                "platform": plat,
-                                "http_status": status_code,
-                                "http_label": status_label,
-                                "message": msg,
-                            }
-                        )
-                    if rows:
-                        plat_summary = ",".join(r["platform"] for r in rows[:12])
-                        lines = "\n".join(
-                            f"  • {r['platform']}: HTTP {r['http_label']} — {(r['message'] or '')[:280]}"
-                            for r in rows
-                        )
-                        body = lines or "Pikzels studio renderer did not return usable images."
-                        types_suffix = ":".join(
-                            f"{r['platform']}:{r['http_label']}"
-                            for r in rows[:4]
-                        )[:80]
-                        pikzels_payment_required = all(
-                            str(r.get("http_label") or "") == "402" for r in rows
-                        )
-                        try:
-                            await record_operational_incident(
-                                db_pool,
-                                source="thumbnail",
-                                incident_type=(
-                                    f"pikzels_render_failed:{types_suffix}"
-                                    if types_suffix
-                                    else "pikzels_render_failed"
-                                )[:120],
-                                subject=(
-                                    f"Pikzels render failed ({len(rows)} platform(s)): {plat_summary}"
-                                )[:200],
-                                body=body[:8000],
-                                details={
-                                    "upload_id": str(upload_id),
-                                    "user_id": str(user_id) if user_id else None,
-                                    "failures": rows,
-                                },
-                                user_id=str(user_id) if user_id else None,
-                                upload_id=str(upload_id),
-                                alert_email=not pikzels_payment_required,
-                                alert_discord=not pikzels_payment_required,
-                            )
-                        except Exception as _pfe:
-                            logger.debug(f"[{upload_id}] pikzels ops_incident emit failed: {_pfe}")
-        except Exception as _pfo:
-            logger.debug(f"[{upload_id}] pikzels failure scan: {_pfo}")
+        await record_pikzels_render_failures_incident(
+            db_pool,
+            upload_id=str(upload_id),
+            user_id=str(user_id) if user_id else None,
+            output_artifacts=ctx.output_artifacts,
+        )
 
         if not ctx.thumbnail_path or not Path(ctx.thumbnail_path).exists():
             logger.warning(
@@ -4292,22 +4239,25 @@ async def run_stale_job_recovery_loop() -> None:
 
                         # No checkpoint (or verify failed): full re-process beats leaving a zombie row.
                         ur = ur or await db_stage.load_upload_record(db_pool, up)
-                        if ur and not upload_source_present_in_r2(ur):
+                        if ur:
                             from services.upload.r2_storage_guard import (
                                 mark_source_not_in_r2_failed,
                                 SOURCE_NOT_IN_R2_MESSAGE,
+                                upload_source_head_status,
                             )
 
-                            async with db_pool.acquire() as uconn:
-                                await mark_source_not_in_r2_failed(
-                                    uconn,
-                                    up,
-                                    detail=SOURCE_NOT_IN_R2_MESSAGE,
+                            r2_status = upload_source_head_status(ur)
+                            if r2_status == "missing":
+                                async with db_pool.acquire() as uconn:
+                                    await mark_source_not_in_r2_failed(
+                                        uconn,
+                                        up,
+                                        detail=SOURCE_NOT_IN_R2_MESSAGE,
+                                    )
+                                logger.error(
+                                    f"[{up}] stale recovery: source missing in R2 — marked SOURCE_NOT_IN_R2"
                                 )
-                            logger.error(
-                                f"[{up}] stale recovery: source missing in R2 — marked SOURCE_NOT_IN_R2"
-                            )
-                            continue
+                                continue
                         deferred = False
                         if ur:
                             deferred = str(ur.get("schedule_mode") or "immediate").lower() in (

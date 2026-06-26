@@ -22,6 +22,7 @@ from stages.m8_engine_brand import (
     M8_ENGINE_FAMILY_TAGLINE,
     M8_ENGINE_SLUG,
 )
+from core.db_pool import acquire_db
 
 logger = logging.getLogger("uploadm8.growth_intelligence")
 
@@ -849,7 +850,7 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
         return coach_endpoint_fallback("free")
 
     async def _acquire_run(coro):
-        async with pool.acquire() as c:
+        async with acquire_db(pool) as c:
             return await coro(c)
 
     async def _bl(c):

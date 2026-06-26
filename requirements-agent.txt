@@ -1,0 +1,3 @@
+# Optional deps for UploadM8 agent MCP server (Level 8)
+# Install: pip install -r requirements-agent.txt
+mcp>=1.0.0

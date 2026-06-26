@@ -10,6 +10,7 @@ from fastapi import HTTPException, Request, Header, Depends
 import core.state
 from core.auth import verify_access_jwt
 from core.cookie_auth import access_token_from_cookie
+from core.db_pool import acquire_db
 from core.wallet import get_wallet, daily_refill
 from services.workspace import get_workspace_for_user, billing_user_id
 
@@ -89,7 +90,7 @@ async def get_current_user(request: Request, authorization: Optional[str] = Head
             raise HTTPException(401, "Missing authorization")
         raise HTTPException(401, "Invalid token")
 
-    async with core.state.db_pool.acquire() as conn:
+    async with acquire_db(core.state.db_pool) as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
         if not user: raise HTTPException(401, "User not found")
         if user["status"] == "banned": raise HTTPException(403, "Account suspended")
@@ -128,7 +129,7 @@ async def get_current_user_readonly(request: Request, authorization: Optional[st
             raise HTTPException(401, "Missing authorization")
         raise HTTPException(401, "Invalid token")
 
-    async with core.state.db_pool.acquire() as conn:
+    async with acquire_db(core.state.db_pool) as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
         if not user:
             raise HTTPException(401, "User not found")
@@ -163,7 +164,7 @@ async def get_current_user_readonly_no_wallet(
             raise HTTPException(401, "Missing authorization")
         raise HTTPException(401, "Invalid token")
 
-    async with core.state.db_pool.acquire() as conn:
+    async with acquire_db(core.state.db_pool) as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
         if not user:
             raise HTTPException(401, "User not found")

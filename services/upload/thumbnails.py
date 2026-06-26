@@ -10,12 +10,13 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 from core.config import R2_BUCKET_NAME
-from core.helpers import _safe_json
+from core.helpers import _safe_json, coerce_output_artifacts_dict
 from core.media_mirror import is_hotlink_blocked_image_url
 from core.r2 import _normalize_r2_key, get_s3_client, r2_object_exists
 from services.platform_posted_thumbnails import (
     PLATFORM_THUMB_PRIORITY,
     pick_primary_thumbnail_url,
+    platform_video_id_from_result,
     posted_platform_thumbnail_urls_from_results,
 )
 
@@ -50,9 +51,7 @@ def _normalize_platform_results_detail(raw: Any) -> List[dict]:
 
 def thumbnail_render_method_from_artifacts(raw: Any) -> str:
     """Worker-persisted thumbnail pipeline method (studio_renderer, template, none, …)."""
-    artifacts = _safe_json(raw, {})
-    if not isinstance(artifacts, dict):
-        return ""
+    artifacts = coerce_output_artifacts_dict(raw)
     return str(artifacts.get("thumbnail_render_method") or "").strip().lower()
 
 
@@ -71,7 +70,7 @@ def pikzels_template_thumbnail_warning(raw_artifacts: Any) -> Optional[Dict[str,
             return None
     except Exception:
         return None
-    artifacts = _safe_json(raw_artifacts, {}) or {}
+    artifacts = coerce_output_artifacts_dict(raw_artifacts)
     skip_reason = ""
     raw_report = artifacts.get("studio_render_report")
     if isinstance(raw_report, str) and raw_report.strip():
@@ -203,6 +202,64 @@ def resolve_upload_thumbnail_r2_key(
     return keys[0] if keys else None
 
 
+def first_verified_thumbnail_r2_key(
+    *,
+    thumbnail_r2_key: Optional[str],
+    output_artifacts: Any,
+    platform_results: Any,
+    upload_platforms: Optional[List[str]] = None,
+) -> Optional[str]:
+    """First candidate R2 key that actually exists (avoids proxy 404s)."""
+    for key in resolve_upload_thumbnail_r2_keys_ordered(
+        thumbnail_r2_key=thumbnail_r2_key,
+        output_artifacts=output_artifacts,
+        platform_results=platform_results,
+        upload_platforms=upload_platforms,
+    ):
+        norm = _normalize_r2_key(key)
+        try:
+            if r2_object_exists(norm):
+                return key
+        except Exception:
+            continue
+    return None
+
+
+def enrich_posted_thumbnail_urls(
+    platform_results: Any,
+    posted_urls: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Add cheap offline fallbacks (e.g. YouTube CDN from video id) when sync has not run."""
+    from services.thumbnail_studio import youtube_reference_thumbnail_url
+
+    platform_results_norm = _normalize_platform_results_detail(platform_results)
+    out = dict(posted_urls or {})
+    out = dict(
+        posted_platform_thumbnail_urls_from_results(platform_results_norm),
+        **out,
+    )
+    for pr in platform_results_norm:
+        if not isinstance(pr, dict) or pr.get("success") is False:
+            continue
+        plat = str(pr.get("platform") or "").lower().strip()
+        if not plat or str(out.get(plat) or "").strip().startswith("http"):
+            continue
+        if plat == "youtube":
+            vid = platform_video_id_from_result(pr)
+            if vid:
+                url = youtube_reference_thumbnail_url(vid)
+                if url:
+                    out[plat] = url
+    return out
+
+
+def _enrich_posted_thumbnail_urls(
+    platform_results: List[dict],
+    posted_urls: Dict[str, str],
+) -> Dict[str, str]:
+    return enrich_posted_thumbnail_urls(platform_results, posted_urls)
+
+
 def posted_thumbnail_browser_url(
     *,
     output_artifacts: Any,
@@ -211,7 +268,10 @@ def posted_thumbnail_browser_url(
 ) -> Optional[str]:
     """Browser-safe live platform cover URL (YouTube/TikTok CDN, etc.)."""
     platform_results_norm = _normalize_platform_results_detail(platform_results)
-    posted_urls = posted_platform_thumbnail_urls_from_results(platform_results_norm)
+    posted_urls = _enrich_posted_thumbnail_urls(
+        platform_results_norm,
+        posted_platform_thumbnail_urls_from_results(platform_results_norm),
+    )
     return browser_safe_thumbnail_url(
         pick_primary_thumbnail_url(
             posted=posted_urls,
@@ -234,28 +294,30 @@ def card_thumbnail_url(
     """
     URL for queue/dashboard <img src>.
 
-    Prefer live platform CDN covers when published (avoids 404 proxy spam), then the
-    stable first-party proxy when an R2 key exists, then artifact presigns.
+    Resolution order (first match wins):
+      1. Platform CDN URLs in platform_results (posted_platform_thumbnail_urls)
+      2. YouTube CDN synthesized from video_id when sync has not run
+      3. Presigned R2 artifact URLs (only keys verified present in R2)
+      4. First-party proxy /api/uploads/{id}/thumbnail (only when R2 verified)
     """
     uid = str(upload_id or "").strip()
     platforms_list = list(upload_platforms or [])
     platform_results_norm = _normalize_platform_results_detail(platform_results)
+    posted_urls = _enrich_posted_thumbnail_urls(
+        platform_results_norm,
+        posted_platform_thumbnail_urls_from_results(platform_results_norm),
+    )
 
-    posted_direct = posted_thumbnail_browser_url(
-        output_artifacts=output_artifacts,
-        platform_results=platform_results_norm,
-        upload_platforms=platforms_list,
+    posted_direct = browser_safe_thumbnail_url(
+        pick_primary_thumbnail_url(
+            posted=posted_urls,
+            artifact_platform_urls={},
+            r2_presigned=None,
+            upload_platforms=platforms_list,
+        )
     )
     if posted_direct:
         return posted_direct
-
-    if resolve_upload_thumbnail_r2_key(
-        thumbnail_r2_key=thumbnail_r2_key,
-        output_artifacts=output_artifacts,
-        platform_results=platform_results_norm,
-        upload_platforms=platforms_list,
-    ):
-        return upload_card_thumbnail_href(uid) if uid else None
 
     sk = str(thumbnail_r2_key or "").strip()
     r2_thumb_url = None
@@ -263,8 +325,7 @@ def card_thumbnail_url(
         r2_thumb_url = presign_upload_thumbnail_r2_key(sk, expires_in=3600)
 
     plat_thumb_urls = merged_platform_thumbnail_urls(output_artifacts, platform_results_norm)
-    posted_urls = posted_platform_thumbnail_urls_from_results(platform_results_norm)
-    return browser_safe_thumbnail_url(
+    fallback = browser_safe_thumbnail_url(
         pick_primary_thumbnail_url(
             posted=posted_urls,
             artifact_platform_urls=plat_thumb_urls,
@@ -272,6 +333,17 @@ def card_thumbnail_url(
             upload_platforms=platforms_list,
         )
     )
+    if fallback:
+        return fallback
+
+    if first_verified_thumbnail_r2_key(
+        thumbnail_r2_key=thumbnail_r2_key,
+        output_artifacts=output_artifacts,
+        platform_results=platform_results_norm,
+        upload_platforms=platforms_list,
+    ):
+        return upload_card_thumbnail_href(uid) if uid else None
+    return None
 
 
 THUMBNAIL_REPAIR_STATUSES = frozenset({"completed", "succeeded", "partial"})
@@ -295,11 +367,14 @@ def thumbnail_storage_missing_flag(
     when ``thumbnail_url`` is present. Also flags when we fell back to a platform CDN
     cover but the primary ``thumbnail_r2_key`` still needs regeneration in R2.
     """
-    sk = str(primary_sk or "").strip()
-    if not sk:
-        return False
     uid = str(upload_id or "").strip()
     if not uid:
+        return False
+    proxy_href = upload_card_thumbnail_href(uid)
+    if thumbnail_url == proxy_href:
+        return False
+    sk = str(primary_sk or "").strip()
+    if not sk:
         return False
     resolved = resolve_upload_thumbnail_r2_key(
         thumbnail_r2_key=sk,
@@ -309,10 +384,7 @@ def thumbnail_storage_missing_flag(
     )
     if resolved != sk:
         return False
-    proxy_href = upload_card_thumbnail_href(uid)
     if not thumbnail_url:
-        return True
-    if thumbnail_url == proxy_href:
         return True
     # Showing a platform CDN fallback while primary R2 key is still on record.
     return bool(posted_thumbnail_browser_url(
@@ -323,17 +395,29 @@ def thumbnail_storage_missing_flag(
 
 
 def collect_thumbnail_repair_ids(items: List[dict], *, limit: int = 15) -> List[str]:
-    """Upload ids needing primary thumbnail repair (bounded; scans full list)."""
+    """Upload ids needing thumbnail repair or first-time R2 backfill (bounded)."""
     ids: List[str] = []
     for item in items:
-        if not item.get("thumbnail_storage_missing"):
-            continue
         st = str(item.get("status") or "").lower()
         if st not in THUMBNAIL_REPAIR_STATUSES:
             continue
         uid = str(item.get("id") or "").strip()
-        if uid and uid not in ids:
-            ids.append(uid)
+        if not uid or uid in ids:
+            continue
+        needs = bool(item.get("thumbnail_storage_missing"))
+        if not needs and not item.get("thumbnail_url"):
+            pr = item.get("platform_results") or []
+            has_publish = False
+            if isinstance(pr, list):
+                for row in pr:
+                    if isinstance(row, dict) and row.get("success") is not False:
+                        if platform_video_id_from_result(row):
+                            has_publish = True
+                            break
+            needs = has_publish
+        if not needs:
+            continue
+        ids.append(uid)
         if len(ids) >= limit:
             break
     return ids
@@ -507,10 +591,9 @@ def merged_platform_thumbnail_urls(
     expires_in: int = 3600,
 ) -> dict:
     """UploadM8-generated R2 previews; live posted covers fill gaps only."""
+    platform_results_norm = _normalize_platform_results_detail(platform_results)
     artifact_urls = platform_thumbnail_urls_from_artifacts(output_artifacts, expires_in=expires_in)
-    posted_urls = posted_platform_thumbnail_urls_from_results(
-        platform_results if isinstance(platform_results, list) else []
-    )
+    posted_urls = enrich_posted_thumbnail_urls(platform_results_norm)
     merged = dict(artifact_urls)
     for plat, url in posted_urls.items():
         existing = str(merged.get(plat) or "").strip()
@@ -539,10 +622,16 @@ def platform_thumbnail_urls_from_artifacts(raw: Any, expires_in: int = 3600) -> 
         k = str(key or "").strip()
         if not plat or not k:
             continue
+        norm = _normalize_r2_key(k)
+        try:
+            if not r2_object_exists(norm):
+                continue
+        except Exception:
+            continue
         try:
             out[plat] = s3.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": R2_BUCKET_NAME, "Key": _normalize_r2_key(k)},
+                Params={"Bucket": R2_BUCKET_NAME, "Key": norm},
                 ExpiresIn=expires_in,
             )
         except Exception:

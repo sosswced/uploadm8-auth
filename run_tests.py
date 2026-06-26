@@ -9,8 +9,11 @@ Examples:
   python run_tests.py tiers
   python run_tests.py consistency
   python run_tests.py router-lint
+  python run_tests.py frontend-lint
   python run_tests.py stress
   python run_tests.py enterprise
+  python run_tests.py e2e
+  python run_tests.py overnight
 
 Extra pytest args pass through: python run_tests.py unit -v --tb=short
 """
@@ -62,6 +65,14 @@ def cmd_router_lint() -> int:
     return subprocess.run([sys.executable, str(script)], cwd=str(ROOT)).returncode
 
 
+def cmd_frontend_lint() -> int:
+    script = ROOT / "scripts" / "lint_frontend_inline.py"
+    if not script.is_file():
+        print("scripts/lint_frontend_inline.py not found - skipping")
+        return 0
+    return subprocess.run([sys.executable, str(script)], cwd=str(ROOT)).returncode
+
+
 def cmd_stress() -> int:
     host = os.environ.get("LOCUST_HOST", "http://127.0.0.1:8000")
     print(f"Starting Locust against {host} - open http://localhost:8089")
@@ -80,8 +91,11 @@ def main() -> int:
         "settings",
         "consistency",
         "router-lint",
+        "frontend-lint",
         "stress",
         "enterprise",
+        "e2e",
+        "overnight",
         "all",
     }
     if argv:
@@ -97,6 +111,8 @@ def main() -> int:
         return cmd_consistency()
     if mode == "router-lint":
         return cmd_router_lint()
+    if mode == "frontend-lint":
+        return cmd_frontend_lint()
     if mode == "stress":
         return cmd_stress()
     if mode == "enterprise":
@@ -104,6 +120,12 @@ def main() -> int:
         os.environ.setdefault("LOCUST_SPAWN_RATE", os.environ.get("LOCUST_SPAWN_RATE", "2"))
         os.environ.setdefault("LOCUST_RUN_TIME", os.environ.get("LOCUST_RUN_TIME", "60s"))
         return cmd_stress()
+
+    if mode in ("e2e", "overnight"):
+        targets = ["tests/e2e/"]
+        if mode == "overnight":
+            pytest_tail = ["-m", "overnight"] + pytest_tail
+        return run_pytest(targets + pytest_tail)
 
     if mode == "tiers":
         targets = [
@@ -122,7 +144,7 @@ def main() -> int:
         targets = ["tests/"]
 
     if mode == "unit":
-        pytest_tail = ["-m", "not slow"] + pytest_tail
+        pytest_tail = ["-m", "not slow and not e2e"] + pytest_tail
 
     cmd = targets + pytest_tail
     if not pytest_tail and mode in ("all", "unit"):

@@ -26,7 +26,8 @@ from core.deps import get_current_user, require_admin, require_master_admin
 from core.wallet import get_wallet
 from core.notifications import discord_notify, notify_weekly_costs
 from core.audit import log_admin_audit
-from core.helpers import _now_utc, get_plan, _tier_is_upgrade, _valid_uuid, _safe_json, _safe_col
+from core.db_pool import acquire_db
+from core.helpers import _now_utc, get_plan, _tier_is_upgrade, _valid_uuid, _safe_json, _safe_col, coerce_output_artifacts_dict
 from core.sql_allowlist import (
     USERS_UPDATE_COLUMNS_ADMIN,
     assert_set_fragments_columns,
@@ -952,8 +953,16 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
     query = "SELECT id, email, name, role, subscription_tier, subscription_status, status, created_at, last_active_at FROM users WHERE 1=1"
     params = []
     if search:
-        params.append(f"%{search}%")
-        query += f" AND (email ILIKE ${len(params)} OR name ILIKE ${len(params)})"
+        term = search.strip()
+        if _valid_uuid(term):
+            params.append(term)
+            query += f" AND id = ${len(params)}::uuid"
+        else:
+            params.append(f"%{term}%")
+            query += (
+                f" AND (email ILIKE ${len(params)} OR name ILIKE ${len(params)} "
+                f"OR CAST(id AS text) ILIKE ${len(params)})"
+            )
     if tier:
         params.append(tier)
         query += f" AND subscription_tier = ${len(params)}"
@@ -1616,7 +1625,7 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
     since = _now_utc() - timedelta(minutes=minutes)
     prev_since = since - timedelta(minutes=minutes)
 
-    async with core.state.require_pool().acquire() as conn:
+    async with acquire_db(core.state.require_pool()) as conn:
         # Users
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
@@ -3557,16 +3566,7 @@ def _collect_upload_diagnostics(
 
 
 def _coerce_output_artifacts_dict(raw: Any) -> Dict[str, Any]:
-    """``uploads.output_artifacts`` should be a JSON object; tolerate list/null legacy rows."""
-    val: Any = raw
-    if val is None:
-        val = {}
-    elif not isinstance(val, dict):
-        val = _safe_json(val, {})
-    if isinstance(val, dict):
-        return val
-    # Legacy rows stored as JSON arrays or other shapes — avoid .keys() crashes.
-    return {}
+    return coerce_output_artifacts_dict(raw)
 
 
 def _serialize_upload_ai_trace_row(

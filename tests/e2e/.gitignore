@@ -1,0 +1,6 @@
+.auth/
+artifacts/
+__pycache__/
+*.pyc
+report.html
+pytest.log

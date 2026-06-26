@@ -1,0 +1,33 @@
+---
+description: UploadM8 test conventions — pytest markers, E2E, eval-driven loops
+globs: "{tests,scripts/agent}/**/*"
+alwaysApply: false
+---
+
+# Tests & eval loops
+
+## Runner
+
+`python run_tests.py <mode>` — modes: `unit`, `tiers`, `settings`, `e2e`, `overnight`, `frontend-lint`, `router-lint`, `all`.
+
+## Markers (pytest.ini)
+
+- `slow` — skip in fast unit runs (`-m "not slow"`).
+- `e2e` — requires running API + Playwright.
+- `overnight` — long E2E suite for unattended runs.
+
+## E2E
+
+- Helpers: `tests/e2e/helpers/`.
+- Config: `tests/e2e/conftest.py`.
+- Run: `python run_tests.py e2e`.
+
+## Eval harness (Level 8)
+
+`python scripts/agent/eval_loop.py --json` returns structured pass/fail for agent self-heal loops.
+
+## Writing tests
+
+- Test real behavior, not implementation trivia.
+- Prefer existing fixtures in `tests/e2e/conftest.py` for browser tests.
+- After fixing a bug, add or extend a test that would have caught it.

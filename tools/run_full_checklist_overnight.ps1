@@ -15,8 +15,11 @@ $ErrorActionPreference = "Continue"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
-python -m pip install -q -r requirements-e2e.txt
-python -m playwright install chromium 2>$null
+$py = Join-Path $repoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $py)) { $py = "python" }
+
+& $py -m pip install -q -r requirements-e2e.txt
+& $py -m playwright install chromium 2>$null
 
 $env:E2E_BASE_URL = $BaseUrl
 $env:E2E_HEADED = "1"
@@ -35,6 +38,7 @@ if ($IncludeSlowApi) { $args += "--include-slow-api" }
 $log = "tests\e2e\artifacts\overnight_run_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 Write-Host "Logging to $log" -ForegroundColor Cyan
 Write-Host "Excel will appear in tests\e2e\artifacts\UploadM8_Full_App_Checklist_*.xlsx" -ForegroundColor Green
+Write-Host "Note: checklist holds pipeline lock; do not run run_overnight_e2e.ps1 in parallel." -ForegroundColor Yellow
 
-python @args 2>&1 | Tee-Object -FilePath $log
+& $py @args 2>&1 | Tee-Object -FilePath $log
 exit $LASTEXITCODE

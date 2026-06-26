@@ -390,6 +390,29 @@ def run_playwright_headed_clicks(recorder: ChecklistRecorder, base: str) -> None
             force_form_login=os.environ.get("E2E_FORCE_RELOGIN", "").lower() in ("1", "true", "yes"),
         )
 
+        t_admin = time.perf_counter()
+        try:
+            from tests.e2e.helpers.target_user_ui import exercise_target_user_admin_ui
+
+            admin_report = exercise_target_user_admin_ui(page, base)
+            recorder.record(
+                check_id="ui.target_user.admin",
+                category="Target User Admin",
+                name="Johnny Omeadows — account-mgmt + wallet UI",
+                status="PASS",
+                detail=str(admin_report.get("account_management", {}).get("steps", []))[:500],
+                duration_ms=_ms(t_admin),
+            )
+        except Exception as e:
+            recorder.record(
+                check_id="ui.target_user.admin",
+                category="Target User Admin",
+                name="Johnny Omeadows — account-mgmt + wallet UI",
+                status="FAIL",
+                detail=str(e)[:500],
+                duration_ms=_ms(t_admin),
+            )
+
         for i, rel in enumerate(AUTHENTICATED_PAGES, start=1):
             t0 = time.perf_counter()
             api_fails: list[str] = []
@@ -463,29 +486,6 @@ def run_playwright_headed_clicks(recorder: ChecklistRecorder, base: str) -> None
                     duration_ms=_ms(t0),
                 )
 
-        t_admin = time.perf_counter()
-        try:
-            from tests.e2e.helpers.target_user_ui import exercise_target_user_admin_ui
-
-            admin_report = exercise_target_user_admin_ui(page, base)
-            recorder.record(
-                check_id="ui.target_user.admin",
-                category="Target User Admin",
-                name="Johnny Omeadows — account-mgmt + wallet UI",
-                status="PASS",
-                detail=str(admin_report.get("account_management", {}).get("steps", []))[:500],
-                duration_ms=_ms(t_admin),
-            )
-        except Exception as e:
-            recorder.record(
-                check_id="ui.target_user.admin",
-                category="Target User Admin",
-                name="Johnny Omeadows — account-mgmt + wallet UI",
-                status="FAIL",
-                detail=str(e)[:500],
-                duration_ms=_ms(t_admin),
-            )
-
         context.close()
         browser.close()
 
@@ -545,6 +545,11 @@ def main() -> int:
     parser.add_argument("--skip-playwright", action="store_true")
     parser.add_argument("--skip-unit", action="store_true")
     parser.add_argument(
+        "--include-e2e-pytest",
+        action="store_true",
+        help="Also run full pytest overnight suite (default off — run tools/run_overnight_e2e.ps1 separately)",
+    )
+    parser.add_argument(
         "--api-only",
         action="store_true",
         help="Skip unit tests and Playwright (infra, routers, API GET sweep, public pages)",
@@ -553,6 +558,14 @@ def main() -> int:
     if args.api_only:
         args.skip_playwright = True
         args.skip_unit = True
+
+    from scripts.agent.pipeline_lock import acquire, release
+
+    try:
+        acquire("full_app_checklist")
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
     os.environ.setdefault("E2E_HEADED", "1" if args.headed else "0")
     if not (ROOT / "tests" / "e2e" / ".auth" / "master_admin.json").is_file():
@@ -634,20 +647,21 @@ def main() -> int:
                     status="FAIL",
                     detail=str(e)[:800],
                 )
-            run_cmd(
-                recorder,
-                check_id="e2e.pytest.start",
-                category="E2E Pytest",
-                name="pytest tests/e2e overnight",
-                cmd=[
-                    sys.executable,
-                    "run_tests.py",
-                    "overnight",
-                    "-q",
-                    f"--junitxml={junit_e2e}",
-                ],
-            )
-            parse_junit_to_recorder(junit_e2e, recorder, "E2E Pytest", "e2e")
+            if args.include_e2e_pytest:
+                run_cmd(
+                    recorder,
+                    check_id="e2e.pytest.start",
+                    category="E2E Pytest",
+                    name="pytest tests/e2e overnight",
+                    cmd=[
+                        sys.executable,
+                        "run_tests.py",
+                        "overnight",
+                        "-q",
+                        f"--junitxml={junit_e2e}",
+                    ],
+                )
+                parse_junit_to_recorder(junit_e2e, recorder, "E2E Pytest", "e2e")
 
         items = recorder.load_all()
         passed = sum(1 for r in items if r.get("status") == "PASS")
@@ -660,6 +674,7 @@ def main() -> int:
         if items:
             export_checklist_excel(items, xlsx_path)
             print(f"Excel: {xlsx_path}")
+        release()
     return exit_code
 
 

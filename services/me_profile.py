@@ -11,6 +11,7 @@ from fastapi import HTTPException
 
 from core.config import BILLING_MODE
 from core.deps import _attach_workspace_context
+from core.db_pool import acquire_db
 from core.helpers import _safe_col
 from core.r2 import resolve_user_profile_avatar_url
 from core.sql_allowlist import assert_set_fragments_columns, USERS_UPDATE_COLUMNS_ME, USERS_UPDATE_COLUMNS_PROFILE
@@ -98,7 +99,7 @@ async def fetch_me_endpoint_data(pool, user_id: str) -> tuple[dict, list]:
 
     Caller should pass a JWT-verified ``user_id`` (e.g. from ``get_verified_user_id``).
     """
-    async with pool.acquire() as conn:
+    async with acquire_db(pool) as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
@@ -147,7 +148,7 @@ async def fetch_me_endpoint_data(pool, user_id: str) -> tuple[dict, list]:
         except Exception:
             logger.debug("GET /api/me trill summary skipped", exc_info=True)
             user_dict["trill"] = {"map_unlocked": False, "enabled": True}
-    return user_dict, personas
+        return user_dict, personas
 
 
 async def apply_me_profile_update(conn, user_id: str, data: ProfileUpdate) -> bool:

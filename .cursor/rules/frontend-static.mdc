@@ -1,0 +1,32 @@
+---
+description: UploadM8 static frontend — HTML pages, vanilla JS, CSS conventions
+globs: "frontend/**/*.{html,js,css}"
+alwaysApply: false
+---
+
+# Frontend static UI
+
+## Structure
+
+- Pages: `frontend/*.html` — shell via `shared-sidebar.js`, `shell-drawer.js`.
+- Shared JS: `frontend/js/` — one concern per file.
+- Marketing copy: `frontend/js/marketing-copy.js`, `docs/copy-seo-spec.md`.
+- API base: `frontend/js/api-base.js` — never hardcode production URLs in pages.
+
+## Safety
+
+- Use `frontend/js/html-safe.js` for API-sourced strings in `innerHTML`.
+- Prefer `textContent` over raw HTML interpolation.
+
+## Auth
+
+- Session: `auth-stack.js`, `session-user-hydrate.js`, `session-chrome-pre.js`.
+
+## Lint & test
+
+- Inline lint: `python run_tests.py frontend-lint`.
+- E2E page loads: `tests/e2e/test_pages_load.py`.
+
+## Deploy
+
+- Frontend ships to separate repo via `uploadm8-frontend-push` skill — not bundled in backend push.

@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>UploadM8 Agent QB Wristband &amp; Desk Sheet</title>
+  <style>
+    :root {
+      --ink: #0f172a;
+      --muted: #475569;
+      --accent: #1d4ed8;
+      --line: #cbd5e1;
+      --band: #f8fafc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+      margin: 0;
+      padding: 16px;
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    h2 {
+      font-size: 13px;
+      margin: 16px 0 8px;
+      padding-bottom: 4px;
+      border-bottom: 2px solid var(--ink);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    h3 { font-size: 11px; margin: 10px 0 4px; color: var(--accent); }
+    .subtitle { color: var(--muted); margin-bottom: 12px; }
+    .print-hint {
+      background: #fef9c3;
+      border: 1px solid #facc15;
+      padding: 8px 12px;
+      margin-bottom: 16px;
+      border-radius: 4px;
+    }
+    @media print {
+      .print-hint { display: none; }
+      body { padding: 0; }
+      .page-break { page-break-before: always; }
+    }
+
+    /* WRISTBAND STRIPS */
+    .wristbands {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .band {
+      border: 2px dashed var(--line);
+      background: var(--band);
+      padding: 8px 10px;
+      border-radius: 4px;
+    }
+    .band-title {
+      font-weight: 700;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--accent);
+      margin-bottom: 4px;
+    }
+    .band-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 4px 8px;
+      font-size: 9px;
+    }
+    .band-grid span code {
+      font-weight: 700;
+      color: var(--ink);
+    }
+    .band-cut {
+      font-size: 8px;
+      color: var(--muted);
+      text-align: center;
+      margin-top: 4px;
+    }
+
+    /* DESK SHEET */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 12px;
+      font-size: 10px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 5px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #e2e8f0;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 9.5px;
+      background: #f1f5f9;
+      padding: 1px 4px;
+      border-radius: 2px;
+    }
+  .lvl { font-weight: 700; white-space: nowrap; }
+    .flow {
+      font-family: Consolas, monospace;
+      font-size: 9px;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      padding: 10px;
+      white-space: pre;
+      line-height: 1.25;
+    }
+    .cols {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    @media print {
+      .cols { grid-template-columns: 1fr 1fr; }
+    }
+    .footer {
+      margin-top: 12px;
+      font-size: 9px;
+      color: var(--muted);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<div class="print-hint">
+  <strong>Print:</strong> Ctrl+P → Letter, margins Normal. Page 1 = cut-out wristbands. Page 2+ = desk sheet.
+  Tape wristband strips around a card or slide into a badge holder.
+</div>
+
+<h1>UploadM8 Agent QB Sheet</h1>
+<p class="subtitle">Levels 4–8+ · uploadm8-auth · Keep at desk · Updated 2026</p>
+
+<h2>✂ Wristband strips — cut on dashed lines</h2>
+
+<div class="wristbands">
+
+  <div class="band">
+    <div class="band-title">Strip A — Slash commands (type in Cursor chat)</div>
+    <div class="band-grid">
+      <span><code>/fix-tests</code> heal</span>
+      <span><code>/ultracode</code> eval loop</span>
+      <span><code>/ultrathink</code> plan</span>
+      <span><code>/ascended-loop</code> full</span>
+      <span><code>/orchestrate</code> team</span>
+      <span><code>/parallel-audit</code> audit</span>
+      <span><code>/five-windows</code> lanes</span>
+      <span><code>/headless-eval</code> bg</span>
+      <span><code>/overnight</code> E2E</span>
+      <span><code>/loop 1h …</code> cron</span>
+      <span><code>/ship-backend</code> push</span>
+      <span><code>/ship-frontend</code> sync</span>
+      <span><code>/multi-repo-ship</code> both</span>
+      <span><code>/trill</code> trill</span>
+    </div>
+    <div class="band-cut">— — — cut here — — —</div>
+  </div>
+
+  <div class="band">
+    <div class="band-title">Strip B — Terminal (PowerShell, repo root)</div>
+    <div class="band-grid">
+      <span><code>eval_loop.py --json</code></span>
+      <span><code>self_heal.py -b 5</code></span>
+      <span><code>dynamic_workflow.py</code></span>
+      <span><code>ci_status.py --json</code></span>
+      <span><code>multi_repo_status.py</code></span>
+      <span><code>run_tests.py unit</code></span>
+      <span><code>run_tests.py overnight</code></span>
+      <span><code>worktree_spawn_all.ps1</code></span>
+    </div>
+    <div class="band-cut">— — — cut here — — —</div>
+  </div>
+
+  <div class="band">
+    <div class="band-title">Strip C — When to call what (plays)</div>
+    <div class="band-grid">
+      <span><strong>RED tests</strong> → /fix-tests</span>
+      <span><strong>Big feature</strong> → /ultrathink</span>
+      <span><strong>Ship day</strong> → /parallel-audit</span>
+      <span><strong>2 repos</strong> → /multi-repo-ship</span>
+      <span><strong>CI red</strong> → ascended-ci</span>
+      <span><strong>Parallel</strong> → /five-windows</span>
+      <span><strong>Bedtime</strong> → /overnight</span>
+      <span><strong>AFK eval</strong> → /headless-eval</span>
+    </div>
+    <div class="band-cut">— — — cut here — — —</div>
+  </div>
+
+  <div class="band">
+    <div class="band-title">Strip D — Hooks (automatic, no command)</div>
+    <div class="band-grid">
+      <span><strong>sessionStart</strong> → read AGENTS.md</span>
+      <span><strong>afterFileEdit</strong> → suggest tests</span>
+      <span><strong>subagentStop</strong> → chain eval</span>
+      <span><strong>beforeShell</strong> → block force-push</span>
+    </div>
+    <div class="band-cut">— — — cut here — — —</div>
+  </div>
+
+</div>
+
+<div class="page-break"></div>
+
+<h2>Desk sheet — slash commands</h2>
+<table>
+  <tr>
+    <th>Command</th>
+    <th>Lvl</th>
+    <th>When</th>
+    <th>What happens</th>
+  </tr>
+  <tr><td><code>/fix-tests</code></td><td class="lvl">8</td><td>Tests red</td><td>eval_loop → patch → retry (max 5)</td></tr>
+  <tr><td><code>/ultracode</code></td><td class="lvl">8+</td><td>Feature w/ proof</td><td>Small diffs until eval green</td></tr>
+  <tr><td><code>/ultrathink</code></td><td class="lvl">8+</td><td>Big change</td><td>Plan first — no code until OK</td></tr>
+  <tr><td><code>/ascended-loop</code></td><td class="lvl">8</td><td>Full feature</td><td>Plan → code → eval → review → ship?</td></tr>
+  <tr><td><code>/orchestrate</code></td><td class="lvl">7</td><td>Complex task</td><td>dynamic_workflow → agent team</td></tr>
+  <tr><td><code>/parallel-audit</code></td><td class="lvl">6</td><td>Pre-ship</td><td>explore + bugbot parallel</td></tr>
+  <tr><td><code>/five-windows</code></td><td class="lvl">5</td><td>Parallel lanes</td><td>5 worktrees, 5 Cursor windows</td></tr>
+  <tr><td><code>/headless-eval</code></td><td class="lvl">7</td><td>Don't wait</td><td>self_heal in background</td></tr>
+  <tr><td><code>/overnight</code></td><td class="lvl">7</td><td>End of day</td><td>pytest -m overnight E2E</td></tr>
+  <tr><td><code>/loop 30m …</code></td><td class="lvl">7</td><td>Recurring</td><td>In-session cron</td></tr>
+  <tr><td><code>/ship-backend</code></td><td class="lvl">5</td><td>Push API</td><td>Scoped → uploadm8-auth</td></tr>
+  <tr><td><code>/ship-frontend</code></td><td class="lvl">5</td><td>Push UI</td><td>Sync → uploadm8-frontend</td></tr>
+  <tr><td><code>/multi-repo-ship</code></td><td class="lvl">8</td><td>Both repos</td><td>status → ship → CI watch</td></tr>
+  <tr><td><code>/trill</code></td><td class="lvl">—</td><td>Trill work</td><td>Trill domain skill</td></tr>
+</table>
+
+<div class="cols">
+  <div>
+    <h2>Skills (agent auto-picks by name)</h2>
+    <table>
+      <tr><th>Skill</th><th>Use for</th></tr>
+      <tr><td><code>uploadm8-eval-loop</code></td><td>eval + self-heal</td></tr>
+      <tr><td><code>uploadm8-ultracode</code></td><td>eval-as-reward dev</td></tr>
+      <tr><td><code>uploadm8-ultrathink</code></td><td>deep architecture plan</td></tr>
+      <tr><td><code>uploadm8-agent-orchestrator</code></td><td>multi-phase team</td></tr>
+      <tr><td><code>uploadm8-dynamic-workflows</code></td><td>diff → subagent graph</td></tr>
+      <tr><td><code>uploadm8-ascended-ci</code></td><td>CI red → fix → push</td></tr>
+      <tr><td><code>uploadm8-multi-repo</code></td><td>auth + frontend status</td></tr>
+      <tr><td><code>uploadm8-worktrees</code></td><td>parallel git lanes</td></tr>
+      <tr><td><code>uploadm8-headless</code></td><td>background agents</td></tr>
+      <tr><td><code>uploadm8-routines</code></td><td>Automations + /loop</td></tr>
+      <tr><td><code>uploadm8-backend-push</code></td><td>scoped backend push</td></tr>
+      <tr><td><code>uploadm8-frontend-push</code></td><td>frontend repo sync</td></tr>
+      <tr><td><code>uploadm8-agent-tooling</code></td><td>register new scripts</td></tr>
+      <tr><td><code>trill</code></td><td>Trill features</td></tr>
+    </table>
+  </div>
+  <div>
+    <h2>Scripts &amp; MCP</h2>
+    <table>
+      <tr><th>Script / MCP tool</th><th>Purpose</th></tr>
+      <tr><td><code>eval_loop.py --json</code></td><td>Pass/fail JSON + suggested -k</td></tr>
+      <tr><td><code>self_heal.py -b 5</code></td><td>Multi-iteration eval driver</td></tr>
+      <tr><td><code>dynamic_workflow.py</code></td><td>Git diff → workflow plan</td></tr>
+      <tr><td><code>ci_status.py</code></td><td>gh pr checks JSON</td></tr>
+      <tr><td><code>multi_repo_status.py</code></td><td>Both repos dirty state</td></tr>
+      <tr><td><code>register_tool.py</code></td><td>Add agent-built tools</td></tr>
+      <tr><td><code>worktree_spawn_all.ps1</code></td><td>All 5 lanes at once</td></tr>
+      <tr><td>MCP <code>uploadm8-agent</code></td><td>eval_run, self_heal, workflow_plan</td></tr>
+      <tr><td>MCP <code>sentry</code></td><td>Prod errors</td></tr>
+      <tr><td>MCP HuggingFace</td><td>Models, training, Spaces</td></tr>
+    </table>
+
+    <h3>Five-window lanes</h3>
+    <table>
+      <tr><th>#</th><th>Lane</th><th>Focus</th></tr>
+      <tr><td>1</td><td>implement</td><td>Feature code</td></tr>
+      <tr><td>2</td><td>fix</td><td>/fix-tests</td></tr>
+      <tr><td>3</td><td>frontend</td><td>HTML/JS/CSS</td></tr>
+      <tr><td>4</td><td>tests</td><td>E2E + eval</td></tr>
+      <tr><td>5</td><td>docs</td><td>AGENTS.md, docs/</td></tr>
+    </table>
+  </div>
+</div>
+
+<h2>Game plan (escalation)</h2>
+<div class="flow">START → read AGENTS.md (auto hook)
+  │
+  ├─ small fix?        → /fix-tests  or  /ultracode
+  ├─ new feature?    → /ultrathink  →  /ascended-loop
+  ├─ messy / big?    → /orchestrate  (+ dynamic_workflow.py)
+  ├─ parallel work?  → /five-windows
+  ├─ pre-ship?       → /parallel-audit
+  ├─ both repos?     → /multi-repo-ship
+  ├─ CI red?         → ci_status.py  +  ascended-ci skill
+  ├─ going AFK?      → /headless-eval  or  /overnight
+  └─ repeat check?   → /loop 1h run eval_loop</div>
+
+<h2>Safety (always)</h2>
+<table>
+  <tr><td>Never commit unless you say so</td><td>Never <code>git push --force</code> main (hook blocks)</td></tr>
+  <tr><td>Never stage <code>.env</code></td><td>Backend push = scoped paths only</td></tr>
+  <tr><td>Fast gate: <code>run_tests.py unit -m "not e2e"</code></td><td>Full gate: <code>eval_loop.py --mode full</code></td></tr>
+</table>
+
+<p class="footer">UploadM8 Agent Stack · docs/agent-wristband.html · docs/agent-stack.md · AGENTS.md</p>
+
+</body>
+</html>

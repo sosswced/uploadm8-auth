@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "description": "Agent-built tooling registry — agents register repeatable scripts here",
+  "tools": [
+    {
+      "name": "eval_loop",
+      "path": "scripts/agent/eval_loop.py",
+      "skill": "uploadm8-eval-loop",
+      "purpose": "Structured test eval JSON for self-heal loops"
+    },
+    {
+      "name": "self_heal",
+      "path": "scripts/agent/self_heal.py",
+      "skill": "uploadm8-eval-loop",
+      "purpose": "Multi-iteration eval driver for headless agent loops"
+    },
+    {
+      "name": "dynamic_workflow",
+      "path": "scripts/agent/dynamic_workflow.py",
+      "skill": "uploadm8-dynamic-workflows",
+      "purpose": "Recommend subagent graph from git diff"
+    },
+    {
+      "name": "ci_status",
+      "path": "scripts/agent/ci_status.py",
+      "skill": "uploadm8-ascended-ci",
+      "purpose": "gh pr checks as JSON"
+    },
+    {
+      "name": "multi_repo_status",
+      "path": "scripts/agent/multi_repo_status.py",
+      "skill": "uploadm8-multi-repo",
+      "purpose": "Backend + frontend repo dirty state"
+    },
+    {
+      "name": "trill",
+      "path": "scripts/agent/trill.py",
+      "skill": "trill",
+      "purpose": "Master orchestrator — route, eval, repos, CI, action plan"
+    },
+    {
+      "name": "ship_gate",
+      "path": "scripts/agent/ship_gate.py",
+      "skill": "333",
+      "purpose": "Live-ready gate before /333 — evals, router lint, checklist Excel, TRILL pre-ship"
+    },
+    {
+      "name": "sentry_triage",
+      "path": "scripts/agent/sentry_triage.py",
+      "skill": "sentry-workflow",
+      "purpose": "Sentry MCP triage artifact for /overnight Phase 7 — feeds ship_gate"
+    },
+    {
+      "name": "worktree_spawn",
+      "path": "scripts/agent/worktree_spawn.ps1",
+      "skill": "uploadm8-worktrees",
+      "purpose": "Spawn parallel git worktree lane"
+    }
+  ]
+}

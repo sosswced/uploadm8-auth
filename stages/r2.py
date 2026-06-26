@@ -186,6 +186,14 @@ async def download_file(r2_key: str, local_path: Path) -> Path:
                 )
                 await asyncio.sleep(wait)
                 continue
+            try:
+                from services.upload.r2_storage_guard import classify_r2_head_not_found
+
+                if classify_r2_head_not_found(exc):
+                    logger.warning("R2 object missing (HeadObject 404): %s — %s", r2_key, exc)
+                    raise
+            except ImportError:
+                pass
             # Non-retryable or out of retries
             logger.error(f"R2 download failed after {attempt} attempt(s): {r2_key} — {exc}")
             raise

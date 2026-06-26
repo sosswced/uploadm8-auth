@@ -75,6 +75,82 @@ async def record_pikzels_template_render_incident(
         logger.debug("[%s] pikzels_template_fallback incident skipped: %s", upload_id, e)
 
 
+async def record_pikzels_render_failures_incident(
+    db_pool: Any,
+    *,
+    upload_id: str,
+    user_id: Optional[str],
+    output_artifacts: Any,
+) -> None:
+    """
+    Emit one consolidated ops incident when ``pikzels_render_failures`` is present
+    on upload output_artifacts (worker thumbnail stage).
+    """
+    try:
+        arts = output_artifacts if isinstance(output_artifacts, dict) else {}
+        raw_pf = arts.get("pikzels_render_failures")
+        if isinstance(raw_pf, str) and raw_pf.strip():
+            failures = json.loads(raw_pf)
+        elif isinstance(raw_pf, list):
+            failures = raw_pf
+        else:
+            return
+        if not isinstance(failures, list) or not failures:
+            return
+
+        from services.ops_incidents import record_operational_incident
+
+        rows = []
+        for f in failures:
+            if not isinstance(f, dict):
+                continue
+            plat = str(f.get("platform") or "unknown").lower()
+            status_code = f.get("http_status")
+            status_label = (
+                str(status_code) if status_code not in (None, "", "unknown") else "unknown"
+            )
+            msg = str(f.get("message") or "")[:1000]
+            rows.append(
+                {
+                    "platform": plat,
+                    "http_status": status_code,
+                    "http_label": status_label,
+                    "message": msg,
+                }
+            )
+        if not rows:
+            return
+
+        plat_summary = ",".join(r["platform"] for r in rows[:12])
+        lines = "\n".join(
+            f"  • {r['platform']}: HTTP {r['http_label']} — {(r['message'] or '')[:280]}"
+            for r in rows
+        )
+        body = lines or "Pikzels studio renderer did not return usable images."
+        types_suffix = ":".join(f"{r['platform']}:{r['http_label']}" for r in rows[:4])[:80]
+        pikzels_payment_required = all(str(r.get("http_label") or "") == "402" for r in rows)
+        await record_operational_incident(
+            db_pool,
+            source="thumbnail",
+            incident_type=(
+                f"pikzels_render_failed:{types_suffix}" if types_suffix else "pikzels_render_failed"
+            )[:120],
+            subject=(f"Pikzels render failed ({len(rows)} platform(s)): {plat_summary}")[:200],
+            body=body[:8000],
+            details={
+                "upload_id": str(upload_id),
+                "user_id": str(user_id) if user_id else None,
+                "failures": rows,
+            },
+            user_id=str(user_id) if user_id else None,
+            upload_id=str(upload_id),
+            alert_email=not pikzels_payment_required,
+            alert_discord=not pikzels_payment_required,
+        )
+    except Exception as e:
+        logger.debug("[%s] pikzels failure scan: %s", upload_id, e)
+
+
 async def record_pikzels_studio_ineligible_incident(
     db_pool: Any,
     *,

@@ -48,6 +48,8 @@ from services.upload.thumbnails import (
     browser_safe_thumbnail_url,
     card_thumbnail_url,
     collect_thumbnail_repair_ids,
+    enrich_posted_thumbnail_urls,
+    first_verified_thumbnail_r2_key,
     merged_platform_thumbnail_urls,
     mirrored_platform_thumbnail_r2_keys,
     pikzels_template_thumbnail_warning,

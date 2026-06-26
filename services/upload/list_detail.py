@@ -12,9 +12,9 @@ from core.helpers import (
     _load_uploads_columns,
     _pick_cols,
     _safe_json,
+    coerce_output_artifacts_dict,
     ensure_uploads_columns_loaded,
 )
-from services.platform_posted_thumbnails import posted_platform_thumbnail_urls_from_results
 from services.uploads_api import enrich_platform_results_batch
 from stages.context import is_placeholder_upload_caption, is_placeholder_upload_title
 
@@ -30,6 +30,7 @@ from services.upload.status import (
 from services.upload.thumbnails import (
     _normalize_platform_results_detail,
     card_thumbnail_url,
+    enrich_posted_thumbnail_urls,
     merged_platform_thumbnail_urls,
     pikzels_template_thumbnail_warning,
     thumbnail_render_method_from_artifacts,
@@ -120,8 +121,7 @@ _ARTIFACT_UI_KEYS = (
 
 def output_artifacts_dict(raw: Any) -> Dict[str, Any]:
     """Parse uploads.output_artifacts jsonb for API consumers."""
-    arts = _safe_json(raw, {})
-    return arts if isinstance(arts, dict) else {}
+    return coerce_output_artifacts_dict(raw)
 
 
 def _normalize_coach_hints_artifact(val: Any) -> Any:
@@ -367,7 +367,7 @@ def build_upload_list_item(
     sk = str(thumb_key).strip() if thumb_key else ""
 
     plat_thumb_urls = merged_platform_thumbnail_urls(d.get("output_artifacts"), platform_results)
-    posted_urls = posted_platform_thumbnail_urls_from_results(platform_results)
+    posted_urls = enrich_posted_thumbnail_urls(platform_results)
     upload_id_str = str(d.get("id") or "")
     thumbnail_url = card_thumbnail_url(
         upload_id_str,
@@ -723,7 +723,7 @@ def build_upload_detail_payload(d: dict) -> dict:
     sk = str(thumb_key).strip() if thumb_key else ""
 
     plat_thumb_urls = merged_platform_thumbnail_urls(d.get("output_artifacts"), platform_results)
-    posted_urls = posted_platform_thumbnail_urls_from_results(platform_results)
+    posted_urls = enrich_posted_thumbnail_urls(platform_results)
     upload_id_str = str(d.get("id") or "")
     thumbnail_url = card_thumbnail_url(
         upload_id_str,
@@ -980,10 +980,20 @@ async def poll_upload_thumbnails_payload(
         )
         if not thumb:
             continue
+        sk = str(d.get("thumbnail_r2_key") or "").strip()
         plat_thumb_urls = merged_platform_thumbnail_urls(d.get("output_artifacts"), platform_results)
-        posted_urls = posted_platform_thumbnail_urls_from_results(platform_results)
+        posted_urls = enrich_posted_thumbnail_urls(platform_results)
+        storage_missing = thumbnail_storage_missing_flag(
+            primary_sk=sk,
+            upload_id=upload_id_str,
+            thumbnail_url=thumb,
+            output_artifacts=d.get("output_artifacts"),
+            platform_results=platform_results,
+            upload_platforms=list(d.get("platforms") or []),
+        )
         out[uid] = {
             "thumbnail_url": thumb,
+            "thumbnail_storage_missing": storage_missing,
             "posted_platform_thumbnail_urls": posted_urls,
             "platform_thumbnail_urls": plat_thumb_urls,
         }

@@ -1,0 +1,30 @@
+---
+description: UploadM8 core architecture — app wiring, dual-repo deploy, agent safety
+alwaysApply: true
+---
+
+# UploadM8 core
+
+Read `AGENTS.md` and `routers/README.md` before structural changes.
+
+## Architecture
+
+- `app.py` — lifespan, middleware, `include_router` only. No new business handlers here.
+- `routers/*.py` — thin HTTP handlers; call `services/` and `core/`.
+- `services/`, `core/` — business logic, DB, shared helpers.
+- `worker.py` + `stages/` — async upload pipeline (transcode, captions, publish).
+- `frontend/` — static HTML/JS; API via `js/api-base.js` + `auth-stack.js`.
+- `migrations/runtime_migrations.py` — single migration source of truth.
+
+## Dual-repo deploy
+
+- Backend scope → `sosswced/uploadm8-auth` (use `uploadm8-backend-push` skill).
+- Frontend scope → `sosswced/uploadm8-frontend` (use `uploadm8-frontend-push` skill).
+- Never `git add .` for backend push — stage scoped paths only.
+
+## Agent safety
+
+- Never commit `.env`, credentials, tokens, or `__pycache__`.
+- Never `git push --force` to `main`/`master` unless user explicitly requests.
+- Commit only when user explicitly asks.
+- After backend edits: `python run_tests.py unit`. After frontend edits: `python run_tests.py frontend-lint`.

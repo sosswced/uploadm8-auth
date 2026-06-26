@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 import core.state
 from core.deps import get_current_user_readonly
 from routers.uploads import _schedule_thumbnail_repair
-from services.shell_bootstrap import _allowed_upload_view, shell_bootstrap_payload
+from services.shell_bootstrap import _allowed_upload_view, run_schedule_repair_background, shell_bootstrap_payload
 
 router = APIRouter(prefix="/api/shell", tags=["shell"])
 
@@ -49,6 +49,8 @@ async def get_shell_bootstrap(
         range=range,
         platform=platform,
     )
+    if context in ("dashboard", "queue"):
+        background_tasks.add_task(run_schedule_repair_background, pool, uid)
     uploads = payload.get("uploads") if isinstance(payload, dict) else None
     _schedule_thumbnail_repair(background_tasks, uid, uploads if isinstance(uploads, list) else [])
     return payload

@@ -2,6 +2,7 @@
 UploadM8 Scheduled-uploads routes — extracted from app.py.
 """
 
+from core.db_pool import acquire_db
 import asyncio
 import json
 import logging
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 
 from core.config import R2_BUCKET_NAME
 import core.state
@@ -23,7 +24,7 @@ from core.models import SmartScheduleOnlyUpdate
 from services.upload.list_detail import _upload_error_message
 from services.upload.status import CANCELLABLE_STATUSES, is_requeueable_upload
 from services.uploads_handlers import SCHEDULED_PIPELINE_STATUSES, scheduled_in_clause
-from services.shell_bootstrap import _bootstrap_schedule_repair, _fetch_platforms_bundle, _ok
+from services.shell_bootstrap import _fetch_platforms_bundle, _ok, run_schedule_repair_background
 from services.upload.schedule_guard import schedule_slot_iso
 
 logger = logging.getLogger(__name__)
@@ -319,7 +320,7 @@ async def get_scheduled_stats(user: dict = Depends(get_current_user_readonly)):
     """Get scheduled upload statistics for the current user"""
     uid = user["id"]
     try:
-        async with core.state.db_pool.acquire() as conn:
+        async with acquire_db(core.state.db_pool) as conn:
             return await _scheduled_stats_row(conn, uid)
     except Exception:
         logger.exception("get_scheduled_stats failed user_id=%s", uid)
@@ -330,10 +331,15 @@ async def get_scheduled_stats(user: dict = Depends(get_current_user_readonly)):
 # GET /api/scheduled/bootstrap — stats + list + platforms (one round-trip)
 # ------------------------------------------------------------------
 @router.get("/bootstrap")
-async def get_scheduled_bootstrap(user: dict = Depends(get_current_user_readonly)):
+async def get_scheduled_bootstrap(
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user_readonly),
+):
     """
     First paint for scheduled.html: stats, upload list (no R2 presign), and
     platform accounts (redirect avatars, not presigned).
+
+    Schedule repair runs in the background so first paint is not blocked.
     """
     uid = str(user["id"])
     pool = core.state.db_pool
@@ -342,10 +348,8 @@ async def get_scheduled_bootstrap(user: dict = Depends(get_current_user_readonly
     plan = get_plan(user.get("subscription_tier", "free"))
 
     async def _stats():
-        async with pool.acquire() as conn:
+        async with acquire_db(pool) as conn:
             return await _scheduled_stats_row(conn, uid)
-
-    schedule_repair = await _bootstrap_schedule_repair(pool, uid)
 
     try:
         stats, uploads, platforms = await asyncio.gather(
@@ -363,18 +367,27 @@ async def get_scheduled_bootstrap(user: dict = Depends(get_current_user_readonly
         logger.exception("get_scheduled_bootstrap failed user_id=%s", uid)
         raise
 
+    background_tasks.add_task(run_schedule_repair_background, pool, uid)
+
     stats = _ok(stats)
     uploads = _ok(uploads)
     platforms = _ok(platforms)
     if stats is None and uploads is None:
-        raise HTTPException(503, "Scheduled bootstrap unavailable")
+        logger.warning("scheduled bootstrap degraded (stats+uploads unavailable) user_id=%s", uid)
+        return {
+            "stats": {},
+            "uploads": [],
+            "platforms": platforms if platforms is not None else [],
+            "processing_window_minutes": _processing_window_minutes(),
+            "schedule_repair": None,
+        }
 
     return {
         "stats": stats or {},
         "uploads": uploads if uploads is not None else [],
         "platforms": platforms,
         "processing_window_minutes": _processing_window_minutes(),
-        "schedule_repair": schedule_repair,
+        "schedule_repair": None,
     }
 
 

@@ -17,13 +17,14 @@ from services.uploads_handlers import (
     fetch_user_uploads_list,
 )
 
-BOOTSTRAP_SCHEDULE_REPAIR_TIMEOUT_SEC = 8.0
+BOOTSTRAP_SCHEDULE_REPAIR_TIMEOUT_SEC = 20.0
+BOOTSTRAP_SCHEDULE_REPAIR_LIMIT = 12
 
 
 async def _bootstrap_schedule_repair(pool: Any, user_id: str) -> dict[str, int] | None:
     try:
         return await asyncio.wait_for(
-            bootstrap_repair_user_schedules(pool, user_id, limit=30),
+            bootstrap_repair_user_schedules(pool, user_id, limit=BOOTSTRAP_SCHEDULE_REPAIR_LIMIT),
             timeout=BOOTSTRAP_SCHEDULE_REPAIR_TIMEOUT_SEC,
         )
     except asyncio.TimeoutError:
@@ -35,6 +36,11 @@ async def _bootstrap_schedule_repair(pool: Any, user_id: str) -> dict[str, int] 
     except Exception:
         logger.exception("shell_bootstrap schedule repair failed user=%s", user_id)
     return None
+
+
+async def run_schedule_repair_background(pool: Any, user_id: str) -> None:
+    """Fire-and-forget schedule repair — must not block first paint."""
+    await _bootstrap_schedule_repair(pool, user_id)
 
 logger = logging.getLogger(__name__)
 
@@ -139,8 +145,6 @@ async def shell_bootstrap_payload(
     )
     platforms_coro = _fetch_platforms_bundle(pool, uid, plan)
 
-    schedule_repair = await _bootstrap_schedule_repair(pool, uid)
-
     if context == "dashboard":
         stats_coro = dashboard_stats_for_user(pool, user, plan, wallet)
         try:
@@ -156,7 +160,7 @@ async def shell_bootstrap_payload(
             "queue_stats": None,
             "uploads": uploads_payload,
             "platforms": platforms_payload,
-            "schedule_repair": schedule_repair,
+            "schedule_repair": None,
         }
 
     if context == "queue":
@@ -181,7 +185,7 @@ async def shell_bootstrap_payload(
             },
             "uploads": uploads_payload if uploads_payload is not None else [],
             "platforms": platforms_payload,
-            "schedule_repair": schedule_repair,
+            "schedule_repair": None,
         }
 
     raise ValueError("context must be dashboard, queue, upload or kpi")

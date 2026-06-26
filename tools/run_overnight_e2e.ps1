@@ -30,6 +30,13 @@ if (-not (Test-Path "requirements-e2e.txt")) {
     Write-Error "Run from uploadm8-auth repo root (requirements-e2e.txt missing)."
 }
 
+$py = Join-Path $repoRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $py)) { $py = "python" }
+
+Write-Host "Acquiring pipeline lock (do not run checklist + overnight E2E in parallel)..." -ForegroundColor Cyan
+& $py scripts/agent/pipeline_lock.py acquire --name overnight_e2e
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 Write-Host "Installing E2E deps (if needed)..." -ForegroundColor Cyan
 python -m pip install -q -r requirements-e2e.txt
 python -m playwright install chromium 2>$null
@@ -63,8 +70,12 @@ $pytestArgs = @(
 
 Write-Host "Starting overnight suite (marker=$marker)..." -ForegroundColor Green
 Write-Host "  HTML report: $report"
-python @pytestArgs
-$code = $LASTEXITCODE
+try {
+    python @pytestArgs
+    $code = $LASTEXITCODE
+} finally {
+    & $py scripts/agent/pipeline_lock.py release | Out-Null
+}
 
 Write-Host ""
 if ($code -eq 0) {

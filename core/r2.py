@@ -218,29 +218,33 @@ def copy_r2_object_within_bucket(src_key: str, dest_key: str) -> str:
 
 
 def r2_object_exists(key: str) -> bool:
-    """
-    Return True if an object exists at ``key`` in ``R2_BUCKET_NAME`` (S3 HeadObject).
+    """Return True only when HeadObject confirms the object exists."""
+    return r2_object_head_status(key) == "present"
 
-    Used to avoid returning presigned URLs for keys that were deleted from R2 while the
-    database row still references them.
+
+def r2_object_head_status(key: str) -> str:
+    """
+    HeadObject result for ``key``: ``present``, ``missing``, or ``unknown``.
+
+    ``unknown`` means R2/network/API error — callers must not treat as missing.
     """
     k = _normalize_r2_key(key or "")
     if not k or not R2_BUCKET_NAME:
-        return False
+        return "missing"
     s3 = get_s3_client()
     try:
         s3.head_object(Bucket=R2_BUCKET_NAME, Key=k)
-        return True
+        return "present"
     except ClientError as e:
         err = (e.response or {}).get("Error") or {}
         code = str(err.get("Code") or "")
         if code in ("404", "NoSuchKey", "NotFound"):
-            return False
-        logger.debug("r2_object_exists: head_object failed key=%s code=%s", k[:120], code)
-        return False
+            return "missing"
+        logger.warning("r2_object_head_status: head_object failed key=%s code=%s", k[:120], code)
+        return "unknown"
     except Exception as e:
-        logger.debug("r2_object_exists: unexpected error key=%s err=%s", k[:120], e)
-        return False
+        logger.warning("r2_object_head_status: unexpected error key=%s err=%s", k[:120], e)
+        return "unknown"
 
 
 def put_object_bytes(key: str, body: bytes, content_type: str) -> str:

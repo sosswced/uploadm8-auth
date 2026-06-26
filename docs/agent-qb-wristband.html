@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>UploadM8 Agent QB Wristband</title>
+  <style>
+    :root {
+      --ink: #111;
+      --muted: #444;
+      --line: #ccc;
+      --accent: #1a56db;
+      --band-bg: #0f172a;
+      --band-fg: #f8fafc;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      font-size: 10pt;
+      line-height: 1.35;
+      color: var(--ink);
+      max-width: 8.5in;
+      margin: 0 auto;
+      padding: 0.35in;
+    }
+    h1 {
+      font-size: 16pt;
+      margin: 0 0 0.15em;
+      letter-spacing: -0.02em;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 9pt;
+      margin-bottom: 0.5em;
+    }
+    /* ---- WRISTBAND (cut out) ---- */
+    .wristband-wrap {
+      margin: 0.4em 0 1em;
+      page-break-inside: avoid;
+    }
+    .wristband-label {
+      font-size: 7pt;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      margin-bottom: 0.25em;
+    }
+    .wristband {
+      background: var(--band-bg);
+      color: var(--band-fg);
+      border-radius: 6px;
+      padding: 0.45em 0.6em;
+      border: 2px dashed #64748b;
+    }
+    .wristband-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.35em 0.5em;
+      font-size: 8.5pt;
+    }
+    .wb-cmd {
+      font-family: Consolas, "Courier New", monospace;
+      font-weight: 700;
+      font-size: 9pt;
+      color: #93c5fd;
+    }
+    .wb-desc {
+      font-size: 7.5pt;
+      color: #cbd5e1;
+      line-height: 1.2;
+    }
+    .wristband-footer {
+      margin-top: 0.4em;
+      padding-top: 0.35em;
+      border-top: 1px solid #334155;
+      font-family: Consolas, monospace;
+      font-size: 7pt;
+      color: #94a3b8;
+      word-break: break-all;
+    }
+    /* ---- DESK REFERENCE ---- */
+    h2 {
+      font-size: 11pt;
+      margin: 0.85em 0 0.35em;
+      padding-bottom: 0.15em;
+      border-bottom: 2px solid var(--ink);
+      page-break-after: avoid;
+    }
+    h3 {
+      font-size: 9.5pt;
+      margin: 0.6em 0 0.25em;
+      color: var(--accent);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 9pt;
+      margin-bottom: 0.5em;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 0.25em 0.4em;
+      vertical-align: top;
+      text-align: left;
+    }
+    th {
+      background: #f1f5f9;
+      font-size: 8pt;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    code, .cmd {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 8.5pt;
+      background: #f1f5f9;
+      padding: 0.05em 0.25em;
+      border-radius: 2px;
+    }
+    .flow {
+      font-family: Consolas, monospace;
+      font-size: 8pt;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      padding: 0.5em 0.6em;
+      white-space: pre;
+      line-height: 1.45;
+      margin: 0.4em 0;
+    }
+    .cols {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.6em;
+    }
+    .when { color: var(--muted); font-size: 8.5pt; }
+    .footer {
+      margin-top: 1em;
+      padding-top: 0.5em;
+      border-top: 1px solid var(--line);
+      font-size: 8pt;
+      color: var(--muted);
+    }
+    @media print {
+      body { padding: 0.25in; }
+      .wristband { border-style: solid; }
+      h2 { page-break-before: auto; }
+      .page-break { page-break-before: always; }
+    }
+  </style>
+</head>
+<body>
+
+  <h1>UploadM8 Agent Stack</h1>
+  <p class="subtitle">QB wristband + desk reference · Levels 4–8+ · Context is everything · <strong>/trill</strong> runs it all</p>
+
+  <!-- ========== WRISTBAND — cut along dashed border ========== -->
+  <div class="wristband-wrap">
+    <div class="wristband-label">✂ Cut-out wristband — tape to desk or fold on arm</div>
+    <div class="wristband">
+      <div class="wristband-grid">
+        <div>
+          <div class="wb-cmd">/trill</div>
+          <div class="wb-desc">Full stack — route, audit, eval, CI, ship prep</div>
+        </div>
+        <div>
+          <div class="wb-cmd">/parallel-audit</div>
+          <div class="wb-desc">explore + bugbot — pre-ship sanity</div>
+        </div>
+        <div>
+          <div class="wb-cmd">/fix-tests</div>
+          <div class="wb-desc">Eval loop until green (max 5)</div>
+        </div>
+        <div>
+          <div class="wb-cmd">/ascended-loop</div>
+          <div class="wb-desc">Plan → code → eval → review</div>
+        </div>
+        <div>
+          <div class="wb-cmd">/ultrathink</div>
+          <div class="wb-desc">Deep plan before code</div>
+        </div>
+        <div>
+          <div class="wb-cmd">/ultracode</div>
+          <div class="wb-desc">Eval-as-reward feature loop</div>
+        </div>
+        <div>
+          <div class="wb-cmd">/multi-repo-ship</div>
+          <div class="wb-desc">auth + frontend + CI</div>
+        </div>
+        <div>
+          <div class="wb-cmd">/overnight</div>
+          <div class="wb-desc">E2E while you sleep</div>
+        </div>
+      </div>
+      <div class="wristband-footer">
+        TRILL script: python scripts/agent/trill.py --mode pre-ship --json &nbsp;|&nbsp; Eval: python scripts/agent/eval_loop.py --mode unit --json
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== MASTER FLOW ========== -->
+  <h2>Master flow (memorize this)</h2>
+  <div class="flow">/trill  →  dynamic_workflow  →  /parallel-audit  →  /fix-tests
+       →  /overnight (if E2E)  →  /multi-repo-ship (when YOU say go live)
+
+Hooks auto: afterFileEdit → test hint · subagentStop → eval chain</div>
+
+  <!-- ========== SLASH COMMANDS ========== -->
+  <h2>Slash commands (type in Cursor chat)</h2>
+  <table>
+    <tr><th>Command</th><th>When to use</th><th>Level</th></tr>
+    <tr><td><code>/trill</code></td><td><strong>Start here.</strong> Full orchestrator — all features in one pipeline</td><td>8+</td></tr>
+    <tr><td><code>/parallel-audit</code></td><td>Before any ship — explore + bugbot, no code changes</td><td>6</td></tr>
+    <tr><td><code>/fix-tests</code></td><td>Tests red — agent reads eval JSON, patches, retries</td><td>8</td></tr>
+    <tr><td><code>/ascended-loop</code></td><td>Feature delivery: plan → implement → eval → review</td><td>8</td></tr>
+    <tr><td><code>/orchestrate</code></td><td>Agent team with dynamic routing from git diff</td><td>7</td></tr>
+    <tr><td><code>/ultrathink</code></td><td>Big change — architecture brief before any code</td><td>8+</td></tr>
+    <tr><td><code>/ultracode</code></td><td>New feature — small diffs, eval until green</td><td>8+</td></tr>
+    <tr><td><code>/five-windows</code></td><td>5 git worktrees — implement / fix / frontend / tests / docs</td><td>5</td></tr>
+    <tr><td><code>/multi-repo-ship</code></td><td>Backend + frontend repos + CI watch</td><td>8</td></tr>
+    <tr><td><code>/ship-backend</code></td><td>Scoped push → uploadm8-auth</td><td>5</td></tr>
+    <tr><td><code>/ship-frontend</code></td><td>Sync frontend → uploadm8-frontend</td><td>5</td></tr>
+    <tr><td><code>/headless-eval</code></td><td>Background self-heal — you keep working</td><td>7</td></tr>
+    <tr><td><code>/overnight</code></td><td>Long E2E suite (pytest -m overnight)</td><td>7</td></tr>
+    <tr><td><code>/loop 30m …</code></td><td>Recurring in-session check (lightweight cron)</td><td>7</td></tr>
+  </table>
+
+  <div class="page-break"></div>
+
+  <!-- ========== SKILLS ========== -->
+  <h2>Skills (agent auto-picks by description)</h2>
+  <div class="cols">
+    <table>
+      <tr><th>Skill</th><th>Purpose</th></tr>
+      <tr><td><code>trill</code></td><td>Master orchestrator — everything below</td></tr>
+      <tr><td><code>uploadm8-eval-loop</code></td><td>eval_loop + self-heal loops</td></tr>
+      <tr><td><code>uploadm8-agent-orchestrator</code></td><td>Multi-phase agent team</td></tr>
+      <tr><td><code>uploadm8-ascended-ci</code></td><td>CI red → triage → fix → push</td></tr>
+      <tr><td><code>uploadm8-ultrathink</code></td><td>Deep plan before code</td></tr>
+      <tr><td><code>uploadm8-ultracode</code></td><td>Eval-driven development</td></tr>
+      <tr><td><code>uploadm8-dynamic-workflows</code></td><td>Diff → subagent graph</td></tr>
+    </table>
+    <table>
+      <tr><th>Skill</th><th>Purpose</th></tr>
+      <tr><td><code>uploadm8-multi-repo</code></td><td>auth + frontend orchestration</td></tr>
+      <tr><td><code>uploadm8-backend-push</code></td><td>Scoped backend commit/push</td></tr>
+      <tr><td><code>uploadm8-frontend-push</code></td><td>Frontend repo sync</td></tr>
+      <tr><td><code>uploadm8-worktrees</code></td><td>Parallel git lanes</td></tr>
+      <tr><td><code>uploadm8-headless</code></td><td>Background subagents</td></tr>
+      <tr><td><code>uploadm8-routines</code></td><td>Automations + /loop</td></tr>
+      <tr><td><code>uploadm8-agent-tooling</code></td><td>Register new agent scripts</td></tr>
+    </table>
+  </div>
+
+  <!-- ========== TERMINAL SCRIPTS ========== -->
+  <h2>Terminal scripts (PowerShell — copy/paste)</h2>
+  <table>
+    <tr><th>Script</th><th>Command</th><th>Output</th></tr>
+    <tr>
+      <td><strong>TRILL</strong></td>
+      <td><code>python scripts/agent/trill.py --mode pre-ship --json</code></td>
+      <td>Full report + actions[]</td>
+    </tr>
+    <tr>
+      <td>Route</td>
+      <td><code>python scripts/agent/dynamic_workflow.py --json</code></td>
+      <td>Which workflow + eval modes</td>
+    </tr>
+    <tr>
+      <td>Eval</td>
+      <td><code>python scripts/agent/eval_loop.py --mode unit --json</code></td>
+      <td>pass/fail + failures + -k hint</td>
+    </tr>
+    <tr>
+      <td>Self-heal</td>
+      <td><code>python scripts/agent/self_heal.py --mode unit --budget 5 --json</code></td>
+      <td>Multi-iteration eval history</td>
+    </tr>
+    <tr>
+      <td>Both repos</td>
+      <td><code>python scripts/agent/multi_repo_status.py --json</code></td>
+      <td>Dirty state + ship order</td>
+    </tr>
+    <tr>
+      <td>CI</td>
+      <td><code>python scripts/agent/ci_status.py --json</code></td>
+      <td>PR checks (needs gh)</td>
+    </tr>
+    <tr>
+      <td>5 windows</td>
+      <td><code>.\scripts\agent\worktree_spawn_all.ps1 -BranchPrefix feat/name</code></td>
+      <td>5 worktree paths</td>
+    </tr>
+    <tr>
+      <td>Fast unit</td>
+      <td><code>python run_tests.py unit</code></td>
+      <td>Pytest gate</td>
+    </tr>
+    <tr>
+      <td>Overnight</td>
+      <td><code>python run_tests.py overnight</code></td>
+      <td>E2E marker suite</td>
+    </tr>
+  </table>
+
+  <!-- ========== WHEN TO USE WHAT ========== -->
+  <h2>When to use what (decision tree)</h2>
+  <table>
+    <tr><th>Situation</th><th>Do this</th></tr>
+    <tr><td>Not sure where to start</td><td><code>/trill</code> or <code>dynamic_workflow.py --json</code></td></tr>
+    <tr><td>Small bug / tests red</td><td><code>/fix-tests</code></td></tr>
+    <tr><td>Normal feature</td><td><code>/ascended-loop</code> or <code>/orchestrate</code></td></tr>
+    <tr><td>Big / risky change</td><td><code>/ultrathink</code> → approve → <code>/ascended-loop</code></td></tr>
+    <tr><td>Prove feature with tests</td><td><code>/ultracode</code></td></tr>
+    <tr><td>Before merge / push</td><td><code>/trill --mode pre-ship</code> + <code>/parallel-audit</code></td></tr>
+    <tr><td>Backend + frontend</td><td><code>/multi-repo-ship</code></td></tr>
+    <tr><td>End of day</td><td><code>/overnight</code> or <code>/headless-eval</code></td></tr>
+    <tr><td>3+ lanes at once</td><td><code>/five-windows</code></td></tr>
+    <tr><td>CI failing on PR</td><td><code>ci_status.py</code> + ascended-ci skill</td></tr>
+    <tr><td>Hourly health check</td><td><code>/loop 1h trill audit --json</code></td></tr>
+  </table>
+
+  <!-- ========== AUTO (HOOKS + MCP) ========== -->
+  <h2>Always on (no command needed)</h2>
+  <div class="cols">
+    <div>
+      <h3>Hooks</h3>
+      <table>
+        <tr><td><strong>sessionStart</strong></td><td>Read AGENTS.md + command index</td></tr>
+        <tr><td><strong>afterFileEdit</strong></td><td>Suggests test command per file</td></tr>
+        <tr><td><strong>beforeShellExecution</strong></td><td>Blocks force-push main, .env staging</td></tr>
+        <tr><td><strong>subagentStop</strong></td><td>After bugbot → chain eval loop</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>MCP (Settings → MCP)</h3>
+      <table>
+        <tr><td><strong>uploadm8-agent</strong></td><td>trill_run, eval_run, self_heal, workflow_plan, ci_status</td></tr>
+        <tr><td><strong>Sentry</strong></td><td>Prod errors → repro → fix</td></tr>
+        <tr><td><strong>HuggingFace</strong></td><td>Models, datasets, ML jobs</td></tr>
+      </table>
+      <p class="when">MCP setup: <code>pip install -r requirements-agent.txt</code></p>
+    </div>
+  </div>
+
+  <!-- ========== TRILL MODES ========== -->
+  <h2>TRILL modes</h2>
+  <table>
+    <tr><th>Mode</th><th>Command</th><th>Use</th></tr>
+    <tr><td>audit</td><td><code>trill.py --json</code></td><td>Daily health check</td></tr>
+    <tr><td>pre-ship</td><td><code>trill.py --mode pre-ship --json</code></td><td>Before push / go live</td></tr>
+    <tr><td>heal</td><td><code>trill.py --mode heal --json</code></td><td>Fix all test failures</td></tr>
+    <tr><td>overnight</td><td><code>trill.py --mode overnight --json</code></td><td>End-of-day E2E prep</td></tr>
+    <tr><td>full</td><td><code>trill.py --mode full --json</code></td><td>Weekly stack health</td></tr>
+  </table>
+
+  <!-- ========== SAFETY ========== -->
+  <h2>Safety rules (never break these)</h2>
+  <table>
+    <tr><td>❌</td><td>Force-push main · commit .env · delete tests to green · git add .</td></tr>
+    <tr><td>✅</td><td>Commit/push only when YOU say so · scoped backend staging · eval before ship</td></tr>
+  </table>
+
+  <p class="footer">
+    UploadM8 · uploadm8-auth + uploadm8-frontend · Print: Ctrl+P → Letter ·
+    Source: <code>docs/agent-qb-wristband.html</code> ·
+    Automations: <code>.cursor/automations/trill.md</code>
+  </p>
+
+</body>
+</html>

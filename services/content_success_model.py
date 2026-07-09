@@ -141,12 +141,12 @@ def score_presign_init(
 ) -> Dict[str, Any]:
     """Lightweight pre-upload hotness hint (no video metadata yet)."""
     prefs = user_prefs or {}
-    nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy") or {}
-    if not isinstance(nested, dict):
-        nested = {}
+    from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy, strategy_audience_niche
+
+    nested = read_thumbnail_studio_default_strategy(prefs)
     feats: Dict[str, Any] = {
         "platform": (platforms or ["unknown"])[0],
-        "content_category": nested.get("audience_niche") or prefs.get("audience_niche") or "general",
+        "content_category": strategy_audience_niche(prefs, "general"),
         "caption_style": prefs.get("captionStyle") or prefs.get("caption_style"),
         "hashtag_count": 0,
         "duration_seconds": 0.0,

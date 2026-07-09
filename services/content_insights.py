@@ -802,9 +802,9 @@ def _pref_display_value(key: str, val: Any) -> str:
 
 
 def _current_pref_value(prefs: Dict[str, Any], key: str) -> Any:
-    nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy") or {}
-    if not isinstance(nested, dict):
-        nested = {}
+    from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy
+
+    nested = read_thumbnail_studio_default_strategy(prefs)
     snake_map = {
         "captionStyle": "caption_style",
         "captionTone": "caption_tone",

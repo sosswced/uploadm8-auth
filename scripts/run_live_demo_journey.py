@@ -68,6 +68,10 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("RATE_LIMIT_LOOPBACK_BYPASS", "1")
     os.environ.setdefault("E2E_TARGET_USER_ID", "ae995094-abb6-4a41-8d51-460ca8f0fd8c")
     os.environ.setdefault("E2E_TARGET_USER_NAME", "Johnny Omeadows")
+    # When invoked under /TUP, keep all-platform + persona defaults from tup.py.
+    if os.environ.get("E2E_TUP", "").lower() in ("1", "true", "yes"):
+        os.environ.setdefault("E2E_UPLOAD_PLATFORMS", "all")
+        os.environ.setdefault("E2E_USE_PERSONA", "1")
     os.environ.setdefault("E2E_WORKER_SAFE", "0" if args.no_worker_safe else "1")
     os.environ.setdefault("E2E_UPLOAD_QUIET_SEC", "90")
     os.environ.setdefault("E2E_UPLOAD_PAGE_DELAY_MS", "10000")

@@ -17,7 +17,7 @@ from core.config import R2_BUCKET_NAME
 import core.state
 from core.deps import get_current_user, get_current_user_readonly
 from core.wallet import refund_tokens
-from core.helpers import _load_uploads_columns, _now_utc, _pick_cols, _safe_col, get_plan
+from core.helpers import _load_uploads_columns, _now_utc, _pick_cols, _safe_col
 from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragments_columns
 from core.r2 import get_s3_client, _normalize_r2_key, resolve_stored_account_avatar_url
 from core.models import SmartScheduleOnlyUpdate
@@ -26,6 +26,7 @@ from services.upload.status import CANCELLABLE_STATUSES, is_requeueable_upload
 from services.uploads_handlers import SCHEDULED_PIPELINE_STATUSES, scheduled_in_clause
 from services.shell_bootstrap import _fetch_platforms_bundle, _ok, run_schedule_repair_background
 from services.upload.schedule_guard import schedule_slot_iso
+from stages.entitlements import entitlements_to_dict, get_entitlements_from_user
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,12 @@ async def _scheduled_upload_list_for_user(
                 else None
             )
             smart_schedule = _smart_schedule_from_upload_row(upload)
+            platform_results = upload.get("platform_results")
+            if isinstance(platform_results, str):
+                try:
+                    platform_results = json.loads(platform_results)
+                except Exception:
+                    platform_results = None
 
             target_account_details = []
             for tid in target_ids:
@@ -207,6 +214,7 @@ async def _scheduled_upload_list_for_user(
                     "status": upload["status"],
                     "schedule_mode": upload.get("schedule_mode") or "scheduled",
                     "smart_schedule": smart_schedule,
+                    "platform_results": platform_results,
                     "is_editable": upload["status"] in SCHEDULED_PIPELINE_STATUSES,
                     "is_cancellable": _is_cancellable(upload["status"]),
                     "is_requeueable": is_requeueable_upload(
@@ -235,6 +243,7 @@ _SCHEDULED_LIST_COLS = [
     "timezone",
     "schedule_mode",
     "schedule_metadata",
+    "platform_results",
     "error_code",
     "error_detail",
 ]
@@ -253,6 +262,7 @@ _SCHEDULED_DETAIL_COLS = [
     "created_at",
     "schedule_mode",
     "schedule_metadata",
+    "platform_results",
     "error_code",
     "error_detail",
 ]
@@ -345,7 +355,7 @@ async def get_scheduled_bootstrap(
     pool = core.state.db_pool
     if pool is None:
         raise HTTPException(503, "Database unavailable")
-    plan = get_plan(user.get("subscription_tier", "free"))
+    plan = entitlements_to_dict(get_entitlements_from_user(user))
 
     async def _stats():
         async with acquire_db(pool) as conn:
@@ -538,6 +548,13 @@ async def get_scheduled_upload(upload_id: UUID, user: dict = Depends(get_current
         elif not isinstance(sm, dict):
             sm = None
 
+        platform_results = upload.get("platform_results")
+        if isinstance(platform_results, str):
+            try:
+                platform_results = json.loads(platform_results)
+            except Exception:
+                platform_results = None
+
     return {
         "id": str(upload["id"]),
         "title": upload.get("title") or "Untitled",
@@ -552,6 +569,7 @@ async def get_scheduled_upload(upload_id: UUID, user: dict = Depends(get_current
         "schedule_mode": upload.get("schedule_mode") or "scheduled",
         "schedule_metadata": sm,
         "smart_schedule": sm,  # alias for scheduled.html saveScheduledUpload()
+        "platform_results": platform_results,
         "is_editable": upload.get("status") in SCHEDULED_PIPELINE_STATUSES,
         "is_cancellable": _is_cancellable(upload.get("status") or ""),
         "is_requeueable": is_requeueable_upload(

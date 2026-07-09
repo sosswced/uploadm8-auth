@@ -1,6 +1,11 @@
 """
-DB-driven marketing execution: campaigns → audience match → email / Discord / in-app events.
+DB-driven marketing execution (Path B — ML propensity targeting).
+
+Campaigns → audience match → optional ``score_user_propensity`` → email / Discord / in-app.
 Requires master-admin approval for outbound (email / discord / mixed) before sends.
+
+Distinct from Path A (``marketing_touchpoint_runner``), which is rule/segment based
+and does not use the promo uplift model.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import httpx
 
 from services.marketing_compliance import (
     assert_channel_rate_ok,
+    claim_campaign_delivery_slot,
     is_suppressed,
     recent_delivery_exists,
     render_template,
@@ -550,31 +556,29 @@ async def run_marketing_execution_tick(
                         )
                     except Exception:
                         pass
-                    await conn.execute(
-                        """
-                        INSERT INTO marketing_touchpoint_deliveries (
-                            id, user_id, channel, subject, body_text, body_html, status, scheduled_at, meta, campaign_id
-                        )
-                        VALUES ($1::uuid, $2::uuid, 'email', $3, $4, $5, 'pending', NOW(),
-                                $6::jsonb, $7::uuid)
-                        """,
-                        did,
-                        uid,
-                        subject,
-                        text_tpl and render_template(str(text_tpl), ctx),
-                        html_send,
-                        json.dumps(
-                            {
-                                "campaign_id": cid,
-                                "variant_id": promo_variant_id or None,
-                                "run_id": str(run_id),
-                                "promo_variant_id": promo_variant_id,
-                                "ml_propensity_score": ml_score,
-                                "ml_model": ml_model,
-                            }
-                        ),
-                        cid,
+                    claimed = await claim_campaign_delivery_slot(
+                        conn,
+                        user_id=uid,
+                        campaign_id=cid,
+                        channel="email",
+                        within_days=7,
+                        delivery_id=did,
+                        subject=subject,
+                        body_text=text_tpl and render_template(str(text_tpl), ctx),
+                        body_html=html_send,
+                        meta={
+                            "campaign_id": cid,
+                            "variant_id": promo_variant_id or None,
+                            "run_id": str(run_id),
+                            "promo_variant_id": promo_variant_id,
+                            "ml_propensity_score": ml_score,
+                            "ml_model": ml_model,
+                            "path": "ml_campaign_execution",
+                        },
                     )
+                    if not claimed:
+                        summary["skipped"] += 1
+                        continue
                     if mailgun_ready():
                         try:
                             await send_email(
@@ -583,6 +587,7 @@ async def run_marketing_execution_tick(
                                 html_send,
                                 category="marketing",
                                 tags=["campaign", str(cid)[:36]],
+                                user_id=uid,
                             )
                             await conn.execute(
                                 """
@@ -660,67 +665,75 @@ async def run_marketing_execution_tick(
                     if not line.strip():
                         line = f"Hi {ctx['name']} — " + (camp.get("objective") or "UploadM8 update")[:500]
                     did = uuid.uuid4()
-                    await conn.execute(
-                        """
-                        INSERT INTO marketing_touchpoint_deliveries (
-                            id, user_id, channel, subject, body_text, body_html, status, scheduled_at, meta, campaign_id
-                        )
-                        VALUES ($1::uuid, $2::uuid, 'discord_in_app', '', $3, '', 'sent', NOW(),
-                                $4::jsonb, $5::uuid)
-                        """,
-                        did,
-                        uid,
-                        line,
-                        json.dumps(
-                            {
-                                "campaign_id": cid,
-                                "variant_id": promo_variant_id or None,
-                                "run_id": str(run_id),
-                                "delivery": "in_app_discord_prompt",
-                                "promo_variant_id": promo_variant_id,
-                            }
-                        ),
-                        cid,
+                    claimed = await claim_campaign_delivery_slot(
+                        conn,
+                        user_id=uid,
+                        campaign_id=cid,
+                        channel="discord",
+                        within_days=7,
+                        delivery_id=did,
+                        subject="",
+                        body_text=line,
+                        body_html="",
+                        meta={
+                            "campaign_id": cid,
+                            "variant_id": promo_variant_id or None,
+                            "run_id": str(run_id),
+                            "delivery": "in_app_discord_prompt",
+                            "promo_variant_id": promo_variant_id,
+                            "path": "ml_campaign_execution",
+                        },
                     )
-                    await conn.execute(
-                        """
-                        INSERT INTO marketing_events (user_id, event_type, payload)
-                        VALUES ($1::uuid, 'campaign_discord_prompt', $2::jsonb)
-                        """,
-                        uid,
-                        json.dumps(
-                            {
-                                "campaign_id": cid,
-                                "title": (camp.get("name") or "UploadM8")[:120],
-                                "body": line[:2000],
-                                "cta_href": ctx.get("app_url", "") + "/settings.html",
-                                "cta_label": "Notification settings",
-                                "image_url": promo_image_url or None,
-                                "variant_id": promo_variant_id or None,
-                                "promo_variant_id": promo_variant_id or None,
-                            }
-                        ),
-                    )
-                    try:
-                        await record_outcome_label(
-                            conn,
-                            user_id=uid,
-                            upload_id=None,
-                            variant_id=promo_variant_id or None,
-                            feature_snapshot={
-                                "campaign_id": cid,
-                                "channel": ch,
-                                "tier": tier_norm,
-                            },
-                            label_json={"campaign_discord_prompt": True},
+                    if not claimed:
+                        summary["skipped"] += 1
+                    else:
+                        await conn.execute(
+                            """
+                            UPDATE marketing_touchpoint_deliveries
+                            SET status = 'sent', sent_at = NOW(), channel = 'discord_in_app'
+                            WHERE id = $1::uuid
+                            """,
+                            did,
                         )
-                    except Exception:
-                        pass
-                    touched = True
-                    camp_sent += 1
-                    total += 1
-                    summary["discord_sent"] += 1
-                    summary["in_app_written"] += 1
+                        await conn.execute(
+                            """
+                            INSERT INTO marketing_events (user_id, event_type, payload)
+                            VALUES ($1::uuid, 'campaign_discord_prompt', $2::jsonb)
+                            """,
+                            uid,
+                            json.dumps(
+                                {
+                                    "campaign_id": cid,
+                                    "title": (camp.get("name") or "UploadM8")[:120],
+                                    "body": line[:2000],
+                                    "cta_href": ctx.get("app_url", "") + "/settings.html",
+                                    "cta_label": "Notification settings",
+                                    "image_url": promo_image_url or None,
+                                    "variant_id": promo_variant_id or None,
+                                    "promo_variant_id": promo_variant_id or None,
+                                }
+                            ),
+                        )
+                        try:
+                            await record_outcome_label(
+                                conn,
+                                user_id=uid,
+                                upload_id=None,
+                                variant_id=promo_variant_id or None,
+                                feature_snapshot={
+                                    "campaign_id": cid,
+                                    "channel": ch,
+                                    "tier": tier_norm,
+                                },
+                                label_json={"campaign_discord_prompt": True},
+                            )
+                        except Exception:
+                            pass
+                        touched = True
+                        camp_sent += 1
+                        total += 1
+                        summary["discord_sent"] += 1
+                        summary["in_app_written"] += 1
                 elif ch == "discord":
                     continue
 

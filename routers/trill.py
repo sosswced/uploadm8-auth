@@ -543,10 +543,13 @@ async def generate_trill_preview(
 
 # ── Map unlock: completed upload with Trill score + route evidence (.map telemetry) ─────────────
 def _trill_since_dt(range_key: str) -> datetime:
-    minutes = {"7d": 10080, "30d": 43200, "90d": 262800, "1y": 525600, "all": 525600}.get(
-        (range_key or "30d").strip(), 43200
-    )
-    return datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    """Lower bound for Trill SQL windows. ``all`` uses the shared analytics all-time floor."""
+    from services.canonical_engagement import sql_since_for_analytics_range
+
+    rk = (range_key or "30d").strip().lower()
+    # Map Trill UI keys onto analytics presets (fix 90d typo that was ~182 days).
+    mapped = {"7d": "7d", "30d": "30d", "90d": "90d", "1y": "1y", "365d": "1y", "all": "all"}.get(rk, "30d")
+    return sql_since_for_analytics_range(mapped)
 
 
 _TRILL_DISPLAY_NAME_RE = re.compile(r"^[A-Za-z0-9 _\-]{2,32}$")
@@ -848,6 +851,8 @@ async def trill_leaderboard(
     hall_of_fame: list = []
     challenge_row = None
     challenge_completion = None
+    challenge_already_done = False
+    board_driver_count = 0
     pref_row = None
     opted_in = False
     viewer_row = None
@@ -989,23 +994,93 @@ async def trill_leaderboard(
 
                 rival_ids = set(await fetch_rivals(conn, uid))
                 challenge_row = await ensure_weekly_challenge(conn)
-                challenge_completion = None
+                challenge_completion = None  # just awarded on this request
+                challenge_already_done = False
                 if challenge_row and opted_in:
-                    challenge_completion = await check_challenge_for_user(conn, uid, challenge_row)
-                    if challenge_completion:
-                        rp = int(challenge_completion.get("reward_put") or 0)
-                        ra = int(challenge_completion.get("reward_aic") or 0)
-                        try:
-                            if rp > 0:
-                                await credit_wallet(conn, uid, "put", rp, "trill_weekly_challenge")
-                            if ra > 0:
-                                await credit_wallet(conn, uid, "aic", ra, "trill_weekly_challenge")
-                            await award_badge(conn, uid, "challenge_champ", presented_by="UploadM8 Challenge Desk")
-                        except Exception as _ce:
-                            logger.warning("trill challenge reward skipped: %s", _ce)
+                    challenge_already_done = bool(
+                        await conn.fetchval(
+                            "SELECT 1 FROM trill_challenge_completions WHERE user_id = $1 AND challenge_id = $2",
+                            uid,
+                            int(challenge_row["id"]),
+                        )
+                    )
+                    if not challenge_already_done:
+                        challenge_completion = await check_challenge_for_user(conn, uid, challenge_row)
+                        if challenge_completion:
+                            challenge_already_done = True
+                            rp = int(challenge_completion.get("reward_put") or 0)
+                            ra = int(challenge_completion.get("reward_aic") or 0)
+                            try:
+                                if rp > 0:
+                                    await credit_wallet(conn, uid, "put", rp, "trill_weekly_challenge")
+                                if ra > 0:
+                                    await credit_wallet(conn, uid, "aic", ra, "trill_weekly_challenge")
+                                await award_badge(conn, uid, "challenge_champ", presented_by="UploadM8 Challenge Desk")
+                            except Exception as _ce:
+                                logger.warning("trill challenge reward skipped: %s", _ce)
                 hall_of_fame = await fetch_hall_of_fame(conn)
                 rank_by_uid = {str(r["user_id"]): int(r["rank"]) for r in rows}
                 rival_handles = {}
+                # Rivals outside the LIMIT page still need ranks for overtake alerts.
+                missing_rivals = [rid for rid in rival_ids if rid not in rank_by_uid]
+                if missing_rivals:
+                    rival_rank_rows = await conn.fetch(
+                        f"""
+                        WITH per_upload AS (
+                            SELECT
+                                u.user_id,
+                                u.trill_score::float AS trill_score,
+                                {speed_x}::float AS speed_mph,
+                                {dist_x}::float AS dist_mi
+                            FROM uploads u
+                            INNER JOIN user_preferences pref ON pref.user_id = u.user_id
+                                AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
+                            WHERE u.created_at >= $1
+                              AND {TRILL_SCORED_PREDICATE.strip()}
+                              AND ($2::text IS NULL OR UPPER(TRIM({state_x})) = $2)
+                        ),
+                        agg AS (
+                            SELECT
+                                user_id::text AS user_id,
+                                COUNT(*)::int AS run_count,
+                                MAX(trill_score)::float AS best_trill,
+                                AVG(trill_score)::float AS avg_trill,
+                                MAX(speed_mph)::float AS best_speed,
+                                SUM(COALESCE(dist_mi, 0))::float AS total_distance
+                            FROM per_upload
+                            GROUP BY user_id
+                        ),
+                        ranked AS (
+                            SELECT
+                                user_id,
+                                ROW_NUMBER() OVER (ORDER BY {order_sql})::int AS rank
+                            FROM agg a
+                        )
+                        SELECT user_id, rank FROM ranked WHERE user_id = ANY($3::text[])
+                        """,
+                        since,
+                        region_code,
+                        missing_rivals,
+                    )
+                    for rr in rival_rank_rows:
+                        rank_by_uid[str(rr["user_id"])] = int(rr["rank"])
+                for rid in rival_ids:
+                    if rid not in rival_handles:
+                        pref_r = await conn.fetchrow(
+                            """
+                            SELECT NULLIF(btrim(trill_public_name), '') AS trill_public_name,
+                                   trill_public_name_status
+                            FROM user_preferences WHERE user_id = $1::uuid
+                            """,
+                            rid,
+                        )
+                        h, _, _ = _leaderboard_driver_handle(
+                            rid,
+                            pref_r.get("trill_public_name") if pref_r else None,
+                            pref_r.get("trill_public_name_status") if pref_r else None,
+                        )
+                        rival_handles[rid] = h
+                # Prefer display names from the page rows when available.
                 for r in rows:
                     uid_row = str(r["user_id"])
                     if uid_row in rival_ids:
@@ -1028,10 +1103,102 @@ async def trill_leaderboard(
                         viewer_rank = int(r["rank"])
                         break
 
+                # True community size (not capped by LIMIT) for percentile + out-of-page rank.
+                board_driver_count = int(
+                    await conn.fetchval(
+                        f"""
+                        WITH per_upload AS (
+                            SELECT
+                                u.user_id,
+                                u.trill_score::float AS trill_score,
+                                {speed_x}::float AS speed_mph,
+                                {dist_x}::float AS dist_mi
+                            FROM uploads u
+                            INNER JOIN user_preferences pref ON pref.user_id = u.user_id
+                                AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
+                            WHERE u.created_at >= $1
+                              AND {TRILL_SCORED_PREDICATE.strip()}
+                              AND ($2::text IS NULL OR UPPER(TRIM({state_x})) = $2)
+                        ),
+                        agg AS (
+                            SELECT user_id::text AS user_id
+                            FROM per_upload
+                            GROUP BY user_id
+                        )
+                        SELECT COUNT(*)::int FROM agg
+                        """,
+                        since,
+                        region_code,
+                    )
+                    or 0
+                )
+
+                # Opted-in viewer outside the LIMIT page still needs a real rank (never default to #1).
+                if (
+                    opted_in
+                    and viewer_row
+                    and int(viewer_row["run_count"] or 0) > 0
+                    and viewer_rank is None
+                    and board_driver_count > 0
+                ):
+                    viewer_rank = await conn.fetchval(
+                        f"""
+                        WITH per_upload AS (
+                            SELECT
+                                u.user_id,
+                                u.trill_score::float AS trill_score,
+                                {speed_x}::float AS speed_mph,
+                                {dist_x}::float AS dist_mi
+                            FROM uploads u
+                            INNER JOIN user_preferences pref ON pref.user_id = u.user_id
+                                AND COALESCE(pref.trill_leaderboard_opt_in, FALSE) = TRUE
+                            WHERE u.created_at >= $1
+                              AND {TRILL_SCORED_PREDICATE.strip()}
+                              AND ($2::text IS NULL OR UPPER(TRIM({state_x})) = $2)
+                        ),
+                        agg AS (
+                            SELECT
+                                user_id::text AS user_id,
+                                COUNT(*)::int AS run_count,
+                                MAX(trill_score)::float AS best_trill,
+                                AVG(trill_score)::float AS avg_trill,
+                                MAX(speed_mph)::float AS best_speed,
+                                SUM(COALESCE(dist_mi, 0))::float AS total_distance
+                            FROM per_upload
+                            GROUP BY user_id
+                        ),
+                        ranked AS (
+                            SELECT
+                                user_id,
+                                ROW_NUMBER() OVER (ORDER BY {order_sql})::int AS rank
+                            FROM agg a
+                        )
+                        SELECT rank FROM ranked WHERE user_id = $3
+                        """,
+                        since,
+                        region_code,
+                        uid_str,
+                    )
+                    if viewer_rank is not None:
+                        viewer_rank = int(viewer_rank)
+
                 v_best = float(viewer_row["best_trill"] or 0) if viewer_row else 0.0
                 v_runs = int(viewer_row["run_count"] or 0) if viewer_row else 0
                 v_speed = round(float(viewer_row["best_speed"] or 0), 1) if viewer_row else 0.0
+                viewer_stats = {
+                    "best_trill": v_best,
+                    "rank": viewer_rank,
+                    "run_count": v_runs,
+                    "best_speed": v_speed,
+                }
                 try:
+                    # Award badges for the viewer on this request so the UI paints earned state immediately.
+                    await evaluate_and_award_badges(
+                        conn,
+                        uid_str,
+                        viewer_stats=viewer_stats,
+                        since=since,
+                    )
                     viewer_badges = (await fetch_badges_for_users(conn, [uid_str])).get(uid_str, [])
                     viewer_badge_collection = await fetch_user_badge_collection(conn, uid_str)
                     if opted_in and viewer_rank is not None and rival_handles:
@@ -1045,16 +1212,12 @@ async def trill_leaderboard(
                             db_pool=core.state.db_pool,
                             defer_external_notify=True,
                         )
+                    # Keep background follow-up for any heavier landmark scans / retries.
                     background_tasks.add_task(
                         _leaderboard_badge_and_rival_followup,
                         uid_str,
                         since,
-                        {
-                            "best_trill": v_best,
-                            "rank": viewer_rank,
-                            "run_count": v_runs,
-                            "best_speed": v_speed,
-                        },
+                        viewer_stats,
                     )
                 except Exception:
                     viewer_badges = []
@@ -1181,7 +1344,10 @@ async def trill_leaderboard(
             str((pref_row or {}).get("trill_public_name_status") or "none"),
         )
         v_best_row = float(viewer_row["best_trill"] or 0)
-        inject_rank = viewer_rank if viewer_rank is not None else 1
+        # Prefer the true community rank computed above; never invent #1.
+        inject_rank = viewer_rank
+        if inject_rank is None:
+            inject_rank = (board_driver_count or len(out_rows)) + 1
         out_rows.append(
             {
                 "rank": inject_rank,
@@ -1209,13 +1375,14 @@ async def trill_leaderboard(
         if viewer_rank is None:
             viewer_rank = inject_rank
 
-    driver_count = len(out_rows)
+    # Prefer full community size for percentile; fall back to returned rows.
+    driver_count = int(board_driver_count or len(out_rows))
     total_runs = sum(int(r["run_count"] or 0) for r in out_rows)
     best_scores = [float(r["best_trill_score"] or 0) for r in out_rows]
     summary = {
         "driver_count": driver_count,
         "total_runs": total_runs,
-        "avg_best_trill": round(sum(best_scores) / driver_count, 1) if driver_count else 0.0,
+        "avg_best_trill": round(sum(best_scores) / len(out_rows), 1) if out_rows else 0.0,
         "max_best_trill": round(max(best_scores), 1) if best_scores else 0.0,
     }
 
@@ -1250,7 +1417,8 @@ async def trill_leaderboard(
     v_runs = int(viewer_row["run_count"] or 0) if viewer_row else 0
     percentile = None
     if opted_in and viewer_rank and driver_count > 0:
-        percentile = max(0, min(100, int(round(100 * (1 - (viewer_rank - 1) / driver_count)))))
+        # "Top X%" = share of the board at or above this rank (rank 1 → Top ~1–few %).
+        percentile = max(1, min(100, int(round(100 * viewer_rank / driver_count))))
 
     viewer = {
         "opted_in": opted_in,
@@ -1279,7 +1447,8 @@ async def trill_leaderboard(
             "target_value": float(challenge_row.get("target_value") or 0),
             "reward_put": int(challenge_row.get("reward_put") or 0),
             "reward_aic": int(challenge_row.get("reward_aic") or 0),
-            "completed": bool(challenge_completion),
+            "completed": bool(challenge_already_done or challenge_completion),
+            "just_completed": bool(challenge_completion),
         }
 
     payload = {
@@ -1534,7 +1703,7 @@ async def list_trill_rivals(user: dict = Depends(get_current_user)):
     async with core.state.db_pool.acquire() as conn:
         rival_uids = await fetch_rivals(conn, uid)
         if not rival_uids:
-            return {"rivals": []}
+            return {"rivals": [], "count": 0, "max": 3}
         rows = await conn.fetch(
             """
             SELECT user_id::text,
@@ -1653,13 +1822,15 @@ async def trill_driver_profile(public_id: str, range: str = Query("30d"), user: 
         handle, anon, approved = _leaderboard_driver_handle(
             target_uid, pref.get("trill_public_name") if pref else None, pref.get("trill_public_name_status") if pref else None
         )
+        speed_x = _leaderboard_speed_expr("u")
+        dist_x = _leaderboard_distance_expr("u")
         stats = await conn.fetchrow(
             f"""
             SELECT COUNT(*)::int AS run_count,
                    COALESCE(MAX(trill_score), 0)::float AS best_trill,
                    COALESCE(AVG(trill_score), 0)::float AS avg_trill,
-                   COALESCE(MAX(max_speed_mph), 0)::float AS best_speed,
-                   COALESCE(SUM(distance_miles), 0)::float AS total_distance
+                   COALESCE(MAX({speed_x}), 0)::float AS best_speed,
+                   COALESCE(SUM({dist_x}), 0)::float AS total_distance
             FROM uploads u
             WHERE u.user_id = $1 AND u.created_at >= $2 AND {TRILL_SCORED_PREDICATE.strip()}
             """,
@@ -1669,7 +1840,7 @@ async def trill_driver_profile(public_id: str, range: str = Query("30d"), user: 
         uploads = await conn.fetch(
             f"""
             SELECT id, COALESCE(NULLIF(btrim(title), ''), filename) AS title,
-                   trill_score::float, max_speed_mph::float, created_at
+                   trill_score::float, ({speed_x})::float AS max_speed_mph, created_at
             FROM uploads u
             WHERE u.user_id = $1 AND u.created_at >= $2 AND u.trill_score IS NOT NULL
               AND {TRILL_SCORED_PREDICATE.strip()}

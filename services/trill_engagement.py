@@ -1226,10 +1226,13 @@ async def process_rival_rank_changes(
     rival_handles: Dict[str, str],
     *,
     db_pool: Any = None,
+    defer_external_notify: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Compare current ranks to trill_lb_snapshot; notify when a tracked rival passes the viewer.
     Returns alerts for the current request (toast in UI).
+
+    When ``defer_external_notify`` is True, skip email/Discord (in-app + toast still fire).
     """
     if viewer_rank is None:
         return []
@@ -1268,10 +1271,12 @@ async def process_rival_rank_changes(
     old_rivals = prev.get("rivals") or {}
     new_my = int(viewer_rank)
 
-    user_row = await conn.fetchrow(
-        "SELECT email, name FROM users WHERE id = $1::uuid",
-        uid,
-    )
+    user_row = None
+    if not defer_external_notify:
+        user_row = await conn.fetchrow(
+            "SELECT email, name FROM users WHERE id = $1::uuid",
+            uid,
+        )
 
     for rid in rival_ids:
         new_r = rank_by_uid.get(rid)
@@ -1319,6 +1324,9 @@ async def process_rival_rank_changes(
                 "rival_public_id": public_driver_id(rid),
             }
         )
+
+        if defer_external_notify:
+            continue
 
         if user_row and user_row.get("email"):
             try:

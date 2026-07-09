@@ -86,6 +86,10 @@ ANALYTICS_RANGE_MINUTES: Dict[str, int] = {
     "1y": 525600,
 }
 
+# Floor for SQL ``created_at >= $since`` when range=all (product has no pre-2000 data).
+# Engagement rollups still treat ``all`` as truly unbounded (window_start=None).
+ALL_TIME_FLOOR_UTC = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
 
 def engagement_time_window_for_analytics_range(
     range_key: str, *, now: datetime
@@ -103,6 +107,20 @@ def engagement_time_window_for_analytics_range(
         end = end.astimezone(timezone.utc)
     start = end - timedelta(minutes=minutes)
     return start, end
+
+
+def sql_since_for_analytics_range(range_key: str, *, now: Optional[datetime] = None) -> datetime:
+    """
+    Non-null UTC lower bound for SQL filters.
+    ``all`` → ALL_TIME_FLOOR_UTC (effectively unbounded for UploadM8).
+    """
+    n = now or datetime.now(timezone.utc)
+    if n.tzinfo is None:
+        n = n.replace(tzinfo=timezone.utc)
+    elif n.tzinfo != timezone.utc:
+        n = n.astimezone(timezone.utc)
+    start, _ = engagement_time_window_for_analytics_range(range_key, now=n)
+    return start if start is not None else ALL_TIME_FLOOR_UTC
 
 
 def engagement_time_window_for_overview_days(days: int, *, now: datetime) -> Tuple[datetime, datetime]:

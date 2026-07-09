@@ -933,11 +933,29 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
         raw_tt = uprefs.get("tiktok_post_settings") or uprefs.get("tiktokPostSettings")
         if isinstance(raw_tt, dict):
             ctx.tiktok_post_settings = raw_tt
+        # Overlay full thumbnail snapshot from this upload so Studio/Upload toggles
+        # (engine, persona, strength, default strategy) beat account defaults.
         for key in (
             "thumbnail_pikzels_enabled",
             "thumbnailPikzelsEnabled",
             "thumbnail_studio_engine_enabled",
             "thumbnailStudioEngineEnabled",
+            "thumbnail_studio_enabled",
+            "thumbnailStudioEnabled",
+            "thumbnail_persona_enabled",
+            "thumbnailPersonaEnabled",
+            "thumbnail_default_persona_id",
+            "thumbnailDefaultPersonaId",
+            "thumbnail_persona_strength",
+            "thumbnailPersonaStrength",
+            "thumbnail_studio_default_strategy",
+            "thumbnailStudioDefaultStrategy",
+            "thumbnail_render_pipeline",
+            "thumbnailRenderPipeline",
+            "auto_thumbnails",
+            "autoThumbnails",
+            "styled_thumbnails",
+            "styledThumbnails",
         ):
             if key in uprefs and uprefs[key] is not None:
                 ctx.user_settings[key] = uprefs[key]

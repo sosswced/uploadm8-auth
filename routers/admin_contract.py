@@ -14,7 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 import core.state
@@ -813,6 +813,7 @@ async def marketing_pending_approval_list(user: dict = Depends(require_admin)):
 @marketing_router.post("/campaigns/{campaign_id}/approve")
 async def marketing_campaign_master_approve(
     campaign_id: str,
+    request: Request,
     payload: Dict[str, Any] = Body(default_factory=dict),
     user: dict = Depends(require_master_admin),
 ):
@@ -856,6 +857,27 @@ async def marketing_campaign_master_approve(
             if bool(payload.get("run_tick")):
                 async with core.state.db_pool.acquire() as conn2:
                     out["execution_tick"] = await run_marketing_execution_tick(conn2)
+            try:
+                await log_admin_audit(
+                    conn,
+                    user_id=str(user.get("id") or ""),
+                    admin=user,
+                    action="MARKETING_CAMPAIGN_APPROVE",
+                    details={
+                        "campaign_id": out.get("campaign_id"),
+                        "status": out.get("status"),
+                        "ticket_skipped": True,
+                        "run_tick": bool(payload.get("run_tick")),
+                        "email_sent": (out.get("execution_tick") or {}).get("email_sent"),
+                    },
+                    request=request,
+                    resource_type="marketing_campaign",
+                    resource_id=str(cid),
+                    severity="INFO",
+                    outcome="SUCCESS",
+                )
+            except Exception as audit_err:
+                logger.warning("marketing approve audit failed: %s", audit_err)
             return out
 
         tid = await conn.fetchval(
@@ -930,6 +952,27 @@ async def marketing_campaign_master_approve(
         }
         if bool(payload.get("run_tick")):
             out["execution_tick"] = await run_marketing_execution_tick(conn)
+        try:
+            await log_admin_audit(
+                conn,
+                user_id=str(user.get("id") or ""),
+                admin=user,
+                action="MARKETING_CAMPAIGN_APPROVE",
+                details={
+                    "campaign_id": out.get("campaign_id"),
+                    "status": out.get("status"),
+                    "ticket_id": out.get("ticket_id"),
+                    "run_tick": bool(payload.get("run_tick")),
+                    "email_sent": (out.get("execution_tick") or {}).get("email_sent"),
+                },
+                request=request,
+                resource_type="marketing_campaign",
+                resource_id=str(cid),
+                severity="INFO",
+                outcome="SUCCESS",
+            )
+        except Exception as audit_err:
+            logger.warning("marketing approve audit failed: %s", audit_err)
         return out
 
 
@@ -954,6 +997,7 @@ async def marketing_approval_tickets_list(
 async def marketing_approval_ticket_resolve(
     ticket_id: str,
     body: MarketingTicketResolveBody,
+    request: Request,
     user: dict = Depends(require_master_admin),
 ):
     try:
@@ -975,6 +1019,21 @@ async def marketing_approval_ticket_resolve(
                 decision=dec,
                 notes=body.notes,
             )
+            try:
+                await log_admin_audit(
+                    conn,
+                    user_id=str(user.get("id") or ""),
+                    admin=user,
+                    action="MARKETING_APPROVAL_TICKET_RESOLVE",
+                    details={"ticket_id": str(tid), "decision": dec, "result": out},
+                    request=request,
+                    resource_type="marketing_approval_ticket",
+                    resource_id=str(tid),
+                    severity="INFO",
+                    outcome="SUCCESS",
+                )
+            except Exception as audit_err:
+                logger.warning("marketing ticket resolve audit failed: %s", audit_err)
     except LookupError:
         raise HTTPException(404, "Ticket or campaign not found")
     except ValueError as e:
@@ -1007,9 +1066,11 @@ async def marketing_submit_approval_ticket(
 
 @marketing_router.post("/execution/tick")
 async def marketing_execution_tick(
+    request: Request,
     payload: Dict[str, Any] = Body(default_factory=dict),
-    user: dict = Depends(require_admin),
+    user: dict = Depends(require_master_admin),
 ):
+    """Run ML campaign execution tick (Path B). Master admin only."""
     max_c = int(payload.get("max_per_campaign") or 30)
     max_t = int(payload.get("max_total_sends") or 120)
     track = OptionalTrackioRun("marketing_execution_tick")
@@ -1019,6 +1080,28 @@ async def marketing_execution_tick(
             summary = await run_marketing_execution_tick(
                 conn, max_per_campaign=max_c, max_total_sends=max_t
             )
+            try:
+                await log_admin_audit(
+                    conn,
+                    user_id=str(user.get("id") or ""),
+                    admin=user,
+                    action="MARKETING_EXECUTION_TICK",
+                    details={
+                        "run_id": summary.get("run_id"),
+                        "email_sent": summary.get("email_sent"),
+                        "discord_sent": summary.get("discord_sent"),
+                        "in_app_written": summary.get("in_app_written"),
+                        "skipped": summary.get("skipped"),
+                        "path": "ml_campaign_execution",
+                    },
+                    request=request,
+                    resource_type="marketing_execution",
+                    resource_id=str(summary.get("run_id") or ""),
+                    severity="INFO",
+                    outcome="SUCCESS",
+                )
+            except Exception as audit_err:
+                logger.warning("marketing execution tick audit failed: %s", audit_err)
         logger.info("marketing_execution_tick by %s: %s", user.get("email"), summary.get("run_id"))
         track.log(
             {
@@ -1036,6 +1119,51 @@ async def marketing_execution_tick(
         raise
     finally:
         track.finish()
+
+
+@marketing_router.get("/automation-gate")
+async def marketing_automation_gate_get(user: dict = Depends(require_admin)):
+    """Status of Path A (rule-based) outbound touchpoint gate."""
+    from services.marketing_automation_gate import get_outbound_touchpoints_gate
+
+    async with core.state.db_pool.acquire() as conn:
+        return await get_outbound_touchpoints_gate(conn)
+
+
+class AutomationGateBody(BaseModel):
+    enabled: bool = False
+    notes: Optional[str] = Field(None, max_length=500)
+
+
+@marketing_router.post("/automation-gate")
+async def marketing_automation_gate_set(
+    body: AutomationGateBody,
+    request: Request,
+    user: dict = Depends(require_master_admin),
+):
+    """Master-admin enable/disable Path A email/Discord outbound (env flag still required)."""
+    from services.marketing_automation_gate import set_outbound_touchpoints_gate
+
+    async with core.state.db_pool.acquire() as conn:
+        out = await set_outbound_touchpoints_gate(
+            conn,
+            enabled=bool(body.enabled),
+            master_user_id=str(user.get("id") or ""),
+            notes=body.notes,
+        )
+        await log_admin_audit(
+            conn,
+            user_id=str(user.get("id") or ""),
+            admin=user,
+            action="MARKETING_AUTOMATION_GATE",
+            details=out,
+            request=request,
+            resource_type="marketing_automation_gate",
+            resource_id="touchpoints_outbound_v1",
+            severity="WARNING" if body.enabled else "INFO",
+            outcome="SUCCESS",
+        )
+    return out
 
 
 @marketing_router.api_route("/execution/heartbeat", methods=["GET", "POST"])
@@ -1507,25 +1635,30 @@ class EmailJobRunBody(BaseModel):
 
 
 @admin_compat_router.post("/email-jobs/run")
-async def email_jobs_run(body: EmailJobRunBody, user: dict = Depends(require_admin)):
-    """Run an admin email job on demand.
+async def email_jobs_run(
+    body: EmailJobRunBody,
+    request: Request,
+    user: dict = Depends(require_master_admin),
+):
+    """Run an admin email job on demand (master admin only).
 
     Supported job names:
       - trial_reminders
       - monthly_user_digest
       - weekly_admin_digest
       - scheduled_publish_alerts
-      - marketing_execution / marketing_touchpoints
-      - all  (runs every email job above + marketing_execution)
+      - marketing_execution / marketing_touchpoints  (explicit only — not via ``all``)
+      - all  (the four cron email jobs only; does NOT run marketing)
     """
     job = (body.job or "").strip().lower()
     admin_email = user.get("email") or "?"
     logger.info("email-jobs/run job=%s admin=%s", job, admin_email)
 
     response: Dict[str, Any] = {"ok": True, "job": job, "ran": []}
+    had_error = False
 
-    # 1. Marketing campaign tick (admin-authored campaigns)
-    if job in ("marketing_execution", "all"):
+    # Marketing legs are explicit-only (never bundled into ``all``).
+    if job == "marketing_execution":
         try:
             async with core.state.db_pool.acquire() as conn:
                 response["marketing_execution"] = await run_marketing_execution_tick(conn)
@@ -1533,10 +1666,9 @@ async def email_jobs_run(body: EmailJobRunBody, user: dict = Depends(require_adm
         except Exception as e:
             logger.exception("marketing_execution tick failed: %s", e)
             response["marketing_execution_error"] = str(e)
+            had_error = True
 
-    # 1b. Personalized multi-channel touchpoints (AI-generated lifecycle/upsell ads).
-    #     Self-gates on MARKETING_AUTOMATION_ENABLED inside the runner.
-    if job in ("marketing_touchpoints", "all"):
+    if job == "marketing_touchpoints":
         try:
             from services.marketing_touchpoint_runner import run_touchpoint_cycle
 
@@ -1545,8 +1677,9 @@ async def email_jobs_run(body: EmailJobRunBody, user: dict = Depends(require_adm
         except Exception as e:
             logger.exception("marketing_touchpoints cycle failed: %s", e)
             response["marketing_touchpoints_error"] = str(e)
+            had_error = True
 
-    # 2. Admin email jobs (the four buttons in the admin UI + 'all')
+    # Admin email jobs (the four buttons in the admin UI + 'all')
     if job in ADMIN_EMAIL_JOBS or job == "all":
         try:
             result = await run_admin_email_job(
@@ -1557,14 +1690,54 @@ async def email_jobs_run(body: EmailJobRunBody, user: dict = Depends(require_adm
                 response["ran"].extend(result["ran"])
             elif "job" in result:
                 response["ran"].append(result["job"])
+            if isinstance(result, dict) and result.get("error"):
+                had_error = True
+            if job == "all":
+                for sub in result.get("results") or []:
+                    if isinstance(sub, dict) and (sub.get("error") or int(sub.get("errors") or 0) > 0):
+                        had_error = True
+                        break
+            elif int(result.get("errors") or 0) > 0:
+                had_error = True
         except Exception as e:
             logger.exception("admin email job %s failed: %s", job, e)
             response["ok"] = False
             response["error"] = str(e)
+            had_error = True
 
     if not response["ran"]:
         response["ok"] = False
         response["error"] = f"unknown job: {body.job}"
+        had_error = True
+    elif had_error:
+        response["ok"] = False
+        if "error" not in response:
+            response["error"] = "one or more email job steps failed"
+
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            await log_admin_audit(
+                conn,
+                user_id=str(user.get("id") or ""),
+                admin=user,
+                action="ADMIN_EMAIL_JOBS_RUN",
+                details={
+                    "job": job,
+                    "ran": response.get("ran"),
+                    "ok": response.get("ok"),
+                    "error": response.get("error"),
+                    "email_jobs": response.get("email_jobs"),
+                    "marketing_execution_error": response.get("marketing_execution_error"),
+                    "marketing_touchpoints_error": response.get("marketing_touchpoints_error"),
+                },
+                request=request,
+                resource_type="admin_email_job",
+                resource_id=job,
+                severity="WARNING" if had_error else "INFO",
+                outcome="FAILURE" if had_error else "SUCCESS",
+            )
+    except Exception as audit_err:
+        logger.warning("email-jobs audit log failed: %s", audit_err)
 
     return response
 
@@ -1678,6 +1851,45 @@ async def marketing_email_open_pixel(token: str):
     except Exception:
         logger.debug("marketing open pixel skip", exc_info=True)
     return Response(content=px, media_type="image/png")
+
+
+@public_marketing_router.api_route("/unsubscribe/{token}", methods=["GET", "POST"])
+async def marketing_one_click_unsubscribe(token: str):
+    """List-Unsubscribe-Post / one-click: opt out of email marketing consent."""
+    from services.marketing_compliance import upsert_user_marketing_consent
+    from services.marketing_promo_media import verify_tracking_token
+
+    pl = verify_tracking_token(token)
+    if not pl or str(pl.get("t")) != "unsub_email":
+        raise HTTPException(400, "Invalid unsubscribe token")
+    uid = str(pl.get("u") or "").strip()
+    if not uid:
+        raise HTTPException(400, "Invalid unsubscribe token")
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            consent = await upsert_user_marketing_consent(
+                conn, uid, email_marketing=False
+            )
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO marketing_events (user_id, event_type, payload)
+                    VALUES ($1::uuid, 'marketing_unsubscribed', $2::jsonb)
+                    """,
+                    uid,
+                    json.dumps({"via": "list_unsubscribe", "email_marketing": False}),
+                )
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "email_marketing": False,
+            "consent": consent,
+            "message": "You have been unsubscribed from marketing emails.",
+        }
+    except Exception as e:
+        logger.warning("marketing one-click unsub failed: %s", e)
+        raise HTTPException(500, "Could not update marketing preferences")
 
 
 @public_marketing_router.post("/events")

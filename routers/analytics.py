@@ -54,10 +54,13 @@ _RANGE_PRESETS_MINUTES = {
     "1y": 365 * 24 * 60,
 }
 
-def _range_to_minutes(range_str: str | None, default_minutes: int) -> int:
+def _range_to_minutes(range_str: str | None, default_minutes: int) -> int | None:
+    """Return minutes for a range preset, or None for unbounded ``all``."""
     r = (range_str or "").strip()
     if not r:
         return default_minutes
+    if r.lower() == "all":
+        return None
     if r in _RANGE_PRESETS_MINUTES:
         return _RANGE_PRESETS_MINUTES[r]
     m = re.fullmatch(r"(\d{1,4})d", r)
@@ -498,10 +501,12 @@ async def get_analytics(
     user: dict = Depends(get_current_user_readonly),
 ):
     # Align range presets with canonical_engagement (includes 90d, half-open UTC windows).
+    # range=all → engagement rollup unbounded; upload/trill SQL uses ALL_TIME_FLOOR_UTC.
+    from services.canonical_engagement import sql_since_for_analytics_range
+
     now = _now_utc()
     win_start, win_end = engagement_time_window_for_analytics_range(range, now=now)
-    minutes = ANALYTICS_RANGE_MINUTES.get((range or "30d").strip().lower(), 43200)
-    since = win_start if win_start is not None else (now - timedelta(minutes=minutes))
+    since = sql_since_for_analytics_range(range, now=now)
     uid = user["id"]
     pool = core.state.db_pool
 
@@ -913,101 +918,57 @@ async def analytics_upload_counts_by_token(user: dict = Depends(get_current_user
 
 
 async def _compute_live_platform_metrics(user: dict) -> dict:
-    """Live platform API fetch; updates in-memory + DB cache."""
+    """
+    Live platform API fetch via the same job that powers the worker cache.
+    Preserves per-account ``accounts[]`` / ``accounts_polled`` / ``aggregate`` for CRM Deep Dive.
+
+    Failed refreshes must not poison the in-memory cache with a synthetic all-not_connected
+    payload for the full TTL (that blocked retries for hours).
+    """
+    from services.platform_metrics_job import refresh_platform_metrics_for_user
+
     user_id = str(user["id"])
     now = _time.time()
-    async with core.state.db_pool.acquire() as conn:
-        token_rows = await conn.fetch(
-            "SELECT id, platform, token_blob, account_id FROM platform_tokens WHERE user_id = $1 AND revoked_at IS NULL",
-            user["id"],
-        )
-        upload_counts = await conn.fetch(
-            """SELECT unnest(platforms) AS platform, COUNT(*)::int AS cnt
-               FROM uploads
-               WHERE user_id = $1 AND status IN ('succeeded', 'completed', 'partial')
-               GROUP BY platform""",
-            user["id"],
-        )
-
-    upload_map = {r["platform"]: r["cnt"] for r in upload_counts}
-
-    from services.platform_oauth_refresh import refresh_decrypted_token_for_row
-
-    token_map: dict = {}
-    for row in token_rows:
-        plat = row["platform"]
-        blob = row["token_blob"]
-        if not blob:
-            continue
-        try:
-            decrypted = decrypt_blob(blob)
-        except Exception:
-            continue
-        if decrypted:
-            if plat == "instagram" and not decrypted.get("ig_user_id") and row["account_id"]:
-                decrypted["ig_user_id"] = str(row["account_id"])
-            if plat == "facebook" and not decrypted.get("page_id") and row["account_id"]:
-                decrypted["page_id"] = str(row["account_id"])
-            decrypted = await refresh_decrypted_token_for_row(
-                plat,
-                decrypted,
-                db_pool=core.state.db_pool,
-                user_id=user_id,
-                token_row_id=str(row["id"]),
-            )
-            token_map[plat] = decrypted
-
-    async def run_tiktok():
-        t = token_map.get("tiktok", {})
-        return await _fetch_tiktok_metrics(t.get("access_token", ""))
-
-    async def run_youtube():
-        t = token_map.get("youtube", {})
-        return await _fetch_youtube_metrics(t.get("access_token", ""))
-
-    async def run_instagram():
-        t = token_map.get("instagram", {})
-        ig_id = (t.get("ig_user_id") or t.get("instagram_user_id") or t.get("instagram_page_id") or "")
-        return await _fetch_instagram_metrics(t.get("access_token", ""), ig_id)
-
-    async def run_facebook():
-        t = token_map.get("facebook", {})
-        page_id = (t.get("page_id") or t.get("facebook_page_id") or t.get("fb_page_id") or "")
-        return await _fetch_facebook_metrics(t.get("access_token", ""), page_id)
-
-    tasks = {}
-    if "tiktok" in token_map:
-        tasks["tiktok"] = run_tiktok()
-    if "youtube" in token_map:
-        tasks["youtube"] = run_youtube()
-    if "instagram" in token_map:
-        tasks["instagram"] = run_instagram()
-    if "facebook" in token_map:
-        tasks["facebook"] = run_facebook()
-
-    platforms_result: dict = {}
-    if tasks:
-        results = await _asyncio.gather(*tasks.values(), return_exceptions=True)
-        for plat, res in zip(tasks.keys(), results):
-            platforms_result[plat] = {"status": "error", "error": str(res)} if isinstance(res, Exception) else res
-
-    for plat in ["tiktok", "youtube", "instagram", "facebook"]:
-        if plat not in platforms_result:
-            platforms_result[plat] = {"status": "not_connected"}
-        platforms_result[plat]["uploads"] = upload_map.get(plat, 0)
-
-    output = {
-        "platforms": platforms_result,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "cached": False,
-        "cache_age_minutes": 0,
-        "next_refresh_minutes": int(_PLATFORM_CACHE_TTL / 60),
-    }
-
+    pool = core.state.db_pool
+    wrote = False
+    try:
+        wrote = bool(await refresh_platform_metrics_for_user(pool, user["id"]))
+    except Exception as e:
+        logger.warning("platform-metrics live refresh failed for %s: %s", user_id, e)
+        wrote = False
+    async with pool.acquire() as conn:
+        output = await _platform_metrics_db_cache_get(conn, user_id)
+    if not output:
+        empty_plat = {
+            "status": "not_connected",
+            "accounts_polled": 0,
+            "accounts_live": 0,
+            "accounts": [],
+            "uploads": 0,
+        }
+        output = {
+            "platforms": {p: dict(empty_plat) for p in ("tiktok", "youtube", "instagram", "facebook")},
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "cached": False,
+            "cache_age_minutes": 0,
+            "next_refresh_minutes": 0,
+            "aggregate": {
+                "views": 0,
+                "likes": 0,
+                "comments": 0,
+                "shares": 0,
+                "platforms_included": [],
+            },
+            "refresh_failed": not wrote,
+        }
+        # Ephemeral empty only — do not store for _PLATFORM_CACHE_TTL.
+        return output
+    output = dict(output)
+    output["cached"] = False
+    output["cache_age_minutes"] = 0
+    output["next_refresh_minutes"] = int(_PLATFORM_CACHE_TTL / 60)
+    output.pop("refresh_failed", None)
     _platform_metrics_cache[user_id] = {"fetched_at": now, "data": output}
-    async with core.state.db_pool.acquire() as conn:
-        await _platform_metrics_db_cache_set(conn, user_id, output)
-
     return output
 
 
@@ -1078,8 +1039,9 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
     plan = get_plan(user.get("subscription_tier", "free"))
     if not plan.get("excel"): raise HTTPException(403, "Excel export requires Studio+ plan")
 
-    minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
-    since = _now_utc() - timedelta(minutes=minutes)
+    from services.canonical_engagement import sql_since_for_analytics_range
+
+    since = sql_since_for_analytics_range(range)
 
     async with core.state.db_pool.acquire() as conn:
         ws_id = (user.get("workspace") or {}).get("id")
@@ -1121,7 +1083,7 @@ async def export_excel(type: str = "uploads", range: str = "30d", user: dict = D
     except ImportError:
         raise HTTPException(500, "Excel export not available")
 
-_TOP_CONTENT_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
+_TOP_CONTENT_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365, "365d": 365, "all": None}
 
 
 @router.get("/api/analytics/top-content")
@@ -1134,9 +1096,19 @@ async def analytics_top_content(
 
     Replaces the old client-side fetch-500-then-sort path: filters to completed,
     sorts by views desc, applies the range window, and returns a slim projection.
+    ``range=all`` is unbounded (no since filter).
     """
-    days = _TOP_CONTENT_RANGE_DAYS.get((range or "30d").strip().lower())
-    since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+    from services.canonical_engagement import sql_since_for_analytics_range
+
+    rk = (range or "30d").strip().lower()
+    if rk == "all":
+        since = None
+    elif rk in _TOP_CONTENT_RANGE_DAYS and _TOP_CONTENT_RANGE_DAYS[rk] is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=int(_TOP_CONTENT_RANGE_DAYS[rk]))
+    elif rk in _TOP_CONTENT_RANGE_DAYS:
+        since = None
+    else:
+        since = sql_since_for_analytics_range(rk)
     uid = str(user.get("billing_user_id") or user["id"])
     items = await fetch_user_uploads_list(
         core.state.db_pool,
@@ -1159,13 +1131,24 @@ async def analytics_top_content(
 @router.get("/api/analytics/overview")
 async def analytics_overview(
     days: int = Query(30, ge=1, le=3650),
+    range: Optional[str] = Query(None, description="Optional preset; range=all uses ALL_TIME_FLOOR_UTC"),
     platform: str = Query("all"),
     user: dict = Depends(get_current_user),
 ):
     """High-level KPI summary for analytics dashboard."""
+    from services.canonical_engagement import ALL_TIME_FLOOR_UTC, sql_since_for_analytics_range
+
     now = _now_utc()
-    win_start, win_end = engagement_time_window_for_overview_days(days, now=now)
-    since = win_start
+    rk = (range or "").strip().lower()
+    if rk == "all":
+        # Align with get_analytics(range=all): floor → now (not a 3650d clamp).
+        win_start = ALL_TIME_FLOOR_UTC
+        win_end = now
+        since = sql_since_for_analytics_range("all", now=now)
+        days = max(1, (win_end - win_start).days)
+    else:
+        win_start, win_end = engagement_time_window_for_overview_days(days, now=now)
+        since = win_start
     pf = _normalize_quality_scores_platform(platform)
     platform_sql = ""
     upload_params: list = [user["id"], win_start, win_end]
@@ -1393,9 +1376,27 @@ async def my_avg_processing(user: dict = Depends(get_current_user)):
 
 
 @router.get("/api/analytics/export")
-async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Query("csv"), user: dict = Depends(get_current_user)):
-    """Export analytics for the last N days as CSV (default) or JSON."""
-    since = _now_utc() - timedelta(days=days)
+async def analytics_export(
+    days: Optional[int] = Query(None, ge=1, le=3650),
+    range: Optional[str] = Query(None),
+    format: str = Query("csv"),
+    user: dict = Depends(get_current_user),
+):
+    """Export analytics as CSV (default) or JSON.
+
+    Prefer ``range=all|7d|30d|…`` (aligned with Analytics). Legacy ``days=N`` still works.
+    ``range=all`` uses the shared all-time floor (effectively unbounded).
+    """
+    from services.canonical_engagement import sql_since_for_analytics_range
+
+    rk = (range or "").strip().lower()
+    if rk:
+        since = sql_since_for_analytics_range(rk)
+        days_label = rk if rk == "all" else rk
+    else:
+        d = int(days if days is not None else 30)
+        since = _now_utc() - timedelta(days=d)
+        days_label = str(d)
 
     async with core.state.db_pool.acquire() as conn:
         try:
@@ -1460,7 +1461,13 @@ async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Q
     ]
 
     if format.lower() == "json":
-        return {"range_days": days, "since": since.isoformat(), "rows": data}
+        # ``range`` is canonical; ``range_days`` kept for legacy export consumers.
+        return {
+            "range": days_label,
+            "range_days": days_label,
+            "since": since.isoformat(),
+            "rows": data,
+        }
 
     # CSV default
     output = io.StringIO()
@@ -1480,5 +1487,6 @@ async def analytics_export(days: int = Query(30, ge=1, le=3650), format: str = Q
         writer.writerow(item)
 
     csv_bytes = output.getvalue().encode("utf-8")
-    headers = {"Content-Disposition": f'attachment; filename="uploadm8-analytics-{days}d.csv"'}
+    fname = f"uploadm8-analytics-{days_label}.csv"
+    headers = {"Content-Disposition": f'attachment; filename="{fname}"'}
     return Response(content=csv_bytes, media_type="text/csv", headers=headers)

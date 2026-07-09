@@ -17,18 +17,40 @@ logger = logging.getLogger("uploadm8-api")
 
 ERROR_SCHEDULE_INCOMPLETE = "SCHEDULE_INCOMPLETE"
 ERROR_SCHEDULE_NO_PLATFORMS = "SCHEDULE_NO_PLATFORMS"
+ERROR_PUBLISH_SLOT_MISSING = "PUBLISH_SLOT_MISSING"
+ERROR_STUCK_READY_TO_PUBLISH = "STUCK_READY_TO_PUBLISH"
+ERROR_STUCK_PENDING = "STUCK_PENDING"
+ERROR_ABANDONED_PENDING = "ABANDONED_PENDING"
 
 UPLOAD_ERROR_MESSAGES: Dict[str, str] = {
     ERROR_SCHEDULE_INCOMPLETE: (
         "This upload has no publish time. Edit the schedule or retry — our team was alerted."
     ),
     ERROR_SCHEDULE_NO_PLATFORMS: "Select at least one platform before scheduling.",
+    ERROR_PUBLISH_SLOT_MISSING: (
+        "This upload has no remaining publish slot. It was marked failed so it cannot sit forever — "
+        "retry or reschedule from Queue."
+    ),
+    ERROR_STUCK_READY_TO_PUBLISH: (
+        "Publishing stalled past the safety window. Marked failed so it cannot hang — "
+        "use Retry from Queue if the video is still needed."
+    ),
+    ERROR_STUCK_PENDING: (
+        "This upload never finished registration (no publish schedule). Marked failed — "
+        "upload again or use Re-queue if the file is still in storage."
+    ),
+    ERROR_ABANDONED_PENDING: (
+        "Upload was left incomplete (file never finished registering). Marked failed."
+    ),
     ERROR_SOURCE_NOT_IN_R2: SOURCE_NOT_IN_R2_MESSAGE,
     "ENQUEUE_FAILED": (
         "Upload saved but the processing queue was unavailable. We will retry automatically."
     ),
     "QUEUE_UNAVAILABLE": (
         "The processing queue was temporarily unavailable. Use Re-queue or wait for automatic retry."
+    ),
+    "STALE_PROCESSING": (
+        "Processing stalled and was stopped. Use Retry from Queue if you still need this upload."
     ),
 }
 
@@ -101,7 +123,7 @@ def validate_presign_schedule(data: Any) -> None:
 
     if mode == "scheduled":
         if not getattr(data, "scheduled_time", None):
-            logger.error(
+            logger.warning(
                 "presign rejected: scheduled mode without scheduled_time platforms=%s",
                 platforms,
             )
@@ -115,7 +137,7 @@ def validate_presign_schedule(data: Any) -> None:
             )
     elif mode == "smart":
         if not platforms:
-            logger.error("presign rejected: smart schedule without platforms")
+            logger.warning("presign rejected: smart schedule without platforms")
             raise HTTPException(
                 400,
                 detail={
@@ -221,7 +243,9 @@ async def mark_schedule_incomplete_failed(
     upload_id: str,
     *,
     detail: str,
+    error_code: str = ERROR_SCHEDULE_INCOMPLETE,
 ) -> None:
+    code = (error_code or ERROR_SCHEDULE_INCOMPLETE).strip().upper() or ERROR_SCHEDULE_INCOMPLETE
     await conn.execute(
         """
         UPDATE uploads
@@ -230,9 +254,10 @@ async def mark_schedule_incomplete_failed(
             error_detail = $3,
             updated_at = NOW()
         WHERE id = $1
+          AND status NOT IN ('failed', 'cancelled', 'completed', 'succeeded', 'partial')
         """,
         upload_id,
-        ERROR_SCHEDULE_INCOMPLETE,
+        code,
         detail[:4000],
     )
 

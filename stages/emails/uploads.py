@@ -534,9 +534,9 @@ async def send_scheduled_publish_alert_email(
     status: str = "upcoming",
     reason: str = "",
     upload_id: str = "",
-) -> None:
+) -> bool:
     if not mailgun_ready():
-        return
+        return False
 
     s = (status or "upcoming").strip().lower()
     if s in ("failed", "stuck", "error"):
@@ -601,4 +601,4 @@ async def send_scheduled_publish_alert_email(
         footer_note="You received this because email notifications are enabled and you have a scheduled upload.",
     )
 
-    await send_email(email, subject, shell_html)
+    return await send_email(email, subject, shell_html)

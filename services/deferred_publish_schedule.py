@@ -208,6 +208,52 @@ def still_has_pending_publish_slots(
     return False
 
 
+def next_due_scheduled_time(
+    upload_record: dict[str, Any],
+    platform_results: Any = None,
+    publish_targets: Optional[list[tuple[str, Optional[str]]]] = None,
+) -> Optional[datetime]:
+    """
+    Earliest remaining smart-slot time for unhandled publish targets.
+
+    Used after a partial deferred publish to advance ``uploads.scheduled_time``
+    so queue/scheduled countdowns and scheduler queries stay aligned with the
+    next platform (not the already-published earliest slot).
+    """
+    mode = str(upload_record.get("schedule_mode") or "").strip().lower()
+    results = platform_results if platform_results is not None else upload_record.get("platform_results")
+    handled = handled_target_keys(results)
+
+    platforms = [str(p).strip().lower() for p in (upload_record.get("platforms") or []) if str(p).strip()]
+    if not platforms:
+        return None
+
+    targets = publish_targets or [(p, None) for p in platforms]
+    pending_plats: set[str] = set()
+    for p, tid in targets:
+        if publish_target_key(str(p).lower(), tid) in handled:
+            continue
+        pending_plats.add(str(p).strip().lower())
+
+    if not pending_plats:
+        return None
+
+    if mode != "smart":
+        return parse_iso_datetime(upload_record.get("scheduled_time"))
+
+    schedule = parse_schedule_metadata(upload_record.get("schedule_metadata"))
+    candidates: list[datetime] = []
+    for plat in pending_plats:
+        slot = schedule.get(plat)
+        if slot is None:
+            slot = parse_iso_datetime(upload_record.get("scheduled_time"))
+        if slot is not None:
+            candidates.append(slot)
+    if not candidates:
+        return parse_iso_datetime(upload_record.get("scheduled_time"))
+    return min(candidates)
+
+
 def hydrate_platform_results_into_ctx(ctx: JobContext, raw: Any) -> None:
     """Load prior partial publish results into ctx before the next batch."""
     ctx.platform_results = []

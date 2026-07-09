@@ -315,6 +315,46 @@ def _studio_job_public(row: Any) -> Dict[str, Any]:
     }
 
 
+async def _assert_thumbnail_studio_enabled(user: dict) -> None:
+    """Block paid Studio/Pikzels spend when Thumbnail Studio is off in preferences."""
+    if core.state.db_pool is None:
+        raise HTTPException(
+            503,
+            {
+                "code": "preferences_unavailable",
+                "message": "Could not verify Thumbnail Studio preferences. Try again in a moment.",
+            },
+        )
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["id"])
+        prefs = _json_obj(row["preferences"] if row else None)
+    except Exception:
+        logger.warning("thumbnail studio preference gate failed closed", exc_info=True)
+        raise HTTPException(
+            503,
+            {
+                "code": "preferences_unavailable",
+                "message": "Could not verify Thumbnail Studio preferences. Try again in a moment.",
+            },
+        ) from None
+    raw = prefs.get("thumbnailStudioEnabled")
+    if raw is None:
+        raw = prefs.get("thumbnail_studio_enabled")
+    if raw is False or str(raw).strip().lower() in ("0", "false", "no", "off"):
+        raise HTTPException(
+            403,
+            {
+                "code": "thumbnail_studio_disabled",
+                "message": (
+                    "Thumbnail Studio is turned off in your upload preferences. "
+                    "Enable it under Settings → Preferences, then try again."
+                ),
+                "settings_url": "/settings.html#preferences",
+            },
+        )
+
+
 def _json_obj(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
@@ -325,6 +365,47 @@ def _json_obj(value: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _collect_studio_job_r2_keys(user_id: str, job_id: str, variant_rows: List[Any]) -> List[str]:
+    """R2 keys owned by a Thumbnail Studio job (variant previews + AB pack)."""
+    keys: List[str] = []
+    uid = str(user_id or "").strip()
+    jid = str(job_id or "").strip()
+    for r in variant_rows or []:
+        raw = r["variant_json"] if hasattr(r, "__getitem__") else None
+        if raw is None and isinstance(r, dict):
+            raw = r.get("variant_json")
+        j = _json_obj(raw)
+        pk = str(j.get("preview_r2_key") or "").strip()
+        if pk:
+            keys.append(pk)
+    if uid and jid:
+        keys.append(f"thumbnail-studio/ab-packs/{uid}/{jid}.zip")
+    # De-dupe while preserving order
+    seen = set()
+    out: List[str] = []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+async def _delete_studio_job_r2_assets(user_id: str, job_id: str, variant_rows: List[Any]) -> None:
+    keys = _collect_studio_job_r2_keys(user_id, job_id, variant_rows)
+    if not keys:
+        return
+    try:
+        await _delete_r2_objects(keys)
+    except Exception:
+        logger.warning(
+            "thumbnail studio R2 cleanup failed user=%s job=%s keys=%s",
+            user_id,
+            job_id,
+            len(keys),
+            exc_info=True,
+        )
 
 
 def _truthy_meta(value: Any) -> bool:
@@ -1236,6 +1317,8 @@ async def ts_link_persona_pikzels(persona_id: str, user: dict = Depends(get_curr
 async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current_user)):
     from services.thumbnail_niches import normalize_niche
 
+    await _assert_thumbnail_studio_enabled(user)
+
     title = await fetch_youtube_title(body.youtube_url)
     vid = extract_youtube_video_id(body.youtube_url)
     if not vid:
@@ -1488,25 +1571,47 @@ async def ts_delete_recent_jobs(
 ):
     """
     Remove the N most recent Thumbnail Studio jobs for this account (newest first).
-    Variants and feedback rows cascade; does not touch personas.
+    Variants and feedback rows cascade; R2 preview/AB assets are cleaned best-effort.
     """
     async with core.state.db_pool.acquire() as conn:
-        status = await conn.execute(
+        rows = await conn.fetch(
             """
-            DELETE FROM thumbnail_recreate_jobs
+            SELECT id FROM thumbnail_recreate_jobs
             WHERE user_id = $1
-              AND id IN (
-                SELECT id FROM (
-                    SELECT id FROM thumbnail_recreate_jobs
-                    WHERE user_id = $1
-                    ORDER BY created_at DESC
-                    LIMIT $2
-                ) sub
-              )
+            ORDER BY created_at DESC
+            LIMIT $2
             """,
             user["id"],
             count,
         )
+        job_ids = [r["id"] for r in rows]
+        variant_by_job: Dict[Any, List[Any]] = {jid: [] for jid in job_ids}
+        if job_ids:
+            vrows = await conn.fetch(
+                """
+                SELECT job_id, variant_json
+                FROM thumbnail_recreate_variants
+                WHERE user_id = $1 AND job_id = ANY($2::uuid[])
+                """,
+                user["id"],
+                job_ids,
+            )
+            for vr in vrows:
+                variant_by_job.setdefault(vr["job_id"], []).append(vr)
+            # Delete DB rows first so a failed DELETE cannot leave jobs with
+            # already-purged R2 keys. R2 cleanup is best-effort afterward.
+            status = await conn.execute(
+                """
+                DELETE FROM thumbnail_recreate_jobs
+                WHERE user_id = $1 AND id = ANY($2::uuid[])
+                """,
+                user["id"],
+                job_ids,
+            )
+            for jid in job_ids:
+                await _delete_studio_job_r2_assets(str(user["id"]), str(jid), variant_by_job.get(jid) or [])
+        else:
+            status = "DELETE 0"
     n = 0
     try:
         n = int(str(status).split()[-1])
@@ -1522,11 +1627,22 @@ async def ts_delete_job(job_id: str, user: dict = Depends(get_current_user_reado
     except ValueError:
         raise HTTPException(400, "Invalid job id")
     async with core.state.db_pool.acquire() as conn:
+        vrows = await conn.fetch(
+            """
+            SELECT variant_json FROM thumbnail_recreate_variants
+            WHERE job_id = $1 AND user_id = $2
+            """,
+            jid,
+            user["id"],
+        )
+        # DB first, then best-effort R2 — avoids orphaned jobs with broken keys.
         status = await conn.execute(
             "DELETE FROM thumbnail_recreate_jobs WHERE id = $1 AND user_id = $2",
             jid,
             user["id"],
         )
+        if str(status).strip() != "DELETE 0":
+            await _delete_studio_job_r2_assets(str(user["id"]), str(jid), vrows)
     if str(status).strip() == "DELETE 0":
         raise HTTPException(404, "Job not found")
     return {"deleted": True, "job_id": str(jid)}
@@ -2038,13 +2154,15 @@ async def _maybe_notify_pikzels_discord(
         logger.debug("pikzels user discord notify failed", exc_info=True)
 
 
-async def _pikzels_debit(user_id: str, op: str) -> str:
+async def _pikzels_debit(user: dict, op: str) -> str:
+    await _assert_thumbnail_studio_enabled(user)
+    user_id = str(user["id"])
     put, aic, meta = estimate_pikzels_v2_call_cost(op)
     # token_ledger.upload_id is UUID — plain id only (reason carries pikzels_v2_*).
     ref = str(uuid.uuid4())
     async with core.state.db_pool.acquire() as conn:
         ok = await atomic_debit_tokens(
-            conn, str(user_id), put, aic, ref, reason=f"pikzels_v2_{op}"
+            conn, user_id, put, aic, ref, reason=f"pikzels_v2_{op}"
         )
     if not ok:
         raise HTTPException(
@@ -2060,7 +2178,7 @@ async def _pikzels_debit(user_id: str, op: str) -> str:
 
 @router.post("/api/thumbnail-studio/pikzels-v2/prompt")
 async def ts_pikzels_prompt(body: PikzelsV2PromptBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "prompt")
+    await _pikzels_debit(user, "prompt")
     payload = body.model_dump(exclude_none=True)
     normalize_url_or_base64(payload, "support_image_url", "support_image_base64")
     await _enforce_pikzels_payload_ownership(str(user["id"]), payload)
@@ -2071,7 +2189,7 @@ async def ts_pikzels_prompt(body: PikzelsV2PromptBody, user: dict = Depends(get_
 
 @router.post("/api/thumbnail-studio/pikzels-v2/recreate")
 async def ts_pikzels_recreate(body: PikzelsV2RecreateBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "recreate")
+    await _pikzels_debit(user, "recreate")
     payload = body.model_dump(exclude_none=True)
     image_url = str(payload.get("image_url") or "").strip()
     if image_url and not image_url.lower().startswith(("data:", "http://i.ytimg.com", "https://i.ytimg.com")):
@@ -2091,7 +2209,7 @@ async def ts_pikzels_recreate(body: PikzelsV2RecreateBody, user: dict = Depends(
 
 @router.post("/api/thumbnail-studio/pikzels-v2/edit")
 async def ts_pikzels_edit(body: PikzelsV2EditBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "edit")
+    await _pikzels_debit(user, "edit")
     payload = body.model_dump(exclude_none=True)
     normalize_url_or_base64(payload, "image_url", "image_base64")
     normalize_url_or_base64(payload, "mask_url", "mask_base64")
@@ -2106,7 +2224,7 @@ async def ts_pikzels_edit(body: PikzelsV2EditBody, user: dict = Depends(get_curr
 
 @router.post("/api/thumbnail-studio/pikzels-v2/one-click-fix")
 async def ts_pikzels_one_click(body: PikzelsV2EditBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "one_click_fix")
+    await _pikzels_debit(user, "one_click_fix")
     payload = body.model_dump(exclude_none=True)
     normalize_url_or_base64(payload, "image_url", "image_base64")
     normalize_url_or_base64(payload, "mask_url", "mask_base64")
@@ -2121,7 +2239,7 @@ async def ts_pikzels_one_click(body: PikzelsV2EditBody, user: dict = Depends(get
 
 @router.post("/api/thumbnail-studio/pikzels-v2/faceswap")
 async def ts_pikzels_faceswap(body: PikzelsV2FaceswapBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "faceswap")
+    await _pikzels_debit(user, "faceswap")
     payload = body.model_dump(exclude_none=True)
     normalize_url_or_base64(payload, "image_url", "image_base64")
     normalize_url_or_base64(payload, "mask_url", "mask_base64")
@@ -2146,7 +2264,7 @@ async def ts_pikzels_faceswap(body: PikzelsV2FaceswapBody, user: dict = Depends(
 
 @router.post("/api/thumbnail-studio/pikzels-v2/score")
 async def ts_pikzels_score(body: PikzelsV2ScoreBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "score")
+    await _pikzels_debit(user, "score")
     payload = body.model_dump(exclude_none=True)
     normalize_url_or_base64(payload, "image_url", "image_base64")
     status, data = await pikzels_v2_post("/v2/thumbnail/score", payload)
@@ -2204,11 +2322,11 @@ async def ts_pikzels_from_upload_frame(
     if op == "edit":
         if not (body.prompt or "").strip():
             raise HTTPException(400, detail="edit requires prompt")
-        await _pikzels_debit(user["id"], "edit")
+        await _pikzels_debit(user, "edit")
     elif op == "recreate":
-        await _pikzels_debit(user["id"], "recreate")
+        await _pikzels_debit(user, "recreate")
     elif op == "score":
-        await _pikzels_debit(user["id"], "score")
+        await _pikzels_debit(user, "score")
     else:
         raise HTTPException(400, detail="invalid operation")
 
@@ -2379,7 +2497,7 @@ async def ts_pikzels_from_upload_frame(
 
 @router.post("/api/thumbnail-studio/pikzels-v2/titles")
 async def ts_pikzels_titles(body: PikzelsV2TitlesBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "titles")
+    await _pikzels_debit(user, "titles")
     payload = body.model_dump(exclude_none=True)
     normalize_url_or_base64(payload, "support_image_url", "support_image_base64")
     status, data = await pikzels_v2_post("/v2/title/text", payload)
@@ -2389,7 +2507,7 @@ async def ts_pikzels_titles(body: PikzelsV2TitlesBody, user: dict = Depends(get_
 
 @router.post("/api/thumbnail-studio/pikzels-v2/persona")
 async def ts_pikzels_persona(body: PikzelsV2PikzonalityBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "persona")
+    await _pikzels_debit(user, "persona")
     payload = body.model_dump(exclude_none=True)
     trim_pikzonality_images(payload)
     status, data = await pikzels_v2_post("/v2/pikzonality/persona", payload)
@@ -2413,7 +2531,7 @@ async def ts_pikzels_persona(body: PikzelsV2PikzonalityBody, user: dict = Depend
 
 @router.post("/api/thumbnail-studio/pikzels-v2/style")
 async def ts_pikzels_style(body: PikzelsV2PikzonalityBody, user: dict = Depends(get_current_user)):
-    await _pikzels_debit(user["id"], "style")
+    await _pikzels_debit(user, "style")
     payload = body.model_dump(exclude_none=True)
     trim_pikzonality_images(payload)
     status, data = await pikzels_v2_post("/v2/pikzonality/style", payload)
@@ -2561,7 +2679,7 @@ async def ts_pikzels_analyzer_apply_fix(
     body: PikzelsAnalyzerApplyFixBody,
     user: dict = Depends(get_current_user),
 ):
-    await _pikzels_debit(user["id"], "one_click_fix")
+    await _pikzels_debit(user, "one_click_fix")
     if body.persona:
         async with core.state.db_pool.acquire() as conn:
             if not await _user_owns_pikzels_pikzonality(conn, str(user["id"]), "persona", body.persona):
@@ -2627,7 +2745,7 @@ async def ts_pikzels_analyzer_generate_titles(
     analysis_id: str,
     user: dict = Depends(get_current_user),
 ):
-    await _pikzels_debit(user["id"], "titles")
+    await _pikzels_debit(user, "titles")
     try:
         async with core.state.db_pool.acquire() as conn:
             row = await generate_titles_for_analysis(
@@ -2674,7 +2792,7 @@ async def ts_pikzels_analyzer_batch_score(
     """Score recent uploads and return them ranked weakest-first."""
 
     async def _debit_score() -> None:
-        await _pikzels_debit(user["id"], "score")
+        await _pikzels_debit(user, "score")
 
     async with core.state.db_pool.acquire() as conn:
         result = await batch_score_user_uploads(

@@ -155,10 +155,23 @@ def _base_features(row: Dict[str, Any]) -> Dict[str, Any]:
         "hashtag_style": _cat("hashtag_style"),
         "thumbnail_selection_mode": _cat("thumbnail_selection_mode"),
         "thumbnail_render_pipeline": _cat("thumbnail_render_pipeline"),
+        "thumbnail_audience_niche": _cat("thumbnail_audience_niche"),
+        "thumbnail_engine_mode": _cat("thumbnail_engine_mode"),
+        "thumbnail_layout_pattern": _cat("thumbnail_layout_pattern"),
         "m8_engine": _bool_int(snap.get("m8_engine")),
         "ai_hashtags_enabled": _bool_int(snap.get("ai_hashtags_enabled")),
         "ai_hashtag_count": int(snap.get("ai_hashtag_count") or 0),
         "caption_frame_count": int(snap.get("caption_frame_count") or 0),
+        "thumbnail_studio_enabled": _bool_int(snap.get("thumbnail_studio_enabled", True)),
+        "thumbnail_studio_engine_enabled": _bool_int(snap.get("thumbnail_studio_engine_enabled", True)),
+        "thumbnail_persona_enabled": _bool_int(snap.get("thumbnail_persona_enabled")),
+        "thumbnail_persona_strength": int(snap.get("thumbnail_persona_strength") or 0),
+        "studio_variant_ctr_score": float(snap["studio_variant_ctr_score"])
+        if snap.get("studio_variant_ctr_score") is not None
+        else None,
+        "studio_pikzels_main_score": float(snap["studio_pikzels_main_score"])
+        if snap.get("studio_pikzels_main_score") is not None
+        else None,
         "sent_dow_utc": sent_dow_pg,
         "sent_hour_utc": sent_hour,
         "has_attribution": 1 if snap else 0,

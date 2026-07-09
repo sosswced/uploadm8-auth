@@ -24,6 +24,7 @@ Registration order in `app.py` (see “Router registration” section). Each rou
 | 8 | `routers.platforms` | Connected accounts |
 | 9 | `routers.billing` | Checkout, Stripe customer portal |
 | 10 | `routers.webhooks` | Stripe / platform webhooks |
+| 10b | `routers.meta_compliance` | Meta data-deletion + deauthorize callbacks (`/api/webhooks/facebook/...`) |
 | 11 | `routers.analytics` | Analytics / exports |
 | 12 | `routers.admin` | Admin APIs |
 | 13 | `routers.dashboard` | Dashboard |

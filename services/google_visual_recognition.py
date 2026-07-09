@@ -238,8 +238,10 @@ def _resolve_content_niche(ctx: Any) -> str:
         return normalize_niche(str(hp["category"]))
     us = getattr(ctx, "user_settings", None) or {}
     if isinstance(us, dict):
-        strat = us.get("thumbnailDefaultStrategy") or us.get("thumbnail_default_strategy") or {}
-        if isinstance(strat, dict) and strat.get("audience_niche"):
+        from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy
+
+        strat = read_thumbnail_studio_default_strategy(us)
+        if strat.get("audience_niche"):
             return normalize_niche(str(strat["audience_niche"]))
     return "general"
 

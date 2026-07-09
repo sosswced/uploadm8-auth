@@ -4,6 +4,7 @@ Admin HTTP surface; prefer thin handlers and ``services/`` for new logic.
 """
 
 import importlib.util
+import asyncio
 import json
 import os
 import re
@@ -950,7 +951,10 @@ async def send_announcement(data: AnnouncementRequest, background_tasks: Backgro
 
 @router.get("/users")
 async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = None, limit: int = 50, offset: int = 0, user: dict = Depends(require_admin)):
-    query = "SELECT id, email, name, role, subscription_tier, subscription_status, status, created_at, last_active_at FROM users WHERE 1=1"
+    query = (
+        "SELECT id, email, name, role, subscription_tier, subscription_status, status, "
+        "email_verified, created_at, last_active_at FROM users WHERE 1=1"
+    )
     params = []
     if search:
         term = search.strip()
@@ -983,6 +987,7 @@ async def admin_get_users(search: Optional[str] = None, tier: Optional[str] = No
                 "subscription_tier": u["subscription_tier"],
                 "subscription_status": u["subscription_status"],
                 "status": u["status"],
+                "email_verified": bool(u["email_verified"]) if u.get("email_verified") is not None else True,
                 "created_at": u["created_at"].isoformat() if u.get("created_at") else None,
                 "last_active_at": u["last_active_at"].isoformat() if u.get("last_active_at") else None,
             }
@@ -1119,6 +1124,38 @@ async def admin_change_email(user_id: str, payload: AdminUpdateEmailIn, request:
     )
 
     return {"ok": True, "email": new_email}
+
+
+@router.post("/users/{user_id}/verify-email")
+async def admin_verify_email(user_id: str, request: Request, user: dict = Depends(require_master_admin)):
+    """Manually mark a user's email as verified (master_admin Account Mgmt only)."""
+    if not _valid_uuid(user_id):
+        raise HTTPException(400, "Invalid user ID")
+    async with core.state.db_pool.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT id, email, email_verified FROM users WHERE id = $1",
+            user_id,
+        )
+        if not target:
+            raise HTTPException(status_code=404, detail="User not found")
+        if target["email_verified"] is True:
+            return {"ok": True, "email_verified": True, "already": True}
+
+        await conn.execute(
+            "UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1",
+            user_id,
+        )
+        await log_admin_audit(
+            conn,
+            user_id=user_id,
+            admin=user,
+            action="ADMIN_VERIFY_EMAIL",
+            details={"target_email": target["email"]},
+            request=request,
+            resource_type="user",
+            resource_id=user_id,
+        )
+    return {"ok": True, "email_verified": True}
 
 
 @router.post("/users/{user_id}/reset-password")
@@ -1553,6 +1590,13 @@ async def admin_analytics_overview(
             since,
         )
 
+        # Always a fixed trailing 30-day window (not the selected range).
+        since_30d = _now_utc() - timedelta(days=30)
+        new_users_30d = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at >= $1",
+            since_30d,
+        )
+
         paid_rows = await conn.fetch(
             """
             SELECT subscription_tier, COUNT(*)::bigint AS c
@@ -1572,9 +1616,12 @@ async def admin_analytics_overview(
     for tier, c in counts.items():
         mrr_estimate += _tier_list_price_usd(tier) * c
 
+    new_count = int(new_users or 0)
     return {
         "total_users": int(total_users or 0),
-        "new_users": int(new_users or 0),
+        "new_users": new_count,
+        # Compat for account-management.html — always trailing 30 days
+        "new_users_30d": int(new_users_30d or 0),
         "paid_users": int(paid_users or 0),
         "mrr_estimate": float(mrr_estimate),
         "range": f"{window_days}d",
@@ -1666,37 +1713,8 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         )
 
         until = _now_utc()
-        cost_summary = await build_admin_costs_summary(
-            conn, since=since, until=until, range_key=range,
-        )
-        openai_cost = cost_summary["openai_cost"]
-        openai_calls = cost_summary["openai_calls"]
-        google_cloud_cost = cost_summary["google_cloud_cost"]
-        pikzels_cost = cost_summary["pikzels_cost"]
-        pikzels_calls = cost_summary["pikzels_calls"]
-        twelvelabs_cost = cost_summary["twelvelabs_cost"]
-        serpapi_cost = cost_summary["serpapi_cost"]
-        other_provider_cost = cost_summary["other_provider_cost"]
-        storage_cost = cost_summary["storage_cost"]
-        storage_gb = cost_summary["storage_gb"]
-        bandwidth_cost = cost_summary["bandwidth_cost"]
-        bandwidth_tb = cost_summary["bandwidth_tb"]
-        compute_cost = cost_summary["compute_cost"]
-        stripe_fees = cost_summary["stripe_fees"]
-        stripe_fee_txns = cost_summary["stripe_fee_txns"]
-        mailgun_cost = cost_summary["mailgun_cost"]
-        mailgun_emails_sent = cost_summary["mailgun_emails_sent"]
-        postgres_cost = cost_summary["postgres_cost"]
-        postgres_size_gb = cost_summary["postgres_size_gb"]
-        redis_cost = cost_summary["redis_cost"]
-        redis_memory_mb = cost_summary["redis_memory_mb"]
-        total_costs = cost_summary["total_costs"]
-        cost_providers = cost_summary.get("providers") or []
-        cost_provenance = cost_summary.get("cost_provenance") or {}
 
-        gross_margin = ((total_mrr - total_costs) / max(total_mrr, 1)) * 100 if total_mrr > 0 else 0
-
-        # Uploads
+        # Uploads (fast SQL — heavy cost/engagement rollups run in parallel after this block)
         upload_stats = await conn.fetchrow("""
             SELECT COUNT(*)::int AS total, SUM(CASE WHEN status IN ('completed','succeeded') THEN 1 ELSE 0 END)::int AS completed,
             SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::int AS failed,
@@ -1709,7 +1727,6 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
 
         prev_uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1 AND created_at < $2", prev_since, since)
         uploads_change = ((total_uploads - prev_uploads) / max(prev_uploads, 1)) * 100 if prev_uploads > 0 else 0
-        cost_per_upload = cost_summary["cost_per_upload"]
 
         w_min = float(os.environ.get("KPI_WHISPER_ASSUMED_MINUTES_PER_UPLOAD", "0.5") or 0.5)
         w_usd = float(os.environ.get("KPI_WHISPER_USD_PER_MINUTE", "0.006") or 0.006)
@@ -1731,45 +1748,175 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
 
         cancellations = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_status = 'cancelled' AND updated_at >= $1", since)
 
-        admin_eng = await compute_admin_engagement_totals(
-            conn,
-            window_start=since,
-            window_end_exclusive=until,
-            pool=core.state.db_pool,
+        # Quota pressure (same signal as /kpi/burn) for Health Targets tile
+        quota_rows = await conn.fetch(
+            """
+            SELECT u.subscription_tier, w.put_balance, w.put_reserved
+            FROM users u
+            JOIN wallets w ON w.user_id = u.id
+            WHERE u.status = 'active'
+            """
         )
-        reliability = await fetch_admin_reliability_metrics(conn, since, until)
-        attach = await fetch_admin_attach_metrics(conn, since, until)
+        hitting_quota = 0
+        for u in quota_rows:
+            daily = get_plan(u["subscription_tier"]).get("put_daily", 1) or 1
+            if (int(u["put_balance"] or 0) - int(u["put_reserved"] or 0)) <= daily:
+                hitting_quota += 1
+        quota_hit_rate = round((hitting_quota / max(len(quota_rows), 1)) * 100, 1)
 
-    upload_pipeline_funnel: dict = {}
-    try:
-        from services.upload_funnel_metrics import funnel_conversion_summary
-
-        lookback_days = max(1, int(minutes / (24 * 60)))
-        upload_pipeline_funnel = await funnel_conversion_summary(
-            core.state.db_pool, lookback_days=lookback_days
+        # Upload volume by tier / platform for margin allocation
+        tier_upload_rows = await conn.fetch(
+            """
+            SELECT COALESCE(u.subscription_tier, 'free') AS tier, COUNT(up.id)::int AS uploads
+            FROM users u
+            LEFT JOIN uploads up ON up.user_id = u.id AND up.created_at >= $1 AND up.created_at < $2
+            GROUP BY COALESCE(u.subscription_tier, 'free')
+            """,
+            since,
+            until,
         )
-    except Exception:
-        upload_pipeline_funnel = {"error": "unavailable"}
+        tier_upload_counts = {
+            _tier_json_key(r["tier"]): int(r["uploads"] or 0) for r in tier_upload_rows
+        }
 
-    refunds_total, refunds_count = await fetch_stripe_refunds_window(since, until)
+    pool = core.state.require_pool()
+
+    async def _load_cost_summary():
+        async with acquire_db(pool) as c:
+            return await build_admin_costs_summary(
+                c, since=since, until=until, range_key=range,
+            )
+
+    async def _load_admin_eng():
+        async with acquire_db(pool) as c:
+            return await compute_admin_engagement_totals(
+                c,
+                window_start=since,
+                window_end_exclusive=until,
+                pool=pool,
+            )
+
+    async def _load_reliability():
+        async with acquire_db(pool) as c:
+            return await fetch_admin_reliability_metrics(c, since, until)
+
+    async def _load_attach():
+        async with acquire_db(pool) as c:
+            return await fetch_admin_attach_metrics(c, since, until)
+
+    async def _load_upload_funnel():
+        try:
+            from services.upload_funnel_metrics import funnel_conversion_summary
+
+            lookback_days = max(1, int(minutes / (24 * 60)))
+            return await funnel_conversion_summary(pool, lookback_days=lookback_days)
+        except Exception:
+            return {"error": "unavailable"}
+
+    async def _load_refunds():
+        return await fetch_stripe_refunds_window(since, until)
+
+    (
+        cost_summary,
+        admin_eng,
+        reliability,
+        attach,
+        upload_pipeline_funnel,
+        refunds_pair,
+    ) = await asyncio.gather(
+        _load_cost_summary(),
+        _load_admin_eng(),
+        _load_reliability(),
+        _load_attach(),
+        _load_upload_funnel(),
+        _load_refunds(),
+    )
+    refunds_total, refunds_count = refunds_pair
+
+    openai_cost = cost_summary["openai_cost"]
+    openai_calls = cost_summary["openai_calls"]
+    google_cloud_cost = cost_summary["google_cloud_cost"]
+    pikzels_cost = cost_summary["pikzels_cost"]
+    pikzels_calls = cost_summary["pikzels_calls"]
+    twelvelabs_cost = cost_summary["twelvelabs_cost"]
+    serpapi_cost = cost_summary["serpapi_cost"]
+    other_provider_cost = cost_summary["other_provider_cost"]
+    storage_cost = cost_summary["storage_cost"]
+    storage_gb = cost_summary["storage_gb"]
+    bandwidth_cost = cost_summary["bandwidth_cost"]
+    bandwidth_tb = cost_summary["bandwidth_tb"]
+    compute_cost = cost_summary["compute_cost"]
+    stripe_fees = cost_summary["stripe_fees"]
+    stripe_fee_txns = cost_summary["stripe_fee_txns"]
+    mailgun_cost = cost_summary["mailgun_cost"]
+    mailgun_emails_sent = cost_summary["mailgun_emails_sent"]
+    postgres_cost = cost_summary["postgres_cost"]
+    postgres_size_gb = cost_summary["postgres_size_gb"]
+    redis_cost = cost_summary["redis_cost"]
+    redis_memory_mb = cost_summary["redis_memory_mb"]
+    total_costs = cost_summary["total_costs"]
+    cost_providers = cost_summary.get("providers") or []
+    cost_provenance = cost_summary.get("cost_provenance") or {}
+    cost_per_upload = cost_summary["cost_per_upload"]
+
+    gross_margin = ((total_mrr - total_costs) / max(total_mrr, 1)) * 100 if total_mrr > 0 else 0
+
+    topup_revenue = float(revenue["topups"]) if revenue else 0.0
+    paid_churn_rate = round((cancellations / max(paid_users, 1)) * 100, 1)
+    arpa_uplift = round((topup_revenue / max(total_mrr, 1)) * 100, 1) if total_mrr > 0 else 0.0
+
+    # Allocate window COGS by upload share → per-tier / per-platform margin %
+    upload_denom = max(sum(tier_upload_counts.values()), 1)
+    margin_by_tier: dict = {}
+    for tier_key, tier_mrr in mrr_by_tier.items():
+        share = tier_upload_counts.get(tier_key, 0) / upload_denom
+        allocated = float(total_costs) * share
+        tm = float(tier_mrr or 0)
+        margin_by_tier[tier_key] = round(((tm - allocated) / max(tm, 1)) * 100, 1) if tm > 0 else None
+    # Alias creator_lite ↔ launch for UI
+    if "creator_lite" in margin_by_tier and "launch" not in margin_by_tier:
+        margin_by_tier["launch"] = margin_by_tier["creator_lite"]
+    elif "launch" in margin_by_tier and "creator_lite" not in margin_by_tier:
+        margin_by_tier["creator_lite"] = margin_by_tier["launch"]
+
+    plat_denom = max(sum(int(v or 0) for v in platform_distribution.values()), 1)
+    margin_by_platform = {}
+    for plat, uploads_n in platform_distribution.items():
+        share = int(uploads_n or 0) / plat_denom
+        allocated = float(total_costs) * share
+        # Platform margin vs total MRR share by upload volume (board estimate)
+        rev_share = float(total_mrr) * share
+        margin_by_platform[plat] = (
+            round(((rev_share - allocated) / max(rev_share, 1)) * 100, 1) if rev_share > 0 else None
+        )
+
+    mrr_creator_lite = float(
+        mrr_by_tier.get("creator_lite")
+        or mrr_by_tier.get("launch")
+        or 0
+    )
 
     return {
         "total_mrr": total_mrr, "mrr_change": 0, "mrr_by_tier": mrr_by_tier,
-        "mrr_launch": mrr_by_tier.get("launch", 0), "mrr_creator_pro": mrr_by_tier.get("creator_pro", 0),
+        "mrr_launch": mrr_creator_lite,
+        "mrr_creator_lite": mrr_creator_lite,
+        "mrr_creator_pro": mrr_by_tier.get("creator_pro", 0),
         "mrr_studio": mrr_by_tier.get("studio", 0), "mrr_agency": mrr_by_tier.get("agency", 0),
         "launch_users": int(tier_breakdown.get("creator_lite") or tier_breakdown.get("launch") or 0),
         "creator_lite_users": int(tier_breakdown.get("creator_lite") or tier_breakdown.get("launch") or 0),
         "creator_pro_users": tier_breakdown.get("creator_pro", 0),
         "studio_users": tier_breakdown.get("studio", 0), "agency_users": tier_breakdown.get("agency", 0),
-        "topup_revenue": float(revenue["topups"]) if revenue else 0,
+        "topup_revenue": topup_revenue,
         "topup_count": int(revenue["topup_cnt"] or 0) if revenue else 0,
         "arpu": round(total_mrr / max(total_users, 1), 2), "arpa": round(total_mrr / max(paid_users, 1), 2),
+        "arpa_uplift": arpa_uplift,
         "refunds": refunds_total, "refund_count": refunds_count,
         "openai_cost": openai_cost, "openai_calls": openai_calls,
         "google_cloud_cost": google_cloud_cost, "pikzels_cost": pikzels_cost, "pikzels_calls": pikzels_calls,
         "twelvelabs_cost": twelvelabs_cost, "serpapi_cost": serpapi_cost, "other_provider_cost": other_provider_cost,
         "storage_cost": storage_cost, "storage_gb": storage_gb,
-        "compute_cost": compute_cost, "bandwidth_cost": bandwidth_cost, "bandwidth_tb": bandwidth_tb,
+        "compute_cost": compute_cost,
+        "bandwidth_cost": bandwidth_cost, "bandwidth_tb": bandwidth_tb,
         "stripe_fees": stripe_fees, "stripe_fee_txns": stripe_fee_txns,
         "mailgun_cost": mailgun_cost, "mailgun_emails_sent": mailgun_emails_sent,
         "postgres_cost": postgres_cost, "postgres_size_gb": postgres_size_gb,
@@ -1777,11 +1924,16 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         "providers": cost_providers, "cost_provenance": cost_provenance,
         "total_costs": total_costs, "cost_per_upload": round(cost_per_upload, 4),
         "gross_margin": round(gross_margin, 1), "gross_margin_change": 0,
+        "margin_by_tier": margin_by_tier,
+        "margin_by_platform": margin_by_platform,
         "funnel_signups": new_users, "funnel_connected": funnel_connected, "funnel_uploaded": funnel_uploaded,
         "funnel_signup_connect": round(funnel_signup_connect, 1), "funnel_connect_upload": round(funnel_connect_upload, 1),
         "upload_pipeline_funnel": upload_pipeline_funnel,
         "free_to_paid_rate": round((paid_users / max(total_users, 1)) * 100, 1), "free_to_paid_change": 0,
-        "cancellations": cancellations, "cancellation_rate": round((cancellations / max(paid_users, 1)) * 100, 1),
+        "paid_churn_rate": paid_churn_rate,
+        "quota_hit_rate": quota_hit_rate,
+        "users_hitting_quota": hitting_quota,
+        "cancellations": cancellations, "cancellation_rate": paid_churn_rate,
         "failed_payments": 0, "payment_failure_rate": 0,
         "total_uploads": total_uploads, "successful_uploads": successful_uploads, "success_rate": round(success_rate, 1),
         "transcode_fail_rate": reliability.get("transcode_fail_rate", 0),
@@ -2823,10 +2975,10 @@ async def admin_adjust_wallet(
     payload:  AdminWalletAdjust,
     request:  Request,
     background_tasks: BackgroundTasks,
-    admin:    dict = Depends(require_admin),
+    admin:    dict = Depends(require_master_admin),
 ):
     """
-    Manually adjust a user's PUT or AIC balance.
+    Manually adjust a user's PUT or AIC balance (master_admin only).
 
     Modes:
       set      -> set balance to exactly this amount

@@ -119,6 +119,17 @@ CONTENT_FEATURES: List[Feature] = [
     Feature("thumbnail_selection_mode", "attribution snapshot", "categorical", "cat"),
     Feature("thumbnail_render_pipeline", "attribution snapshot", "categorical", "cat"),
 
+    # Thumbnail Studio / Aurora packaging — consumed by content-success training.
+    Feature("thumbnail_studio_enabled", "attribution snapshot", "int", "num"),
+    Feature("thumbnail_studio_engine_enabled", "attribution snapshot", "int", "num"),
+    Feature("thumbnail_persona_enabled", "attribution snapshot", "int", "num"),
+    Feature("thumbnail_persona_strength", "attribution snapshot", "int", "num"),
+    Feature("studio_variant_ctr_score", "studio_render_report via attribution", "float", "num"),
+    Feature("studio_pikzels_main_score", "studio_render_report via attribution", "float", "num"),
+    Feature("thumbnail_audience_niche", "studio default strategy", "categorical", "cat"),
+    Feature("thumbnail_engine_mode", "thumbnail_render_method", "categorical", "cat"),
+    Feature("thumbnail_layout_pattern", "studio default strategy", "categorical", "cat"),
+
     # Missing-attribution indicator (replaces fake-default categoricals).
     Feature("has_attribution", "output_artifacts presence", "int", "num"),
 

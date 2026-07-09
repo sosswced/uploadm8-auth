@@ -3,14 +3,15 @@
   Final live-ready gate before /333 — evals, router lint, checklist Excel, TRILL pre-ship.
 
 .DESCRIPTION
-  Scriptable checks only. Agent must also confirm via flags:
-  - Sentry MCP: is:unresolved level:error → zero blocking issues
-  - /parallel-audit bugbot: no critical findings
-  - Self-heal green from /overnight phases 3–5
+  Scriptable checks + agent flags. Sentry clearance comes from
+  tests/e2e/artifacts/sentry_triage.json with mcp_verified=true
+  (Phase 6: MCP search_issues → sentry_triage.py --record --mcp-verified).
+  - /parallel-audit bugbot: no critical findings (-BugbotClear)
+  - Self-heal green (-SelfHealed)
 
 .EXAMPLE
-  # After overnight + Sentry + bugbot confirmed in agent session:
-  .\tools\run_overnight_ship_gate.ps1 -SentryCleared -BugbotClear -SelfHealed
+  # After overnight Phase 6 wrote mcp_verified artifact + bugbot/self-heal confirmed:
+  .\tools\run_overnight_ship_gate.ps1 -BugbotClear -SelfHealed
 
 .EXAMPLE
   .\tools\run_overnight_ship_gate.ps1 -Checklist "tests\e2e\artifacts\UploadM8_Full_App_Checklist_20260609_143426.xlsx" -OvernightJUnit "tests\e2e\artifacts\overnight_report.xml"
@@ -21,6 +22,7 @@ param(
     [string] $OvernightJUnit = "tests\e2e\artifacts\overnight_report.xml",
     [switch] $SkipChecklist,
     [switch] $SentryCleared,
+    [switch] $AllowSentryFlagOnly,
     [switch] $BugbotClear,
     [switch] $SelfHealed
 )
@@ -36,6 +38,7 @@ if ($OvernightJUnit -and (Test-Path -LiteralPath $OvernightJUnit)) {
     $args += @("--require-overnight-junit", $OvernightJUnit)
 }
 if ($SentryCleared) { $args += "--sentry-cleared" }
+if ($AllowSentryFlagOnly) { $args += "--allow-sentry-flag-only" }
 if ($BugbotClear) { $args += "--bugbot-clear" }
 if ($SelfHealed) { $args += "--self-healed" }
 

@@ -3,6 +3,19 @@
 .env.*
 !.env.example
 
+# Local debug / investigation scripts (PII + prod DB footguns)
+_tmp_*.py
+_tmp_*.json
+_tmp_*.txt
+
+# Local ML training exports (may embed user_id / upload_id / balances)
+# Runtime models sync from Hugging Face via services/ml_model_sync.py
+data/ml/*.parquet
+data/ml/*_report.json
+data/ml/*.joblib
+data/ml/engine_state.json
+data/ml/test_*.*
+
 # Python
 .venv/
 .venv-*/

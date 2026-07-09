@@ -700,3 +700,13 @@ def tracking_pixel_url_for_delivery(delivery_id: str, user_id: str, campaign_id:
         }
     )
     return f"{api}/api/marketing/o/{tok}"
+
+
+def marketing_one_click_unsub_url(user_id: str) -> str:
+    """Signed List-Unsubscribe-Post URL that opts the user out of email marketing."""
+    base = (os.environ.get("FRONTEND_URL") or "https://app.uploadm8.com").rstrip("/")
+    api = (os.environ.get("PUBLIC_API_BASE_URL") or os.environ.get("API_PUBLIC_URL") or "").strip().rstrip("/")
+    if not api:
+        api = base.replace("app.", "auth.").replace("//app.", "//auth.")
+    tok = sign_tracking_token({"u": str(user_id), "t": "unsub_email"})
+    return f"{api}/api/marketing/unsubscribe/{tok}"

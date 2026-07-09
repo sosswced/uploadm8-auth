@@ -1980,6 +1980,76 @@ async def run_migrations(db_pool):
                 LEFT JOIN uploads u ON u.id = pci.upload_id
                 WHERE pci.upload_id IS NOT NULL;
             """),
+            (1090, """
+                ALTER TABLE admin_email_job_runs
+                    ALTER COLUMN triggered_by TYPE VARCHAR(255);
+
+                ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS last_weekly_admin_digest_sent_at TIMESTAMPTZ;
+
+                CREATE INDEX IF NOT EXISTS idx_users_weekly_admin_digest_pending
+                    ON users (last_weekly_admin_digest_sent_at)
+                    WHERE role IN ('admin', 'master_admin')
+                      AND status = 'active';
+            """),
+            (1091, """
+                -- Marketing consent is opt-in: missing row = no marketing email.
+                ALTER TABLE user_marketing_consent
+                    ALTER COLUMN email_marketing SET DEFAULT FALSE;
+
+                CREATE TABLE IF NOT EXISTS marketing_automation_gate (
+                    gate_key    VARCHAR(64) PRIMARY KEY,
+                    enabled     BOOLEAN NOT NULL DEFAULT FALSE,
+                    enabled_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+                    enabled_at  TIMESTAMPTZ,
+                    notes       TEXT,
+                    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                INSERT INTO marketing_automation_gate (gate_key, enabled, notes)
+                VALUES (
+                    'touchpoints_outbound_v1',
+                    FALSE,
+                    'Master must enable before Path A (rule-based) email/Discord sends'
+                )
+                ON CONFLICT (gate_key) DO NOTHING;
+            """),
+            (1092, """
+                -- Backfill: existing signed-up users get marketing email consent (signup auto-consent parity).
+                -- Never overwrite an existing consent row (preserves explicit opt-outs).
+                INSERT INTO user_marketing_consent (
+                    user_id, email_marketing, discord_marketing, allow_pii_in_ml, updated_at
+                )
+                SELECT u.id, TRUE, FALSE, FALSE, NOW()
+                FROM users u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM user_marketing_consent c WHERE c.user_id = u.id
+                )
+                  AND COALESCE(u.status, 'active') <> 'banned'
+                  AND u.email IS NOT NULL
+                  AND TRIM(u.email) <> '';
+            """),
+            (1093, """
+                -- Meta (Facebook) Data Deletion Request Callback audit + status tracking.
+                -- confirmation_code is returned to Meta and shown on data-deletion.html?code=...
+                CREATE TABLE IF NOT EXISTS meta_data_deletion_requests (
+                    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    confirmation_code   VARCHAR(64) NOT NULL UNIQUE,
+                    facebook_user_id    TEXT NOT NULL,
+                    status              VARCHAR(32) NOT NULL DEFAULT 'received',
+                    tokens_purged       INT NOT NULL DEFAULT 0,
+                    notes               TEXT,
+                    requested_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at        TIMESTAMPTZ,
+                    CONSTRAINT meta_data_deletion_status_chk CHECK (
+                        status IN ('received', 'completed', 'no_data', 'failed')
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_meta_deletion_fb_user
+                    ON meta_data_deletion_requests(facebook_user_id);
+                CREATE INDEX IF NOT EXISTS idx_meta_deletion_requested
+                    ON meta_data_deletion_requests(requested_at DESC);
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

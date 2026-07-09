@@ -50,9 +50,9 @@ def fetch_content_success_rankings() -> Dict[str, Any]:
 def _prefs_summary(prefs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not prefs:
         return {}
-    nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy") or {}
-    if not isinstance(nested, dict):
-        nested = {}
+    from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy, strategy_audience_niche
+
+    nested = read_thumbnail_studio_default_strategy(prefs)
     return {
         "caption_style": prefs.get("captionStyle") or prefs.get("caption_style"),
         "caption_tone": prefs.get("captionTone") or prefs.get("caption_tone"),
@@ -61,7 +61,7 @@ def _prefs_summary(prefs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "auto_captions": prefs.get("autoCaptions") if prefs.get("autoCaptions") is not None else prefs.get("auto_captions"),
         "thumbnail_persona_enabled": prefs.get("thumbnailPersonaEnabled") if prefs.get("thumbnailPersonaEnabled") is not None else prefs.get("thumbnail_persona_enabled"),
         "thumbnail_default_persona_id": prefs.get("thumbnailDefaultPersonaId") or prefs.get("thumbnail_default_persona_id"),
-        "audience_niche": nested.get("audience_niche") or prefs.get("audienceNiche") or prefs.get("audience_niche"),
+        "audience_niche": strategy_audience_niche(prefs) if nested or prefs.get("audienceNiche") or prefs.get("audience_niche") else (prefs.get("audienceNiche") or prefs.get("audience_niche")),
         "thumbnail_selection_mode": nested.get("thumbnailSelectionMode") or nested.get("thumbnail_selection_mode"),
         "thumbnail_render_pipeline": nested.get("thumbnailRenderPipeline") or nested.get("thumbnail_render_pipeline"),
     }
@@ -417,6 +417,55 @@ async def _fetch_prefs_and_personas(conn: Any, user_id: uuid.UUID) -> Dict[str, 
     return {"persona_count": int(row["persona_count"] or 0), "setup": _prefs_summary(raw)}
 
 
+def _unlock_progress(samples_30d: int, ranked_n: int, platforms_n: int, has_catalog: bool) -> Dict[str, Any]:
+    """Guided checklist toward readiness:ready for the Smart Insights decoder."""
+    steps = [
+        {
+            "id": "connect",
+            "label": "Connect at least one platform",
+            "done": platforms_n >= 1,
+            "href": "platforms.html",
+        },
+        {
+            "id": "publish",
+            "label": "Publish 3+ videos with AI captions",
+            "done": samples_30d >= 3,
+            "href": "upload.html",
+            "progress": min(samples_30d, 3),
+            "target": 3,
+        },
+        {
+            "id": "sync",
+            "label": "Sync engagement on Analytics",
+            "done": samples_30d >= 1,
+            "href": "analytics.html",
+        },
+        {
+            "id": "catalog",
+            "label": "Build channel memory (Vision entities)",
+            "done": has_catalog,
+            "href": "upload.html",
+        },
+        {
+            "id": "combo",
+            "label": "Unlock exact packaging combo (8+ scored posts)",
+            "done": samples_30d >= 8 and ranked_n >= 1,
+            "href": "upload.html",
+            "progress": min(samples_30d, 8),
+            "target": 8,
+        },
+    ]
+    done_n = sum(1 for s in steps if s.get("done"))
+    return {
+        "samples_30d": samples_30d,
+        "samples_to_ready": max(0, 8 - samples_30d),
+        "steps": steps,
+        "completed": done_n,
+        "total": len(steps),
+        "pct": int(round(100.0 * done_n / max(len(steps), 1))),
+    }
+
+
 def ai_insights_hub_fallback(*, error: Optional[str] = None) -> Dict[str, Any]:
     """Degraded hub when DB is unavailable or a gather task fails."""
     return {
@@ -438,6 +487,8 @@ def ai_insights_hub_fallback(*, error: Optional[str] = None) -> Dict[str, Any]:
         "current_setup": {},
         "persona_count": 0,
         "coach_suggestions": [],
+        "smart_offer": None,
+        "unlock_progress": _unlock_progress(0, 0, 0, False),
         "playbook": [],
     }
 
@@ -463,8 +514,10 @@ async def build_ai_insights_hub(pool: Any, user_id, user: Optional[Dict[str, Any
             row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1::uuid", uid)
         if row:
             prefs = coerce_jsonb_dict(row.get("preferences"))
-            nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy")
-            if isinstance(nested, dict) and nested.get("audience_niche"):
+            from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy
+
+            nested = read_thumbnail_studio_default_strategy(prefs)
+            if nested.get("audience_niche"):
                 category = normalize_niche(str(nested["audience_niche"]))
         return await fetch_channel_catalog_detail(pool, user_id=str(uid), category=category, limit_per_bucket=12)
 
@@ -543,6 +596,14 @@ async def build_ai_insights_hub(pool: Any, user_id, user: Optional[Dict[str, Any
     elif samples >= 3:
         readiness = "emerging"
 
+    catalog_entities = int((catalog or {}).get("entity_count") or 0) if isinstance(catalog, dict) else 0
+    unlock = _unlock_progress(
+        samples,
+        len(ranked),
+        len(platforms or []),
+        catalog_entities > 0,
+    )
+
     playbook = [
         {"id": "analytics", "label": "Analytics", "href": "analytics.html", "icon": "fas fa-chart-line", "hint": "Views, likes, comments, shares by upload"},
         {"id": "kpi", "label": "Upload KPIs", "href": "kpi.html", "icon": "fas fa-chart-bar", "hint": "Throughput and success rates"},
@@ -551,6 +612,7 @@ async def build_ai_insights_hub(pool: Any, user_id, user: Optional[Dict[str, Any
         {"id": "settings", "label": "AI settings", "href": "settings.html#preferences", "icon": "fas fa-sliders-h", "hint": "Caption tone, hashtags, personas"},
         {"id": "platforms", "label": "Connected accounts", "href": "platforms.html", "icon": "fas fa-plug", "hint": "OAuth health per platform"},
         {"id": "scheduled", "label": "Scheduled", "href": "scheduled.html", "icon": "fas fa-calendar-alt", "hint": "Rhythm and peak windows"},
+        {"id": "billing", "label": "Wallet & plans", "href": "billing.html", "icon": "fas fa-wallet", "hint": "PUT/AIC balance for optimized volume"},
     ]
 
     out: Dict[str, Any] = {
@@ -571,6 +633,8 @@ async def build_ai_insights_hub(pool: Any, user_id, user: Optional[Dict[str, Any
         "current_setup": prefs_block.get("setup") or {},
         "persona_count": prefs_block.get("persona_count") or 0,
         "coach_suggestions": (coach or {}).get("suggestions") or [],
+        "smart_offer": (coach or {}).get("smart_offer"),
+        "unlock_progress": unlock,
         "content_rankings": fetch_content_success_rankings(),
         "playbook": playbook,
     }

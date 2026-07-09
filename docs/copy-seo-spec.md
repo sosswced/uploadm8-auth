@@ -10,6 +10,8 @@
 **Repo mapping (no new HTML files):**
 - Feature Guide → `frontend/guide.html`
 - Setup Handbook → `frontend/guide.html#feat-settings-playbook`
+- ML & AI playbook (admin) → `frontend/guide.html#feat-ml-ai-hub`
+- HF assets setup (admin) → `frontend/guide.html#feat-hf-assets-setup`
 - Connected Accounts → `frontend/platforms.html`
 - Discord → external invite link (no `discord.html`)
 
@@ -41,14 +43,14 @@
 
 **Hero subhead:** Upload once and UploadM8 publishes to TikTok, YouTube, Instagram, and Facebook — with accurate AI captions, auto-generated thumbnails, and the consistent posting schedule you've been struggling to keep.
 
-**Section headers:** Everything happens after you hit upload · Captions that actually heard your video · Scroll-stopping thumbnails · It posts at the right time · Trill leaderboard · Built for creators who'd rather create · Final CTA: Make the video. We'll handle the rest.
+**Section headers:** Everything happens after you hit upload · Captions that actually heard your video · Scroll-stopping thumbnails · It posts at the right time · Smart Insights · Trill leaderboard · Built for creators who'd rather create · Final CTA: Make the video. We'll handle the rest.
 
 **SEO:** Title `UploadM8 — Upload Once, Post to TikTok, YouTube, Instagram & Facebook` · OG `Upload once. Post everywhere.` · JSON-LD `MultimediaApplication`
 
 ## guide.html (Feature Guide)
 
 - H1: `Everything UploadM8 does for you`
-- Subhead: A walkthrough of captions, thumbnails, scheduling, multi-account publishing, and the Trill leaderboard — what each feature does and when to use it.
+- Subhead: A walkthrough of captions, thumbnails, scheduling, Smart Insights, multi-account publishing, and the Trill leaderboard — what each feature does and when to use it.
 - Title: `Feature Guide — UploadM8`
 - Public SEO, indexed (no noindex)
 

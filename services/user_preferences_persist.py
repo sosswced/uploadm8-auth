@@ -481,6 +481,10 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             "thumbnail_default_persona_id",
             "thumbnailPersonaStrength",
             "thumbnail_persona_strength",
+            "thumbnailStudioDefaultStrategy",
+            "thumbnail_studio_default_strategy",
+            "thumbnailDefaultStrategy",
+            "thumbnail_default_strategy",
         )
         if any(k in p or sk in p for k, sk in zip(caption_keys, caption_snake)) or any(
             k in p or sk in p for k, sk in zip(thumb_keys, thumb_snake)
@@ -562,6 +566,43 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 v_persona = _pick_bool("thumbnailPersonaEnabled", "thumbnail_persona_enabled")
                 if v_persona is not None:
                     users_prefs["thumbnailPersonaEnabled"] = users_prefs["thumbnail_persona_enabled"] = v_persona
+                # Merge Studio default strategy (Settings niche / make-default from Studio).
+                incoming_strat = (
+                    p.get("thumbnailStudioDefaultStrategy")
+                    if isinstance(p.get("thumbnailStudioDefaultStrategy"), dict)
+                    else None
+                )
+                if incoming_strat is None and isinstance(p.get("thumbnail_studio_default_strategy"), dict):
+                    incoming_strat = p.get("thumbnail_studio_default_strategy")
+                if incoming_strat is None and isinstance(p.get("thumbnailDefaultStrategy"), dict):
+                    incoming_strat = p.get("thumbnailDefaultStrategy")
+                if incoming_strat is None and isinstance(p.get("thumbnail_default_strategy"), dict):
+                    incoming_strat = p.get("thumbnail_default_strategy")
+                if incoming_strat is not None:
+                    from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy
+
+                    if not incoming_strat:
+                        # Explicit clear from Settings.
+                        for k in (
+                            "thumbnailStudioDefaultStrategy",
+                            "thumbnail_studio_default_strategy",
+                            "thumbnailDefaultStrategy",
+                            "thumbnail_default_strategy",
+                        ):
+                            users_prefs.pop(k, None)
+                    else:
+                        existing = read_thumbnail_studio_default_strategy(users_prefs)
+                        merged = dict(existing)
+                        for k, v in incoming_strat.items():
+                            if v is None:
+                                continue
+                            if isinstance(v, str) and not v.strip():
+                                continue
+                            merged[k] = v
+                        users_prefs["thumbnailStudioDefaultStrategy"] = users_prefs[
+                            "thumbnail_studio_default_strategy"
+                        ] = merged
+                        users_prefs["thumbnailDefaultStrategy"] = users_prefs["thumbnail_default_strategy"] = merged
                 if "thumbnailDefaultPersonaId" in p or "thumbnail_default_persona_id" in p:
                     pid = p.get("thumbnailDefaultPersonaId")
                     if pid is None:

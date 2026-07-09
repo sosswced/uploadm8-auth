@@ -13,7 +13,6 @@ import core.state
 from core.deps import get_current_user, get_current_user_readonly
 from core.oauth import _revoke_platform_token
 from core.audit import log_system_event
-from core.helpers import get_plan
 from services.workspace import require_can_manage_platforms, resolve_billing_user_id
 from services.platform_accounts import (
     _PLATFORM_TOKEN_SELECT,
@@ -21,6 +20,7 @@ from services.platform_accounts import (
     serialize_platform_account,
     serialize_platform_account_flat,
 )
+from stages.entitlements import entitlements_to_dict, get_entitlements_from_user
 from services.platform_profile_refresh import refresh_platform_token_profile
 from services.accounts_hub_insights import build_accounts_hub_insights
 from services.tiktok_api import (
@@ -108,13 +108,15 @@ async def get_platforms(user: dict = Depends(get_current_user_readonly)):
             platforms[p] = []
         platforms[p].append(serialize_platform_account(acc, auth_error_by_token=auth_errors))
 
-    plan = get_plan(user.get("subscription_tier", "free"))
+    # Match /api/me: role (master_admin) + tier, not subscription_tier alone.
+    plan = entitlements_to_dict(get_entitlements_from_user(user))
     total = sum(len(v) for v in platforms.values())
+    max_accounts = int(plan.get("max_accounts", 1) or 1)
     return {
         "platforms": platforms,
         "total_accounts": total,
-        "max_accounts": plan.get("max_accounts", 1),
-        "can_add_more": total < plan.get("max_accounts", 1),
+        "max_accounts": max_accounts,
+        "can_add_more": total < max_accounts,
     }
 
 

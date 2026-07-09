@@ -30,7 +30,15 @@ class AdminResetPasswordIn(BaseModel):
 
 
 class AdminEmailJobRunRequest(BaseModel):
-    job: Literal["trial_reminders", "monthly_user_digest", "weekly_admin_digest", "scheduled_publish_alerts", "all"]
+    job: Literal[
+        "trial_reminders",
+        "monthly_user_digest",
+        "weekly_admin_digest",
+        "scheduled_publish_alerts",
+        "marketing_execution",
+        "marketing_touchpoints",
+        "all",
+    ]
 
 
 class PromoTogglesBody(BaseModel):

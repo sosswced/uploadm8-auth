@@ -2,6 +2,7 @@
 UploadM8 Webhook routes -- extracted from app.py.
 
 Handles TikTok and Facebook/Instagram webhook verification and event processing.
+Meta data-deletion / deauthorize callbacks live in routers.meta_compliance.
 """
 
 import hashlib

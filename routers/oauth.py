@@ -390,6 +390,18 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
 
                 meta_perms = await fetch_granted_permissions(client, user_access_token)
 
+                # App-scoped Facebook user id (ASID) — required to honor Meta data-deletion callbacks.
+                facebook_user_asid = None
+                try:
+                    me_resp = await client.get(
+                        "https://graph.facebook.com/v18.0/me",
+                        params={"fields": "id", "access_token": user_access_token},
+                    )
+                    if me_resp.status_code == 200:
+                        facebook_user_asid = str((me_resp.json() or {}).get("id") or "").strip() or None
+                except Exception as _asid_e:
+                    logger.debug("Instagram OAuth ASID fetch skipped: %s", _asid_e)
+
                 # Get Facebook Pages the user manages
                 pages_response = await client.get(
                     f"https://graph.facebook.com/v18.0/me/accounts?access_token={user_access_token}"
@@ -464,6 +476,18 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
 
                 meta_perms_fb = await fetch_granted_permissions(client, user_access_token)
 
+                # App-scoped Facebook user id (ASID) — required to honor Meta data-deletion callbacks.
+                facebook_user_asid = None
+                try:
+                    me_resp = await client.get(
+                        "https://graph.facebook.com/v18.0/me",
+                        params={"fields": "id", "access_token": user_access_token},
+                    )
+                    if me_resp.status_code == 200:
+                        facebook_user_asid = str((me_resp.json() or {}).get("id") or "").strip() or None
+                except Exception as _asid_e:
+                    logger.debug("Facebook OAuth ASID fetch skipped: %s", _asid_e)
+
                 # Facebook Reels require a Page token, not a user token.
                 # Fetch the user's Pages and use the first one.
                 pages_response = await client.get(
@@ -522,6 +546,10 @@ async def oauth_callback(platform: str, code: str = Query(None), state: str = Qu
                     blob_payload["meta_permissions"] = meta_perms
                 elif platform == "facebook":
                     blob_payload["meta_permissions"] = meta_perms_fb
+                # Persist ASID so Meta data-deletion / deauthorize callbacks can find rows.
+                _asid = locals().get("facebook_user_asid")
+                if _asid:
+                    blob_payload["facebook_user_id"] = str(_asid)
             if platform == "instagram" and account_id:
                 blob_payload["ig_user_id"] = str(account_id)
             if platform == "facebook" and account_id:

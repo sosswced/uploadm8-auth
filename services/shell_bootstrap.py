@@ -6,13 +6,16 @@ import asyncio
 import logging
 from typing import Any, Mapping, Optional
 
-from core.helpers import get_plan
-from core.r2 import resolve_stored_account_avatar_url
+from stages.entitlements import entitlements_to_dict, get_entitlements_from_user
 from services.dashboard_user_stats import dashboard_stats_for_user
+from services.platform_accounts import (
+    _PLATFORM_TOKEN_SELECT,
+    fetch_auth_errors_by_token,
+    serialize_platform_account,
+)
 from services.upload.schedule_guard import bootstrap_repair_user_schedules
 from services.uploads_handlers import (
     UPLOAD_VIEW_STATUS,
-    _dt_iso,
     fetch_upload_queue_stats,
     fetch_user_uploads_list,
 )
@@ -28,7 +31,7 @@ async def _bootstrap_schedule_repair(pool: Any, user_id: str) -> dict[str, int] 
             timeout=BOOTSTRAP_SCHEDULE_REPAIR_TIMEOUT_SEC,
         )
     except asyncio.TimeoutError:
-        logger.error(
+        logger.warning(
             "shell_bootstrap schedule repair timed out after %.0fs user=%s",
             BOOTSTRAP_SCHEDULE_REPAIR_TIMEOUT_SEC,
             user_id,
@@ -56,21 +59,13 @@ def _allowed_upload_view(raw: Optional[str]) -> Optional[str]:
 
 
 async def _fetch_platforms_bundle(pool: Any, user_id: str, plan: Mapping[str, Any]) -> dict[str, Any]:
-    """Same JSON shape as GET /api/platforms."""
+    """Same JSON shape as GET /api/platforms (status + reconnect timestamps included).
+
+    Avatars use redirect paths (``presign=False``) for cheap bootstrap first paint.
+    """
     async with pool.acquire() as conn:
-        accounts = await conn.fetch(
-            """
-            SELECT DISTINCT ON (platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''))
-                id, platform, account_id, account_name, account_username, account_avatar, is_primary, created_at
-            FROM platform_tokens
-            WHERE user_id = $1
-              AND revoked_at IS NULL
-              AND account_id IS NOT NULL AND account_id <> ''
-              AND (COALESCE(account_username,'') <> '' OR COALESCE(account_name,'') <> '')
-            ORDER BY platform, account_id, COALESCE(account_username,''), COALESCE(account_name,''), created_at DESC
-            """,
-            user_id,
-        )
+        auth_errors = await fetch_auth_errors_by_token(conn, user_id)
+        accounts = await conn.fetch(_PLATFORM_TOKEN_SELECT, user_id)
 
     platforms: dict[str, list] = {}
     for acc in accounts:
@@ -78,16 +73,11 @@ async def _fetch_platforms_bundle(pool: Any, user_id: str, plan: Mapping[str, An
         if p not in platforms:
             platforms[p] = []
         platforms[p].append(
-            {
-                "id": str(acc["id"]),
-                "account_id": acc["account_id"],
-                "name": acc["account_name"],
-                "username": acc["account_username"],
-                "avatar": resolve_stored_account_avatar_url(acc["account_avatar"], presign=False),
-                "is_primary": acc["is_primary"],
-                "status": "active",
-                "connected_at": _dt_iso(acc["created_at"]),
-            }
+            serialize_platform_account(
+                acc,
+                auth_error_by_token=auth_errors,
+                presign=False,
+            )
         )
 
     total = sum(len(v) for v in platforms.values())
@@ -119,7 +109,7 @@ async def shell_bootstrap_payload(
     (Sentry: multiple ``pg_advisory_unlock_all`` spans are pool returns, not app advisory locks).
     """
     uid = str(user.get("billing_user_id") or user["id"])
-    plan = get_plan(user.get("subscription_tier", "free"))
+    plan = entitlements_to_dict(get_entitlements_from_user(user))
     wallet = user.get("wallet") or {}
     view = _allowed_upload_view(upload_view)
 
@@ -212,7 +202,7 @@ async def _upload_bootstrap_payload(user: dict[str, Any]) -> dict[str, Any]:
     from routers.preferences import get_user_preferences
 
     results = await asyncio.gather(
-        get_user_preferences(include_personas=False, user=user),
+        get_user_preferences(include_personas=True, user=user),
         get_platform_accounts(user=user),
         get_groups(user=user),
         return_exceptions=True,
@@ -226,7 +216,9 @@ async def _upload_bootstrap_payload(user: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-_KPI_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "365d": 365, "1y": 365, "all": 3650}
+# Map KPI UI range presets → analytics_overview ``days``.
+# ``all`` is handled via range=all on analytics_overview (ALL_TIME_FLOOR_UTC).
+_KPI_RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "365d": 365, "1y": 365}
 
 
 async def _kpi_bootstrap_payload(
@@ -247,15 +239,26 @@ async def _kpi_bootstrap_payload(
 
     uid_billing = str(user.get("billing_user_id") or user["id"])
     uid_plain = str(user["id"])
-    days = _KPI_RANGE_DAYS.get((range or "30d").strip().lower(), 30)
+    rk = (range or "30d").strip().lower()
+    days = int(_KPI_RANGE_DAYS.get(rk, 30))
     workspace_id = (user.get("workspace") or {}).get("id")
 
     async def _insights() -> Any:
         async with pool.acquire() as conn:
             return await build_user_content_insights(conn, uid_plain)
 
+    overview_kwargs: dict[str, Any] = {
+        "platform": platform or "all",
+        "user": user,
+    }
+    if rk == "all":
+        # Align with get_analytics(range=all) / ALL_TIME_FLOOR_UTC — not a 3650d clamp.
+        overview_kwargs["range"] = "all"
+    else:
+        overview_kwargs["days"] = days
+
     results = await asyncio.gather(
-        analytics_overview(days=days, platform=platform or "all", user=user),
+        analytics_overview(**overview_kwargs),
         get_analytics(
             range=range,
             trill_vehicle_make=None,

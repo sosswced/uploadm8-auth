@@ -1,9 +1,15 @@
 """
-Opt-in multi-channel marketing automation (email, Discord webhook, in-app wallet nudges).
+Rule-based (non-ML) multi-channel lifecycle automation.
 
-Requires MARKETING_AUTOMATION_ENABLED=1. Uses aggregate user context + OpenAI when
-OPENAI_API_KEY is set; otherwise deterministic copy. Designed for high-tier users with
-unused platform connection headroom.
+Path A — segment ``high_tier_platform_headroom_v1`` + optional OpenAI copy.
+Does NOT use propensity / uplift scoring (that is Path B: marketing_execution).
+
+Requires:
+  - MARKETING_AUTOMATION_ENABLED=1
+  - Master-admin gate ``marketing_automation_gate`` for email/Discord outbound
+  - Explicit user_marketing_consent opt-in for email/Discord
+
+In-app wallet nudges may run when the env flag is on even if the outbound gate is off.
 """
 
 from __future__ import annotations
@@ -20,9 +26,11 @@ import httpx
 
 from stages.entitlements import get_entitlements_for_tier, normalize_tier
 from services.growth_intelligence import fetch_user_engagement_snapshot
+from services.marketing_automation_gate import outbound_touchpoints_master_enabled
 from services.marketing_compliance import (
     assert_channel_rate_ok,
     is_suppressed,
+    sanitize_truth_bundle_for_llm,
     user_discord_marketing_allowed,
     user_email_marketing_allowed,
 )
@@ -213,17 +221,19 @@ async def _synthesize_copy(
     if not (OPENAI_API_KEY or "").strip():
         return base, False
     try:
-        payload = {
-            "name": name,
-            "email": email,
-            "tier": tier,
-            "connected": n_conn,
-            "max_accounts": max_ac,
-            "per_platform_cap": per_pf,
-            "headroom": headroom,
-            "platforms_url": plat_url,
-            "engagement_30d": engagement or {},
-        }
+        # Never send raw email / PII to the LLM (same policy as marketing_strategist).
+        payload = sanitize_truth_bundle_for_llm(
+            {
+                "name": (name or "there").split(" ")[0][:40],
+                "tier": tier,
+                "connected": n_conn,
+                "max_accounts": max_ac,
+                "per_platform_cap": per_pf,
+                "headroom": headroom,
+                "platforms_url": plat_url,
+                "engagement_30d": engagement or {},
+            }
+        )
         async with httpx.AsyncClient(timeout=45.0) as client:
             r = await client.post(
                 "https://api.openai.com/v1/chat/completions",
@@ -273,15 +283,22 @@ async def _synthesize_copy(
 async def run_touchpoint_cycle(pool) -> Dict[str, Any]:
     """
     Evaluate users, generate AI/deterministic copy, deliver across enabled channels.
+
+    Email/Discord require master-admin outbound gate + marketing consent.
+    In-app may still write when env automation is enabled.
     """
     out: Dict[str, Any] = {
         "ok": True,
         "enabled": MARKETING_AUTOMATION_ENABLED,
+        "kind": "rule_based_lifecycle",
+        "ml_propensity": False,
+        "outbound_gate_enabled": False,
         "users_messaged": 0,
         "email_sent": 0,
         "discord_sent": 0,
         "in_app_written": 0,
         "skipped_dedupe": 0,
+        "skipped_no_outbound_gate": 0,
     }
     if not MARKETING_AUTOMATION_ENABLED:
         return out
@@ -290,13 +307,35 @@ async def run_touchpoint_cycle(pool) -> Dict[str, Any]:
     run_id = uuid.uuid4()
 
     async with pool.acquire() as conn:
+        outbound_ok = await outbound_touchpoints_master_enabled(conn)
+        out["outbound_gate_enabled"] = outbound_ok
+        if not outbound_ok:
+            # Hard-block email/Discord until master enables the gate.
+            want_email = False
+            want_discord = False
+            out["skipped_no_outbound_gate"] = 1
+            if not want_in_app:
+                out["ok"] = True
+                out["hint"] = (
+                    "MARKETING_AUTOMATION_ENABLED is on but master outbound gate is off; "
+                    "email/Discord skipped. Enable via POST /api/admin/marketing/automation-gate."
+                )
+                return out
+
         await conn.execute(
             """
             INSERT INTO marketing_automation_runs (id, status, mode, segment_key, meta)
-            VALUES ($1, 'running', 'touchpoints_v1', $2, '{}'::jsonb)
+            VALUES ($1, 'running', 'touchpoints_v1', $2, $3::jsonb)
             """,
             run_id,
             SEGMENT_KEY,
+            json.dumps(
+                {
+                    "kind": "rule_based_lifecycle",
+                    "ml_propensity": False,
+                    "outbound_gate_enabled": outbound_ok,
+                }
+            ),
         )
 
         rows = await conn.fetch(
@@ -445,6 +484,7 @@ async def run_touchpoint_cycle(pool) -> Dict[str, Any]:
                             reply_to=SUPPORT_EMAIL,
                             category="marketing",
                             tags=["touchpoint", SEGMENT_KEY],
+                            user_id=uid,
                         )
                         await conn.execute(
                             """

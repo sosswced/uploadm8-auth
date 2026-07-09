@@ -26,7 +26,7 @@
       "max_db_touch_lines": 8
     },
     "routers/auth.py": {
-      "max_lines": 522,
+      "max_lines": 560,
       "max_db_touch_lines": 43
     },
     "routers/billing.py": {
@@ -156,6 +156,10 @@
     "routers/webhooks.py": {
       "max_lines": 576,
       "max_db_touch_lines": 13
+    },
+    "routers/meta_compliance.py": {
+      "max_lines": 320,
+      "max_db_touch_lines": 8
     },
     "routers/workspace.py": {
       "max_lines": 247,

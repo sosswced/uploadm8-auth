@@ -96,6 +96,7 @@ from routers.platform_avatar_redirect import router as platform_avatar_redirect_
 from routers.user_avatar_redirect import router as user_avatar_redirect_router
 from routers.billing import router as billing_router
 from routers.webhooks import router as webhooks_router
+from routers.meta_compliance import router as meta_compliance_router
 from routers.analytics import router as analytics_router
 from routers.admin import router as admin_router
 from routers.admin_catalog import router as admin_catalog_router
@@ -529,6 +530,7 @@ app.include_router(platform_avatar_redirect_router)
 app.include_router(user_avatar_redirect_router)
 app.include_router(billing_router)
 app.include_router(webhooks_router)
+app.include_router(meta_compliance_router)
 app.include_router(analytics_router)
 app.include_router(admin_router)
 app.include_router(admin_catalog_router)

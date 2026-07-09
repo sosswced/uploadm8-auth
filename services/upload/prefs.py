@@ -32,6 +32,7 @@ def normalize_user_prefs_snapshot(user_prefs: Dict[str, Any]) -> None:
 def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: Any) -> None:
     """Overlay presign-body thumbnail toggles onto the snapshot stored on ``uploads.user_preferences``."""
     use_eng = getattr(data, "thumbnail_use_studio_engine", None)
+    engine_explicitly_off = use_eng is False
     if use_eng is not None:
         v = bool(use_eng)
         user_prefs["thumbnail_studio_engine_enabled"] = v
@@ -41,8 +42,13 @@ def merge_upload_init_thumbnail_preferences(user_prefs: Dict[str, Any], data: An
         if v:
             user_prefs["thumbnail_pikzels_enabled"] = True
             user_prefs["thumbnailPikzelsEnabled"] = True
+        else:
+            # Explicit engine-off on this upload must also disable Pikzels for the job.
+            user_prefs["thumbnail_pikzels_enabled"] = False
+            user_prefs["thumbnailPikzelsEnabled"] = False
     use_pkz = getattr(data, "thumbnail_use_pikzels", None)
-    if use_pkz is not None:
+    # Engine-off wins: do not let a later pikzels=true (or server default) re-enable.
+    if use_pkz is not None and not engine_explicitly_off:
         v = bool(use_pkz)
         user_prefs["thumbnail_pikzels_enabled"] = v
         user_prefs["thumbnailPikzelsEnabled"] = v

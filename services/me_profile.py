@@ -80,6 +80,7 @@ def build_me_response(user: dict) -> dict:
             "support": True,
         },
         "entitlements": plan,
+        "must_reset_password": bool(user.get("must_reset_password")),
     }
     trill = user.get("trill")
     if isinstance(trill, dict):

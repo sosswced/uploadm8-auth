@@ -64,6 +64,12 @@ async def register_user(
     await ledger_entry(conn, user_id, "put", signup_put, "signup_bonus")
     await ledger_entry(conn, user_id, "aic", signup_aic, "signup_bonus")
 
+    # Signup auto-consent: creating an account opts the user into marketing email
+    # (user can revoke anytime via /unsubscribe.html or /api/me/marketing-consent).
+    from services.marketing_compliance import ensure_signup_marketing_consent
+
+    await ensure_signup_marketing_consent(conn, user_id)
+
     from services.workspace import create_personal_workspace
 
     await create_personal_workspace(conn, user_id, data.name or "My Workspace")
@@ -75,11 +81,11 @@ async def register_user(
     return access, refresh
 
 
-async def login_user(conn, data: UserLogin) -> Tuple[str, str]:
-    """Validate credentials; return (access_jwt, refresh_token)."""
+async def login_user(conn, data: UserLogin) -> Tuple[str, str, bool]:
+    """Validate credentials; return (access_jwt, refresh_token, must_reset_password)."""
     user = await conn.fetchrow(
         """
-        SELECT id, password_hash, status, email_verified
+        SELECT id, password_hash, status, email_verified, must_reset_password
         FROM users WHERE LOWER(email) = $1
         """,
         data.email.lower(),
@@ -100,10 +106,46 @@ async def login_user(conn, data: UserLogin) -> Tuple[str, str]:
     uid = str(user["id"])
     access = create_access_jwt(uid)
     refresh = await create_refresh_token(conn, uid)
-    return access, refresh
+    return access, refresh, bool(user.get("must_reset_password"))
 
 
 async def refresh_session(conn, refresh_token: str) -> Tuple[str, str]:
     """Rotate refresh; return (new_access_jwt, new_refresh_token)."""
     access, new_refresh = await rotate_refresh_token(conn, refresh_token)
     return access, new_refresh
+
+
+async def resolve_logout_user_id(
+    *,
+    authorization: Optional[str],
+    cookies: dict,
+    body_refresh: Optional[str],
+    cookie_refresh: Optional[str],
+    conn,
+) -> Optional[str]:
+    """
+    Resolve user for logout without requiring a valid access JWT.
+
+    Prefer a still-valid access token (Bearer or cookie). If access is expired/missing,
+    fall back to the refresh token (cookie or JSON body) so logout still revokes the
+    session and clears HttpOnly cookies after long idle periods.
+    """
+    from core.deps import _resolve_user_id_from_session
+    from core.helpers import _sha256_hex
+
+    user_id, _reason = _resolve_user_id_from_session(authorization, cookies)
+    if user_id:
+        return user_id
+
+    rt = (body_refresh or cookie_refresh or "").strip()
+    if not rt:
+        return None
+    h = _sha256_hex(rt)
+    row = await conn.fetchrow(
+        """
+        SELECT user_id FROM refresh_tokens
+        WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
+        """,
+        h,
+    )
+    return str(row["user_id"]) if row else None

@@ -146,10 +146,11 @@ def _mailgun_tracking_flags(category: str) -> dict:
     return {}
 
 
-def _list_unsubscribe_headers(category: str) -> dict:
+def _list_unsubscribe_headers(category: str, *, one_click_url: Optional[str] = None) -> dict:
     if (category or "").strip().lower() != "marketing":
         return {}
-    unsub = URL_UNSUBSCRIBE
+    # Prefer signed one-click API URL so List-Unsubscribe-Post flips marketing consent.
+    unsub = (one_click_url or "").strip() or URL_UNSUBSCRIBE
     return {
         "h:List-Unsubscribe": f"<{unsub}>, <mailto:{SUPPORT_EMAIL}?subject=unsubscribe>",
         "h:List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
@@ -165,15 +166,20 @@ async def send_email(
     text: Optional[str] = None,
     category: str = "transactional",
     tags: Optional[List[str]] = None,
-) -> None:
+    *,
+    user_id: Optional[str] = None,
+) -> bool:
     """Low-level Mailgun sender. All email modules call this.
 
     Sends multipart HTML + plain text, optional List-Unsubscribe for marketing,
     and disables click/open tracking by default on transactional mail.
 
+    Returns True only when Mailgun accepts the message (HTTP 200). Returns False
+    when Mailgun is not configured or the send fails. Never raises.
+
     On failure (non-200 response or network exception) records an
     ``operational_incidents`` row so the admin incidents page surfaces email
-    delivery problems. The send_email contract (never raise) is preserved.
+    delivery problems.
     """
     sender = from_addr or MAIL_FROM
     clean_subject = sanitize_email_subject(subject, brand_prefix=True)
@@ -194,7 +200,15 @@ async def send_email(
         data["h:Reply-To"] = SUPPORT_EMAIL
 
     data.update(_mailgun_tracking_flags(category))
-    data.update(_list_unsubscribe_headers(category))
+    one_click = None
+    if (category or "").strip().lower() == "marketing" and user_id:
+        try:
+            from services.marketing_promo_media import marketing_one_click_unsub_url
+
+            one_click = marketing_one_click_unsub_url(str(user_id))
+        except Exception:
+            one_click = None
+    data.update(_list_unsubscribe_headers(category, one_click_url=one_click))
 
     tag_list = [t.strip() for t in (tags or []) if t and str(t).strip()]
     if not tag_list:
@@ -203,7 +217,7 @@ async def send_email(
 
     if not mailgun_ready():
         logger.info(f"Email skipped (Mailgun not configured): {to} | {subject}")
-        return
+        return False
 
     fail_kind: str | None = None
     fail_body: str = ""
@@ -254,6 +268,8 @@ async def send_email(
                 )
         except Exception as _ix:
             logger.debug("email incident record failed: %s", _ix)
+        return False
+    return True
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

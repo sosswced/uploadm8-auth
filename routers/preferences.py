@@ -292,6 +292,16 @@ def _overlay_upload_ai_audio_studio_prefs(result: dict, up: dict) -> None:
         if v is not None:
             result[camel] = result[snake] = v
 
+    # Studio "make default" strategy (layout / niche / YouTube ref) — round-trip for Settings + Upload.
+    from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy
+
+    strat = read_thumbnail_studio_default_strategy(up)
+    if strat:
+        result["thumbnailStudioDefaultStrategy"] = result["thumbnail_studio_default_strategy"] = strat
+        # Legacy alias so older clients still see a strategy object.
+        result.setdefault("thumbnailDefaultStrategy", strat)
+        result.setdefault("thumbnail_default_strategy", strat)
+
     def _pair_choice(
         camel: str, snake: str, default: str, allowed: frozenset
     ) -> None:
@@ -689,9 +699,11 @@ async def get_channel_visual_catalog(user: dict = Depends(get_current_user)):
                 user["id"],
             )
             if row:
+                from services.thumbnail_studio_strategy import read_thumbnail_studio_default_strategy
+
                 prefs = coerce_jsonb_dict(row.get("preferences") or {})
-                nested = prefs.get("thumbnailDefaultStrategy") or prefs.get("thumbnail_default_strategy")
-                if isinstance(nested, dict) and nested.get("audience_niche"):
+                nested = read_thumbnail_studio_default_strategy(prefs)
+                if nested.get("audience_niche"):
                     category = normalize_niche(str(nested["audience_niche"]))
     except Exception as e:
         logger.debug("channel-catalog niche lookup: %s", e)

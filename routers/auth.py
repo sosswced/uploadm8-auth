@@ -36,7 +36,12 @@ from stages.emails import (
     send_password_reset_email,
     send_password_changed_email,
 )
-from services.auth_credentials import login_user, refresh_session, register_user
+from services.auth_credentials import (
+    login_user,
+    refresh_session,
+    register_user,
+    resolve_logout_user_id,
+)
 
 logger = logging.getLogger("uploadm8-api")
 
@@ -114,9 +119,14 @@ async def session_probe(request: Request, authorization: Optional[str] = Header(
 @router.post("/login")
 async def login(data: UserLogin, request: Request):
     async with core.state.db_pool.acquire() as conn:
-        access, refresh = await login_user(conn, data)
+        access, refresh, must_reset = await login_user(conn, data)
     resp = JSONResponse(
-        content={"access_token": access, "refresh_token": refresh, "token_type": "bearer"}
+        content={
+            "access_token": access,
+            "refresh_token": refresh,
+            "token_type": "bearer",
+            "must_reset_password": must_reset,
+        }
     )
     set_auth_cookies(resp, access, refresh, request)
     return resp
@@ -145,25 +155,49 @@ async def refresh(request: Request):
     set_auth_cookies(resp, access, new_refresh, request)
     return resp
 
-@router.post("/logout")
-async def logout(request: Request, user: dict = Depends(get_current_user)):
+
+async def _logout_user_id_from_request(request: Request) -> Optional[str]:
+    body: dict = {}
+    try:
+        raw = await request.json()
+        if isinstance(raw, dict):
+            body = raw
+    except Exception:
+        pass
+    body_rt = (body.get("refresh_token") or body.get("refreshToken") or "").strip()
     async with core.state.db_pool.acquire() as conn:
-        await conn.execute("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL", user["id"])
-    resp = JSONResponse(content={"status": "logged_out"})
+        return await resolve_logout_user_id(
+            authorization=request.headers.get("authorization"),
+            cookies=request.cookies,
+            body_refresh=body_rt,
+            cookie_refresh=refresh_token_from_cookie(request.cookies),
+            conn=conn,
+        )
+
+
+async def _end_auth_session(request: Request, *, status: str):
+    user_id = await _logout_user_id_from_request(request)
+    if user_id:
+        async with core.state.db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
+                user_id,
+            )
+    resp = JSONResponse(content={"status": status})
     clear_auth_cookies(resp, request)
     return resp
 
+
+@router.post("/logout")
+async def logout(request: Request):
+    """End session; works with expired access if refresh cookie/body is valid."""
+    return await _end_auth_session(request, status="logged_out")
+
+
 @router.post("/logout-all")
-async def logout_all(request: Request, user: dict = Depends(get_current_user)):
+async def logout_all(request: Request):
     """Revoke all refresh tokens for current user (log out all devices)."""
-    async with core.state.db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL",
-            user["id"],
-        )
-    resp = JSONResponse(content={"status": "logged_out_all"})
-    clear_auth_cookies(resp, request)
-    return resp
+    return await _end_auth_session(request, status="logged_out_all")
 
 
 @router.post("/logout-other-sessions")
@@ -241,7 +275,7 @@ async def forgot_password(payload: ForgotPasswordRequest, background: Background
     return {"ok": True}
 
 @router.post("/reset-password")
-async def reset_password(payload: ResetPasswordRequest, background: BackgroundTasks):
+async def reset_password(payload: ResetPasswordRequest, background: BackgroundTasks, request: Request):
     token_hash = hashlib.sha256(payload.token.encode()).hexdigest()
     async with core.state.db_pool.acquire() as conn:
         pr = await conn.fetchrow(
@@ -262,7 +296,11 @@ async def reset_password(payload: ResetPasswordRequest, background: BackgroundTa
         new_hash = hash_password(payload.new_password)
 
         await conn.execute(
-            "UPDATE users SET password_hash=$1, updated_at=NOW() WHERE id=$2",
+            """
+            UPDATE users
+            SET password_hash=$1, must_reset_password=false, updated_at=NOW()
+            WHERE id=$2
+            """,
             new_hash, pr["user_id"]
         )
         await conn.execute("UPDATE password_resets SET used_at=NOW() WHERE id=$1", pr["id"])
@@ -276,7 +314,9 @@ async def reset_password(payload: ResetPasswordRequest, background: BackgroundTa
     if _u:
         background.add_task(send_password_changed_email, _u["email"], _u["name"] or "there")
 
-    return {"ok": True}
+    resp = JSONResponse(content={"ok": True})
+    clear_auth_cookies(resp, request)
+    return resp
 
 @router.post("/change-password")
 async def change_password(data: PasswordChange, background: BackgroundTasks, request: Request, user: dict = Depends(get_current_user)):
@@ -289,7 +329,15 @@ async def change_password(data: PasswordChange, background: BackgroundTasks, req
 
         # Update to new password
         new_hash = hash_password(data.new_password)
-        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", new_hash, user["id"])
+        await conn.execute(
+            """
+            UPDATE users
+            SET password_hash = $1, must_reset_password = false, updated_at = NOW()
+            WHERE id = $2
+            """,
+            new_hash,
+            user["id"],
+        )
 
         # Optionally invalidate other sessions (refresh tokens)
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
@@ -309,6 +357,7 @@ async def _issue_auth_pair(conn, user_id: str) -> tuple[str, str]:
 
 @router.get("/confirm-email")
 async def confirm_email(
+    request: Request,
     background_tasks: BackgroundTasks,
     token: str = Query(..., min_length=8),
 ):
@@ -332,7 +381,7 @@ async def confirm_email(
             )
             if u and u["email_verified"] is True:
                 access, refresh = await _issue_auth_pair(conn, uid)
-                return JSONResponse(
+                already = JSONResponse(
                     status_code=400,
                     content={
                         "detail": "Email already confirmed",
@@ -341,6 +390,8 @@ async def confirm_email(
                         "token_type": "bearer",
                     },
                 )
+                set_auth_cookies(already, access, refresh, request)
+                return already
             raise HTTPException(status_code=400, detail="Invalid confirmation link")
 
         await conn.execute("UPDATE signup_verifications SET used_at = NOW() WHERE id = $1", row["id"])
@@ -348,6 +399,11 @@ async def confirm_email(
             "UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1",
             row["user_id"],
         )
+        # Idempotent: ensure signup auto-consent exists after verify (covers older pending rows).
+        # Does not overwrite an existing opt-out.
+        from services.marketing_compliance import ensure_signup_marketing_consent
+
+        await ensure_signup_marketing_consent(conn, uid)
         urow = await conn.fetchrow(
             "SELECT email, name FROM users WHERE id = $1",
             row["user_id"],
@@ -360,11 +416,15 @@ async def confirm_email(
             urow["email"],
             (urow["name"] or "there"),
         )
-    return {
-        "access_token": access,
-        "refresh_token": refresh,
-        "token_type": "bearer",
-    }
+    resp = JSONResponse(
+        content={
+            "access_token": access,
+            "refresh_token": refresh,
+            "token_type": "bearer",
+        }
+    )
+    set_auth_cookies(resp, access, refresh, request)
+    return resp
 
 
 @router.get("/verify-email")

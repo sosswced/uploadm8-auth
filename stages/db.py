@@ -463,9 +463,80 @@ async def mark_deferred_publish_batch(pool: asyncpg.Pool, ctx: JobContext) -> No
     """
     Persist partial smart-schedule publish results and return upload to
     ready_to_publish until every platform slot has been attempted.
+
+    Advances ``scheduled_time`` to the earliest remaining unhandled slot so
+    UI countdowns and scheduler windows track the next platform, not the
+    already-published earliest slot.
     """
+    from services.deferred_publish_schedule import next_due_scheduled_time
+
     platform_results_json = _platform_results_json(ctx)
     async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT schedule_mode, platforms, schedule_metadata, scheduled_time
+            FROM uploads WHERE id = $1
+            """,
+            ctx.upload_id,
+        )
+        next_anchor = None
+        upload_snap: dict = {
+            "schedule_mode": getattr(ctx, "schedule_mode", None) or "smart",
+            "platforms": list(getattr(ctx, "platforms", None) or []),
+            "schedule_metadata": getattr(ctx, "schedule_metadata", None),
+            "scheduled_time": getattr(ctx, "scheduled_time", None),
+        }
+        if row:
+            plats = row.get("platforms")
+            upload_snap = {
+                "schedule_mode": row.get("schedule_mode") or "smart",
+                "platforms": list(plats) if plats is not None else [],
+                "schedule_metadata": row.get("schedule_metadata"),
+                "scheduled_time": row.get("scheduled_time"),
+            }
+            next_anchor = next_due_scheduled_time(upload_snap, ctx.platform_results)
+
+        if next_anchor is not None:
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET status = 'ready_to_publish',
+                    platform_results = COALESCE($2::jsonb, platform_results),
+                    scheduled_time = $3,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                ctx.upload_id,
+                platform_results_json,
+                next_anchor,
+            )
+            return
+
+        # Remaining targets but no resolvable next slot → fail hard (do not hang).
+        from services.upload.stuck_recovery import fail_deferred_batch_without_slot
+
+        failed = await fail_deferred_batch_without_slot(
+            conn,
+            str(ctx.upload_id),
+            str(getattr(ctx, "user_id", "") or ""),
+            upload_snap,
+            ctx.platform_results,
+            db_pool=pool,
+        )
+        if failed:
+            # Persist platform_results on the failed row for audit.
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET platform_results = COALESCE($2::jsonb, platform_results),
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                ctx.upload_id,
+                platform_results_json,
+            )
+            return
+
         await conn.execute(
             """
             UPDATE uploads

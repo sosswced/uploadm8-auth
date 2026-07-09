@@ -37,9 +37,9 @@ async def send_monthly_user_kpi_digest_email(
     comments: int = 0,
     shares: int = 0,
     platform_breakdown: Optional[List[Tuple[str, str]]] = None,
-) -> None:
+) -> bool:
     if not mailgun_ready():
-        return
+        return False
 
     plan = tier_label(tier)
     html = email_shell(
@@ -102,7 +102,7 @@ async def send_monthly_user_kpi_digest_email(
         ),
         footer_note="You received this monthly digest because email notifications are enabled.",
     )
-    await send_email(
+    return await send_email(
         email,
         f"UploadM8 monthly recap — {period_label}",
         html,
@@ -126,9 +126,9 @@ async def send_admin_weekly_kpi_digest_email(
     upload_success_pct: int = 0,
     trialing_paid_users: int = 0,
     platform_summary_lines: Optional[List[str]] = None,
-) -> None:
+) -> bool:
     if not mailgun_ready():
-        return
+        return False
 
     html = email_shell(
         gradient=GRAD_PURPLE,
@@ -185,7 +185,7 @@ async def send_admin_weekly_kpi_digest_email(
         ),
         footer_note="You received this digest because weekly admin reporting is enabled.",
     )
-    await send_email(
+    return await send_email(
         email,
         f"UploadM8 admin weekly KPI digest — {week_label}",
         html,

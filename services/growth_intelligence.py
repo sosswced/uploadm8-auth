@@ -96,11 +96,17 @@ RANGE_MINUTES = {
 
 def parse_range_since_until(range_key: str) -> Tuple[datetime, datetime]:
     """
-    Map admin-style range keys (``30d``, ``7d``, ``90d``, ``6m``, ``1y``, ``365d``)
+    Map admin-style range keys (``30d``, ``7d``, ``90d``, ``6m``, ``1y``, ``365d``, ``all``)
     plus custom ``Nd`` (1–3650 days) to a UTC half-open window ``[since, until)``.
+
+    ``all`` uses the shared analytics all-time floor (same as GET /api/analytics).
     """
+    from services.canonical_engagement import sql_since_for_analytics_range
+
     now = datetime.now(timezone.utc)
     rk = (range_key or "30d").strip()
+    if rk.lower() == "all":
+        return sql_since_for_analytics_range("all", now=now), now
     if rk in RANGE_MINUTES:
         mins = RANGE_MINUTES[rk]
     else:

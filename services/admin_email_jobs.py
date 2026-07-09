@@ -11,19 +11,22 @@ Each job is a coroutine that takes ``db_pool`` and returns a summary dict::
         "details":       {...},  # job-specific extra info
     }
 
-Jobs are designed to be IDEMPOTENT. They check ``users.trial_reminder_sent``,
-``users.last_monthly_digest_sent_at``, etc., before sending so that running
-a job twice in the same window doesn't re-spam users.
+Jobs are designed to be IDEMPOTENT. They claim rows (UPDATE … WHERE marker IS NULL
+RETURNING) before sending, and only keep the claim when Mailgun accepts the
+message — so concurrent runs and Mailgun-down skips do not re-spam or burn
+idempotency windows.
 
 Triggers:
-  - ``POST /api/admin/email-jobs/run``  (manual, from Admin UI)
+  - ``POST /api/admin/email-jobs/run``  (manual, master admin UI)
   - ``run_admin_email_jobs_loop()``     (worker-side daily cron)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,10 +41,21 @@ from stages.emails import (
 
 logger = logging.getLogger("uploadm8-admin-jobs")
 
+# Worker cron: run the four email jobs once per day (default 24h).
+ADMIN_EMAIL_JOBS_INTERVAL_SEC = max(
+    3600, int(os.environ.get("ADMIN_EMAIL_JOBS_INTERVAL_SEC", str(24 * 3600)))
+)
+WEEKLY_ADMIN_DIGEST_MIN_INTERVAL_DAYS = 6
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Run ledger helpers (admin_email_job_runs table — migration 1050)
+# Run ledger helpers (admin_email_job_runs table — migration 1050 / 1090)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_triggered_by(triggered_by: str) -> str:
+    raw = (triggered_by or "manual").strip() or "manual"
+    return raw[:255]
+
 
 async def _start_run(pool: asyncpg.Pool, job: str, triggered_by: str) -> Optional[str]:
     try:
@@ -53,7 +67,7 @@ async def _start_run(pool: asyncpg.Pool, job: str, triggered_by: str) -> Optiona
                 RETURNING id::text
                 """,
                 job,
-                triggered_by,
+                _normalize_triggered_by(triggered_by),
             )
         return run_id
     except Exception as e:
@@ -109,7 +123,8 @@ async def run_trial_reminders(
     """Email every trialing user whose trial_end is within the next 4 days
     and who hasn't already received a reminder.
 
-    Sets ``users.trial_reminder_sent = NOW()`` on send so we don't re-spam.
+    Claims ``users.trial_reminder_sent`` before send; rolls back the claim if
+    Mailgun does not accept the message.
     """
     job = "trial_reminders"
     run_id = await _start_run(pool, job, triggered_by)
@@ -136,26 +151,51 @@ async def run_trial_reminders(
         for r in rows:
             email = r["email"]
             try:
+                async with pool.acquire() as conn:
+                    claimed = await conn.fetchval(
+                        """
+                        UPDATE users
+                        SET trial_reminder_sent = NOW()
+                        WHERE id = $1 AND trial_reminder_sent IS NULL
+                        RETURNING id
+                        """,
+                        r["id"],
+                    )
+                if not claimed:
+                    skipped += 1
+                    continue
+
                 trial_end_dt = r["trial_end"]
                 if trial_end_dt.tzinfo is None:
                     trial_end_dt = trial_end_dt.replace(tzinfo=timezone.utc)
                 days_left = max(1, (trial_end_dt - datetime.now(timezone.utc)).days)
-                await send_trial_ending_reminder_email(
+                ok = await send_trial_ending_reminder_email(
                     email=email,
                     name=r["name"] or "there",
                     tier=r["subscription_tier"] or "creator_pro",
                     trial_end_date=trial_end_dt.strftime("%B %d, %Y"),
                     days_left=days_left,
                 )
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE users SET trial_reminder_sent = NOW() WHERE id = $1",
-                        r["id"],
-                    )
+                if not ok:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE users SET trial_reminder_sent = NULL WHERE id = $1",
+                            r["id"],
+                        )
+                    skipped += 1
+                    continue
                 sent += 1
                 sent_emails.append(email)
             except Exception as e:
                 logger.warning("trial_reminder failed for %s: %s", email, e)
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE users SET trial_reminder_sent = NULL WHERE id = $1",
+                            r["id"],
+                        )
+                except Exception:
+                    pass
                 errors += 1
 
         summary = {
@@ -250,7 +290,7 @@ async def run_monthly_user_digest(
         async with pool.acquire() as conn:
             user_rows = await conn.fetch(
                 f"""
-                SELECT u.id, u.email, u.name, u.subscription_tier
+                SELECT u.id, u.email, u.name, u.subscription_tier, u.last_monthly_digest_sent_at
                 FROM users u
                 LEFT JOIN user_preferences up ON up.user_id = u.id
                 WHERE u.status = 'active'
@@ -264,37 +304,70 @@ async def run_monthly_user_digest(
                 """
             )
 
-            for r in user_rows:
-                try:
+        for r in user_rows:
+            prev_sent_at = r["last_monthly_digest_sent_at"]
+            try:
+                async with pool.acquire() as conn:
                     metrics = await _user_monthly_metrics(conn, r["id"])
                     if metrics["uploads"] == 0:
                         skipped += 1
                         continue
 
-                    await send_monthly_user_kpi_digest_email(
-                        email=r["email"],
-                        name=r["name"] or "there",
-                        tier=r["subscription_tier"] or "free",
-                        period_label=period_label,
-                        uploads=metrics["uploads"],
-                        success_rate_pct=metrics["success_rate_pct"],
-                        views=metrics["views"],
-                        likes=metrics["likes"],
-                        put_used=metrics["put_used"],
-                        aic_used=metrics["aic_used"],
-                        put_balance=metrics["put_balance"],
-                        aic_balance=metrics["aic_balance"],
-                        comments=metrics["comments"],
-                        shares=metrics["shares"],
-                    )
-                    await conn.execute(
-                        "UPDATE users SET last_monthly_digest_sent_at = NOW() WHERE id = $1",
+                    claimed = await conn.fetchval(
+                        f"""
+                        UPDATE users
+                        SET last_monthly_digest_sent_at = NOW()
+                        WHERE id = $1
+                          AND (
+                                last_monthly_digest_sent_at IS NULL
+                             OR last_monthly_digest_sent_at < NOW() - INTERVAL '{MONTHLY_DIGEST_MIN_INTERVAL_DAYS} days'
+                          )
+                        RETURNING id
+                        """,
                         r["id"],
                     )
-                    sent += 1
-                except Exception as e:
-                    logger.warning("monthly_user_digest failed for %s: %s", r["email"], e)
-                    errors += 1
+                if not claimed:
+                    skipped += 1
+                    continue
+
+                ok = await send_monthly_user_kpi_digest_email(
+                    email=r["email"],
+                    name=r["name"] or "there",
+                    tier=r["subscription_tier"] or "free",
+                    period_label=period_label,
+                    uploads=metrics["uploads"],
+                    success_rate_pct=metrics["success_rate_pct"],
+                    views=metrics["views"],
+                    likes=metrics["likes"],
+                    put_used=metrics["put_used"],
+                    aic_used=metrics["aic_used"],
+                    put_balance=metrics["put_balance"],
+                    aic_balance=metrics["aic_balance"],
+                    comments=metrics["comments"],
+                    shares=metrics["shares"],
+                )
+                if not ok:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE users SET last_monthly_digest_sent_at = $2 WHERE id = $1",
+                            r["id"],
+                            prev_sent_at,
+                        )
+                    skipped += 1
+                    continue
+                sent += 1
+            except Exception as e:
+                logger.warning("monthly_user_digest failed for %s: %s", r["email"], e)
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE users SET last_monthly_digest_sent_at = $2 WHERE id = $1",
+                            r["id"],
+                            prev_sent_at,
+                        )
+                except Exception:
+                    pass
+                errors += 1
 
         summary = {
             "queried":      len(user_rows),
@@ -315,25 +388,36 @@ async def run_monthly_user_digest(
 PAID_TIERS = ("creator_lite", "creator_pro", "studio", "agency", "enterprise")
 
 
-async def _admin_recipients(conn: asyncpg.Connection) -> List[Tuple[str, str]]:
-    """All users with role admin or master_admin who can receive ops mail."""
+async def _admin_recipients(conn: asyncpg.Connection) -> List[Tuple[Any, str, str, Any]]:
+    """Active admin/master_admin users eligible for ops mail."""
     rows = await conn.fetch(
-        """
-        SELECT email, name
+        f"""
+        SELECT id, email, name, last_weekly_admin_digest_sent_at
         FROM users
         WHERE role IN ('admin', 'master_admin')
           AND status = 'active'
           AND email IS NOT NULL
           AND email <> ''
+          AND (
+                last_weekly_admin_digest_sent_at IS NULL
+             OR last_weekly_admin_digest_sent_at < NOW() - INTERVAL '{WEEKLY_ADMIN_DIGEST_MIN_INTERVAL_DAYS} days'
+          )
         """
     )
-    return [(r["email"], r["name"] or "Admin") for r in rows]
+    return [
+        (r["id"], r["email"], r["name"] or "Admin", r["last_weekly_admin_digest_sent_at"])
+        for r in rows
+    ]
 
 
 async def run_weekly_admin_digest(
     pool: asyncpg.Pool, *, triggered_by: str = "manual"
 ) -> Dict[str, Any]:
-    """Send the weekly KPI digest to every admin/master_admin user."""
+    """Send the weekly KPI digest to every admin/master_admin user.
+
+    Per-recipient ``last_weekly_admin_digest_sent_at`` prevents re-spam within
+    WEEKLY_ADMIN_DIGEST_MIN_INTERVAL_DAYS.
+    """
     job = "weekly_admin_digest"
     run_id = await _start_run(pool, job, triggered_by)
     sent = skipped = errors = 0
@@ -348,12 +432,12 @@ async def run_weekly_admin_digest(
         async with pool.acquire() as conn:
             recipients = await _admin_recipients(conn)
             if not recipients:
-                summary = {"reason": "no admin recipients"}
+                summary = {"reason": "no admin recipients (or all within digest window)"}
                 await _finish_run(pool, run_id, 0, 0, 0, summary)
                 return {"job": job, "sent": 0, "skipped": 0, "errors": 0, "details": summary}
 
             kpi_row = await conn.fetchrow(
-                f"""
+                """
                 SELECT
                   (SELECT COUNT(*) FROM users)                                               AS total_users,
                   (SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days') AS new_users,
@@ -382,9 +466,27 @@ async def run_weekly_admin_digest(
         cost_7d       = float(kpi_row["cost_7d"] or 0)
         margin_pct    = ((revenue_7d - cost_7d) / revenue_7d * 100.0) if revenue_7d > 0 else 0.0
 
-        for email, name in recipients:
+        for user_id, email, name, prev_sent_at in recipients:
             try:
-                await send_admin_weekly_kpi_digest_email(
+                async with pool.acquire() as conn:
+                    claimed = await conn.fetchval(
+                        f"""
+                        UPDATE users
+                        SET last_weekly_admin_digest_sent_at = NOW()
+                        WHERE id = $1
+                          AND (
+                                last_weekly_admin_digest_sent_at IS NULL
+                             OR last_weekly_admin_digest_sent_at < NOW() - INTERVAL '{WEEKLY_ADMIN_DIGEST_MIN_INTERVAL_DAYS} days'
+                          )
+                        RETURNING id
+                        """,
+                        user_id,
+                    )
+                if not claimed:
+                    skipped += 1
+                    continue
+
+                ok = await send_admin_weekly_kpi_digest_email(
                     email=email,
                     name=name,
                     week_label=week_label,
@@ -398,9 +500,27 @@ async def run_weekly_admin_digest(
                     upload_success_pct=upload_ok_pct,
                     trialing_paid_users=int(kpi_row["trialing_paid"] or 0),
                 )
+                if not ok:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE users SET last_weekly_admin_digest_sent_at = $2 WHERE id = $1",
+                            user_id,
+                            prev_sent_at,
+                        )
+                    skipped += 1
+                    continue
                 sent += 1
             except Exception as e:
                 logger.warning("weekly_admin_digest failed for %s: %s", email, e)
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE users SET last_weekly_admin_digest_sent_at = $2 WHERE id = $1",
+                            user_id,
+                            prev_sent_at,
+                        )
+                except Exception:
+                    pass
                 errors += 1
 
         summary = {
@@ -433,6 +553,35 @@ UPCOMING_WINDOW_HOURS = 24
 STUCK_THRESHOLD_MINUTES = 30
 
 
+async def _claim_upload_alert(conn: asyncpg.Connection, upload_id, key: str) -> bool:
+    """Atomically set output_artifacts[key] if unset. Returns True if this caller won."""
+    claimed = await conn.fetchval(
+        """
+        UPDATE uploads
+        SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb)
+                            || jsonb_build_object($2::text, NOW()::text)
+        WHERE id = $1
+          AND COALESCE(output_artifacts->>$2, '') = ''
+        RETURNING id
+        """,
+        upload_id,
+        key,
+    )
+    return bool(claimed)
+
+
+async def _release_upload_alert(conn: asyncpg.Connection, upload_id, key: str) -> None:
+    await conn.execute(
+        """
+        UPDATE uploads
+        SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb) - $2::text
+        WHERE id = $1
+        """,
+        upload_id,
+        key,
+    )
+
+
 async def run_scheduled_publish_alerts(
     pool: asyncpg.Pool, *, triggered_by: str = "manual"
 ) -> Dict[str, Any]:
@@ -445,10 +594,6 @@ async def run_scheduled_publish_alerts(
     try:
         async with pool.acquire() as conn:
             # ── Upcoming uploads in the next 24h, alerted at most once each.
-            #
-            # We piggy-back on output_artifacts->>'scheduled_alert_sent' as the
-            # idempotency anchor (text key, set after we send) so we don't
-            # need a new column for this.
             upcoming = await conn.fetch(
                 f"""
                 SELECT u.id, u.user_id, u.filename, u.scheduled_time,
@@ -468,7 +613,10 @@ async def run_scheduled_publish_alerts(
 
             for r in upcoming:
                 try:
-                    await send_scheduled_publish_alert_email(
+                    if not await _claim_upload_alert(conn, r["id"], "scheduled_alert_sent"):
+                        skipped += 1
+                        continue
+                    ok = await send_scheduled_publish_alert_email(
                         email=r["email"],
                         name=r["name"] or "there",
                         filename=r["filename"] or "your upload",
@@ -476,19 +624,18 @@ async def run_scheduled_publish_alerts(
                         status="upcoming",
                         upload_id=str(r["id"]),
                     )
-                    await conn.execute(
-                        """
-                        UPDATE uploads
-                        SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb)
-                                            || jsonb_build_object('scheduled_alert_sent', NOW()::text)
-                        WHERE id = $1
-                        """,
-                        r["id"],
-                    )
+                    if not ok:
+                        await _release_upload_alert(conn, r["id"], "scheduled_alert_sent")
+                        skipped += 1
+                        continue
                     sent += 1
                     upcoming_sent += 1
                 except Exception as e:
                     logger.warning("scheduled upcoming alert failed for upload %s: %s", r["id"], e)
+                    try:
+                        await _release_upload_alert(conn, r["id"], "scheduled_alert_sent")
+                    except Exception:
+                        pass
                     errors += 1
 
             # ── Stuck publishes (should have fired but didn't)
@@ -511,7 +658,10 @@ async def run_scheduled_publish_alerts(
 
             for r in stuck:
                 try:
-                    await send_scheduled_publish_alert_email(
+                    if not await _claim_upload_alert(conn, r["id"], "scheduled_stuck_alert_sent"):
+                        skipped += 1
+                        continue
+                    ok = await send_scheduled_publish_alert_email(
                         email=r["email"],
                         name=r["name"] or "there",
                         filename=r["filename"] or "your upload",
@@ -520,19 +670,18 @@ async def run_scheduled_publish_alerts(
                         reason=(r["error_detail"] or r["error_code"] or "Job did not fire on time"),
                         upload_id=str(r["id"]),
                     )
-                    await conn.execute(
-                        """
-                        UPDATE uploads
-                        SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb)
-                                            || jsonb_build_object('scheduled_stuck_alert_sent', NOW()::text)
-                        WHERE id = $1
-                        """,
-                        r["id"],
-                    )
+                    if not ok:
+                        await _release_upload_alert(conn, r["id"], "scheduled_stuck_alert_sent")
+                        skipped += 1
+                        continue
                     sent += 1
                     stuck_sent += 1
                 except Exception as e:
                     logger.warning("scheduled stuck alert failed for upload %s: %s", r["id"], e)
+                    try:
+                        await _release_upload_alert(conn, r["id"], "scheduled_stuck_alert_sent")
+                    except Exception:
+                        pass
                     errors += 1
 
             # ── Stuck staged (past scheduled_time but never entered processing)
@@ -555,7 +704,10 @@ async def run_scheduled_publish_alerts(
 
             for r in stuck_staged:
                 try:
-                    await send_scheduled_publish_alert_email(
+                    if not await _claim_upload_alert(conn, r["id"], "staged_stuck_alert_sent"):
+                        skipped += 1
+                        continue
+                    ok = await send_scheduled_publish_alert_email(
                         email=r["email"],
                         name=r["name"] or "there",
                         filename=r["filename"] or "your upload",
@@ -568,19 +720,18 @@ async def run_scheduled_publish_alerts(
                         ),
                         upload_id=str(r["id"]),
                     )
-                    await conn.execute(
-                        """
-                        UPDATE uploads
-                        SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb)
-                                            || jsonb_build_object('staged_stuck_alert_sent', NOW()::text)
-                        WHERE id = $1
-                        """,
-                        r["id"],
-                    )
+                    if not ok:
+                        await _release_upload_alert(conn, r["id"], "staged_stuck_alert_sent")
+                        skipped += 1
+                        continue
                     sent += 1
                     stuck_staged_sent += 1
                 except Exception as e:
                     logger.warning("staged stuck alert failed for upload %s: %s", r["id"], e)
+                    try:
+                        await _release_upload_alert(conn, r["id"], "staged_stuck_alert_sent")
+                    except Exception:
+                        pass
                     errors += 1
 
         summary = {
@@ -613,7 +764,10 @@ ADMIN_EMAIL_JOBS = {
 async def run_admin_email_job(
     pool: asyncpg.Pool, job: str, *, triggered_by: str = "manual"
 ) -> Dict[str, Any]:
-    """Run a single named job, or every job when ``job=='all'``."""
+    """Run a single named job, or every email job when ``job=='all'``.
+
+    ``all`` runs only the four ADMIN_EMAIL_JOBS entries — never marketing.
+    """
     job_norm = (job or "").strip().lower()
     if job_norm == "all":
         results = []
@@ -625,3 +779,38 @@ async def run_admin_email_job(
     if fn is None:
         return {"job": job, "error": f"unknown job: {job}"}
     return await fn(pool, triggered_by=triggered_by)
+
+
+async def run_admin_email_jobs_loop(pool: asyncpg.Pool, shutdown_event: asyncio.Event) -> None:
+    """Worker background loop: run all four email jobs once per interval."""
+    logger.info(
+        "[admin-email-jobs] loop started | interval=%ss",
+        ADMIN_EMAIL_JOBS_INTERVAL_SEC,
+    )
+    # Stagger after KPI collector / analytics so cold start does not pile on.
+    try:
+        await asyncio.wait_for(asyncio.shield(shutdown_event.wait()), timeout=180)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    while not shutdown_event.is_set():
+        try:
+            result = await run_admin_email_job(pool, "all", triggered_by="cron:worker")
+            logger.info(
+                "[admin-email-jobs] tick complete | ran=%s",
+                result.get("ran"),
+            )
+        except Exception as e:
+            logger.warning("[admin-email-jobs] tick failed: %s", e)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(shutdown_event.wait()),
+                timeout=ADMIN_EMAIL_JOBS_INTERVAL_SEC,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("[admin-email-jobs] loop stopped")

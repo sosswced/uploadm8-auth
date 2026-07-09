@@ -277,6 +277,47 @@ async def get_me_coach(user: dict = Depends(get_current_user)):
             }
 
 
+@router.get("/api/me/marketing-consent")
+async def get_marketing_consent(user: dict = Depends(get_current_user)):
+    """User marketing opt-in flags (email / Discord). Missing row = opted out."""
+    from services.marketing_compliance import get_user_marketing_consent
+
+    async with core.state.db_pool.acquire() as conn:
+        return await get_user_marketing_consent(conn, str(user["id"]))
+
+
+@router.put("/api/me/marketing-consent")
+@router.patch("/api/me/marketing-consent")
+async def update_marketing_consent(request: Request, user: dict = Depends(get_current_user)):
+    """Set marketing consent. Body: {email_marketing?, discord_marketing?, allow_pii_in_ml?}."""
+    from services.marketing_compliance import upsert_user_marketing_consent
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object required")
+
+    def _opt_bool(key: str):
+        if key not in body:
+            return None
+        v = body.get(key)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        return bool(v)
+
+    async with core.state.db_pool.acquire() as conn:
+        return await upsert_user_marketing_consent(
+            conn,
+            str(user["id"]),
+            email_marketing=_opt_bool("email_marketing"),
+            discord_marketing=_opt_bool("discord_marketing"),
+            allow_pii_in_ml=_opt_bool("allow_pii_in_ml"),
+        )
+
+
 @router.post("/api/me/touchpoints/{delivery_id}/dismiss")
 async def dismiss_marketing_touchpoint(delivery_id: str, user: dict = Depends(get_current_user)):
     """Dismiss an in-app AI marketing touchpoint surfaced via wallet opportunities."""
@@ -448,7 +489,15 @@ async def update_password_settings(data: PasswordChange, request: Request, user:
 
         # Update to new password
         new_hash = hash_password(data.new_password)
-        await conn.execute("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2", new_hash, user["id"])
+        await conn.execute(
+            """
+            UPDATE users
+            SET password_hash = $1, must_reset_password = false, updated_at = NOW()
+            WHERE id = $2
+            """,
+            new_hash,
+            user["id"],
+        )
 
         # Optionally invalidate other sessions (refresh tokens)
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])

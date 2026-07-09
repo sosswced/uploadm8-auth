@@ -51,8 +51,12 @@ def serialize_platform_account(
     row: asyncpg.Record | Mapping[str, Any],
     *,
     auth_error_by_token: Optional[Mapping[str, str]] = None,
+    presign: bool = True,
 ) -> dict:
-    """API shape for one connected platform_tokens row."""
+    """API shape for one connected platform_tokens row.
+
+    ``presign=False`` keeps avatars as same-origin redirect paths (bootstrap / bulk lists).
+    """
     auth_error_by_token = auth_error_by_token or {}
     tid = str(row["id"])
     created = row.get("created_at")
@@ -65,7 +69,7 @@ def serialize_platform_account(
         "account_id": row.get("account_id"),
         "name": row.get("account_name"),
         "username": row.get("account_username"),
-        "avatar": resolve_stored_account_avatar_url(row.get("account_avatar")),
+        "avatar": resolve_stored_account_avatar_url(row.get("account_avatar"), presign=presign),
         "is_primary": row.get("is_primary"),
         "status": status,
         "connected_at": created_iso,

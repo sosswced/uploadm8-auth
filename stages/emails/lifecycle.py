@@ -137,7 +137,7 @@ async def send_trial_ending_reminder_email(
     trial_end_date: str,
     days_left: int = 3,
     amount: float = 0.0,
-) -> None:
+) -> bool:
     """
     Proactive reminder email sent N days before the trial expires.
     Implement a scheduled job (e.g., APScheduler or a Render cron job) that
@@ -155,7 +155,7 @@ async def send_trial_ending_reminder_email(
         ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_reminder_sent TIMESTAMPTZ;
     """
     if not mailgun_ready():
-        return
+        return False
 
     plan = tier_label(tier)
     days_word = f"{days_left} day" if days_left == 1 else f"{days_left} days"
@@ -215,7 +215,13 @@ async def send_trial_ending_reminder_email(
         footer_note=f"You received this reminder because your {plan} trial ends on {trial_end_date}.",
     )
 
-    await send_email(email, f"⏳ Your {plan} trial ends in {days_word} — here's what happens next", html, from_addr=MAIL_FROM_SUPPORT, reply_to=SUPPORT_EMAIL)
+    return await send_email(
+        email,
+        f"⏳ Your {plan} trial ends in {days_word} — here's what happens next",
+        html,
+        from_addr=MAIL_FROM_SUPPORT,
+        reply_to=SUPPORT_EMAIL,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

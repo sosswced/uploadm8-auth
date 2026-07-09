@@ -1947,13 +1947,34 @@ async def run_processing_pipeline(job_data: dict) -> bool:
                     if _thumb_render == "studio_renderer"
                     else "uploadm8_gpt_image_edit_pipeline"
                 )
+                _report = {}
+                try:
+                    import json as _json_rep
+
+                    _raw_rep = ctx.output_artifacts.get("studio_render_report")
+                    if isinstance(_raw_rep, dict):
+                        _report = _raw_rep
+                    elif isinstance(_raw_rep, str) and _raw_rep.strip():
+                        _parsed = _json_rep.loads(_raw_rep)
+                        if isinstance(_parsed, dict):
+                            _report = _parsed
+                except Exception:
+                    _report = {}
+                _plat = _report.get("platform_render_methods") if isinstance(_report.get("platform_render_methods"), dict) else {}
+                _first_plat = next(iter(_plat.values()), {}) if _plat else {}
+                if not isinstance(_first_plat, dict):
+                    _first_plat = {}
                 _variants = [
                     {
                         "index": 1,
-                        "ctr_score": None,
-                        "engine_status": "ok",
-                        "pikzels_main_score": None,
-                        "pikzels_recreate_http_status": None,
+                        "ctr_score": _first_plat.get("ctr_score") or _report.get("ctr_score"),
+                        "engine_status": "ok" if not _report.get("skip_reason") else "skipped",
+                        "pikzels_main_score": _first_plat.get("pikzels_main_score") or _report.get("pikzels_main_score"),
+                        "pikzels_recreate_http_status": _first_plat.get("http_status")
+                        or _report.get("pikzels_recreate_http_status"),
+                        "persona_kind": _report.get("persona_kind"),
+                        "persona_uuid": _report.get("persona_uuid"),
+                        "render_steps": _report.get("render_steps"),
                     }
                 ]
                 async with db_pool.acquire() as conn:
@@ -3513,6 +3534,15 @@ async def run_platform_metrics_cache_loop() -> None:
     await _service_loop(db_pool)
 
 
+async def run_admin_email_jobs_loop() -> None:
+    """Daily cron for trial reminders, digests, and scheduled publish alerts."""
+    global shutdown_event
+    from services.admin_email_jobs import run_admin_email_jobs_loop as _service_loop
+
+    logger.info("[admin-email-jobs] delegating to services.admin_email_jobs")
+    await _service_loop(db_pool, shutdown_event)
+
+
 # ---------------------------------------------------------------------------
 # SCHEDULER LOOP
 # ---------------------------------------------------------------------------
@@ -3681,11 +3711,14 @@ async def run_scheduler_loop() -> None:
                         if not due:
                             continue
 
-                    # Atomically claim
+                    # Atomically claim — refresh processing_started_at so stale
+                    # recovery does not treat deferred publish as a zombie transcode.
                     updated = await conn.fetchval(
                         """
                         UPDATE uploads
-                        SET status = 'processing', updated_at = NOW()
+                        SET status = 'processing',
+                            processing_started_at = NOW(),
+                            updated_at = NOW()
                         WHERE id = $1 AND status = 'ready_to_publish'
                         RETURNING id
                         """,
@@ -3739,9 +3772,24 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
         shutdown_check=lambda: shutdown_requested,
     ):
         logger.warning(
-            "[%s] scheduler job skipped — user process slot unavailable",
+            "[%s] scheduler job skipped — user process slot unavailable; reverting queued → staged",
             upload_id or "?",
         )
+        # Avoid parking forever in queued when the user process slot is busy.
+        if upload_id and db_pool is not None:
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE uploads
+                        SET status = 'staged', updated_at = NOW()
+                        WHERE id = $1 AND status = 'queued'
+                          AND COALESCE(schedule_mode, 'immediate') IN ('scheduled', 'smart')
+                        """,
+                        upload_id,
+                    )
+            except Exception as rev_e:
+                logger.warning("[%s] queued→staged revert failed: %s", upload_id, rev_e)
         return
     try:
         async with _process_semaphore:
@@ -4313,10 +4361,17 @@ async def run_stale_job_recovery_loop() -> None:
                                 pass
 
                 from services.upload.stuck_recovery import (
+                    recover_abandoned_pending,
                     recover_auto_retry_failed_immediate,
                     recover_enqueue_failed_pending,
+                    recover_stuck_ready_to_publish,
                     recover_stuck_staged_past_window,
                 )
+
+                async def _dispatch_stuck_publish(uid_up: str, uid_user: str) -> None:
+                    asyncio.create_task(
+                        _run_deferred_publish_with_semaphore(uid_up, uid_user)
+                    )
 
                 async with db_pool.acquire() as conn:
                     n_enqueue = await recover_enqueue_failed_pending(
@@ -4342,6 +4397,26 @@ async def run_stale_job_recovery_loop() -> None:
                     )
                     if n_staged:
                         logger.warning("stale recovery: re-dispatched %s overdue staged uploads", n_staged)
+
+                    n_abandoned = await recover_abandoned_pending(conn, db_pool)
+                    if n_abandoned:
+                        logger.warning(
+                            "stale recovery: failed %s abandoned pending uploads",
+                            n_abandoned,
+                        )
+
+                    ready_stats = await recover_stuck_ready_to_publish(
+                        conn,
+                        db_pool,
+                        dispatch_publish=_dispatch_stuck_publish,
+                    )
+                    if any(ready_stats.get(k, 0) for k in ("failed", "redispatched", "repaired")):
+                        logger.warning(
+                            "stale recovery: ready_to_publish repaired=%s redispatched=%s failed=%s",
+                            ready_stats.get("repaired", 0),
+                            ready_stats.get("redispatched", 0),
+                            ready_stats.get("failed", 0),
+                        )
         except Exception as e:
             logger.warning(f"Stale job recovery cycle error: {e}")
 
@@ -4884,6 +4959,7 @@ async def main() -> None:
             ("analytics_sync", run_analytics_sync_loop),
             ("kpi_collector", run_kpi_collector_loop),
             ("platform_metrics_cache", run_platform_metrics_cache_loop),
+            ("admin_email_jobs", run_admin_email_jobs_loop),
         ]
     )
 

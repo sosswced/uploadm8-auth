@@ -42,13 +42,25 @@
       "name": "ship_gate",
       "path": "scripts/agent/ship_gate.py",
       "skill": "333",
-      "purpose": "Live-ready gate before /333 — evals, router lint, checklist Excel, TRILL pre-ship"
+      "purpose": "Live-ready gate before /333 — evals, live_demo, checklist, TRILL pre-ship"
     },
     {
       "name": "sentry_triage",
       "path": "scripts/agent/sentry_triage.py",
       "skill": "sentry-workflow",
-      "purpose": "Sentry MCP triage artifact for /overnight Phase 7 — feeds ship_gate"
+      "purpose": "Sentry MCP triage artifact for /TUP Phase 6 — feeds ship_gate"
+    },
+    {
+      "name": "live_result_workflow",
+      "path": "scripts/agent/live_result_workflow.py",
+      "skill": "uploadm8-eval-loop",
+      "purpose": "Plan heal actions from live_demo + checklist + sentry artifacts"
+    },
+    {
+      "name": "tup",
+      "path": "scripts/agent/tup.py",
+      "skill": "uploadm8-routines",
+      "purpose": "/TUP driver — live upload all platforms + persona, Pikzels once, heal"
     },
     {
       "name": "worktree_spawn",

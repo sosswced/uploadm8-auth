@@ -1913,6 +1913,28 @@ async def enrich_variants_with_uploadm8_engine(
                     pv["faceswap_error"] = fs_error[:500]
             if not img_bytes or len(img_bytes) < 2048:
                 if salvage.startswith("http"):
+                    # Prefer durable R2 mirror so Saved runs survive CDN expiry.
+                    mirrored = await _download_bytes(salvage)
+                    if mirrored and len(mirrored) >= 2048:
+                        r2_key = (
+                            f"thumbnail-studio/previews/{user_id}/{job_id}/"
+                            f"variant_{int(pv.get('index') or idx + 1)}.jpg"
+                        )
+                        try:
+                            await _r2_put_bytes(r2_key, mirrored, "image/jpeg")
+                            pv["preview_r2_key"] = r2_key
+                            pv["pikzels_cdn_url"] = salvage
+                            pv["engine_status"] = "ok"
+                            scored = await _pikzels_score_from_url(
+                                salvage, str(pv.get("headline") or "")
+                            )
+                            if scored is not None:
+                                pv["ctr_score"] = scored
+                                pv["pikzels_main_score"] = scored
+                            variants[idx] = pv
+                            return
+                        except Exception as e:
+                            _log.warning("R2 CDN mirror upload failed: %s", e)
                     pv["engine_status"] = "ok"
                     scored = await _pikzels_score_from_url(
                         salvage, str(pv.get("headline") or "")

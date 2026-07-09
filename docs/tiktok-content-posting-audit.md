@@ -11,7 +11,21 @@ For TikTok, UploadM8 implements the required Content Posting export UX: we call 
 Live app: https://app.uploadm8.com  
 Privacy policy: https://app.uploadm8.com/privacy.html  
 Data deletion: https://app.uploadm8.com/data-deletion.html  
-Terms: https://app.uploadm8.com/terms.html
+Terms: https://app.uploadm8.com/terms.html  
+Refunds: https://app.uploadm8.com/refunds.html  
+Support: https://app.uploadm8.com/support.html  
+
+## Meta (Facebook / Instagram) App Dashboard URLs
+
+| Field | URL |
+|-------|-----|
+| Privacy Policy | https://app.uploadm8.com/privacy.html |
+| Terms of Service | https://app.uploadm8.com/terms.html |
+| Data Deletion Instructions | https://app.uploadm8.com/data-deletion.html |
+| Data Deletion Request Callback | https://auth.uploadm8.com/api/webhooks/facebook/data-deletion |
+| Deauthorize Callback | https://auth.uploadm8.com/api/webhooks/facebook/deauthorize |
+
+Requires `META_APP_SECRET` set in production. After deploy, reconnect Facebook/Instagram once so tokens store the Meta user ASID for reliable callback matching.
 
 ## Demo video shot list (2–3 minutes)
 

@@ -110,8 +110,10 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     # Per-service AI toggles (Settings page mirrors these keys)
     "ai_service_telemetry": True,
     "aiServiceTelemetry": True,
-    "ai_service_dashcam_osd": True,
-    "aiServiceDashcamOSD": True,
+    # Heavy / minute-metered services default OFF — biggest free margin lever.
+    # Users opt in via Settings; billing only charges what is enabled.
+    "ai_service_dashcam_osd": False,
+    "aiServiceDashcamOSD": False,
     "ai_service_audio_signals": True,
     "aiServiceAudioSignals": True,
     "ai_service_music_detection": True,
@@ -124,14 +126,14 @@ UNIVERSAL_UPLOAD_BASELINE: Dict[str, Any] = {
     "aiServiceCaptionWriter": True,
     "ai_service_thumbnail_designer": True,
     "aiServiceThumbnailDesigner": True,
-    "ai_service_speech_to_text": True,
-    "aiServiceSpeechToText": True,
-    "ai_service_scene_understanding": True,
-    "aiServiceSceneUnderstanding": True,
+    "ai_service_speech_to_text": False,
+    "aiServiceSpeechToText": False,
+    "ai_service_scene_understanding": False,
+    "aiServiceSceneUnderstanding": False,
     "ai_service_frame_inspector": True,
     "aiServiceFrameInspector": True,
-    "ai_service_video_analyzer": True,
-    "aiServiceVideoAnalyzer": True,
+    "ai_service_video_analyzer": False,
+    "aiServiceVideoAnalyzer": False,
 }
 
 # Free / entry: lighter defaults when keys are unset (faster, fewer API calls).

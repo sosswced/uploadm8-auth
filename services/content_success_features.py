@@ -130,6 +130,43 @@ def _bool_int(v: Any) -> int:
     return 1 if bool(v) else 0
 
 
+def _evidence_density_features(output_artifacts: Any, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Experimental P3 features — produced for curated views; not yet active model inputs."""
+    oa = _as_dict(output_artifacts)
+    hr = _as_dict(oa.get("hydration_report"))
+    gs = hr.get("grounding_score")
+    if gs is None:
+        gsv = _as_dict(oa.get("grounding_score_v1"))
+        gs = gsv.get("grounding_score")
+    try:
+        grounding_score = float(gs) if gs is not None else None
+    except (TypeError, ValueError):
+        grounding_score = None
+
+    lanes = 0
+    if oa.get("place_evidence_v1") or oa.get("place_evidence"):
+        lanes += 1
+    if oa.get("shot_list_v1"):
+        lanes += 1
+    if oa.get("m8_claims_v1") or oa.get("m8_evidence_catalog_v1"):
+        lanes += 1
+    if hr.get("evidence") or hr.get("evidence_present"):
+        lanes += 1
+    if oa.get("depth_route_v1") or oa.get("multimodal_depth_v1"):
+        lanes += 1
+
+    transcript = (
+        str(row.get("ai_transcript") or "")
+        or str(_as_dict(oa.get("audio_context")).get("transcript") or "")
+        or str(hr.get("transcript_phrase") or "")
+    )
+    return {
+        "grounding_score": grounding_score,
+        "evidence_lane_count": int(lanes),
+        "transcript_chars": len(transcript.strip()),
+    }
+
+
 def _base_features(row: Dict[str, Any]) -> Dict[str, Any]:
     snap = attribution_snapshot(row.get("output_artifacts"))
     created = row.get("created_at")
@@ -145,7 +182,7 @@ def _base_features(row: Dict[str, Any]) -> Dict[str, Any]:
             return None
         return str(v).strip().lower()
 
-    return {
+    out = {
         "content_category": _cat("content_category"),
         # Kept for ranking surfaces only; deprecated as a model feature.
         "primary_hashtag": _primary_hashtag(snap, row.get("hashtags")),
@@ -176,6 +213,8 @@ def _base_features(row: Dict[str, Any]) -> Dict[str, Any]:
         "sent_hour_utc": sent_hour,
         "has_attribution": 1 if snap else 0,
     }
+    out.update(_evidence_density_features(row.get("output_artifacts"), row))
+    return out
 
 
 def _assemble_row(

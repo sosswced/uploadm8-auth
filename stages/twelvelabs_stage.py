@@ -86,7 +86,7 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
     tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
     tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
     if not user_pref_ai_service_enabled(
-        ctx.user_settings or {}, "twelvelabs", default=True, allowed_services=tier_allowed_set
+        ctx.user_settings or {}, "twelvelabs", default=False, allowed_services=tier_allowed_set
     ):
         raise SkipStage("Scene Understanding disabled in upload preferences (aiServiceSceneUnderstanding)")
 
@@ -95,7 +95,8 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
 
     # Cost gate: if Video Intelligence already produced rich tracks the
     # additional TL spend rarely improves caption accuracy. Skip unless the
-    # user explicitly forces TL on or this gate is disabled by env.
+    # user explicitly forces TL, Vision labels are weak (depth router), or
+    # this gate is disabled by env.
     if TWELVELABS_SKIP_WHEN_VI_RICH:
         vi = getattr(ctx, "video_intelligence", None) or getattr(
             ctx, "video_intelligence_context", None
@@ -105,11 +106,30 @@ async def run_twelvelabs_stage(ctx: JobContext) -> JobContext:
             n_logo = len(vi.get("logos") or [])
             us = ctx.user_settings or {}
             force_tl = bool(us.get("force_twelvelabs") or us.get("forceTwelveLabs"))
-            if (n_obj >= TWELVELABS_VI_RICH_OBJECT_MIN or n_logo >= TWELVELABS_VI_RICH_LOGO_MIN) and not force_tl:
+            vision_weak = False
+            try:
+                from core.vision_labels import vision_labels_are_weak
+
+                vc = getattr(ctx, "vision_context", None) or {}
+                if isinstance(vc, dict) and vc:
+                    vision_weak = vision_labels_are_weak(
+                        vc.get("label_names") or [],
+                        landmark_names=vc.get("landmark_names") or [],
+                        logo_names=vc.get("logo_names") or [],
+                        ocr_text=str(vc.get("ocr_text") or ""),
+                    )
+            except Exception:
+                vision_weak = False
+            if (
+                (n_obj >= TWELVELABS_VI_RICH_OBJECT_MIN or n_logo >= TWELVELABS_VI_RICH_LOGO_MIN)
+                and not force_tl
+                and not vision_weak
+            ):
                 raise SkipStage(
                     f"Video Intelligence already rich (objects={n_obj}, logos={n_logo}) — "
                     "skipping Twelve Labs to control cost. "
-                    "Set forceTwelveLabs=true or TWELVELABS_SKIP_WHEN_VI_RICH=false to override."
+                    "Set forceTwelveLabs=true, enable depth router, or "
+                    "TWELVELABS_SKIP_WHEN_VI_RICH=false to override."
                 )
 
     video_path = None

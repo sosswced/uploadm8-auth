@@ -16,31 +16,34 @@ import math
 import os
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
-# Relative AIC units per service — ordered by typical vendor $ to recoup (higher = costlier).
-# Audit bands (defaults; tune live via admin Debit weights page):
-#   24–28  minute-metered cloud APIs (twelvelabs, video_intelligence)
-#   16–22  LLM / heavy gen (caption_llm, thumbnail_ai, thumbnail_recreate_ai)
-#   8–14   vision / persona / ranking middle tier
-#   2–7    fingerprint, local CPU, lightweight search (audio_acr … trend_intel)
-#   1      telemetry parse (negligible API cost)
+# Relative AIC units per service — anchored so 1 AIC ≈ $0.01 intended retail value.
+# Target: ~12–15 AIC for default light 60s job; ~22–25 AIC for full-smart 60s
+# (desired all-in AI COGS ~$0.15–$0.25). Tune live via admin Debit weights page.
+# Audit bands (Jul 2026 recalibration from Render/GCP/Pikzels/Upstash statements):
+#   4–5   minute-metered cloud APIs (twelvelabs, video_intelligence) — opt-in
+#   3–5   LLM / heavy gen (caption_llm, thumbnail_ai)
+#   1–2   vision / light audio / search
+#   1     local CPU / telemetry (negligible API $)
+# Studio/Pikzels ops use separate debit tables in services/thumbnail_studio.py
+# (2.5× vendor $), not these upload-pipeline weights alone.
 SERVICE_WEIGHTS: Dict[str, int] = {
-    "twelvelabs": 28,  # Full-video index + Pegasus — usually highest $/min
-    "video_intelligence": 24,  # GCP Video Intelligence — billed per minute of video
-    "caption_llm": 22,  # GPT-4o caption / hashtags / title — large token spend
-    "audio_whisper": 18,  # OpenAI Whisper — $/minute; also in DURATION_SCALED
-    "thumbnail_ai": 16,  # Playwright / rembg / gen stack (+12% per extra thumb in compute)
-    "vision_google": 12,  # Cloud Vision — per-image, multi-feature on one frame
-    "dashcam_osd": 8,  # Cloud Vision OCR sweep over bottom-strip HUD across the clip
-    "audio_gpt_classify": 7,  # GPT-4o-mini — small prompt; fixed cost (not duration-scaled)
-    "audio_acr": 5,  # ACRCloud fingerprint (when configured)
-    "thumbnail_recreate_ai": 14,  # URL-to-thumbnail recreate + prompt synthesis
-    "persona_consistency": 10,  # Persona profile consistency checks
-    "thumbnail_ctr_ranker": 6,  # Pre-publish scoring + suggestions
-    "marketing_image": 2,  # Per-user product card + optional Pikzels headline overlay
-    "thumbnail_competitor_gap": 4,  # Competitor gap analysis mode
-    "audio_yamnet": 2,  # Local AudioSet / YAMNet — CPU only
-    "telemetry_trill": 1,  # .map parse + Nominatim geocode — negligible API $
-    "trend_intel": 2,  # SerpAPI / YouTube Data — one lightweight search per caption job
+    "twelvelabs": 4,  # Full-video index + Pegasus — opt-in; duration-scaled
+    "video_intelligence": 3,  # GCP Video Intelligence — opt-in; duration-scaled
+    "caption_llm": 4,  # GPT caption / hashtags / title
+    "audio_whisper": 0,  # OpenAI Whisper — AIC-exempt (accuracy ladder); still duration-aware for ops
+    "thumbnail_ai": 3,  # Thumbnail gen stack (+12% per extra thumb in compute)
+    "vision_google": 2,  # Cloud Vision labels on caption/thumb frames
+    "dashcam_osd": 1,  # Vision OCR sweep — opt-in
+    "audio_gpt_classify": 1,  # GPT-4o-mini audio summary — fixed
+    "audio_acr": 1,  # ACRCloud fingerprint (when configured)
+    "thumbnail_recreate_ai": 90,  # Aligns with Pikzels image→thumb ~$0.36 × 2.5
+    "persona_consistency": 95,  # Aligns with Pikzels create-persona ~$0.38 × 2.5
+    "thumbnail_ctr_ranker": 8,  # Score thumb ~$0.03 × ~2.5
+    "marketing_image": 2,  # Product card + optional Pikzels overlay
+    "thumbnail_competitor_gap": 8,  # Competitor gap analysis mode
+    "audio_yamnet": 1,  # Local AudioSet / YAMNet — CPU only
+    "telemetry_trill": 1,  # .map parse + Nominatim — negligible API $
+    "trend_intel": 1,  # SerpAPI / YouTube Data — one light search per caption job
 }
 
 # Vendor cost scales with clip/audio length — apply duration_multiplier().
@@ -51,6 +54,10 @@ DURATION_SCALED: FrozenSet[str] = frozenset(
         "twelvelabs",
     }
 )
+
+# Services that may appear in enabled_services but must not invent AIC when alone.
+# Weight 0 is the billing signal; this set documents product intent for UI/copy.
+AIC_BILLING_EXEMPT: FrozenSet[str] = frozenset({"audio_whisper"})
 
 SERVICE_PREF_KEYS: Dict[str, str] = {
     "telemetry_trill": "aiServiceTelemetry",
@@ -165,7 +172,10 @@ SERVICE_PUBLIC_META: Dict[str, Dict[str, str]] = {
     },
     "audio_whisper": {
         "label": "Speech-to-Text Transcript",
-        "description": "Transcribes speech for accurate context and stronger caption quality.",
+        "description": (
+            "Transcribes speech for accurate context and stronger caption quality. "
+            "Included at no extra AIC — enable freely for talking-head and voiceover clips."
+        ),
     },
     "video_intelligence": {
         "label": "Video Analyzer",
@@ -444,22 +454,27 @@ def resolve_enabled_ai_services(
             out.add("audio_gpt_classify")
         if env.get("YAMNET_ENABLED", True) and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_yamnet", ""), True):
             out.add("audio_yamnet")
-        if transcribe and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_whisper", ""), True):
+        if transcribe and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_whisper", ""), False):
             out.add("audio_whisper")
         if env.get("ACRCLOUD_CONFIGURED") and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("audio_acr", ""), True):
             out.add("audio_acr")
 
-    # Base Google frame + clip analysis are priced when caption/thumb work needs
-    # them; ``aiServiceFrameInspector`` / ``aiServiceVideoAnalyzer`` are legacy UI
-    # toggles and do not remove these from the presign service set.
-    vision_on = env.get("VISION_STAGE_ENABLED", True) and (want_caption or want_thumb)
+    # Frame inspector (Vision) — on by default for caption/thumb quality; user can disable.
+    vision_on = (
+        env.get("VISION_STAGE_ENABLED", True)
+        and (want_caption or want_thumb)
+        and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("vision_google", ""), True)
+    )
     if vision_on:
         out.add("vision_google")
 
-    if want_caption and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("twelvelabs", ""), True):
+    # Twelve Labs + Video Intelligence are opt-in (heavy $/min). Defaults off in baseline.
+    if want_caption and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("twelvelabs", ""), False):
         out.add("twelvelabs")
 
-    if want_caption or want_thumb:
+    if (want_caption or want_thumb) and _pref_true(
+        user_prefs, SERVICE_PREF_KEYS.get("video_intelligence", ""), False
+    ):
         out.add("video_intelligence")
 
     if want_thumb and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("thumbnail_ai", ""), True):
@@ -470,6 +485,10 @@ def resolve_enabled_ai_services(
         # SerpAPI / YouTube title sample for M8 — same user gate as caption writer.
         if env.get("TREND_INTEL_AVAILABLE", False):
             out.add("trend_intel")
+
+    # Dashcam OSD OCR — opt-in; bill only when Vision path is on and pref allows.
+    if vision_on and _pref_true(user_prefs, SERVICE_PREF_KEYS.get("dashcam_osd", ""), False):
+        out.add("dashcam_osd")
 
     if tier_allowed is not None:
         out = {svc for svc in out if svc in tier_allowed}
@@ -491,6 +510,18 @@ def effective_num_thumbnails(
     return 1
 
 
+def _fallback_billable_part(enabled: Set[str], weights: Dict[str, int]) -> Dict[str, float]:
+    """When all raw parts are zero, charge 1 AIC on a positive-weight service only."""
+    billable = [
+        s
+        for s in sorted(enabled)
+        if float(weights.get(s, 0)) > 0 and s not in AIC_BILLING_EXEMPT
+    ]
+    if not billable:
+        return {}
+    return {billable[0]: 1.0}
+
+
 def compute_aic_service_charge(
     *,
     enabled: Set[str],
@@ -506,9 +537,11 @@ def compute_aic_service_charge(
         enabled, duration_seconds, max_caption_frames, num_thumbnails, weights
     )
     if enabled and sum(parts.values()) <= 0:
-        parts = {sorted(enabled)[0]: 1.0}
+        parts = _fallback_billable_part(enabled, weights)
+        if not parts:
+            return 0
     total = sum(parts.values())
-    return max(1, int(math.ceil(total)))
+    return max(1, int(math.ceil(total))) if total > 0 else 0
 
 
 def compute_aic_breakdown(
@@ -567,7 +600,7 @@ def compute_aic_breakdown(
 
     parts = _aic_raw_parts(enabled, dur, max_caption_frames, num_thumbnails, merged_w)
     if enabled and sum(parts.values()) <= 0:
-        parts = {sorted(enabled)[0]: 1.0}
+        parts = _fallback_billable_part(enabled, merged_w)
     aic = compute_aic_service_charge(
         enabled=enabled,
         duration_seconds=dur,

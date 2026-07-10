@@ -295,6 +295,8 @@ class JobContext:
     m8_platform_captions: Dict[str, str] = field(default_factory=dict)
     # Optional: full style x tone x voice sweep from one M8 call (see m8_engine caption_evidence_matrix)
     m8_caption_evidence_matrix: Dict[str, Any] = field(default_factory=dict)
+    # Per-platform claim↔evidence bindings from M8 grounding pass 2
+    m8_platform_claims: Dict[str, Any] = field(default_factory=dict)
     # Populated by audio_stage (Whisper) when enabled — injected into caption prompts.
     ai_transcript: Optional[str] = None
     audio_path: Optional[Path] = None
@@ -1802,6 +1804,54 @@ def build_multimodal_scene_digest(ctx: JobContext, *, max_chars: int = 10000) ->
         vi_body = _video_intelligence_digest_body(vi)
         if vi_body:
             push("=== VIDEO INTELLIGENCE (Google - full clip + timeline) ===", vi_body, 0.18)
+
+    arts = getattr(ctx, "output_artifacts", None) or {}
+    if isinstance(arts, dict):
+        shot_list = arts.get("shot_list_v1")
+        if isinstance(shot_list, list) and shot_list:
+            shot_lines: List[str] = []
+            for row in shot_list[:24]:
+                if not isinstance(row, dict):
+                    continue
+                t = row.get("t_seconds")
+                kind = str(row.get("kind") or "beat")
+                text = str(row.get("text") or "").strip()
+                if not text:
+                    continue
+                try:
+                    t_s = f"{float(t):.1f}s" if t is not None else "?"
+                except (TypeError, ValueError):
+                    t_s = "?"
+                shot_lines.append(f"[{t_s} {kind}] {text[:160]}")
+            if shot_lines:
+                push(
+                    "=== SHOT LIST (narrate in order; do not invent beats) ===",
+                    "\n".join(shot_lines),
+                    0.16,
+                )
+
+    pe = getattr(ctx, "place_evidence", None)
+    if not isinstance(pe, dict) and isinstance(arts, dict):
+        pe = arts.get("place_evidence_v1")
+    if isinstance(pe, dict) and pe:
+        pe_lines: List[str] = []
+        if pe.get("places"):
+            pe_lines.append("Places: " + ", ".join(str(x) for x in pe["places"][:10]))
+        if pe.get("beaches"):
+            pe_lines.append("Beaches: " + ", ".join(str(x) for x in pe["beaches"][:6]))
+        if pe.get("monuments"):
+            pe_lines.append("Monuments: " + ", ".join(str(x) for x in pe["monuments"][:6]))
+        if pe.get("stadiums"):
+            pe_lines.append("Stadiums: " + ", ".join(str(x) for x in pe["stadiums"][:6]))
+        if pe.get("sports_teams"):
+            pe_lines.append("Teams: " + ", ".join(str(x) for x in pe["sports_teams"][:6]))
+        if pe.get("license_plates"):
+            pe_lines.append("License plates (OCR): " + ", ".join(str(x) for x in pe["license_plates"][:4]))
+        geo = pe.get("geocode_from_landmark") or {}
+        if isinstance(geo, dict) and geo.get("location_display"):
+            pe_lines.append(f"Geocoded from landmark: {geo.get('location_display')}")
+        if pe_lines:
+            push("=== PLACE EVIDENCE (no .map fallback lanes) ===", "\n".join(pe_lines), 0.14)
 
     vc = ctx.vision_context or {}
     if isinstance(vc, dict) and vc and not vc.get("skipped"):

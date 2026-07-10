@@ -27,8 +27,10 @@ registered here with ``app.include_router(...)``. New endpoints belong in an exi
 focused routers above. See ``routers/README.md`` for mount order.
 """
 
+import asyncio
 import json
 import logging
+import os
 
 # Load .env before any config reads (needed for local dev when running via uvicorn) (needed for local dev when running via uvicorn)
 try:
@@ -88,6 +90,7 @@ from routers.uploads_lifecycle import router as uploads_lifecycle_router
 from routers.uploads_read import router as uploads_read_router
 from routers.scheduled import router as scheduled_router
 from routers.scheduling import router as scheduling_router
+from routers.uploads_schedule_legacy import legacy_uploads_router as scheduling_legacy_uploads_router
 from routers.preferences import router as preferences_router
 from routers.groups import router as groups_router
 from routers.workspace import router as workspace_router
@@ -104,8 +107,8 @@ from routers.admin_contract import (
     admin_compat_router,
     marketing_router as admin_marketing_contract_router,
     ml_router as admin_ml_contract_router,
-    public_marketing_router,
 )
+from routers.admin_marketing_public import public_marketing_router
 from routers.dashboard import router as dashboard_router
 from routers.shell_bootstrap import router as shell_bootstrap_router
 from routers.trill import router as trill_router, seed_trill_places
@@ -134,18 +137,67 @@ async def lifespan(app: FastAPI):
         # shapes (e.g. the Basil move of current_period_* / invoice.subscription).
         stripe.api_version = "2025-03-31.basil"
 
-    core.state.db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=DB_POOL_MIN,
-        max_size=DB_POOL_MAX,
-        init=_init_asyncpg_codecs,
-        max_inactive_connection_lifetime=300,
-        command_timeout=60,
-    )
+    from core.db_pool import is_transient_db_error
+
+    last_pool_err: Exception | None = None
+    # Neon / serverless: prefer a small warm pool locally to avoid connection storms
+    # when E2E + worker wake the cluster together (override via DB_POOL_*).
+    pool_min = DB_POOL_MIN
+    pool_max = max(DB_POOL_MAX, pool_min)
+    for attempt in range(1, 8):
+        try:
+            core.state.db_pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=pool_min,
+                max_size=pool_max,
+                init=_init_asyncpg_codecs,
+                max_inactive_connection_lifetime=180,
+                command_timeout=60,
+            )
+            last_pool_err = None
+            break
+        except Exception as e:
+            last_pool_err = e
+            if attempt < 7 and is_transient_db_error(e):
+                delay = min(8.0, 0.5 * (2 ** (attempt - 1)))
+                logger.warning(
+                    "db pool create transient error (attempt %s/7, sleep %.2fs): %s",
+                    attempt,
+                    delay,
+                    e,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+    if last_pool_err is not None:
+        raise last_pool_err
+    # Warm one connection so the first E2E request is not a cold Neon wake.
+    try:
+        from core.db_pool import acquire_db as _acquire_db
+
+        async with _acquire_db(core.state.db_pool):
+            pass
+    except Exception as e:
+        logger.warning("db pool warm-up skipped: %s", e)
     await _load_uploads_columns(core.state.db_pool)
     logger.info("Database connected")
 
-    await run_migrations(core.state.db_pool)
+    for mig_attempt in range(1, 6):
+        try:
+            await run_migrations(core.state.db_pool)
+            break
+        except Exception as e:
+            if mig_attempt < 5 and is_transient_db_error(e):
+                delay = min(8.0, 0.5 * (2 ** (mig_attempt - 1)))
+                logger.warning(
+                    "migrations transient error (attempt %s/5, sleep %.2fs): %s",
+                    mig_attempt,
+                    delay,
+                    e,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
 
     try:
         from services.upload_funnel import set_funnel_db_pool
@@ -167,10 +219,33 @@ async def lifespan(app: FastAPI):
 
     try:
         async with core.state.db_pool.acquire() as conn:
-            from services.billing_service_weights import ensure_billing_weights_seeded
+            from services.billing_service_weights import (
+                ensure_billing_weights_seeded,
+                migrate_legacy_weights_to_code_defaults,
+                sync_service_weights_from_code,
+            )
 
             await ensure_billing_weights_seeded(conn)
-            logger.info("billing_service_weights seed check complete")
+            force = (os.environ.get("BILLING_WEIGHTS_FORCE_SYNC_FROM_CODE") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if force:
+                n = await sync_service_weights_from_code(
+                    conn, updated_by="boot:BILLING_WEIGHTS_FORCE_SYNC_FROM_CODE"
+                )
+                logger.info(
+                    "billing_service_weights FORCE sync from code complete (rows=%s)",
+                    n,
+                )
+            else:
+                migrated = await migrate_legacy_weights_to_code_defaults(conn)
+                logger.info(
+                    "billing_service_weights seed check complete (legacy_migrated=%s)",
+                    migrated,
+                )
     except Exception as e:
         logger.warning("billing_service_weights seed failed: %s", e)
 
@@ -254,7 +329,6 @@ async def lifespan(app: FastAPI):
     ml_engine_task = None
     marketing_automation_task = None
     if core.state.db_pool:
-        import asyncio
         from services.trill_background import run_trill_maintenance_loop
 
         trill_maintenance_task = asyncio.create_task(
@@ -351,7 +425,7 @@ async def _cors_safe_500_handler(request: Request, exc: Exception):
     if isinstance(exc, RequestValidationError):
         return await request_validation_exception_handler(request, exc)
 
-    from core.db_pool import is_transient_db_error
+    from core.db_pool import DatabaseUnavailableError, is_transient_db_error
 
     origin = request.headers.get("origin", "")
     allowed = ALLOWED_ORIGINS_LIST
@@ -361,7 +435,7 @@ async def _cors_safe_500_handler(request: Request, exc: Exception):
         "Access-Control-Allow-Credentials": "true",
     }
 
-    if is_transient_db_error(exc):
+    if isinstance(exc, DatabaseUnavailableError) or is_transient_db_error(exc):
         logger.warning(
             "Transient database error on %s %s: %s: %s",
             request.method,
@@ -521,6 +595,7 @@ app.include_router(uploads_analytics_router)
 app.include_router(uploads_lifecycle_router)
 app.include_router(scheduled_router)
 app.include_router(scheduling_router)
+app.include_router(scheduling_legacy_uploads_router)
 app.include_router(preferences_router)
 app.include_router(groups_router)
 app.include_router(workspace_router)
@@ -558,7 +633,40 @@ app.include_router(domain_router)
 # ============================================================
 @app.get("/health")
 async def health():
+    """Liveness — process is up (load balancers). Does not require DB."""
     return {"status": "ok", "timestamp": _now_utc().isoformat()}
+
+
+@app.get("/api/health")
+async def api_health():
+    """Readiness — DB pool can serve a query (E2E / overnight warm-up)."""
+    from fastapi.responses import JSONResponse
+
+    from core.db_pool import acquire_db
+
+    ts = _now_utc().isoformat()
+    if core.state.db_pool is None:
+        return JSONResponse(
+            {"status": "starting", "db": False, "timestamp": ts},
+            status_code=503,
+        )
+    try:
+        # Keep readiness fast — do not burn full acquire backoff here.
+        async with asyncio.timeout(10):
+            async with acquire_db(core.state.db_pool, attempts=2) as conn:
+                await conn.fetchval("SELECT 1")
+        return {"status": "ok", "db": True, "timestamp": ts}
+    except Exception as e:
+        logger.warning("api health db check failed: %s", e)
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "db": False,
+                "timestamp": ts,
+                "detail": type(e).__name__,
+            },
+            status_code=503,
+        )
 
 
 # Static HTML/JS/CSS — same process as API (cookie auth, no cross-origin for local dev).

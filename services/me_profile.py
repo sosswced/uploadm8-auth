@@ -15,6 +15,7 @@ from core.db_pool import acquire_db
 from core.helpers import _safe_col
 from core.r2 import resolve_user_profile_avatar_url
 from core.sql_allowlist import assert_set_fragments_columns, USERS_UPDATE_COLUMNS_ME, USERS_UPDATE_COLUMNS_PROFILE
+from core.user_columns import USERS_ME_COLUMNS, users_select_sql
 from core.models import ProfileUpdate, ProfileUpdateSettings
 from services.workspace import ensure_personal_workspace, workspace_capabilities
 from stages.entitlements import get_entitlements_from_user, entitlements_to_dict
@@ -101,7 +102,7 @@ async def fetch_me_endpoint_data(pool, user_id: str) -> tuple[dict, list]:
     Caller should pass a JWT-verified ``user_id`` (e.g. from ``get_verified_user_id``).
     """
     async with acquire_db(pool) as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        user = await conn.fetchrow(users_select_sql(USERS_ME_COLUMNS), user_id)
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         if user["status"] == "banned":

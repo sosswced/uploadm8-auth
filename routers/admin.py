@@ -1637,7 +1637,7 @@ async def kpi_overview(range: str = "30d", user: dict = Depends(require_admin)):
     minutes = _range_to_minutes(range, default_minutes=30 * 24 * 60)
     since = _now_utc() - timedelta(minutes=minutes)
 
-    async with core.state.db_pool.acquire() as conn:
+    async with acquire_db(core.state.require_pool()) as conn:
         new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         paid_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE subscription_tier NOT IN ('free', 'master_admin', 'friends_family')")
@@ -1788,12 +1788,14 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
             )
 
     async def _load_admin_eng():
+        # Sequential on one connection — parallel per-user pool.acquire wedged
+        # the pool under overnight E2E (UPLOADM8-7H / late-suite ReadTimeout).
         async with acquire_db(pool) as c:
             return await compute_admin_engagement_totals(
                 c,
                 window_start=since,
                 window_end_exclusive=until,
-                pool=pool,
+                pool=None,
             )
 
     async def _load_reliability():
@@ -1816,6 +1818,14 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
     async def _load_refunds():
         return await fetch_stripe_refunds_window(since, until)
 
+    # Cap concurrent pool checkouts — full gather + engagement rollups exhausted
+    # DB_POOL_MAX under overnight E2E and hung /ready while /health stayed green.
+    _kpi_sem = asyncio.Semaphore(2)
+
+    async def _bounded(coro):
+        async with _kpi_sem:
+            return await coro
+
     (
         cost_summary,
         admin_eng,
@@ -1824,12 +1834,12 @@ async def get_admin_kpis(range: str = Query("30d"), user: dict = Depends(require
         upload_pipeline_funnel,
         refunds_pair,
     ) = await asyncio.gather(
-        _load_cost_summary(),
-        _load_admin_eng(),
-        _load_reliability(),
-        _load_attach(),
-        _load_upload_funnel(),
-        _load_refunds(),
+        _bounded(_load_cost_summary()),
+        _bounded(_load_admin_eng()),
+        _bounded(_load_reliability()),
+        _bounded(_load_attach()),
+        _bounded(_load_upload_funnel()),
+        _load_refunds(),  # Stripe only — no DB pool
     )
     refunds_total, refunds_count = refunds_pair
 
@@ -2343,7 +2353,7 @@ async def get_kpi_usage(range: str = Query("30d"), user: dict = Depends(require_
     minutes = _range_to_minutes(range, 43200)
     since = _now_utc() - timedelta(minutes=minutes)
     until = _now_utc()
-    async with core.state.db_pool.acquire() as conn:
+    async with acquire_db(core.state.require_pool()) as conn:
         active = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM uploads WHERE created_at >= $1", since)
         uploads = await conn.fetchval("SELECT COUNT(*) FROM uploads WHERE created_at >= $1", since)
         new_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE created_at >= $1", since)
@@ -2418,6 +2428,8 @@ async def admin_get_billing_service_weights(user: dict = Depends(require_master_
     merged = merge_service_weights_from_db(raw)
     put_db = dict(core.state.billing_catalog_cache.get("put_cost_overrides") or {})
     put_effective = effective_put_cost_rules()
+    from services.billing_service_weights import weights_drift_summary
+
     return {
         "code_defaults": dict(SERVICE_WEIGHTS),
         "db_weights": raw,
@@ -2426,6 +2438,36 @@ async def admin_get_billing_service_weights(user: dict = Depends(require_master_
         "put_cost_defaults": dict(PUT_COST_DEFAULTS),
         "put_cost_db_overrides": put_db,
         "put_cost_effective": put_effective,
+        "drift": weights_drift_summary(raw),
+    }
+
+
+@router.post("/billing/service-weights/reset-to-code")
+async def admin_reset_billing_service_weights_to_code(user: dict = Depends(require_master_admin)):
+    """Force-upsert all AIC weights from ``SERVICE_WEIGHTS`` (Jul 2026 calibration).
+
+    Use after deploy when DB still holds legacy ordinal weights. Does not change PUT rules.
+    """
+    if core.state.db_pool is None:
+        raise HTTPException(503, "Database unavailable")
+    from services.billing_service_weights import (
+        fetch_service_weights_map,
+        sync_service_weights_from_code,
+        weights_drift_summary,
+    )
+    from stages.ai_service_costs import SERVICE_WEIGHTS, merge_service_weights_from_db, service_catalog
+
+    async with core.state.require_pool().acquire() as conn:
+        n = await sync_service_weights_from_code(conn, updated_by=str(user["id"]))
+        raw = await fetch_service_weights_map(conn)
+    merged = merge_service_weights_from_db(raw)
+    return {
+        "status": "reset",
+        "rows_written": n,
+        "code_defaults": dict(SERVICE_WEIGHTS),
+        "effective": merged,
+        "catalog": service_catalog(merged),
+        "drift": weights_drift_summary(raw),
     }
 
 

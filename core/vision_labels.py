@@ -502,6 +502,34 @@ def is_generic_vision_label(raw: Any, *, min_specific_len: int = 4) -> bool:
     return slug in GENERIC_VISION_LABEL_SLUGS
 
 
+def vision_labels_are_weak(
+    labels: Optional[Iterable[Any]] = None,
+    *,
+    landmark_names: Optional[Iterable[Any]] = None,
+    logo_names: Optional[Iterable[Any]] = None,
+    ocr_text: str = "",
+    min_specific: int = 2,
+) -> bool:
+    """
+    True when Vision mostly returned coarse labels (outdoor/vehicle/person)
+    without landmarks, logos, or meaningful OCR — signal to deepen multimodal
+    (force Twelve Labs / keep VI) before M8 writes captions.
+    """
+    if landmark_names and any(str(x).strip() for x in landmark_names):
+        return False
+    if logo_names and any(str(x).strip() for x in logo_names):
+        return False
+    ocr = (ocr_text or "").strip()
+    if len(ocr) >= 12:
+        return False
+    specific = [
+        str(x).strip()
+        for x in (labels or [])
+        if str(x).strip() and not is_generic_vision_label(x)
+    ]
+    return len(specific) < max(0, int(min_specific))
+
+
 def resolve_ambient_profiles(
     *,
     category: str = "general",

@@ -29,18 +29,19 @@ UPLOAD_ERROR_MESSAGES: Dict[str, str] = {
     ERROR_SCHEDULE_NO_PLATFORMS: "Select at least one platform before scheduling.",
     ERROR_PUBLISH_SLOT_MISSING: (
         "This upload has no remaining publish slot. It was marked failed so it cannot sit forever — "
-        "retry or reschedule from Queue."
+        "use Retry from Queue or Scheduled (slots are rebuilt on retry)."
     ),
     ERROR_STUCK_READY_TO_PUBLISH: (
         "Publishing stalled past the safety window. Marked failed so it cannot hang — "
-        "use Retry from Queue if the video is still needed."
+        "use Retry from Queue or Scheduled if the video is still needed."
     ),
     ERROR_STUCK_PENDING: (
         "This upload never finished registration (no publish schedule). Marked failed — "
-        "upload again or use Re-queue if the file is still in storage."
+        "upload again, or Retry / Re-queue if the file is still in storage."
     ),
     ERROR_ABANDONED_PENDING: (
-        "Upload was left incomplete (file never finished registering). Marked failed."
+        "Upload was left incomplete (file never finished registering). Marked failed — "
+        "upload again, or Retry if the file is still in storage."
     ),
     ERROR_SOURCE_NOT_IN_R2: SOURCE_NOT_IN_R2_MESSAGE,
     "ENQUEUE_FAILED": (
@@ -66,6 +67,87 @@ def schedule_slot_iso(v: Any) -> str:
     return str(v)
 
 
+def normalize_platform_list(platforms: Any) -> List[str]:
+    """Lowercase unique platforms preserving first-seen order."""
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in platforms or []:
+        p = str(raw or "").strip().lower()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def smart_metadata_missing_platforms(
+    platforms: Any,
+    schedule_metadata: Any,
+) -> List[str]:
+    """Platforms that lack a resolvable datetime in ``schedule_metadata``."""
+    from services.deferred_publish_schedule import parse_schedule_metadata
+
+    plats = normalize_platform_list(platforms)
+    meta = parse_schedule_metadata(schedule_metadata)
+    return [p for p in plats if p not in meta]
+
+
+_SUCCESS_PLATFORM_STATUSES = frozenset(
+    {"published", "succeeded", "success", "completed", "partial"}
+)
+
+
+def successful_platforms_from_results(platform_results: Any) -> set[str]:
+    """Lowercase platforms already marked successful in ``platform_results``."""
+    from services.retry_policy import split_platform_results
+
+    succeeded, _ = split_platform_results(
+        platform_results if isinstance(platform_results, list) else None
+    )
+    out: set[str] = set()
+    for entry in succeeded:
+        name = str(entry.get("platform") or "").strip().lower()
+        if name:
+            out.add(name)
+    # Also accept status-shaped rows when ``success`` was omitted.
+    raw = platform_results
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = None
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("success") is True:
+                continue  # already counted
+            st = str(entry.get("status") or "").strip().lower()
+            if st in _SUCCESS_PLATFORM_STATUSES:
+                name = str(entry.get("platform") or "").strip().lower()
+                if name:
+                    out.add(name)
+    return out
+
+
+def anchor_platforms_for_scheduled_time(
+    platforms: List[str],
+    platform_results: Any,
+) -> List[str]:
+    """Platforms that should drive top-level ``scheduled_time`` (exclude published)."""
+    done = successful_platforms_from_results(platform_results)
+    pending = [p for p in platforms if p not in done]
+    return pending if pending else list(platforms)
+
+
+def min_slot_among(
+    slots: Dict[str, datetime],
+    platforms: List[str],
+) -> Optional[datetime]:
+    times = [slots[p] for p in platforms if p in slots]
+    return min(times) if times else None
+
+
 async def _user_timezone(conn: Any, user_id: str) -> str:
     row = await conn.fetchrow("SELECT timezone FROM users WHERE id = $1", user_id)
     tz = (row.get("timezone") if row else None) or "America/Chicago"
@@ -82,8 +164,9 @@ async def build_smart_schedule_for_upload(
     random_seed: Optional[str] = None,
     user_timezone: Optional[str] = None,
 ) -> Dict[str, datetime]:
-    """Return per-platform UTC slots; static priors when data-driven signals are empty."""
-    if not platforms:
+    """Return per-platform UTC slots (lowercase keys) for every requested platform."""
+    plats = normalize_platform_list(platforms)
+    if not plats:
         return {}
 
     tz = user_timezone or await _user_timezone(conn, user_id)
@@ -93,27 +176,56 @@ async def build_smart_schedule_for_upload(
     schedule = await calculate_smart_schedule_data_driven(
         conn,
         user_id,
-        platforms,
+        plats,
         num_days=num_days,
         blocked_day_offsets=blocked or None,
         user_timezone=tz,
         random_seed=random_seed,
     )
-    if schedule:
-        return schedule
+    if not schedule:
+        logger.warning(
+            "smart_schedule data-driven empty for user=%s platforms=%s — using static priors",
+            user_id,
+            plats,
+        )
+        schedule = calculate_smart_schedule(
+            plats,
+            num_days=num_days,
+            user_timezone=tz,
+            blocked_day_offsets=blocked or None,
+            random_seed=random_seed,
+        )
 
-    logger.warning(
-        "smart_schedule data-driven empty for user=%s platforms=%s — using static priors",
-        user_id,
-        platforms,
-    )
-    return calculate_smart_schedule(
-        platforms,
-        num_days=num_days,
-        user_timezone=tz,
-        blocked_day_offsets=blocked or None,
-        random_seed=random_seed,
-    )
+    # Guarantee every platform has a slot (unknown platforms fall back to tiktok priors).
+    out: Dict[str, datetime] = {}
+    for p in plats:
+        slot = schedule.get(p) if schedule else None
+        if slot is None and schedule:
+            # Case-insensitive lookup if builder returned mixed keys
+            for k, v in schedule.items():
+                if str(k).strip().lower() == p:
+                    slot = v
+                    break
+        if slot is not None:
+            out[p] = slot
+    if len(out) < len(plats):
+        missing = [p for p in plats if p not in out]
+        logger.warning(
+            "smart_schedule incomplete user=%s missing=%s — filling with static priors",
+            user_id,
+            missing,
+        )
+        filler = calculate_smart_schedule(
+            missing,
+            num_days=num_days,
+            user_timezone=tz,
+            blocked_day_offsets=blocked or None,
+            random_seed=f"{random_seed or user_id}:fill",
+        )
+        for p in missing:
+            if p in filler:
+                out[p] = filler[p]
+    return out
 
 
 def validate_presign_schedule(data: Any) -> None:
@@ -148,10 +260,25 @@ def validate_presign_schedule(data: Any) -> None:
 
 
 def upload_has_schedule(upload_row: dict) -> bool:
+    """True when the row is ready to complete without schedule repair.
+
+    Smart mode requires a top-level ``scheduled_time`` **and** a resolvable slot
+    for every platform in ``schedule_metadata``. Partial metadata must return
+    False so ``/complete`` runs ``repair_upload_schedule`` before staging.
+    """
     mode = (upload_row.get("schedule_mode") or "immediate").strip().lower()
     if mode not in ("scheduled", "smart"):
         return True
-    return bool(upload_row.get("scheduled_time"))
+    if not upload_row.get("scheduled_time"):
+        return False
+    if mode == "smart":
+        missing = smart_metadata_missing_platforms(
+            upload_row.get("platforms"),
+            upload_row.get("schedule_metadata"),
+        )
+        if missing:
+            return False
+    return True
 
 
 # Pipeline statuses that may await a schedule before publish.
@@ -171,14 +298,20 @@ async def repair_upload_schedule(
     num_days: int = 14,
 ) -> Tuple[bool, Optional[datetime], Optional[dict]]:
     """
-    Fill missing scheduled_time / schedule_metadata for staged smart/scheduled rows.
+    Fill missing ``scheduled_time`` / incomplete ``schedule_metadata`` for smart/scheduled rows.
+
+    Smart mode requires a resolvable slot for **every** platform. Partial metadata
+    (e.g. only tiktok after a multi-platform presign) is rebuilt for missing platforms
+    and merged — existing slots are preserved.
 
     Returns (ok, scheduled_time, schedule_metadata dict or None).
     """
+    from services.deferred_publish_schedule import parse_schedule_metadata
+
     upload_id = str(upload_row.get("id") or "")
     user_id = str(upload_row.get("user_id") or "")
     mode = (upload_row.get("schedule_mode") or "immediate").strip().lower()
-    platforms = list(upload_row.get("platforms") or [])
+    platforms = normalize_platform_list(upload_row.get("platforms") or [])
 
     if mode not in ("scheduled", "smart"):
         return True, upload_row.get("scheduled_time"), upload_row.get("schedule_metadata")
@@ -193,29 +326,82 @@ async def repair_upload_schedule(
         except Exception:
             schedule_metadata = None
 
-    if scheduled_time is not None:
-        if mode != "smart" or schedule_metadata:
-            return True, scheduled_time, schedule_metadata
+    existing = parse_schedule_metadata(schedule_metadata) if schedule_metadata else {}
+    missing = [p for p in platforms if p not in existing] if mode == "smart" else []
+    anchor_plats = anchor_platforms_for_scheduled_time(
+        platforms, upload_row.get("platform_results")
+    )
 
-    if mode in ("smart", "scheduled"):
-        if not platforms:
-            logger.error("[%s] schedule repair failed: no platforms", upload_id)
+    # Scheduled mode: only need a top-level scheduled_time.
+    if mode == "scheduled" and scheduled_time is not None:
+        return True, scheduled_time, schedule_metadata
+
+    # Smart mode: complete metadata — do not rebuild slots. If scheduled_time is
+    # null, derive the anchor from pending (non-published) platform slots only.
+    if mode == "smart" and existing and not missing:
+        normalized = {p: schedule_slot_iso(existing[p]) for p in platforms if p in existing}
+        if scheduled_time is not None:
+            return True, scheduled_time, normalized or schedule_metadata
+        derived = min_slot_among(existing, anchor_plats)
+        if derived is None:
             return False, None, None
-        smart = await build_smart_schedule_for_upload(
-            conn,
-            user_id,
-            platforms,
-            num_days=num_days,
-            exclude_upload_id=upload_id,
-            random_seed=upload_id,
+        await conn.execute(
+            """
+            UPDATE uploads
+            SET scheduled_time = $2,
+                schedule_metadata = $3::jsonb,
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            upload_id,
+            derived,
+            json.dumps(normalized, default=str) if normalized else None,
         )
-        if not smart:
-            logger.error("[%s] schedule repair failed: smart calc returned empty", upload_id)
-            return False, None, None
-        schedule_metadata = {p: schedule_slot_iso(dt) for p, dt in smart.items()}
-        scheduled_time = min(smart.values())
-    else:
+        logger.warning(
+            "[%s] schedule anchor derived from metadata scheduled_time=%s platforms=%s",
+            upload_id,
+            derived,
+            anchor_plats,
+        )
+        return True, derived, normalized or schedule_metadata
+
+    if not platforms:
+        logger.error("[%s] schedule repair failed: no platforms", upload_id)
         return False, None, None
+
+    # Rebuild missing (or all) platform slots.
+    need = missing if (mode == "smart" and existing and missing) else platforms
+    smart = await build_smart_schedule_for_upload(
+        conn,
+        user_id,
+        need,
+        num_days=num_days,
+        exclude_upload_id=upload_id,
+        random_seed=upload_id,
+    )
+    if not smart:
+        logger.error("[%s] schedule repair failed: smart calc returned empty", upload_id)
+        return False, None, None
+
+    merged: Dict[str, datetime] = dict(existing)
+    for p, dt in smart.items():
+        pl = str(p).strip().lower()
+        if pl:
+            merged[pl] = dt
+
+    # Ensure every requested platform is present after merge.
+    still_missing = [p for p in platforms if p not in merged]
+    if still_missing:
+        logger.error(
+            "[%s] schedule repair failed: still missing platforms=%s",
+            upload_id,
+            still_missing,
+        )
+        return False, None, None
+
+    schedule_metadata = {p: schedule_slot_iso(merged[p]) for p in platforms}
+    # Never rewind the row anchor to an already-published platform's past slot.
+    scheduled_time = min_slot_among(merged, anchor_plats) or min(merged[p] for p in platforms)
 
     await conn.execute(
         """
@@ -230,10 +416,12 @@ async def repair_upload_schedule(
         json.dumps(schedule_metadata, default=str) if schedule_metadata else None,
     )
     logger.warning(
-        "[%s] schedule repaired mode=%s scheduled_time=%s",
+        "[%s] schedule repaired mode=%s scheduled_time=%s platforms=%s anchor=%s",
         upload_id,
         mode,
         scheduled_time,
+        platforms,
+        anchor_plats,
     )
     return True, scheduled_time, schedule_metadata
 
@@ -271,6 +459,9 @@ async def bootstrap_repair_user_schedules(
     """
     On queue/scheduled bootstrap: assign times to pending/awaiting rows missing them.
 
+    Includes smart rows with **partial** ``schedule_metadata`` (some platforms
+    missing slots), not only null metadata.
+
     Returns summary ``{repaired, failed}`` for logging.
     """
     repaired = 0
@@ -279,6 +470,8 @@ async def bootstrap_repair_user_schedules(
         return {"repaired": 0, "failed": 0}
 
     async with pool.acquire() as conn:
+        # Over-fetch smart/scheduled awaiting rows; filter with upload_has_schedule
+        # so partial metadata (e.g. only tiktok) is repaired, not only NULL meta.
         rows = await conn.fetch(
             """
             SELECT id, user_id, schedule_mode, platforms, schedule_metadata, scheduled_time, status
@@ -286,20 +479,23 @@ async def bootstrap_repair_user_schedules(
             WHERE user_id = $1
               AND schedule_mode IN ('scheduled', 'smart')
               AND status = ANY($2::text[])
-              AND (
-                    scheduled_time IS NULL
-                    OR (schedule_mode = 'smart' AND (schedule_metadata IS NULL OR schedule_metadata = 'null'::jsonb))
-                  )
             ORDER BY created_at ASC
             LIMIT $3
             """,
             user_id,
             list(_AWAITING_SCHEDULE_STATUSES),
-            limit,
+            max(limit * 3, 60),
         )
+        checked = 0
         for row in rows:
+            if checked >= limit:
+                break
+            row_d = dict(row)
+            if upload_has_schedule(row_d):
+                continue
+            checked += 1
             upload_id = str(row["id"])
-            ok, _, _ = await repair_upload_schedule(conn, dict(row))
+            ok, _, _ = await repair_upload_schedule(conn, row_d)
             if ok:
                 repaired += 1
                 logger.warning("[%s] bootstrap schedule repair OK (status=%s)", upload_id, row.get("status"))

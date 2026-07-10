@@ -693,6 +693,32 @@ async def build_user_content_insights(conn, user_id) -> Dict[str, Any]:
     if anomaly:
         narrative_parts.append(anomaly.get("body") or "")
 
+    # Accuracy ladder P3: surface low caption–evidence grounding when rollup exists.
+    try:
+        g_avg = await conn.fetchval(
+            """
+            SELECT AVG(mean_grounding)::double precision
+              FROM upload_quality_scores_daily
+             WHERE user_id = $1
+               AND platform = 'all'
+               AND mean_grounding IS NOT NULL
+               AND day >= (CURRENT_DATE - INTERVAL '60 days')
+            """,
+            uid,
+        )
+        if g_avg is not None and float(g_avg) < 0.35:
+            narrative_parts.append(
+                f"Caption grounding vs video evidence is low lately (~{float(g_avg):.0%}) — "
+                "enable Speech-to-Text (no extra AIC) and Frame Inspector so titles mention "
+                "what is actually in the clip."
+            )
+        elif g_avg is not None and float(g_avg) >= 0.55:
+            narrative_parts.append(
+                f"Your captions are staying well grounded in clip evidence (~{float(g_avg):.0%} match)."
+            )
+    except Exception:
+        pass
+
     if recommended is not None and suggested_hashtags:
         recommended = dict(recommended)
         recommended["suggested_hashtags_for_traction"] = suggested_hashtags

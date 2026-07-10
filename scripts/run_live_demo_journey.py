@@ -63,7 +63,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     base = args.base_url.rstrip("/")
-    os.environ.setdefault("E2E_BASE_URL", base)
+    # Single origin only — never fall back to a second static http.server port.
+    os.environ["E2E_BASE_URL"] = base
     os.environ.setdefault("E2E_HEADED", "0" if args.headless else "1")
     os.environ.setdefault("RATE_LIMIT_LOOPBACK_BYPASS", "1")
     os.environ.setdefault("E2E_TARGET_USER_ID", "ae995094-abb6-4a41-8d51-460ca8f0fd8c")
@@ -75,10 +76,19 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("E2E_WORKER_SAFE", "0" if args.no_worker_safe else "1")
     os.environ.setdefault("E2E_UPLOAD_QUIET_SEC", "90")
     os.environ.setdefault("E2E_UPLOAD_PAGE_DELAY_MS", "10000")
-    os.environ.setdefault("E2E_WORKER_SAFE_API_PER_PAGE", "2")
+    os.environ.setdefault("E2E_WORKER_SAFE_API_PER_PAGE", "1")
     os.environ.setdefault("E2E_WORKER_SAFE_MAX_CLICKS", "4")
-    os.environ.setdefault("E2E_REQUEST_DELAY_MS", "1200")
+    os.environ.setdefault("E2E_REQUEST_DELAY_MS", "1500")
+    os.environ.setdefault("E2E_SMOKE_READ_TIMEOUT_S", "45")
+    os.environ.setdefault("E2E_API_TIMEOUT_S", "60")
 
+    from tests.e2e.helpers.api_ready import wait_for_api_ready
+
+    ready = wait_for_api_ready(base, timeout_s=120.0, require_db=True)
+    if not ready.get("ok"):
+        print(json.dumps({"ok": False, "error": "api_not_ready", "ready": ready}, indent=2))
+        return 2
+    print(f"API/DB ready @ {base} (attempt {ready.get('attempt')})", flush=True)
     video, telemetry = resolve_demo_paths(Path(args.video), Path(args.telemetry) if args.telemetry else None)
     log = LiveDemoLog()
     report: dict = {

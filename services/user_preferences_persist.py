@@ -298,15 +298,15 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
         p.get("aiServiceThumbnailDesigner", p.get("ai_service_thumbnail_designer")),
         True,
     )
-    ai_service_speech_to_text = _coerce_bool(p.get("aiServiceSpeechToText", p.get("ai_service_speech_to_text")), True)
+    ai_service_speech_to_text = _coerce_bool(p.get("aiServiceSpeechToText", p.get("ai_service_speech_to_text")), False)
     ai_service_scene_understanding = _coerce_bool(
         p.get("aiServiceSceneUnderstanding", p.get("ai_service_scene_understanding")),
-        True,
+        False,
     )
 
     ent = get_entitlements_from_user(user)
     ai_service_dashcam_osd = _coerce_bool(
-        p.get("aiServiceDashcamOSD", p.get("ai_service_dashcam_osd")), True
+        p.get("aiServiceDashcamOSD", p.get("ai_service_dashcam_osd")), False
     )
     _svc_clamped = clamp_ai_service_db_fields(
         ent.allowed_ai_services,

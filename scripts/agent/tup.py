@@ -70,7 +70,18 @@ def _configure_tup_env(*, force_pikzels: bool, skip_pikzels: bool) -> None:
     os.environ.setdefault("E2E_WORKER_SAFE", "1")
     os.environ.setdefault("E2E_INCLUDE_SLOW_API", "0")
     os.environ.setdefault("RATE_LIMIT_LOOPBACK_BYPASS", "1")
-    os.environ.setdefault("E2E_BASE_URL", os.environ.get("BASE_URL") or "http://127.0.0.1:8000")
+    # Single-origin local API only — never point E2E at production BASE_URL or :8080 static.
+    base = (os.environ.get("E2E_BASE_URL") or "").strip().rstrip("/")
+    if not (
+        base.startswith("http://127.")
+        or base.startswith("http://localhost")
+        or base.startswith("http://[::1]")
+    ):
+        os.environ["E2E_BASE_URL"] = "http://127.0.0.1:8000"
+    os.environ.setdefault("E2E_WORKER_SAFE_API_PER_PAGE", "1")
+    os.environ.setdefault("E2E_REQUEST_DELAY_MS", "1500")
+    os.environ.setdefault("E2E_SMOKE_READ_TIMEOUT_S", "45")
+    os.environ.setdefault("E2E_API_TIMEOUT_S", "60")
     if force_pikzels:
         os.environ["E2E_FORCE_PIKZELS"] = "1"
     if skip_pikzels:
@@ -210,6 +221,26 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     if not args.skip_journey:
+        from tests.e2e.helpers.api_ready import wait_for_api_ready
+
+        ready = wait_for_api_ready(os.environ.get("E2E_BASE_URL"), timeout_s=120.0)
+        report["api_ready"] = ready
+        if not ready.get("ok"):
+            report["ok"] = False
+            report["agent_action"] = (
+                "Start a single uvicorn on 127.0.0.1:8000 (SERVE_FRONTEND_STATIC=1); "
+                "do not run a second http.server port. Re-run /TUP when /api/health returns db:true."
+            )
+            ARTIFACTS.mkdir(parents=True, exist_ok=True)
+            out_path = ARTIFACTS / f"tup_{time.strftime('%Y%m%d_%H%M%S')}.json"
+            out_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+            report["artifact"] = str(out_path)
+            if args.json:
+                print(json.dumps(report, indent=2, default=str))
+            else:
+                print(f"TUP: RED — API not ready: {ready}")
+            return 2
+
         print(
             f"[TUP] Live journey — platforms={report['platforms']} "
             f"persona={report['use_persona']} pikzels={report['will_use_pikzels']}",

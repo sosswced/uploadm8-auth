@@ -37,7 +37,7 @@ def main() -> int:
     tools.append(entry)
     data["tools"] = sorted(tools, key=lambda t: t["name"])
     REGISTRY.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    print(f"Registered {args.name} → {REGISTRY}")
+    print(f"Registered {args.name} -> {REGISTRY}")
     return 0
 
 

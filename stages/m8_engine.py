@@ -395,6 +395,16 @@ def build_scene_graph(ctx: JobContext, category: str) -> Dict[str, Any]:
         "geo": geo,
         "trill": trill_d,
         "dashcam_osd": osd_d,
+        "place_evidence": (
+            getattr(ctx, "place_evidence", None)
+            if isinstance(getattr(ctx, "place_evidence", None), dict)
+            else (
+                (getattr(ctx, "output_artifacts", None) or {}).get("place_evidence_v1")
+                if isinstance(getattr(ctx, "output_artifacts", None), dict)
+                else {}
+            )
+        )
+        or {},
     }
 
     # Video Intelligence structured tracks (object/text/person/logo) — keep
@@ -889,6 +899,19 @@ TITLE EVIDENCE BUILD CONTRACT (HARD — REJECTION RULES APPLY):
     must_use = merge_m8_must_use_tokens(must_use_base, ctx, max_tokens=12)
     must_use_block = ""
     cluster_block = ""
+    claims_section = ""
+    try:
+        from services.m8_grounding_pass import (
+            build_evidence_catalog,
+            claims_prompt_section,
+            m8_grounding_pass2_enabled,
+        )
+
+        if m8_grounding_pass2_enabled(getattr(ctx, "user_settings", None) or {}):
+            catalog = build_evidence_catalog(scene_graph, must_use)
+            claims_section = claims_prompt_section(catalog)
+    except Exception:
+        claims_section = ""
     if must_use:
         bullets = "\n".join(f"  - {tok}" for tok in must_use)
         must_use_block = (
@@ -1051,6 +1074,7 @@ EFFECTIVE STRATEGY (policy/ML context — per-platform nuance only, NOT a licens
 {fusion}
 {title_evidence_contract}
 {must_use_block}
+{claims_section}
 {hydration_contract_block}
 {cluster_block}
 {pattern_block}
@@ -1067,6 +1091,7 @@ Fields per variant:
 - title: string or null (YouTube needs title; TikTok null)
 - caption: string (required for platforms that use captions)
 - hashtags: array of strings without # (or empty array)
+- claims: array of {{text, evidence_ids, confidence}} when the EVIDENCE CATALOG section is present
 
 {title_rule}
 {caption_rule}
@@ -1093,11 +1118,11 @@ Return ONLY valid JSON (no markdown) in this exact shape:
   "platforms": {{
     "tiktok": {{
       "variants": [
-        {{"variant_index": 1, "title": null, "caption": "...", "hashtags": ["a","b"]}},
-        {{"variant_index": 2, "title": null, "caption": "...", "hashtags": []}},
-        {{"variant_index": 3, "title": null, "caption": "...", "hashtags": []}},
-        {{"variant_index": 4, "title": null, "caption": "...", "hashtags": []}},
-        {{"variant_index": 5, "title": null, "caption": "...", "hashtags": []}}
+        {{"variant_index": 1, "title": null, "caption": "...", "hashtags": ["a","b"], "claims": [{{"text": "...", "evidence_ids": ["e1"], "confidence": 0.9}}]}},
+        {{"variant_index": 2, "title": null, "caption": "...", "hashtags": [], "claims": []}},
+        {{"variant_index": 3, "title": null, "caption": "...", "hashtags": [], "claims": []}},
+        {{"variant_index": 4, "title": null, "caption": "...", "hashtags": [], "claims": []}},
+        {{"variant_index": 5, "title": null, "caption": "...", "hashtags": [], "claims": []}}
       ]
     }}
   }}{matrix_close}
@@ -1266,6 +1291,15 @@ def build_must_use_shortlist(scene_graph: Dict[str, Any], *, max_tokens: int = 1
             _push(city)
     if geo.get("protected_area_name"):
         _push(str(geo.get("protected_area_name")))
+
+    # 2b. Place evidence (no .map): beaches, monuments, teams, plates
+    pe = scene_graph.get("place_evidence") or {}
+    if isinstance(pe, dict):
+        for key in ("beaches", "monuments", "stadiums", "sports_teams", "places"):
+            for item in (pe.get(key) or [])[:2]:
+                _push(item)
+        for plate in (pe.get("license_plates") or [])[:1]:
+            _push(plate)
 
     # 3. Music (ACR catalogue)
     music = scene_graph.get("music") or {}
@@ -1714,6 +1748,7 @@ def rank_and_select(
                 "title": v.get("title"),
                 "caption": v.get("caption"),
                 "hashtags": v.get("hashtags") or [],
+                "claims": v.get("claims") if isinstance(v.get("claims"), list) else [],
                 "score": round(sc, 4),
                 "rationale": why,
             }
@@ -2183,6 +2218,22 @@ def apply_selection_to_context(
     else:
         ctx.m8_caption_evidence_matrix = {}
 
+    claims_by_platform = selection.get("claims") if isinstance(selection, dict) else None
+    if isinstance(claims_by_platform, dict):
+        ctx.m8_platform_claims = claims_by_platform
+    else:
+        ctx.m8_platform_claims = {}
+    if isinstance(selection, dict) and selection.get("evidence_catalog"):
+        try:
+            if not isinstance(getattr(ctx, "output_artifacts", None), dict):
+                ctx.output_artifacts = {}
+            ctx.output_artifacts["m8_evidence_catalog_v1"] = selection.get("evidence_catalog")
+            ctx.output_artifacts["m8_claims_v1"] = claims_by_platform or {}
+            if selection.get("grounding_pass2"):
+                ctx.output_artifacts["m8_grounding_pass2_v1"] = selection.get("grounding_pass2")
+        except Exception:
+            pass
+
     for pl in platforms:
         block = pdata.get(pl) or {}
         w = (block.get("winner") or {}) if isinstance(block, dict) else {}
@@ -2429,6 +2480,22 @@ async def run_m8_caption_engine(
     if matrix_san:
         ranked["caption_evidence_matrix"] = matrix_san
 
+    try:
+        from services.m8_grounding_pass import (
+            apply_grounding_pass2_to_ranked,
+            m8_grounding_pass2_enabled,
+        )
+
+        if m8_grounding_pass2_enabled(ctx.user_settings or {}):
+            ranked = apply_grounding_pass2_to_ranked(
+                ranked,
+                scene,
+                must_use=list(ranked.get("must_use") or []),
+            )
+            _trace_m8(ctx, str(ctx.upload_id), "grounding_pass2", ranked.get("grounding_pass2") or {})
+    except Exception as _gp2_e:
+        logger.warning("M8 grounding pass2 skipped: %s", _gp2_e)
+
     apply_selection_to_context(
         ctx,
         ranked,
@@ -2454,6 +2521,9 @@ async def run_m8_caption_engine(
         "ml_strategy_priors": (historical or {}).get("__strategy_priors__", {}),
         "caption_evidence_matrix": bool(matrix_san),
         "caption_evidence_matrix_cells": len((matrix_san or {}).get("cells") or []) if matrix_san else 0,
+        "grounding_pass2": bool((ranked.get("grounding_pass2") or {}).get("enabled")),
+        "grounding_pass2_report": ranked.get("grounding_pass2") or {},
+        "evidence_catalog_size": len(ranked.get("evidence_catalog") or {}),
     }
 
     try:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from typing import Any
 
 
@@ -124,7 +125,45 @@ _DROPPED_EXC_VALUES: tuple[str, ...] = (
     "'NoneType' object has no attribute 'fetch'",
     "'NoneType' object has no attribute 'fetchval'",
     "'NoneType' object has no attribute 'execute'",
+    "unexpected connection_lost() call",
 )
+
+
+def _should_drop_localhost_db_acquire_noise(event: dict[str, Any], hint: dict[str, Any] | None) -> bool:
+    """
+    Pool saturation / Neon socket drops during local overnight E2E become clean
+    HTTP 503s. Reporting them as unhandled TimeoutError (UPLOADM8-7H/7J/7N) or
+    asyncio connection_lost noise (UPLOADM8-7P) drowns real signal.
+    """
+    info = hint.get("exc_info") if hint else None
+    etype = None
+    if info and len(info) >= 1 and info[0] is not None:
+        etype = info[0]
+    types: list[str] = []
+    if etype is not None:
+        try:
+            types.append(etype.__name__)
+        except Exception:
+            pass
+    for entry in (event.get("exception") or {}).get("values", []) or []:
+        t = str(entry.get("type") or "")
+        if t:
+            types.append(t)
+    type_blob = " ".join(types)
+    # Expected fail-fast after acquire retries — never actionable as an error issue.
+    if "DatabaseUnavailableError" in type_blob:
+        return True
+    le = event.get("logentry") or {}
+    log_blob = ""
+    if isinstance(le, dict):
+        log_blob = f"{le.get('message') or ''} {le.get('formatted') or ''}"
+    if "unexpected connection_lost()" in log_blob or "Future exception was never retrieved" in log_blob:
+        return True
+    if not _is_localhost_url(_request_url(event)) and not _is_local_uvicorn_process():
+        return False
+    if "TimeoutError" in type_blob:
+        return True
+    return False
 
 
 def _exception_chain_values(event: dict[str, Any], hint: dict[str, Any] | None) -> list[str]:
@@ -158,6 +197,8 @@ def _before_send(event: dict[str, Any], hint: dict[str, Any] | None) -> dict[str
         if _should_drop_dev_worker_ffmpeg_watermark(event, hint):
             return None
         if _should_drop_fastapi_testclient_request(event):
+            return None
+        if _should_drop_localhost_db_acquire_noise(event, hint):
             return None
         for v in _exception_chain_values(event, hint):
             for needle in _DROPPED_EXC_VALUES:
@@ -216,9 +257,55 @@ def _strip_asyncpg_pool_reset_spans(event: dict[str, Any]) -> dict[str, Any]:
     return event
 
 
+def _request_url(event: dict[str, Any]) -> str:
+    try:
+        req = event.get("request") or {}
+        return str(req.get("url") or "")
+    except Exception:
+        return ""
+
+
+def _is_localhost_url(url: str) -> bool:
+    u = (url or "").lower()
+    return (
+        "127.0.0.1" in u
+        or "://localhost" in u
+        or "://[::1]" in u
+        or "testserver" in u
+    )
+
+
+def _is_local_uvicorn_process() -> bool:
+    """True when this process is clearly a loopback API (local E2E / laptop uvicorn)."""
+    argv = " ".join(sys.argv).lower()
+    if "127.0.0.1" in argv or "--host localhost" in argv or "--host ::1" in argv:
+        return True
+    e2e = (os.environ.get("E2E_BASE_URL") or "").strip().lower()
+    if e2e and _is_localhost_url(e2e) and os.environ.get("E2E_TUP", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
+    return False
+
+
+def _should_drop_localhost_transaction(event: dict[str, Any]) -> bool:
+    """
+    Local E2E against 127.0.0.1 must not create/regress production Slow DB Query issues
+    (UPLOADM8-6E / 5R / 30 / 5T). Neon wake latency looks like slow SELECTs under load.
+    """
+    raw = (os.environ.get("SENTRY_DROP_LOCALHOST_TRACES") or "1").strip().lower()
+    if raw in ("0", "false", "no"):
+        return False
+    return _is_localhost_url(_request_url(event))
+
+
 def _before_send_transaction(event: dict[str, Any], hint: dict[str, Any] | None) -> dict[str, Any] | None:
     try:
         if _should_drop_fastapi_testclient_request(event):
+            return None
+        if _should_drop_localhost_transaction(event):
             return None
         return _strip_asyncpg_pool_reset_spans(event)
     except Exception:
@@ -226,6 +313,9 @@ def _before_send_transaction(event: dict[str, Any], hint: dict[str, Any] | None)
 
 
 def _trace_sample_rate() -> float:
+    # Local uvicorn: never sample performance traces into the production project.
+    if _is_local_uvicorn_process():
+        return 0.0
     raw = (os.environ.get("SENTRY_TRACES_SAMPLE_RATE") or os.environ.get("SENTRY_TRACES_RATE") or "0").strip()
     if not raw:
         return 0.0
@@ -236,6 +326,10 @@ def _trace_sample_rate() -> float:
 
 
 def _env_name() -> str | None:
+    # Loopback API must never tag as production — .env often has SENTRY_ENVIRONMENT=production
+    # for deploy, while laptop uvicorn still uses that same file for E2E.
+    if _is_local_uvicorn_process():
+        return "development"
     v = (
         os.environ.get("SENTRY_ENVIRONMENT")
         or os.environ.get("SENTRY_ENV")
@@ -243,6 +337,13 @@ def _env_name() -> str | None:
         or ""
     ).strip()
     if v:
+        # If BASE_URL / E2E clearly local, prefer development over a stale production tag.
+        base = (os.environ.get("BASE_URL") or "").strip().lower()
+        e2e = (os.environ.get("E2E_BASE_URL") or "").strip().lower()
+        if v.lower() == "production" and (
+            _is_localhost_url(base) or _is_localhost_url(e2e)
+        ):
+            return "development"
         return v
     base = (os.environ.get("BASE_URL") or "").strip().lower()
     if any(h in base for h in ("127.0.0.1", "localhost")):

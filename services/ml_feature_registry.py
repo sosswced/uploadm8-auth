@@ -145,6 +145,17 @@ CONTENT_FEATURES: List[Feature] = [
     Feature("object_track_count", "upload_recognition_summary", "int", "num"),
     Feature("hydration_score", "upload_recognition_summary.hydration_score", "float", "num"),
 
+    # Evidence-density / grounding (accuracy ladder P3) — experimental until labeled corpus grows.
+    Feature("grounding_score", "output_artifacts.hydration_report / grounding_score_v1", "float", "num",
+            status="experimental",
+            notes="Caption–evidence overlap; rollup also in upload_quality_scores_daily.mean_grounding."),
+    Feature("evidence_lane_count", "output_artifacts evidence lanes", "int", "num",
+            status="experimental",
+            notes="How many sensing lanes contributed (vision/place/transcript/osd/tl)."),
+    Feature("transcript_chars", "ai_transcript / audio_context length", "int", "num",
+            status="experimental",
+            notes="Speech coverage proxy; correlates with STT pref + auto-Whisper."),
+
     # Engagement label inputs (kept as meta, used to build the label)
     Feature("views", "platform_results engagement", "int", "meta"),
     Feature("engagement_rate_pct", "derived", "float", "meta"),

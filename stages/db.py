@@ -54,9 +54,11 @@ async def load_upload_record(pool: asyncpg.Pool, upload_id: str) -> Optional[dic
 
 
 async def load_user(pool: asyncpg.Pool, user_id: str) -> Optional[dict]:
-    """Load a user record by ID."""
+    """Load a user record by ID (projected — preferences via ``load_user_settings``)."""
+    from core.user_columns import USERS_WORKER_COLUMNS, users_select_sql
+
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        row = await conn.fetchrow(users_select_sql(USERS_WORKER_COLUMNS), user_id)
         return dict(row) if row else None
 
 
@@ -745,6 +747,14 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
     _diag_keys = (
         "hydration_report",
         "hydration_payload",
+        "grounding_score_v1",
+        "coach_hints",
+        "place_evidence_v1",
+        "shot_list_v1",
+        "m8_claims_v1",
+        "m8_evidence_catalog_v1",
+        "m8_grounding_pass2_v1",
+        "multimodal_depth_route_v1",
         "studio_render_report",
         "thumbnail_brief_json",
         "thumbnail_render_method",

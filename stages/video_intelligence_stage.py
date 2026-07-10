@@ -552,7 +552,7 @@ async def run_video_intelligence_stage(ctx: JobContext) -> JobContext:
     if not user_pref_ai_service_enabled(
         ctx.user_settings or {},
         "video_intelligence",
-        default=True,
+        default=False,
         allowed_services=tier_allowed_set,
     ):
         raise SkipStage("Video Intelligence disabled in upload preferences (aiServiceVideoAnalyzer)")

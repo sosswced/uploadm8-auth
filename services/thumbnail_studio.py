@@ -423,29 +423,50 @@ def estimate_studio_cost(
     competitor_gap_mode: bool,
     has_channel_memory: bool,
 ) -> Tuple[int, int, Dict[str, Any]]:
+    """Estimate PUT/AIC for Thumbnail Studio recreate jobs.
+
+    Debits must still go through ``core.wallet.atomic_debit_tokens``. AIC component
+    sizes for known pipeline services are anchored to ``stages.ai_service_costs.SERVICE_WEIGHTS``
+    where a 1:1 mapping exists (competitor gap); studio-specific base/variant math
+    stays local so wallet UX does not silently change.
+    """
+    from stages.ai_service_costs import SERVICE_WEIGHTS
+
+    # Jul 2026: Pikzels image→thumb ≈ $0.36; target wallet ≥ 2.5× ≈ 90 AIC @ $0.01/AIC.
     n = clamp_studio_variant_count(variant_count)
+    per_variant_aic = int(SERVICE_WEIGHTS.get("thumbnail_recreate_ai", 90) or 90)
     put = 4 + n
-    aic = 10 + (n * 2)
-    persona_base_aic = 5 if has_persona else 0
-    persona_faceswap_aic = (n * 2) if has_persona else 0
+    aic = n * per_variant_aic
+    persona_base_aic = int(SERVICE_WEIGHTS.get("persona_consistency", 95) or 95) if has_persona else 0
+    # Faceswap ≈ $0.37 × 2.5 ≈ 93 AIC per variant when persona is applied.
+    persona_faceswap_aic = (n * 90) if has_persona else 0
     if has_persona:
         aic += persona_base_aic + persona_faceswap_aic
-    if competitor_gap_mode:
-        aic += 4
-    if has_channel_memory:
-        aic += 2
+    competitor_gap_aic = int(SERVICE_WEIGHTS.get("thumbnail_competitor_gap", 8)) if competitor_gap_mode else 0
+    if competitor_gap_aic:
+        aic += competitor_gap_aic
+    channel_memory_aic = 5 if has_channel_memory else 0
+    if channel_memory_aic:
+        aic += channel_memory_aic
     breakdown = {
         "variant_count": n,
         "components": {
             "base_put": 4,
             "variant_put": n,
-            "base_aic": 10,
-            "variant_aic": n * 2,
+            "base_aic": 0,
+            "variant_aic": n * per_variant_aic,
             "persona_aic": persona_base_aic,
             "persona_faceswap_aic": persona_faceswap_aic,
-            "competitor_gap_aic": 4 if competitor_gap_mode else 0,
-            "channel_memory_aic": 2 if has_channel_memory else 0,
+            "competitor_gap_aic": competitor_gap_aic,
+            "channel_memory_aic": channel_memory_aic,
         },
+        "service_weight_refs": {
+            "competitor_gap_aic": "thumbnail_competitor_gap",
+            "persona_aic": "persona_consistency",
+            "variant_aic": "thumbnail_recreate_ai",
+        },
+        "pricing_note": "2.5x Pikzels vendor avg (Jul 2026); 1 AIC ≈ $0.01 retail",
+        "debit_via": "atomic_debit_tokens",
     }
     return int(put), int(aic), breakdown
 
@@ -453,22 +474,30 @@ def estimate_studio_cost(
 def estimate_pikzels_v2_call_cost(op: str) -> Tuple[int, int, Dict[str, Any]]:
     """
     Per-call token debit for proxied Pikzels v2 operations (PUT + AIC).
-    Tuned to be lighter than full Thumbnail Studio recreate jobs.
+
+    Anchored to Jul 2026 Pikzels usage (~$0.36–$0.38 for PKZ-4 gen, $0.12 edit,
+    $0.03 score) at ≥2.5× vendor with 1 AIC ≈ $0.01 intended retail.
     """
     o = (op or "").strip().lower()
+    # (put, aic) — AIC ≈ ceil(2.5 * vendor_usd / 0.01)
     table: Dict[str, Tuple[int, int]] = {
-        "prompt": (1, 4),
-        "recreate": (1, 5),
-        "edit": (1, 5),
-        "one_click_fix": (1, 5),
-        "faceswap": (1, 6),
-        "score": (0, 2),
-        "titles": (0, 3),
-        "persona": (1, 8),
-        "style": (1, 8),
+        "prompt": (1, 20),          # lighter than full gen
+        "recreate": (1, 90),        # image/text→thumb ~$0.36–0.37
+        "edit": (1, 30),            # PKZ-4.5 edit ~$0.12
+        "one_click_fix": (1, 30),  # treat like edit
+        "faceswap": (1, 93),        # ~$0.37
+        "score": (0, 8),            # ~$0.03
+        "titles": (0, 10),          # text-only; modest buffer
+        "persona": (1, 95),         # create persona ~$0.38
+        "style": (1, 90),           # style gen ≈ recreate
     }
-    put, aic = table.get(o, (1, 4))
-    return int(put), int(aic), {"pikzels_v2_op": o, "put": put, "aic": aic}
+    put, aic = table.get(o, (1, 20))
+    return int(put), int(aic), {
+        "pikzels_v2_op": o,
+        "put": put,
+        "aic": aic,
+        "pricing_note": "2.5x Pikzels vendor avg (Jul 2026); 1 AIC ≈ $0.01 retail",
+    }
 
 
 def detect_safety_flags(text: str) -> List[str]:

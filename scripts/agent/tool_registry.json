@@ -1,18 +1,12 @@
 {
   "version": 1,
-  "description": "Agent-built tooling registry — agents register repeatable scripts here",
+  "description": "Agent-built tooling registry \u2014 agents register repeatable scripts here",
   "tools": [
     {
-      "name": "eval_loop",
-      "path": "scripts/agent/eval_loop.py",
-      "skill": "uploadm8-eval-loop",
-      "purpose": "Structured test eval JSON for self-heal loops"
-    },
-    {
-      "name": "self_heal",
-      "path": "scripts/agent/self_heal.py",
-      "skill": "uploadm8-eval-loop",
-      "purpose": "Multi-iteration eval driver for headless agent loops"
+      "name": "ci_status",
+      "path": "scripts/agent/ci_status.py",
+      "skill": "uploadm8-ascended-ci",
+      "purpose": "gh pr checks as JSON"
     },
     {
       "name": "dynamic_workflow",
@@ -21,34 +15,10 @@
       "purpose": "Recommend subagent graph from git diff"
     },
     {
-      "name": "ci_status",
-      "path": "scripts/agent/ci_status.py",
-      "skill": "uploadm8-ascended-ci",
-      "purpose": "gh pr checks as JSON"
-    },
-    {
-      "name": "multi_repo_status",
-      "path": "scripts/agent/multi_repo_status.py",
-      "skill": "uploadm8-multi-repo",
-      "purpose": "Backend + frontend repo dirty state"
-    },
-    {
-      "name": "trill",
-      "path": "scripts/agent/trill.py",
-      "skill": "trill",
-      "purpose": "Master orchestrator — route, eval, repos, CI, action plan"
-    },
-    {
-      "name": "ship_gate",
-      "path": "scripts/agent/ship_gate.py",
-      "skill": "333",
-      "purpose": "Live-ready gate before /333 — evals, live_demo, checklist, TRILL pre-ship"
-    },
-    {
-      "name": "sentry_triage",
-      "path": "scripts/agent/sentry_triage.py",
-      "skill": "sentry-workflow",
-      "purpose": "Sentry MCP triage artifact for /TUP Phase 6 — feeds ship_gate"
+      "name": "eval_loop",
+      "path": "scripts/agent/eval_loop.py",
+      "skill": "uploadm8-eval-loop",
+      "purpose": "Structured test eval JSON for self-heal loops"
     },
     {
       "name": "live_result_workflow",
@@ -57,10 +27,52 @@
       "purpose": "Plan heal actions from live_demo + checklist + sentry artifacts"
     },
     {
+      "name": "multi_repo_status",
+      "path": "scripts/agent/multi_repo_status.py",
+      "skill": "uploadm8-multi-repo",
+      "purpose": "Backend + frontend repo dirty state"
+    },
+    {
+      "name": "pre_ship_pricing",
+      "path": "scripts/pre_ship_pricing.py",
+      "purpose": "Sync pricing surfaces + optional force billing_service_weights before frontend/333 push",
+      "skill": "333"
+    },
+    {
+      "name": "self_heal",
+      "path": "scripts/agent/self_heal.py",
+      "skill": "uploadm8-eval-loop",
+      "purpose": "Multi-iteration eval driver for headless agent loops"
+    },
+    {
+      "name": "sentry_triage",
+      "path": "scripts/agent/sentry_triage.py",
+      "skill": "sentry-workflow",
+      "purpose": "Sentry MCP triage artifact for /TUP Phase 6 \u2014 feeds ship_gate"
+    },
+    {
+      "name": "ship_gate",
+      "path": "scripts/agent/ship_gate.py",
+      "skill": "333",
+      "purpose": "Live-ready gate before /333 \u2014 evals, live_demo, checklist, TRILL pre-ship"
+    },
+    {
+      "name": "sync_pricing_surfaces",
+      "path": "scripts/sync_pricing_surfaces.py",
+      "purpose": "Regenerate frontend PUT/AIC copy and pricing-surfaces.generated.js from SERVICE_WEIGHTS",
+      "skill": "uploadm8-agent-tooling"
+    },
+    {
+      "name": "trill",
+      "path": "scripts/agent/trill.py",
+      "skill": "trill",
+      "purpose": "Master orchestrator \u2014 route, eval, repos, CI, action plan"
+    },
+    {
       "name": "tup",
       "path": "scripts/agent/tup.py",
       "skill": "uploadm8-routines",
-      "purpose": "/TUP driver — live upload all platforms + persona, Pikzels once, heal"
+      "purpose": "/TUP driver \u2014 live upload all platforms + persona, Pikzels once, heal"
     },
     {
       "name": "worktree_spawn",

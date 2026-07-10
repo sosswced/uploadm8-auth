@@ -802,13 +802,53 @@ async def _coach_parallel_prefs(conn: Any, uid: uuid.UUID):
     try:
         return await conn.fetchrow(
             """
-            SELECT auto_captions, ai_hashtags_enabled
+            SELECT auto_captions, ai_hashtags_enabled, ai_service_speech_to_text
             FROM user_preferences WHERE user_id = $1
             """,
             uid,
         )
     except Exception as e:
         logger.warning("coach user_preferences unavailable user_id=%s: %s", uid, e)
+        return None
+
+
+async def _coach_avg_grounding(conn: Any, uid: uuid.UUID) -> Optional[float]:
+    """Recent mean grounding from quality rollup or hydration artifacts."""
+    try:
+        v = await conn.fetchval(
+            """
+            SELECT AVG(mean_grounding)::double precision
+              FROM upload_quality_scores_daily
+             WHERE user_id = $1
+               AND platform = 'all'
+               AND mean_grounding IS NOT NULL
+               AND day >= (CURRENT_DATE - INTERVAL '60 days')
+            """,
+            uid,
+        )
+        if v is not None:
+            return float(v)
+    except Exception:
+        pass
+    try:
+        v = await conn.fetchval(
+            """
+            SELECT AVG(
+                COALESCE(
+                    NULLIF(output_artifacts->'hydration_report'->>'grounding_score', '')::double precision,
+                    NULLIF(output_artifacts->'grounding_score_v1'->>'grounding_score', '')::double precision
+                )
+            )::double precision
+              FROM uploads
+             WHERE user_id = $1
+               AND status IN ('completed', 'succeeded', 'partial')
+               AND created_at >= NOW() - INTERVAL '60 days'
+            """,
+            uid,
+        )
+        return float(v) if v is not None else None
+    except Exception as e:
+        logger.debug("coach avg grounding skipped user_id=%s: %s", uid, e)
         return None
 
 
@@ -877,14 +917,18 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
     async def _ins(c):
         return await _coach_parallel_content_insights(c, uid)
 
+    async def _gr(c):
+        return await _coach_avg_grounding(c, uid)
+
     try:
-        baselines, upload_row, prefs, wallet, studio_n, content_attribution_insights = await asyncio.gather(
+        baselines, upload_row, prefs, wallet, studio_n, content_attribution_insights, avg_grounding = await asyncio.gather(
             _acquire_run(_bl),
             _acquire_run(_ub),
             _acquire_run(_pr),
             _acquire_run(_wa),
             _acquire_run(_st),
             _acquire_run(_ins),
+            _acquire_run(_gr),
         )
     except Exception:
         logger.exception("coach parallel gather failed user_id=%s", user_id)
@@ -985,16 +1029,17 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
     tier_n = normalize_tier(tier)
     if tier_n in ("creator_pro", "studio", "agency", "friends_family", "lifetime"):
         try:
-            n_plat = int(
-                await conn.fetchval(
-                    """
-                    SELECT COUNT(*)::int FROM platform_tokens
-                    WHERE user_id = $1 AND revoked_at IS NULL
-                    """,
-                    uid,
+            async with acquire_db(pool) as conn:
+                n_plat = int(
+                    await conn.fetchval(
+                        """
+                        SELECT COUNT(*)::int FROM platform_tokens
+                        WHERE user_id = $1 AND revoked_at IS NULL
+                        """,
+                        uid,
+                    )
+                    or 0
                 )
-                or 0
-            )
             ent = get_entitlements_for_tier(tier_n)
             max_ac = int(ent.max_accounts or 0)
             if max_ac > 0 and n_plat < max_ac:
@@ -1034,6 +1079,41 @@ async def build_user_coach_payload(pool: Any, user_id) -> Dict[str, Any]:
                 "cta_href": "/settings.html#preferences",
                 "confidence": 0.74,
                 "source": "settings_gap",
+            }
+        )
+
+    stt_on = _pref.get("ai_service_speech_to_text")
+    if stt_on is False or (isinstance(stt_on, str) and stt_on.strip().lower() in ("false", "0", "off", "no")):
+        suggestions.append(
+            {
+                "id": "enable_speech_to_text",
+                "severity": "info",
+                "title": "Turn on Speech-to-Text for talking clips",
+                "body": (
+                    "Transcripts ground captions in what was actually said. "
+                    "Speech-to-Text is included at no extra AIC — enable it in Settings → AI services."
+                ),
+                "cta_label": "Open AI services",
+                "cta_href": "/settings.html#ai-services",
+                "confidence": 0.76,
+                "source": "evidence_density",
+            }
+        )
+
+    if avg_grounding is not None and ok_u >= 2 and float(avg_grounding) < 0.35:
+        suggestions.append(
+            {
+                "id": "low_grounding_density",
+                "severity": "warning",
+                "title": "Captions are drifting from video evidence",
+                "body": (
+                    f"Your recent caption–evidence match is low (~{float(avg_grounding):.0%}). "
+                    "Enable Speech-to-Text and Frame Inspector, or regenerate captions after upload."
+                ),
+                "cta_label": "Open Settings",
+                "cta_href": "/settings.html#ai-services",
+                "confidence": 0.73,
+                "source": "grounding_score",
             }
         )
 

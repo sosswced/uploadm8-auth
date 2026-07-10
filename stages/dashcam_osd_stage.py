@@ -828,7 +828,7 @@ async def run_dashcam_osd_stage(ctx: JobContext) -> JobContext:
     tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
     tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
     if not user_pref_ai_service_enabled(
-        ctx.user_settings or {}, "dashcam_osd", default=True, allowed_services=tier_allowed_set
+        ctx.user_settings or {}, "dashcam_osd", default=False, allowed_services=tier_allowed_set
     ):
         raise SkipStage("Dashcam HUD Reader disabled in upload preferences (aiServiceDashcamOSD)")
 

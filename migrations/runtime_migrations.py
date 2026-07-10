@@ -2050,6 +2050,12 @@ async def run_migrations(db_pool):
                 CREATE INDEX IF NOT EXISTS idx_meta_deletion_requested
                     ON meta_data_deletion_requests(requested_at DESC);
             """),
+            (1094, """
+                -- Caption–evidence grounding rollup (accuracy ladder P3).
+                -- Distinct from upload_recognition_summary.hydration_score (VI richness).
+                ALTER TABLE upload_quality_scores_daily
+                    ADD COLUMN IF NOT EXISTS mean_grounding DOUBLE PRECISION;
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

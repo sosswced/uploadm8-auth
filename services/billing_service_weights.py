@@ -2,18 +2,51 @@
 DB-backed per-service AIC weights (billing_service_weights table).
 
 Seeded from stages.ai_service_costs.SERVICE_WEIGHTS; admin upserts tune live pricing.
+
+Important: ``ensure_billing_weights_seeded`` uses ON CONFLICT DO NOTHING, so a code
+deploy alone does **not** overwrite existing DB rows. Use
+``migrate_legacy_weights_to_code_defaults`` (startup) and/or
+``sync_service_weights_from_code`` (admin reset) to push a new calibration live.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from stages.ai_service_costs import SERVICE_WEIGHTS
 
 logger = logging.getLogger(__name__)
 
 _MAX_WEIGHT = 5000
+
+# Pre–Jul-2026 ordinal scale. Startup migrates a row only when it still matches
+# these exact values (admin-tuned rows are left alone).
+_LEGACY_CODE_DEFAULTS: Dict[str, int] = {
+    "twelvelabs": 28,
+    "video_intelligence": 24,
+    "caption_llm": 22,
+    "audio_whisper": 18,
+    "thumbnail_ai": 16,
+    "vision_google": 12,
+    "dashcam_osd": 8,
+    "audio_gpt_classify": 7,
+    "audio_acr": 5,
+    "thumbnail_recreate_ai": 14,
+    "persona_consistency": 10,
+    "thumbnail_ctr_ranker": 6,
+    "marketing_image": 2,
+    "thumbnail_competitor_gap": 4,
+    "audio_yamnet": 2,
+    "telemetry_trill": 1,
+    "trend_intel": 2,
+}
+
+# Jul-2026 v2 calibration values that should move to current code defaults
+# (e.g. audio_whisper 3 → 0 AIC-exempt). Admin-tuned rows that differ are kept.
+_PRIOR_CALIBRATION_DEFAULTS: Dict[str, int] = {
+    "audio_whisper": 3,
+}
 
 
 async def fetch_service_weights_map(conn: Any) -> Dict[str, int]:
@@ -52,6 +85,64 @@ async def ensure_billing_weights_seeded(conn: Any) -> None:
             logger.warning("ensure_billing_weights_seeded skip %s: %s", sid, e)
 
 
+async def migrate_legacy_weights_to_code_defaults(conn: Any) -> int:
+    """
+    One-shot-safe: if a DB weight still equals a known prior code default,
+    update it to the current ``SERVICE_WEIGHTS`` value. Custom admin edits are kept.
+    Returns number of rows updated.
+    """
+    n = 0
+    prior_maps = (_LEGACY_CODE_DEFAULTS, _PRIOR_CALIBRATION_DEFAULTS)
+    for prior in prior_maps:
+        for sid, legacy_w in prior.items():
+            if sid not in SERVICE_WEIGHTS:
+                continue
+            new_w = max(0, min(_MAX_WEIGHT, int(SERVICE_WEIGHTS[sid])))
+            if new_w == legacy_w:
+                continue
+            try:
+                result = await conn.execute(
+                    """
+                    UPDATE billing_service_weights
+                       SET aic_weight = $2,
+                           updated_at = NOW(),
+                           updated_by = COALESCE(updated_by, 'calibration:2026-07-v3')
+                     WHERE service_id = $1
+                       AND aic_weight = $3
+                    """,
+                    sid,
+                    new_w,
+                    int(legacy_w),
+                )
+                # asyncpg returns e.g. "UPDATE 1"
+                if result and str(result).endswith("1"):
+                    n += 1
+                elif result and "UPDATE" in str(result).upper():
+                    try:
+                        touched = int(str(result).split()[-1])
+                        n += max(0, touched)
+                    except (TypeError, ValueError):
+                        pass
+            except Exception as e:
+                logger.warning("migrate_legacy_weights skip %s: %s", sid, e)
+    if n:
+        logger.info("billing_service_weights: migrated %s legacy rows to code defaults", n)
+    return n
+
+
+async def sync_service_weights_from_code(
+    conn: Any,
+    *,
+    updated_by: Optional[str] = None,
+) -> int:
+    """Force-upsert every ``SERVICE_WEIGHTS`` key (admin reset / deploy sync)."""
+    return await upsert_service_weights(
+        conn,
+        {sid: int(w) for sid, w in SERVICE_WEIGHTS.items()},
+        updated_by=updated_by or "sync_from_code",
+    )
+
+
 async def upsert_service_weights(
     conn: Any,
     weights: Dict[str, int],
@@ -86,3 +177,18 @@ async def upsert_service_weights(
         )
         n += 1
     return n
+
+
+def weights_drift_summary(db_map: Optional[Dict[str, int]]) -> Dict[str, Any]:
+    """Compare DB rows to code defaults (for admin UI / ops)."""
+    db = db_map or {}
+    drifted: Dict[str, Tuple[int, int]] = {}
+    for sid, code_w in SERVICE_WEIGHTS.items():
+        if sid in db and int(db[sid]) != int(code_w):
+            drifted[sid] = (int(db[sid]), int(code_w))
+    return {
+        "calibration": "2026-07-v2",
+        "code_defaults": dict(SERVICE_WEIGHTS),
+        "drifted_count": len(drifted),
+        "drifted": {k: {"db": v[0], "code": v[1]} for k, v in drifted.items()},
+    }

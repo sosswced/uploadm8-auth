@@ -25,6 +25,7 @@ MODES: dict[str, list[str]] = {
     "frontend": ["frontend-lint"],
     "router": ["router-lint"],
     "full": ["unit", "-q", "--tb=line", "--maxfail=10"],
+    "grounding": ["grounding", "-q", "--tb=line", "--maxfail=5"],
 }
 
 FAILURE_RES = [

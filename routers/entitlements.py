@@ -15,6 +15,7 @@ from stages.entitlements import (
     get_effective_topup_products,
 )
 from services.thumbnail_studio import format_library_rows
+from services.pricing_surfaces import build_pricing_surfaces_snapshot
 
 router = APIRouter(tags=["entitlements"])
 
@@ -120,4 +121,9 @@ async def get_public_pricing():
     wtxt = sanitize_watermark_burn_text(
         core.state.admin_settings_cache.get("watermark_burn_text")
     )
-    return {"tiers": tiers, "topups": topups, "watermark_burn_text": wtxt}
+    return {
+        "tiers": tiers,
+        "topups": topups,
+        "watermark_burn_text": wtxt,
+        "debit_surfaces": build_pricing_surfaces_snapshot(),
+    }

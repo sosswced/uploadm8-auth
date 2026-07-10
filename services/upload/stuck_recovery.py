@@ -43,6 +43,7 @@ from services.upload.schedule_guard import (
     loud_upload_schedule_failure,
     mark_schedule_incomplete_failed,
     repair_upload_schedule,
+    upload_has_schedule,
 )
 
 logger = logging.getLogger("uploadm8-worker")
@@ -79,25 +80,33 @@ async def recover_staged_without_schedule(
     *,
     limit: int = 20,
 ) -> int:
-    """Repair or fail staged/pending scheduled uploads missing scheduled_time."""
+    """Repair or fail staged/pending scheduled uploads missing schedule completeness.
+
+    Smart mode: also recovers rows with ``scheduled_time`` set but incomplete
+    ``schedule_metadata`` (missing platform slots).
+    """
     rows = await conn.fetch(
         """
         SELECT id, user_id, schedule_mode, platforms, schedule_metadata, scheduled_time, status
         FROM uploads
         WHERE status IN ('staged', 'pending')
           AND COALESCE(schedule_mode, 'immediate') IN ('scheduled', 'smart')
-          AND scheduled_time IS NULL
         ORDER BY updated_at ASC
         LIMIT $1
         """,
-        limit,
+        max(limit * 3, 40),
     )
     handled = 0
     for row in rows:
+        if handled >= limit:
+            break
+        row_d = dict(row)
+        if upload_has_schedule(row_d):
+            continue
         upload_id = str(row["id"])
         user_id = str(row["user_id"])
         status = str(row.get("status") or "")
-        ok, _, _ = await repair_upload_schedule(conn, dict(row))
+        ok, _, _ = await repair_upload_schedule(conn, row_d)
         if ok:
             logger.warning(
                 "[%s] stuck recovery: repaired missing schedule on %s upload",
@@ -422,7 +431,7 @@ async def recover_abandoned_pending(
             schedule_mode=mode,
             db_pool=db_pool,
         )
-        logger.error("[%s] stuck recovery: abandoned pending → failed %s", upload_id, ERROR_ABANDONED_PENDING)
+        logger.warning("[%s] stuck recovery: abandoned pending → failed %s", upload_id, ERROR_ABANDONED_PENDING)
         failed += 1
     return failed
 
@@ -474,69 +483,124 @@ async def recover_stuck_ready_to_publish(
                     stats["repaired"] += 1
                     logger.warning("[%s] ready_to_publish: repaired missing scheduled_time", upload_id)
                     continue
-            detail = UPLOAD_ERROR_MESSAGES.get(
-                ERROR_PUBLISH_SLOT_MISSING,
-                "No publish slot available.",
-            )
-            await mark_schedule_incomplete_failed(
-                conn,
-                upload_id,
-                detail=detail,
-                error_code=ERROR_PUBLISH_SLOT_MISSING,
-            )
-            await loud_upload_schedule_failure(
-                upload_id,
-                user_id,
-                reason=detail,
-                schedule_mode=mode,
-                db_pool=db_pool,
-            )
-            stats["failed"] += 1
-            logger.error(
-                "[%s] ready_to_publish → failed %s (null scheduled_time)",
-                upload_id,
-                ERROR_PUBLISH_SLOT_MISSING,
-            )
-            continue
+                detail = UPLOAD_ERROR_MESSAGES.get(
+                    ERROR_PUBLISH_SLOT_MISSING,
+                    "No publish slot available.",
+                )
+                await mark_schedule_incomplete_failed(
+                    conn,
+                    upload_id,
+                    detail=detail,
+                    error_code=ERROR_PUBLISH_SLOT_MISSING,
+                )
+                await loud_upload_schedule_failure(
+                    upload_id,
+                    user_id,
+                    reason=detail,
+                    schedule_mode=mode,
+                    db_pool=db_pool,
+                )
+                stats["failed"] += 1
+                logger.warning(
+                    "[%s] ready_to_publish → failed %s (null scheduled_time)",
+                    upload_id,
+                    ERROR_PUBLISH_SLOT_MISSING,
+                )
+                continue
+            # Immediate (and similar) rows often have null scheduled_time by design.
+            # Treat as due-now and fall through to idle/redispatch logic — never fail
+            # solely because scheduled_time is null.
+            if mode != "immediate":
+                detail = UPLOAD_ERROR_MESSAGES.get(
+                    ERROR_PUBLISH_SLOT_MISSING,
+                    "No publish slot available.",
+                )
+                await mark_schedule_incomplete_failed(
+                    conn,
+                    upload_id,
+                    detail=detail,
+                    error_code=ERROR_PUBLISH_SLOT_MISSING,
+                )
+                await loud_upload_schedule_failure(
+                    upload_id,
+                    user_id,
+                    reason=detail,
+                    schedule_mode=mode,
+                    db_pool=db_pool,
+                )
+                stats["failed"] += 1
+                logger.warning(
+                    "[%s] ready_to_publish → failed %s (null scheduled_time mode=%s)",
+                    upload_id,
+                    ERROR_PUBLISH_SLOT_MISSING,
+                    mode,
+                )
+                continue
 
         st = upload.get("scheduled_time")
-        if hasattr(st, "tzinfo") and st.tzinfo is None:
+        if hasattr(st, "tzinfo") and st is not None and st.tzinfo is None:
             st = st.replace(tzinfo=timezone.utc)
 
         due = platforms_due_for_publish(upload, now)
         next_anchor = next_due_scheduled_time(upload, upload.get("platform_results"))
         has_pending = still_has_pending_publish_slots(upload, upload.get("platform_results"))
 
-        # Smart with remaining targets but no resolvable slot → fail hard
+        # Smart with remaining targets but no resolvable slot → repair once, then fail
         if mode == "smart" and has_pending and next_anchor is None and not due:
-            detail = UPLOAD_ERROR_MESSAGES.get(
-                ERROR_PUBLISH_SLOT_MISSING,
-                "No remaining publish slot.",
-            )
-            await mark_schedule_incomplete_failed(
-                conn,
-                upload_id,
-                detail=detail,
-                error_code=ERROR_PUBLISH_SLOT_MISSING,
-            )
-            await loud_upload_schedule_failure(
-                upload_id,
-                user_id,
-                reason=detail,
-                schedule_mode=mode,
-                db_pool=db_pool,
-            )
-            stats["failed"] += 1
-            logger.error(
-                "[%s] ready_to_publish → failed %s (no next slot)",
-                upload_id,
-                ERROR_PUBLISH_SLOT_MISSING,
-            )
-            continue
+            ok, repaired_st, repaired_meta = await repair_upload_schedule(conn, upload)
+            if ok and repaired_st is not None:
+                upload["scheduled_time"] = repaired_st
+                if repaired_meta is not None:
+                    upload["schedule_metadata"] = repaired_meta
+                next_anchor = next_due_scheduled_time(upload, upload.get("platform_results"))
+                due = platforms_due_for_publish(upload, now)
+                has_pending = still_has_pending_publish_slots(
+                    upload, upload.get("platform_results")
+                )
+                if next_anchor is not None or due:
+                    stats["repaired"] += 1
+                    st = repaired_st or next_anchor or upload.get("scheduled_time")
+                    logger.warning(
+                        "[%s] ready_to_publish: repaired missing slots → next=%s",
+                        upload_id,
+                        next_anchor,
+                    )
+                    # Fall through to overdue / redispatch logic with repaired row.
+                else:
+                    ok = False
+            if not ok or (has_pending and next_anchor is None and not due):
+                detail = UPLOAD_ERROR_MESSAGES.get(
+                    ERROR_PUBLISH_SLOT_MISSING,
+                    "No remaining publish slot.",
+                )
+                await mark_schedule_incomplete_failed(
+                    conn,
+                    upload_id,
+                    detail=detail,
+                    error_code=ERROR_PUBLISH_SLOT_MISSING,
+                )
+                await loud_upload_schedule_failure(
+                    upload_id,
+                    user_id,
+                    reason=detail,
+                    schedule_mode=mode,
+                    db_pool=db_pool,
+                )
+                stats["failed"] += 1
+                logger.warning(
+                    "[%s] ready_to_publish → failed %s (no next slot)",
+                    upload_id,
+                    ERROR_PUBLISH_SLOT_MISSING,
+                )
+                continue
 
         if mode == "smart":
             overdue = bool(due)
             anchor_for_age = next_anchor or st
+        elif mode == "immediate" and st is None:
+            # Immediate publish: null scheduled_time means due now; age off updated_at.
+            overdue = True
+            anchor_for_age = upload.get("updated_at") or upload.get("created_at") or now
         else:
             overdue = st is not None and st <= now
             anchor_for_age = st
@@ -593,7 +657,7 @@ async def recover_stuck_ready_to_publish(
                 db_pool=db_pool,
             )
             stats["failed"] += 1
-            logger.error(
+            logger.warning(
                 "[%s] ready_to_publish → failed %s (overdue %.0fm)",
                 upload_id,
                 ERROR_STUCK_READY_TO_PUBLISH,
@@ -658,7 +722,7 @@ async def fail_deferred_batch_without_slot(
 ) -> bool:
     """
     When a partial smart publish has remaining targets but no next slot,
-    mark failed instead of parking forever in ready_to_publish.
+    attempt schedule repair once, then mark failed if still unresolvable.
 
     Returns True if the row was failed.
     """
@@ -666,6 +730,40 @@ async def fail_deferred_batch_without_slot(
         return False
     if next_due_scheduled_time(upload_snap, platform_results) is not None:
         return False
+
+    # Repair-before-fail: rebuild missing per-platform slots, then re-check.
+    snap = dict(upload_snap)
+    snap["id"] = upload_id
+    snap["user_id"] = user_id
+    ok, repaired_st, repaired_meta = await repair_upload_schedule(conn, snap)
+    if ok:
+        if repaired_st is not None:
+            snap["scheduled_time"] = repaired_st
+        if repaired_meta is not None:
+            snap["schedule_metadata"] = repaired_meta
+        nxt = next_due_scheduled_time(snap, platform_results)
+        if nxt is not None:
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET status = 'ready_to_publish',
+                    scheduled_time = $2,
+                    schedule_metadata = COALESCE($3::jsonb, schedule_metadata),
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND status NOT IN ('failed', 'cancelled', 'completed', 'succeeded')
+                """,
+                upload_id,
+                nxt,
+                json.dumps(repaired_meta, default=str) if isinstance(repaired_meta, dict) else None,
+            )
+            logger.warning(
+                "[%s] partial smart publish: repaired slots → ready_to_publish next=%s",
+                upload_id,
+                nxt,
+            )
+            return False
+
     detail = UPLOAD_ERROR_MESSAGES.get(
         ERROR_PUBLISH_SLOT_MISSING,
         "No remaining publish slot after partial publish.",
@@ -683,7 +781,7 @@ async def fail_deferred_batch_without_slot(
         schedule_mode=str(upload_snap.get("schedule_mode") or "smart"),
         db_pool=db_pool,
     )
-    logger.error(
+    logger.warning(
         "[%s] partial smart publish → failed %s (no next slot)",
         upload_id,
         ERROR_PUBLISH_SLOT_MISSING,

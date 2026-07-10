@@ -288,15 +288,15 @@ async def calculate_smart_schedule_data_driven(
     hour_weights_by_platform: Dict[str, List[float]] = {}
     try:
         batch = await build_hour_weights_for_platforms_batch(conn, user_id, platforms)
-        for p in sorted(set(platforms)):
-            hour_weights_by_platform[p] = batch.get(p.strip().lower(), static_hour_prior_24(p))
+        for p in sorted({str(x).strip().lower() for x in platforms if str(x).strip()}):
+            hour_weights_by_platform[p] = batch.get(p, static_hour_prior_24(p))
     except Exception as e:
         logger.warning("smart_schedule batch signals failed: %s", e)
-        for p in sorted(set(platforms)):
+        for p in sorted({str(x).strip().lower() for x in platforms if str(x).strip()}):
             hour_weights_by_platform[p] = static_hour_prior_24(p)
 
     return calculate_smart_schedule(
-        platforms,
+        list(hour_weights_by_platform.keys()),
         num_days=num_days,
         user_timezone=user_timezone,
         hour_weights_by_platform=hour_weights_by_platform,

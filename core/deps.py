@@ -11,6 +11,7 @@ import core.state
 from core.auth import verify_access_jwt
 from core.cookie_auth import access_token_from_cookie
 from core.db_pool import acquire_db
+from core.user_columns import USERS_AUTH_COLUMNS, users_select_sql
 from core.wallet import get_wallet, daily_refill
 from services.workspace import get_workspace_for_user, billing_user_id
 
@@ -91,7 +92,7 @@ async def get_current_user(request: Request, authorization: Optional[str] = Head
         raise HTTPException(401, "Invalid token")
 
     async with acquire_db(core.state.db_pool) as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        user = await conn.fetchrow(users_select_sql(USERS_AUTH_COLUMNS), user_id)
         if not user: raise HTTPException(401, "User not found")
         if user["status"] == "banned": raise HTTPException(403, "Account suspended")
         if user.get("email_verified") is False:
@@ -130,7 +131,7 @@ async def get_current_user_readonly(request: Request, authorization: Optional[st
         raise HTTPException(401, "Invalid token")
 
     async with acquire_db(core.state.db_pool) as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        user = await conn.fetchrow(users_select_sql(USERS_AUTH_COLUMNS), user_id)
         if not user:
             raise HTTPException(401, "User not found")
         if user["status"] == "banned":
@@ -165,7 +166,7 @@ async def get_current_user_readonly_no_wallet(
         raise HTTPException(401, "Invalid token")
 
     async with acquire_db(core.state.db_pool) as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        user = await conn.fetchrow(users_select_sql(USERS_AUTH_COLUMNS), user_id)
         if not user:
             raise HTTPException(401, "User not found")
         if user["status"] == "banned":
@@ -215,7 +216,7 @@ async def require_verified_user_on_conn(conn, user_id: str) -> dict:
     Pair with ``get_verified_user_id`` for read-heavy handlers that only need ``users``
     row validation (no wallet / daily_refill).
     """
-    user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+    user = await conn.fetchrow(users_select_sql(USERS_AUTH_COLUMNS), user_id)
     if not user:
         raise HTTPException(401, "User not found")
     if user["status"] == "banned":

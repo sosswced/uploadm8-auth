@@ -13,6 +13,11 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
+from core.user_columns import (
+    USERS_MEMBER_COLUMNS,
+    USERS_OWNER_BILLING_COLUMNS,
+    users_select_sql,
+)
 from stages.entitlements import get_entitlements_from_user
 
 INVITE_TTL_HOURS = 168
@@ -109,8 +114,8 @@ async def get_workspace_for_user(conn, user_id: str, workspace_id: Optional[str]
         )
         if not row:
             raise HTTPException(403, "Not a member of this workspace")
-    owner = await conn.fetchrow("SELECT * FROM users WHERE id = $1", row["owner_user_id"])
-    member = await conn.fetchrow("SELECT * FROM users WHERE id = $1", uid)
+    owner = await conn.fetchrow(users_select_sql(USERS_OWNER_BILLING_COLUMNS), row["owner_user_id"])
+    member = await conn.fetchrow(users_select_sql(USERS_MEMBER_COLUMNS), uid)
     if not owner or not member:
         raise HTTPException(403, "Workspace user not found")
     return WorkspaceContext(

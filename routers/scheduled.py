@@ -22,7 +22,12 @@ from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragme
 from core.r2 import get_s3_client, _normalize_r2_key, resolve_stored_account_avatar_url
 from core.models import SmartScheduleOnlyUpdate
 from services.upload.list_detail import _upload_error_message
-from services.upload.status import CANCELLABLE_STATUSES, is_requeueable_upload
+from services.upload.status import (
+    CANCELLABLE_STATUSES,
+    SCHEDULE_ATTENTION_ERROR_CODES,
+    is_requeueable_upload,
+    is_retryable_upload,
+)
 from services.uploads_handlers import SCHEDULED_PIPELINE_STATUSES, scheduled_in_clause
 from services.shell_bootstrap import _fetch_platforms_bundle, _ok, run_schedule_repair_background
 from services.upload.schedule_guard import schedule_slot_iso
@@ -130,16 +135,34 @@ async def _scheduled_upload_list_for_user(
             ]
         col_sql = ", ".join(select_cols)
         ph, statuses = scheduled_in_clause(2)
+        # Also surface recent terminal schedule failures so Retry is reachable
+        # from scheduled.html (not only Queue).
+        attn_codes = sorted(SCHEDULE_ATTENTION_ERROR_CODES)
+        attn_ph = ", ".join(
+            f"${i}" for i in range(2 + len(statuses), 2 + len(statuses) + len(attn_codes))
+        )
         uploads = await conn.fetch(
             f"""
             SELECT {col_sql}
             FROM uploads
             WHERE user_id = $1
-              AND status IN ({ph})
-            ORDER BY scheduled_time ASC NULLS LAST, created_at ASC
+              AND (
+                status IN ({ph})
+                OR (
+                  status = 'failed'
+                  AND LOWER(COALESCE(schedule_mode, '')) IN ('smart', 'scheduled')
+                  AND UPPER(COALESCE(error_code, '')) IN ({attn_ph})
+                  AND created_at > NOW() - INTERVAL '14 days'
+                )
+              )
+            ORDER BY
+              CASE WHEN status = 'failed' THEN 0 ELSE 1 END,
+              scheduled_time ASC NULLS LAST,
+              created_at ASC
             """,
             uid,
             *statuses,
+            *attn_codes,
         )
 
         all_token_ids: set[str] = set()
@@ -220,6 +243,10 @@ async def _scheduled_upload_list_for_user(
                     "is_requeueable": is_requeueable_upload(
                         str(upload.get("status") or ""), upload.get("error_code")
                     ),
+                    "is_retryable": is_retryable_upload(
+                        str(upload.get("status") or ""),
+                        error_code=upload.get("error_code"),
+                    ),
                     "error_code": upload.get("error_code"),
                     "error": _upload_error_message(dict(upload)),
                     "created_at": upload["created_at"].isoformat()
@@ -268,41 +295,7 @@ _SCHEDULED_DETAIL_COLS = [
 ]
 
 
-def _normalize_target_account_uuids(raw: Any) -> List[str]:
-    """
-    uploads.target_accounts is TEXT[]; values must be platform_tokens.id UUID strings.
-    Invalid entries (or a mistaken string stored as JSON) must not reach ANY($1::uuid[]).
-    """
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s:
-            return []
-        try:
-            parsed = json.loads(s)
-            if isinstance(parsed, list):
-                raw = parsed
-            else:
-                return []
-        except json.JSONDecodeError:
-            return []
-    if not isinstance(raw, (list, tuple)):
-        return []
-    out: List[str] = []
-    seen: set[str] = set()
-    for x in raw:
-        if x is None:
-            continue
-        s = str(x).strip()
-        if not s or s in seen:
-            continue
-        try:
-            out.append(str(uuid.UUID(s)))
-            seen.add(s)
-        except (ValueError, AttributeError, TypeError):
-            continue
-    return out
+from services.scheduled_target_accounts import normalize_target_account_uuids as _normalize_target_account_uuids
 
 router = APIRouter(prefix="/api/scheduled", tags=["scheduled"])
 
@@ -574,6 +567,10 @@ async def get_scheduled_upload(upload_id: UUID, user: dict = Depends(get_current
         "is_cancellable": _is_cancellable(upload.get("status") or ""),
         "is_requeueable": is_requeueable_upload(
             str(upload.get("status") or ""), upload.get("error_code")
+        ),
+        "is_retryable": is_retryable_upload(
+            str(upload.get("status") or ""),
+            error_code=upload.get("error_code"),
         ),
         "error_code": upload.get("error_code"),
         "error": _upload_error_message(dict(upload)),

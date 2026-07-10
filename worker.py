@@ -1679,6 +1679,34 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         if not (_multimodal_parallel and TWELVE_LABS_PARALLEL and resume_stage != "post_audio"):
             await _run_twelvelabs_multimodal()
         await maybe_cancel(ctx, "twelvelabs")
+
+        # Depth router: after Vision/VI/TL race, force a TL retry when Vision is
+        # generic and scene understanding never landed (accuracy over cost).
+        try:
+            from services.multimodal_depth_router import apply_depth_route_to_ctx
+
+            _depth = apply_depth_route_to_ctx(ctx)
+            _ai_trace(ctx, upload_id, "multimodal_depth", {
+                "clip_kind": _depth.get("clip_kind"),
+                "force_twelvelabs": _depth.get("force_twelvelabs"),
+                "vision_weak": _depth.get("vision_weak"),
+                "reason": _depth.get("reason"),
+            })
+            vu = getattr(ctx, "video_understanding", None) or {}
+            has_scene = isinstance(vu, dict) and bool(
+                (vu.get("scene_description") or vu.get("description") or "").strip()
+            )
+            if _depth.get("force_twelvelabs") and not has_scene:
+                logger.info(
+                    "[%s] depth router forcing Twelve Labs retry (%s)",
+                    upload_id,
+                    _depth.get("reason"),
+                )
+                await _run_twelvelabs_multimodal()
+                await maybe_cancel(ctx, "twelvelabs_depth_retry")
+        except Exception as _depth_e:
+            logger.debug(f"[{upload_id}] multimodal depth router skipped: {_depth_e}")
+
         try:
             await db_stage.save_pipeline_manifest(
                 db_pool,
@@ -1715,6 +1743,22 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             await backfill_telemetry_from_vision_osd(ctx)
         except Exception as e:
             logger.warning(f"[{upload_id}] Vision OSD fallback skipped: {e}")
+
+        # Place evidence: landmarks / OCR / transcript → Nominatim when no .map
+        try:
+            from services.place_evidence import backfill_place_from_vision
+
+            _pe = await backfill_place_from_vision(ctx)
+            _ai_trace(ctx, upload_id, "place_evidence", {
+                "sources": (_pe or {}).get("sources"),
+                "places": len((_pe or {}).get("places") or []),
+                "landmarks": len((_pe or {}).get("landmarks") or []),
+                "geocode": bool(((_pe or {}).get("geocode_from_landmark") or {}).get("ok")),
+                "teams": len((_pe or {}).get("sports_teams") or []),
+                "plates": len((_pe or {}).get("license_plates") or []),
+            })
+        except Exception as _pe_e:
+            logger.debug(f"[{upload_id}] place_evidence skipped: {_pe_e}")
 
         if _multimodal_strict_gaps and isinstance(getattr(ctx, "output_artifacts", None), dict):
             ctx.output_artifacts["google_multimodal_gaps"] = json.dumps(
@@ -1789,13 +1833,28 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         try:
             _scene_story = build_hydration_story_text(ctx, max_chars=900) or ""
             _timeline_events = build_video_story_timeline(ctx, max_events=80) or []
+            # First-class shot list for M8 prompt spine (temporal story, not bag-of-labels).
+            _shot_list = []
+            for ev in _timeline_events:
+                if not isinstance(ev, dict):
+                    continue
+                kind = str(ev.get("kind") or "").lower()
+                if kind in ("shot", "segment", "scene", "vi_label", "vision", "osd", "speech", "music"):
+                    _shot_list.append({
+                        "t_seconds": ev.get("t_seconds"),
+                        "kind": kind,
+                        "text": str(ev.get("text") or "")[:240],
+                    })
+                if len(_shot_list) >= 40:
+                    break
             if isinstance(ctx.output_artifacts, dict):
                 ctx.output_artifacts["scene_story"] = _scene_story[:1600]
                 ctx.output_artifacts["timeline_story"] = json.dumps(_timeline_events)[:48_000]
-            await _persist_diag_artifacts_now("timeline_story", "scene_story")
+                ctx.output_artifacts["shot_list_v1"] = _shot_list
+            await _persist_diag_artifacts_now("timeline_story", "scene_story", "shot_list_v1")
             logger.info(
                 f"[{upload_id}] scene_story built ({len(_scene_story)} chars), "
-                f"timeline events={len(_timeline_events)}"
+                f"timeline events={len(_timeline_events)}, shot_list={len(_shot_list)}"
             )
         except Exception as _scts_e:
             logger.debug(f"[{upload_id}] scene_story/timeline build skipped: {_scts_e}")

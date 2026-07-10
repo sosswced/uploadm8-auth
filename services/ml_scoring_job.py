@@ -3,6 +3,10 @@ Periodic ML score rollups for strategy performance.
 
 Produces per-user/per-day quality rows with confidence intervals so the generation
 engine can bias toward empirically stronger strategies over time.
+
+Also rolls up ``mean_grounding`` (caption–evidence overlap) from
+``uploads.output_artifacts`` for coach / accuracy observability — does not
+replace engagement priors.
 """
 from __future__ import annotations
 
@@ -14,6 +18,14 @@ import asyncpg
 from services.ml_observability import OptionalTrackioRun
 
 logger = logging.getLogger("uploadm8.ml_scoring_job")
+
+# Shared expression: prefer nested hydration_report, fall back to grounding_score_v1.
+_GROUNDING_SQL = """
+COALESCE(
+    NULLIF(u.output_artifacts->'hydration_report'->>'grounding_score', '')::double precision,
+    NULLIF(u.output_artifacts->'grounding_score_v1'->>'grounding_score', '')::double precision
+)
+"""
 
 
 async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180) -> int:
@@ -33,7 +45,7 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
 
         # all-platform rollup per user/day/strategy (attribution from uploads.output_artifacts)
         await conn.execute(
-            """
+            f"""
             WITH base AS (
                 SELECT
                     u.user_id,
@@ -52,7 +64,8 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                         WHEN COALESCE(u.views, 0) > 0
                         THEN ((COALESCE(u.likes, 0) + COALESCE(u.comments, 0) + COALESCE(u.shares, 0))::double precision / u.views::double precision) * 100.0
                         ELSE 0.0
-                    END AS engagement
+                    END AS engagement,
+                    {_GROUNDING_SQL} AS grounding_score
                 FROM uploads u
                 WHERE u.created_at >= (NOW() - ($1::int || ' days')::interval)
                   AND u.status IN ('completed', 'succeeded', 'partial')
@@ -63,13 +76,15 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                     COUNT(*)::int AS samples,
                     AVG(engagement)::double precision AS mean_engagement,
                     AVG(views)::double precision AS mean_views,
-                    COALESCE(STDDEV_POP(engagement), 0)::double precision AS engagement_stddev
+                    COALESCE(STDDEV_POP(engagement), 0)::double precision AS engagement_stddev,
+                    AVG(grounding_score) FILTER (WHERE grounding_score IS NOT NULL)::double precision AS mean_grounding
                 FROM base
                 GROUP BY user_id, day, strategy_key
             )
             INSERT INTO upload_quality_scores_daily
                 (user_id, day, platform, strategy_key, samples,
-                 mean_engagement, mean_views, engagement_stddev, ci95_low, ci95_high, updated_at)
+                 mean_engagement, mean_views, engagement_stddev, ci95_low, ci95_high,
+                 mean_grounding, updated_at)
             SELECT
                 user_id,
                 day,
@@ -81,6 +96,7 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                 engagement_stddev,
                 GREATEST(0.0, mean_engagement - (1.96 * engagement_stddev / GREATEST(sqrt(samples::double precision), 1))),
                 mean_engagement + (1.96 * engagement_stddev / GREATEST(sqrt(samples::double precision), 1)),
+                mean_grounding,
                 NOW()
             FROM agg
             ON CONFLICT (user_id, day, platform, strategy_key) DO UPDATE
@@ -90,6 +106,7 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                 engagement_stddev = EXCLUDED.engagement_stddev,
                 ci95_low = EXCLUDED.ci95_low,
                 ci95_high = EXCLUDED.ci95_high,
+                mean_grounding = EXCLUDED.mean_grounding,
                 updated_at = NOW()
             """,
             lookback_days,
@@ -97,7 +114,7 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
 
         # platform-specific rollup by exploding uploads.platforms
         await conn.execute(
-            """
+            f"""
             WITH base AS (
                 SELECT
                     u.user_id,
@@ -117,7 +134,8 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                         WHEN COALESCE(u.views, 0) > 0
                         THEN ((COALESCE(u.likes, 0) + COALESCE(u.comments, 0) + COALESCE(u.shares, 0))::double precision / u.views::double precision) * 100.0
                         ELSE 0.0
-                    END AS engagement
+                    END AS engagement,
+                    {_GROUNDING_SQL} AS grounding_score
                 FROM uploads u
                 CROSS JOIN LATERAL unnest(COALESCE(u.platforms, ARRAY[]::text[])) AS p(platform)
                 WHERE u.created_at >= (NOW() - ($1::int || ' days')::interval)
@@ -129,13 +147,15 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                     COUNT(*)::int AS samples,
                     AVG(engagement)::double precision AS mean_engagement,
                     AVG(views)::double precision AS mean_views,
-                    COALESCE(STDDEV_POP(engagement), 0)::double precision AS engagement_stddev
+                    COALESCE(STDDEV_POP(engagement), 0)::double precision AS engagement_stddev,
+                    AVG(grounding_score) FILTER (WHERE grounding_score IS NOT NULL)::double precision AS mean_grounding
                 FROM base
                 GROUP BY user_id, day, platform, strategy_key
             )
             INSERT INTO upload_quality_scores_daily
                 (user_id, day, platform, strategy_key, samples,
-                 mean_engagement, mean_views, engagement_stddev, ci95_low, ci95_high, updated_at)
+                 mean_engagement, mean_views, engagement_stddev, ci95_low, ci95_high,
+                 mean_grounding, updated_at)
             SELECT
                 user_id,
                 day,
@@ -147,6 +167,7 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                 engagement_stddev,
                 GREATEST(0.0, mean_engagement - (1.96 * engagement_stddev / GREATEST(sqrt(samples::double precision), 1))),
                 mean_engagement + (1.96 * engagement_stddev / GREATEST(sqrt(samples::double precision), 1)),
+                mean_grounding,
                 NOW()
             FROM agg
             ON CONFLICT (user_id, day, platform, strategy_key) DO UPDATE
@@ -156,6 +177,7 @@ async def recompute_quality_scores(pool: asyncpg.Pool, lookback_days: int = 180)
                 engagement_stddev = EXCLUDED.engagement_stddev,
                 ci95_low = EXCLUDED.ci95_low,
                 ci95_high = EXCLUDED.ci95_high,
+                mean_grounding = EXCLUDED.mean_grounding,
                 updated_at = NOW()
             """,
             lookback_days,
@@ -203,4 +225,3 @@ async def run_ml_scoring_cycle(
     finally:
         if track is not None:
             track.finish()
-

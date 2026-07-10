@@ -47,7 +47,9 @@ logger = logging.getLogger("uploadm8.canonical_engagement")
 ROLLUP_VERSION = 2
 SLOW_ROLLUP_WARN_MS = 2000.0
 _ADMIN_ENGAGEMENT_CACHE_TTL_S = 90.0
-_ADMIN_ROLLUP_CONCURRENCY = 6
+# Keep low: each rollup acquires a pool connection. High concurrency + admin KPI
+# gather wedged the pool under overnight E2E (/health ok, /ready hung).
+_ADMIN_ROLLUP_CONCURRENCY = 2
 _admin_engagement_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 _ENG_KEYS = ("views", "likes", "comments", "shares")
@@ -748,7 +750,9 @@ async def compute_admin_engagement_totals(
     async def _rollup_one(uid: str) -> Optional[Dict[str, Any]]:
         try:
             if pool is not None:
-                async with pool.acquire() as rollup_conn:
+                from core.db_pool import acquire_db
+
+                async with acquire_db(pool, attempts=2) as rollup_conn:
                     return await compute_canonical_engagement_rollup(
                         rollup_conn,
                         uid,

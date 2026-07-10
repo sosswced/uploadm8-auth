@@ -2,16 +2,15 @@
 
 import json
 import logging
-import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from typing import Dict, List, Optional
 
 import core.state
 from core.audit import log_system_event
 from core.cancel_signal import clear_cancel_signal, signal_cancel
 from core.db_pool import acquire_db
-from core.deps import get_current_user, get_current_user_readonly
+from core.deps import get_current_user
 from core.queue import enqueue_job
 from core.r2 import _delete_r2_objects, generate_presigned_upload_url
 from core.wallet import refund_tokens
@@ -25,8 +24,6 @@ from services.upload.r2_storage_guard import (
     upload_source_head_status,
     upload_source_present_in_r2,
 )
-from services.upload.schedule_guard import build_smart_schedule_for_upload, schedule_slot_iso
-from services.scheduling_preview import preview_response_payload
 from services.upload.inline_rescue import inline_rescue_if_stuck
 from services.uploads_handlers import (
     ALLOWED_VIDEO_TYPES,
@@ -173,51 +170,6 @@ async def estimate_upload(data: UploadInit, user: dict = Depends(get_current_use
         return await estimate_upload_costs(conn, data, user)
 
 
-@router.post("/smart-schedule/preview")
-async def preview_smart_schedule_legacy(
-    response: Response,
-    platforms: List[str] = Query(...),
-    days: int = Query(14, ge=1, le=730),
-    seed: Optional[str] = Query(None),
-    user: dict = Depends(get_current_user_readonly),
-):
-    """Deprecated — use POST /api/scheduling/preview."""
-    response.headers["Deprecation"] = "true"
-    response.headers["Link"] = '</api/scheduling/preview>; rel="successor-version"'
-    response.headers["Sunset"] = "2026-09-01"
-
-    if not platforms:
-        raise HTTPException(400, "At least one platform required")
-
-    bill_id = str(user.get("billing_user_id") or user["id"])
-    plats = [p.strip().lower() for p in platforms if p and str(p).strip()]
-    schedule_seed = (seed or "").strip() or str(uuid.uuid4())
-
-    async with core.state.db_pool.acquire() as conn:
-        from services.upload.schedule_guard import _user_timezone
-
-        tz = await _user_timezone(conn, bill_id)
-        schedule = await build_smart_schedule_for_upload(
-            conn,
-            bill_id,
-            plats,
-            num_days=days,
-            random_seed=schedule_seed,
-        )
-
-    if not schedule:
-        raise HTTPException(500, "Could not generate smart schedule preview")
-
-    sm = {p: schedule_slot_iso(dt) for p, dt in schedule.items()}
-    return preview_response_payload(
-        schedule,
-        sm,
-        seed=schedule_seed,
-        smart_schedule_days=days,
-        user_timezone=tz,
-    )
-
-
 @router.post("/{upload_id}/complete")
 async def complete_upload(
     upload_id: str,
@@ -350,22 +302,31 @@ async def requeue_upload(
     """
     Re-submit a pending upload after ENQUEUE_FAILED or similar transient errors.
 
+    For smart/scheduled rows, rebuilds missing publish slots first (same repair
+    path as Retry) so SCHEDULE_INCOMPLETE / PUBLISH_SLOT_MISSING recoveries work.
     Clears error fields and re-runs the /complete transition (enqueue or stage).
     """
+    from services.upload.schedule_guard import repair_upload_schedule
+    from services.upload.status import is_requeueable_upload
+
     async with acquire_db(core.state.db_pool) as conn:
         upload = await conn.fetchrow(
-            "SELECT id, status, r2_key FROM uploads WHERE id = $1 AND user_id = $2",
+            """
+            SELECT id, user_id, status, r2_key, error_code, schedule_mode,
+                   platforms, schedule_metadata, scheduled_time, platform_results
+            FROM uploads WHERE id = $1 AND user_id = $2
+            """,
             upload_id,
             user["id"],
         )
         if not upload:
             raise HTTPException(404, "Upload not found")
-        if (upload["status"] or "").lower() != "pending":
+        if not is_requeueable_upload(str(upload["status"] or ""), upload.get("error_code")):
             raise HTTPException(
                 400,
                 detail={
                     "code": "not_requeueable",
-                    "message": "Only pending uploads can be re-queued. Use Retry for failed uploads.",
+                    "message": "Only pending uploads with a requeueable error can be re-queued. Use Retry for failed uploads.",
                 },
             )
         head_status = upload_source_head_status(upload)
@@ -386,6 +347,22 @@ async def requeue_upload(
                     "message": "Storage check temporarily unavailable. Try again in a moment.",
                 },
             )
+
+        mode = str(upload.get("schedule_mode") or "").strip().lower()
+        if mode in ("smart", "scheduled"):
+            ok, _, _ = await repair_upload_schedule(conn, dict(upload))
+            if not ok:
+                raise HTTPException(
+                    400,
+                    detail={
+                        "code": "schedule_repair_failed",
+                        "message": (
+                            "Could not rebuild publish slots for this upload. "
+                            "Edit the schedule on Scheduled, then re-queue."
+                        ),
+                    },
+                )
+
         await conn.execute(
             """
             UPDATE uploads
@@ -592,6 +569,25 @@ async def retry_upload(
             except Exception:
                 prior_platform_results = []
         succeeded_entries, failed_platforms = split_platform_results(prior_platform_results)
+
+        # Smart / scheduled: rebuild missing per-platform slots before re-queue
+        # (PUBLISH_SLOT_MISSING / SCHEDULE_INCOMPLETE recoveries).
+        mode = str(upload.get("schedule_mode") or "").strip().lower()
+        if mode in ("smart", "scheduled"):
+            from services.upload.schedule_guard import repair_upload_schedule
+
+            ok, _, _ = await repair_upload_schedule(conn, dict(upload))
+            if not ok:
+                raise HTTPException(
+                    400,
+                    detail={
+                        "code": "schedule_repair_failed",
+                        "message": (
+                            "Could not rebuild publish slots for this upload. "
+                            "Edit the schedule on Scheduled, then retry."
+                        ),
+                    },
+                )
 
         retry_mode = "full"
         retry_subset: Optional[List[str]] = None

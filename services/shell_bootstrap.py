@@ -163,7 +163,18 @@ async def shell_bootstrap_payload(
         platforms_payload = _ok(results[1])
         queue_stats = _ok(results[2])
         if uploads_payload is None and queue_stats is None:
-            raise RuntimeError("queue bootstrap: uploads and queue_stats both failed")
+            logger.warning(
+                "queue bootstrap: uploads and queue_stats both failed user=%s — null fields for frontend fallback",
+                uid,
+            )
+            return {
+                "context": "queue",
+                "dashboard_stats": None,
+                "queue_stats": None,
+                "uploads": None,
+                "platforms": platforms_payload,
+                "schedule_repair": None,
+            }
         return {
             "context": "queue",
             "dashboard_stats": None,

@@ -251,6 +251,39 @@ async def get_upload_details(upload_id: str, user_id: str = Depends(get_verified
     return await fetch_upload_detail(core.state.db_pool, upload_id, user_id)
 
 
+@router.post("/{upload_id}/ask")
+async def ask_upload(
+    upload_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Answer a question about this upload using hydration evidence only.
+
+    Body: ``{"question": "..."}``. Citations are ``evidence_ids`` from persisted
+    artifacts (place, shot list, claims, hydration). No ungrounded free-form invent.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    question = str(body.get("question") or body.get("q") or "").strip()
+    if not question:
+        raise HTTPException(400, "question is required")
+    if len(question) > 2000:
+        raise HTTPException(400, "question too long")
+
+    from services.upload_qa import ask_upload_question
+
+    uid = str(user.get("billing_user_id") or user["id"])
+    result = await ask_upload_question(core.state.db_pool, upload_id, uid, question)
+    if result.get("status") == "not_found":
+        raise HTTPException(404, "Upload not found")
+    return result
+
+
 @router.patch("/{upload_id}")
 async def update_upload(
     upload_id: str,

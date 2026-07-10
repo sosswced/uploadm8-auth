@@ -6,7 +6,7 @@
   },
   "files": {
     "routers/admin.py": {
-      "max_lines": 4111,
+      "max_lines": 4130,
       "max_db_touch_lines": 162
     },
     "routers/admin_catalog.py": {

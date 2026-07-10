@@ -10,6 +10,7 @@ from typing import Any, Mapping, Tuple
 from fastapi import HTTPException
 
 from core.helpers import get_plan
+from core.user_columns import USERS_WALLET_COLUMNS, users_select_sql
 from core.wallet import get_wallet as get_wallet_core
 from services.wallet import get_wallet
 from services.wallet_marketing import build_wallet_marketing_payload
@@ -26,7 +27,7 @@ async def fetch_me_wallet_endpoint_data(
     ``get_current_user_readonly`` (Sentry: consecutive queries / duplicate unlock spans).
     """
     async with pool.acquire() as conn:
-        user_row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        user_row = await conn.fetchrow(users_select_sql(USERS_WALLET_COLUMNS), user_id)
         if not user_row:
             raise HTTPException(status_code=401, detail="User not found")
         if user_row["status"] == "banned":

@@ -34,11 +34,12 @@ TIER_BASELINE_SUMMARY: Dict[str, str] = {
         "all AI services off, TikTok burn off, audio context off. Watermark enforced at worker."
     ),
     "creator_lite": (
-        "Creator Lite: universal baseline (light AI on by default), styled thumbs on, "
-        "TikTok burn opt-in only, watermark off."
+        "Creator Lite: light AI on by default (captions/thumbs/Vision); "
+        "Twelve Labs / Video Intelligence / Whisper / dashcam opt-in; TikTok burn opt-in; watermark off."
     ),
     "creator_pro": (
-        "Creator Pro: full universal baseline, styled AI thumbs, TikTok burn default on when unset."
+        "Creator Pro: same light AI defaults as Lite + styled AI thumbs; "
+        "heavy analyzers still opt-in; TikTok burn default on when unset."
     ),
     "studio": "Studio: Pro-level AI defaults + higher caps (team seats, queue depth).",
     "agency": "Agency: max caps + white-label + flex.",

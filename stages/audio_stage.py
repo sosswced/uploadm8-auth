@@ -31,13 +31,57 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
 from .errors import SkipStage
 from .context import JobContext
 from .ai_service_costs import billing_env_from_os, user_pref_ai_service_enabled
+
+
+def _wav_speech_like_energy(wav_path: Path) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Cheap RMS / peak check on extracted WAV to detect speech-like energy.
+    Used to auto-enable Whisper when prefs left STT off but the clip talks.
+    """
+    meta: Dict[str, Any] = {"ok": False}
+    try:
+        import audioop
+        import wave
+
+        with wave.open(str(wav_path), "rb") as wf:
+            nch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            rate = wf.getframerate()
+            nframes = wf.getnframes()
+            # Sample up to ~8s from the middle for speed.
+            take = min(nframes, int(rate * 8))
+            start = max(0, (nframes - take) // 2)
+            wf.setpos(start)
+            raw = wf.readframes(take)
+        if not raw:
+            return False, meta
+        rms = audioop.rms(raw, sw)
+        peak = audioop.max(raw, sw)
+        # 16-bit PCM: silence ~0–200; speech often >400–800 RMS.
+        thresh = int(os.environ.get("MULTIMODAL_SPEECH_RMS_MIN", "450") or 450)
+        speech_like = rms >= thresh and peak >= thresh * 2
+        meta.update(
+            {
+                "ok": True,
+                "rms": int(rms),
+                "peak": int(peak),
+                "rate": rate,
+                "channels": nch,
+                "thresh": thresh,
+                "speech_like": speech_like,
+            }
+        )
+        return speech_like, meta
+    except Exception as e:
+        meta["error"] = str(e)[:160]
+        return False, meta
 from .ffmpeg_env import resolve_ffmpeg_executable
 
 logger = logging.getLogger("uploadm8-worker.audio")
@@ -532,7 +576,7 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
     tier_allowed = getattr(ctx.entitlements, "allowed_ai_services", None) if ctx.entitlements else None
     tier_allowed_set = set(tier_allowed) if tier_allowed is not None else None
     want_whisper = transcribe_pref and user_pref_ai_service_enabled(
-        us, "audio_whisper", default=True, allowed_services=tier_allowed_set
+        us, "audio_whisper", default=False, allowed_services=tier_allowed_set
     )
     want_yamnet = env_audio.get("YAMNET_ENABLED", True) and user_pref_ai_service_enabled(
         us, "audio_yamnet", default=True, allowed_services=tier_allowed_set
@@ -544,7 +588,18 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
         us, "audio_gpt_classify", default=True, allowed_services=tier_allowed_set
     )
 
-    if not any((want_whisper, want_yamnet, want_acr, want_gpt_summary)):
+    auto_whisper_env = (os.environ.get("MULTIMODAL_AUTO_WHISPER_ON_SPEECH") or "true").strip().lower()
+    auto_whisper_on = auto_whisper_env in ("1", "true", "yes", "on")
+    # Explicit user off (aiServiceSpeechToText=false) still wins; only auto-enable
+    # when the pref was left at default-off / unset and use_audio is on.
+    explicit_stt_off = (
+        us.get("aiServiceSpeechToText") is False
+        or us.get("ai_service_speech_to_text") is False
+        or us.get("audio_transcription") is False
+        or us.get("audioTranscription") is False
+    )
+
+    if not any((want_whisper, want_yamnet, want_acr, want_gpt_summary, auto_whisper_on and not explicit_stt_off)):
         raise SkipStage("All audio analysis services disabled in upload preferences")
 
     audio_codec = (ctx.video_info or {}).get("audio_codec")
@@ -595,6 +650,31 @@ async def run_audio_context_stage(ctx: JobContext) -> JobContext:
         return ctx
 
     ctx.audio_path = wav_path
+
+    # Minimum viable watch: if STT wasn't requested but the WAV has speech-like
+    # energy, auto-enable Whisper so M8 gets spoken-word evidence.
+    speech_meta: Dict[str, Any] = {}
+    if (
+        not want_whisper
+        and auto_whisper_on
+        and not explicit_stt_off
+        and OPENAI_API_KEY
+        and (tier_allowed_set is None or "audio_whisper" in tier_allowed_set)
+    ):
+        speech_like, speech_meta = _wav_speech_like_energy(wav_path)
+        ctx.audio_context["speech_energy"] = speech_meta
+        if speech_like:
+            want_whisper = True
+            ctx.audio_context["whisper_auto_enabled"] = True
+            logger.info(
+                "Auto-enabled Whisper (speech-like energy rms=%s peak=%s)",
+                speech_meta.get("rms"),
+                speech_meta.get("peak"),
+            )
+    elif not want_whisper:
+        speech_like, speech_meta = _wav_speech_like_energy(wav_path)
+        ctx.audio_context["speech_energy"] = speech_meta
+        ctx.audio_context["speech_like_hint"] = bool(speech_like)
 
     if want_whisper and OPENAI_API_KEY:
         whisper_payload = await _transcribe_wav(wav_path)

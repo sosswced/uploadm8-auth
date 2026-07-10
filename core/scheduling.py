@@ -198,10 +198,16 @@ def calculate_smart_schedule(
     schedule: Dict[str, datetime] = {}
     used_days: set = set()
 
-    for platform in sorted(platforms):
+    plats = sorted({str(p).strip().lower() for p in platforms if str(p).strip()})
+    for platform in plats:
         hour_weights = None
         if hour_weights_by_platform:
             hour_weights = hour_weights_by_platform.get(platform)
+            if hour_weights is None:
+                for k, v in hour_weights_by_platform.items():
+                    if str(k).strip().lower() == platform:
+                        hour_weights = v
+                        break
         if not hour_weights or len(hour_weights) != 24:
             hour_weights = static_hour_prior_24(platform)
         else:

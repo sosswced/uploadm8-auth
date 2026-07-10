@@ -50,8 +50,30 @@ FAILED_STATUSES: tuple[str, ...] = ("failed",)
 CANCELLABLE_STATUSES: tuple[str, ...] = ("pending", "scheduled", "queued")
 
 # Pending uploads eligible for POST /api/uploads/{id}/requeue (transient pipeline errors).
+# Keep in sync with frontend/js/scheduled-status.js isRequeueable().
 REQUEUEABLE_ERROR_CODES: frozenset[str] = frozenset(
-    {"ENQUEUE_FAILED", "QUEUE_UNAVAILABLE", "SCHEDULE_INCOMPLETE"}
+    {
+        "ENQUEUE_FAILED",
+        "QUEUE_UNAVAILABLE",
+        "SCHEDULE_INCOMPLETE",
+        "PUBLISH_SLOT_MISSING",
+        "STUCK_PENDING",
+        "ABANDONED_PENDING",
+    }
+)
+
+# Failed / cancelled / partial (and stale processing) → POST /api/uploads/{id}/retry.
+RETRYABLE_STATUSES: frozenset[str] = frozenset({"failed", "cancelled", "canceled", "partial"})
+
+# Terminal schedule failures still shown on scheduled.html so users can Retry there.
+SCHEDULE_ATTENTION_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "PUBLISH_SLOT_MISSING",
+        "SCHEDULE_INCOMPLETE",
+        "STUCK_READY_TO_PUBLISH",
+        "STUCK_PENDING",
+        "ABANDONED_PENDING",
+    }
 )
 
 
@@ -62,6 +84,34 @@ def is_requeueable_upload(status: str, error_code: str | None = None) -> bool:
     if not ec:
         return True
     return ec in REQUEUEABLE_ERROR_CODES
+
+
+def is_retryable_upload(
+    status: str,
+    *,
+    error_code: str | None = None,
+    has_failed_platform: bool = False,
+    stale_processing: bool = False,
+) -> bool:
+    """Whether POST /api/uploads/{id}/retry is appropriate (mirrors queue UI).
+
+    Hard-block ``error_code`` values match ``classify_retry_error`` so list/detail
+    ``is_retryable`` never advertises a retry the API will reject with 409.
+    """
+    from services.retry_policy import classify_retry_error
+
+    s = (status or "").lower()
+    if s in RETRYABLE_STATUSES:
+        if s == "partial" and not has_failed_platform:
+            return False
+        if not classify_retry_error(error_code).allowed:
+            return False
+        return True
+    if s == "processing" and stale_processing:
+        if not classify_retry_error(error_code).allowed:
+            return False
+        return True
+    return False
 
 # /complete is a no-op (success, no re-enqueue) when status is already in-flight or terminal.
 COMPLETE_IDEMPOTENT_STATUSES: tuple[str, ...] = (

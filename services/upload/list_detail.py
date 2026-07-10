@@ -26,6 +26,7 @@ from services.upload.status import (
     UPLOAD_STATUS_LABEL,
     UPLOAD_VIEW_STATUS,
     is_requeueable_upload,
+    is_retryable_upload,
 )
 from services.upload.thumbnails import (
     _normalize_platform_results_detail,
@@ -444,6 +445,7 @@ def build_upload_list_item(
         in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
         "is_cancellable": raw_status in CANCELLABLE_STATUSES or raw_status == "processing",
         "is_requeueable": is_requeueable_upload(raw_status, d.get("error_code")),
+        "is_retryable": is_retryable_upload(raw_status, error_code=d.get("error_code")),
         "video_url": d.get("video_url"),
         "trill_score": trill_score,
         "speed_bucket": d.get("speed_bucket"),
@@ -775,6 +777,9 @@ def build_upload_detail_payload(d: dict) -> dict:
         or (d.get("status") or "") == "processing",
         "is_requeueable": is_requeueable_upload(
             str(d.get("status") or ""), d.get("error_code")
+        ),
+        "is_retryable": is_retryable_upload(
+            str(d.get("status") or ""), error_code=d.get("error_code")
         ),
         "created_at": _dt_iso(d.get("created_at")),
         "completed_at": _dt_iso(d.get("completed_at")),

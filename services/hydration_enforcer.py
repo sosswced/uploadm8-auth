@@ -250,6 +250,11 @@ class EvidencePool:
                 self.vi_object_tracks, self.vi_text_detections,
                 self.vi_person_segments, self.vi_logos,
                 self.recognition_entities,
+                getattr(self, "place_beaches", None),
+                getattr(self, "place_monuments", None),
+                getattr(self, "place_stadiums", None),
+                getattr(self, "license_plates", None),
+                getattr(self, "sports_teams", None),
             )
         )
 
@@ -309,6 +314,14 @@ class EvidencePool:
                 "recognition_entities": {
                     k: v[:6] for k, v in (self.recognition_entities or {}).items() if v
                 },
+            },
+            "place_entities": {
+                "beaches": list(getattr(self, "place_beaches", None) or [])[:6],
+                "monuments": list(getattr(self, "place_monuments", None) or [])[:6],
+                "stadiums": list(getattr(self, "place_stadiums", None) or [])[:6],
+                "license_plates": list(getattr(self, "license_plates", None) or [])[:6],
+                "sports_teams": list(getattr(self, "sports_teams", None) or [])[:6],
+                "sources": list(getattr(self, "place_sources", None) or []),
             },
             "video_understanding": self.video_understanding_phrase,
             "yamnet_top": self.yamnet_top,
@@ -703,6 +716,18 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
         if not is_redundant_vision_label(lbl, ambient_profiles=ambient)
     ]
 
+    try:
+        from services.place_evidence import merge_place_evidence_into_pool
+
+        pe = getattr(ctx, "place_evidence", None)
+        if not isinstance(pe, dict):
+            arts = getattr(ctx, "output_artifacts", None) or {}
+            if isinstance(arts, dict):
+                pe = arts.get("place_evidence_v1")
+        merge_place_evidence_into_pool(pool, pe if isinstance(pe, dict) else None)
+    except Exception:
+        pass
+
     return pool
 
 
@@ -905,6 +930,15 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
 
     for lm in pool.vision_landmarks[:3]:
         _push(lm)
+
+    for beach in list(getattr(pool, "place_beaches", None) or [])[:2]:
+        _push(beach)
+    for mon in list(getattr(pool, "place_monuments", None) or [])[:2]:
+        _push(mon)
+    for team in list(getattr(pool, "sports_teams", None) or [])[:2]:
+        _push(team)
+    for stad in list(getattr(pool, "place_stadiums", None) or [])[:2]:
+        _push(stad)
 
     if pool.music_artist:
         _push(pool.music_artist)
@@ -1512,6 +1546,17 @@ def enforce_hydration(
         report["warnings"].extend(qual)
     report["metadata_quality"] = {"notes": qual}
 
+    try:
+        from services.grounding_eval import score_ctx_grounding
+
+        grounding = score_ctx_grounding(ctx, pool, evidence_present=has_evidence)
+        report["grounding"] = grounding
+        report["grounding_score"] = grounding.get("grounding_score")
+    except Exception as _ge:
+        logger.debug("grounding_eval skipped: %s", _ge)
+        report["grounding"] = {"status": "error"}
+        report["grounding_score"] = None
+
     # Persist report for diagnostics if ctx supports it.
     try:
         if not isinstance(getattr(ctx, "output_artifacts", None), dict):
@@ -1529,7 +1574,11 @@ def enforce_hydration(
             "evidence": report["evidence"],
             "warnings": report["warnings"],
             "metadata_quality": report.get("metadata_quality") or {},
+            "grounding_score": report.get("grounding_score"),
+            "grounding": report.get("grounding") or {},
         }
+        if report.get("grounding"):
+            ctx.output_artifacts["grounding_score_v1"] = report["grounding"]
     except (AttributeError, TypeError):
         pass
 
@@ -1540,7 +1589,12 @@ def enforce_hydration(
     try:
         from services.diag_persist import schedule_persist_artifact_now
 
-        schedule_persist_artifact_now(ctx, "hydration_report", "hydration_story")
+        schedule_persist_artifact_now(
+            ctx,
+            "hydration_report",
+            "hydration_story",
+            "grounding_score_v1",
+        )
     except Exception:
         pass
 

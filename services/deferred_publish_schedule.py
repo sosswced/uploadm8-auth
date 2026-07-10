@@ -125,10 +125,20 @@ def handled_target_keys(platform_results: Any) -> set[str]:
 
 
 def slot_for_platform(upload_record: dict[str, Any], platform: str) -> Optional[datetime]:
+    """
+    Resolvable publish slot for one platform.
+
+    Smart mode: only ``schedule_metadata[platform]`` (no stale ``scheduled_time``
+    fallback — that time often belongs to an already-published earliest platform).
+    Other modes: metadata slot, else top-level ``scheduled_time``.
+    """
     plat = str(platform or "").strip().lower()
     schedule = parse_schedule_metadata(upload_record.get("schedule_metadata"))
     if plat in schedule:
         return schedule[plat]
+    mode = str(upload_record.get("schedule_mode") or "").strip().lower()
+    if mode == "smart":
+        return None
     st = upload_record.get("scheduled_time")
     if st is not None:
         return parse_iso_datetime(st)
@@ -169,8 +179,7 @@ def platforms_due_for_publish(
     due: set[str] = set()
     for plat in platforms:
         slot = schedule.get(plat)
-        if slot is None:
-            slot = parse_iso_datetime(upload_record.get("scheduled_time"))
+        # No scheduled_time fallback — missing metadata means "not due" (repair needed).
         if slot is None or slot > now:
             continue
         plat_targets = [(p, tid) for p, tid in targets if str(p).strip().lower() == plat]
@@ -245,11 +254,13 @@ def next_due_scheduled_time(
     candidates: list[datetime] = []
     for plat in pending_plats:
         slot = schedule.get(plat)
-        if slot is None:
-            slot = parse_iso_datetime(upload_record.get("scheduled_time"))
         if slot is not None:
             candidates.append(slot)
     if not candidates:
+        # Smart: do not fall back to top-level scheduled_time — it often belongs to
+        # an already-published platform and hides incomplete schedule_metadata.
+        if mode == "smart":
+            return None
         return parse_iso_datetime(upload_record.get("scheduled_time"))
     return min(candidates)
 

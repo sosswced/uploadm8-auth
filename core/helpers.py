@@ -103,7 +103,12 @@ def _safe_json(v, default=None):
 
 
 def coerce_output_artifacts_dict(raw) -> dict:
-    """``uploads.output_artifacts`` should be a JSON object; tolerate list/null legacy rows."""
+    """``uploads.output_artifacts`` should be a JSON object; tolerate list/null legacy rows.
+
+    Some pipeline writes left a JSON **array** (e.g. ``[{...}]``). ``dict(that)`` raises
+    ``ValueError: dictionary update sequence element #0 has length N`` (Sentry UPLOADM8-7W
+    on ``/retry``). Merge list-of-dicts / list-of-JSON-strings into one object.
+    """
     val = raw
     if val is None:
         val = {}
@@ -111,6 +116,17 @@ def coerce_output_artifacts_dict(raw) -> dict:
         val = _safe_json(val, {})
     if isinstance(val, dict):
         return val
+    if isinstance(val, list):
+        merged: dict = {}
+        for item in val:
+            if isinstance(item, dict):
+                merged.update(item)
+                continue
+            if isinstance(item, str):
+                parsed = _safe_json(item, None)
+                if isinstance(parsed, dict):
+                    merged.update(parsed)
+        return merged
     return {}
 
 

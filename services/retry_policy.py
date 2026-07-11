@@ -109,11 +109,12 @@ def is_transient_error(error_code: Optional[str]) -> bool:
 # Retry counter (stored in uploads.output_artifacts JSONB)
 # ---------------------------------------------------------------------------
 
-def get_retry_count(output_artifacts: Optional[Dict[str, Any]]) -> int:
+def get_retry_count(output_artifacts: Optional[Any]) -> int:
     """Return the number of user-initiated retries already attempted."""
-    if not isinstance(output_artifacts, dict):
-        return 0
-    section = output_artifacts.get("retry")
+    from core.helpers import coerce_output_artifacts_dict
+
+    arts = coerce_output_artifacts_dict(output_artifacts)
+    section = arts.get("retry")
     if isinstance(section, dict):
         try:
             return int(section.get("count") or 0)
@@ -123,7 +124,7 @@ def get_retry_count(output_artifacts: Optional[Dict[str, Any]]) -> int:
 
 
 def bump_retry_metadata(
-    output_artifacts: Optional[Dict[str, Any]],
+    output_artifacts: Optional[Any],
     *,
     actor_user_id: str,
     prior_error_code: Optional[str],
@@ -133,10 +134,14 @@ def bump_retry_metadata(
     """Return a new output_artifacts dict with the retry section incremented.
 
     Caller is responsible for persisting it. Never mutates the input.
+    Tolerates list-shaped legacy ``output_artifacts`` (UPLOADM8-7W).
     """
-    base: Dict[str, Any] = dict(output_artifacts or {})
+    from core.helpers import coerce_output_artifacts_dict
+
+    base: Dict[str, Any] = dict(coerce_output_artifacts_dict(output_artifacts))
     section = base.get("retry") if isinstance(base.get("retry"), dict) else {}
     history = list(section.get("history") or [])
+
 
     new_count = int(section.get("count") or 0) + 1
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -205,10 +210,11 @@ MAX_AUTO_RETRIES_DEFAULT = 3
 AUTO_RETRY_BACKOFF_MINUTES: Tuple[int, ...] = (2, 5, 15)
 
 
-def get_auto_retry_count(output_artifacts: Optional[Dict[str, Any]]) -> int:
-    if not isinstance(output_artifacts, dict):
-        return 0
-    section = output_artifacts.get("auto_retry")
+def get_auto_retry_count(output_artifacts: Optional[Any]) -> int:
+    from core.helpers import coerce_output_artifacts_dict
+
+    arts = coerce_output_artifacts_dict(output_artifacts)
+    section = arts.get("auto_retry")
     if isinstance(section, dict):
         try:
             return int(section.get("count") or 0)
@@ -223,11 +229,13 @@ def auto_retry_backoff_minutes(prior_count: int) -> int:
 
 
 def bump_auto_retry_metadata(
-    output_artifacts: Optional[Dict[str, Any]],
+    output_artifacts: Optional[Any],
     *,
     error_code: Optional[str],
 ) -> Dict[str, Any]:
-    base: Dict[str, Any] = dict(output_artifacts or {})
+    from core.helpers import coerce_output_artifacts_dict
+
+    base: Dict[str, Any] = dict(coerce_output_artifacts_dict(output_artifacts))
     section = base.get("auto_retry") if isinstance(base.get("auto_retry"), dict) else {}
     new_count = int(section.get("count") or 0) + 1
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -265,14 +273,9 @@ def should_auto_retry_upload(
     arts = (
         upload_row.get("output_artifacts") if isinstance(upload_row, dict) else upload_row["output_artifacts"]
     )
-    if isinstance(arts, str):
-        try:
-            import json
+    from core.helpers import coerce_output_artifacts_dict
 
-            arts = json.loads(arts)
-        except Exception:
-            arts = {}
-    return get_auto_retry_count(arts if isinstance(arts, dict) else None) < max_retries
+    return get_auto_retry_count(coerce_output_artifacts_dict(arts)) < max_retries
 
 
 def upload_is_stale_processing(upload_row: Any, *, minutes: int | None = None) -> bool:

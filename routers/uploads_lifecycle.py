@@ -543,12 +543,10 @@ async def retry_upload(
                 },
             )
 
-        existing_artifacts = upload.get("output_artifacts") or {}
-        if isinstance(existing_artifacts, str):
-            try:
-                existing_artifacts = json.loads(existing_artifacts) or {}
-            except Exception:
-                existing_artifacts = {}
+        from core.helpers import coerce_output_artifacts_dict
+
+        # Legacy rows may store a JSON array; dict(list) 500s (UPLOADM8-7W).
+        existing_artifacts = coerce_output_artifacts_dict(upload.get("output_artifacts"))
         prior_count = get_retry_count(existing_artifacts)
         if prior_count >= MAX_USER_RETRIES_DEFAULT:
             raise HTTPException(

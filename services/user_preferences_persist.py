@@ -475,6 +475,8 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             "thumbnail_studio_enabled",
             "thumbnailStudioEngineEnabled",
             "thumbnail_studio_engine_enabled",
+            "thumbnailStudioStrict",
+            "thumbnail_studio_strict",
             "thumbnailPersonaEnabled",
             "thumbnail_persona_enabled",
             "thumbnailDefaultPersonaId",
@@ -563,6 +565,9 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                     users_prefs["thumbnailStudioEngineEnabled"] = users_prefs["thumbnail_studio_engine_enabled"] = (
                         v_engine
                     )
+                v_strict = _pick_bool("thumbnailStudioStrict", "thumbnail_studio_strict")
+                if v_strict is not None:
+                    users_prefs["thumbnailStudioStrict"] = users_prefs["thumbnail_studio_strict"] = v_strict
                 v_persona = _pick_bool("thumbnailPersonaEnabled", "thumbnail_persona_enabled")
                 if v_persona is not None:
                     users_prefs["thumbnailPersonaEnabled"] = users_prefs["thumbnail_persona_enabled"] = v_persona

@@ -60,4 +60,21 @@ def format_pikzels_error_message(data: Any, *, max_len: int = 800) -> str:
     if detail is not None and not isinstance(detail, (dict, list)):
         return str(detail)[:max_len]
 
-    return str(data.get("message") or data.get("detail") or "upstream_error")[:max_len]
+    raw = data.get("raw")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()[:max_len]
+
+    msg = data.get("message") or data.get("detail")
+    if msg is not None and str(msg).strip():
+        return str(msg).strip()[:max_len]
+
+    # Last resort: compact JSON so ops never see an empty "non-2xx" placeholder.
+    try:
+        import json
+
+        blob = json.dumps(data, default=str)
+        if blob and blob not in ("{}", "null"):
+            return blob[:max_len]
+    except Exception:
+        pass
+    return "upstream_error"

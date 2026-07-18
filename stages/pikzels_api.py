@@ -56,11 +56,12 @@ _PERSONA_STYLE_TEXT_GUARD = (
     "only on the reference image. "
 )
 
+# Softened: hard "Do NOT add faces" conflicted with persona UUID payloads (Pikzels 400s).
 _DASHCAM_POV_FIDELITY_GUARD = (
-    "DASHCAM POV FIDELITY: edit the supplied in-car forward-facing frame only. "
+    "DASHCAM POV FIDELITY: edit the supplied in-car forward-facing frame. "
     "Preserve the real road, vehicle hood or windshield, trees, sky, and any HUD timestamp "
-    "overlay exactly. Do NOT add faces, people, celebrities, reaction shots, stock subjects, "
-    "neon compass circles, or graphic overlays not in the source frame."
+    "overlay. If a persona reference is supplied, apply likeness/lighting only — do not invent "
+    "extra celebrities, reaction shots, stock subjects, neon compass circles, or unrelated overlays."
 )
 
 logger = logging.getLogger("uploadm8-worker.thumb_renderer")
@@ -326,10 +327,8 @@ def _build_pikzels_v2_prompt(
         if ma or mt:
             prioritized.append("Music: " + " — ".join(p for p in (ma, mt) if p)[:140])
 
-        spch = ev.get("speech") if isinstance(ev.get("speech"), dict) else {}
-        phrase = str(spch.get("phrase") or "").strip()
-        if phrase:
-            prioritized.append(f"Speech: {phrase[:200]}")
+        # Skip raw speech/lyrics in image prompts — often trip Pikzels content 400s
+        # and do not help dashcam composition (music artist/title above is enough).
 
         vis = ev.get("vision") if isinstance(ev.get("vision"), dict) else {}
         vlabels = vis.get("labels") if isinstance(vis.get("labels"), list) else []
@@ -424,9 +423,7 @@ def _build_pikzels_v2_prompt(
     if music_context and not any(p.startswith("Music:") for p in prioritized):
         prioritized.append(f"Music: {music_context[:140]}")
 
-    speech_context = str(brief.get("speech_context") or "").strip()
-    if speech_context and not any(p.startswith("Speech:") for p in prioritized):
-        prioritized.append(f"Speech: {speech_context[:200]}")
+    # speech_context intentionally omitted from image prompts (content-filter / lyric noise).
 
     signal_hashtags = str(brief.get("signal_hashtags") or "").strip()
     if signal_hashtags and not any(p.startswith("Tags:") for p in prioritized):
@@ -628,6 +625,36 @@ async def generate_pikzels_text_brief(*, source_title: str, niche: str, context_
 _pikzels_v2_text_brief = generate_pikzels_text_brief
 
 
+def _jpeg_bytes_for_pikzels_frame(path: Path, *, max_edge: int = 1920) -> bytes:
+    """Re-encode the source frame as a real JPEG so Pikzels does not return INVALID_IMAGE.
+
+    Workers often extract PNG/WebP/odd containers; labeling raw bytes as
+    ``data:image/jpeg;base64,…`` causes HTTP 400 ``INVALID_IMAGE`` across all platforms.
+    """
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise ValueError("Pillow required to prepare Pikzels frames") from e
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        if w < 32 or h < 32:
+            raise ValueError(f"frame too small for Pikzels ({w}x{h})")
+        edge = max(w, h)
+        if edge > max_edge:
+            scale = max_edge / float(edge)
+            _resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+            im = im.resize((max(32, int(w * scale)), max(32, int(h * scale))), _resample)
+        import io
+
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=90, optimize=True)
+        out = buf.getvalue()
+    if len(out) < 256:
+        raise ValueError(f"re-encoded JPEG too small ({len(out)} bytes)")
+    return out
+
+
 # ── Main entrypoint (call-site signature preserved) ─────────────────────────
 
 
@@ -659,9 +686,9 @@ async def render_thumbnail_with_studio_renderer(
         return False
 
     try:
-        frame_bytes = base_frame_path.read_bytes()
-    except (OSError, PermissionError) as e:
-        logger.warning("[thumb-renderer] failed reading source frame: %s", e)
+        frame_bytes = _jpeg_bytes_for_pikzels_frame(base_frame_path)
+    except (OSError, PermissionError, ValueError) as e:
+        logger.warning("[thumb-renderer] failed preparing source frame for Pikzels: %s", e)
         return False
     if not frame_bytes:
         logger.warning("[thumb-renderer] source frame is empty: %s", base_frame_path)
@@ -731,6 +758,59 @@ async def render_thumbnail_with_studio_renderer(
     _sup_ref = ""
     if isinstance(brief, dict):
         _sup_ref = str(brief.get("_uploadm8_pikzels_support_image_url") or "").strip()
+
+    # Structured Studio strategy → prompt directives (format_key / layout / closeness).
+    structured = {}
+    if isinstance(options, dict):
+        structured = options.get("strategy_structured") if isinstance(options.get("strategy_structured"), dict) else {}
+    if not structured and isinstance(brief, dict):
+        structured = brief.get("_uploadm8_strategy_structured") if isinstance(
+            brief.get("_uploadm8_strategy_structured"), dict
+        ) else {}
+    if structured:
+        bits = []
+        fk = str(structured.get("format_key") or "").strip()
+        lp = str(structured.get("layout_pattern") or structured.get("layout_name") or "").strip()
+        if fk:
+            bits.append(f"layout format {fk}")
+        if lp:
+            bits.append(f"composition {lp.replace('_', ' ')}")
+        emo = str(structured.get("emotion") or "").strip()
+        if emo:
+            bits.append(f"{emo} emotion")
+        if bits:
+            payload["prompt"] = clamp_pikzels_image_prompt(
+                f"{payload['prompt']}. " + "; ".join(bits)
+            )
+        if not explicit_weight:
+            rs = structured.get("reference_strength")
+            if isinstance(rs, (int, float)):
+                try:
+                    iw = closeness_to_pikzels_image_weight(int(rs))
+                    payload["image_weight"] = iw
+                    explicit_weight = True
+                except (TypeError, ValueError):
+                    pass
+
+    persona_uuid_set = False
+    style_uuid_set = False
+    # Persona vs YouTube support XOR (recreate_style / face_brand); "both" keeps both.
+    us_for_xor = us if isinstance(us, dict) else None
+    strip_support_for_persona = False
+    if isinstance(persona, dict) and persona and us_for_xor is not None:
+        try:
+            from services.thumbnail_apply_mode import resolve_ref_persona_mode
+
+            rpm = resolve_ref_persona_mode(us_for_xor)
+            if rpm == "face_brand":
+                strip_support_for_persona = True
+            elif rpm == "recreate_style":
+                persona = None  # recreate-style: support image wins
+        except Exception:
+            pass
+    if strip_support_for_persona:
+        _sup_ref = ""
+
     if _sup_ref.startswith("https://") and _model_lc in ("pkz_4", "pkz_4_5"):
         payload["support_image_url"] = _sup_ref[:2000]
         logger.info(
@@ -745,8 +825,6 @@ async def render_thumbnail_with_studio_renderer(
             upload_id,
         )
 
-    persona_uuid_set = False
-    style_uuid_set = False
     if isinstance(persona, dict) and persona:
         pid = str(persona.get("id") or persona.get("pikzonality_id") or "").strip()
         if pid:
@@ -844,36 +922,108 @@ async def render_thumbnail_with_studio_renderer(
 
     coerce_pikzels_v2_image_base64_fields(payload)
 
-    timeout = pikzels_timeout_seconds()
-    try:
-        status, data = await pikzels_v2_post(V2_THUMBNAIL_IMAGE, payload)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.warning("[thumb-renderer] Pikzels v2 POST raised: %s", e)
-        if job_context is not None:
-            append_provider_error(
-                job_context,
-                provider="pikzels",
-                stage="thumbnail_stage",
-                operation="thumbnail_image_post",
-                message=str(e),
-                exception_type=type(e).__name__,
-            )
-        return False
+    # Strip URLs again after persona/style prompt merges (API rejects URLs in prompt).
+    payload["prompt"] = re.sub(
+        r"https?://[^\s]+", "", str(payload.get("prompt") or ""), flags=re.IGNORECASE
+    )
+    payload["prompt"] = re.sub(r"\s{2,}", " ", payload["prompt"]).strip()
+    payload["prompt"] = clamp_pikzels_image_prompt(payload["prompt"])
 
-    if status >= 400 or not isinstance(data, dict):
+    timeout = pikzels_timeout_seconds()
+
+    async def _post_once() -> tuple[int, Any]:
+        try:
+            return await pikzels_v2_post(V2_THUMBNAIL_IMAGE, payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("[thumb-renderer] Pikzels v2 POST raised: %s", e)
+            if job_context is not None:
+                append_provider_error(
+                    job_context,
+                    provider="pikzels",
+                    stage="thumbnail_stage",
+                    operation="thumbnail_image_post",
+                    message=str(e),
+                    exception_type=type(e).__name__,
+                )
+            return 0, {"error": {"code": "client_exception", "message": str(e)[:500]}}
+
+    status, data = await _post_once()
+
+    def _err_code(body: Any) -> str:
+        if isinstance(body, dict) and isinstance(body.get("error"), dict):
+            return str(body["error"].get("code") or "").strip().upper()
+        return ""
+
+    persona_required = False
+    if isinstance(us, dict):
+        persona_required = str(
+            us.get("thumbnail_persona_required")
+            or us.get("thumbnailPersonaRequired")
+            or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+    # INVALID_IMAGE often means a bad support still — retry once without it.
+    if status == 400 and _err_code(data) == "INVALID_IMAGE" and payload.pop("support_image_url", None):
+        logger.warning(
+            "[thumb-renderer] Pikzels INVALID_IMAGE — retrying without support_image_url upload=%s platform=%s",
+            upload_id,
+            plat,
+        )
+        status, data = await _post_once()
+
+    # Invalid/expired persona UUID is a common 400 — retry once without persona/style
+    # unless the job hard-requires a linked persona (fail loud instead of silent drop).
+    if (
+        status == 400
+        and (persona_uuid_set or style_uuid_set)
+        and isinstance(data, dict)
+        and not persona_required
+        and _err_code(data) != "INVALID_IMAGE"  # image issues won't be fixed by dropping persona
+    ):
+        dropped = []
+        if payload.pop("persona", None):
+            dropped.append("persona")
+            persona_uuid_set = False
+        if payload.pop("style", None):
+            dropped.append("style")
+            style_uuid_set = False
+        if dropped:
+            logger.warning(
+                "[thumb-renderer] Pikzels HTTP 400 with %s — retrying without refs upload=%s platform=%s body=%s",
+                "+".join(dropped),
+                upload_id,
+                plat,
+                str(data)[:240],
+            )
+            status, data = await _post_once()
+    elif status == 400 and persona_required and persona_uuid_set:
+        logger.warning(
+            "[thumb-renderer] Pikzels HTTP 400 with required persona — not stripping upload=%s platform=%s body=%s",
+            upload_id,
+            plat,
+            str(data)[:240],
+        )
+
+    if status < 200 or status >= 400 or not isinstance(data, dict):
+        from services.pikzels_errors import format_pikzels_error_message
+
+        err_msg = format_pikzels_error_message(data if isinstance(data, dict) else {}, max_len=400)
+        body_blob = ""
+        try:
+            body_blob = json.dumps(data, default=str)[:2000] if isinstance(data, dict) else str(data)[:2000]
+        except Exception:
+            body_blob = str(data)[:2000]
+        if not (err_msg or "").strip() or err_msg == "upstream_error":
+            err_msg = (body_blob or f"HTTP {status} empty/non-json body")[:400]
+        code = _err_code(data)
         logger.warning(
             "[thumb-renderer] Pikzels v2 image HTTP %s upload=%s platform=%s body=%s",
             status, upload_id, plat, str(data)[:240],
         )
         if job_context is not None:
-            body_blob = ""
-            try:
-                body_blob = json.dumps(data, default=str)[:2000] if isinstance(data, dict) else str(data)[:2000]
-            except Exception:
-                body_blob = str(data)[:2000]
-            low = body_blob.lower()
+            low = (body_blob + " " + err_msg).lower()
             prompt_long = status == 400 and (
                 "1000" in low
                 or "prompt must" in low
@@ -889,10 +1039,14 @@ async def render_thumbnail_with_studio_renderer(
                     "Pikzels rejected prompt length (API max 1000 chars); shorten fused evidence "
                     "or lower PIKZELS_THUMBNAIL_PROMPT_MAX"
                     if prompt_long
-                    else "non-2xx or non-json response"
+                    else err_msg
                 ),
-                http_status=status,
-                provider_code="prompt_too_long" if prompt_long else None,
+                http_status=status if status else None,
+                provider_code=(
+                    "prompt_too_long"
+                    if prompt_long
+                    else (code.lower() if code else None)
+                ),
                 response_body_snippet=body_blob[:1200],
             )
         return False

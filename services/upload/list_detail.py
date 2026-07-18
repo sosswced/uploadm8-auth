@@ -35,6 +35,7 @@ from services.upload.thumbnails import (
     merged_platform_thumbnail_urls,
     pikzels_template_thumbnail_warning,
     thumbnail_render_method_from_artifacts,
+    studio_thumb_diagnostics_from_artifacts,
     thumbnail_storage_missing_flag,
 )
 
@@ -461,6 +462,9 @@ def build_upload_list_item(
             d.get("output_artifacts")
         ),
         "pikzels_thumbnail_warning": pikzels_template_thumbnail_warning(d.get("output_artifacts")),
+        "studio_thumb_diagnostics": studio_thumb_diagnostics_from_artifacts(
+            d.get("output_artifacts")
+        ),
         "geo_location_hint": geo_location_hint_for_upload(d),
         "output_artifacts": slim_output_artifacts_for_ui(d.get("output_artifacts")),
         "pipeline_manifest": _pipeline_manifest_dict(d.get("pipeline_manifest")),
@@ -814,6 +818,9 @@ def build_upload_detail_payload(d: dict) -> dict:
         ),
         "thumbnail_render_method": thumbnail_render_method_from_artifacts(d.get("output_artifacts")),
         "pikzels_thumbnail_warning": pikzels_template_thumbnail_warning(d.get("output_artifacts")),
+        "studio_thumb_diagnostics": studio_thumb_diagnostics_from_artifacts(
+            d.get("output_artifacts")
+        ),
         "geo_location_hint": geo_location_hint_for_upload(d),
         "output_artifacts": slim_output_artifacts_for_ui(d.get("output_artifacts")),
         "pipeline_manifest": _pipeline_manifest_dict(d.get("pipeline_manifest")),

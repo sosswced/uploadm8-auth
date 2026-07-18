@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from services.deferred_publish_schedule import (
     handled_target_keys,
     hydrate_platform_results_into_ctx,
+    next_due_scheduled_time,
     parse_schedule_metadata,
     platforms_due_for_publish,
     publish_target_already_done,
@@ -119,3 +120,48 @@ def test_handled_target_keys():
         [{"platform": "tiktok", "success": True, "token_row_id": "t1"}]
     )
     assert publish_target_key("tiktok", "t1") in keys
+
+
+def test_next_due_scheduled_time_advances_past_published_platform():
+    upload = {
+        "schedule_mode": "smart",
+        "platforms": ["tiktok", "youtube", "instagram"],
+        "schedule_metadata": {
+            "tiktok": "2026-06-15T19:00:00+00:00",
+            "youtube": "2026-06-17T14:00:00+00:00",
+            "instagram": "2026-06-19T18:00:00+00:00",
+        },
+        "scheduled_time": _utc(2026, 6, 15, 19, 0),
+        "platform_results": [{"platform": "tiktok", "success": True}],
+    }
+    nxt = next_due_scheduled_time(upload)
+    assert nxt is not None
+    assert nxt == _utc(2026, 6, 17, 14, 0)
+
+
+def test_next_due_scheduled_time_none_when_all_handled():
+    upload = {
+        "schedule_mode": "smart",
+        "platforms": ["tiktok", "youtube"],
+        "schedule_metadata": {
+            "tiktok": "2026-06-15T19:00:00+00:00",
+            "youtube": "2026-06-17T14:00:00+00:00",
+        },
+        "platform_results": [
+            {"platform": "tiktok", "success": True},
+            {"platform": "youtube", "success": True},
+        ],
+    }
+    assert next_due_scheduled_time(upload) is None
+
+
+def test_next_due_none_when_metadata_incomplete_and_no_scheduled_time():
+    upload = {
+        "schedule_mode": "smart",
+        "platforms": ["tiktok", "youtube", "instagram", "facebook"],
+        "schedule_metadata": {"tiktok": "2026-06-15T19:00:00+00:00"},
+        "scheduled_time": None,
+        "platform_results": [{"platform": "tiktok", "success": True}],
+    }
+    assert next_due_scheduled_time(upload) is None
+    assert still_has_pending_publish_slots(upload, upload["platform_results"]) is True

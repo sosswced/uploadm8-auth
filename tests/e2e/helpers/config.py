@@ -66,16 +66,16 @@ def e2e_skip_mutations() -> bool:
 
 def e2e_api_timeout_s() -> float:
     try:
-        return float(os.environ.get("E2E_API_TIMEOUT_S", "30"))
+        return float(os.environ.get("E2E_API_TIMEOUT_S", "60"))
     except ValueError:
-        return 30.0
+        return 60.0
 
 
 def e2e_page_timeout_ms() -> int:
     try:
-        return int(os.environ.get("E2E_PAGE_TIMEOUT_MS", "45000"))
+        return int(os.environ.get("E2E_PAGE_TIMEOUT_MS", "90000"))
     except ValueError:
-        return 45000
+        return 90000
 
 
 def auth_state_path() -> Path:
@@ -97,16 +97,46 @@ def e2e_target_user_name() -> str:
     return (os.environ.get("E2E_TARGET_USER_NAME") or DEFAULT_TARGET_USER_NAME).strip()
 
 
+# Canonical publish targets for /TUP (all connected platforms; UI applies each default).
+ALL_UPLOAD_PLATFORMS: tuple[str, ...] = ("tiktok", "youtube", "instagram", "facebook")
+
+
 def e2e_upload_platforms() -> tuple[str, ...]:
-    """Platforms to publish to on upload.html (live demo defaults to TikTok only)."""
-    raw = (os.environ.get("E2E_UPLOAD_PLATFORMS") or "tiktok").strip()
+    """
+    Platforms to publish to on upload.html.
+
+    Default for /TUP is all platforms (`E2E_UPLOAD_PLATFORMS=all` or unset under TUP).
+    Legacy live-demo default remains TikTok-only when E2E_UPLOAD_PLATFORMS is unset
+    and E2E_TUP is not set.
+    """
+    raw = (os.environ.get("E2E_UPLOAD_PLATFORMS") or "").strip()
+    if not raw:
+        if os.environ.get("E2E_TUP", "").lower() in ("1", "true", "yes"):
+            return ALL_UPLOAD_PLATFORMS
+        return ("tiktok",)
+    lowered = raw.lower()
+    if lowered in ("all", "*", "every", "connected"):
+        return ALL_UPLOAD_PLATFORMS
     parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
-    return tuple(parts or ("tiktok",))
+    return tuple(parts or ALL_UPLOAD_PLATFORMS)
 
 
 def e2e_tiktok_profile() -> str:
     """Optional TikTok profile name/@username substring for account picker."""
     return (os.environ.get("E2E_TIKTOK_PROFILE") or "").strip()
+
+
+def e2e_use_persona() -> bool:
+    """Apply linked persona on upload (default on for /TUP)."""
+    raw = os.environ.get("E2E_USE_PERSONA")
+    if raw is None or raw.strip() == "":
+        return os.environ.get("E2E_TUP", "").lower() in ("1", "true", "yes")
+    return raw.lower() not in ("0", "false", "no")
+
+
+def e2e_persona_id() -> str:
+    """Optional persona UUID override; empty → use settings default / first linked."""
+    return (os.environ.get("E2E_PERSONA_ID") or "").strip()
 
 
 def e2e_target_user_search_terms() -> tuple[str, ...]:

@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from tests.e2e.helpers.browser_session import navigate_to_page_human, wait_for_authenticated_shell
-from tests.e2e.helpers.pages import ADMIN_SETTINGS_PAGES
+from tests.e2e.helpers.browser_session import (
+    ensure_authed,
+    goto_page_resilient,
+    human_login_via_form,
+    navigate_to_page_human,
+    wait_for_authenticated_shell,
+)
+from tests.e2e.helpers.pages import ADMIN_SETTINGS_PAGES, page_url
 from tests.e2e.helpers.ui_safe_clicks import click_admin_settings_surfaces, click_page_surfaces
 
 pytestmark = [pytest.mark.e2e, pytest.mark.ui_smoke, pytest.mark.overnight, pytest.mark.ui_clicks]
@@ -13,8 +19,18 @@ pytestmark = [pytest.mark.e2e, pytest.mark.ui_smoke, pytest.mark.overnight, pyte
 
 @pytest.mark.parametrize("rel_path", ADMIN_SETTINGS_PAGES)
 def test_admin_settings_surfaces(human_session_page, base_url: str, rel_path: str):
-    navigate_to_page_human(human_session_page, base_url, rel_path)
-    wait_for_authenticated_shell(human_session_page)
+    if rel_path == "settings.html":
+        # Cold human_session often lacks settings DOM until a real form login.
+        human_login_via_form(human_session_page, base_url)
+        goto_page_resilient(human_session_page, page_url(base_url, "settings.html"))
+        human_session_page.locator("a.settings-tab").first.wait_for(state="attached", timeout=90_000)
+    else:
+        navigate_to_page_human(human_session_page, base_url, rel_path)
+        ensure_authed(human_session_page, base_url)
+        if "login.html" in human_session_page.url:
+            human_login_via_form(human_session_page, base_url)
+            navigate_to_page_human(human_session_page, base_url, rel_path)
+        wait_for_authenticated_shell(human_session_page)
     assert "login.html" not in human_session_page.url, f"Session lost on {rel_path}"
 
     clicked = click_page_surfaces(human_session_page, rel_path, max_clicks=22)
@@ -35,6 +51,15 @@ def test_admin_settings_surfaces(human_session_page, base_url: str, rel_path: st
 def test_admin_primary_tabs(human_session_page, base_url: str, rel_path: str, tab_selector: str):
     navigate_to_page_human(human_session_page, base_url, rel_path)
     wait_for_authenticated_shell(human_session_page)
+    if rel_path == "account-management.html":
+        # Tabs live under #adminContent, hidden until async admin gate finishes.
+        human_session_page.wait_for_function(
+            """() => {
+                const el = document.getElementById('adminContent');
+                return el && getComputedStyle(el).display !== 'none';
+            }""",
+            timeout=90_000,
+        )
     tabs = human_session_page.locator(tab_selector)
     assert tabs.count() > 0, f"No tabs matching {tab_selector} on {rel_path}"
     clicked = click_admin_settings_surfaces(human_session_page, max_clicks=12)

@@ -75,7 +75,9 @@ python scripts/run_live_demo_journey.py --pipeline-timeout-min 120 --video "C:\U
 
 Optional: `--include-slow-api`, `--api-per-page 12`, `--skip-api-smoke`
 
-Upload platform defaults to **TikTok** (`E2E_UPLOAD_PLATFORMS=tiktok`). Set `E2E_TIKTOK_PROFILE=@yourhandle` when multiple TikTok accounts are connected.
+Upload platform defaults to **all connected platforms** under `/TUP` (`E2E_UPLOAD_PLATFORMS=all`).
+Legacy live-demo without `E2E_TUP` still defaults to TikTok. Set `E2E_TIKTOK_PROFILE=@yourhandle` when multiple TikTok accounts are connected.
+Persona is applied when linked (`E2E_USE_PERSONA=1`). Pikzels engine runs **once per setup cycle** (see `tup_pikzels_setup.json`).
 
 **Worker-safe mode** (`E2E_WORKER_SAFE=1`, default): 90s quiet period after publish, ~10s between pages, 2 API checks/page, skips ML/KPI-heavy pages until upload finishes. Prevents starving `worker.py` FFmpeg slots on a dev machine.
 

@@ -178,6 +178,11 @@ def resolve_pikzels_persona_style_xor(body: Dict[str, Any]) -> None:
     """
     Pikzels thumbnail endpoints do not combine ``persona`` and ``style`` pikzonalities.
     If both are set, keep ``persona`` (on-camera look) and omit ``style``.
+
+    Also enforces UploadM8 recreate_style vs face_brand when
+    ``body["_uploadm8_ref_persona_mode"]`` is set:
+      - face_brand → drop support_image_url
+      - recreate_style → drop persona (keep support image)
     """
     if not isinstance(body, dict):
         return
@@ -190,6 +195,17 @@ def resolve_pikzels_persona_style_xor(body: Dict[str, Any]) -> None:
         _log.debug(
             "pikzels: dropped style (persona and style are mutually exclusive on thumbnail calls)"
         )
+    rpm = str(body.pop("_uploadm8_ref_persona_mode", None) or "").strip().lower()
+    if not rpm:
+        return
+    has_persona = isinstance(body.get("persona"), str) and bool(str(body.get("persona")).strip())
+    has_support = bool(str(body.get("support_image_url") or "").strip())
+    if rpm == "face_brand" and has_support:
+        body.pop("support_image_url", None)
+        _log.debug("pikzels: dropped support_image_url (face_brand XOR)")
+    elif rpm == "recreate_style" and has_persona:
+        body.pop("persona", None)
+        _log.debug("pikzels: dropped persona (recreate_style XOR)")
 
 
 def trim_pikzonality_images(body: Dict[str, Any]) -> None:

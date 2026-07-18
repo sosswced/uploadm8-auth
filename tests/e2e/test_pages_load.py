@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.e2e.helpers.browser_session import navigate_to_page_human
+from tests.e2e.helpers.browser_session import goto_page_resilient, navigate_to_page_human
 from tests.e2e.helpers.human_pace import pause_between_requests
 from tests.e2e.helpers.pages import AUTHENTICATED_PAGES, PUBLIC_PAGES, NO_APP_SHELL_PAGES, page_url
 
@@ -14,9 +14,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.ui_smoke, pytest.mark.overnight]
 @pytest.mark.parametrize("rel_path", PUBLIC_PAGES)
 def test_public_page_loads(public_page, base_url: str, rel_path: str):
     url = page_url(base_url, rel_path)
-    resp = public_page.goto(url, wait_until="domcontentloaded")
-    assert resp is not None
-    assert resp.status < 500, f"{rel_path} returned {resp.status}"
+    goto_page_resilient(public_page, url)
     assert "UploadM8" in (public_page.title() or "")
 
 

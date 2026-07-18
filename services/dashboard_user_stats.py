@@ -5,6 +5,7 @@ import json
 import logging
 from typing import Any, Mapping
 
+from core.db_pool import is_dead_connection_error
 from core.deps import require_verified_user_on_conn
 from core.helpers import _now_utc, get_plan
 from core.wallet import get_wallet
@@ -202,6 +203,9 @@ async def build_dashboard_stats_payload(
             uid,
         )
     except Exception as e:
+        # Schema/SQL fallback only — never reuse a dead pool connection (UPLOADM8-80).
+        if is_dead_connection_error(e):
+            raise
         logger.warning("dashboard: platform_tokens count with revoked clause failed, fallback: %s", e)
         accounts = await conn.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", uid)
     recent = await conn.fetch(
@@ -348,6 +352,9 @@ async def _dashboard_stats_on_conn(
                 uid,
             )
         except Exception as e:
+            # Schema/SQL fallback only — never reuse a dead pool connection (UPLOADM8-80).
+            if is_dead_connection_error(e):
+                raise
             logger.warning("dashboard: platform_tokens count with revoked clause failed, fallback: %s", e)
             return await c.fetchval("SELECT COUNT(*) FROM platform_tokens WHERE user_id = $1", uid)
 

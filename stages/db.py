@@ -777,8 +777,12 @@ async def save_generated_metadata(pool: asyncpg.Pool, ctx: JobContext):
             artifact_patch[k] = v
 
     if artifact_patch:
+        from stages.pipeline_checkpoint import output_artifacts_as_object_sql
+
         idx += 1
-        updates.append(f"output_artifacts = COALESCE(output_artifacts, '{{}}'::jsonb) || ${idx}::jsonb")
+        updates.append(
+            f"output_artifacts = {output_artifacts_as_object_sql()} || ${idx}::jsonb"
+        )
         params.append(json.dumps(artifact_patch, default=str))
 
     if not updates:
@@ -920,14 +924,17 @@ async def save_trill_metadata(pool: asyncpg.Pool, ctx: JobContext) -> None:
                     "model_id": getattr(ctx, "vehicle_model_id", None),
                 }
         patch = {k: v for k, v in patch.items() if v is not None}
+        from stages.pipeline_checkpoint import output_artifacts_as_object_sql
+
+        _arts_obj = output_artifacts_as_object_sql()
         try:
             await conn.execute(
-                """
+                f"""
                 UPDATE uploads
                 SET trill_score = COALESCE($2::numeric, trill_score),
                     speed_bucket = COALESCE($3, speed_bucket),
-                    trill_metadata = COALESCE(trill_metadata, '{}'::jsonb) || $4::jsonb,
-                    output_artifacts = COALESCE(output_artifacts, '{}'::jsonb) || $5::jsonb,
+                    trill_metadata = COALESCE(trill_metadata, '{{}}'::jsonb) || $4::jsonb,
+                    output_artifacts = {_arts_obj} || $5::jsonb,
                     updated_at = NOW()
                 WHERE id = $1
                 """,
@@ -942,9 +949,9 @@ async def save_trill_metadata(pool: asyncpg.Pool, ctx: JobContext) -> None:
             # breadcrumb in output_artifacts when that column exists.
             try:
                 await conn.execute(
-                    """
+                    f"""
                     UPDATE uploads
-                    SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb) || $2::jsonb,
+                    SET output_artifacts = {_arts_obj} || $2::jsonb,
                         updated_at = NOW()
                     WHERE id = $1
                     """,
@@ -1816,10 +1823,13 @@ async def save_processed_assets(pool: asyncpg.Pool, upload_id: str, assets: Dict
 
         # Fallback: store in existing JSONB column if available
         try:
+            from stages.pipeline_checkpoint import output_artifacts_as_object_sql
+
             await conn.execute(
-                """
+                f"""
                 UPDATE uploads
-                SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb) || jsonb_build_object('processed_assets', $2::jsonb),
+                SET output_artifacts = {output_artifacts_as_object_sql()}
+                    || jsonb_build_object('processed_assets', $2::jsonb),
                     updated_at = NOW()
                 WHERE id = $1
                 """,

@@ -96,6 +96,7 @@ def main() -> int:
         "enterprise",
         "e2e",
         "overnight",
+        "grounding",
         "all",
     }
     if argv:
@@ -133,6 +134,8 @@ def main() -> int:
             "tests/test_api_entitlements_smoke.py",
             "tests/test_thumbnail_studio_personas_pikzels_api.py",
         ]
+    elif mode == "grounding":
+        targets = ["tests/test_grounding_eval.py"]
     elif mode == "settings":
         targets = [
             "tests/test_settings_combinatorics.py",

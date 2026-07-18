@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "description": "Gold-set scaffold for caption grounding CI (accuracy ladder P3). Expand toward 50–200 clips.",
+  "min_grounding_score": 0.35,
+  "clips": [
+    {
+      "id": "dashcam_beach_ocr",
+      "genre": "dashcam",
+      "evidence": {
+        "city": "Santa Monica",
+        "place_beaches": ["Santa Monica Beach"],
+        "vision_ocr_tokens": ["SANTA", "MONICA", "BEACH"],
+        "max_speed_mph": 42
+      },
+      "gold_caption": "Rolling past Santa Monica Beach at 42 mph on a clear afternoon.",
+      "bad_caption": "Epic vibes only — living my best life out here!"
+    },
+    {
+      "id": "landmark_liberty",
+      "genre": "travel",
+      "evidence": {
+        "vision_landmarks": ["Statue of Liberty"],
+        "city": "New York",
+        "state": "NY"
+      },
+      "gold_caption": "Statue of Liberty rising over New York Harbor.",
+      "bad_caption": "Another day another adventure somewhere cool."
+    },
+    {
+      "id": "speech_product",
+      "genre": "talking_head",
+      "evidence": {
+        "transcript_phrase": "this ceramic mug holds heat for hours",
+        "transcript_nouns": ["ceramic", "mug", "heat"],
+        "vision_logos": []
+      },
+      "gold_caption": "This ceramic mug holds heat for hours — desk essential.",
+      "bad_caption": "Check out this crazy transformation you won't believe."
+    },
+    {
+      "id": "sports_stadium",
+      "genre": "sports",
+      "evidence": {
+        "place_stadiums": ["Lambeau Field"],
+        "sports_teams": ["Packers"],
+        "vision_ocr_tokens": ["PACKERS", "LAMBEAU"]
+      },
+      "gold_caption": "Packers faithful packing Lambeau Field for kickoff.",
+      "bad_caption": "Game day energy is unmatched everywhere tonight."
+    }
+  ]
+}

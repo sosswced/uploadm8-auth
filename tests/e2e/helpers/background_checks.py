@@ -28,8 +28,10 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def _smoke_timeout() -> httpx.Timeout:
-    read_s = float(os.environ.get("E2E_SMOKE_READ_TIMEOUT_S", "12"))
-    return httpx.Timeout(connect=10.0, read=read_s, write=10.0, pool=10.0)
+    # Neon wake + local pool recovery need headroom; short timeouts cause connection storms.
+    read_s = float(os.environ.get("E2E_SMOKE_READ_TIMEOUT_S", "45"))
+    connect_s = float(os.environ.get("E2E_SMOKE_CONNECT_TIMEOUT_S", "20"))
+    return httpx.Timeout(connect=connect_s, read=read_s, write=20.0, pool=20.0)
 
 
 @dataclass
@@ -40,7 +42,7 @@ class BackgroundCheckRunner:
     """
 
     log: Any
-    api_per_page: int = 8
+    api_per_page: int = 2
     include_slow_api: bool = False
     skip_api_smoke: bool = False
 
@@ -161,14 +163,15 @@ class BackgroundCheckRunner:
             row, client = self._run_api_case(client, case)
             batch["api"].append(row)
             self._records.append(row)
+            pause_between_requests()
 
         if include_target_user and self._target_idx < len(self._target_specs):
             row, client = self._run_target_user_case(client, self._target_specs[self._target_idx])
             batch["target_user"] = row
             self._records.append(row)
             self._target_idx += 1
+            pause_between_requests()
 
-        pause_between_requests()
         return batch, client
 
     def drain_remaining_api(self, client: httpx.Client) -> tuple[int, httpx.Client]:
@@ -184,8 +187,8 @@ class BackgroundCheckRunner:
             row, client = self._run_api_case(client, case)
             self._records.append(row)
             ran += 1
-            if ran % 10 == 0:
-                pause_between_requests()
+            # Always pace — parallel-ish bursts open extra sockets and trip Neon limits.
+            pause_between_requests()
         return ran, client
 
     def api_remaining(self) -> int:

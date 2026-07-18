@@ -44,6 +44,15 @@ def append_provider_error(
     """
     arts = getattr(ctx, "output_artifacts", None)
     if not isinstance(arts, dict):
+        # Corrupted JSON-array artifacts lose provider traces — coerce in-memory.
+        try:
+            from core.helpers import coerce_output_artifacts_dict
+
+            arts = coerce_output_artifacts_dict(arts)
+            setattr(ctx, "output_artifacts", arts)
+        except Exception:
+            return
+    if not isinstance(arts, dict):
         return
     raw = arts.get(_TRACE_KEY)
     rows = []

@@ -65,9 +65,31 @@ def test_upload_funnel_emit_and_read():
 def test_is_requeueable_upload_policy():
     assert is_requeueable_upload("pending", None) is True
     assert is_requeueable_upload("pending", "ENQUEUE_FAILED") is True
+    assert is_requeueable_upload("pending", "PUBLISH_SLOT_MISSING") is True
+    assert is_requeueable_upload("pending", "STUCK_PENDING") is True
     assert is_requeueable_upload("pending", "PLATFORM_AUTH_FAILED") is False
     assert is_requeueable_upload("queued", "ENQUEUE_FAILED") is False
     assert is_requeueable_upload("failed", "ENQUEUE_FAILED") is False
+
+
+def test_is_retryable_upload_policy():
+    from services.upload.status import is_retryable_upload
+
+    assert is_retryable_upload("failed") is True
+    assert is_retryable_upload("cancelled") is True
+    assert is_retryable_upload("partial", has_failed_platform=True) is True
+    assert is_retryable_upload("partial", has_failed_platform=False) is False
+    assert is_retryable_upload("pending") is False
+    assert is_retryable_upload("processing", stale_processing=True) is True
+    assert is_retryable_upload("processing", stale_processing=False) is False
+    # Hard-blocks must match classify_retry_error (API returns 409).
+    assert is_retryable_upload("failed", error_code="PLATFORM_AUTH_FAILED") is False
+    assert is_retryable_upload("failed", error_code="INSUFFICIENT_TOKENS") is False
+    assert is_retryable_upload("failed", error_code="SOURCE_NOT_IN_R2") is False
+    assert is_retryable_upload("failed", error_code="INTERNAL") is True
+    assert is_retryable_upload(
+        "partial", error_code="PLATFORM_AUTH_FAILED", has_failed_platform=True
+    ) is False
 
 
 def test_cancellable_statuses_match_cancel_policy():

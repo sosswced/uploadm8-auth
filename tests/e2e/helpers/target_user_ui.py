@@ -115,6 +115,22 @@ def exercise_account_management_target(page: Page, base_url: str) -> dict[str, A
     return out
 
 
+def _wait_wallet_page_ready(page: Page) -> None:
+    page.wait_for_function(
+        "() => document.getElementById('mainContent') && getComputedStyle(document.getElementById('mainContent')).display !== 'none'",
+        timeout=90_000,
+    )
+
+
+def _wallet_search_and_select(page: Page) -> None:
+    inp = page.locator("#userSearchInput")
+    inp.fill(_search_term())
+    result = page.locator(".search-result-item").first
+    expect(result).to_be_visible(timeout=30_000)
+    result.click()
+    page.wait_for_timeout(click_delay_ms())
+
+
 def exercise_admin_wallet_target(page: Page, base_url: str) -> dict[str, Any]:
     """Wallet admin: search target user → load PUT/AIC balances + ledger."""
     uid = e2e_target_user_id()
@@ -123,20 +139,10 @@ def exercise_admin_wallet_target(page: Page, base_url: str) -> dict[str, Any]:
 
     navigate_to_page_human(page, base_url, "admin-wallet.html")
     wait_for_authenticated_shell(page)
-    page.wait_for_function(
-        "() => document.getElementById('mainContent') && getComputedStyle(document.getElementById('mainContent')).display !== 'none'",
-        timeout=90_000,
-    )
+    _wait_wallet_page_ready(page)
 
-    inp = page.locator("#userSearchInput")
-    inp.fill(_search_term())
-    page.wait_for_timeout(600)
+    _wallet_search_and_select(page)
     out["steps"].append("wallet_search")
-
-    result = page.locator(".search-result-item").first
-    expect(result).to_be_visible(timeout=30_000)
-    result.click()
-    page.wait_for_timeout(click_delay_ms())
 
     expect(page.locator("#selectedUserCard")).to_be_visible(timeout=15_000)
     sel_text = page.locator("#selectedUserCard").inner_text()
@@ -167,10 +173,9 @@ def exercise_admin_wallet_target(page: Page, base_url: str) -> dict[str, Any]:
             click_admin_settings_surfaces(page, max_clicks=6)
             out["steps"].append(f"billing_tab_{tab_href}")
             navigate_to_page_human(page, base_url, "admin-wallet.html")
-            inp.fill(_search_term())
-            page.wait_for_timeout(500)
-            page.locator(".search-result-item").first.click()
-            page.wait_for_timeout(click_delay_ms())
+            wait_for_authenticated_shell(page)
+            _wait_wallet_page_ready(page)
+            _wallet_search_and_select(page)
 
     return out
 

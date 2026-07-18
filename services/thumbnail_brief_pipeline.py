@@ -287,6 +287,9 @@ def attach_youtube_support_image_from_ctx(
     2. Saved default YouTube reference (user preferences)
     3. Upload default strategy ``reference_youtube_url`` / ``youtube_url``
     4. Published YouTube URL on this upload (``platform_results``)
+
+    Skipped when apply mode is ``strategy_only`` / ``pinned_cover``, or when
+    ref/persona mode is ``face_brand`` (persona XOR YouTube support).
     """
     b = dict(brief or {})
     if str(b.get("_uploadm8_pikzels_support_image_url") or "").strip().startswith("https://"):
@@ -294,6 +297,11 @@ def attach_youtube_support_image_from_ctx(
 
     us = user_settings if user_settings is not None else getattr(ctx, "user_settings", None)
     if isinstance(us, dict):
+        from services.thumbnail_apply_mode import allow_youtube_support_image, resolve_ref_persona_mode
+
+        if not allow_youtube_support_image(us):
+            b["_uploadm8_support_image_skipped"] = resolve_ref_persona_mode(us)
+            return b
         from services.thumbnail_youtube_refs import (
             support_image_url_from_prefs,
         )

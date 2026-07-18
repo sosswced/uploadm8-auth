@@ -55,41 +55,108 @@ def thumbnail_render_method_from_artifacts(raw: Any) -> str:
     return str(artifacts.get("thumbnail_render_method") or "").strip().lower()
 
 
+def _parse_studio_render_report(raw_artifacts: Any) -> Dict[str, Any]:
+    artifacts = coerce_output_artifacts_dict(raw_artifacts)
+    raw_report = artifacts.get("studio_render_report")
+    if isinstance(raw_report, str) and raw_report.strip():
+        try:
+            rep = json.loads(raw_report)
+            return rep if isinstance(rep, dict) else {}
+        except Exception:
+            return {}
+    if isinstance(raw_report, dict):
+        return dict(raw_report)
+    return {}
+
+
+def studio_thumb_diagnostics_from_artifacts(raw_artifacts: Any) -> Dict[str, Any]:
+    """Queue/detail payload: render methods + cover push status + skip reason."""
+    artifacts = coerce_output_artifacts_dict(raw_artifacts)
+    report = _parse_studio_render_report(raw_artifacts)
+    methods = report.get("platform_render_methods")
+    if not isinstance(methods, dict):
+        raw_m = artifacts.get("platform_render_methods")
+        if isinstance(raw_m, str) and raw_m.strip():
+            try:
+                methods = json.loads(raw_m)
+            except Exception:
+                methods = {}
+        elif isinstance(raw_m, dict):
+            methods = raw_m
+        else:
+            methods = {}
+    push = artifacts.get("platform_thumb_push_status")
+    if isinstance(push, str) and push.strip():
+        try:
+            push = json.loads(push)
+        except Exception:
+            push = {}
+    if not isinstance(push, dict):
+        push = {}
+    return {
+        "thumbnail_render_method": thumbnail_render_method_from_artifacts(raw_artifacts),
+        "skip_reason": str(report.get("skip_reason") or "").strip() or None,
+        "pikzels_requested_but_skipped": bool(
+            report.get("pikzels_requested_but_skipped")
+            or str(artifacts.get("pikzels_requested_but_skipped") or "") in ("1", "true", "yes")
+        ),
+        "platform_render_methods": methods,
+        "platform_thumb_push_status": push,
+        "instagram_cover_url_set": report.get("instagram_cover_url_set"),
+        "studio_winner_apply_mode": report.get("studio_winner_apply_mode"),
+    }
+
+
 def pikzels_template_thumbnail_warning(raw_artifacts: Any) -> Optional[Dict[str, str]]:
     """
     When the server has PIKZELS_API_KEY but this upload used PIL template render,
     return a short warning for queue/upload UI.
     """
     method = thumbnail_render_method_from_artifacts(raw_artifacts)
-    if method not in ("template", "none", ""):
+    report = _parse_studio_render_report(raw_artifacts)
+    requested = bool(
+        report.get("pikzels_requested_but_skipped")
+        or str(coerce_output_artifacts_dict(raw_artifacts).get("pikzels_requested_but_skipped") or "")
+        in ("1", "true", "yes")
+    )
+    if method in ("studio_renderer", "studio_winner_cover_direct") and not requested:
+        return None
+    if method not in ("template", "none", "", "sticker_composite") and not requested:
         return None
     try:
         from services.pikzels_v2 import resolve_public_api_key
 
-        if not (resolve_public_api_key() or "").strip():
+        if not (resolve_public_api_key() or "").strip() and not requested:
             return None
     except Exception:
-        return None
-    artifacts = coerce_output_artifacts_dict(raw_artifacts)
-    skip_reason = ""
-    raw_report = artifacts.get("studio_render_report")
-    if isinstance(raw_report, str) and raw_report.strip():
-        try:
-            rep = json.loads(raw_report)
-            if isinstance(rep, dict):
-                skip_reason = str(rep.get("skip_reason") or "").strip()
-        except Exception:
-            pass
-    elif isinstance(raw_report, dict):
-        skip_reason = str(raw_report.get("skip_reason") or "").strip()
-    return {
-        "code": "pikzels_template_fallback",
-        "message": (
+        if not requested:
+            return None
+    skip_reason = str(report.get("skip_reason") or "").strip()
+    msg = (
+        "Pikzels was requested for this upload but was not used "
+        f"({method or 'no render'})."
+        if requested
+        else (
             "This upload did not use Pikzels Studio (template or raw frame only). "
             "Turn on auto-thumbnails and Thumbnail Studio in Settings, and set render pipeline to Auto."
-        ),
+        )
+    )
+    if skip_reason == "tier_lacks_ai_thumbnail_styling":
+        msg = (
+            "Your plan can store custom thumbnails but Pikzels AI styling needs Creator Pro or higher. "
+            "Upgrade to generate Pikzels covers on upload."
+        )
+    elif skip_reason == "persona_not_linked":
+        msg = (
+            "A persona was selected but is not linked to Pikzels. "
+            "Open Thumbnail Studio → Personas → Link to Pikzels."
+        )
+    return {
+        "code": "pikzels_requested_skipped" if requested else "pikzels_template_fallback",
+        "message": msg,
         "settings_path": "settings.html#thumbnail-studio",
         "skip_reason": skip_reason,
+        "upgrade_path": "billing.html" if skip_reason == "tier_lacks_ai_thumbnail_styling" else None,
     }
 
 

@@ -126,6 +126,15 @@ def test_build_records_expands_platform_results():
                 "ai_hashtags_enabled": True,
                 "ai_hashtag_count": 3,
                 "caption_frame_count": 6,
+                "thumbnail_studio_enabled": True,
+                "thumbnail_studio_engine_enabled": True,
+                "thumbnail_persona_enabled": True,
+                "thumbnail_persona_strength": 70,
+                "studio_variant_ctr_score": 0.62,
+                "studio_pikzels_main_score": 0.58,
+                "thumbnail_audience_niche": "cars",
+                "thumbnail_engine_mode": "uploadm8_pikzels_v2_pipeline",
+                "thumbnail_layout_pattern": "face_left_text_right",
             }
         },
     }
@@ -134,3 +143,205 @@ def test_build_records_expands_platform_results():
     assert out[0]["platform"] == "tiktok"
     assert out[0]["has_attribution"] == 1
     assert out[0]["content_category"] == "cars"
+    assert out[0]["thumbnail_persona_enabled"] == 1
+    assert out[0]["studio_variant_ctr_score"] == 0.62
+    assert out[0]["thumbnail_audience_niche"] == "cars"
+    assert "thumbnail_studio_enabled" in FEATURES_NUM
+    assert "thumbnail_audience_niche" in FEATURES_CAT
+
+
+def test_registry_marks_leakage_columns_deprecated():
+    from services.ml_feature_registry import PROMO_FEATURES
+
+    by_name = {f.name: f for f in PROMO_FEATURES}
+    assert by_name["channel"].status == "deprecated"
+    assert by_name["delivery_status"].status == "deprecated"
+    assert "channel" not in active_cat("promo")
+    assert "delivery_status" not in active_cat("promo")
+    assert "channel" not in active_num("promo")
+
+
+def test_public_ml_hub_is_link_only_no_tokens():
+    from services.ml_hub_config import build_ml_hub_public_response
+
+    payload = build_ml_hub_public_response()
+    blob = str(payload).lower()
+    for needle in ("hf_token", "hugging_face_hub_token", "authorization", "bearer "):
+        assert needle not in blob
+    assert "huggingface" in payload
+    assert "ecosystem" in payload
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kl = str(k).lower()
+                assert "token" not in kl or kl.endswith("_doc")
+                _walk(v)
+        elif isinstance(obj, list):
+            for x in obj:
+                _walk(x)
+
+    _walk(payload)
+
+
+def test_admin_ml_routes_require_admin():
+    from app import app
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        for path in (
+            "/api/admin/ml/feature-catalog",
+            "/api/admin/ml/engine-status",
+            "/api/admin/ml/observability-overview?mode=strip",
+        ):
+            r = client.get(path)
+            assert r.status_code in (401, 403), path
+
+
+def test_studio_estimate_debits_via_atomic_and_refs_service_weights():
+    from stages.ai_service_costs import SERVICE_WEIGHTS
+    from services.thumbnail_studio import estimate_studio_cost
+
+    put, aic, breakdown = estimate_studio_cost(
+        variant_count=2,
+        has_persona=True,
+        competitor_gap_mode=True,
+        has_channel_memory=True,
+    )
+    assert put > 0 and aic > 0
+    assert breakdown.get("debit_via") == "atomic_debit_tokens"
+    assert breakdown["service_weight_refs"]["competitor_gap_aic"] == "thumbnail_competitor_gap"
+    assert breakdown["components"]["competitor_gap_aic"] == SERVICE_WEIGHTS["thumbnail_competitor_gap"]
+
+
+def test_dashcam_osd_included_in_presign_aic_when_vision_on():
+    from stages.ai_service_costs import resolve_enabled_ai_services
+
+    enabled = resolve_enabled_ai_services(
+        can_ai=True,
+        user_prefs={
+            "autoCaptions": True,
+            "autoThumbnails": True,
+            "aiServiceDashcamOSD": True,
+        },
+        use_ai_request=True,
+        has_telemetry=False,
+        env={
+            "VISION_STAGE_ENABLED": True,
+            "AUDIO_STAGE_ENABLED": False,
+            "TREND_INTEL_AVAILABLE": False,
+        },
+    )
+    assert "dashcam_osd" in enabled
+    assert "vision_google" in enabled
+
+    disabled = resolve_enabled_ai_services(
+        can_ai=True,
+        user_prefs={
+            "autoCaptions": True,
+            "autoThumbnails": True,
+            "aiServiceDashcamOSD": False,
+        },
+        use_ai_request=True,
+        has_telemetry=False,
+        env={"VISION_STAGE_ENABLED": True, "AUDIO_STAGE_ENABLED": False},
+    )
+    assert "dashcam_osd" not in disabled
+
+
+def test_ml_engine_finalize_blocks_seeded_and_cold_data():
+    import asyncio
+    from unittest.mock import MagicMock
+
+    from services.ml_engine import _finalize_publish
+    from services.ml_engine_config import get_ml_engine_config
+
+    async def _seeded():
+        out: dict = {}
+        cfg = get_ml_engine_config()
+        await _finalize_publish(
+            cfg,
+            None,
+            out,
+            {"status": "ok", "train_rows": max(cfg.min_train_rows, 100), "roc_auc": 0.99},
+            True,
+            task="promo_targeting_uplift_baseline",
+            push_step=MagicMock(return_value={"ok": True}),
+            record_run=MagicMock(),
+        )
+        return out
+
+    async def _cold():
+        out: dict = {}
+        cfg = get_ml_engine_config()
+        await _finalize_publish(
+            cfg,
+            None,
+            out,
+            {"status": "insufficient_rows", "message": "need more rows"},
+            False,
+            task="promo_targeting_uplift_baseline",
+            push_step=MagicMock(side_effect=AssertionError("must not push")),
+            record_run=MagicMock(),
+        )
+        return out
+
+    async def _low_roc():
+        out: dict = {}
+        cfg = get_ml_engine_config()
+        await _finalize_publish(
+            cfg,
+            None,
+            out,
+            {
+                "status": "ok",
+                "train_rows": max(cfg.min_train_rows, 100),
+                "roc_auc": max(0.0, cfg.publish_min_roc_auc - 0.2),
+            },
+            False,
+            task="promo_targeting_uplift_baseline",
+            push_step=MagicMock(side_effect=AssertionError("must not push")),
+            record_run=MagicMock(),
+        )
+        return out
+
+    seeded = asyncio.run(_seeded())
+    assert seeded["ok"] is True
+    assert seeded["status"] == "trained_not_published"
+    assert "seeded" in seeded["reason_not_published"]
+
+    cold = asyncio.run(_cold())
+    assert cold["ok"] is True
+    assert cold["status"] == "blocked_on_data"
+
+    low = asyncio.run(_low_roc())
+    assert low["ok"] is True
+    assert low["status"] == "trained_not_published"
+    assert "roc_auc" in low["reason_not_published"]
+
+
+def test_smart_schedule_blend_prefers_user_when_enough_samples():
+    from services.smart_schedule_insights import _blend_vectors, _normalize
+
+    static_w = _normalize([1.0] * 24)
+    global_w = _normalize([2.0 if i == 10 else 0.1 for i in range(24)])
+    user_w = _normalize([5.0 if i == 18 else 0.05 for i in range(24)])
+    momentum = [1.0] * 24
+
+    low = _blend_vectors(static_w, global_w, user_w, user_sample_count=2, momentum=momentum)
+    high = _blend_vectors(static_w, global_w, user_w, user_sample_count=20, momentum=momentum)
+    assert abs(sum(low) - 1.0) < 1e-6
+    assert abs(sum(high) - 1.0) < 1e-6
+    assert high[18] > low[18]
+
+
+def test_architecture_doc_restored():
+    from pathlib import Path
+
+    doc = Path(__file__).resolve().parents[1] / "docs" / "ml-ai-architecture.md"
+    assert doc.is_file()
+    text = doc.read_text(encoding="utf-8")
+    assert "ml_feature_registry" in text
+    assert "atomic_debit_tokens" in text
+    assert "trained_not_published" in text
+    assert "require_admin" in text

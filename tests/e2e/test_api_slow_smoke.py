@@ -25,8 +25,8 @@ def _collect_slow_cases(api_session: httpx.Client):
 
 
 def _smoke_timeout() -> httpx.Timeout:
-    read_s = float(os.environ.get("E2E_SMOKE_READ_TIMEOUT_S", "30"))
-    return httpx.Timeout(connect=15.0, read=read_s, write=15.0, pool=15.0)
+    read_s = float(os.environ.get("E2E_SMOKE_READ_TIMEOUT_S", "45"))
+    return httpx.Timeout(connect=20.0, read=read_s, write=20.0, pool=20.0)
 
 
 def _get_with_retry(client: httpx.Client, path: str, *, attempts: int = 4) -> httpx.Response:

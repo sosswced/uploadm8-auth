@@ -211,45 +211,133 @@ def _tiktok_cover_timestamp_ms(ctx: JobContext) -> int:
     return 1500
 
 
+def _youtube_thumb_push_error_code(status: int, body: str) -> str:
+    text = (body or "").lower()
+    if status in (401, 403) or "forbidden" in text:
+        if "verified" in text or "verification" in text:
+            return "youtube_channel_not_verified"
+        if "custom thumbnail" in text or "thumbnail" in text and "permission" in text:
+            return "youtube_custom_thumbs_disabled"
+        return "youtube_thumb_forbidden"
+    if status == 429 or "rateLimitExceeded" in (body or "") or "quota" in text:
+        return "youtube_thumb_rate_limited"
+    if status >= 500:
+        return "youtube_thumb_server_error"
+    return f"youtube_thumb_http_{status}"
+
+
+def _record_platform_thumb_push(ctx: JobContext, platform: str, payload: Dict[str, Any]) -> None:
+    raw = ctx.output_artifacts.get("platform_thumb_push_status") or "{}"
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[str(platform)] = payload
+    ctx.output_artifacts["platform_thumb_push_status"] = json.dumps(data)
+
+
 async def _push_thumbnail_to_platform(
     platform: str,
     video_id: str,
     thumbnail_path: Optional[Path],
     access_token: str,
     client: httpx.AsyncClient,
+    *,
+    ctx: Optional[JobContext] = None,
+    max_attempts: int = 3,
 ) -> bool:
     """
     Upload the local thumbnail JPEG to the platform as the video cover.
     Called right after a successful video publish.
     Non-fatal — a failure here never blocks the upload result.
 
-    YouTube:   POST /thumbnails/set  (multipart, requires verified channel)
+    YouTube:   POST /thumbnails/set  (multipart, requires verified channel) with retry/backoff
     TikTok:    Uses ``video_cover_timestamp_ms`` at init (not custom image upload).
     Instagram: Cover must be set at container creation time (handled there).
     Facebook:  POST /{video_id}  with thumb= multipart field.
     """
     if not thumbnail_path or not thumbnail_path.exists():
+        if ctx is not None:
+            _record_platform_thumb_push(
+                ctx, platform, {"ok": False, "error_code": "thumbnail_file_missing"}
+            )
         return False
     try:
         thumbnail_path = ensure_jpeg_file(Path(thumbnail_path))
         if platform == "youtube":
             with open(thumbnail_path, "rb") as f:
                 thumb_bytes = f.read()
-            resp = await client.post(
-                f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
-                f"?videoId={video_id}&uploadType=media",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "image/jpeg",
-                    "Content-Length": str(len(thumb_bytes)),
-                },
-                content=thumb_bytes,
-                timeout=60,
+            last_status = 0
+            last_body = ""
+            for attempt in range(max(1, int(max_attempts))):
+                resp = await client.post(
+                    f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
+                    f"?videoId={video_id}&uploadType=media",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "image/jpeg",
+                        "Content-Length": str(len(thumb_bytes)),
+                    },
+                    content=thumb_bytes,
+                    timeout=60,
+                )
+                last_status = int(resp.status_code)
+                last_body = resp.text[:400] if resp.text else ""
+                if resp.status_code in (200, 201):
+                    logger.info(
+                        "YouTube thumbnail set: video_id=%s attempt=%s",
+                        video_id,
+                        attempt + 1,
+                    )
+                    if ctx is not None:
+                        _record_platform_thumb_push(
+                            ctx,
+                            "youtube",
+                            {"ok": True, "attempts": attempt + 1, "http_status": last_status},
+                        )
+                    return True
+                err_code = _youtube_thumb_push_error_code(last_status, last_body)
+                # Don't retry permanent channel/permission failures.
+                if err_code in (
+                    "youtube_channel_not_verified",
+                    "youtube_custom_thumbs_disabled",
+                    "youtube_thumb_forbidden",
+                ):
+                    break
+                if attempt + 1 < max_attempts and last_status in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(0.75 * (2 ** attempt))
+                    continue
+                break
+            err_code = _youtube_thumb_push_error_code(last_status, last_body)
+            logger.warning(
+                "YouTube thumbnail failed: %s %s code=%s",
+                last_status,
+                last_body[:200],
+                err_code,
             )
-            if resp.status_code in (200, 201):
-                logger.info(f"YouTube thumbnail set: video_id={video_id}")
-                return True
-            logger.warning(f"YouTube thumbnail failed: {resp.status_code} {resp.text[:200]}")
+            if ctx is not None:
+                _record_platform_thumb_push(
+                    ctx,
+                    "youtube",
+                    {
+                        "ok": False,
+                        "http_status": last_status,
+                        "error_code": err_code,
+                        "message": (
+                            "YouTube rejected the custom thumbnail. "
+                            "Verify the channel and enable custom thumbnails in YouTube Studio."
+                            if err_code
+                            in (
+                                "youtube_channel_not_verified",
+                                "youtube_custom_thumbs_disabled",
+                                "youtube_thumb_forbidden",
+                            )
+                            else last_body[:180]
+                        ),
+                    },
+                )
             return False
 
         elif platform == "facebook":
@@ -263,13 +351,32 @@ async def _push_thumbnail_to_platform(
             )
             if resp.status_code == 200 and resp.json().get("success"):
                 logger.info(f"Facebook thumbnail set: video_id={video_id}")
+                if ctx is not None:
+                    _record_platform_thumb_push(
+                        ctx, "facebook", {"ok": True, "http_status": resp.status_code}
+                    )
                 return True
             logger.warning(f"Facebook thumbnail failed: {resp.status_code} {resp.text[:200]}")
+            if ctx is not None:
+                _record_platform_thumb_push(
+                    ctx,
+                    "facebook",
+                    {
+                        "ok": False,
+                        "http_status": resp.status_code,
+                        "error_code": "facebook_thumb_failed",
+                        "message": (resp.text or "")[:180],
+                    },
+                )
             return False
 
         return False
     except Exception as e:
         logger.warning(f"Thumbnail push {platform} failed (non-fatal): {e}")
+        if ctx is not None:
+            _record_platform_thumb_push(
+                ctx, platform, {"ok": False, "error_code": "thumb_push_exception", "message": str(e)[:180]}
+            )
         return False
 
 
@@ -1509,23 +1616,34 @@ async def publish_to_youtube(
             logger.info(f"YouTube publish accepted: video_id={video_id}, url={platform_url}")
             # Push thumbnail to YouTube (non-fatal — requires verified channel)
             thumb_path = await _ensure_platform_thumbnail_local(ctx, "youtube")
+            yt_payload: Dict[str, Any] = {"youtube_long_form_rights_guard": rights_long_form} if rights_long_form else {}
             if video_id and thumb_path:
                 pushed = await _push_thumbnail_to_platform(
-                    "youtube", video_id, thumb_path, access_token, client
+                    "youtube", video_id, thumb_path, access_token, client, ctx=ctx
                 )
                 if not pushed:
                     logger.warning(
                         "YouTube: custom thumbnail not applied for video_id=%s "
-                        "(channel may need verification)",
+                        "(channel may need verification / custom thumbs disabled)",
                         video_id,
                     )
+                    try:
+                        push_raw = ctx.output_artifacts.get("platform_thumb_push_status") or "{}"
+                        push_map = json.loads(push_raw) if isinstance(push_raw, str) else (push_raw or {})
+                        yt_push = push_map.get("youtube") if isinstance(push_map, dict) else None
+                        if isinstance(yt_push, dict):
+                            yt_payload["thumbnail_push"] = yt_push
+                    except Exception:
+                        yt_payload["thumbnail_push"] = {"ok": False}
+                else:
+                    yt_payload["thumbnail_push"] = {"ok": True}
             return PlatformResult(
                 platform="youtube",
                 success=True,
                 platform_video_id=video_id,
                 platform_url=platform_url,
                 verify_status="pending",
-                response_payload={"youtube_long_form_rights_guard": rights_long_form} if rights_long_form else None,
+                response_payload=yt_payload or None,
             )
 
     except Exception as e:
@@ -1698,6 +1816,41 @@ async def publish_to_instagram(
                         logger.warning(f"Instagram: could not set cover_url: {_e}")
             if thumb_cover_url:
                 ig_params["cover_url"] = thumb_cover_url
+                _record_platform_thumb_push(
+                    ctx,
+                    "instagram",
+                    {"ok": True, "cover_url_set": True, "stage": "container_create"},
+                )
+                try:
+                    rep_raw = ctx.output_artifacts.get("studio_render_report")
+                    if isinstance(rep_raw, str) and rep_raw.strip():
+                        rep = json.loads(rep_raw)
+                        if isinstance(rep, dict):
+                            rep["instagram_cover_url_set"] = True
+                            ctx.output_artifacts["studio_render_report"] = json.dumps(rep)
+                except Exception:
+                    pass
+            else:
+                method = str(ctx.output_artifacts.get("thumbnail_render_method") or "").strip().lower()
+                _record_platform_thumb_push(
+                    ctx,
+                    "instagram",
+                    {
+                        "ok": False,
+                        "cover_url_set": False,
+                        "stage": "container_create",
+                        "error_code": "instagram_cover_missing",
+                        "message": (
+                            "No 9:16 Pikzels/styled cover available at Reels container create. "
+                            f"thumbnail_render_method={method or 'unknown'}"
+                        ),
+                    },
+                )
+                logger.warning(
+                    "Instagram: publishing Reels without cover_url (no platform thumb) upload=%s method=%s",
+                    getattr(ctx, "upload_id", ""),
+                    method,
+                )
             create_resp = await client.post(
                 f"https://graph.facebook.com/{META_API_VERSION}/{ig_user_id}/media",
                 params=ig_params
@@ -2048,7 +2201,7 @@ async def publish_to_facebook(
             thumb_path = await _ensure_platform_thumbnail_local(ctx, "facebook")
             if video_id and thumb_path:
                 pushed = await _push_thumbnail_to_platform(
-                    "facebook", video_id, thumb_path, access_token, client
+                    "facebook", video_id, thumb_path, access_token, client, ctx=ctx
                 )
                 if not pushed:
                     logger.warning(

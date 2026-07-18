@@ -843,9 +843,10 @@ def _thumbnail_styled_render_order(
     studio still runs next when configured so YouTube reference styling can apply
     if the local pass did not produce an acceptable cover.
 
-    When Pikzels studio is available (``studio_ok``), styled thumbnail pixels prefer
-    that path after stickers. Optional ``refine_thumbnail_with_pikzels_edit`` still
-    runs after a successful studio render when hydration edit is enabled.
+    When Pikzels studio is available (``studio_ok``), try studio first, then always
+    keep ``template`` as a hard fallback so a Pikzels 4xx cannot leave the upload
+    with ``thumbnail_render_method=none`` and queue card 404s (ops
+    ``pikzels_template_fallback`` / ``pikzels_render_failed``).
     """
     p = (pipeline_pref or "auto").lower().strip()
     if p not in ("auto", "studio_renderer", "ai_edit", "template", "none"):
@@ -856,7 +857,8 @@ def _thumbnail_styled_render_order(
     sticker_first: List[str] = ["sticker"] if sticker_ok else []
 
     if studio_ok:
-        return sticker_first + ["studio"]
+        # Studio first; PIL template always last so API 400s still produce a cover.
+        return sticker_first + ["studio", "template"]
     if p == "template":
         return sticker_first + ["template"]
     if p == "ai_edit":
@@ -942,7 +944,7 @@ def pikzels_studio_eligible_for_styled_thumbnail(
         # When the API key is configured AND the user has the entitlement, treat
         # a stale "none" preference as opt-in (auto). Without this every account
         # whose preference row predates the studio renderer silently bypassed Pikzels.
-        if ready and can_custom:
+        if ready and can_custom and can_ai_style:
             render_pipeline_pref = "auto"
         else:
             return False
@@ -971,7 +973,49 @@ def pikzels_studio_eligible_for_styled_thumbnail(
         "thumbnail_pikzels_enabled",
         "thumbnailPikzelsEnabled",
     )
-    return bool(studio_flow and use_studio_engine and ready)
+    return bool(studio_flow and use_studio_engine and ready and can_ai_style)
+
+
+def studio_pipeline_skip_reason(
+    us: Dict[str, Any],
+    entitlements: Any,
+    *,
+    require_auto_thumbnails: bool = True,
+) -> Optional[str]:
+    """Human/diagnostic reason when ``pikzels_studio_eligible_for_styled_thumbnail`` is false."""
+    if pikzels_studio_eligible_for_styled_thumbnail(
+        us, entitlements, require_auto_thumbnails=require_auto_thumbnails
+    ):
+        return None
+    ready = studio_renderer_enabled()
+    can_custom = bool(getattr(entitlements, "can_custom_thumbnails", False) if entitlements else False)
+    can_ai_style = bool(getattr(entitlements, "can_ai_thumbnail_styling", False) if entitlements else False)
+    if not ready:
+        return "pikzels_api_key_missing"
+    if can_custom and not can_ai_style:
+        return "tier_lacks_ai_thumbnail_styling"
+    if not can_custom:
+        return "tier_lacks_can_custom_thumbnails"
+    auto_on = bool(us.get("auto_thumbnails") or us.get("autoThumbnails"))
+    if require_auto_thumbnails and not auto_on and not _upload_requests_thumbnail_render(us):
+        return "auto_thumbnails_disabled"
+    if normalize_thumbnail_render_pipeline(us) == "none" and not (ready and can_custom and can_ai_style):
+        return "thumbnail_render_pipeline_none"
+    styled = us.get("styled_thumbnails", us.get("styledThumbnails", True))
+    if styled is False:
+        return "styled_thumbnails_disabled"
+    for k in ("thumbnail_studio_enabled", "thumbnailStudioEnabled"):
+        if k in us and not bool(us.get(k)):
+            return "thumbnail_studio_flow_disabled"
+    for k in (
+        "thumbnail_studio_engine_enabled",
+        "thumbnailStudioEngineEnabled",
+        "thumbnail_pikzels_enabled",
+        "thumbnailPikzelsEnabled",
+    ):
+        if k in us and not bool(us.get(k)):
+            return "studio_engine_disabled"
+    return "pikzels_studio_pipeline_ineligible"
 
 
 def _studio_persona_for_request(us: Dict) -> Tuple[Optional[Dict], Optional[Dict]]:
@@ -1130,6 +1174,8 @@ def _apply_thumbnail_default_strategy(
     upload still fills speech/music/geo/vision details, so outputs stay consistent in
     structure but adapt to each video.
     """
+    from services.thumbnail_apply_mode import apply_structured_strategy_to_brief
+
     strategy = _thumbnail_default_strategy(us)
     if not strategy:
         return brief
@@ -1157,7 +1203,7 @@ def _apply_thumbnail_default_strategy(
         joined = " ".join(bits)
         b["notes"] = (existing + " " + joined).strip()[:700]
         b["default_strategy"] = strategy
-    return b
+    return apply_structured_strategy_to_brief(b, strategy)
 
 
 def _strict_studio_mode_enabled(us: Dict[str, Any]) -> bool:
@@ -1171,7 +1217,40 @@ def _strict_studio_mode_enabled(us: Dict[str, Any]) -> bool:
         raw = us.get("thumbnail_pikzels_strict")
     if raw is None:
         raw = us.get("thumbnailPikzelsStrict")
-    return bool(raw)
+    if raw is not None:
+        return bool(raw)
+    # Default strict when this upload explicitly opted into the studio engine.
+    for key in (
+        "thumbnail_studio_engine_enabled",
+        "thumbnailStudioEngineEnabled",
+        "thumbnail_pikzels_enabled",
+        "thumbnailPikzelsEnabled",
+    ):
+        if key in us and bool(us.get(key)):
+            return True
+    return False
+
+
+def _engine_explicitly_requested(us: Dict[str, Any]) -> bool:
+    for key in (
+        "thumbnail_studio_engine_enabled",
+        "thumbnailStudioEngineEnabled",
+        "thumbnail_pikzels_enabled",
+        "thumbnailPikzelsEnabled",
+    ):
+        if key in us:
+            return bool(us.get(key))
+    return False
+
+
+def _persona_explicitly_required(us: Dict[str, Any]) -> bool:
+    if us.get("thumbnail_persona_required") or us.get("thumbnailPersonaRequired"):
+        return True
+    if us.get("thumbnail_persona_enabled") or us.get("thumbnailPersonaEnabled"):
+        return bool(
+            us.get("thumbnail_default_persona_id") or us.get("thumbnailDefaultPersonaId")
+        )
+    return False
 
 
 def _hydration_pikzels_edit_enabled() -> bool:
@@ -1512,16 +1591,23 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         and styled_generation_enabled
     ):
         if not can_custom:
-            studio_render_report["skip_reason"] = "tier lacks can_custom_thumbnails"
+            studio_render_report["skip_reason"] = "tier_lacks_can_custom_thumbnails"
         elif not styled_enabled:
-            studio_render_report["skip_reason"] = "user pref styled_thumbnails=false"
+            studio_render_report["skip_reason"] = "styled_thumbnails_disabled"
         elif not ctx.temp_dir:
-            studio_render_report["skip_reason"] = "no temp dir"
+            studio_render_report["skip_reason"] = "no_temp_dir"
         elif render_pipeline_pref == "none":
-            studio_render_report["skip_reason"] = "thumbnailRenderPipeline=none"
+            studio_render_report["skip_reason"] = "thumbnail_render_pipeline_none"
         elif not styled_generation_enabled:
-            studio_render_report["skip_reason"] = "pikzels studio pipeline disabled or API key missing"
+            studio_render_report["skip_reason"] = studio_pipeline_skip_reason(
+                us, ctx.entitlements, require_auto_thumbnails=False
+            ) or "pikzels_studio_pipeline_ineligible"
+        if _engine_explicitly_requested(us):
+            studio_render_report["pikzels_requested_but_skipped"] = True
         ctx.output_artifacts["studio_render_report"] = json.dumps(studio_render_report)
+        ctx.output_artifacts["pikzels_requested_but_skipped"] = (
+            "1" if studio_render_report.get("pikzels_requested_but_skipped") else "0"
+        )
         try:
             from services.diag_persist import schedule_persist_artifact_now
 
@@ -1581,6 +1667,28 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         )
         brief = attach_youtube_support_image_from_ctx(brief, ctx)
 
+        from services.thumbnail_apply_mode import (
+            normalize_apply_mode,
+            resolve_ref_persona_mode,
+        )
+
+        apply_mode_ui = normalize_apply_mode(
+            us.get("thumbnail_apply_mode") or us.get("thumbnailApplyMode")
+            or (_thumbnail_default_strategy(us) or {}).get("apply_mode")
+        )
+        studio_render_report["thumbnail_apply_mode"] = apply_mode_ui
+        studio_render_report["thumbnail_ref_persona_mode"] = resolve_ref_persona_mode(us)
+        job_bind = str(us.get("thumbnail_source_job_id") or us.get("thumbnailSourceJobId") or "").strip()
+        var_bind = str(
+            us.get("thumbnail_source_variant_id") or us.get("thumbnailSourceVariantId") or ""
+        ).strip()
+        if not job_bind or not var_bind:
+            _st = _thumbnail_default_strategy(us)
+            job_bind = job_bind or str(_st.get("job_id") or _st.get("source_job_id") or "")
+            var_bind = var_bind or str(_st.get("variant_id") or _st.get("source_variant_id") or "")
+        studio_render_report["source_job_id"] = job_bind or None
+        studio_render_report["source_variant_id"] = var_bind or None
+
         trace_append(
             ctx,
             "thumbnail_brief_post_evidence",
@@ -1589,6 +1697,8 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                 "selected_headline": str((brief or {}).get("selected_headline") or "")[:80],
                 "fusion_chars": len(str((brief or {}).get("fusion_summary") or "")),
                 "hydration_story_chars": len(str((brief or {}).get("hydration_story") or "")),
+                "apply_mode": apply_mode_ui,
+                "ref_persona_mode": studio_render_report["thumbnail_ref_persona_mode"],
             },
         )
 
@@ -1620,9 +1730,27 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
         render_method = "none"
         primary_styled: Optional[Path] = None  # Prefer YouTube for primary
         persona_api, studio_opts = _studio_persona_for_request(us)
+        from services.thumbnail_apply_mode import (
+            allow_persona_on_render,
+            merge_strategy_into_studio_options,
+        )
+
+        strategy_for_bridge = _thumbnail_default_strategy(us)
+        studio_opts = merge_strategy_into_studio_options(studio_opts, strategy_for_bridge)
+        if persona_api and not allow_persona_on_render(us):
+            studio_render_report["persona_xor_stripped"] = True
+            persona_api = None
         if isinstance(persona_api, dict):
             studio_render_report["persona_kind"] = persona_api.get("kind")
             studio_render_report["persona_uuid"] = persona_api.get("id")
+        elif _persona_explicitly_required(us):
+            studio_render_report["skip_reason"] = "persona_not_linked"
+            studio_render_report["pikzels_requested_but_skipped"] = True
+            if _strict_studio_mode_enabled(us) or _persona_explicitly_required(us):
+                raise ThumbnailError(
+                    "Linked Pikzels persona required but not resolved. "
+                    "Open Thumbnail Studio → Personas and Link to Pikzels, or turn off Apply persona."
+                )
 
         studio_ok = bool(
             pikzels_studio_eligible_for_styled_thumbnail(
@@ -1631,9 +1759,44 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             and isinstance(brief, dict)
         )
         strict_studio = _strict_studio_mode_enabled(us)
-        if strict_studio and not studio_ok:
+
+        # Studio winner → upload covers / support image (before per-platform Pikzels).
+        # Pinned/letterboxed covers satisfy Instagram cover_url-at-container-create.
+        skip_studio_platforms: List[str] = []
+        try:
+            from services.thumbnail_studio_upload_bridge import apply_studio_winner_to_upload_thumbs
+
+            if strategy_for_bridge and ctx.temp_dir:
+                platform_map, brief, skip_studio_platforms, opts_overlay = await apply_studio_winner_to_upload_thumbs(
+                    strategy=strategy_for_bridge,
+                    platforms=list(platforms_to_render),
+                    temp_dir=Path(ctx.temp_dir),
+                    upload_id=str(ctx.upload_id or ""),
+                    brief=brief if isinstance(brief, dict) else {},
+                    studio_opts=studio_opts if isinstance(studio_opts, dict) else {},
+                    platform_map=platform_map,
+                    report=studio_render_report,
+                    user_settings=us,
+                )
+                if isinstance(opts_overlay, dict):
+                    studio_opts = {**(studio_opts or {}), **opts_overlay}
+                elif studio_render_report.get("studio_winner_image_weight") == "high":
+                    if not isinstance(studio_opts, dict):
+                        studio_opts = {}
+                    studio_opts["image_weight"] = "high"
+        except Exception:
+            logger.warning("studio winner upload bridge failed", exc_info=True)
+
+        needs_live_pikzels = any(
+            str(p).strip().lower() not in {str(x).strip().lower() for x in skip_studio_platforms}
+            for p in (platforms_to_render or [])
+        )
+        if strict_studio and not studio_ok and needs_live_pikzels:
+            reason = studio_pipeline_skip_reason(
+                us, ctx.entitlements, require_auto_thumbnails=False
+            ) or "studio_unavailable"
             raise ThumbnailError(
-                "Strict Pikzels mode enabled but Studio renderer is unavailable for this upload"
+                f"Strict Pikzels mode: Studio renderer unavailable ({reason})"
             )
         # Legacy "template only" pipeline would skip Pikzels entirely; when the studio
         # engine is enabled, prefer auto ordering so the API render runs first.
@@ -1680,7 +1843,21 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
             )
 
         pikzels_render_failures: List[Dict[str, Any]] = []
+        skip_studio_set = {str(p).strip().lower() for p in (skip_studio_platforms or [])}
         for platform in platforms_to_render:
+            plat_l = str(platform or "").strip().lower()
+            # Studio winner cover_direct already wrote YT/FB JPEGs — keep them durable.
+            if plat_l in skip_studio_set and platform_map.get(plat_l):
+                existing = Path(platform_map[plat_l])
+                if existing.exists():
+                    studio_render_report["platform_render_methods"][plat_l] = {
+                        "attempted": ["studio_winner_cover_direct"],
+                        "succeeded_with": "studio_winner_cover_direct",
+                    }
+                    if primary_styled is None or plat_l == "youtube":
+                        primary_styled = existing
+                    render_method = "studio_winner_cover_direct"
+                    continue
             out_name = f"thumb_styled_{platform}_{ctx.upload_id}.jpg"
             out_path = ctx.temp_dir / out_name
             ok = False
@@ -1774,10 +1951,10 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                             "provider": "pikzels",
                             "status": "failed",
                             "reason": _reason,
-                            "fallback": "auto_frame",
+                            "fallback": "template",
                             "platform": platform,
                             "http_status": last_status,
-                            "message": last_message,
+                            "message": (last_message or _snippet or "pikzels_http_error")[:500],
                         })
                 elif step == "template":
                     attempted_methods.append("template")
@@ -1814,19 +1991,77 @@ async def run_thumbnail_stage(ctx: JobContext) -> JobContext:
                 "Strict Pikzels mode enabled and Studio renderer did not produce a styled thumbnail"
             )
 
+        if (
+            _engine_explicitly_requested(us)
+            and render_method
+            not in ("studio_renderer", "studio_winner_cover_direct", "studio_winner_pin")
+        ):
+            studio_render_report["pikzels_requested_but_skipped"] = True
+            if not studio_render_report.get("skip_reason"):
+                studio_render_report["skip_reason"] = (
+                    f"engine_requested_but_got_{render_method or 'none'}"
+                )
+
+        # Similarity: Studio winner vs primary YouTube cover (drift diagnostics).
+        try:
+            from services.thumbnail_studio_upload_bridge import similarity_score_paths
+
+            winner_local = studio_render_report.get("studio_winner_local_path")
+            yt_path = platform_map.get("youtube") or (
+                str(primary_styled) if primary_styled else ""
+            )
+            if winner_local and yt_path:
+                sim = similarity_score_paths(Path(str(winner_local)), Path(str(yt_path)))
+                if sim is not None:
+                    studio_render_report["studio_vs_upload_similarity"] = sim
+                    ctx.output_artifacts["thumbnail_studio_similarity"] = str(sim)
+        except Exception:
+            pass
+
+        # Fail loud when engine was requested but Pikzels fell through to template.
+        if pikzels_render_failures and _engine_explicitly_requested(us):
+            ctx.output_artifacts["thumbnail_error_code"] = "PIKZELS_FAILED_USED_TEMPLATE"
+            ctx.output_artifacts["thumbnail_queue_badge"] = "Pikzels failed — used template"
+            studio_render_report["fail_loud"] = True
+            studio_render_report["queue_badge"] = "Pikzels failed — used template"
+            if strict_studio:
+                raise ThumbnailError(
+                    "Strict Pikzels mode: engine was requested but Pikzels failed for one or more platforms"
+                )
+        elif studio_render_report.get("pikzels_requested_but_skipped") and _engine_explicitly_requested(us):
+            ctx.output_artifacts["thumbnail_error_code"] = "PIKZELS_SKIPPED_UNEXPECTED"
+            ctx.output_artifacts["thumbnail_queue_badge"] = "Pikzels skipped — check thumbnail settings"
+            studio_render_report["fail_loud"] = True
+
         ctx.output_artifacts["thumbnail_render_method"] = render_method
         ctx.output_artifacts["platform_thumbnail_map"] = json.dumps(platform_map)
         ctx.output_artifacts["studio_render_report"] = json.dumps(studio_render_report)
+        ctx.output_artifacts["pikzels_requested_but_skipped"] = (
+            "1" if studio_render_report.get("pikzels_requested_but_skipped") else "0"
+        )
+        ctx.output_artifacts["platform_render_methods"] = json.dumps(
+            studio_render_report.get("platform_render_methods") or {}
+        )
         if pikzels_render_failures:
             ctx.output_artifacts["pikzels_render_failures"] = json.dumps(pikzels_render_failures)
         try:
             from services.diag_persist import schedule_persist_artifact_now
 
-            persist_keys = ["studio_render_report", "thumbnail_render_method", "platform_thumbnail_map"]
+            persist_keys = [
+                "studio_render_report",
+                "thumbnail_render_method",
+                "platform_thumbnail_map",
+                "pikzels_requested_but_skipped",
+                "platform_render_methods",
+            ]
             if sticker_composite_enabled():
                 persist_keys.append("sticker_pack_json")
             if pikzels_render_failures:
                 persist_keys.append("pikzels_render_failures")
+            if ctx.output_artifacts.get("thumbnail_error_code"):
+                persist_keys.extend(["thumbnail_error_code", "thumbnail_queue_badge"])
+            if ctx.output_artifacts.get("thumbnail_studio_similarity"):
+                persist_keys.append("thumbnail_studio_similarity")
             schedule_persist_artifact_now(ctx, *persist_keys)
         except Exception:
             pass

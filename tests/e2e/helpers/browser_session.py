@@ -48,14 +48,25 @@ def goto_page_resilient(page: Page, url: str, *, timeout_ms: int = 90_000) -> No
 
 def wait_for_authenticated_shell(page: Page, *, timeout_ms: int = 90_000) -> None:
     """Wait until app shell has validated /api/me and painted chrome."""
+    if "login.html" in (page.url or ""):
+        raise AssertionError("wait_for_authenticated_shell: still on login.html")
     page.wait_for_function(
         """() => {
+            if (location.href.includes('login.html')) return false;
             const root = document.documentElement;
             if (root.classList.contains('um8-shell-ready') || root.classList.contains('um8-user-ready')) {
                 return true;
             }
-            const tier = (document.getElementById('userTier')?.textContent || '').toLowerCase();
-            return /admin|master|starter|creator|studio|agency|lite|pro/.test(tier);
+            // Settings page often paints tabs before sidebar tier hydrate.
+            if (document.querySelector('a.settings-tab')) return true;
+            const tier = (document.getElementById('userTier')?.textContent || '').trim().toLowerCase();
+            if (/admin|master|starter|creator|studio|agency|lite|pro|friends|family|free|launch/.test(tier)) {
+                return true;
+            }
+            // Sidebar chrome present + not on login is enough under slow hydrate.
+            const name = (document.getElementById('userName')?.textContent || '').trim();
+            const nav = document.querySelector('nav.sidebar-nav');
+            return Boolean(nav && name && name.toLowerCase() !== 'user');
         }""",
         timeout=timeout_ms,
     )
@@ -161,6 +172,12 @@ def navigate_to_page_human(page: Page, base_url: str, rel_path: str) -> None:
         pause_between_requests()
     if rel_norm in NO_APP_SHELL_PAGES or target in NO_APP_SHELL_PAGES:
         page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(click_delay_ms())
+        settle_page_monitors(page)
+        return
+    if target == "settings.html" or rel_norm == "settings.html":
+        # Settings tabs are static HTML; don't block on sidebar tier hydrate.
+        page.locator("a.settings-tab").first.wait_for(state="attached", timeout=90_000)
         page.wait_for_timeout(click_delay_ms())
         settle_page_monitors(page)
         return

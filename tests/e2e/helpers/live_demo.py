@@ -30,11 +30,14 @@ from tests.e2e.helpers.browser_session import (
 from tests.e2e.helpers.human_pace import CHROME_UA, click_delay_ms, pause_between_requests
 from tests.e2e.helpers.config import (
     e2e_master_email,
+    e2e_persona_id,
     e2e_target_user_id,
     e2e_target_user_name,
     e2e_tiktok_profile,
     e2e_upload_platforms,
+    e2e_use_persona,
 )
+from tests.e2e.helpers.pikzels_gate import consume_pikzels_slot, should_use_pikzels
 from tests.e2e.helpers.pages import ADMIN_SETTINGS_PAGES, AUTHENTICATED_PAGES
 from tests.e2e.helpers.background_checks import BackgroundCheckRunner
 from tests.e2e.helpers.target_user import TargetUserNotFound, resolve_target_user
@@ -212,7 +215,12 @@ def select_upload_platforms(
     preferred: tuple[str, ...] | None = None,
     tiktok_profile: str | None = None,
 ) -> list[str]:
-    """Enable connected platforms (live demo defaults to TikTok profile + post settings)."""
+    """
+    Enable connected platforms from E2E_UPLOAD_PLATFORMS (or all under /TUP).
+
+    Leaves each platform's default privacy / caption prefs from Settings intact;
+    only TikTok needs explicit privacy+consent fill for the publish button.
+    """
     wait_for_authenticated_shell(page)
     page.wait_for_function(
         """() => document.querySelectorAll('input[name="platforms"]:not([disabled])').length > 0""",
@@ -231,6 +239,7 @@ def select_upload_platforms(
     for platform in order:
         option = page.locator(f'label.platform-option[data-platform="{platform}"]:not(.disabled)')
         if option.count() == 0 or not option.first.is_visible():
+            log.note(f"Platform not connected/visible — skip: {platform}")
             continue
         cb = page.locator(f'input[name="platforms"][value="{platform}"]:not([disabled])')
         if cb.count() and not cb.first.is_checked():
@@ -273,7 +282,126 @@ def select_upload_platforms(
         for platform in selected:
             log.note(f"Selected platform: {platform}")
 
+    # Re-validate so platform default privacy / schedule prefs from Settings apply.
+    page.evaluate(
+        """() => {
+            if (typeof validateForm === 'function') validateForm();
+            return true;
+        }"""
+    )
     return selected
+
+
+def apply_upload_thumbnail_controls(
+    page: Page,
+    log: LiveDemoLog,
+    *,
+    use_pikzels: bool,
+    use_persona: bool | None = None,
+    persona_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Set Thumbnail Studio controls on upload.html.
+
+    Persona is selected/called when available (default persona or first Pikzels-linked).
+    Pikzels engine checkbox follows the once-per-setup gate (use_pikzels).
+    """
+    want_persona = e2e_use_persona() if use_persona is None else use_persona
+    want_id = (persona_id if persona_id is not None else e2e_persona_id()).strip()
+
+    page.wait_for_selector("#uploadUseStudioEngine", state="attached", timeout=60_000)
+    # Wait for persona select to finish async init (options beyond placeholder).
+    page.wait_for_timeout(1200)
+    page.wait_for_function(
+        """() => {
+            const sel = document.getElementById('uploadPersonaSelect');
+            return !!sel && sel.options && sel.options.length >= 1;
+        }""",
+        timeout=60_000,
+    )
+
+    result = page.evaluate(
+        """({ usePikzels, wantPersona, wantId }) => {
+            const engine = document.getElementById('uploadUseStudioEngine');
+            const personaCb = document.getElementById('uploadUsePersona');
+            const personaSel = document.getElementById('uploadPersonaSelect');
+            const strength = document.getElementById('uploadPersonaStrength');
+            const out = {
+                studio_blocked: window._uploadStudioBlocked === true,
+                pikzels: false,
+                persona: false,
+                persona_id: '',
+                persona_name: '',
+                linked_count: 0,
+                note: '',
+            };
+            if (!engine || !personaCb || !personaSel) {
+                out.note = 'thumbnail controls missing';
+                return out;
+            }
+            if (out.studio_blocked) {
+                engine.checked = false;
+                personaCb.checked = false;
+                out.note = 'studio blocked (auto thumbs / studio flow off in Settings)';
+                if (typeof validateForm === 'function') validateForm();
+                return out;
+            }
+
+            const options = Array.from(personaSel.options || []).filter((o) => o.value);
+            out.linked_count = options.length;
+
+            let pick = '';
+            if (wantId && options.some((o) => o.value === wantId)) {
+                pick = wantId;
+            } else if (options.length) {
+                pick = options[0].value;
+            }
+
+            engine.checked = !!usePikzels;
+            engine.dispatchEvent(new Event('change', { bubbles: true }));
+
+            const canPersona = wantPersona && !!pick;
+            personaCb.checked = canPersona;
+            personaCb.dispatchEvent(new Event('change', { bubbles: true }));
+            if (canPersona) {
+                personaSel.value = pick;
+                personaSel.dispatchEvent(new Event('change', { bubbles: true }));
+                // Only force engine when this run is allowed to spend Pikzels.
+                if (usePikzels && !engine.checked) {
+                    engine.checked = true;
+                    engine.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                out.persona = true;
+                out.persona_id = pick;
+                const opt = options.find((o) => o.value === pick);
+                out.persona_name = (opt && opt.textContent || '').trim().slice(0, 120);
+                if (!usePikzels) {
+                    out.note = 'persona selected; Pikzels engine skipped (once-per-setup gate)';
+                }
+            } else if (wantPersona && !pick) {
+                out.note = 'persona requested but no Pikzels-linked persona available';
+            }
+
+            out.pikzels = !!engine.checked;
+            if (typeof syncUploadPersonaFieldDisabled === 'function') syncUploadPersonaFieldDisabled();
+            if (typeof validateForm === 'function') validateForm();
+            return out;
+        }""",
+        {"usePikzels": use_pikzels, "wantPersona": want_persona, "wantId": want_id},
+    )
+    if result.get("pikzels"):
+        log.note("Pikzels / AuroraRender: ON for this upload")
+    else:
+        log.note("Pikzels / AuroraRender: OFF (gate skip or studio blocked)")
+    if result.get("persona"):
+        log.note(
+            f"Persona applied: {result.get('persona_name') or result.get('persona_id')}"
+        )
+    elif result.get("note"):
+        log.note(str(result["note"]))
+    else:
+        log.note("Persona: not applied")
+    return result if isinstance(result, dict) else {}
 
 
 def _read_upload_session_ids(page: Page) -> list[str]:
@@ -293,8 +421,10 @@ def start_upload_on_page(
     video: Path,
     telemetry: Path | None,
     log: LiveDemoLog,
+    *,
+    use_pikzels: bool | None = None,
 ) -> tuple[str, list[str]]:
-    """upload.html → attach files → Upload & Publish. Returns (filename_stem, upload_ids)."""
+    """upload.html → attach files → platforms + persona → Upload & Publish."""
     navigate_to_page_human(page, base_url, "upload.html")
     wait_for_authenticated_shell(page)
 
@@ -309,6 +439,16 @@ def start_upload_on_page(
     log.note(f"Attached {video.name}" + (f" + {telemetry.name}" if telemetry else ""))
 
     select_upload_platforms(page, log)
+
+    if use_pikzels is None:
+        use_pikzels = consume_pikzels_slot(note="live_demo start_upload")
+    elif use_pikzels and should_use_pikzels():
+        consume_pikzels_slot(note="live_demo start_upload forced")
+    thumb = apply_upload_thumbnail_controls(page, log, use_pikzels=bool(use_pikzels))
+    log.note(
+        f"Thumbnail controls: pikzels={thumb.get('pikzels')} persona={thumb.get('persona')}"
+    )
+
     page.wait_for_function(
         """() => {
             const btn = document.getElementById('uploadBtn');
@@ -427,7 +567,7 @@ def verify_upload_on_dashboard_and_queue(
     navigate_to_page_human(page, base_url, "dashboard.html")
     wait_for_authenticated_shell(page)
     human_scroll(page)
-    page.locator("#recentUploads .upload-row").wait_for(state="attached", timeout=60_000)
+    page.locator("#recentUploads .upload-row").first.wait_for(state="attached", timeout=60_000)
     dash_text = page.locator("#recentUploads").inner_text(timeout=10_000).lower()
     dash_ok = hint in dash_text or hint.replace("_", "") in dash_text.replace("_", "")
     if not dash_ok and id_set:
@@ -517,12 +657,15 @@ def _wait_upload_quiet_period(
     terminal: dict[str, Any] | None = None
     while time.time() < deadline and terminal is None:
         now = time.time()
+        remaining = deadline - now
+        if remaining <= 0:
+            break
         if now - last_poll >= min(20.0, upload_poll_interval_sec()):
             row, client = find_upload_via_api(
                 client,
                 filename_hint=stem,
                 upload_ids=upload_ids,
-                timeout_s=8.0,
+                timeout_s=min(8.0, max(1.0, remaining)),
                 poll_s=2.0,
                 log=log,
                 raise_on_timeout=False,
@@ -532,7 +675,10 @@ def _wait_upload_quiet_period(
                 terminal = row
                 log.note(f"Upload terminal during quiet period: {row.get('status')}")
                 break
-        time.sleep(min(5.0, deadline - time.time()))
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(5.0, remaining))
     return terminal, client
 
 
@@ -574,6 +720,17 @@ def run_live_demo_journey(
     """
     log = log or LiveDemoLog()
     admin_email = e2e_master_email()
+
+    from tests.e2e.helpers.api_ready import wait_for_api_ready
+
+    ready = wait_for_api_ready(base_url, timeout_s=120.0, require_db=True)
+    if not ready.get("ok"):
+        raise RuntimeError(
+            f"API/DB not ready at {base_url} before live journey "
+            f"(last={ready}). Start uvicorn on :8000 only — do not use a second static port."
+        )
+    log.note(f"API ready (db ok) after {ready.get('attempt')} probe(s)")
+
     bootstrap_human_session(page, base_url)
     log.note(f"Logged in as {admin_email or 'master admin'} @ {base_url}")
 

@@ -34,9 +34,14 @@ def require_master_credentials() -> tuple[str, str]:
 
 def api_login(*, attempts: int = 5) -> dict[str, Any]:
     """Return token payload from POST /api/auth/login (retries on transient errors)."""
+    from tests.e2e.helpers.api_ready import wait_for_api_ready
+
     email, password = require_master_credentials()
     base = e2e_base_url()
     timeout = e2e_api_timeout_s()
+    ready = wait_for_api_ready(base, timeout_s=min(180.0, max(60.0, timeout * 2)), require_db=True)
+    if not ready.get("ok"):
+        raise E2EAuthError(f"API not ready for login: {ready}")
     last: Exception | None = None
     for i in range(attempts):
         try:
@@ -50,7 +55,7 @@ def api_login(*, attempts: int = 5) -> dict[str, Any]:
             return data
         except (httpx.HTTPError, E2EAuthError) as e:
             last = e
-            time.sleep(0.5 * (i + 1))
+            time.sleep(min(8.0, 0.5 * (2**i)))
     assert last is not None
     raise last
 
@@ -116,19 +121,29 @@ def api_request_with_retry(
     method: str,
     path: str,
     *,
-    attempts: int = 3,
+    attempts: int = 5,
     **kwargs: Any,
 ) -> tuple[httpx.Response, httpx.Client]:
-    """Retry and refresh the httpx client on stale connections (e.g. WinError 10054)."""
+    """Retry and refresh the httpx client on stale connections / DB wake (503)."""
     last: Exception | None = None
     active = client
     for i in range(attempts):
         try:
-            return active.request(method, path, **kwargs), active
+            resp = active.request(method, path, **kwargs)
+            if resp.status_code == 401 and i < attempts - 1:
+                active = refresh_api_client(active)
+                time.sleep(0.5 * (i + 1))
+                continue
+            # Neon wake / pool recovery — do not treat as hard E2E failure yet.
+            if resp.status_code in (502, 503) and i < attempts - 1:
+                time.sleep(min(8.0, 0.6 * (2**i)))
+                active = refresh_api_client(active)
+                continue
+            return resp, active
         except _TRANSIENT_API_EXC as e:
             last = e
             active = refresh_api_client(active)
-            time.sleep(0.4 * (i + 1))
+            time.sleep(min(8.0, 0.5 * (2**i)))
     assert last is not None
     raise last
 

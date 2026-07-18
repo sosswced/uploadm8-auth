@@ -8,7 +8,18 @@ from services.upload.thumbnails import pikzels_template_thumbnail_warning
 
 def test_coerce_output_artifacts_dict_list_legacy_row():
     legacy = [json.dumps({"thumbnail_render_method": "template", "studio_render_report": "{}"})]
-    assert coerce_output_artifacts_dict(legacy) == {}
+    assert coerce_output_artifacts_dict(legacy) == {
+        "thumbnail_render_method": "template",
+        "studio_render_report": "{}",
+    }
+
+
+def test_coerce_output_artifacts_dict_list_of_dicts():
+    """UPLOADM8-7W shape: JSON array wrapping one object."""
+    legacy = [{"ai_pipeline_trace_v1": '{"upload_id": "x"}', "retry": {"count": 1}}]
+    out = coerce_output_artifacts_dict(legacy)
+    assert out["ai_pipeline_trace_v1"] == '{"upload_id": "x"}'
+    assert out["retry"] == {"count": 1}
 
 
 def test_coerce_output_artifacts_dict_normal_dict():

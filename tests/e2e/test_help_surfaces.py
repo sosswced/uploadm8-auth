@@ -30,4 +30,31 @@ def test_settings_token_balances_tab(human_session_page, base_url: str):
     navigate_to_page_human(human_session_page, base_url, "settings.html#token-balances")
     wait_for_authenticated_shell(human_session_page)
     assert human_session_page.locator("#token-balances-panel").count() > 0
-    assert human_session_page.locator("#settings-tab-token-balances.active, #tbLedgerTbody").count() >= 1
+    assert human_session_page.locator("#settings-tab-token-balances.active").count() >= 1
+    # Deep-link must load ledger (not leave an empty tbody from the early-hash race).
+    human_session_page.wait_for_function(
+        """() => {
+            const tb = document.getElementById('tbLedgerTbody');
+            if (!tb) return false;
+            return tb.children.length > 0;
+        }""",
+        timeout=20000,
+    )
+    assert human_session_page.locator("#tbLedgerTbody tr").count() >= 1
+
+
+def test_settings_guide_handbook_button(human_session_page, base_url: str):
+    navigate_to_page_human(human_session_page, base_url, "settings.html#guide")
+    wait_for_authenticated_shell(human_session_page)
+    btn = human_session_page.locator("#settingsGuideHandbookBtn")
+    assert btn.count() >= 1
+    btn.click()
+    iframe = human_session_page.locator("#settingsGuideIframe")
+    human_session_page.wait_for_function(
+        """() => {
+            const el = document.getElementById('settingsGuideIframe');
+            return !!(el && el.src && el.src.indexOf('feat-settings-playbook') !== -1);
+        }""",
+        timeout=10000,
+    )
+    assert "feat-settings-playbook" in (iframe.get_attribute("src") or "")

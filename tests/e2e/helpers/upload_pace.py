@@ -51,9 +51,10 @@ def upload_page_delay_sec() -> float:
 def effective_api_per_page(requested: int) -> int:
     if worker_safe_mode():
         try:
-            cap = int(os.environ.get("E2E_WORKER_SAFE_API_PER_PAGE", "2"))
+            # Default 1 — one GET per page visit while FFmpeg + Neon recover.
+            cap = int(os.environ.get("E2E_WORKER_SAFE_API_PER_PAGE", "1"))
         except ValueError:
-            cap = 2
+            cap = 1
         return max(0, min(requested, cap))
     return requested
 

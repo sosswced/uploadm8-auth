@@ -193,8 +193,34 @@ async def verify_transcode_r2_keys(transcode_r2: Dict[str, str]) -> bool:
     return True
 
 
+def output_artifacts_as_object_sql(column: str = "output_artifacts") -> str:
+    """SQL expr: coerce jsonb array-of-objects → object before ``||`` merge.
+
+    Postgres ``jsonb ||`` concatenates into an *array* when the left side is already
+    an array. That permanently corrupts ``uploads.output_artifacts`` into a list of
+    one-key objects (TUP upload ed5f5e17…).
+    """
+    col = column if column.replace("_", "").isalnum() else "output_artifacts"
+    return f"""(
+        CASE jsonb_typeof(COALESCE({col}, '{{}}'::jsonb))
+            WHEN 'object' THEN COALESCE({col}, '{{}}'::jsonb)
+            WHEN 'array' THEN COALESCE((
+                SELECT jsonb_object_agg(kv.key, kv.value)
+                  FROM jsonb_array_elements(COALESCE({col}, '[]'::jsonb)) AS elem
+                  CROSS JOIN LATERAL jsonb_each(
+                      CASE
+                          WHEN jsonb_typeof(elem) = 'object' THEN elem
+                          ELSE '{{}}'::jsonb
+                      END
+                  ) AS kv(key, value)
+            ), '{{}}'::jsonb)
+            ELSE '{{}}'::jsonb
+        END
+    )"""
+
+
 async def merge_output_artifacts_patch(pool, upload_id: str, patch: dict) -> None:
-    """Merge patch into uploads.output_artifacts (jsonb)."""
+    """Merge patch into uploads.output_artifacts (jsonb object)."""
     import asyncpg
 
     if not patch:
@@ -202,9 +228,9 @@ async def merge_output_artifacts_patch(pool, upload_id: str, patch: dict) -> Non
     try:
         async with pool.acquire() as conn:
             await conn.execute(
-                """
+                f"""
                 UPDATE uploads
-                SET output_artifacts = COALESCE(output_artifacts, '{}'::jsonb) || $2::jsonb,
+                SET output_artifacts = {output_artifacts_as_object_sql()} || $2::jsonb,
                     updated_at = NOW()
                 WHERE id = $1
                 """,

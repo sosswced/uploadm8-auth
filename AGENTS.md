@@ -280,7 +280,9 @@ python scripts/agent/mcp_server.py
 
 | `/headless-eval` | 7 | Background self-heal |
 
-| `/overnight` | 7→8+ | Full pipeline → ship gate → `/333` when green (ultrathink, five-windows, checklist, E2E, ultracode, Sentry, `ship_gate.py`) |
+| /overnight | 7→8+ | Full pipeline → ship gate (prefer **/TUP**) |
+
+| **/TUP** | 7→8+ | Test Upload Pipeline — live all-platform upload + persona + Pikzels-once + heal |
 
 | `/loop` | 7 | Recurring in-session prompt |
 

@@ -33,6 +33,38 @@ def test_upload_has_schedule_requires_time_for_scheduled():
     ) is True
 
 
+def test_upload_has_schedule_smart_requires_complete_metadata():
+    now = datetime.now(timezone.utc)
+    # Top-level time alone is not enough for multi-platform smart.
+    assert upload_has_schedule(
+        {
+            "schedule_mode": "smart",
+            "scheduled_time": now,
+            "platforms": ["tiktok", "youtube"],
+            "schedule_metadata": {"tiktok": now.isoformat()},
+        }
+    ) is False
+    assert upload_has_schedule(
+        {
+            "schedule_mode": "smart",
+            "scheduled_time": now,
+            "platforms": ["tiktok", "youtube"],
+            "schedule_metadata": {
+                "tiktok": now.isoformat(),
+                "youtube": now.isoformat(),
+            },
+        }
+    ) is True
+    assert upload_has_schedule(
+        {
+            "schedule_mode": "smart",
+            "scheduled_time": None,
+            "platforms": ["youtube"],
+            "schedule_metadata": {"youtube": now.isoformat()},
+        }
+    ) is False
+
+
 def test_validate_presign_schedule_rejects_scheduled_without_time():
     import pytest
     from fastapi import HTTPException
@@ -127,3 +159,266 @@ def test_bump_auto_retry_metadata_increments():
     assert get_auto_retry_count(arts) == 1
     arts2 = bump_auto_retry_metadata(arts, error_code="TIMEOUT")
     assert get_auto_retry_count(arts2) == 2
+
+
+def test_normalize_platform_list_and_missing_slots():
+    from services.upload.schedule_guard import (
+        normalize_platform_list,
+        smart_metadata_missing_platforms,
+    )
+
+    assert normalize_platform_list(["TikTok", "youtube", "TIKTOK", " facebook "]) == [
+        "tiktok",
+        "youtube",
+        "facebook",
+    ]
+    missing = smart_metadata_missing_platforms(
+        ["tiktok", "youtube", "instagram", "facebook"],
+        {"tiktok": "2026-06-15T19:00:00+00:00"},
+    )
+    assert missing == ["youtube", "instagram", "facebook"]
+
+
+def test_repair_fills_incomplete_smart_metadata():
+    """Smart row with scheduled_time but missing platform slots must be repaired."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from services.upload.schedule_guard import repair_upload_schedule
+
+    class FakeConn:
+        def __init__(self):
+            self.updates = []
+
+        async def execute(self, sql, *args):
+            self.updates.append((sql, args))
+
+    row = {
+        "id": "u-partial-meta",
+        "user_id": "user-1",
+        "schedule_mode": "smart",
+        "platforms": ["tiktok", "youtube", "instagram", "facebook"],
+        "scheduled_time": datetime(2026, 6, 15, 19, 0, tzinfo=timezone.utc),
+        "schedule_metadata": {"tiktok": "2026-06-15T19:00:00+00:00"},
+    }
+
+    async def _run():
+        conn = FakeConn()
+        fake_smart = {
+            "youtube": datetime(2026, 6, 16, 14, 0, tzinfo=timezone.utc),
+            "instagram": datetime(2026, 6, 17, 18, 0, tzinfo=timezone.utc),
+            "facebook": datetime(2026, 6, 18, 13, 0, tzinfo=timezone.utc),
+        }
+        with patch(
+            "services.upload.schedule_guard.build_smart_schedule_for_upload",
+            new=AsyncMock(return_value=fake_smart),
+        ):
+            return await repair_upload_schedule(conn, row), conn
+
+    (ok, sched, meta), conn = asyncio.run(_run())
+    assert ok is True
+    assert sched is not None
+    assert set(meta.keys()) == {"tiktok", "youtube", "instagram", "facebook"}
+    assert "tiktok" in meta
+    assert conn.updates
+
+
+def test_calculate_smart_schedule_covers_all_four_platforms():
+    from core.scheduling import calculate_smart_schedule
+
+    plats = ["tiktok", "YouTube", "instagram", "FACEBOOK"]
+    schedule = calculate_smart_schedule(plats, num_days=14, user_timezone="America/Chicago", random_seed="test-all")
+    assert set(schedule.keys()) == {"tiktok", "youtube", "instagram", "facebook"}
+    assert all(isinstance(v, datetime) for v in schedule.values())
+    # Distinct day slots preferred (used_days) — times should differ across platforms
+    assert len({v.isoformat() for v in schedule.values()}) >= 3
+
+
+def test_repair_complete_metadata_null_scheduled_time_derives_anchor():
+    """Complete smart metadata + null scheduled_time must not rebuild all slots."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from services.upload.schedule_guard import repair_upload_schedule
+
+    class FakeConn:
+        def __init__(self):
+            self.updates = []
+
+        async def execute(self, sql, *args):
+            self.updates.append((sql, args))
+
+    past = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    future = datetime(2026, 8, 1, 18, 0, tzinfo=timezone.utc)
+    row = {
+        "id": "u-anchor",
+        "user_id": "user-1",
+        "schedule_mode": "smart",
+        "platforms": ["tiktok", "youtube"],
+        "scheduled_time": None,
+        "schedule_metadata": {
+            "tiktok": past.isoformat(),
+            "youtube": future.isoformat(),
+        },
+        "platform_results": [
+            {"platform": "tiktok", "success": True},
+            {"platform": "youtube", "success": False},
+        ],
+    }
+
+    async def _run():
+        conn = FakeConn()
+        with patch(
+            "services.upload.schedule_guard.build_smart_schedule_for_upload",
+            new=AsyncMock(side_effect=AssertionError("must not rebuild")),
+        ):
+            return await repair_upload_schedule(conn, row), conn
+
+    (ok, sched, meta), conn = asyncio.run(_run())
+    assert ok is True
+    assert sched == future
+    assert set(meta.keys()) == {"tiktok", "youtube"}
+    assert conn.updates
+
+
+def test_repair_does_not_rewind_scheduled_time_to_published_platform():
+    """Partial publish: anchor must be min of pending slots, not published past slots."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from services.upload.schedule_guard import repair_upload_schedule
+
+    class FakeConn:
+        def __init__(self):
+            self.updates = []
+
+        async def execute(self, sql, *args):
+            self.updates.append((sql, args))
+
+    past = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    future_yt = datetime(2026, 8, 2, 14, 0, tzinfo=timezone.utc)
+    future_ig = datetime(2026, 8, 3, 16, 0, tzinfo=timezone.utc)
+    row = {
+        "id": "u-partial-pub",
+        "user_id": "user-1",
+        "schedule_mode": "smart",
+        "platforms": ["tiktok", "youtube", "instagram"],
+        "scheduled_time": past,
+        "schedule_metadata": {"tiktok": past.isoformat()},
+        "platform_results": [
+            {"platform": "tiktok", "success": True},
+        ],
+    }
+
+    async def _run():
+        conn = FakeConn()
+        fake_smart = {"youtube": future_yt, "instagram": future_ig}
+        with patch(
+            "services.upload.schedule_guard.build_smart_schedule_for_upload",
+            new=AsyncMock(return_value=fake_smart),
+        ):
+            return await repair_upload_schedule(conn, row), conn
+
+    (ok, sched, meta), conn = asyncio.run(_run())
+    assert ok is True
+    assert sched == future_yt
+    assert sched > past
+    assert set(meta.keys()) == {"tiktok", "youtube", "instagram"}
+    assert conn.updates
+
+
+def test_anchor_platforms_exclude_successful():
+    from services.upload.schedule_guard import (
+        anchor_platforms_for_scheduled_time,
+        successful_platforms_from_results,
+    )
+
+    pr = [
+        {"platform": "TikTok", "success": True},
+        {"platform": "youtube", "status": "published"},
+        {"platform": "instagram", "success": False},
+    ]
+    assert successful_platforms_from_results(pr) == {"tiktok", "youtube"}
+    assert anchor_platforms_for_scheduled_time(
+        ["tiktok", "youtube", "instagram"], pr
+    ) == ["instagram"]
+
+
+def test_upload_has_schedule_false_for_partial_smart_meta():
+    from services.upload.schedule_guard import upload_has_schedule
+
+    assert upload_has_schedule(
+        {
+            "schedule_mode": "smart",
+            "platforms": ["tiktok", "youtube"],
+            "scheduled_time": datetime(2026, 6, 15, 19, 0, tzinfo=timezone.utc),
+            "schedule_metadata": {"tiktok": "2026-06-15T19:00:00+00:00"},
+        }
+    ) is False
+    assert upload_has_schedule(
+        {
+            "schedule_mode": "smart",
+            "platforms": ["tiktok", "youtube"],
+            "scheduled_time": datetime(2026, 6, 15, 19, 0, tzinfo=timezone.utc),
+            "schedule_metadata": {
+                "tiktok": "2026-06-15T19:00:00+00:00",
+                "youtube": "2026-06-16T14:00:00+00:00",
+            },
+        }
+    ) is True
+
+
+def test_bootstrap_repairs_partial_smart_metadata():
+    """Bootstrap must repair smart rows with partial metadata, not only null meta."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from services.upload.schedule_guard import bootstrap_repair_user_schedules
+
+    class FakeConn:
+        def __init__(self):
+            self.updates = []
+
+        async def fetch(self, sql, *args):
+            return [
+                {
+                    "id": "u-partial-boot",
+                    "user_id": "user-1",
+                    "schedule_mode": "smart",
+                    "platforms": ["tiktok", "youtube", "instagram", "facebook"],
+                    "scheduled_time": datetime(2026, 6, 15, 19, 0, tzinfo=timezone.utc),
+                    "schedule_metadata": {"tiktok": "2026-06-15T19:00:00+00:00"},
+                    "status": "pending",
+                }
+            ]
+
+        async def execute(self, sql, *args):
+            self.updates.append((sql, args))
+
+    class FakePool:
+        def acquire(self):
+            conn = FakeConn()
+            cm = MagicMock()
+            cm.__aenter__ = AsyncMock(return_value=conn)
+            cm.__aexit__ = AsyncMock(return_value=None)
+            return cm
+
+    async def _run():
+        pool = FakePool()
+        fake_smart = {
+            "youtube": datetime(2026, 6, 16, 14, 0, tzinfo=timezone.utc),
+            "instagram": datetime(2026, 6, 17, 18, 0, tzinfo=timezone.utc),
+            "facebook": datetime(2026, 6, 18, 20, 0, tzinfo=timezone.utc),
+        }
+        with patch(
+            "services.upload.schedule_guard.build_smart_schedule_for_upload",
+            new=AsyncMock(return_value=fake_smart),
+        ), patch(
+            "services.upload.schedule_guard.loud_upload_schedule_failure",
+            new=AsyncMock(),
+        ):
+            return await bootstrap_repair_user_schedules(pool, "user-1", limit=10)
+
+    summary = asyncio.run(_run())
+    assert summary["repaired"] == 1
+    assert summary["failed"] == 0

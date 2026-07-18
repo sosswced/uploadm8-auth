@@ -17,10 +17,13 @@ SKIP_PATH_RE = re.compile(
 )
 
 # Heavy reads (LLM, HF, large aggregates) — opt-in via E2E_INCLUDE_SLOW_API=1 overnight.
+# Also defer admin chart/KPI/wallet paths that stampede Neon during worker-safe tours
+# (Sentry Slow DB: UPLOADM8-6E / 5R / 30 / 5T).
 SLOW_PATH_RE = re.compile(
     r"(/coach|optimize-preview|/marketing/intel|/marketing/reports|"
     r"/marketing/ai/truth|upload-ai-trace|sync-analytics|/ml/loop-reports|"
-    r"/admin/kpi|/admin/kpis|platform-metrics(?!/cached)|"
+    r"/admin/kpi|/admin/kpis|effective-tiers|chart/revenue|/admin/chart|"
+    r"service-weights|platform-metrics(?!/cached)|"
     r"smart-insights|ai-insights|pikzels|thumbnail-studio/jobs|content-insights)",
     re.I,
 )
@@ -52,6 +55,7 @@ SAFE_GET_PREFIXES: tuple[str, ...] = (
     "/api/marketing",
 )
 
+# 503 after retries exhausted still fails the case; soft-accept only if caller opts in.
 ACCEPTABLE_STATUSES = frozenset({200, 204, 400, 401, 403, 404, 405, 422})
 
 

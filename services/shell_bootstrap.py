@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any, Mapping, Optional
 
+from core.db_pool import acquire_db
 from stages.entitlements import entitlements_to_dict, get_entitlements_from_user
 from services.dashboard_user_stats import dashboard_stats_for_user
 from services.platform_accounts import (
@@ -63,7 +64,7 @@ async def _fetch_platforms_bundle(pool: Any, user_id: str, plan: Mapping[str, An
 
     Avatars use redirect paths (``presign=False``) for cheap bootstrap first paint.
     """
-    async with pool.acquire() as conn:
+    async with acquire_db(pool) as conn:
         auth_errors = await fetch_auth_errors_by_token(conn, user_id)
         accounts = await conn.fetch(_PLATFORM_TOKEN_SELECT, user_id)
 
@@ -255,7 +256,7 @@ async def _kpi_bootstrap_payload(
     workspace_id = (user.get("workspace") or {}).get("id")
 
     async def _insights() -> Any:
-        async with pool.acquire() as conn:
+        async with acquire_db(pool) as conn:
             return await build_user_content_insights(conn, uid_plain)
 
     overview_kwargs: dict[str, Any] = {

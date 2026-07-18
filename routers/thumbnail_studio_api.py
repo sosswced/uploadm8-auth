@@ -408,56 +408,6 @@ async def _delete_studio_job_r2_assets(user_id: str, job_id: str, variant_rows: 
         )
 
 
-def _truthy_meta(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on", "default")
-    return False
-
-
-def _thumbnail_strategy_from_variant(
-    *,
-    job_row: Any,
-    variant_id: str,
-    variant_json: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Persist a selected Studio variation as upload-time prompt strategy, not fixed copy."""
-    job = dict(job_row)
-    v = dict(variant_json or {})
-    from services.thumbnail_niches import normalize_niche
-
-    job_yt_url = str(job.get("youtube_url") or "")[:500]
-    job_yt_vid = str(job.get("youtube_video_id") or "")[:32]
-    strategy = {
-        "version": 1,
-        "source": "thumbnail_studio_selected_variant",
-        "job_id": str(job.get("id") or ""),
-        "variant_id": str(variant_id or ""),
-        "format_key": str(v.get("format_key") or "")[:80],
-        "layout_name": str(v.get("name") or "")[:120],
-        "layout_pattern": str(v.get("layout_pattern") or "")[:240],
-        "audience_niche": normalize_niche(str(job.get("niche") or ""))[:120],
-        "reference_youtube_url": job_yt_url,
-        "youtube_url": job_yt_url,
-        "reference_youtube_video_id": job_yt_vid,
-        "youtube_video_id": job_yt_vid,
-        "reference_topic": str(job.get("topic") or "")[:200],
-        "reference_strength": int(job.get("closeness") or 55),
-        "competitor_gap_mode": bool(job.get("competitor_gap_mode")),
-        "persona_id": str(job.get("persona_id") or "")[:80],
-        "hydration_focus": str(v.get("hydration_focus") or "")[:120],
-        "selected_headline_style": str(v.get("headline") or "")[:120],
-        "text_position": str(v.get("text_position") or "")[:40],
-        "contrast_profile": str(v.get("contrast_profile") or "")[:40],
-        "emotion": str(v.get("emotion") or "")[:60],
-        "face_scale": float(v.get("face_scale") or 0) if v.get("face_scale") is not None else 0,
-    }
-    return {k: val for k, val in strategy.items() if val not in ("", None)}
-
-
 @router.get("/api/thumbnail-studio/cdn-preview")
 async def thumbnail_studio_cdn_preview(
     variant_id: str = Query(..., min_length=30, max_length=48),
@@ -1784,9 +1734,14 @@ async def ts_feedback(body: StudioFeedbackBody, user: dict = Depends(get_current
             except Exception:
                 pass
         default_saved = False
-        if var_uuid and _truthy_meta((body.metadata or {}).get("make_default")):
+        from services.thumbnail_studio_strategy import (
+            thumbnail_strategy_from_variant,
+            truthy_meta,
+        )
+
+        if var_uuid and truthy_meta((body.metadata or {}).get("make_default")):
             try:
-                strategy = _thumbnail_strategy_from_variant(
+                strategy = thumbnail_strategy_from_variant(
                     job_row=job,
                     variant_id=str(var_uuid),
                     variant_json=variant_json,
@@ -1798,9 +1753,25 @@ async def ts_feedback(body: StudioFeedbackBody, user: dict = Depends(get_current
                 prefs["thumbnailStudioEnabled"] = prefs["thumbnail_studio_enabled"] = True
                 prefs["thumbnailStudioEngineEnabled"] = prefs["thumbnail_studio_engine_enabled"] = True
                 prefs["thumbnailPikzelsEnabled"] = prefs["thumbnail_pikzels_enabled"] = True
+                from services.thumbnail_apply_mode import bind_source_ids_into_prefs, to_bridge_apply_mode
+
+                bind_source_ids_into_prefs(
+                    prefs,
+                    job_id=strategy.get("job_id"),
+                    variant_id=strategy.get("variant_id"),
+                    strategy=strategy,
+                )
+                bridge_mode = to_bridge_apply_mode(strategy.get("apply_mode") or "cover_direct")
+                ux_mode = "pinned_cover" if bridge_mode == "cover_direct" else (
+                    "strategy_only" if bridge_mode == "strategy_only" else "fresh_generate"
+                )
+                prefs["thumbnail_apply_mode"] = prefs["thumbnailApplyMode"] = ux_mode
                 if strategy.get("persona_id"):
                     prefs["thumbnailDefaultPersonaId"] = prefs["thumbnail_default_persona_id"] = strategy["persona_id"]
                     prefs["thumbnailPersonaEnabled"] = prefs["thumbnail_persona_enabled"] = True
+                    prefs["thumbnail_ref_persona_mode"] = prefs["thumbnailRefPersonaMode"] = "face_brand"
+                elif strategy.get("preview_r2_key") or strategy.get("reference_youtube_url"):
+                    prefs["thumbnail_ref_persona_mode"] = prefs["thumbnailRefPersonaMode"] = "recreate_style"
                 yt_url = str(strategy.get("reference_youtube_url") or strategy.get("youtube_url") or "").strip()
                 if yt_url:
                     from services.thumbnail_youtube_refs import (

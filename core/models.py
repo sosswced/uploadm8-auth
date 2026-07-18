@@ -127,6 +127,20 @@ class UploadInit(BaseModel):
     thumbnail_use_persona: Optional[bool] = None
     thumbnail_persona_id: Optional[str] = None
     thumbnail_persona_strength: Optional[int] = Field(default=None, ge=0, le=100)
+    # Studio → upload apply bridge
+    thumbnail_apply_mode: Optional[str] = Field(
+        default=None,
+        description="fresh_generate | strategy_only | pinned_cover",
+        alias="thumbnailApplyMode",
+    )
+    thumbnail_ref_persona_mode: Optional[str] = Field(
+        default=None,
+        description="recreate_style | face_brand | both",
+        alias="thumbnailRefPersonaMode",
+    )
+    thumbnail_source_job_id: Optional[str] = Field(default=None, alias="thumbnailSourceJobId")
+    thumbnail_source_variant_id: Optional[str] = Field(default=None, alias="thumbnailSourceVariantId")
+    thumbnail_studio_strict: Optional[bool] = Field(default=None, alias="thumbnailStudioStrict")
     # TikTok Content Posting API export settings (required when tiktok in platforms)
     tiktok_post_settings: Optional[dict] = Field(default=None, alias="tiktokPostSettings")
 

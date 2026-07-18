@@ -37,6 +37,22 @@ def is_transient_db_error(exc: BaseException) -> bool:
     return isinstance(exc, _TRANSIENT_DB_ERRORS) or isinstance(exc, DatabaseUnavailableError)
 
 
+_DEAD_CONNECTION_ERRORS = (
+    asyncpg.CannotConnectNowError,
+    asyncpg.ConnectionDoesNotExistError,
+    asyncpg.InterfaceError,
+    asyncpg.PostgresConnectionError,
+    OSError,
+    TimeoutError,
+    asyncio.TimeoutError,
+)
+
+
+def is_dead_connection_error(exc: BaseException) -> bool:
+    """True when the pool connection is unusable — do not retry SQL on the same conn."""
+    return isinstance(exc, _DEAD_CONNECTION_ERRORS) or isinstance(exc, DatabaseUnavailableError)
+
+
 def _acquire_attempts() -> int:
     try:
         return max(3, int(os.environ.get("DB_ACQUIRE_ATTEMPTS", "8")))

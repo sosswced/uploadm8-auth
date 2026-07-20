@@ -55,13 +55,16 @@ def _upload_error_message(d: dict) -> Optional[str]:
 
 
 def _row_is_retryable(d: dict, *, has_failed_platform: bool = False) -> bool:
-    """Compute is_retryable including stale processing / overdue ready."""
+    """Compute is_retryable including stale processing / stuck queued / overdue ready."""
+    from services.retry_policy import upload_is_stuck_queued
+
     return is_retryable_upload(
         str(d.get("status") or ""),
         error_code=d.get("error_code"),
         has_failed_platform=has_failed_platform,
         stale_processing=upload_is_stale_processing(d),
         overdue_ready=upload_is_overdue_ready_to_publish(d),
+        stuck_queued=upload_is_stuck_queued(d),
     )
 
 

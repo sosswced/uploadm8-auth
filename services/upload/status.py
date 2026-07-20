@@ -93,12 +93,14 @@ def is_retryable_upload(
     has_failed_platform: bool = False,
     stale_processing: bool = False,
     overdue_ready: bool = False,
+    stuck_queued: bool = False,
 ) -> bool:
     """Whether POST /api/uploads/{id}/retry is appropriate (mirrors queue UI).
 
     Hard-block ``error_code`` values match ``classify_retry_error`` so list/detail
     ``is_retryable`` never advertises a retry the API will reject with 409.
     Overdue ``ready_to_publish`` rows may retry to re-dispatch publish.
+    Stuck ``queued`` (lost Redis job after worker recycle) may nudge re-enqueue.
     """
     from services.retry_policy import classify_retry_error
 
@@ -110,6 +112,10 @@ def is_retryable_upload(
             return False
         return True
     if s == "processing" and stale_processing:
+        if not classify_retry_error(error_code).allowed:
+            return False
+        return True
+    if s == "queued" and stuck_queued:
         if not classify_retry_error(error_code).allowed:
             return False
         return True

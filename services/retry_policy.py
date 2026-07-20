@@ -342,6 +342,19 @@ def upload_is_overdue_ready_to_publish(
     return clock > (due + timedelta(minutes=threshold))
 
 
+# Queued with a lost Redis message — user Retry / stale recovery can re-enqueue.
+# Keep short so deploy/recycle zombies are nudgeable without waiting STALE_QUEUED_MINUTES.
+STUCK_QUEUED_MINUTES_DEFAULT = 2
+
+
+def _aware_utc(dt: Any) -> datetime | None:
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def upload_is_stale_processing(upload_row: Any, *, minutes: int | None = None) -> bool:
     """True when status=processing and last progress is older than ``minutes``.
 
@@ -356,27 +369,46 @@ def upload_is_stale_processing(upload_row: Any, *, minutes: int | None = None) -
     threshold = minutes if minutes is not None else STALE_PROCESSING_MINUTES_DEFAULT
     now = datetime.now(timezone.utc)
 
-    def _aware(dt: Any) -> datetime | None:
-        if dt is None:
-            return None
-        if getattr(dt, "tzinfo", None) is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt
-
     try:
-        updated = _aware(get("updated_at"))
+        updated = _aware_utc(get("updated_at"))
     except Exception:
         updated = None
     try:
-        started = _aware(get("processing_started_at"))
+        started = _aware_utc(get("processing_started_at"))
     except Exception:
         started = None
     try:
-        created = _aware(get("created_at"))
+        created = _aware_utc(get("created_at"))
     except Exception:
         created = None
 
     anchor = updated or started or created
+    if not anchor:
+        return False
+    return (now - anchor) > timedelta(minutes=threshold)
+
+
+def upload_is_stuck_queued(upload_row: Any, *, minutes: int | None = None) -> bool:
+    """True when status=queued and the row has sat without a claim for ``minutes``.
+
+    Typical cause: worker recycle dropped the Redis process message while the
+    DB row stayed ``queued``. User Retry and stale recovery re-enqueue.
+    """
+    get = upload_row.get if isinstance(upload_row, dict) else upload_row.__getitem__
+    status = (get("status") or "").lower()
+    if status != "queued":
+        return False
+    threshold = minutes if minutes is not None else STUCK_QUEUED_MINUTES_DEFAULT
+    now = datetime.now(timezone.utc)
+    try:
+        updated = _aware_utc(get("updated_at"))
+    except Exception:
+        updated = None
+    try:
+        created = _aware_utc(get("created_at"))
+    except Exception:
+        created = None
+    anchor = updated or created
     if not anchor:
         return False
     return (now - anchor) > timedelta(minutes=threshold)

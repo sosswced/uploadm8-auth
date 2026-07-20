@@ -4354,7 +4354,11 @@ async def run_stale_job_recovery_loop() -> None:
                     if str(st or "").lower() != "queued":
                         continue
                     payload = await _build_process_job_payload(
-                        up, uid, deferred=False, job_id=f"stale-recover-{up}"
+                        up,
+                        uid,
+                        deferred=False,
+                        job_id=f"stale-recover-{up}",
+                        resume_from_checkpoint=True,
                     )
                     if not payload:
                         continue
@@ -4365,7 +4369,10 @@ async def run_stale_job_recovery_loop() -> None:
                                 "UPDATE uploads SET updated_at = NOW() WHERE id = $1",
                                 up,
                             )
-                        logger.warning(f"[{up}] stale recovery: re-enqueued process job (queued {STALE_QUEUED_MINUTES}+ min)")
+                        logger.warning(
+                            f"[{up}] stale recovery: re-enqueued process job "
+                            f"(queued {STALE_QUEUED_MINUTES}+ min, resume_checkpoint=1)"
+                        )
 
                 if STALE_PROCESSING_MINUTES > 0:
                     async with db_pool.acquire() as conn:

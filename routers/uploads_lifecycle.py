@@ -41,6 +41,7 @@ from services.retry_policy import (
     split_platform_results,
     upload_is_overdue_ready_to_publish,
     upload_is_stale_processing,
+    upload_is_stuck_queued,
 )
 from services.upload_funnel import emit_upload_funnel_event
 from services.upload.status import CANCELLABLE_STATUSES
@@ -524,10 +525,12 @@ async def retry_upload(
 
         current_status = (upload["status"] or "").lower()
         stale_processing_retry = current_status == "processing" and upload_is_stale_processing(upload)
+        stuck_queued_retry = current_status == "queued" and upload_is_stuck_queued(upload)
         overdue_ready_retry = upload_is_overdue_ready_to_publish(upload)
         if (
             current_status not in _RETRYABLE_STATUSES
             and not stale_processing_retry
+            and not stuck_queued_retry
             and not overdue_ready_retry
         ):
             raise HTTPException(
@@ -535,6 +538,7 @@ async def retry_upload(
                 f"Upload status '{current_status}' is not retryable. "
                 f"Allowed: {', '.join(_RETRYABLE_STATUSES)}"
                 + (" or stale processing (20+ min without progress)." if current_status == "processing" else "")
+                + (" or stuck queued (2+ min with no worker claim)." if current_status == "queued" else "")
                 + (" or overdue ready_to_publish." if current_status == "ready_to_publish" else "."),
             )
 

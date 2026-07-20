@@ -2056,6 +2056,16 @@ async def run_migrations(db_pool):
                 ALTER TABLE upload_quality_scores_daily
                     ADD COLUMN IF NOT EXISTS mean_grounding DOUBLE PRECISION;
             """),
+            (1095, """
+                -- Async Thumbnail Studio recreate (avoid Cloudflare 524) + durable R2 previews.
+                ALTER TABLE thumbnail_recreate_jobs
+                    ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'completed',
+                    ADD COLUMN IF NOT EXISTS engine_mode VARCHAR(64),
+                    ADD COLUMN IF NOT EXISTS error_message TEXT,
+                    ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+                CREATE INDEX IF NOT EXISTS idx_thumbnail_recreate_jobs_user_status
+                    ON thumbnail_recreate_jobs(user_id, status, created_at DESC);
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

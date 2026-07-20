@@ -172,6 +172,7 @@ async def fetch_marketing_conversion_proxy(
             NULLIF(TRIM(payload->>'campaign_id'), '') AS campaign_id,
             COUNT(*) FILTER (WHERE event_type = 'campaign_email_sent')::bigint AS email_sent,
             COUNT(*) FILTER (WHERE event_type = 'campaign_discord_prompt')::bigint AS discord_sent,
+            COUNT(*) FILTER (WHERE event_type IN ('campaign_in_app_prompt', 'campaign_discount_offer'))::bigint AS in_app_sent,
             COUNT(*) FILTER (WHERE event_type = 'campaign_email_open')::bigint AS email_open,
             COUNT(*) FILTER (WHERE event_type = 'shown')::bigint AS nudge_shown,
             COUNT(*) FILTER (WHERE event_type = 'clicked')::bigint AS nudge_clicked,
@@ -184,6 +185,7 @@ async def fetch_marketing_conversion_proxy(
         ORDER BY (
             COUNT(*) FILTER (WHERE event_type = 'campaign_email_sent')
           + COUNT(*) FILTER (WHERE event_type = 'campaign_discord_prompt')
+          + COUNT(*) FILTER (WHERE event_type IN ('campaign_in_app_prompt', 'campaign_discount_offer'))
         ) DESC NULLS LAST
         LIMIT $2
         """,
@@ -200,6 +202,7 @@ async def fetch_marketing_conversion_proxy(
                 "campaign_id": cid,
                 "email_sent": es,
                 "discord_sent": int(r["discord_sent"] or 0),
+                "in_app_sent": int(r["in_app_sent"] or 0),
                 "email_open": eo,
                 "nudge_shown": int(r["nudge_shown"] or 0),
                 "nudge_clicked": int(r["nudge_clicked"] or 0),

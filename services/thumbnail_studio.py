@@ -34,6 +34,16 @@ from services.pikzels_v2 import (
 )
 from services.pikzels_errors import format_pikzels_error_message
 
+# Durable studio previews live on R2 under thumbnail-studio/previews/…
+# Objects are kept ~10 months by default (set Cloudflare R2 lifecycle to match).
+# Presigned GET max is 7d (SigV4); clients re-presign via job load / r2-preview proxy.
+STUDIO_PREVIEW_RETENTION_DAYS = max(
+    30, min(int(os.environ.get("STUDIO_PREVIEW_RETENTION_DAYS", "300")), 3660)
+)
+STUDIO_PREVIEW_PRESIGN_TTL_SEC = max(
+    3600, min(int(os.environ.get("STUDIO_PREVIEW_PRESIGN_TTL_SEC", str(7 * 86400))), 7 * 86400)
+)
+
 # Guided recreate: each variant = one Pikzels /v2/thumbnail/image (+ optional faceswap).
 STUDIO_VARIANT_COUNT_MIN = max(1, int(os.environ.get("THUMBNAIL_STUDIO_VARIANT_MIN", "1")))
 STUDIO_VARIANT_COUNT_MAX = max(
@@ -1670,29 +1680,38 @@ async def _r2_put_bytes(r2_key: str, body: bytes, content_type: str) -> None:
     await asyncio.to_thread(_put)
 
 
-def presign_variant_preview_url(r2_key: str, ttl: int = 3600) -> str:
+def presign_variant_preview_url(r2_key: str, ttl: Optional[int] = None) -> str:
     k = (r2_key or "").strip()
     if not k or not R2_BUCKET_NAME:
         return ""
     try:
-        return generate_presigned_download_url(k, ttl=int(ttl))
+        return generate_presigned_download_url(
+            k, ttl=int(ttl if ttl is not None else STUDIO_PREVIEW_PRESIGN_TTL_SEC)
+        )
     except Exception as e:
         _log.debug("presign_variant_preview_url: %s", e)
         return ""
 
 
-def attach_preview_urls_to_variants(variants: List[Dict[str, Any]], ttl: int = 3600) -> None:
+def attach_preview_urls_to_variants(
+    variants: List[Dict[str, Any]], ttl: Optional[int] = None
+) -> None:
+    """Attach fresh preview_url. Prefer R2 (re-presigned); CDN only as fallback."""
+    use_ttl = int(ttl if ttl is not None else STUDIO_PREVIEW_PRESIGN_TTL_SEC)
     for v in variants:
         if not isinstance(v, dict):
             continue
         polish_studio_variant_for_client(v)
         key = str(v.get("preview_r2_key") or "").strip()
         if key:
-            v["preview_url"] = presign_variant_preview_url(key, ttl=ttl)
+            v["preview_url"] = presign_variant_preview_url(key, ttl=use_ttl)
+            v["preview_storage"] = "r2"
+            v["preview_retention_days"] = STUDIO_PREVIEW_RETENTION_DAYS
             continue
         ext = str(v.get("pikzels_cdn_url") or "").strip()
         if ext.startswith("http"):
             v["preview_url"] = ext
+            v["preview_storage"] = "pikzels_cdn"
 
 
 async def _pikzels_engine_text_brief(
@@ -1996,7 +2015,7 @@ async def enrich_variants_with_uploadm8_engine(
                 return
             pv["preview_r2_key"] = r2_key
             pv["engine_status"] = "ok"
-            signed = presign_variant_preview_url(r2_key, ttl=3600)
+            signed = presign_variant_preview_url(r2_key)
             scored = await _pikzels_score_from_url(signed, str(pv.get("headline") or ""))
             if scored is not None:
                 pv["ctr_score"] = scored

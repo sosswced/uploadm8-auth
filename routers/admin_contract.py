@@ -41,7 +41,9 @@ from services.marketing_promo_media import (
 )
 from services.marketing_execution import (
     approval_required_for_channel,
+    channel_reach_note,
     count_campaign_audience,
+    list_campaign_audience_users,
     list_pending_approval_campaigns,
     maybe_alert_pending_approvals,
     run_marketing_execution_tick,
@@ -252,6 +254,26 @@ async def marketing_campaigns_list(limit: int = Query(100, ge=1, le=500), user: 
     return {"campaigns": out}
 
 
+def _parse_campaign_schedule_at(raw: Any) -> Optional[datetime]:
+    """Parse schedule_at from ISO string / datetime; naive values treated as UTC."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 @marketing_router.post("/campaigns")
 async def marketing_campaigns_create(
     payload: Dict[str, Any] = Body(default_factory=dict),
@@ -270,6 +292,7 @@ async def marketing_campaigns_create(
     if pm0 is not None and not isinstance(pm0, dict):
         pm0 = {}
     apply_defaults = bool(payload.get("apply_promo_defaults") or payload.get("apply_promo_media_defaults"))
+    schedule_at = _parse_campaign_schedule_at(payload.get("schedule_at"))
     async with core.state.db_pool.acquire() as conn:
         aud = await count_campaign_audience(conn, targeting=targeting, range_key=rk)
         est = int(aud.get("matched_count") or 0)
@@ -293,7 +316,7 @@ async def marketing_campaigns_create(
             (payload.get("objective") or "")[:8000],
             (payload.get("channel") or "in_app")[:50],
             est,
-            payload.get("schedule_at"),
+            schedule_at,
             json.dumps(targeting),
             (payload.get("notes") or "")[:8000],
             str(user["id"]) if user.get("id") else None,
@@ -311,7 +334,7 @@ async def marketing_campaigns_create(
         "channel": payload.get("channel") or "in_app",
         "status": "draft",
         "estimated_audience": est,
-        "schedule_at": payload.get("schedule_at"),
+        "schedule_at": schedule_at.isoformat() if schedule_at else None,
         "targeting": targeting,
         "range_key": rk,
         "created_at": _now_iso(),
@@ -334,6 +357,7 @@ async def marketing_campaigns_preview(
         "require_no_revenue_7d": bool(payload.get("require_no_revenue_7d")),
     }
     cid = payload.get("campaign_id")
+    ch = str(payload.get("channel") or "in_app")
     async with core.state.db_pool.acquire() as conn:
         aud = await count_campaign_audience(
             conn,
@@ -341,6 +365,9 @@ async def marketing_campaigns_preview(
             range_key=rk,
             campaign_id=str(cid) if cid else None,
         )
+    aud["channel"] = ch
+    aud["channel_reach"] = channel_reach_note(ch)
+    aud["needs_approval"] = approval_required_for_channel(ch)
     return aud
 
 
@@ -355,7 +382,7 @@ async def marketing_campaign_audience_count(
         raise HTTPException(404, "Campaign not found")
     async with core.state.db_pool.acquire() as conn:
         camp = await conn.fetchrow(
-            "SELECT targeting, range_key FROM marketing_campaigns WHERE id = $1",
+            "SELECT targeting, range_key, channel FROM marketing_campaigns WHERE id = $1",
             cid,
         )
         if not camp:
@@ -372,6 +399,10 @@ async def marketing_campaign_audience_count(
             cid,
             est,
         )
+    ch = str(camp.get("channel") or "in_app")
+    aud["channel"] = ch
+    aud["channel_reach"] = channel_reach_note(ch)
+    aud["needs_approval"] = approval_required_for_channel(ch)
     return aud
 
 
@@ -638,20 +669,73 @@ async def marketing_campaign_status(
 
 @marketing_router.get("/campaigns/{campaign_id}/audience.csv")
 async def marketing_campaign_audience_csv(campaign_id: str, user: dict = Depends(require_admin)):
+    """Live audience CSV using the same matchers as Preview / execution tick."""
     try:
         cid = uuid.UUID(campaign_id)
     except ValueError:
         raise HTTPException(404, "Campaign not found")
     async with core.state.db_pool.acquire() as conn:
-        camp = await conn.fetchrow("SELECT targeting FROM marketing_campaigns WHERE id = $1", cid)
+        camp = await conn.fetchrow(
+            "SELECT targeting, range_key, name FROM marketing_campaigns WHERE id = $1",
+            cid,
+        )
+        if not camp:
+            raise HTTPException(404, "Campaign not found")
+        listed = await list_campaign_audience_users(
+            conn,
+            targeting=camp.get("targeting"),
+            range_key=str(camp.get("range_key") or "30d"),
+            campaign_id=str(cid),
+            dedupe_within_days=7,
+            result_limit=2000,
+        )
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["user_id", "email", "note"])
-    if not camp:
-        w.writerow(["", "", "campaign not found"])
-        return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8")
-    w.writerow(["", "", "Use Marketing Ops account table + filters; full CSV export queued for warehouse sync."])
-    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8")
+    w.writerow(
+        [
+            "user_id",
+            "email",
+            "name",
+            "tier",
+            "uploads",
+            "enterprise_fit_score",
+            "nudge_ctr_pct",
+            "send_ready",
+        ]
+    )
+    for row in listed.get("users") or []:
+        w.writerow(
+            [
+                row.get("user_id") or "",
+                row.get("email") or "",
+                row.get("name") or "",
+                row.get("tier") or "",
+                row.get("uploads") or 0,
+                row.get("enterprise_fit_score") or 0,
+                row.get("nudge_ctr_pct") or 0,
+                "yes" if row.get("send_ready") else "no",
+            ]
+        )
+    if not (listed.get("users") or []):
+        w.writerow(
+            [
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                f"no matches (scanned {listed.get('users_scanned') or 0})",
+            ]
+        )
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="marketing_campaign_{campaign_id}_audience.csv"'
+        },
+    )
 
 
 @marketing_router.post("/campaigns/{campaign_id}/handoff")
@@ -662,15 +746,31 @@ async def marketing_campaign_handoff(campaign_id: str, user: dict = Depends(requ
         raise HTTPException(404, "Campaign not found")
     async with core.state.db_pool.acquire() as conn:
         c = await conn.fetchrow("SELECT * FROM marketing_campaigns WHERE id = $1", cid)
-    if not c:
-        raise HTTPException(404, "Campaign not found")
+        if not c:
+            raise HTTPException(404, "Campaign not found")
+        listed = await list_campaign_audience_users(
+            conn,
+            targeting=c.get("targeting"),
+            range_key=str(c.get("range_key") or "30d"),
+            campaign_id=str(cid),
+            dedupe_within_days=0,
+            result_limit=500,
+        )
+    selected = [str(u["user_id"]) for u in (listed.get("users") or []) if u.get("user_id")]
     title = f"Campaign: {c['name'] or 'Untitled'}"
     body = (
         f"Objective: {c['objective'] or '—'}\n"
         f"Channel: {c['channel'] or '—'}\n"
-        f"Estimated audience: {c['estimated_audience'] or 0}\n"
+        f"Matched audience: {listed.get('matched_count') or c.get('estimated_audience') or 0}\n"
+        f"Handoff users: {len(selected)} (capped)\n"
     )
-    return {"title": title, "body": body, "selected_user_ids": []}
+    return {
+        "title": title,
+        "body": body,
+        "selected_user_ids": selected,
+        "matched_count": listed.get("matched_count") or 0,
+        "returned": listed.get("returned") or 0,
+    }
 
 
 @marketing_router.post("/campaigns/{campaign_id}/templates")

@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -25,8 +25,14 @@ import core.state
 from core.config import R2_BUCKET_NAME
 from core.deps import get_current_user, get_current_user_readonly
 from core.helpers import _now_utc
-from core.r2 import _delete_r2_objects, generate_presigned_download_url, get_s3_client, put_object_bytes
-from core.wallet import atomic_debit_tokens
+from core.r2 import (
+    _delete_r2_objects,
+    generate_presigned_download_url,
+    get_object_bytes,
+    get_s3_client,
+    put_object_bytes,
+)
+from core.wallet import atomic_debit_tokens, credit_wallet
 from api.schemas.pikzels_v2 import (
     PikzelsV2EditBody,
     PikzelsV2FaceswapBody,
@@ -60,6 +66,8 @@ from services.thumbnail_studio import (
     fetch_youtube_title,
     generate_recreate_variants,
     clamp_studio_variant_count,
+    STUDIO_PREVIEW_PRESIGN_TTL_SEC,
+    STUDIO_PREVIEW_RETENTION_DAYS,
     STUDIO_VARIANT_COUNT_DEFAULT,
     STUDIO_VARIANT_COUNT_MAX,
     STUDIO_VARIANT_COUNT_MIN,
@@ -296,6 +304,7 @@ def _studio_job_public(row: Any) -> Dict[str, Any]:
     hydration_context = breakdown.get("hydration_context") if isinstance(breakdown, dict) else {}
     if not isinstance(hydration_context, dict):
         hydration_context = {}
+    completed = d.get("completed_at")
     return {
         "job_id": str(jid) if jid else "",
         "youtube_url": str(d.get("youtube_url") or ""),
@@ -311,7 +320,14 @@ def _studio_job_public(row: Any) -> Dict[str, Any]:
         "persona_id": str(pid) if pid else None,
         "format_key": str(breakdown.get("format_key") or ""),
         "hydration_context": hydration_context,
+        "status": str(d.get("status") or "completed"),
+        "engine_mode": str(d.get("engine_mode") or "") or None,
+        "error_message": str(d.get("error_message") or "") or None,
+        "preview_retention_days": STUDIO_PREVIEW_RETENTION_DAYS,
         "created_at": ca.isoformat() if hasattr(ca, "isoformat") else str(ca or ""),
+        "completed_at": (
+            completed.isoformat() if hasattr(completed, "isoformat") else (str(completed) if completed else None)
+        ),
     }
 
 
@@ -408,15 +424,84 @@ async def _delete_studio_job_r2_assets(user_id: str, job_id: str, variant_rows: 
         )
 
 
+async def _variant_json_for_user(variant_id: uuid.UUID, user_id: Any) -> Dict[str, Any]:
+    async with core.state.db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT variant_json FROM thumbnail_recreate_variants
+            WHERE id = $1 AND user_id = $2
+            """,
+            variant_id,
+            user_id,
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="variant not found")
+    return _json_obj(row["variant_json"])
+
+
+async def _studio_r2_preview_response(variant_json: Dict[str, Any]) -> Optional[Response]:
+    """Serve durable R2 preview when ``preview_r2_key`` is present."""
+    r2_key = str(variant_json.get("preview_r2_key") or "").strip()
+    if not r2_key or not r2_key.startswith("thumbnail-studio/"):
+        return None
+    try:
+        body, ct = await asyncio.to_thread(get_object_bytes, r2_key)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.warning("r2-preview get_object failed key=%s", r2_key[:120], exc_info=True)
+        return None
+    if not body or len(body) < 512:
+        return None
+    if not (ct or "").startswith("image/"):
+        ct = "image/jpeg"
+    return Response(
+        content=body,
+        media_type=ct,
+        headers={
+            "Cache-Control": f"private, max-age={min(86400, STUDIO_PREVIEW_PRESIGN_TTL_SEC)}",
+            "X-UploadM8-Preview-Storage": "r2",
+            "X-UploadM8-Preview-Retention-Days": str(STUDIO_PREVIEW_RETENTION_DAYS),
+        },
+    )
+
+
+@router.get("/api/thumbnail-studio/r2-preview")
+async def thumbnail_studio_r2_preview(
+    variant_id: str = Query(..., min_length=30, max_length=48),
+    user: dict = Depends(get_current_user_readonly),
+):
+    """
+    Stream a durable R2-mirrored studio preview for this user's variant.
+    Objects are kept ~``STUDIO_PREVIEW_RETENTION_DAYS`` (default 300 ≈ 10 months).
+    """
+    try:
+        vid = uuid.UUID(variant_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid variant_id")
+    j = await _variant_json_for_user(vid, user["id"])
+    resp = await _studio_r2_preview_response(j)
+    if resp is not None:
+        return resp
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "code": "r2_preview_not_found",
+            "message": "No durable R2 preview for this variant. Regenerate to mirror into R2.",
+        },
+    )
+
+
 @router.get("/api/thumbnail-studio/cdn-preview")
 async def thumbnail_studio_cdn_preview(
     variant_id: str = Query(..., min_length=30, max_length=48),
     user: dict = Depends(get_current_user_readonly),
 ):
     """
-    Fetch a Pikzels CDN image for **this user's** stored variant only (variant_json
-    must contain ``pikzels_cdn_url`` or an extractable CDN URL). Uses the server
-    API key — browsers cannot send ``X-Api-Key`` to cdn.pikzels.com.
+    Fetch a preview for **this user's** stored variant.
+
+    Prefers durable R2 (``preview_r2_key``) so Saved runs survive Pikzels CDN expiry.
+    Falls back to ``cdn.pikzels.com`` with the server API key when R2 is missing.
 
     **Upstream mapping** (so Sentry and clients do not treat stale URLs as generic 502s):
 
@@ -432,26 +517,12 @@ async def thumbnail_studio_cdn_preview(
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid variant_id")
 
-    async with core.state.db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT variant_json FROM thumbnail_recreate_variants
-            WHERE id = $1 AND user_id = $2
-            """,
-            vid,
-            user["id"],
-        )
-    if not row:
-        raise HTTPException(status_code=404, detail="variant not found")
+    j = await _variant_json_for_user(vid, user["id"])
 
-    j = row["variant_json"]
-    if isinstance(j, str):
-        try:
-            j = json.loads(j)
-        except Exception:
-            j = {}
-    if not isinstance(j, dict):
-        j = {}
+    # Prefer R2 — Survives 8–10 months; Pikzels CDN URLs often 404 within days.
+    r2_resp = await _studio_r2_preview_response(j)
+    if r2_resp is not None:
+        return r2_resp
 
     raw = str(j.get("pikzels_cdn_url") or "").strip()
     if not raw.startswith("https://"):
@@ -487,7 +558,7 @@ async def thumbnail_studio_cdn_preview(
             status_code=404,
             detail={
                 "code": "upstream_image_not_found",
-                "message": "The preview image is no longer available on the CDN.",
+                "message": "The preview image is no longer available on the CDN (and no R2 mirror was stored).",
             },
         )
     if r.status_code == 403:
@@ -1263,8 +1334,188 @@ async def ts_link_persona_pikzels(persona_id: str, user: dict = Depends(get_curr
     }
 
 
+async def _mark_studio_job(
+    job_id: uuid.UUID,
+    *,
+    status: str,
+    engine_mode: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    if core.state.db_pool is None:
+        return
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE thumbnail_recreate_jobs
+                SET status = $2,
+                    engine_mode = COALESCE($3, engine_mode),
+                    error_message = $4,
+                    completed_at = CASE
+                        WHEN $2 IN ('completed', 'failed') THEN NOW()
+                        ELSE completed_at
+                    END
+                WHERE id = $1
+                """,
+                job_id,
+                str(status)[:32],
+                (engine_mode or None),
+                (error_message or None),
+            )
+    except Exception:
+        logger.warning("mark studio job status failed job_id=%s", job_id, exc_info=True)
+
+
+async def _refund_studio_recreate(
+    user_id: str, put: int, aic: int, job_id: uuid.UUID
+) -> None:
+    if (put <= 0 and aic <= 0) or core.state.db_pool is None:
+        return
+    try:
+        async with core.state.db_pool.acquire() as conn:
+            async with conn.transaction():
+                if put > 0:
+                    await credit_wallet(
+                        conn, user_id, "put", int(put), "thumbnail_studio_recreate_refund", str(job_id)
+                    )
+                if aic > 0:
+                    await credit_wallet(
+                        conn, user_id, "aic", int(aic), "thumbnail_studio_recreate_refund", str(job_id)
+                    )
+    except Exception:
+        logger.exception("studio recreate refund failed job_id=%s", job_id)
+
+
+async def _run_studio_recreate_job(
+    *,
+    job_id: uuid.UUID,
+    user_id: str,
+    youtube_title: str,
+    topic: str,
+    niche: str,
+    closeness: int,
+    variant_count: int,
+    persona_name: str,
+    competitor_gap_mode: bool,
+    format_key: Optional[str],
+    hydration_context: Dict[str, Any],
+    youtube_video_id: str,
+    pikzels_persona_pikzonality_id: Optional[str],
+    persona_face_ref: str,
+    reference_image_data_url: str,
+    put_cost: int,
+    aic_cost: int,
+) -> None:
+    """Background Pikzels + R2 work so Cloudflare does not 524 the HTTP request."""
+    variants_out: List[Dict[str, Any]] = []
+    engine_mode = "uploadm8_heuristic"
+    try:
+        raw_variants = generate_recreate_variants(
+            youtube_title=youtube_title or topic or "Video",
+            topic=topic or "",
+            niche=niche,
+            closeness=closeness,
+            variant_count=variant_count,
+            persona_name=persona_name,
+            competitor_gap_mode=competitor_gap_mode,
+            channel_memory_hint="",
+            format_key=format_key,
+            hydration_context=hydration_context,
+        )
+        raw_variants = await enrich_variants_with_uploadm8_engine(
+            raw_variants,
+            youtube_video_id=youtube_video_id or "",
+            source_title=youtube_title or topic or "",
+            niche=niche,
+            topic=topic or "",
+            persona_name=persona_name,
+            user_id=user_id,
+            job_id=str(job_id),
+            pikzels_persona_pikzonality_id=pikzels_persona_pikzonality_id,
+            closeness=int(closeness),
+            persona_face_ref=persona_face_ref,
+            reference_image_data_url=reference_image_data_url,
+            hydration_context=hydration_context,
+        )
+        if core.state.db_pool is None:
+            raise RuntimeError("Database unavailable")
+        async with core.state.db_pool.acquire() as conn:
+            async with conn.transaction():
+                for v in raw_variants:
+                    vid_row = uuid.uuid4()
+                    await conn.execute(
+                        """
+                        INSERT INTO thumbnail_recreate_variants (id, job_id, user_id, rank_idx, variant_json)
+                        VALUES ($1, $2, $3, $4, $5::jsonb)
+                        """,
+                        vid_row,
+                        job_id,
+                        uuid.UUID(str(user_id)),
+                        int(v.get("index") or 1),
+                        json.dumps(v),
+                    )
+                    vo = dict(v)
+                    vo["variant_id"] = str(vid_row)
+                    variants_out.append(vo)
+
+        if youtube_video_id and resolve_public_api_key():
+            engine_mode = "uploadm8_pikzels_v2_r2"
+        elif youtube_video_id:
+            engine_mode = "uploadm8_heuristic_youtube_ref_only"
+
+        await _mark_studio_job(job_id, status="completed", engine_mode=engine_mode)
+        m8_engine = m8_engine_identity_payload()
+        try:
+            async with core.state.db_pool.acquire() as conn:
+                meta = {
+                    "job_id": str(job_id),
+                    "engine_mode": engine_mode,
+                    "variant_count": len(variants_out),
+                    "engine_ok_count": sum(
+                        1 for v in variants_out if isinstance(v, dict) and v.get("engine_status") == "ok"
+                    ),
+                    "pikzels_configured": bool(resolve_public_api_key()),
+                    "m8_engine_ai_slug": m8_engine.get("ai_slug"),
+                    "preview_retention_days": STUDIO_PREVIEW_RETENTION_DAYS,
+                }
+                await record_studio_usage_event(
+                    conn, user_id, "thumbnail_studio_recreate_job", 200, meta
+                )
+                await record_thumbnail_studio_engine_ml_batch(
+                    conn,
+                    user_id=user_id,
+                    job_id=str(job_id),
+                    engine_mode=engine_mode,
+                    variants=variants_out,
+                    youtube_video_id=youtube_video_id or None,
+                )
+        except Exception:
+            logger.debug("thumbnail studio engine telemetry failed", exc_info=True)
+    except Exception as e:
+        logger.exception("studio recreate background job failed job_id=%s", job_id)
+        await _mark_studio_job(
+            job_id,
+            status="failed",
+            engine_mode=engine_mode,
+            error_message=str(e)[:2000],
+        )
+        await _refund_studio_recreate(user_id, put_cost, aic_cost, job_id)
+
+
 @router.post("/api/thumbnail-studio/recreate")
-async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current_user)):
+async def ts_recreate(
+    body: StudioRecreateBody,
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Start a Thumbnail Studio recreate job.
+
+    Returns immediately with ``status=running`` so Cloudflare/proxies do not 524
+    during multi-minute Pikzels runs. Poll ``GET .../jobs/{job_id}`` until
+    ``status`` is ``completed`` or ``failed``. Previews are mirrored to R2
+    (~``STUDIO_PREVIEW_RETENTION_DAYS`` retention).
+    """
     from services.thumbnail_niches import normalize_niche
 
     await _assert_thumbnail_studio_enabled(user)
@@ -1341,9 +1592,10 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
         breakdown["hydration_context"] = hydration_context
     if (body.format_key or "").strip():
         breakdown["format_key"] = str(body.format_key).strip()[:80]
+    breakdown["preview_retention_days"] = STUDIO_PREVIEW_RETENTION_DAYS
 
     job_id = uuid.uuid4()
-    variants_out: List[Dict[str, Any]] = []
+    niche_norm = normalize_niche(body.niche or "general")[:120]
 
     async with core.state.db_pool.acquire() as conn:
         async with conn.transaction():
@@ -1370,9 +1622,9 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
                 INSERT INTO thumbnail_recreate_jobs (
                     id, user_id, youtube_url, youtube_video_id, source_title, topic, niche,
                     closeness, variant_count, persona_id, competitor_gap_mode,
-                    put_cost, aic_cost, breakdown_json
+                    put_cost, aic_cost, breakdown_json, status
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, 'running')
                 """,
                 job_id,
                 user["id"],
@@ -1380,7 +1632,7 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
                 vid or None,
                 (title or "")[:512],
                 (body.topic or "")[:512],
-                normalize_niche(body.niche or "general")[:120],
+                niche_norm,
                 int(body.closeness),
                 int(body.variant_count),
                 persona_uuid,
@@ -1390,96 +1642,43 @@ async def ts_recreate(body: StudioRecreateBody, user: dict = Depends(get_current
                 json.dumps(breakdown),
             )
 
-    raw_variants = generate_recreate_variants(
+    background_tasks.add_task(
+        _run_studio_recreate_job,
+        job_id=job_id,
+        user_id=str(user["id"]),
         youtube_title=title or body.topic or "Video",
         topic=body.topic or "",
-        niche=normalize_niche(body.niche or "general"),
-        closeness=body.closeness,
-        variant_count=body.variant_count,
-        persona_name=persona_name,
-        competitor_gap_mode=body.competitor_gap_mode,
-        channel_memory_hint="",
-        format_key=body.format_key,
-        hydration_context=hydration_context,
-    )
-
-    raw_variants = await enrich_variants_with_uploadm8_engine(
-        raw_variants,
-        youtube_video_id=vid or "",
-        source_title=title or body.topic or "",
-        niche=normalize_niche(body.niche or "general"),
-        topic=body.topic or "",
-        persona_name=persona_name,
-        user_id=str(user["id"]),
-        job_id=str(job_id),
-        pikzels_persona_pikzonality_id=pikzels_persona_pikzonality_id,
+        niche=niche_norm,
         closeness=int(body.closeness),
-        persona_face_ref=persona_face_ref,
-        reference_image_data_url=reference_image_data_url,
-        hydration_context=hydration_context,
+        variant_count=int(body.variant_count),
+        persona_name=persona_name,
+        competitor_gap_mode=bool(body.competitor_gap_mode),
+        format_key=body.format_key,
+        hydration_context=hydration_context or {},
+        youtube_video_id=vid or "",
+        pikzels_persona_pikzonality_id=pikzels_persona_pikzonality_id,
+        persona_face_ref=persona_face_ref or "",
+        reference_image_data_url=reference_image_data_url or "",
+        put_cost=int(put),
+        aic_cost=int(aic),
     )
-
-    async with core.state.db_pool.acquire() as conn:
-        async with conn.transaction():
-            for v in raw_variants:
-                vid_row = uuid.uuid4()
-                await conn.execute(
-                    """
-                    INSERT INTO thumbnail_recreate_variants (id, job_id, user_id, rank_idx, variant_json)
-                    VALUES ($1, $2, $3, $4, $5::jsonb)
-                    """,
-                    vid_row,
-                    job_id,
-                    user["id"],
-                    int(v.get("index") or 1),
-                    json.dumps(v),
-                )
-                vo = dict(v)
-                vo["variant_id"] = str(vid_row)
-                variants_out.append(vo)
-
-    attach_preview_urls_to_variants(variants_out, ttl=3600)
-
-    engine_mode = "uploadm8_heuristic"
-    if vid and resolve_public_api_key():
-        engine_mode = "uploadm8_pikzels_v2_r2"
-    elif vid:
-        engine_mode = "uploadm8_heuristic_youtube_ref_only"
 
     m8_engine = m8_engine_identity_payload()
-    try:
-        async with core.state.db_pool.acquire() as conn:
-            meta = {
-                "job_id": str(job_id),
-                "engine_mode": engine_mode,
-                "variant_count": len(variants_out),
-                "engine_ok_count": sum(
-                    1 for v in variants_out if isinstance(v, dict) and v.get("engine_status") == "ok"
-                ),
-                "pikzels_configured": bool(resolve_public_api_key()),
-                "m8_engine_ai_slug": m8_engine.get("ai_slug"),
-            }
-            await record_studio_usage_event(
-                conn, str(user["id"]), "thumbnail_studio_recreate_job", 200, meta
-            )
-            await record_thumbnail_studio_engine_ml_batch(
-                conn,
-                user_id=str(user["id"]),
-                job_id=str(job_id),
-                engine_mode=engine_mode,
-                variants=variants_out,
-                youtube_video_id=vid or None,
-            )
-    except Exception:
-        logger.debug("thumbnail studio engine telemetry failed", exc_info=True)
-
+    engine_mode = (
+        "uploadm8_pikzels_v2_r2"
+        if vid and resolve_public_api_key()
+        else ("uploadm8_heuristic_youtube_ref_only" if vid else "uploadm8_heuristic")
+    )
     return {
         "job_id": str(job_id),
-        "variants": variants_out,
+        "status": "running",
+        "variants": [],
         "put_cost": put,
         "aic_cost": aic,
         "engine_mode": engine_mode,
         "m8_engine": m8_engine,
+        "preview_retention_days": STUDIO_PREVIEW_RETENTION_DAYS,
+        "poll_url": f"/api/thumbnail-studio/jobs/{job_id}",
     }
 
 
@@ -1635,9 +1834,15 @@ async def ts_get_job(job_id: str, user: dict = Depends(get_current_user_readonly
         j = dict(j)
         j["variant_id"] = str(r["id"])
         variants.append(j)
-    attach_preview_urls_to_variants(variants, ttl=3600)
+    attach_preview_urls_to_variants(variants)
     job_meta = _studio_job_public(job)
-    return {"job": job_meta, "job_id": str(job["id"]), "variants": variants}
+    return {
+        "job": job_meta,
+        "job_id": str(job["id"]),
+        "status": job_meta.get("status") or "completed",
+        "variants": variants,
+        "preview_retention_days": STUDIO_PREVIEW_RETENTION_DAYS,
+    }
 
 
 @router.post("/api/thumbnail-studio/feedback")

@@ -264,6 +264,27 @@ def put_object_bytes(key: str, body: bytes, content_type: str) -> str:
     return k
 
 
+def get_object_bytes(key: str) -> tuple[bytes, str]:
+    """Download object bytes + content-type from R2. Raises FileNotFoundError if missing."""
+    if not R2_BUCKET_NAME:
+        raise RuntimeError("Missing R2_BUCKET_NAME env var")
+    k = _normalize_r2_key(key)
+    if not k:
+        raise ValueError("empty R2 key")
+    s3 = get_s3_client()
+    try:
+        obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=k)
+    except ClientError as e:
+        err = (e.response or {}).get("Error") or {}
+        code = str(err.get("Code") or "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            raise FileNotFoundError(k) from e
+        raise
+    body = obj["Body"].read()
+    ct = str((obj.get("ContentType") or "application/octet-stream").split(";")[0].strip())
+    return body, ct or "application/octet-stream"
+
+
 async def _delete_r2_objects(keys: list[str]) -> int:
     """
     Delete a list of R2 object keys.  Runs in a thread-pool executor so it

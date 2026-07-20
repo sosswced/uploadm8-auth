@@ -44,6 +44,9 @@ from stages.emails.base import URL_UNSUBSCRIBE, send_email, mailgun_ready
 logger = logging.getLogger("uploadm8.marketing_execution")
 
 OUTBOUND_CHANNELS = frozenset({"email", "discord", "mixed"})
+# Delivered via marketing_events / in-app surfaces — no Mailgun / master ticket required.
+INAPP_CHANNELS = frozenset({"in_app", "discount"})
+EXECUTABLE_CHANNELS = OUTBOUND_CHANNELS | INAPP_CHANNELS
 
 
 def _campaign_channel(ch: Optional[str]) -> str:
@@ -52,6 +55,22 @@ def _campaign_channel(ch: Optional[str]) -> str:
 
 def _needs_approval_row(ch: str) -> bool:
     return _campaign_channel(ch) in OUTBOUND_CHANNELS
+
+
+def channel_reach_note(channel: str) -> str:
+    """Short operator-facing note for Preview / UI (how this channel is delivered)."""
+    ch = _campaign_channel(channel)
+    if ch == "email":
+        return "Email via Mailgun (master approve + execution tick; respects email opt-out)"
+    if ch == "discord":
+        return "In-app Discord-style prompt (master approve + tick; not a Discord bot DM)"
+    if ch == "mixed":
+        return "Email + in-app Discord prompt (master approve + tick)"
+    if ch == "discount":
+        return "In-app discount / upgrade offer event (Set Active + tick; no email)"
+    if ch == "in_app":
+        return "In-app wallet/dashboard nudge event (Set Active + tick; no email)"
+    return f"Channel `{ch}`"
 
 
 def _campaign_name_slug(name: str) -> str:
@@ -234,6 +253,82 @@ def _user_matches_campaign(
     return _match_fail_reason(tier, feats, targeting) is None
 
 
+async def list_campaign_audience_users(
+    conn: asyncpg.Connection,
+    *,
+    targeting: Any,
+    range_key: str = "30d",
+    user_limit: int = 2500,
+    result_limit: int = 500,
+    campaign_id: Optional[str] = None,
+    dedupe_within_days: int = 0,
+) -> Dict[str, Any]:
+    """
+    Return matched audience rows (same matchers as execution tick / preview).
+
+    ``dedupe_within_days`` > 0 excludes users already delivered for this campaign.
+    Used for CSV export and announcement handoff (capped by ``result_limit``).
+    """
+    tg = _parse_targeting(targeting)
+    rk = str(range_key or "30d")[:32]
+    rejects: Dict[str, int] = {}
+    matched = 0
+    send_ready = 0
+    scanned = 0
+    users: list[Dict[str, Any]] = []
+    cid_s: Optional[str] = None
+    if campaign_id:
+        try:
+            cid_s = str(uuid.UUID(str(campaign_id)))
+        except (ValueError, TypeError):
+            cid_s = None
+    cap = max(1, min(int(result_limit or 500), 2000))
+
+    for urow in await _iter_candidate_users(conn, user_limit):
+        scanned += 1
+        uid = str(urow["id"])
+        tier = str(urow.get("subscription_tier") or "free")
+        feats = await _user_campaign_features(conn, uid, rk)
+        reason = _match_fail_reason(tier, feats, tg)
+        if reason:
+            rejects[reason] = rejects.get(reason, 0) + 1
+            continue
+        matched += 1
+        dedupe_hit = False
+        if cid_s and dedupe_within_days > 0:
+            if await recent_delivery_exists(
+                conn, user_id=uid, campaign_id=cid_s, within_days=dedupe_within_days
+            ):
+                dedupe_hit = True
+        if not dedupe_hit:
+            send_ready += 1
+        if len(users) < cap:
+            users.append(
+                {
+                    "user_id": uid,
+                    "email": str(urow.get("email") or ""),
+                    "name": str(urow.get("name") or ""),
+                    "tier": tier,
+                    "uploads": int(feats.get("uploads_window") or feats.get("uploads") or 0),
+                    "enterprise_fit_score": float(feats.get("enterprise_fit_score") or 0),
+                    "nudge_ctr_pct": float(feats.get("nudge_ctr_pct") or 0),
+                    "send_ready": not dedupe_hit,
+                }
+            )
+
+    return {
+        "users": users,
+        "matched_count": matched,
+        "send_ready_count": send_ready,
+        "users_scanned": scanned,
+        "reject_breakdown": rejects,
+        "range_key": rk,
+        "estimated_audience": matched,
+        "returned": len(users),
+        "result_limit": cap,
+    }
+
+
 async def count_campaign_audience(
     conn: asyncpg.Connection,
     *,
@@ -247,43 +342,22 @@ async def count_campaign_audience(
     Count users matching campaign targeting (same logic as execution tick).
     send_ready_count excludes users already touched for this campaign within dedupe window.
     """
-    tg = _parse_targeting(targeting)
-    rk = str(range_key or "30d")[:32]
-    rejects: Dict[str, int] = {}
-    matched = 0
-    send_ready = 0
-    scanned = 0
-    cid_s: Optional[str] = None
-    if campaign_id:
-        try:
-            cid_s = str(uuid.UUID(str(campaign_id)))
-        except (ValueError, TypeError):
-            cid_s = None
-
-    for urow in await _iter_candidate_users(conn, user_limit):
-        scanned += 1
-        uid = str(urow["id"])
-        tier = str(urow.get("subscription_tier") or "free")
-        feats = await _user_campaign_features(conn, uid, rk)
-        reason = _match_fail_reason(tier, feats, tg)
-        if reason:
-            rejects[reason] = rejects.get(reason, 0) + 1
-            continue
-        matched += 1
-        if cid_s and dedupe_within_days > 0:
-            if await recent_delivery_exists(
-                conn, user_id=uid, campaign_id=cid_s, within_days=dedupe_within_days
-            ):
-                continue
-        send_ready += 1
-
+    listed = await list_campaign_audience_users(
+        conn,
+        targeting=targeting,
+        range_key=range_key,
+        user_limit=user_limit,
+        result_limit=1,
+        campaign_id=campaign_id,
+        dedupe_within_days=dedupe_within_days,
+    )
     return {
-        "matched_count": matched,
-        "send_ready_count": send_ready,
-        "users_scanned": scanned,
-        "reject_breakdown": rejects,
-        "range_key": rk,
-        "estimated_audience": matched,
+        "matched_count": listed["matched_count"],
+        "send_ready_count": listed["send_ready_count"],
+        "users_scanned": listed["users_scanned"],
+        "reject_breakdown": listed["reject_breakdown"],
+        "range_key": listed["range_key"],
+        "estimated_audience": listed["estimated_audience"],
     }
 
 
@@ -293,8 +367,9 @@ def execution_tick_hint(summary: Dict[str, Any]) -> str:
     sent_total = int(summary.get("email_sent") or 0) + int(summary.get("discord_sent") or 0)
     if eligible <= 0:
         return (
-            "No outbound campaigns are ready: need status active, master approval, "
-            "channel email/discord/mixed, and schedule_at in the past."
+            "No campaigns are ready to deliver: need status active, schedule_at in the past "
+            "(or empty), and for email/discord/mixed also master approval + approved ticket. "
+            "In-app / discount only need Set Active."
         )
     if sent_total > 0:
         return ""
@@ -339,7 +414,9 @@ async def run_marketing_execution_tick(
     max_total_sends: int = 120,
 ) -> Dict[str, Any]:
     """
-    Process active, approved outbound campaigns: queue sends, write marketing_events, update runs.
+    Process eligible active campaigns across all executable channels:
+    email / discord / mixed (master-approved) and in_app / discount (Set Active).
+    Writes marketing_events / Mailgun sends and updates automation runs.
     """
     run_id = uuid.uuid4()
     await conn.execute(
@@ -370,15 +447,20 @@ async def run_marketing_execution_tick(
         SELECT c.*
         FROM marketing_campaigns c
         WHERE c.status = 'active'
-          AND LOWER(COALESCE(c.channel, '')) IN ('email', 'discord', 'mixed')
-          AND c.approved_at IS NOT NULL
-          AND EXISTS (
-              SELECT 1 FROM marketing_approval_tickets t
-              WHERE t.campaign_id = c.id
-                AND t.status = 'approved'
-                AND t.resolved_by IS NOT NULL
-          )
+          AND LOWER(COALESCE(c.channel, '')) IN ('email', 'discord', 'mixed', 'in_app', 'discount')
           AND (c.schedule_at IS NULL OR c.schedule_at <= NOW())
+          AND (
+                LOWER(COALESCE(c.channel, '')) IN ('in_app', 'discount')
+                OR (
+                    c.approved_at IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM marketing_approval_tickets t
+                        WHERE t.campaign_id = c.id
+                          AND t.status = 'approved'
+                          AND t.resolved_by IS NOT NULL
+                    )
+                )
+          )
         ORDER BY COALESCE(c.schedule_at, c.created_at) ASC
         LIMIT 20
         """
@@ -740,14 +822,106 @@ async def run_marketing_execution_tick(
             if ch == "discord" and not touched:
                 continue
 
-        if camp_sent and webhook and ch in ("discord", "mixed", "email"):
+            # In-app / discount: write marketing_events for wallet / dashboard surfaces.
+            if ch in INAPP_CHANNELS and not touched:
+                line = render_template(str(disc_tpl or text_tpl or ""), ctx)[:1800]
+                if not line.strip():
+                    line = f"Hi {ctx['name']} — " + (camp.get("objective") or "UploadM8 update")[:500]
+                event_type = (
+                    "campaign_discount_offer" if ch == "discount" else "campaign_in_app_prompt"
+                )
+                cta_href = (
+                    (ctx.get("app_url", "") + "/billing.html")
+                    if ch == "discount"
+                    else (ctx.get("app_url", "") + "/dashboard.html")
+                )
+                cta_label = "View offer" if ch == "discount" else "Open UploadM8"
+                did = uuid.uuid4()
+                claimed = await claim_campaign_delivery_slot(
+                    conn,
+                    user_id=uid,
+                    campaign_id=cid,
+                    channel=ch,
+                    within_days=7,
+                    delivery_id=did,
+                    subject=(camp.get("name") or "UploadM8")[:200],
+                    body_text=line,
+                    body_html="",
+                    meta={
+                        "campaign_id": cid,
+                        "variant_id": promo_variant_id or None,
+                        "run_id": str(run_id),
+                        "delivery": event_type,
+                        "path": "ml_campaign_execution",
+                    },
+                )
+                if not claimed:
+                    summary["skipped"] += 1
+                else:
+                    await conn.execute(
+                        """
+                        UPDATE marketing_touchpoint_deliveries
+                        SET status = 'sent', sent_at = NOW(), channel = $2
+                        WHERE id = $1::uuid
+                        """,
+                        did,
+                        ch,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO marketing_events (user_id, event_type, payload)
+                        VALUES ($1::uuid, $2, $3::jsonb)
+                        """,
+                        uid,
+                        event_type,
+                        json.dumps(
+                            {
+                                "campaign_id": cid,
+                                "title": (camp.get("name") or "UploadM8")[:120],
+                                "body": line[:2000],
+                                "cta_href": cta_href,
+                                "cta_label": cta_label,
+                                "image_url": promo_image_url or None,
+                                "variant_id": promo_variant_id or None,
+                                "channel": ch,
+                            }
+                        ),
+                    )
+                    try:
+                        await record_outcome_label(
+                            conn,
+                            user_id=uid,
+                            upload_id=None,
+                            variant_id=promo_variant_id or None,
+                            feature_snapshot={
+                                "campaign_id": cid,
+                                "channel": ch,
+                                "tier": tier_norm,
+                            },
+                            label_json={event_type: True},
+                        )
+                    except Exception:
+                        pass
+                    touched = True
+                    camp_sent += 1
+                    total += 1
+                    summary["in_app_written"] += 1
+
+        if camp_sent and webhook and ch in ("discord", "mixed", "email", "in_app", "discount"):
             await send_discord_webhook(
                 webhook,
                 f"**Marketing run** · campaign **{camp.get('name') or cid[:8]}** · touches **{camp_sent}** users "
-                f"(channel `{ch}`). Email uses Mailgun; Discord leg is in-app + community (no PII on webhook).",
+                f"(channel `{ch}`). Email uses Mailgun; Discord/in-app legs are in-product (no PII on webhook).",
             )
 
-        summary["campaigns"].append({"id": cid, "sent": camp_sent, "matched": camp_matched})
+        summary["campaigns"].append(
+            {
+                "id": cid,
+                "sent": camp_sent,
+                "matched": camp_matched,
+                "channel": ch,
+            }
+        )
 
     summary["users_evaluated"] = users_eval
     summary["hint"] = execution_tick_hint(summary)

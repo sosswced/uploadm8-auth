@@ -508,6 +508,114 @@ async def recalculate_smart_schedule(upload_id: UUID, user: dict = Depends(get_c
 
 
 # ------------------------------------------------------------------
+# POST /api/scheduled/{upload_id}/randomize-schedule
+# ------------------------------------------------------------------
+@router.post("/{upload_id:uuid}/randomize-schedule")
+async def randomize_schedule(upload_id: UUID, user: dict = Depends(get_current_user)):
+    """Pick a new random future publish window and apply it immediately.
+
+    Intended for ``ready_to_publish`` rows stuck past their due time (and other
+    still-editable scheduled statuses). Smart mode regenerates per-platform
+    slots; one-time mode sets a single shared ``scheduled_time``.
+    """
+    uid_str = str(upload_id)
+    bill_id = str(user.get("billing_user_id") or user["id"])
+    async with core.state.db_pool.acquire() as conn:
+        upload = await conn.fetchrow(
+            """
+            SELECT id, status, schedule_mode, platforms, schedule_metadata,
+                   scheduled_time, user_id
+            FROM uploads
+            WHERE id = $1 AND user_id = $2
+            """,
+            uid_str,
+            user["id"],
+        )
+        if not upload:
+            raise HTTPException(404, "Scheduled upload not found")
+        status = (upload.get("status") or "").lower()
+        if status not in SCHEDULED_PIPELINE_STATUSES:
+            raise HTTPException(400, "Cannot randomize schedule for an upload that is no longer editable")
+
+        platforms = list(upload["platforms"] or [])
+        if not platforms:
+            raise HTTPException(400, "Upload has no platforms")
+
+        mode = (upload.get("schedule_mode") or "scheduled").lower()
+        num_days = (
+            _infer_smart_spread_days(upload.get("schedule_metadata"))
+            if mode == "smart"
+            else 14
+        )
+        from services.upload.schedule_guard import build_smart_schedule_for_upload
+
+        smart = await build_smart_schedule_for_upload(
+            conn,
+            bill_id,
+            platforms,
+            num_days=num_days,
+            exclude_upload_id=uid_str,
+            random_seed=str(uuid.uuid4()),
+        )
+        if not smart:
+            raise HTTPException(
+                500,
+                detail={
+                    "code": "schedule_generation_failed",
+                    "message": "Could not generate a new random schedule time.",
+                },
+            )
+
+        if mode == "smart":
+            sm = {p: schedule_slot_iso(dt) for p, dt in smart.items()}
+            await _apply_smart_schedule(conn, uid_str, user["id"], sm)
+            await conn.execute(
+                """
+                UPDATE uploads
+                SET error_code = NULL,
+                    error_detail = NULL,
+                    cancel_requested = FALSE,
+                    updated_at = NOW()
+                WHERE id = $1 AND user_id = $2
+                """,
+                uid_str,
+                user["id"],
+            )
+            scheduled_min = min(smart.values())
+            return {
+                "status": "updated",
+                "id": uid_str,
+                "mode": "smart",
+                "smart_schedule": sm,
+                "scheduled_time": scheduled_min.isoformat(),
+            }
+
+        # One-time / scheduled: single shared time = earliest generated slot.
+        scheduled_dt = min(smart.values())
+        await conn.execute(
+            """
+            UPDATE uploads
+            SET scheduled_time = $3,
+                error_code = NULL,
+                error_detail = NULL,
+                cancel_requested = FALSE,
+                updated_at = NOW()
+            WHERE id = $1 AND user_id = $2
+            """,
+            uid_str,
+            user["id"],
+            scheduled_dt,
+        )
+        return {
+            "status": "updated",
+            "id": uid_str,
+            "mode": mode or "scheduled",
+            "smart_schedule": None,
+            "scheduled_time": scheduled_dt.isoformat(),
+        }
+
+
+# ------------------------------------------------------------------
 # GET /api/scheduled/{upload_id}  — single upload detail
 # ------------------------------------------------------------------
 @router.get("/{upload_id:uuid}")

@@ -1714,6 +1714,126 @@ def attach_preview_urls_to_variants(
             v["preview_storage"] = "pikzels_cdn"
 
 
+def resolve_variant_cdn_url(variant: Dict[str, Any]) -> str:
+    """Best-effort Pikzels CDN URL from stored variant JSON (no network)."""
+    if not isinstance(variant, dict):
+        return ""
+    polish_studio_variant_for_client(variant)
+    raw = str(variant.get("pikzels_cdn_url") or "").strip()
+    if raw.lower().startswith("https://cdn.pikzels.com/"):
+        return raw
+    extracted = _pikzels_extract_image_url(variant)
+    if str(extracted or "").lower().startswith("https://cdn.pikzels.com/"):
+        return str(extracted).strip()
+    for k in ("subhead", "engine_text_brief", "engine_error"):
+        u = extract_cdn_pikzels_rest_url(str(variant.get(k) or ""))
+        if u:
+            return u
+    return ""
+
+
+async def backfill_variant_preview_to_r2(
+    *,
+    user_id: str,
+    job_id: str,
+    variant_id: str,
+    variant: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Free repair: if the variant has no ``preview_r2_key`` but a live CDN URL,
+    download once and mirror to R2. No Pikzels regenerate / no wallet debit.
+
+    Returns ``{status, preview_r2_key?, reason?}`` where status is one of:
+    ``already_r2``, ``mirrored``, ``cdn_gone``, ``no_cdn``, ``error``.
+    """
+    v = dict(variant) if isinstance(variant, dict) else {}
+    existing = str(v.get("preview_r2_key") or "").strip()
+    if existing.startswith("thumbnail-studio/"):
+        return {"status": "already_r2", "preview_r2_key": existing, "variant_id": variant_id}
+
+    cdn = resolve_variant_cdn_url(v)
+    if not cdn:
+        return {"status": "no_cdn", "variant_id": variant_id, "reason": "no_pikzels_cdn_url"}
+
+    img = await _download_bytes(cdn)
+    if not img or len(img) < 2048:
+        return {
+            "status": "cdn_gone",
+            "variant_id": variant_id,
+            "reason": "cdn_unavailable_or_expired",
+        }
+
+    idx = int(v.get("index") or 1)
+    r2_key = f"thumbnail-studio/previews/{user_id}/{job_id}/variant_{idx}.jpg"
+    # Avoid collisions when rank_idx differs from index — include variant id suffix.
+    if variant_id:
+        short = str(variant_id).replace("-", "")[:12]
+        r2_key = f"thumbnail-studio/previews/{user_id}/{job_id}/variant_{idx}_{short}.jpg"
+    try:
+        await _r2_put_bytes(r2_key, img, "image/jpeg")
+    except Exception as e:
+        _log.warning("backfill R2 put failed variant=%s: %s", variant_id, e)
+        return {"status": "error", "variant_id": variant_id, "reason": str(e)[:300]}
+
+    v["preview_r2_key"] = r2_key
+    v["pikzels_cdn_url"] = cdn
+    v["preview_backfilled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    v["preview_storage"] = "r2"
+    return {
+        "status": "mirrored",
+        "variant_id": variant_id,
+        "preview_r2_key": r2_key,
+        "variant": v,
+    }
+
+
+async def backfill_job_variants_to_r2(
+    *,
+    user_id: str,
+    job_id: str,
+    variants: List[Dict[str, Any]],
+    max_parallel: int = 3,
+) -> Dict[str, Any]:
+    """
+    Free CDN→R2 backfill for a job's variants. Mutates variants that succeed
+    (sets ``preview_r2_key``). Caller must persist updated ``variant_json``.
+    """
+    sem = asyncio.Semaphore(max(1, min(int(max_parallel or 3), 4)))
+    summary: Dict[str, Any] = {
+        "job_id": job_id,
+        "mirrored": 0,
+        "already_r2": 0,
+        "cdn_gone": 0,
+        "no_cdn": 0,
+        "error": 0,
+        "updated_variants": [],
+        "free": True,
+        "note": (
+            "No wallet debit. Only works while Pikzels CDN still has the image; "
+            "expired CDN links need a paid regenerate."
+        ),
+    }
+
+    async def one(v: Dict[str, Any]) -> None:
+        async with sem:
+            vid = str(v.get("variant_id") or "")
+            result = await backfill_variant_preview_to_r2(
+                user_id=user_id,
+                job_id=job_id,
+                variant_id=vid,
+                variant=v,
+            )
+            st = str(result.get("status") or "error")
+            summary[st] = int(summary.get(st) or 0) + 1
+            if st == "mirrored" and isinstance(result.get("variant"), dict):
+                v.update(result["variant"])
+                v["variant_id"] = vid
+                summary["updated_variants"].append(vid)
+
+    await asyncio.gather(*[one(v) for v in variants if isinstance(v, dict)])
+    return summary
+
+
 async def _pikzels_engine_text_brief(
     *,
     source_title: str,

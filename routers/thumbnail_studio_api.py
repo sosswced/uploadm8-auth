@@ -13,11 +13,11 @@ import binascii
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -57,6 +57,7 @@ from services.pikzels_v2_client import (
 from services.thumbnail_studio import (
     _pikzels_extract_image_url,
     attach_preview_urls_to_variants,
+    backfill_job_variants_to_r2,
     build_thumbnail_ab_export_zip,
     enrich_variants_with_uploadm8_engine,
     estimate_pikzels_v2_call_cost,
@@ -1797,17 +1798,14 @@ async def ts_delete_job(job_id: str, user: dict = Depends(get_current_user_reado
     return {"deleted": True, "job_id": str(jid)}
 
 
-@router.get("/api/thumbnail-studio/jobs/{job_id}")
-async def ts_get_job(job_id: str, user: dict = Depends(get_current_user_readonly)):
-    try:
-        jid = uuid.UUID(job_id)
-    except ValueError:
-        raise HTTPException(400, "Invalid job id")
+async def _load_job_variants_for_user(
+    jid: uuid.UUID, user_id: Any
+) -> Tuple[Any, List[Dict[str, Any]], List[Any]]:
     async with core.state.db_pool.acquire() as conn:
         job = await conn.fetchrow(
             "SELECT * FROM thumbnail_recreate_jobs WHERE id = $1 AND user_id = $2",
             jid,
-            user["id"],
+            user_id,
         )
         if not job:
             raise HTTPException(404, "Job not found")
@@ -1819,21 +1817,23 @@ async def ts_get_job(job_id: str, user: dict = Depends(get_current_user_readonly
             ORDER BY rank_idx ASC
             """,
             jid,
-            user["id"],
+            user_id,
         )
     variants: List[Dict[str, Any]] = []
     for r in vrows:
-        j = r["variant_json"]
-        if isinstance(j, str):
-            try:
-                j = json.loads(j)
-            except Exception:
-                j = {}
-        if not isinstance(j, dict):
-            j = {}
-        j = dict(j)
+        j = _json_obj(r["variant_json"])
         j["variant_id"] = str(r["id"])
         variants.append(j)
+    return job, variants, list(vrows)
+
+
+@router.get("/api/thumbnail-studio/jobs/{job_id}")
+async def ts_get_job(job_id: str, user: dict = Depends(get_current_user_readonly)):
+    try:
+        jid = uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid job id")
+    job, variants, _vrows = await _load_job_variants_for_user(jid, user["id"])
     attach_preview_urls_to_variants(variants)
     job_meta = _studio_job_public(job)
     return {
@@ -1841,6 +1841,112 @@ async def ts_get_job(job_id: str, user: dict = Depends(get_current_user_readonly
         "job_id": str(job["id"]),
         "status": job_meta.get("status") or "completed",
         "variants": variants,
+        "preview_retention_days": STUDIO_PREVIEW_RETENTION_DAYS,
+    }
+
+
+async def _persist_job_r2_backfill(user: dict, jid: uuid.UUID) -> Dict[str, Any]:
+    if not R2_BUCKET_NAME:
+        raise HTTPException(503, "R2 not configured")
+    _job, variants, _vrows = await _load_job_variants_for_user(jid, user["id"])
+    summary = await backfill_job_variants_to_r2(
+        user_id=str(user["id"]),
+        job_id=str(jid),
+        variants=variants,
+    )
+    updated_ids = set(summary.get("updated_variants") or [])
+    if updated_ids:
+        async with core.state.db_pool.acquire() as conn:
+            for v in variants:
+                vid = str(v.get("variant_id") or "")
+                if vid not in updated_ids:
+                    continue
+                try:
+                    vu = uuid.UUID(vid)
+                except ValueError:
+                    continue
+                payload = dict(v)
+                payload.pop("variant_id", None)
+                await conn.execute(
+                    """
+                    UPDATE thumbnail_recreate_variants
+                    SET variant_json = $3::jsonb
+                    WHERE id = $1 AND job_id = $2 AND user_id = $4
+                    """,
+                    vu,
+                    jid,
+                    json.dumps(payload),
+                    user["id"],
+                )
+    attach_preview_urls_to_variants(variants)
+    summary["variants"] = variants
+    summary["preview_retention_days"] = STUDIO_PREVIEW_RETENTION_DAYS
+    return summary
+
+
+@router.post("/api/thumbnail-studio/jobs/{job_id}/backfill-r2")
+async def ts_backfill_job_r2(job_id: str, user: dict = Depends(get_current_user)):
+    """
+    Free repair: mirror still-live Pikzels CDN previews into durable R2.
+    No regenerate / no wallet debit. Variants whose CDN links already 404
+    cannot be recovered without a paid Generate.
+    """
+    try:
+        jid = uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid job id")
+    return await _persist_job_r2_backfill(user, jid)
+
+
+@router.post("/api/thumbnail-studio/jobs/backfill-r2")
+async def ts_backfill_recent_jobs_r2(
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    user: dict = Depends(get_current_user),
+):
+    """Free CDN→R2 backfill across recent saved jobs (default 15)."""
+    body = payload if isinstance(payload, dict) else {}
+    limit = max(1, min(int(body.get("limit") or 15), 40))
+    if not R2_BUCKET_NAME:
+        raise HTTPException(503, "R2 not configured")
+    async with core.state.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id FROM thumbnail_recreate_jobs
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            user["id"],
+            limit,
+        )
+    jobs_out: List[Dict[str, Any]] = []
+    totals = {"mirrored": 0, "already_r2": 0, "cdn_gone": 0, "no_cdn": 0, "error": 0}
+    for r in rows:
+        jid = r["id"]
+        try:
+            one = await _persist_job_r2_backfill(user, jid if isinstance(jid, uuid.UUID) else uuid.UUID(str(jid)))
+        except HTTPException:
+            continue
+        jobs_out.append(
+            {
+                "job_id": str(jid),
+                "mirrored": one.get("mirrored") or 0,
+                "cdn_gone": one.get("cdn_gone") or 0,
+                "already_r2": one.get("already_r2") or 0,
+            }
+        )
+        for k in totals:
+            totals[k] += int(one.get(k) or 0)
+    return {
+        "ok": True,
+        "free": True,
+        "jobs_scanned": len(jobs_out),
+        "totals": totals,
+        "jobs": jobs_out,
+        "note": (
+            "No wallet debit. Mirrored = saved to R2 from still-live CDN. "
+            "cdn_gone = CDN expired; those need a paid regenerate."
+        ),
         "preview_retention_days": STUDIO_PREVIEW_RETENTION_DAYS,
     }
 

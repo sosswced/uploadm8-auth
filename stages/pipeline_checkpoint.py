@@ -474,6 +474,11 @@ async def try_resume_from_checkpoint(
     If ``action=retry`` or ``resume_from_checkpoint`` and checkpoint is valid,
     prepare temp dir + ctx for resume.
 
+    Also auto-resumes when a durable ``pipeline_resume`` checkpoint exists and
+    the job did not opt out (``skip_checkpoint_resume``). That covers Redis
+    stream redelivery after a mid-pipeline worker crash (e.g. killed during
+    FFmpeg) without waiting for stale recovery.
+
     Returns:
         (mode, temp_dir_holder) where mode is
         ``post_telemetry`` | ``post_transcode`` | ``post_audio`` | ``post_caption`` | None,
@@ -481,8 +486,7 @@ async def try_resume_from_checkpoint(
     """
     import tempfile
 
-    allow = (job_data.get("action") == "retry") or bool(job_data.get("resume_from_checkpoint"))
-    if not allow:
+    if job_data.get("skip_checkpoint_resume"):
         return None, None
 
     cp = load_resume(upload_record)
@@ -491,6 +495,16 @@ async def try_resume_from_checkpoint(
 
     stage = (cp.get("stage") or "").strip().lower()
     if stage not in ("post_telemetry", "post_transcode", "post_audio", "post_caption", "post_publish"):
+        return None, None
+
+    allow = (
+        (job_data.get("action") == "retry")
+        or bool(job_data.get("resume_from_checkpoint"))
+        # Crash / stream reclaim: same job payload, no resume flag — still skip
+        # finished stages when a matching checkpoint is on the upload row.
+        or stage in ("post_telemetry", "post_transcode", "post_audio", "post_caption")
+    )
+    if not allow:
         return None, None
 
     if stage == "post_publish":

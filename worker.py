@@ -4300,10 +4300,12 @@ async def run_stale_job_recovery_loop() -> None:
 
     When STALE_PROCESSING_MINUTES > 0, also handle stuck `processing` rows:
     if STALE_PROCESSING_RECOVER_CHECKPOINT is on and ``pipeline_resume`` is
-    at ``post_transcode`` or ``post_audio`` with valid R2 checkpoint objects,
+    at ``post_telemetry`` / ``post_transcode`` / ``post_audio`` / ``post_caption``
+    with a valid checkpoint (R2 objects verified when past transcode),
     reset the row to ``queued`` and enqueue with ``resume_from_checkpoint`` so
-    the worker skips download/transcode (and audio when stage is post_audio).
-    Otherwise mark the upload failed with STALE_PROCESSING.
+    the worker skips finished stages (e.g. mid-transcode crash resumes after
+    telemetry without re-scoring Trill). Otherwise full re-enqueue, then
+    STALE_PROCESSING fail if enqueue fails.
     """
     global shutdown_requested, shutdown_event, redis_client
 
@@ -4405,20 +4407,38 @@ async def run_stale_job_recovery_loop() -> None:
                                 stg = str((cp or {}).get("stage") or "").lower()
                                 if (
                                     cp
-                                    and stg in ("post_transcode", "post_audio", "post_caption")
+                                    and stg
+                                    in (
+                                        "post_telemetry",
+                                        "post_transcode",
+                                        "post_audio",
+                                        "post_caption",
+                                    )
                                     and pipeline_checkpoint.checkpoint_matches_upload(cp, ur)
                                 ):
                                     try:
-                                        transcode_ok = await pipeline_checkpoint.verify_transcode_r2_keys(
-                                            dict(cp.get("transcode_r2") or {})
-                                        )
-                                        if stg == "post_caption":
-                                            thumb_ok = bool(
-                                                (cp.get("thumbnail_r2_key") or ur.get("thumbnail_r2_key") or "").strip()
-                                            )
-                                            recover_ok = transcode_ok and thumb_ok
+                                        if stg == "post_telemetry":
+                                            # Mid-transcode / pre-transcode crash: source still in R2;
+                                            # resume re-downloads video and skips telemetry/trill.
+                                            src = (
+                                                (cp.get("source_r2_key") or ur.get("r2_key") or "")
+                                            ).strip()
+                                            recover_ok = bool(src)
                                         else:
-                                            recover_ok = transcode_ok
+                                            transcode_ok = await pipeline_checkpoint.verify_transcode_r2_keys(
+                                                dict(cp.get("transcode_r2") or {})
+                                            )
+                                            if stg == "post_caption":
+                                                thumb_ok = bool(
+                                                    (
+                                                        cp.get("thumbnail_r2_key")
+                                                        or ur.get("thumbnail_r2_key")
+                                                        or ""
+                                                    ).strip()
+                                                )
+                                                recover_ok = transcode_ok and thumb_ok
+                                            else:
+                                                recover_ok = transcode_ok
                                     except Exception:
                                         recover_ok = False
 
@@ -4481,16 +4501,31 @@ async def run_stale_job_recovery_loop() -> None:
                                 )
                                 continue
                         deferred = False
+                        resume_cp = False
                         if ur:
                             deferred = str(ur.get("schedule_mode") or "immediate").lower() in (
                                 "scheduled",
                                 "smart",
+                            )
+                            _cp_full = pipeline_checkpoint.load_resume(ur)
+                            _stg_full = str((_cp_full or {}).get("stage") or "").lower()
+                            resume_cp = bool(
+                                _cp_full
+                                and _stg_full
+                                in (
+                                    "post_telemetry",
+                                    "post_transcode",
+                                    "post_audio",
+                                    "post_caption",
+                                )
+                                and pipeline_checkpoint.checkpoint_matches_upload(_cp_full, ur)
                             )
                         full_payload = await _build_process_job_payload(
                             up,
                             uid,
                             deferred=deferred,
                             job_id=f"stale-recover-full-{up}",
+                            resume_from_checkpoint=resume_cp,
                         )
                         if full_payload and await enqueue_process_lane_job(full_payload):
                             async with db_pool.acquire() as uconn:

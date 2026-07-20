@@ -258,17 +258,24 @@ async def _gather_batch(
     baseline_start: datetime,
     baseline_end: datetime,
 ):
-    import asyncio
-
-    return await asyncio.gather(
-        _fetch_hour_scores_batch(conn, plats, user_id=None, window_start=g_start, window_end=now),
-        _fetch_hour_scores_batch(conn, plats, user_id=user_id, window_start=u_start, window_end=now),
-        _fetch_hour_scores_batch(conn, plats, user_id=None, window_start=recent_start, window_end=now),
-        _fetch_hour_scores_batch(
-            conn, plats, user_id=None, window_start=baseline_start, window_end=baseline_end
-        ),
-        fetch_m8_hour_priors_batch(conn, plats),
+    # Sequential on a single asyncpg connection. asyncio.gather on the same
+    # ``conn`` raises InterfaceError ("another operation is in progress"), which
+    # the API maps to a misleading 503 ("Database temporarily unavailable") —
+    # see Sentry UPLOADM8-88 on POST /api/scheduled/.../randomize-schedule.
+    global_batch = await _fetch_hour_scores_batch(
+        conn, plats, user_id=None, window_start=g_start, window_end=now
     )
+    user_batch = await _fetch_hour_scores_batch(
+        conn, plats, user_id=user_id, window_start=u_start, window_end=now
+    )
+    recent_batch = await _fetch_hour_scores_batch(
+        conn, plats, user_id=None, window_start=recent_start, window_end=now
+    )
+    baseline_batch = await _fetch_hour_scores_batch(
+        conn, plats, user_id=None, window_start=baseline_start, window_end=baseline_end
+    )
+    m8_batch = await fetch_m8_hour_priors_batch(conn, plats)
+    return global_batch, user_batch, recent_batch, baseline_batch, m8_batch
 
 
 async def calculate_smart_schedule_data_driven(

@@ -22,6 +22,7 @@ from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragme
 from core.r2 import get_s3_client, _normalize_r2_key, resolve_stored_account_avatar_url
 from core.models import SmartScheduleOnlyUpdate
 from services.upload.list_detail import _upload_error_message
+from services.retry_policy import upload_is_overdue_ready_to_publish
 from services.upload.status import (
     CANCELLABLE_STATUSES,
     SCHEDULE_ATTENTION_ERROR_CODES,
@@ -246,11 +247,22 @@ async def _scheduled_upload_list_for_user(
                     "is_retryable": is_retryable_upload(
                         str(upload.get("status") or ""),
                         error_code=upload.get("error_code"),
+                        has_failed_platform=any(
+                            str((r or {}).get("status") or "").lower()
+                            in ("failed", "error", "cancelled", "canceled")
+                            for r in (platform_results or [])
+                            if isinstance(r, dict)
+                        ),
+                        overdue_ready=upload_is_overdue_ready_to_publish(dict(upload)),
                     ),
+                    "is_overdue": upload_is_overdue_ready_to_publish(dict(upload)),
                     "error_code": upload.get("error_code"),
                     "error": _upload_error_message(dict(upload)),
                     "created_at": upload["created_at"].isoformat()
                     if upload.get("created_at")
+                    else None,
+                    "updated_at": upload["updated_at"].isoformat()
+                    if upload.get("updated_at")
                     else None,
                 }
             )
@@ -267,6 +279,7 @@ _SCHEDULED_LIST_COLS = [
     "caption",
     "status",
     "created_at",
+    "updated_at",
     "timezone",
     "schedule_mode",
     "schedule_metadata",
@@ -287,6 +300,7 @@ _SCHEDULED_DETAIL_COLS = [
     "privacy",
     "status",
     "created_at",
+    "updated_at",
     "schedule_mode",
     "schedule_metadata",
     "platform_results",
@@ -363,7 +377,7 @@ async def get_scheduled_bootstrap(
                 presign_thumbnails=False,
                 presign_account_avatars=False,
             ),
-            _fetch_platforms_bundle(pool, uid, plan),
+            _fetch_platforms_bundle(pool, uid, plan, include_auth_errors=False),
             return_exceptions=True,
         )
     except Exception:
@@ -571,10 +585,19 @@ async def get_scheduled_upload(upload_id: UUID, user: dict = Depends(get_current
         "is_retryable": is_retryable_upload(
             str(upload.get("status") or ""),
             error_code=upload.get("error_code"),
+            has_failed_platform=any(
+                str((r or {}).get("status") or "").lower()
+                in ("failed", "error", "cancelled", "canceled")
+                for r in (platform_results or [])
+                if isinstance(r, dict)
+            ),
+            overdue_ready=upload_is_overdue_ready_to_publish(dict(upload)),
         ),
+        "is_overdue": upload_is_overdue_ready_to_publish(dict(upload)),
         "error_code": upload.get("error_code"),
         "error": _upload_error_message(dict(upload)),
         "created_at": upload["created_at"].isoformat() if upload.get("created_at") else None,
+        "updated_at": upload["updated_at"].isoformat() if upload.get("updated_at") else None,
     }
 
 

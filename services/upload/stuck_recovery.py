@@ -229,13 +229,19 @@ async def recover_auto_retry_failed_immediate(
     limit: int = 8,
     max_retries: int = MAX_AUTO_RETRIES_DEFAULT,
 ) -> int:
-    """Re-queue failed immediate uploads with transient errors (exponential backoff)."""
+    """Re-queue failed uploads with auto-retryable errors (exponential backoff).
+
+    Immediate mode runs a full process job. Scheduled/smart modes repair publish
+    slots first, then enqueue a deferred process job so publish waits for slots.
+    """
     rows = await conn.fetch(
         """
-        SELECT id, user_id, error_code, output_artifacts, schedule_mode, status, updated_at
+        SELECT id, user_id, error_code, output_artifacts, schedule_mode, status,
+               updated_at, platforms, schedule_metadata, scheduled_time, timezone,
+               r2_key
         FROM uploads
         WHERE status = 'failed'
-          AND COALESCE(schedule_mode, 'immediate') = 'immediate'
+          AND COALESCE(schedule_mode, 'immediate') IN ('immediate', 'scheduled', 'smart')
           AND error_code IS NOT NULL
         ORDER BY updated_at ASC
         LIMIT $1
@@ -246,9 +252,12 @@ async def recover_auto_retry_failed_immediate(
     for row in rows:
         if recovered >= limit:
             break
-        if not should_auto_retry_upload(dict(row), max_retries=max_retries):
+        row_d = dict(row)
+        if not should_auto_retry_upload(row_d, max_retries=max_retries):
             continue
-        if upload_source_head_status(dict(row)) == "missing":
+        # Only fail hard when we know the key and R2 says missing (not when key
+        # is absent from the row shape — that would poison every auto-retry).
+        if row_d.get("r2_key") and upload_source_head_status(row_d) == "missing":
             await mark_source_not_in_r2_failed(
                 conn,
                 str(row["id"]),
@@ -281,10 +290,24 @@ async def recover_auto_retry_failed_immediate(
 
         upload_id = str(row["id"])
         user_id = str(row["user_id"])
+        mode = str(row.get("schedule_mode") or "immediate").strip().lower()
+        deferred = mode in ("scheduled", "smart")
+        if deferred:
+            from services.upload.schedule_guard import repair_upload_schedule
+
+            ok, _, _ = await repair_upload_schedule(conn, row_d)
+            if not ok:
+                logger.warning(
+                    "[%s] auto-retry skipped: schedule repair failed (mode=%s)",
+                    upload_id,
+                    mode,
+                )
+                continue
+
         payload = await build_payload(
             upload_id,
             user_id,
-            deferred=False,
+            deferred=deferred,
             job_id=f"auto-retry-{upload_id}-{prior + 1}",
         )
         if not payload or not await enqueue(payload):
@@ -310,11 +333,12 @@ async def recover_auto_retry_failed_immediate(
             json.dumps(new_arts, default=str),
         )
         logger.warning(
-            "[%s] auto-retry: failed → queued (attempt %s/%s, prior_error=%s)",
+            "[%s] auto-retry: failed → queued (attempt %s/%s, prior_error=%s, deferred=%s)",
             upload_id,
             prior + 1,
             max_retries,
             row.get("error_code"),
+            deferred,
         )
         recovered += 1
     return recovered

@@ -281,9 +281,17 @@ async def build_dashboard_stats_payload(
 
 
 async def _dashboard_stats_on_conn(
-    conn: Any, user: dict[str, Any], plan: dict[str, Any], wallet: dict[str, Any]
+    conn: Any,
+    user: dict[str, Any],
+    plan: dict[str, Any],
+    wallet: dict[str, Any],
+    *,
+    light: bool = False,
 ) -> dict[str, Any]:
-    """Run all dashboard stats SQL on an existing connection (no ``pool.acquire``)."""
+    """Run all dashboard stats SQL on an existing connection (no ``pool.acquire``).
+
+    ``light=True`` skips canonical engagement rollup (shell bootstrap first paint).
+    """
     uid = user["id"]
     win_start, win_end = engagement_time_window_for_analytics_range("30d", now=_now_utc())
 
@@ -389,6 +397,49 @@ async def _dashboard_stats_on_conn(
     if int(accounts or 0) > 0:
         dash_live = await q_metrics_cache(conn)
 
+    dash_win = engagement_window_api_dict(start=win_start, end_exclusive=win_end)
+
+    if light:
+        # Metrics-cache only — full rollup via GET /api/dashboard/stats after paint.
+        upload_engagement = {
+            "views": int(dash_live.get("views") or 0),
+            "likes": int(dash_live.get("likes") or 0),
+            "comments": int(dash_live.get("comments") or 0),
+            "shares": int(dash_live.get("shares") or 0),
+        }
+        cr = {
+            "views": upload_engagement["views"],
+            "likes": upload_engagement["likes"],
+            "comments": upload_engagement["comments"],
+            "shares": upload_engagement["shares"],
+            "breakdown": {
+                "compute": {
+                    "rollup_version": ROLLUP_VERSION,
+                    "complete": False,
+                    "warnings": ["light_bootstrap"],
+                },
+            },
+            "catalog_tracked_videos": 0,
+            "rollup_version": ROLLUP_VERSION,
+            "rollup_rule": "light_metrics_cache",
+            "kpi_sources": {"light": True, "rollup_version": ROLLUP_VERSION},
+        }
+        return _assemble_dashboard_stats(
+            user,
+            plan,
+            wallet,
+            stats,
+            scheduled,
+            put_used_month,
+            uploads_used_month,
+            accounts,
+            recent,
+            dash_live,
+            upload_engagement,
+            cr,
+            dash_win,
+        )
+
     try:
         upload_engagement = await _compute_upload_engagement_totals(
             conn, str(uid), since=win_start, until=win_end
@@ -439,7 +490,6 @@ async def _dashboard_stats_on_conn(
             "kpi_sources": {"rollup_version": ROLLUP_VERSION},
         }
 
-    dash_win = engagement_window_api_dict(start=win_start, end_exclusive=win_end)
     return _assemble_dashboard_stats(
         user,
         plan,
@@ -457,14 +507,22 @@ async def _dashboard_stats_on_conn(
     )
 
 
-async def dashboard_stats_for_user(pool: Any, user: dict[str, Any], plan: dict[str, Any], wallet: dict[str, Any]) -> dict[str, Any]:
+async def dashboard_stats_for_user(
+    pool: Any,
+    user: dict[str, Any],
+    plan: dict[str, Any],
+    wallet: dict[str, Any],
+    *,
+    light: bool = False,
+) -> dict[str, Any]:
     """
     Dashboard stats when the caller already has ``user`` / ``plan`` / ``wallet`` (e.g. shell bootstrap).
 
     One pooled connection for the stats queries; user/wallet often came from a separate dep.
+    ``light=True`` skips the heavy engagement rollup for first paint.
     """
     async with pool.acquire() as conn:
-        return await _dashboard_stats_on_conn(conn, user, plan, wallet)
+        return await _dashboard_stats_on_conn(conn, user, plan, wallet, light=light)
 
 
 async def fetch_dashboard_stats_for_user_id(pool: Any, user_id: str) -> dict[str, Any]:

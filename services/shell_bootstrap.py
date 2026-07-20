@@ -59,13 +59,22 @@ def _allowed_upload_view(raw: Optional[str]) -> Optional[str]:
     return None
 
 
-async def _fetch_platforms_bundle(pool: Any, user_id: str, plan: Mapping[str, Any]) -> dict[str, Any]:
+async def _fetch_platforms_bundle(
+    pool: Any,
+    user_id: str,
+    plan: Mapping[str, Any],
+    *,
+    include_auth_errors: bool = False,
+) -> dict[str, Any]:
     """Same JSON shape as GET /api/platforms (status + reconnect timestamps included).
 
     Avatars use redirect paths (``presign=False``) for cheap bootstrap first paint.
+    Auth-error scan is skipped on shell bootstrap (reconnect badges hydrate idle).
     """
     async with acquire_db(pool) as conn:
-        auth_errors = await fetch_auth_errors_by_token(conn, user_id)
+        auth_errors = (
+            await fetch_auth_errors_by_token(conn, user_id) if include_auth_errors else {}
+        )
         accounts = await conn.fetch(_PLATFORM_TOKEN_SELECT, user_id)
 
     platforms: dict[str, list] = {}
@@ -133,11 +142,14 @@ async def shell_bootstrap_payload(
         meta=meta,
         presign_r2_thumbnails=False,
         presign_platform_avatars=False,
+        shell=True,
     )
-    platforms_coro = _fetch_platforms_bundle(pool, uid, plan)
+    # Skip full-history auth-error explode on first paint; platforms page can hydrate later.
+    platforms_coro = _fetch_platforms_bundle(pool, uid, plan, include_auth_errors=False)
 
     if context == "dashboard":
-        stats_coro = dashboard_stats_for_user(pool, user, plan, wallet)
+        # Light stats: quota/counts first; engagement rollup fills in after paint.
+        stats_coro = dashboard_stats_for_user(pool, user, plan, wallet, light=True)
         try:
             dashboard_stats, uploads_payload, platforms_payload = await asyncio.gather(
                 stats_coro, uploads_coro, platforms_coro

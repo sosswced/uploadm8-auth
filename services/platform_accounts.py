@@ -105,6 +105,9 @@ def serialize_platform_account_flat(
 async def fetch_auth_errors_by_token(conn: asyncpg.Connection, user_id: str) -> Dict[str, str]:
     """
     Latest publish failure per platform_tokens.id from uploads.platform_results.
+
+    Scoped to recent uploads so bootstrap/platform lists do not explode the full
+    history JSONB on every first paint.
     """
     rows = await conn.fetch(
         """
@@ -123,6 +126,7 @@ async def fetch_auth_errors_by_token(conn: asyncpg.Connection, user_id: str) -> 
                 END
             ) AS elem
             WHERE u.user_id = $1
+              AND u.updated_at > NOW() - INTERVAL '90 days'
               AND elem->>'token_row_id' IS NOT NULL
               AND elem->>'token_row_id' <> ''
         )

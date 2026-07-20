@@ -205,9 +205,23 @@ def split_platform_results(
 
 STALE_PROCESSING_MINUTES_DEFAULT = 20
 
-# Worker-initiated auto-retries (immediate uploads with transient failures).
+# ready_to_publish past due by this many minutes → user may Retry (republish).
+# Worker auto-redispatch uses a longer window (STUCK_READY_REDISPATCH_MINUTES).
+OVERDUE_READY_GRACE_MINUTES_DEFAULT = 5
+
+# Worker-initiated auto-retries (transient failures; immediate + scheduled/smart).
 MAX_AUTO_RETRIES_DEFAULT = 3
 AUTO_RETRY_BACKOFF_MINUTES: Tuple[int, ...] = (2, 5, 15)
+
+# Extra failed codes safe for worker auto-retry (scheduled publish stalls).
+_AUTO_RETRY_EXTRA: Tuple[str, ...] = (
+    "STUCK_READY_TO_PUBLISH",
+    "PUBLISH_SLOT_MISSING",
+    "SCHEDULE_INCOMPLETE",
+    "STALE_PROCESSING",
+    "ENQUEUE_FAILED",
+    "QUEUE_UNAVAILABLE",
+)
 
 
 def get_auto_retry_count(output_artifacts: Optional[Any]) -> int:
@@ -247,12 +261,25 @@ def bump_auto_retry_metadata(
     return base
 
 
+def is_auto_retryable_error(error_code: Optional[str]) -> bool:
+    """Transient + schedule-stall codes the worker may auto-retry."""
+    if not error_code:
+        return False
+    code = str(error_code).strip().upper()
+    return is_transient_error(code) or code in _AUTO_RETRY_EXTRA
+
+
 def should_auto_retry_upload(
     upload_row: Any,
     *,
     max_retries: int = MAX_AUTO_RETRIES_DEFAULT,
 ) -> bool:
-    """True when worker may re-queue a failed immediate upload with a transient error."""
+    """True when worker may re-queue a failed upload with a retryable error.
+
+    Immediate, scheduled, and smart modes are eligible. Hard-block codes never
+    auto-retry. Scheduled/smart use deferred process jobs so publish slots stay
+    intact.
+    """
     status = (
         (upload_row.get("status") if isinstance(upload_row, dict) else upload_row["status"])
         or ""
@@ -263,12 +290,14 @@ def should_auto_retry_upload(
         (upload_row.get("schedule_mode") if isinstance(upload_row, dict) else upload_row["schedule_mode"])
         or "immediate"
     ).strip().lower()
-    if mode != "immediate":
+    if mode not in ("immediate", "scheduled", "smart"):
         return False
     error_code = (
         upload_row.get("error_code") if isinstance(upload_row, dict) else upload_row["error_code"]
     )
-    if not is_transient_error(error_code):
+    if not is_auto_retryable_error(error_code):
+        return False
+    if not classify_retry_error(error_code).allowed:
         return False
     arts = (
         upload_row.get("output_artifacts") if isinstance(upload_row, dict) else upload_row["output_artifacts"]
@@ -276,6 +305,41 @@ def should_auto_retry_upload(
     from core.helpers import coerce_output_artifacts_dict
 
     return get_auto_retry_count(coerce_output_artifacts_dict(arts)) < max_retries
+
+
+def upload_is_overdue_ready_to_publish(
+    upload_row: Any,
+    *,
+    grace_minutes: int | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """True when status=ready_to_publish and the due slot is past grace."""
+    status = (
+        (upload_row.get("status") if isinstance(upload_row, dict) else upload_row["status"])
+        or ""
+    ).lower()
+    if status != "ready_to_publish":
+        return False
+    due = None
+    if isinstance(upload_row, dict):
+        due = upload_row.get("scheduled_time")
+        if due is None:
+            from services.deferred_publish_schedule import next_due_scheduled_time
+
+            due = next_due_scheduled_time(upload_row)
+    else:
+        due = upload_row["scheduled_time"] if "scheduled_time" in upload_row.keys() else None
+        if due is None:
+            from services.deferred_publish_schedule import next_due_scheduled_time
+
+            due = next_due_scheduled_time(dict(upload_row))
+    if not due:
+        return False
+    if getattr(due, "tzinfo", None) is None:
+        due = due.replace(tzinfo=timezone.utc)
+    threshold = grace_minutes if grace_minutes is not None else OVERDUE_READY_GRACE_MINUTES_DEFAULT
+    clock = now or datetime.now(timezone.utc)
+    return clock > (due + timedelta(minutes=threshold))
 
 
 def upload_is_stale_processing(upload_row: Any, *, minutes: int | None = None) -> bool:

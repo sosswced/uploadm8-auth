@@ -489,6 +489,7 @@ async def fetch_user_uploads_list(
     order: str = "desc",
     since: Any = None,
     slim: bool = False,
+    shell: bool = False,
 ) -> Union[list, dict]:
     if pool is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
@@ -509,6 +510,40 @@ async def fetch_user_uploads_list(
             "likes",
             "comments",
             "shares",
+        ]
+    elif shell:
+        # Dashboard/queue first paint: card fields without AI/pipeline blobs or avatar enrich.
+        wanted = [
+            "id",
+            "filename",
+            "platforms",
+            "status",
+            "privacy",
+            "title",
+            "caption",
+            "hashtags",
+            "scheduled_time",
+            "created_at",
+            "completed_at",
+            "error_code",
+            "error_detail",
+            "thumbnail_r2_key",
+            "platform_results",
+            "file_size",
+            "processing_started_at",
+            "processing_finished_at",
+            "updated_at",
+            "processing_stage",
+            "processing_progress",
+            "views",
+            "likes",
+            "comments",
+            "shares",
+            "schedule_mode",
+            "schedule_metadata",
+            "target_accounts",
+            "trill_score",
+            "created_by_user_id",
         ]
     else:
         wanted = [
@@ -635,6 +670,30 @@ async def fetch_user_uploads_list(
             if not meta:
                 return slim_out
             return {"uploads": slim_out, "total": int(total or 0), "limit": limit, "offset": offset}
+
+        if shell:
+            # Raw platform_results — skip token avatar enrichment for first paint.
+            for d in row_dicts:
+                try:
+                    out.append(
+                        build_upload_list_item(
+                            d,
+                            d.get("platform_results"),
+                            creator_map={},
+                            presign_r2_thumbnails=False,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "upload shell list row skipped upload_id=%s user_id=%s: %s",
+                        d.get("id"),
+                        user_id,
+                        exc,
+                        exc_info=True,
+                    )
+            if not meta:
+                return out
+            return {"uploads": out, "total": int(total or 0), "limit": limit, "offset": offset}
 
         enriched_pr = await enrich_platform_results_batch(
             conn, row_dicts, str(user_id), presign_avatars=presign_platform_avatars

@@ -39,6 +39,7 @@ from services.retry_policy import (
     classify_retry_error,
     get_retry_count,
     split_platform_results,
+    upload_is_overdue_ready_to_publish,
     upload_is_stale_processing,
 )
 from services.upload_funnel import emit_upload_funnel_event
@@ -523,12 +524,18 @@ async def retry_upload(
 
         current_status = (upload["status"] or "").lower()
         stale_processing_retry = current_status == "processing" and upload_is_stale_processing(upload)
-        if current_status not in _RETRYABLE_STATUSES and not stale_processing_retry:
+        overdue_ready_retry = upload_is_overdue_ready_to_publish(upload)
+        if (
+            current_status not in _RETRYABLE_STATUSES
+            and not stale_processing_retry
+            and not overdue_ready_retry
+        ):
             raise HTTPException(
                 400,
                 f"Upload status '{current_status}' is not retryable. "
                 f"Allowed: {', '.join(_RETRYABLE_STATUSES)}"
-                + (" or stale processing (20+ min without progress)." if current_status == "processing" else "."),
+                + (" or stale processing (20+ min without progress)." if current_status == "processing" else "")
+                + (" or overdue ready_to_publish." if current_status == "ready_to_publish" else "."),
             )
 
         decision = classify_retry_error(upload.get("error_code"))
@@ -559,6 +566,112 @@ async def retry_upload(
                     "max_retries": MAX_USER_RETRIES_DEFAULT,
                 },
             )
+
+        # Overdue ready_to_publish: nudge scheduler and optionally enqueue publish lane.
+        # Never leave the row in processing unless a publish job was accepted.
+        if overdue_ready_retry:
+            import os
+
+            new_artifacts = bump_retry_metadata(
+                existing_artifacts,
+                actor_user_id=user_id_str,
+                prior_error_code=upload.get("error_code") or "OVERDUE_READY",
+                mode="republish",
+                retry_platforms=None,
+            )
+            nudged = await conn.fetchval(
+                """
+                UPDATE uploads
+                SET status = 'ready_to_publish',
+                    error_code = NULL,
+                    error_detail = NULL,
+                    cancel_requested = FALSE,
+                    scheduled_time = LEAST(
+                        COALESCE(scheduled_time, NOW()),
+                        NOW()
+                    ),
+                    output_artifacts = $3::jsonb,
+                    updated_at = NOW()
+                WHERE id = $1 AND user_id = $2 AND status = 'ready_to_publish'
+                RETURNING id
+                """,
+                upload_id,
+                user["id"],
+                json.dumps(new_artifacts),
+            )
+            if not nudged:
+                raise HTTPException(409, "Upload is no longer ready_to_publish.")
+
+            await log_system_event(
+                conn,
+                user_id=user_id_str,
+                action="UPLOAD_REPUBLISH_REQUESTED",
+                event_category="UPLOAD",
+                resource_type="upload",
+                resource_id=upload_id,
+                details={
+                    "mode": "republish",
+                    "retry_count": prior_count + 1,
+                    "prior_status": current_status,
+                },
+                request=request,
+            )
+
+            async_publish = os.environ.get("ASYNC_PUBLISH_QUEUE", "false").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            if async_publish:
+                ent = get_entitlements_for_tier(user.get("subscription_tier", "free"))
+                claimed = await conn.fetchval(
+                    """
+                    UPDATE uploads
+                    SET status = 'processing',
+                        processing_started_at = COALESCE(processing_started_at, NOW()),
+                        updated_at = NOW()
+                    WHERE id = $1 AND user_id = $2 AND status = 'ready_to_publish'
+                    RETURNING id
+                    """,
+                    upload_id,
+                    user["id"],
+                )
+                if claimed:
+                    pub_job = {
+                        "upload_id": upload_id,
+                        "user_id": user_id_str,
+                        "action": "republish",
+                        "priority_class": ent.priority_class,
+                    }
+                    enqueued = await enqueue_job(
+                        pub_job, lane="publish", priority_class=ent.priority_class
+                    )
+                    if enqueued:
+                        return {
+                            "status": "republish_queued",
+                            "upload_id": upload_id,
+                            "mode": "republish",
+                            "retry_count": prior_count + 1,
+                            "max_retries": MAX_USER_RETRIES_DEFAULT,
+                        }
+                    await conn.execute(
+                        """
+                        UPDATE uploads
+                        SET status = 'ready_to_publish', updated_at = NOW()
+                        WHERE id = $1 AND user_id = $2 AND status = 'processing'
+                        """,
+                        upload_id,
+                        user["id"],
+                    )
+
+            return {
+                "status": "republish_nudged",
+                "upload_id": upload_id,
+                "mode": "republish",
+                "retry_count": prior_count + 1,
+                "max_retries": MAX_USER_RETRIES_DEFAULT,
+            }
 
         prior_platform_results = upload.get("platform_results")
         if isinstance(prior_platform_results, str):

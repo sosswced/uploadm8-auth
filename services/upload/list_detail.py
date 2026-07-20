@@ -21,6 +21,10 @@ from stages.context import is_placeholder_upload_caption, is_placeholder_upload_
 from services.upload.hashtags import _normalize_hashtags_list
 from services.upload.schedule_guard import UPLOAD_ERROR_MESSAGES
 from services.upload.stage_labels import stage_label_for
+from services.retry_policy import (
+    upload_is_overdue_ready_to_publish,
+    upload_is_stale_processing,
+)
 from services.upload.status import (
     CANCELLABLE_STATUSES,
     UPLOAD_STATUS_LABEL,
@@ -48,6 +52,17 @@ def _upload_error_message(d: dict) -> Optional[str]:
     if code and code in UPLOAD_ERROR_MESSAGES:
         return UPLOAD_ERROR_MESSAGES[code]
     return detail or code or None
+
+
+def _row_is_retryable(d: dict, *, has_failed_platform: bool = False) -> bool:
+    """Compute is_retryable including stale processing / overdue ready."""
+    return is_retryable_upload(
+        str(d.get("status") or ""),
+        error_code=d.get("error_code"),
+        has_failed_platform=has_failed_platform,
+        stale_processing=upload_is_stale_processing(d),
+        overdue_ready=upload_is_overdue_ready_to_publish(d),
+    )
 
 
 def _dt_iso(v: Any) -> Optional[str]:
@@ -446,7 +461,8 @@ def build_upload_list_item(
         in ("pending", "staged", "queued", "scheduled", "ready_to_publish"),
         "is_cancellable": raw_status in CANCELLABLE_STATUSES or raw_status == "processing",
         "is_requeueable": is_requeueable_upload(raw_status, d.get("error_code")),
-        "is_retryable": is_retryable_upload(raw_status, error_code=d.get("error_code")),
+        "is_retryable": _row_is_retryable(d),
+        "is_stale_processing": upload_is_stale_processing(d),
         "video_url": d.get("video_url"),
         "trill_score": trill_score,
         "speed_bucket": d.get("speed_bucket"),
@@ -841,9 +857,8 @@ def build_upload_detail_payload(d: dict) -> dict:
         "is_requeueable": is_requeueable_upload(
             str(d.get("status") or ""), d.get("error_code")
         ),
-        "is_retryable": is_retryable_upload(
-            str(d.get("status") or ""), error_code=d.get("error_code")
-        ),
+        "is_retryable": _row_is_retryable(d),
+        "is_stale_processing": upload_is_stale_processing(d),
         "created_at": _dt_iso(d.get("created_at")),
         "completed_at": _dt_iso(d.get("completed_at")),
         "put_cost": int(d.get("put_reserved") or 0),

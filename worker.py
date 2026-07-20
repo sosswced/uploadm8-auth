@@ -184,10 +184,22 @@ PRIORITY_JOB_QUEUE = os.environ.get("PRIORITY_JOB_QUEUE", "uploadm8:priority")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
 
 # ── Concurrency ───────────────────────────────────────────────────
-# WORKER_CONCURRENCY  = FFmpeg-heavy process jobs (CPU-bound, default 3)
-# PUBLISH_CONCURRENCY = API-light publish jobs   (I/O-bound, default 5)
-WORKER_CONCURRENCY  = int(os.environ.get("WORKER_CONCURRENCY",  "3"))
-PUBLISH_CONCURRENCY = int(os.environ.get("PUBLISH_CONCURRENCY", "5"))
+# WORKER_CONCURRENCY  = FFmpeg-heavy process jobs (CPU-bound)
+# PUBLISH_CONCURRENCY = API-light publish jobs   (I/O-bound)
+# On Render background workers, default to 1 process slot so two HD/4K
+# encodes cannot OOM a 2 GB instance. Override explicitly if on Pro/4GB+.
+def _env_concurrency(name: str, *, render_default: int, local_default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return render_default if os.environ.get("RENDER") else local_default
+
+
+WORKER_CONCURRENCY = _env_concurrency("WORKER_CONCURRENCY", render_default=1, local_default=2)
+PUBLISH_CONCURRENCY = _env_concurrency("PUBLISH_CONCURRENCY", render_default=2, local_default=5)
 
 # Scheduler: how far in advance to start processing a scheduled upload (minutes)
 PROCESSING_WINDOW_MINUTES = int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15"))
@@ -3658,11 +3670,13 @@ async def run_scheduler_loop() -> None:
                 # Only pull as many staged jobs as there are free process slots.
                 # This prevents dispatching 500-job batches into memory when
                 # workers are already saturated.
-                free_slots = WORKER_CONCURRENCY - (
-                    WORKER_CONCURRENCY - _process_semaphore._value
-                    if _process_semaphore else WORKER_CONCURRENCY
-                )
-                dispatch_limit = max(1, free_slots)
+                free_slots = _process_slots_free()
+                from core.process_stats import blocks_new_process_job
+
+                if blocks_new_process_job() or free_slots <= 0:
+                    dispatch_limit = 0
+                else:
+                    dispatch_limit = max(1, free_slots)
 
                 staged_jobs = await conn.fetch(
                     """
@@ -3675,7 +3689,7 @@ async def run_scheduler_loop() -> None:
                     LIMIT $2
                     """,
                     process_cutoff,
-                    dispatch_limit,
+                    max(dispatch_limit, 0),
                 )
 
                 for row in staged_jobs:
@@ -3850,12 +3864,42 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
             except Exception as rev_e:
                 logger.warning("[%s] queued→staged revert failed: %s", upload_id, rev_e)
         return
+    if not await _wait_for_process_memory_headroom(upload_id):
+        logger.warning(
+            "[%s] scheduler process deferred — memory pressure; leaving job for later reclaim",
+            upload_id or "?",
+        )
+        if upload_id and db_pool is not None:
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE uploads
+                        SET status = 'staged', updated_at = NOW()
+                        WHERE id = $1 AND status = 'queued'
+                          AND COALESCE(schedule_mode, 'immediate') IN ('scheduled', 'smart')
+                        """,
+                        upload_id,
+                    )
+            except Exception as rev_e:
+                logger.warning("[%s] memory-defer queued→staged failed: %s", upload_id, rev_e)
+        return
     try:
         async with _process_semaphore:
             try:
                 await run_processing_pipeline(job_data)
             except Exception as e:
                 logger.exception(f"[{job_data.get('upload_id')}] Unhandled pipeline error: {e}")
+            finally:
+                try:
+                    from core.process_stats import memory_pressure_level
+
+                    if memory_pressure_level() != "ok":
+                        import gc
+
+                        gc.collect()
+                except Exception:
+                    pass
     finally:
         if uid:
             await user_process_release(redis_client, uid)
@@ -3884,6 +3928,71 @@ def _ensure_worker_semaphores() -> None:
     if _heavy_semaphore is None:
         _heavy_semaphore = asyncio.Semaphore(WORKER_HEAVY_PIPELINE_SLOTS)
     _job_semaphore = _process_semaphore
+
+
+def _process_slots_free() -> int:
+    _ensure_worker_semaphores()
+    if _process_semaphore is None:
+        return WORKER_CONCURRENCY
+    try:
+        return max(0, int(getattr(_process_semaphore, "_value", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _wait_for_process_memory_headroom(upload_id: str = "") -> bool:
+    """Block briefly under soft pressure; return False under hard pressure (caller should requeue)."""
+    from core.process_stats import blocks_new_process_job, memory_pressure_level, sample_memory_mb
+
+    # Fast path
+    mem = sample_memory_mb()
+    level = memory_pressure_level(mem)
+    if level == "ok":
+        return True
+
+    max_wait = float(os.environ.get("MEMORY_ADMIT_WAIT_SEC", "45") or 45)
+    step = float(os.environ.get("MEMORY_ADMIT_POLL_SEC", "3") or 3)
+    waited = 0.0
+    while waited < max_wait and not shutdown_requested:
+        mem = sample_memory_mb()
+        level = memory_pressure_level(mem)
+        if level == "ok":
+            if waited > 0:
+                logger.info(
+                    "[%s] memory headroom restored after %.0fs | rss=%sMB pct=%s%%",
+                    upload_id or "?",
+                    waited,
+                    mem.get("rss_mb"),
+                    mem.get("pct_of_limit"),
+                )
+            return True
+        if level == "hard":
+            logger.warning(
+                "[%s] memory HARD pressure — deferring process job | rss=%sMB pct=%s%% limit=%sMB",
+                upload_id or "?",
+                mem.get("rss_mb"),
+                mem.get("pct_of_limit"),
+                mem.get("limit_mb"),
+            )
+            return False
+        logger.warning(
+            "[%s] memory soft pressure — waiting before encode | rss=%sMB pct=%s%% (%.0fs/%.0fs)",
+            upload_id or "?",
+            mem.get("rss_mb"),
+            mem.get("pct_of_limit"),
+            waited,
+            max_wait,
+        )
+        await asyncio.sleep(step)
+        waited += step
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+
+    return not blocks_new_process_job()
 
 
 def _process_queue_name(priority_class: str) -> str:
@@ -4258,14 +4367,20 @@ async def run_stale_job_recovery_loop() -> None:
 
                 if STALE_PROCESSING_MINUTES > 0:
                     async with db_pool.acquire() as conn:
+                        # Include rows with null processing_started_at (never claimed cleanly).
                         zomb = await conn.fetch(
                             """
                             SELECT id, user_id
                               FROM uploads
                              WHERE status = 'processing'
-                               AND processing_started_at IS NOT NULL
-                               AND processing_started_at < NOW() - ($1::int * INTERVAL '1 minute')
-                               AND updated_at < NOW() - ($1::int * INTERVAL '1 minute')
+                               AND COALESCE(updated_at, processing_started_at, created_at)
+                                   < NOW() - ($1::int * INTERVAL '1 minute')
+                               AND (
+                                    processing_started_at IS NULL
+                                    OR processing_started_at
+                                       < NOW() - ($1::int * INTERVAL '1 minute')
+                               )
+                             ORDER BY COALESCE(updated_at, created_at) ASC
                              LIMIT 10
                             """,
                             STALE_PROCESSING_MINUTES,
@@ -4540,12 +4655,45 @@ async def _process_one_job(job_json: str) -> None:
                 shutdown_requested,
             )
         return
+    if not await _wait_for_process_memory_headroom(upload_id):
+        # Requeue so another (or later) worker attempt can run when RSS drops.
+        max_requeue = int(os.environ.get("MEMORY_PRESSURE_MAX_REQUEUE", "8") or 8)
+        gen = int(job_data.get("_memory_wait_gen") or 0) + 1
+        if gen <= max_requeue and not shutdown_requested:
+            job_data["_memory_wait_gen"] = gen
+            delay = min(8.0 * gen, 90.0)
+            logger.warning(
+                "[%s] memory pressure — requeue attempt %s/%s in %.0fs",
+                upload_id or "?",
+                gen,
+                max_requeue,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            await enqueue_process_lane_job(job_data)
+        else:
+            logger.error(
+                "[%s] memory pressure requeue exhausted (gen=%s) — job left for stale recovery",
+                upload_id or "?",
+                gen,
+            )
+        return
     try:
         async with _process_semaphore:
             try:
                 await run_processing_pipeline(job_data)
             except Exception as e:
                 logger.exception(f"Unhandled pipeline exception: {e}")
+            finally:
+                try:
+                    from core.process_stats import memory_pressure_level
+
+                    if memory_pressure_level() != "ok":
+                        import gc
+
+                        gc.collect()
+                except Exception:
+                    pass
     finally:
         if uid:
             await user_process_release(redis_client, uid)
@@ -4604,6 +4752,24 @@ async def process_jobs() -> None:
         active_tasks = [t for t in active_tasks if not t.done()]
 
         try:
+            # Backpressure: never pile waiting process tasks in RAM (FFmpeg + buffers).
+            if len(active_tasks) >= WORKER_CONCURRENCY or _process_slots_free() <= 0:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            from core.process_stats import blocks_new_process_job, sample_memory_mb
+
+            if blocks_new_process_job():
+                mem = sample_memory_mb()
+                logger.warning(
+                    "process consumer paused — memory pressure | rss=%sMB pct=%s%% active=%s",
+                    mem.get("rss_mb"),
+                    mem.get("pct_of_limit"),
+                    len(active_tasks),
+                )
+                await asyncio.sleep(max(POLL_INTERVAL, 2.0))
+                continue
+
             job_json = None
             stream_ack: Optional[Tuple[str, str]] = None
 

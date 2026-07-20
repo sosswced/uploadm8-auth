@@ -343,18 +343,40 @@ def upload_is_overdue_ready_to_publish(
 
 
 def upload_is_stale_processing(upload_row: Any, *, minutes: int | None = None) -> bool:
-    """True when status=processing and updated_at has not moved for ``minutes``."""
-    status = (
-        (upload_row.get("status") if isinstance(upload_row, dict) else upload_row["status"])
-        or ""
-    ).lower()
+    """True when status=processing and last progress is older than ``minutes``.
+
+    Uses ``updated_at``, then ``processing_started_at``, then ``created_at``.
+    Rows stuck in ``processing`` with a null ``processing_started_at`` still
+    qualify (worker reclaim historically skipped those).
+    """
+    get = upload_row.get if isinstance(upload_row, dict) else upload_row.__getitem__
+    status = (get("status") or "").lower()
     if status != "processing":
-        return False
-    updated = upload_row.get("updated_at") if isinstance(upload_row, dict) else upload_row["updated_at"]
-    if not updated:
         return False
     threshold = minutes if minutes is not None else STALE_PROCESSING_MINUTES_DEFAULT
     now = datetime.now(timezone.utc)
-    if getattr(updated, "tzinfo", None) is None:
-        updated = updated.replace(tzinfo=timezone.utc)
-    return (now - updated) > timedelta(minutes=threshold)
+
+    def _aware(dt: Any) -> datetime | None:
+        if dt is None:
+            return None
+        if getattr(dt, "tzinfo", None) is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    try:
+        updated = _aware(get("updated_at"))
+    except Exception:
+        updated = None
+    try:
+        started = _aware(get("processing_started_at"))
+    except Exception:
+        started = None
+    try:
+        created = _aware(get("created_at"))
+    except Exception:
+        created = None
+
+    anchor = updated or started or created
+    if not anchor:
+        return False
+    return (now - anchor) > timedelta(minutes=threshold)

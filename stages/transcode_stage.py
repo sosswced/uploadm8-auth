@@ -26,12 +26,14 @@ import logging
 import os
 import subprocess
 
-# Cap FFmpeg CPU per invocation so concurrent jobs don't pin all cores.
-# Default scales with WORKER_CONCURRENCY: cpu_count // concurrency, min 1.
+# Cap FFmpeg CPU/RAM per invocation so concurrent jobs don't OOM the box.
+# Default scales with WORKER_CONCURRENCY; on Render clamp harder (2 GB workers).
 _FFMPEG_THREADS_DEFAULT = max(
     1,
-    (os.cpu_count() or 2) // max(1, int(os.environ.get("WORKER_CONCURRENCY", "3"))),
+    (os.cpu_count() or 2) // max(1, int(os.environ.get("WORKER_CONCURRENCY", "2"))),
 )
+if os.environ.get("RENDER") and "FFMPEG_THREADS" not in os.environ:
+    _FFMPEG_THREADS_DEFAULT = min(_FFMPEG_THREADS_DEFAULT, 2)
 FFMPEG_THREADS = int(os.environ.get("FFMPEG_THREADS", str(_FFMPEG_THREADS_DEFAULT)))
 
 # Encode quality (override without code changes). Preset affects encoder CPU time, not target resolution.

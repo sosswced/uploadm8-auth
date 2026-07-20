@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import platform
 import socket
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 try:
     import resource
@@ -12,6 +12,8 @@ except ImportError:
     resource = None  # Windows — use /proc only (unavailable locally)
 
 _peak_rss_mb: float = 0.0
+
+MemoryPressure = Literal["ok", "soft", "hard"]
 
 
 def _read_proc_rss_vms_mb() -> tuple[Optional[float], Optional[float]]:
@@ -31,6 +33,28 @@ def _read_proc_rss_vms_mb() -> tuple[Optional[float], Optional[float]]:
     return None, None
 
 
+def _cgroup_memory_limit_mb() -> Optional[float]:
+    """Best-effort container memory limit (cgroup v1/v2) — accurate on Render."""
+    paths = (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    )
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = (f.read() or "").strip()
+            if not raw or raw.lower() == "max":
+                continue
+            n = int(raw)
+            # Ignore absurd "unlimited" sentinel values from cgroup v1.
+            if n <= 0 or n >= (1 << 60):
+                continue
+            return n / (1024.0 * 1024.0)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def memory_limit_mb() -> Optional[float]:
     for key in ("RENDER_MEMORY_LIMIT_MB", "MEMORY_LIMIT_MB", "WEB_MEMORY_LIMIT_MB"):
         raw = (os.environ.get(key) or "").strip()
@@ -39,14 +63,33 @@ def memory_limit_mb() -> Optional[float]:
                 return float(raw)
             except ValueError:
                 pass
+    cg = _cgroup_memory_limit_mb()
+    if cg is not None:
+        return cg
     inst = (os.environ.get("RENDER_INSTANCE_TYPE") or "").lower()
     if "performance" in inst or inst.endswith("-8gb"):
         return 8192.0
     if "pro" in inst or "4gb" in inst:
         return 4096.0
+    if "starter" in inst or "512" in inst:
+        return 512.0
     if os.environ.get("RENDER"):
         return 2048.0
     return None
+
+
+def memory_admit_pct() -> float:
+    try:
+        return float(os.environ.get("MEMORY_ADMIT_PCT", "75") or 75)
+    except ValueError:
+        return 75.0
+
+
+def memory_hard_pct() -> float:
+    try:
+        return float(os.environ.get("MEMORY_HARD_PCT", "88") or 88)
+    except ValueError:
+        return 88.0
 
 
 def sample_memory_mb() -> Dict[str, Optional[float]]:
@@ -73,6 +116,24 @@ def sample_memory_mb() -> Dict[str, Optional[float]]:
         "limit_mb": limit,
         "pct_of_limit": pct,
     }
+
+
+def memory_pressure_level(sample: Optional[Dict[str, Optional[float]]] = None) -> MemoryPressure:
+    """ok / soft (pause new heavy work) / hard (requeue, never start another encode)."""
+    mem = sample if sample is not None else sample_memory_mb()
+    pct = mem.get("pct_of_limit")
+    if pct is None:
+        return "ok"
+    if pct >= memory_hard_pct():
+        return "hard"
+    if pct >= memory_admit_pct():
+        return "soft"
+    return "ok"
+
+
+def blocks_new_process_job(sample: Optional[Dict[str, Optional[float]]] = None) -> bool:
+    """True when starting another FFmpeg-heavy job would risk Render OOM kill."""
+    return memory_pressure_level(sample) != "ok"
 
 
 def render_instance_context() -> Dict[str, Any]:

@@ -22,7 +22,10 @@ from core.sql_allowlist import UPLOADS_METADATA_PATCH_COLUMNS, assert_set_fragme
 from core.r2 import get_s3_client, _normalize_r2_key, resolve_stored_account_avatar_url
 from core.models import SmartScheduleOnlyUpdate
 from services.upload.list_detail import _upload_error_message
-from services.retry_policy import upload_is_overdue_ready_to_publish
+from services.retry_policy import (
+    upload_is_overdue_ready_to_publish,
+    upload_is_stale_processing,
+)
 from services.upload.status import (
     CANCELLABLE_STATUSES,
     SCHEDULE_ATTENTION_ERROR_CODES,
@@ -253,9 +256,11 @@ async def _scheduled_upload_list_for_user(
                             for r in (platform_results or [])
                             if isinstance(r, dict)
                         ),
+                        stale_processing=upload_is_stale_processing(dict(upload)),
                         overdue_ready=upload_is_overdue_ready_to_publish(dict(upload)),
                     ),
                     "is_overdue": upload_is_overdue_ready_to_publish(dict(upload)),
+                    "is_stale_processing": upload_is_stale_processing(dict(upload)),
                     "error_code": upload.get("error_code"),
                     "error": _upload_error_message(dict(upload)),
                     "created_at": upload["created_at"].isoformat()
@@ -455,7 +460,10 @@ async def recalculate_smart_schedule(upload_id: UUID, user: dict = Depends(get_c
     """Recompute per-platform smart times (respects blocked days, excludes this upload)."""
     uid_str = str(upload_id)
     bill_id = str(user.get("billing_user_id") or user["id"])
-    async with core.state.db_pool.acquire() as conn:
+    pool = core.state.db_pool
+    if pool is None:
+        raise HTTPException(503, "Database unavailable")
+    async with acquire_db(pool) as conn:
         upload = await conn.fetchrow(
             """
             SELECT id, status, schedule_mode, platforms, schedule_metadata, user_id
@@ -520,7 +528,10 @@ async def randomize_schedule(upload_id: UUID, user: dict = Depends(get_current_u
     """
     uid_str = str(upload_id)
     bill_id = str(user.get("billing_user_id") or user["id"])
-    async with core.state.db_pool.acquire() as conn:
+    pool = core.state.db_pool
+    if pool is None:
+        raise HTTPException(503, "Database unavailable")
+    async with acquire_db(pool) as conn:
         upload = await conn.fetchrow(
             """
             SELECT id, status, schedule_mode, platforms, schedule_metadata,
@@ -699,9 +710,11 @@ async def get_scheduled_upload(upload_id: UUID, user: dict = Depends(get_current
                 for r in (platform_results or [])
                 if isinstance(r, dict)
             ),
+            stale_processing=upload_is_stale_processing(dict(upload)),
             overdue_ready=upload_is_overdue_ready_to_publish(dict(upload)),
         ),
         "is_overdue": upload_is_overdue_ready_to_publish(dict(upload)),
+        "is_stale_processing": upload_is_stale_processing(dict(upload)),
         "error_code": upload.get("error_code"),
         "error": _upload_error_message(dict(upload)),
         "created_at": upload["created_at"].isoformat() if upload.get("created_at") else None,

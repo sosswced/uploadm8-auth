@@ -66,8 +66,8 @@ async def worker_health():
     worker_lane = (os.environ.get("WORKER_LANE") or "full").strip().lower()
     base = {
         "worker_lane": worker_lane,
-        "worker_concurrency": int(os.environ.get("WORKER_CONCURRENCY", "3") or 3),
-        "publish_concurrency": int(os.environ.get("PUBLISH_CONCURRENCY", "5") or 5),
+        "worker_concurrency": int(os.environ.get("WORKER_CONCURRENCY", "1") or 1),
+        "publish_concurrency": int(os.environ.get("PUBLISH_CONCURRENCY", "1") or 1),
         "heavy_pipeline_slots": int(os.environ.get("WORKER_HEAVY_PIPELINE_SLOTS", "1") or 1),
         "async_publish_queue": os.environ.get("ASYNC_PUBLISH_QUEUE", "false"),
         "timestamp": _now_utc().isoformat(),

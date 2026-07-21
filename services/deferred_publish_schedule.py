@@ -153,8 +153,9 @@ def platforms_due_for_publish(
     """
     Platform names (lowercase) that should publish in the next batch.
 
-    Non-smart scheduled uploads: all platforms when ``scheduled_time <= now`` and
-    nothing has been published yet.
+    Immediate: unhandled platforms (``scheduled_time`` may be null).
+    Scheduled: unhandled platforms when ``scheduled_time <= now``.
+    Smart: per-platform slots from ``schedule_metadata``.
 
     ``publish_targets``: optional resolved (platform, token_id) list; when omitted,
     uses one target per entry in ``uploads.platforms``.
@@ -169,29 +170,40 @@ def platforms_due_for_publish(
 
     targets = publish_targets or [(p, None) for p in platforms]
 
+    def _unhandled_platforms() -> set[str]:
+        due_plats: set[str] = set()
+        for plat in platforms:
+            plat_targets = [(p, tid) for p, tid in targets if str(p).strip().lower() == plat]
+            if not plat_targets:
+                plat_targets = [(plat, None)]
+            unhandled = [
+                (p, tid)
+                for p, tid in plat_targets
+                if publish_target_key(str(p).lower(), tid) not in handled
+            ]
+            if unhandled:
+                due_plats.add(plat)
+        return due_plats
+
     if mode != "smart":
         st = parse_iso_datetime(upload_record.get("scheduled_time"))
-        if st is not None and st <= now and not handled:
-            return frozenset(platforms)
-        return frozenset()
+        # Immediate often stores null scheduled_time — still due until all platforms
+        # are handled. Empty due here caused ready_to_publish recovery to re-dispatch
+        # forever while deferred publish exited as a no-op.
+        due_now = mode == "immediate" or (st is not None and st <= now)
+        if not due_now:
+            return frozenset()
+        return frozenset(_unhandled_platforms())
 
     schedule = parse_schedule_metadata(upload_record.get("schedule_metadata"))
+    pending = _unhandled_platforms()
     due: set[str] = set()
-    for plat in platforms:
+    for plat in pending:
         slot = schedule.get(plat)
         # No scheduled_time fallback — missing metadata means "not due" (repair needed).
         if slot is None or slot > now:
             continue
-        plat_targets = [(p, tid) for p, tid in targets if str(p).strip().lower() == plat]
-        if not plat_targets:
-            plat_targets = [(plat, None)]
-        unhandled = [
-            (p, tid)
-            for p, tid in plat_targets
-            if publish_target_key(str(p).lower(), tid) not in handled
-        ]
-        if unhandled:
-            due.add(plat)
+        due.add(plat)
     return frozenset(due)
 
 
@@ -201,11 +213,7 @@ def still_has_pending_publish_slots(
     now: Optional[datetime] = None,
     publish_targets: Optional[list[tuple[str, Optional[str]]]] = None,
 ) -> bool:
-    """True while smart upload has publish targets not yet attempted."""
-    mode = str(upload_record.get("schedule_mode") or "").strip().lower()
-    if mode != "smart":
-        return False
-
+    """True while upload has publish targets not yet attempted."""
     platforms = [str(p).strip().lower() for p in (upload_record.get("platforms") or []) if str(p).strip()]
     handled = handled_target_keys(platform_results)
     targets = publish_targets or [(p, None) for p in platforms]

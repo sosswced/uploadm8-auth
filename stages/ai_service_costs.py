@@ -84,6 +84,8 @@ AI_SERVICE_DB_FIELD_TO_ID: Dict[str, str] = {
     "ai_service_thumbnail_designer": "thumbnail_ai",
     "ai_service_speech_to_text": "audio_whisper",
     "ai_service_scene_understanding": "twelvelabs",
+    "ai_service_frame_inspector": "vision_google",
+    "ai_service_video_analyzer": "video_intelligence",
 }
 
 PREF_KEY_TO_SERVICE_ID: Dict[str, str] = {v: k for k, v in SERVICE_PREF_KEYS.items()}

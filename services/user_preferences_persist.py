@@ -63,6 +63,9 @@ _CAMEL_TO_SNAKE: dict[str, str] = {
     "aiServiceThumbnailDesigner": "ai_service_thumbnail_designer",
     "aiServiceSpeechToText": "ai_service_speech_to_text",
     "aiServiceSceneUnderstanding": "ai_service_scene_understanding",
+    "aiServiceFrameInspector": "ai_service_frame_inspector",
+    "aiServiceVideoAnalyzer": "ai_service_video_analyzer",
+    "tiktokBurnStyledCover": "tiktok_burn_styled_cover",
     "authSecurityAlerts": "auth_security_alerts",
     "digestEmails": "digest_emails",
     "scheduledAlertEmails": "scheduled_alert_emails",
@@ -218,6 +221,12 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
 
     p = _normalize_prefs_payload(raw_in)
     p = normalize_upload_preferences_snake(p)
+    try:
+        from core.upload_preference_configurator import clamp_prefs_for_tier
+
+        p = clamp_prefs_for_tier(p, tier=str(user.get("subscription_tier") or "free"))
+    except Exception as clamp_err:
+        logger.warning("clamp_prefs_for_tier skipped: %s", clamp_err)
 
     always = _coerce_hashtag_list(p.get("always_hashtags"))
     blocked = _coerce_hashtag_list(p.get("blocked_hashtags"))
@@ -303,6 +312,14 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
         p.get("aiServiceSceneUnderstanding", p.get("ai_service_scene_understanding")),
         False,
     )
+    ai_service_frame_inspector = _coerce_bool(
+        p.get("aiServiceFrameInspector", p.get("ai_service_frame_inspector")),
+        True,
+    )
+    ai_service_video_analyzer = _coerce_bool(
+        p.get("aiServiceVideoAnalyzer", p.get("ai_service_video_analyzer")),
+        False,
+    )
 
     ent = get_entitlements_from_user(user)
     ai_service_dashcam_osd = _coerce_bool(
@@ -320,6 +337,8 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             "ai_service_thumbnail_designer": ai_service_thumbnail_designer,
             "ai_service_speech_to_text": ai_service_speech_to_text,
             "ai_service_scene_understanding": ai_service_scene_understanding,
+            "ai_service_frame_inspector": ai_service_frame_inspector,
+            "ai_service_video_analyzer": ai_service_video_analyzer,
         },
     )
     ai_service_telemetry = _svc_clamped["ai_service_telemetry"]
@@ -331,6 +350,12 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
     ai_service_thumbnail_designer = _svc_clamped["ai_service_thumbnail_designer"]
     ai_service_speech_to_text = _svc_clamped["ai_service_speech_to_text"]
     ai_service_scene_understanding = _svc_clamped["ai_service_scene_understanding"]
+    ai_service_frame_inspector = _svc_clamped.get(
+        "ai_service_frame_inspector", ai_service_frame_inspector
+    )
+    ai_service_video_analyzer = _svc_clamped.get(
+        "ai_service_video_analyzer", ai_service_video_analyzer
+    )
 
     exd: dict[str, Any] = dict(existing_row) if existing_row else {}
     trill_leaderboard_opt_in = _coerce_bool(
@@ -387,11 +412,13 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
                 ai_service_thumbnail_designer = $31,
                 ai_service_speech_to_text = $32,
                 ai_service_scene_understanding = $33,
-                trill_leaderboard_opt_in = $34,
-                trill_map_sharing_opt_in = $35,
-                trill_welcome_modal_seen_at = $36,
+                ai_service_frame_inspector = $34,
+                ai_service_video_analyzer = $35,
+                trill_leaderboard_opt_in = $36,
+                trill_map_sharing_opt_in = $37,
+                trill_welcome_modal_seen_at = $38,
                 updated_at = NOW()
-            WHERE user_id = $37
+            WHERE user_id = $39
             """,
             auto_captions,
             auto_thumbnails,
@@ -431,6 +458,8 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             ai_service_thumbnail_designer,
             ai_service_speech_to_text,
             ai_service_scene_understanding,
+            ai_service_frame_inspector,
+            ai_service_video_analyzer,
             trill_leaderboard_opt_in,
             trill_map_sharing_opt_in,
             trill_welcome_modal_seen_at,
@@ -469,6 +498,9 @@ async def save_user_content_preferences(conn, user: dict[str, Any], payload: Map
             ("aiServiceThumbnailDesigner", "ai_service_thumbnail_designer"),
             ("aiServiceSpeechToText", "ai_service_speech_to_text"),
             ("aiServiceSceneUnderstanding", "ai_service_scene_understanding"),
+            ("aiServiceFrameInspector", "ai_service_frame_inspector"),
+            ("aiServiceVideoAnalyzer", "ai_service_video_analyzer"),
+            ("tiktokBurnStyledCover", "tiktok_burn_styled_cover"),
         )
         studio_keys = (
             "thumbnailStudioEnabled",

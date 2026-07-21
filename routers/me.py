@@ -1472,25 +1472,28 @@ async def update_preferences(request: Request, user: dict = Depends(get_current_
             "UPDATE users SET preferences = $1, updated_at = NOW() WHERE id = $2",
             merged, user["id"]
         )
-        # Sync discord_webhook to user_settings and user_preferences so:
-        # - Admin "Send to user webhooks" finds it (announcement query reads from these tables)
-        # - Worker load_user_settings can use either source
-        discord_webhook = (prefs.get("discordWebhook") or prefs.get("discord_webhook") or "").strip() or None
-        await conn.execute(
-            """
-            INSERT INTO user_settings (user_id, discord_webhook) VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE SET discord_webhook = $2, updated_at = NOW()
-            """,
-            user["id"],
-            discord_webhook,
-        )
-        await conn.execute(
-            "INSERT INTO user_preferences (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
-            user["id"],
-        )
-        await conn.execute(
-            "UPDATE user_preferences SET discord_webhook = $1, updated_at = NOW() WHERE user_id = $2",
-            discord_webhook,
-            user["id"],
-        )
+        # Sync discord_webhook only when the client explicitly sent the key.
+        # Settings Save All often PUTs hashtag/caption fields without discordWebhook;
+        # nulling here used to wipe a webhook just saved via POST /settings/preferences.
+        if "discordWebhook" in prefs or "discord_webhook" in prefs:
+            discord_webhook = (
+                prefs.get("discordWebhook") or prefs.get("discord_webhook") or ""
+            ).strip() or None
+            await conn.execute(
+                """
+                INSERT INTO user_settings (user_id, discord_webhook) VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET discord_webhook = $2, updated_at = NOW()
+                """,
+                user["id"],
+                discord_webhook,
+            )
+            await conn.execute(
+                "INSERT INTO user_preferences (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+                user["id"],
+            )
+            await conn.execute(
+                "UPDATE user_preferences SET discord_webhook = $1, updated_at = NOW() WHERE user_id = $2",
+                discord_webhook,
+                user["id"],
+            )
     return {"status": "updated"}

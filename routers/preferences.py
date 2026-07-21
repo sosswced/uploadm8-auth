@@ -278,8 +278,12 @@ def _overlay_upload_ai_audio_studio_prefs(result: dict, up: dict) -> None:
         ("aiServiceThumbnailDesigner", "ai_service_thumbnail_designer"),
         ("aiServiceSpeechToText", "ai_service_speech_to_text"),
         ("aiServiceSceneUnderstanding", "ai_service_scene_understanding"),
+        ("aiServiceFrameInspector", "ai_service_frame_inspector"),
+        ("aiServiceVideoAnalyzer", "ai_service_video_analyzer"),
+        ("tiktokBurnStyledCover", "tiktok_burn_styled_cover"),
         ("thumbnailStudioEnabled", "thumbnail_studio_enabled"),
         ("thumbnailStudioEngineEnabled", "thumbnail_studio_engine_enabled"),
+        ("thumbnailStudioStrict", "thumbnail_studio_strict"),
         ("thumbnailPersonaEnabled", "thumbnail_persona_enabled"),
     ]:
         _pair_bool(camel, snake)
@@ -525,10 +529,10 @@ async def get_user_preferences(
                 "aiServiceEmotionSignals": bool(d.get("ai_service_emotion_signals", False)),
                 "aiServiceCaptionWriter": bool(d.get("ai_service_caption_writer", True)),
                 "aiServiceThumbnailDesigner": bool(d.get("ai_service_thumbnail_designer", True)),
-                "aiServiceSpeechToText": bool(d.get("ai_service_speech_to_text", True)),
-                "aiServiceSceneUnderstanding": bool(d.get("ai_service_scene_understanding", True)),
+                "aiServiceSpeechToText": bool(d.get("ai_service_speech_to_text", False)),
+                "aiServiceSceneUnderstanding": bool(d.get("ai_service_scene_understanding", False)),
                 "aiServiceFrameInspector": bool(d.get("ai_service_frame_inspector", True)),
-                "aiServiceVideoAnalyzer": bool(d.get("ai_service_video_analyzer", True)),
+                "aiServiceVideoAnalyzer": bool(d.get("ai_service_video_analyzer", False)),
             }
             # Overlay users.preferences -- source of truth for hashtags + caption (PUT /api/me/preferences)
             users_prefs = None

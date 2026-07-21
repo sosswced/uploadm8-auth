@@ -199,7 +199,8 @@ def _env_concurrency(name: str, *, render_default: int, local_default: int) -> i
 
 
 WORKER_CONCURRENCY = _env_concurrency("WORKER_CONCURRENCY", render_default=1, local_default=2)
-PUBLISH_CONCURRENCY = _env_concurrency("PUBLISH_CONCURRENCY", render_default=2, local_default=5)
+# Publish still pulls full platform MP4s from R2 — keep at 1 on 2 GB Render.
+PUBLISH_CONCURRENCY = _env_concurrency("PUBLISH_CONCURRENCY", render_default=1, local_default=5)
 
 # Scheduler: how far in advance to start processing a scheduled upload (minutes)
 PROCESSING_WINDOW_MINUTES = int(os.environ.get("PROCESSING_WINDOW_MINUTES", "15"))
@@ -3083,8 +3084,11 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
         ctx.temp_dir = temp_dir
 
         downloaded: Dict[str, Path] = {}
+        due_filter = set(due_platforms) if due_platforms else None
         for platform, r2_key in processed_assets.items():
             if platform == "default" or platform.startswith("thumb_"):
+                continue
+            if due_filter is not None and str(platform).strip().lower() not in due_filter:
                 continue
             if r2_key in downloaded:
                 ctx.platform_videos[platform] = downloaded[r2_key]
@@ -3125,6 +3129,8 @@ async def run_deferred_publish(upload_id: str, user_id: str) -> bool:
             if not key.startswith("thumb_") or not r2_key:
                 continue
             plat = key.replace("thumb_", "")
+            if due_filter is not None and str(plat).strip().lower() not in due_filter:
+                continue
             platform_thumb_r2_keys[plat] = r2_key
             local_thumb = temp_dir / f"thumb_{plat}.jpg"
             try:
@@ -3768,17 +3774,17 @@ async def run_scheduler_loop() -> None:
                     user_id = str(row["user_id"])
                     upload_row = dict(row)
 
-                    # Non-smart: require scheduled_time <= now. Smart: per-platform due check.
+                    # Require at least one due platform (smart and non-smart).
+                    # Claiming with an empty due set caused deferred publish to
+                    # download R2 assets then no-op back to ready_to_publish.
                     mode = str(upload_row.get("schedule_mode") or "scheduled").lower()
                     if mode != "smart":
                         st = upload_row.get("scheduled_time")
                         if st is None or st > now:
                             continue
-                        due = platforms_due_for_publish(upload_row, now)
-                    else:
-                        due = platforms_due_for_publish(upload_row, now)
-                        if not due:
-                            continue
+                    due = platforms_due_for_publish(upload_row, now)
+                    if not due:
+                        continue
 
                     # Atomically claim — refresh processing_started_at so stale
                     # recovery does not treat deferred publish as a zombie transcode.
@@ -4503,6 +4509,42 @@ async def run_stale_job_recovery_loop() -> None:
                                     f"[{up}] stale recovery: source missing in R2 — marked SOURCE_NOT_IN_R2"
                                 )
                                 continue
+
+                            # Publish-phase zombies already have encoded assets — do NOT
+                            # re-enqueue FFmpeg (stale-recover-full → claim lost + OOM).
+                            _assets = ur.get("processed_assets")
+                            if isinstance(_assets, str):
+                                try:
+                                    _assets = json.loads(_assets) if _assets.strip() else {}
+                                except Exception:
+                                    _assets = {}
+                            _has_assets = isinstance(_assets, dict) and any(
+                                k and not str(k).startswith("thumb_") and k != "default"
+                                for k in _assets
+                                if _assets.get(k)
+                            )
+                            _cp_pub = pipeline_checkpoint.load_resume(ur)
+                            _stg_pub = str((_cp_pub or {}).get("stage") or "").lower()
+                            if _has_assets or _stg_pub in ("post_caption", "post_publish"):
+                                async with db_pool.acquire() as uconn:
+                                    await uconn.execute(
+                                        """
+                                        UPDATE uploads
+                                           SET status = 'ready_to_publish',
+                                               processing_started_at = NULL,
+                                               updated_at = NOW()
+                                         WHERE id = $1 AND status = 'processing'
+                                        """,
+                                        up,
+                                    )
+                                asyncio.create_task(
+                                    _run_deferred_publish_with_semaphore(up, uid)
+                                )
+                                logger.warning(
+                                    f"[{up}] stale recovery: publish-phase → ready_to_publish "
+                                    f"(skip full re-encode; processing>{STALE_PROCESSING_MINUTES}m)"
+                                )
+                                continue
                         deferred = False
                         resume_cp = False
                         if ur:
@@ -5216,15 +5258,23 @@ async def main() -> None:
         background_loops.append(("stream_reclaim", run_stream_reclaim_loop))
     if STALE_JOB_RECOVERY_ENABLED:
         background_loops.append(("stale_recovery", run_stale_job_recovery_loop))
-    background_loops.extend(
-        [
-            ("verification_loop", lambda: run_verification_loop(db_pool, shutdown_event)),
-            ("analytics_sync", run_analytics_sync_loop),
-            ("kpi_collector", run_kpi_collector_loop),
-            ("platform_metrics_cache", run_platform_metrics_cache_loop),
-            ("admin_email_jobs", run_admin_email_jobs_loop),
-        ]
+    def _loop_enabled(name: str, default: bool = True) -> bool:
+        raw = (os.environ.get(name) or "").strip().lower()
+        if not raw:
+            return default
+        return raw in ("1", "true", "yes", "on")
+
+    background_loops.append(
+        ("verification_loop", lambda: run_verification_loop(db_pool, shutdown_event))
     )
+    if _loop_enabled("WORKER_ENABLE_ANALYTICS_SYNC", True):
+        background_loops.append(("analytics_sync", run_analytics_sync_loop))
+    if _loop_enabled("WORKER_ENABLE_KPI_COLLECTOR", True):
+        background_loops.append(("kpi_collector", run_kpi_collector_loop))
+    if _loop_enabled("WORKER_ENABLE_PLATFORM_METRICS", True):
+        background_loops.append(("platform_metrics_cache", run_platform_metrics_cache_loop))
+    if _loop_enabled("WORKER_ENABLE_ADMIN_EMAIL_JOBS", True):
+        background_loops.append(("admin_email_jobs", run_admin_email_jobs_loop))
 
     tasks = [
         asyncio.create_task(_supervise(name, factory))

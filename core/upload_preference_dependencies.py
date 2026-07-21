@@ -94,6 +94,7 @@ def normalize_preferences_dict(d: Dict[str, Any]) -> None:
 
     if _explicitly_disabled(d, "trill_enabled", "trillEnabled"):
         _set_pair(d, "ai_service_telemetry", "aiServiceTelemetry", False)
+        _set_pair(d, "trill_ai_enhance", "trillAiEnhance", False)
 
     if _explicitly_disabled(d, "ai_service_caption_writer", "aiServiceCaptionWriter"):
         _set_pair(d, "ai_service_frame_inspector", "aiServiceFrameInspector", False)

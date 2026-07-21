@@ -658,7 +658,9 @@ async def recover_stuck_ready_to_publish(
                 updated_at = updated_at.replace(tzinfo=timezone.utc)
             idle_minutes = max(0.0, (now - updated_at).total_seconds() / 60.0)
 
-        if age_minutes < float(redispatch_m) and idle_minutes < float(redispatch_m):
+        # Prefer idle for redispatch cadence — fixed scheduled_time ages forever past
+        # the window and would otherwise re-fire every recovery tick.
+        if idle_minutes < float(redispatch_m) and age_minutes < float(fail_m):
             stats["skipped"] += 1
             continue
 
@@ -687,6 +689,37 @@ async def recover_stuck_ready_to_publish(
                 ERROR_STUCK_READY_TO_PUBLISH,
                 age_minutes,
             )
+            continue
+
+        # Never redispatch when nothing is due — deferred publish would no-op,
+        # reset updated_at, and burn R2/CPU on a ~30m loop (Render OOM pattern).
+        if not due:
+            if idle_minutes >= float(fail_m):
+                detail = UPLOAD_ERROR_MESSAGES.get(
+                    ERROR_PUBLISH_SLOT_MISSING,
+                    "No remaining publish slot.",
+                )
+                await mark_schedule_incomplete_failed(
+                    conn,
+                    upload_id,
+                    detail=detail,
+                    error_code=ERROR_PUBLISH_SLOT_MISSING,
+                )
+                await loud_upload_schedule_failure(
+                    upload_id,
+                    user_id,
+                    reason=detail,
+                    schedule_mode=mode,
+                    db_pool=db_pool,
+                )
+                stats["failed"] += 1
+                logger.warning(
+                    "[%s] ready_to_publish → failed %s (overdue, nothing due)",
+                    upload_id,
+                    ERROR_PUBLISH_SLOT_MISSING,
+                )
+            else:
+                stats["skipped"] += 1
             continue
 
         if dispatch_publish is None:

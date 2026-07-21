@@ -25,7 +25,7 @@ from stages.publish_stage import decrypt_token
 logger = logging.getLogger("uploadm8.platform_metrics_job")
 
 _PLATFORM_CACHE_TTL = 3 * 60 * 60
-_POLL_CONCURRENCY = max(2, int(os.environ.get("PLATFORM_POLL_CONCURRENCY", "8") or 8))
+_POLL_CONCURRENCY = max(1, int(os.environ.get("PLATFORM_POLL_CONCURRENCY", "8") or 8))
 _OAUTH_REFRESH_CONCURRENCY = max(1, int(os.environ.get("PLATFORM_OAUTH_REFRESH_CONCURRENCY", "4") or 4))
 _POLL_RETRIES = max(1, int(os.environ.get("PLATFORM_POLL_RETRIES", "3") or 3))
 _POLL_BACKOFF_BASE_SEC = float(os.environ.get("PLATFORM_POLL_BACKOFF_BASE_SEC", "0.6") or 0.6)

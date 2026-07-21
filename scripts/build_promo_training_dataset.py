@@ -5,7 +5,7 @@
 #   "pandas>=2.0.0,<3.0.0",
 #   "pyarrow>=15.0.0",
 #   "datasets>=2.20.0,<4.0.0",
-#   "huggingface_hub>=0.24.0,<1.0.0",
+#   "huggingface_hub>=1.10.0,<2.0.0",
 #   "python-dotenv>=1.0.0,<2.0.0",
 #   "trackio>=0.25.0,<1.0.0",
 # ]

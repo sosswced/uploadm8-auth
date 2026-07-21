@@ -554,6 +554,34 @@ async def retry_upload(
                 },
             )
 
+        # Stale-processing / heal Retry must not re-enqueue zombies with no R2
+        # object — that burns a worker cycle and pages Discord as upload_failed.
+        head_status = upload_source_head_status(upload)
+        if head_status == "missing":
+            from services.upload.r2_storage_guard import mark_source_not_in_r2_failed
+
+            await mark_source_not_in_r2_failed(
+                conn,
+                upload_id,
+                detail=SOURCE_NOT_IN_R2_MESSAGE,
+            )
+            raise HTTPException(
+                409,
+                detail={
+                    "code": ERROR_SOURCE_NOT_IN_R2,
+                    "message": SOURCE_NOT_IN_R2_MESSAGE,
+                    "hint": "Start a new upload with the video file; Retry cannot recreate missing storage.",
+                },
+            )
+        if head_status == "unknown":
+            raise HTTPException(
+                503,
+                detail={
+                    "code": ERROR_STORAGE_CHECK_UNAVAILABLE,
+                    "message": "Storage check temporarily unavailable. Try again in a moment.",
+                },
+            )
+
         from core.helpers import coerce_output_artifacts_dict
 
         # Legacy rows may store a JSON array; dict(list) 500s (UPLOADM8-7W).

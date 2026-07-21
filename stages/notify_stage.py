@@ -1623,6 +1623,11 @@ async def notify_admin_upload_status(
     except Exception:
         pass
 
+    error_code = str(getattr(ctx, "error_code", None) or "").strip().upper()
+    # Missing source is a client/storage precondition, not a pipeline incident.
+    # Still record the row for admin-incidents, but do not page Discord/email.
+    page_ops = error_code not in ("SOURCE_NOT_IN_R2",)
+
     details: Dict[str, Any] = {
         "upload_id": str(upload_id) if upload_id else None,
         "user_id": str(getattr(ctx, "user_id", "") or "") or None,
@@ -1710,8 +1715,8 @@ async def notify_admin_upload_status(
             details=details,
             user_id=details.get("user_id"),
             upload_id=details.get("upload_id"),
-            alert_email=True,
-            alert_discord=True,
+            alert_email=page_ops,
+            alert_discord=page_ops,
         )
     except Exception as e:
         logger.warning("notify_admin_upload_status record failed: %s", e)

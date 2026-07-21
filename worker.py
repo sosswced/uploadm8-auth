@@ -1150,12 +1150,8 @@ async def run_processing_pipeline(job_data: dict) -> bool:
             await db_stage.mark_processing_failed(
                 db_pool, ctx, ERROR_SOURCE_NOT_IN_R2, SOURCE_NOT_IN_R2_MESSAGE
             )
-            try:
-                await notify_upload_terminal(
-                    db_pool, ctx, str(upload_id), status="failed", scene_story=""
-                )
-            except Exception:
-                pass
+            # No Discord/ops page: missing source is a precondition, not a pipeline fault.
+            # Retry API now blocks these before enqueue; this path is a race/legacy job only.
             return False
 
         ctx = create_context(job_data, upload_record, user_settings, entitlements)

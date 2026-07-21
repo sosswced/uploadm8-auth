@@ -43,11 +43,19 @@ async def validate_account_ids_for_user(
     return ids
 
 
+GROUPS_NO_MATCHING_ACCOUNTS = (
+    "Selected groups contain no matching platform accounts for this upload. "
+    "Check group membership and selected platforms."
+)
+
+
 async def resolve_group_ids_to_target_accounts(
     conn,
     user_id: str,
     group_ids: Optional[Sequence[str]],
     platforms: Optional[Sequence[str]] = None,
+    *,
+    raise_on_empty: bool = True,
 ) -> tuple[List[str], List[str]]:
     """
     Load account_groups for user, union account_ids, intersect with owned tokens.
@@ -55,7 +63,8 @@ async def resolve_group_ids_to_target_accounts(
     When platforms is provided, only include accounts whose platform is in that set.
 
     Returns (resolved_target_account_ids, normalized_group_ids).
-    Raises HTTPException 400 if group_ids provided but resolve to zero accounts.
+    Raises HTTPException 400 if group_ids provided but resolve to zero accounts
+    (unless ``raise_on_empty=False`` — used by cost estimate to avoid console spam).
     """
     if not group_ids:
         return [], []
@@ -109,10 +118,8 @@ async def resolve_group_ids_to_target_accounts(
             ]
 
     if not resolved:
-        raise HTTPException(
-            400,
-            "Selected groups contain no matching platform accounts for this upload. "
-            "Check group membership and selected platforms.",
-        )
+        if raise_on_empty:
+            raise HTTPException(400, GROUPS_NO_MATCHING_ACCOUNTS)
+        return [], gids
 
     return resolved, gids

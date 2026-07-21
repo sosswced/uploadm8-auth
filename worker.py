@@ -4704,61 +4704,109 @@ async def _process_one_job(job_json: str) -> None:
     uid = str(job_data.get("user_id") or "")
     pc = str(job_data.get("priority_class") or "p4")
     upload_id = str(job_data.get("upload_id") or "")
-    from stages.redis_job_queue import user_process_release, user_process_wait_acquire
+    from stages.redis_job_queue import (
+        heal_user_process_slots,
+        user_process_release,
+        user_process_wait_acquire,
+    )
 
-    if uid and not await user_process_wait_acquire(
-        redis_client,
-        uid,
-        pc,
-        upload_id=upload_id,
-        shutdown_check=lambda: shutdown_requested,
-    ):
-        max_requeue = int(os.environ.get("USER_SLOT_MAX_REQUEUE", "5") or 5)
-        gen = int(job_data.get("_user_slot_wait_gen") or 0) + 1
-        if gen <= max_requeue and not shutdown_requested:
-            job_data["_user_slot_wait_gen"] = gen
-            delay = min(5.0 * gen, 60.0)
-            logger.warning(
-                "[%s] user slot unavailable — requeue attempt %s/%s in %.0fs",
-                upload_id or "?",
-                gen,
-                max_requeue,
-                delay,
-            )
-            await asyncio.sleep(delay)
-            await enqueue_process_lane_job(job_data)
-        else:
-            logger.error(
-                "[%s] user slot wait exhausted — job not requeued (gen=%s shutdown=%s)",
-                upload_id or "?",
-                gen,
-                shutdown_requested,
-            )
-        return
-    if not await _wait_for_process_memory_headroom(upload_id):
-        # Requeue so another (or later) worker attempt can run when RSS drops.
-        max_requeue = int(os.environ.get("MEMORY_PRESSURE_MAX_REQUEUE", "8") or 8)
-        gen = int(job_data.get("_memory_wait_gen") or 0) + 1
-        if gen <= max_requeue and not shutdown_requested:
-            job_data["_memory_wait_gen"] = gen
-            delay = min(8.0 * gen, 90.0)
-            logger.warning(
-                "[%s] memory pressure — requeue attempt %s/%s in %.0fs",
-                upload_id or "?",
-                gen,
-                max_requeue,
-                delay,
-            )
-            await asyncio.sleep(delay)
-            await enqueue_process_lane_job(job_data)
-        else:
-            logger.error(
-                "[%s] memory pressure requeue exhausted (gen=%s) — job left for stale recovery",
-                upload_id or "?",
-                gen,
-            )
-        return
+    # Slot must be released on EVERY exit after acquire — including memory-pressure
+    # requeue. Leaking here filled the per-user cap after OOM/memory storms.
+    slot_held = False
     try:
+        if uid:
+            # Heal counter vs DB before waiting (OOM leaves Redis INCR without DECR).
+            try:
+                if db_pool is not None:
+                    async with db_pool.acquire() as conn:
+                        db_n = int(
+                            await conn.fetchval(
+                                """
+                                SELECT COUNT(*)::int FROM uploads
+                                 WHERE user_id = $1::uuid AND status = 'processing'
+                                """,
+                                uid,
+                            )
+                            or 0
+                        )
+                    await heal_user_process_slots(redis_client, uid, db_processing=db_n)
+            except Exception as _heal_e:
+                logger.debug("[%s] user slot heal skipped: %s", upload_id or "?", _heal_e)
+
+            got = await user_process_wait_acquire(
+                redis_client,
+                uid,
+                pc,
+                upload_id=upload_id,
+                shutdown_check=lambda: shutdown_requested,
+            )
+            if not got:
+                # Another consumer may already be processing this upload — don't stack
+                # duplicate requeues (logs showed attempt 1/5 forever via stale recovery).
+                already = False
+                if upload_id and db_pool is not None:
+                    try:
+                        async with db_pool.acquire() as conn:
+                            st = await conn.fetchval(
+                                "SELECT status FROM uploads WHERE id = $1::uuid",
+                                upload_id,
+                            )
+                        already = str(st or "").lower() == "processing"
+                    except Exception:
+                        already = False
+                if already:
+                    logger.info(
+                        "[%s] user slot unavailable but status=processing — skip requeue",
+                        upload_id,
+                    )
+                    return
+                max_requeue = int(os.environ.get("USER_SLOT_MAX_REQUEUE", "5") or 5)
+                gen = int(job_data.get("_user_slot_wait_gen") or 0) + 1
+                if gen <= max_requeue and not shutdown_requested:
+                    job_data["_user_slot_wait_gen"] = gen
+                    delay = min(5.0 * gen, 60.0)
+                    logger.warning(
+                        "[%s] user slot unavailable — requeue attempt %s/%s in %.0fs",
+                        upload_id or "?",
+                        gen,
+                        max_requeue,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    await enqueue_process_lane_job(job_data)
+                else:
+                    logger.error(
+                        "[%s] user slot wait exhausted — job not requeued (gen=%s shutdown=%s)",
+                        upload_id or "?",
+                        gen,
+                        shutdown_requested,
+                    )
+                return
+            slot_held = True
+
+        if not await _wait_for_process_memory_headroom(upload_id):
+            max_requeue = int(os.environ.get("MEMORY_PRESSURE_MAX_REQUEUE", "8") or 8)
+            gen = int(job_data.get("_memory_wait_gen") or 0) + 1
+            if gen <= max_requeue and not shutdown_requested:
+                job_data["_memory_wait_gen"] = gen
+                delay = min(8.0 * gen, 90.0)
+                logger.warning(
+                    "[%s] memory pressure — requeue attempt %s/%s in %.0fs",
+                    upload_id or "?",
+                    gen,
+                    max_requeue,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                await enqueue_process_lane_job(job_data)
+            else:
+                logger.error(
+                    "[%s] memory pressure requeue exhausted (gen=%s) — job left for stale recovery",
+                    upload_id or "?",
+                    gen,
+                )
+            return
+
         async with _process_semaphore:
             try:
                 await run_processing_pipeline(job_data)
@@ -4775,7 +4823,7 @@ async def _process_one_job(job_json: str) -> None:
                 except Exception:
                     pass
     finally:
-        if uid:
+        if slot_held and uid:
             await user_process_release(redis_client, uid)
 
 

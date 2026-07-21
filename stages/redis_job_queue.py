@@ -9,7 +9,7 @@ REDIS_JOB_STREAM_GROUP    — consumer group name (default uploadm8_process)
 REDIS_JOB_STREAM_MAXLEN   — approximate max stream length (0 = disabled)
 USER_PROCESS_MAX_PARALLEL — max concurrent process-lane jobs per user_id cluster-wide (0 = unlimited)
 USER_PROCESS_MAX_PARALLEL_PRIORITY — cap for p0/p1 priority_class (default max(6, base))
-USER_SLOT_TTL_SEC         — TTL on per-user slot keys (default 7200)
+USER_SLOT_TTL_SEC         — TTL on per-user slot keys (default 2700)
 STREAM_RECLAIM_MIN_IDLE_MS — XAUTOCLAIM min idle (default 120000)
 STREAM_RECLAIM_INTERVAL_SEC — reclaim loop sleep (default 25)
 STREAM_RECLAIM_COUNT      — messages per stream per reclaim tick (default 8)
@@ -260,11 +260,17 @@ return 1
 """
 
 
+def _user_slot_ttl_sec() -> int:
+    # Default 45m — long enough for Twelve Labs + encode; short enough that OOM
+    # leaks self-heal. Override with USER_SLOT_TTL_SEC.
+    return max(300, int(os.environ.get("USER_SLOT_TTL_SEC", "2700") or 2700))
+
+
 async def user_process_try_acquire(redis: Any, user_id: str, priority_class: str) -> bool:
     cap = user_process_cap(priority_class)
     if cap <= 0 or not user_id:
         return True
-    ttl = int(os.environ.get("USER_SLOT_TTL_SEC", "7200") or 7200)
+    ttl = _user_slot_ttl_sec()
     key = _USER_SLOT_PREFIX + str(user_id)
     try:
         n = await redis.eval(_USER_ACQUIRE_LUA, 1, key, str(cap), str(ttl))
@@ -293,6 +299,49 @@ async def user_process_in_use(redis: Any, user_id: str) -> int:
         return int(n or 0)
     except Exception:
         return 0
+
+
+async def heal_user_process_slots(
+    redis: Any,
+    user_id: str,
+    *,
+    db_processing: int,
+) -> Optional[int]:
+    """
+    If Redis slot counter exceeds rows currently ``processing`` for the user,
+    clamp it down (OOM / memory-requeue used to INCR without DECR).
+    Returns new counter value, or None if unchanged/unavailable.
+    """
+    if not user_id or not redis:
+        return None
+    key = _USER_SLOT_PREFIX + str(user_id)
+    try:
+        cur = int(await redis.get(key) or 0)
+    except Exception:
+        return None
+    target = max(0, int(db_processing or 0))
+    if cur <= target:
+        return None
+    try:
+        if target <= 0:
+            await redis.delete(key)
+            logger.warning(
+                "healed user process slots user=%s… redis=%s → 0 (no DB processing)",
+                str(user_id)[:8],
+                cur,
+            )
+            return 0
+        await redis.set(key, str(target), ex=_user_slot_ttl_sec())
+        logger.warning(
+            "healed user process slots user=%s… redis=%s → %s (DB processing)",
+            str(user_id)[:8],
+            cur,
+            target,
+        )
+        return target
+    except Exception as e:
+        logger.debug("heal_user_process_slots: %s", e)
+        return None
 
 
 async def user_process_wait_acquire(

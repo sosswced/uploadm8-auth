@@ -310,13 +310,33 @@ async def estimate_upload_costs(conn, data: UploadInit, user: dict) -> dict:
                 user_for_ent[_k] = _v
     ent_cost = get_entitlements_from_user(user_for_ent)
 
+    from services.account_groups import GROUPS_NO_MATCHING_ACCOUNTS
+
     platforms = list(getattr(data, "platforms", None) or [])
     target_accounts = list(getattr(data, "target_accounts", None) or [])
     group_ids_raw = getattr(data, "group_ids", None) or []
     if group_ids_raw:
         resolved_accounts, _ = await resolve_group_ids_to_target_accounts(
-            conn, bill_id, group_ids_raw, platforms
+            conn, bill_id, group_ids_raw, platforms, raise_on_empty=False
         )
+        if not resolved_accounts:
+            wallet = await get_wallet(conn, bill_id)
+            put_avail = wallet["put_balance"] - wallet["put_reserved"]
+            aic_avail = wallet["aic_balance"] - wallet["aic_reserved"]
+            return {
+                "ok": False,
+                "error": GROUPS_NO_MATCHING_ACCOUNTS,
+                "put_cost": 0,
+                "aic_cost": 0,
+                "billing_breakdown": {},
+                "queue_depth": ent_cost.queue_depth,
+                "queue_depth_pending": 0,
+                "queue_depth_remaining": ent_cost.queue_depth,
+                "put_available": put_avail,
+                "aic_available": aic_avail,
+                "sufficient_put": True,
+                "sufficient_aic": True,
+            }
         target_accounts = resolved_accounts
 
     user_prefs = await get_user_prefs_for_upload(conn, bill_id)
@@ -349,6 +369,7 @@ async def estimate_upload_costs(conn, data: UploadInit, user: dict) -> dict:
     aic_avail = wallet["aic_balance"] - wallet["aic_reserved"]
 
     return {
+        "ok": True,
         "put_cost": put_cost,
         "aic_cost": aic_cost,
         "billing_breakdown": billing_breakdown,

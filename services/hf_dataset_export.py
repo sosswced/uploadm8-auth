@@ -7,12 +7,17 @@ Parquet files with PyArrow ``uuid`` extension columns break HF's dataset inspect
 
 from __future__ import annotations
 
+import logging
+import tempfile
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 def uuid_to_hf_string(value: Any) -> Optional[str]:
@@ -131,3 +136,74 @@ def parquet_bytes_hf_safe(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     safe.to_parquet(buf, index=False)
     return buf.getvalue()
+
+
+def _is_datasets_pickle_bug(exc: BaseException) -> bool:
+    msg = str(exc)
+    return (
+        "_batch_setitems" in msg
+        or "when serializing datasets.table" in msg
+        or ("Pickler" in msg and "positional arguments" in msg)
+    )
+
+
+def push_parquet_to_hub(
+    df: pd.DataFrame,
+    *,
+    repo_id: str,
+    token: str,
+    split: str = "train",
+    private: bool = False,
+) -> Dict[str, Any]:
+    """Upload a Viewer-safe parquet file (avoids datasets/dill pickle on Py3.14)."""
+    from huggingface_hub import HfApi
+
+    safe = coerce_dataframe_for_hf(df)
+    api = HfApi(token=token)
+    api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="um8-hf-ds-") as td:
+        path = Path(td) / f"{split}.parquet"
+        safe.to_parquet(path, index=False)
+        api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=f"data/{split}.parquet",
+            repo_id=repo_id,
+            repo_type="dataset",
+        )
+    return {"ok": True, "mode": "parquet", "rows": int(len(safe)), "repo_id": repo_id}
+
+
+def push_dataframe_to_hub(
+    df: pd.DataFrame,
+    *,
+    repo_id: str,
+    token: str,
+    split: str = "train",
+    private: bool = False,
+) -> Dict[str, Any]:
+    """
+    Push rows to a Hub dataset.
+
+    Prefers ``datasets.Dataset.push_to_hub``; on Python 3.14 / dill pickle bugs,
+    falls back to a direct parquet upload so the ML engine cycle can continue.
+    """
+    if df is None or df.empty:
+        return {"ok": False, "skipped": "empty", "repo_id": repo_id}
+    safe = coerce_dataframe_for_hf(df)
+    try:
+        from datasets import Dataset
+
+        ds = Dataset.from_pandas(safe, preserve_index=False)
+        ds.push_to_hub(repo_id, token=token, split=split, private=private)
+        return {"ok": True, "mode": "datasets", "rows": int(len(ds)), "repo_id": repo_id}
+    except Exception as e:
+        if not _is_datasets_pickle_bug(e) and not isinstance(e, TypeError):
+            raise
+        logger.warning(
+            "datasets Hub push failed (%s); falling back to parquet upload for %s",
+            str(e)[:200],
+            repo_id,
+        )
+        return push_parquet_to_hub(
+            safe, repo_id=repo_id, token=token, split=split, private=private
+        )

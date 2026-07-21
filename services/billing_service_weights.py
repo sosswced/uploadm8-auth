@@ -12,6 +12,7 @@ deploy alone does **not** overwrite existing DB rows. Use
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Dict, Optional, Tuple
 
 from stages.ai_service_costs import SERVICE_WEIGHTS
@@ -19,6 +20,19 @@ from stages.ai_service_costs import SERVICE_WEIGHTS
 logger = logging.getLogger(__name__)
 
 _MAX_WEIGHT = 5000
+
+
+def coerce_updated_by_uuid(value: Optional[str]) -> Optional[str]:
+    """``billing_service_weights.updated_by`` is UUID — reject calibration labels."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return str(uuid.UUID(text))
+    except ValueError:
+        return None
 
 # Pre–Jul-2026 ordinal scale. Startup migrates a row only when it still matches
 # these exact values (admin-tuned rows are left alone).
@@ -105,8 +119,7 @@ async def migrate_legacy_weights_to_code_defaults(conn: Any) -> int:
                     """
                     UPDATE billing_service_weights
                        SET aic_weight = $2,
-                           updated_at = NOW(),
-                           updated_by = COALESCE(updated_by, 'calibration:2026-07-v3')
+                           updated_at = NOW()
                      WHERE service_id = $1
                        AND aic_weight = $3
                     """,
@@ -139,7 +152,7 @@ async def sync_service_weights_from_code(
     return await upsert_service_weights(
         conn,
         {sid: int(w) for sid, w in SERVICE_WEIGHTS.items()},
-        updated_by=updated_by or "sync_from_code",
+        updated_by=updated_by,
     )
 
 
@@ -165,7 +178,7 @@ async def upsert_service_weights(
         await conn.execute(
             """
             INSERT INTO billing_service_weights (service_id, aic_weight, updated_at, updated_by)
-            VALUES ($1, $2, NOW(), $3)
+            VALUES ($1, $2, NOW(), $3::uuid)
             ON CONFLICT (service_id) DO UPDATE SET
                 aic_weight = EXCLUDED.aic_weight,
                 updated_at = NOW(),
@@ -173,7 +186,7 @@ async def upsert_service_weights(
             """,
             sid,
             w,
-            updated_by,
+            coerce_updated_by_uuid(updated_by),
         )
         n += 1
     return n

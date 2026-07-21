@@ -5,6 +5,7 @@
 #   "pandas>=2.0.0,<3.0.0",
 #   "pyarrow>=15.0.0",
 #   "datasets>=2.20.0,<4.0.0",
+#   "huggingface_hub>=0.24.0,<1.0.0",
 #   "python-dotenv>=1.0.0,<2.0.0",
 #   "trackio>=0.25.0,<1.0.0",
 # ]
@@ -46,9 +47,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 load_dotenv(_REPO_ROOT / ".env")
 
+import logging
+
 from services.ml_observability import OptionalTrackioRun, hf_env_status, hf_write_token
-from services.hf_dataset_export import coerce_dataframe_for_hf
+from services.hf_dataset_export import coerce_dataframe_for_hf, push_dataframe_to_hub
 from services.content_success_features import build_labeled_dataframe
+
+logger = logging.getLogger(__name__)
 from services.ml_feature_registry import active_cat, active_num
 
 UPLOADS_SQL = """
@@ -185,15 +190,16 @@ def _maybe_push_hf(df: pd.DataFrame, repo_id: str, split: str, private: bool) ->
     token = hf_write_token()
     if not token:
         raise SystemExit("HF_TOKEN or HUGGING_FACE_HUB_TOKEN is required for push")
-    try:
-        from datasets import Dataset
-    except ImportError as e:
-        raise SystemExit(
-            "datasets package is required for --push-to (pip install 'datasets>=2.20.0')"
-        ) from e
-    ds = Dataset.from_pandas(_prepare_df(df), preserve_index=False)
-    ds.push_to_hub(repo_id, token=token, split=split, private=private)
-    print(f"Pushed {len(ds)} rows to {repo_id} ({split})")
+    result = push_dataframe_to_hub(
+        _prepare_df(df),
+        repo_id=repo_id,
+        token=token,
+        split=split,
+        private=private,
+    )
+    print(
+        f"Pushed {result.get('rows', 0)} rows to {repo_id} ({split}) via {result.get('mode')}"
+    )
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -222,7 +228,11 @@ async def _run(args: argparse.Namespace) -> None:
     )
     _write_local(df, args.output)
     if args.push_to and len(df):
-        _maybe_push_hf(df, args.push_to, args.split, args.private)
+        try:
+            _maybe_push_hf(df, args.push_to, args.split, args.private)
+        except Exception as e:
+            logger.warning("HF push failed after local write (continuing): %s", e)
+            print(f"WARNING: HF push failed after local write: {e}")
     track.finish()
 
 

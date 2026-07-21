@@ -116,12 +116,19 @@ async def _alert_ml_engine_failure(
 
 
 def _run_subprocess(cmd: list[str], *, timeout: int = 1800) -> Dict[str, Any]:
+    import os
+
+    env = os.environ.copy()
+    # Child PEP 723 scripts must not init/finish Trackio — that tears down the
+    # parent ``ml_engine_cycle`` run and yields "Call trackio.init() before …".
+    env["UM8_TRACKIO_NESTED_DISABLE"] = "1"
     proc = subprocess.run(
         cmd,
         cwd=str(_REPO_ROOT),
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
     return {
         "ok": proc.returncode == 0,
@@ -696,7 +703,9 @@ async def run_ml_engine_cycle(
                 from services.m8_publish_hour_model import train_m8_publish_hour_priors, training_lookback_days_from_env
 
                 m8_metrics = await train_m8_publish_hour_priors(
-                    pool, lookback_days=training_lookback_days_from_env()
+                    pool,
+                    lookback_days=training_lookback_days_from_env(),
+                    emit_trackio=False,
                 )
                 result["steps"]["m8_publish_hour_priors"] = {
                     "ok": bool(m8_metrics),

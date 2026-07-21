@@ -35,7 +35,13 @@ def hf_env_status(*, require_write_token: bool = False) -> Tuple[bool, str]:
 def trackio_env_enabled() -> bool:
     """
     Trackio is enabled only when explicit project configuration is present.
+
+    Nested callers (ML engine subprocesses / in-process child steps) set
+    ``UM8_TRACKIO_NESTED_DISABLE=1`` so they do not tear down the parent run.
     """
+    nested = (os.environ.get("UM8_TRACKIO_NESTED_DISABLE") or "").strip().lower()
+    if nested in ("1", "true", "yes", "on"):
+        return False
     project = (os.environ.get("TRACKIO_PROJECT") or "").strip()
     return bool(project)
 

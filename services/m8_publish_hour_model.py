@@ -300,6 +300,7 @@ async def train_m8_publish_hour_priors(
     *,
     lookback_days: int = 420,
     related_ops_incident_ids: Optional[Sequence[uuid.UUID]] = None,
+    emit_trackio: bool = True,
 ) -> Dict[str, Any]:
     """
     Pull PCI training data, fit HGBR, insert ``m8_model_runs``, replace hour priors.
@@ -311,16 +312,19 @@ async def train_m8_publish_hour_priors(
       M8_TRAIN_CONTENT_KIND_ALLOWLIST — e.g. ``reel,short`` (optional).
       M8_RELATED_OPS_INCIDENT_IDS — comma-separated UUIDs stored on the run row
         (``m8_model_runs.related_ops_incident_ids``) for postmortems beside ``training_run_id``.
+
+    ``emit_trackio`` should be ``False`` when nested under ``run_ml_engine_cycle``.
     """
     from core.scheduling import static_hour_prior_24
 
-    track = OptionalTrackioRun("m8_publish_hour_priors")
-    track.start(
-        config={
-            "lookback_days": int(lookback_days),
-            "model_family": "hist_gradient_boosting_regressor",
-        }
-    )
+    track = OptionalTrackioRun("m8_publish_hour_priors") if emit_trackio else None
+    if track is not None:
+        track.start(
+            config={
+                "lookback_days": int(lookback_days),
+                "model_family": "hist_gradient_boosting_regressor",
+            }
+        )
 
     pci_only = _env_bool("M8_TRAIN_PCI_ONLY", True)
     source_allow = _parse_csv_lower("M8_TRAIN_SOURCE_ALLOWLIST")
@@ -351,14 +355,15 @@ async def train_m8_publish_hour_priors(
     else:
         inc_ids = related_ops_incident_ids_from_env()
     train_config["related_ops_incident_ids"] = [str(x) for x in inc_ids]
-    track.log(
-        {
-            "phase": "data_load",
-            "sql_row_count": len(rows),
-            "frame_row_count": int(len(df)),
-            "lookback_days": int(lookback_days),
-        }
-    )
+    if track is not None:
+        track.log(
+            {
+                "phase": "data_load",
+                "sql_row_count": len(rows),
+                "frame_row_count": int(len(df)),
+                "lookback_days": int(lookback_days),
+            }
+        )
 
     priors: Dict[str, List[float]]
     model_version: str
@@ -375,27 +380,29 @@ async def train_m8_publish_hour_priors(
         run_metrics = {"skipped": True, "reason": "insufficient_rows", "n_rows": len(df), "fallback": "static"}
         model_version = "static-fallback"
         mae = None
-        track.log(
-            {
-                "phase": "train",
-                "skipped": 1,
-                "reason": "insufficient_rows",
-                "min_required_rows": int(_MIN_TOTAL_ROWS),
-                "train_rows": int(len(df)),
-            }
-        )
+        if track is not None:
+            track.log(
+                {
+                    "phase": "train",
+                    "skipped": 1,
+                    "reason": "insufficient_rows",
+                    "min_required_rows": int(_MIN_TOTAL_ROWS),
+                    "train_rows": int(len(df)),
+                }
+            )
     else:
         priors, run_metrics = _fit_and_predict_hour_grid(df)
         model_version = "hgb-v1"
         mae = run_metrics.get("val_mae_log1p_views")
-        track.log(
-            {
-                "phase": "train",
-                "skipped": 0,
-                "val_mae_log1p_views": float(mae) if mae is not None else None,
-                "platforms_written_count": len(priors),
-            }
-        )
+        if track is not None:
+            track.log(
+                {
+                    "phase": "train",
+                    "skipped": 0,
+                    "val_mae_log1p_views": float(mae) if mae is not None else None,
+                    "platforms_written_count": len(priors),
+                }
+            )
         for p in sorted(M8_PRIOR_PLATFORMS):
             if p not in priors:
                 priors[p] = static_hour_prior_24(p)
@@ -470,16 +477,17 @@ async def train_m8_publish_hour_priors(
         [str(x) for x in inc_ids],
         sorted(run_metrics_out.keys()),
     )
-    track.log(
-        {
-            "phase": "persist",
-            "train_row_count": int(len(df)),
-            "model_version": model_version,
-            "training_run_id": str(run_id),
-            "related_ops_incident_ids": [str(x) for x in inc_ids],
-        }
-    )
-    track.finish()
+    if track is not None:
+        track.log(
+            {
+                "phase": "persist",
+                "train_row_count": int(len(df)),
+                "model_version": model_version,
+                "training_run_id": str(run_id),
+                "related_ops_incident_ids": [str(x) for x in inc_ids],
+            }
+        )
+        track.finish()
     return run_metrics_out
 
 

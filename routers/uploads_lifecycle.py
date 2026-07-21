@@ -104,13 +104,21 @@ async def presign_upload(data: UploadInit, request: Request, user: dict = Depend
             )
             result["telemetry_r2_key"] = telemetry_r2_key
 
+        # Never block the upload URL on ML scoring — model load/predict can stall
+        # the event loop and trip the browser's 15s fetch timeout on /presign.
         try:
+            import asyncio
+
             from services.content_success_model import score_presign_init
 
-            result["content_hotness_hint"] = score_presign_init(
-                platforms=list(data.platforms or []),
-                user_prefs=user_prefs,
-                schedule_mode=data.schedule_mode,
+            result["content_hotness_hint"] = await asyncio.wait_for(
+                asyncio.to_thread(
+                    score_presign_init,
+                    platforms=list(data.platforms or []),
+                    user_prefs=user_prefs,
+                    schedule_mode=data.schedule_mode,
+                ),
+                timeout=0.75,
             )
         except Exception:
             pass

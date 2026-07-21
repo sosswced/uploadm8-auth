@@ -106,10 +106,14 @@ def score_features(features: Dict[str, Any]) -> Tuple[float, str]:
             import pandas as pd
 
             cols = rep.get("feature_columns") or []
+            if not isinstance(cols, (list, tuple)) or not cols:
+                raise ValueError("content report missing feature_columns")
             row = {c: features.get(c) for c in cols}
             df = pd.DataFrame([row])
-            prob = float(pipe.predict_proba(df)[0][1])
-            return prob, model_key
+            proba = pipe.predict_proba(df)
+            if proba is None or len(proba) < 1 or len(proba[0]) < 2:
+                raise ValueError("predict_proba returned empty result")
+            return float(proba[0][1]), model_key
         except Exception as e:
             logger.warning("content model predict failed: %s", e)
     return _heuristic_hotness(features), "content_hotness_heuristic"

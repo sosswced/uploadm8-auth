@@ -783,6 +783,10 @@ async def fail_deferred_batch_without_slot(
 
     Returns True if the row was failed.
     """
+    mode = str(upload_snap.get("schedule_mode") or "").strip().lower()
+    # Immediate/scheduled never use per-platform smart slots — do not fail them here.
+    if mode != "smart":
+        return False
     if not still_has_pending_publish_slots(upload_snap, platform_results):
         return False
     if next_due_scheduled_time(upload_snap, platform_results) is not None:

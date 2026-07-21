@@ -2710,11 +2710,18 @@ async def run_publish_and_notify(
             pass
         ctx.mark_error(e.code.value, e.message)
 
-    # Smart schedule: more platform slots remain — save batch and stay staged for publish.
-    if upload_record and still_has_pending_publish_slots(
-        upload_record,
-        ctx.platform_results,
-        publish_targets=publish_targets,
+    # Smart schedule only: more platform slots remain — save batch and stay ready.
+    # Immediate/scheduled must never take this path (false "pending" used to mark
+    # successful publishes as PUBLISH_SLOT_MISSING).
+    mode = str((upload_record or {}).get("schedule_mode") or "").strip().lower()
+    if (
+        upload_record
+        and mode == "smart"
+        and still_has_pending_publish_slots(
+            upload_record,
+            ctx.platform_results,
+            publish_targets=publish_targets,
+        )
     ):
         await db_stage.mark_deferred_publish_batch(db_pool, ctx)
         logger.info(
@@ -3829,6 +3836,20 @@ async def run_scheduler_loop() -> None:
     logger.info("Scheduler loop stopped")
 
 
+async def _upload_already_processing(upload_id: str) -> bool:
+    if not upload_id or db_pool is None:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            st = await conn.fetchval(
+                "SELECT status FROM uploads WHERE id = $1::uuid",
+                upload_id,
+            )
+        return str(st or "").lower() == "processing"
+    except Exception:
+        return False
+
+
 async def _run_job_with_semaphore(job_data: dict) -> None:
     """
     Wrapper: run processing pipeline (FFmpeg-heavy) inside the PROCESS semaphore.
@@ -3839,54 +3860,67 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
     upload_id = str(job_data.get("upload_id") or "")
     from stages.redis_job_queue import user_process_release, user_process_wait_acquire
 
-    if uid and not await user_process_wait_acquire(
-        redis_client,
-        uid,
-        pc,
-        upload_id=upload_id,
-        shutdown_check=lambda: shutdown_requested,
-    ):
-        logger.warning(
-            "[%s] scheduler job skipped — user process slot unavailable; reverting queued → staged",
-            upload_id or "?",
+    # Duplicate reclaim/scheduler race: don't wait on our own processing row.
+    if upload_id and await _upload_already_processing(upload_id):
+        logger.info(
+            "[%s] scheduler skip — upload already processing",
+            upload_id,
         )
-        # Avoid parking forever in queued when the user process slot is busy.
-        if upload_id and db_pool is not None:
-            try:
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE uploads
-                        SET status = 'staged', updated_at = NOW()
-                        WHERE id = $1 AND status = 'queued'
-                          AND COALESCE(schedule_mode, 'immediate') IN ('scheduled', 'smart')
-                        """,
-                        upload_id,
-                    )
-            except Exception as rev_e:
-                logger.warning("[%s] queued→staged revert failed: %s", upload_id, rev_e)
         return
-    if not await _wait_for_process_memory_headroom(upload_id):
-        logger.warning(
-            "[%s] scheduler process deferred — memory pressure; leaving job for later reclaim",
-            upload_id or "?",
-        )
-        if upload_id and db_pool is not None:
-            try:
-                async with db_pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE uploads
-                        SET status = 'staged', updated_at = NOW()
-                        WHERE id = $1 AND status = 'queued'
-                          AND COALESCE(schedule_mode, 'immediate') IN ('scheduled', 'smart')
-                        """,
-                        upload_id,
-                    )
-            except Exception as rev_e:
-                logger.warning("[%s] memory-defer queued→staged failed: %s", upload_id, rev_e)
-        return
+
+    slot_held = False
     try:
+        if uid and not await user_process_wait_acquire(
+            redis_client,
+            uid,
+            pc,
+            upload_id=upload_id,
+            shutdown_check=lambda: shutdown_requested,
+            already_processing_check=(
+                (lambda: _upload_already_processing(upload_id)) if upload_id else None
+            ),
+        ):
+            logger.warning(
+                "[%s] scheduler job skipped — user process slot unavailable; reverting queued → staged",
+                upload_id or "?",
+            )
+            # Avoid parking forever in queued when the user process slot is busy.
+            if upload_id and db_pool is not None:
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE uploads
+                            SET status = 'staged', updated_at = NOW()
+                            WHERE id = $1 AND status = 'queued'
+                              AND COALESCE(schedule_mode, 'immediate') IN ('scheduled', 'smart')
+                            """,
+                            upload_id,
+                        )
+                except Exception as rev_e:
+                    logger.warning("[%s] queued→staged revert failed: %s", upload_id, rev_e)
+            return
+        slot_held = bool(uid)
+        if not await _wait_for_process_memory_headroom(upload_id):
+            logger.warning(
+                "[%s] scheduler process deferred — memory pressure; leaving job for later reclaim",
+                upload_id or "?",
+            )
+            if upload_id and db_pool is not None:
+                try:
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            """
+                            UPDATE uploads
+                            SET status = 'staged', updated_at = NOW()
+                            WHERE id = $1 AND status = 'queued'
+                              AND COALESCE(schedule_mode, 'immediate') IN ('scheduled', 'smart')
+                            """,
+                            upload_id,
+                        )
+                except Exception as rev_e:
+                    logger.warning("[%s] memory-defer queued→staged failed: %s", upload_id, rev_e)
+            return
         async with _process_semaphore:
             try:
                 await run_processing_pipeline(job_data)
@@ -3903,7 +3937,7 @@ async def _run_job_with_semaphore(job_data: dict) -> None:
                 except Exception:
                     pass
     finally:
-        if uid:
+        if slot_held and uid:
             await user_process_release(redis_client, uid)
 
 
@@ -4714,6 +4748,14 @@ async def _process_one_job(job_json: str) -> None:
     # requeue. Leaking here filled the per-user cap after OOM/memory storms.
     slot_held = False
     try:
+        # Duplicate stream reclaim / dual consumer: never wait on our own row.
+        if upload_id and await _upload_already_processing(upload_id):
+            logger.info(
+                "[%s] skip — upload already processing (no slot wait)",
+                upload_id,
+            )
+            return
+
         if uid:
             # Heal counter vs DB before waiting (OOM leaves Redis INCR without DECR).
             try:
@@ -4739,22 +4781,14 @@ async def _process_one_job(job_json: str) -> None:
                 pc,
                 upload_id=upload_id,
                 shutdown_check=lambda: shutdown_requested,
+                already_processing_check=(
+                    (lambda: _upload_already_processing(upload_id)) if upload_id else None
+                ),
             )
             if not got:
                 # Another consumer may already be processing this upload — don't stack
                 # duplicate requeues (logs showed attempt 1/5 forever via stale recovery).
-                already = False
-                if upload_id and db_pool is not None:
-                    try:
-                        async with db_pool.acquire() as conn:
-                            st = await conn.fetchval(
-                                "SELECT status FROM uploads WHERE id = $1::uuid",
-                                upload_id,
-                            )
-                        already = str(st or "").lower() == "processing"
-                    except Exception:
-                        already = False
-                if already:
+                if upload_id and await _upload_already_processing(upload_id):
                     logger.info(
                         "[%s] user slot unavailable but status=processing — skip requeue",
                         upload_id,
@@ -5255,6 +5289,19 @@ async def main() -> None:
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     await redis_client.ping()
     logger.info("Redis connected")
+
+    # After OOM/SIGKILL the process dies holding Redis INCR; DB may still say
+    # processing so heal_user_process_slots cannot clamp to 0. Single-worker
+    # Render boots clear orphans so the next job is not stuck in_use=1/1.
+    # Opt out with USER_SLOT_CLEAR_ON_START=0 if multiple process workers share Redis.
+    _clear_slots = (os.environ.get("USER_SLOT_CLEAR_ON_START") or "1").strip().lower()
+    if _clear_slots in ("1", "true", "yes", "on"):
+        try:
+            from stages.redis_job_queue import clear_all_user_process_slots
+
+            await clear_all_user_process_slots(redis_client)
+        except Exception as _clr_e:
+            logger.warning("USER_SLOT_CLEAR_ON_START failed: %s", _clr_e)
 
     shutdown_event = asyncio.Event()
     _ensure_worker_semaphores()

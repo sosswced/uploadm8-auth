@@ -301,6 +301,35 @@ async def user_process_in_use(redis: Any, user_id: str) -> int:
         return 0
 
 
+async def clear_all_user_process_slots(redis: Any) -> int:
+    """
+    Delete every ``uploadm8:user_process_slots:*`` key.
+
+    Call on single-instance worker boot after SIGKILL/OOM — Redis INCR survives
+    the process, but no local holder remains. Safe when only one process worker
+    owns the lane (Render Standard). Disable with USER_SLOT_CLEAR_ON_START=0.
+    """
+    if not redis:
+        return 0
+    deleted = 0
+    try:
+        cursor = 0
+        pattern = _USER_SLOT_PREFIX + "*"
+        while True:
+            cursor, keys = await redis.scan(cursor=cursor, match=pattern, count=100)
+            if keys:
+                n = await redis.delete(*keys)
+                deleted += int(n or 0)
+            if cursor == 0:
+                break
+    except Exception as e:
+        logger.warning("clear_all_user_process_slots failed: %s", e)
+        return deleted
+    if deleted:
+        logger.warning("cleared %s orphaned user process slot key(s) on worker start", deleted)
+    return deleted
+
+
 async def heal_user_process_slots(
     redis: Any,
     user_id: str,
@@ -351,6 +380,7 @@ async def user_process_wait_acquire(
     *,
     upload_id: str = "",
     shutdown_check=None,
+    already_processing_check=None,
     max_wait_sec: Optional[int] = None,
 ) -> bool:
     """
@@ -359,6 +389,10 @@ async def user_process_wait_acquire(
     Avoids re-enqueue storms when USER_PROCESS_MAX_PARALLEL is saturated:
     wait in place (stream message stays pending until ack) instead of
     LPUSH/XADD duplicates every 2 seconds.
+
+    ``already_processing_check``: optional async callable → True if this upload
+    is already being processed elsewhere; abort wait (return False) so the
+    duplicate does not sit for USER_SLOT_MAX_WAIT_SEC.
     """
     cap = user_process_cap(priority_class)
     if cap <= 0 or not user_id:
@@ -375,6 +409,17 @@ async def user_process_wait_acquire(
     while True:
         if shutdown_check and shutdown_check():
             return False
+        if already_processing_check:
+            try:
+                if await already_processing_check():
+                    if upload_id:
+                        logger.info(
+                            "[%s] aborting slot wait — upload already processing elsewhere",
+                            upload_id,
+                        )
+                    return False
+            except Exception:
+                pass
         if await user_process_try_acquire(redis, user_id, priority_class):
             if logged_wait and upload_id:
                 logger.info(

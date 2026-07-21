@@ -468,6 +468,10 @@ def collect_thumbnail_repair_ids(items: List[dict], *, limit: int = 15) -> List[
         st = str(item.get("status") or "").lower()
         if st not in THUMBNAIL_REPAIR_STATUSES:
             continue
+        # Never schedule regenerate for uploads whose source never landed in R2.
+        err = str(item.get("error_code") or "").strip().upper()
+        if err == "SOURCE_NOT_IN_R2":
+            continue
         uid = str(item.get("id") or "").strip()
         if not uid or uid in ids:
             continue
@@ -549,6 +553,13 @@ async def repair_upload_thumbnails_batch(
                 continue
             st = str(d.get("status") or "").lower()
             if st not in THUMBNAIL_REPAIR_STATUSES:
+                continue
+            # Skip SOURCE_NOT_IN_R2 / cleaned-R2 rows — regenerate cannot invent bytes.
+            has_video_key = bool(
+                str(d.get("r2_key") or "").strip()
+                or str(d.get("processed_r2_key") or "").strip()
+            )
+            if not has_video_key:
                 continue
             had_object = await asyncio.to_thread(r2_object_exists, _normalize_r2_key(sk))
             url, _rk = await ensure_upload_thumbnail_resident(

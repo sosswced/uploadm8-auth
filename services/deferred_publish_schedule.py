@@ -117,11 +117,55 @@ def handled_target_keys(platform_results: Any) -> set[str]:
         plat = str(row.get("platform") or "").strip().lower()
         if not plat:
             continue
-        tid = row.get("token_row_id") or row.get("account_id")
-        keys.add(publish_target_key(plat, tid))
-        if not tid:
-            keys.add(plat)
+        # Index every id form the publish stage may write so callers that pass
+        # token_row_id vs account_id / open_id still match.
+        for tid_field in (
+            row.get("token_row_id"),
+            row.get("account_id"),
+            row.get("token_id"),
+        ):
+            if tid_field:
+                keys.add(publish_target_key(plat, tid_field))
+        keys.add(plat)
     return keys
+
+
+def is_publish_target_handled(
+    platform_results: Any,
+    platform: str,
+    token_row_id: Any = None,
+) -> bool:
+    """
+    True when ``platform_results`` already covers this publish target.
+
+    Unresolved targets ``(platform, None)`` are covered by any result for that
+    platform (including account-scoped ``tiktok|<uuid>`` keys). This matches
+    ``publish_target_already_done`` and prevents false ``PUBLISH_SLOT_MISSING``
+    after a successful single-account immediate publish.
+    """
+    plat = str(platform or "").strip().lower()
+    if not plat:
+        return True
+    tid = str(token_row_id or "").strip()
+    for row in normalize_platform_results(platform_results):
+        if str(row.get("platform") or "").strip().lower() != plat:
+            continue
+        row_ids = {
+            str(x).strip()
+            for x in (
+                row.get("token_row_id"),
+                row.get("account_id"),
+                row.get("token_id"),
+            )
+            if x is not None and str(x).strip()
+        }
+        if not tid:
+            return True
+        if tid in row_ids:
+            return True
+        if not row_ids:
+            return True
+    return False
 
 
 def slot_for_platform(upload_record: dict[str, Any], platform: str) -> Optional[datetime]:
@@ -162,13 +206,13 @@ def platforms_due_for_publish(
     """
     now = _aware(now or _now_utc())
     mode = str(upload_record.get("schedule_mode") or "scheduled").strip().lower()
-    handled = handled_target_keys(upload_record.get("platform_results"))
 
     platforms = [str(p).strip().lower() for p in (upload_record.get("platforms") or []) if str(p).strip()]
     if not platforms:
         return frozenset()
 
     targets = publish_targets or [(p, None) for p in platforms]
+    results = upload_record.get("platform_results")
 
     def _unhandled_platforms() -> set[str]:
         due_plats: set[str] = set()
@@ -179,7 +223,7 @@ def platforms_due_for_publish(
             unhandled = [
                 (p, tid)
                 for p, tid in plat_targets
-                if publish_target_key(str(p).lower(), tid) not in handled
+                if not is_publish_target_handled(results, p, tid)
             ]
             if unhandled:
                 due_plats.add(plat)
@@ -214,14 +258,13 @@ def still_has_pending_publish_slots(
     publish_targets: Optional[list[tuple[str, Optional[str]]]] = None,
 ) -> bool:
     """True while upload has publish targets not yet attempted."""
+    del now  # retained for call-site compatibility
     platforms = [str(p).strip().lower() for p in (upload_record.get("platforms") or []) if str(p).strip()]
-    handled = handled_target_keys(platform_results)
     targets = publish_targets or [(p, None) for p in platforms]
 
     for p, tid in targets:
-        if publish_target_key(str(p).lower(), tid) in handled:
-            continue
-        return True
+        if not is_publish_target_handled(platform_results, p, tid):
+            return True
     return False
 
 
@@ -239,7 +282,6 @@ def next_due_scheduled_time(
     """
     mode = str(upload_record.get("schedule_mode") or "").strip().lower()
     results = platform_results if platform_results is not None else upload_record.get("platform_results")
-    handled = handled_target_keys(results)
 
     platforms = [str(p).strip().lower() for p in (upload_record.get("platforms") or []) if str(p).strip()]
     if not platforms:
@@ -248,7 +290,7 @@ def next_due_scheduled_time(
     targets = publish_targets or [(p, None) for p in platforms]
     pending_plats: set[str] = set()
     for p, tid in targets:
-        if publish_target_key(str(p).lower(), tid) in handled:
+        if is_publish_target_handled(results, p, tid):
             continue
         pending_plats.add(str(p).strip().lower())
 

@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -443,6 +445,49 @@ async def regenerate_upload_thumbnail(
         }
 
 
+# upload_id → monotonic deadline; avoid re-probing SOURCE_NOT_IN_R2 zombies on every
+# shell/bootstrap poll (queue.html hits this every few seconds).
+_THUMB_NO_VIDEO_UNTIL: Dict[str, float] = {}
+_THUMB_NO_VIDEO_TTL_SEC = float(os.environ.get("THUMB_NO_VIDEO_CACHE_SEC", "3600") or 3600)
+
+
+def _thumb_no_video_cached(upload_id: str) -> bool:
+    until = _THUMB_NO_VIDEO_UNTIL.get(upload_id)
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        _THUMB_NO_VIDEO_UNTIL.pop(upload_id, None)
+        return False
+    return True
+
+
+def _mark_thumb_no_video(upload_id: str) -> None:
+    if not upload_id:
+        return
+    _THUMB_NO_VIDEO_UNTIL[upload_id] = time.monotonic() + max(60.0, _THUMB_NO_VIDEO_TTL_SEC)
+    # Bound memory if a huge queue is scanned once.
+    if len(_THUMB_NO_VIDEO_UNTIL) > 5000:
+        oldest = sorted(_THUMB_NO_VIDEO_UNTIL.items(), key=lambda kv: kv[1])[:1000]
+        for k, _ in oldest:
+            _THUMB_NO_VIDEO_UNTIL.pop(k, None)
+
+
+async def _any_video_key_in_r2(upload_row: Dict[str, Any]) -> bool:
+    """True if processed_r2_key or r2_key exists in object storage."""
+    for cand in (upload_row.get("processed_r2_key"), upload_row.get("r2_key")):
+        if not cand:
+            continue
+        s = str(cand).strip()
+        if not s:
+            continue
+        try:
+            if await asyncio.to_thread(r2_object_exists, _normalize_r2_key(s)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def ensure_upload_thumbnail_resident(
     *,
     db_pool: asyncpg.Pool,
@@ -464,6 +509,9 @@ async def ensure_upload_thumbnail_resident(
     thumb_key = upload_row.get("thumbnail_r2_key")
     sk = str(thumb_key).strip() if thumb_key else ""
 
+    if _thumb_no_video_cached(upload_id):
+        return None, sk or None
+
     if sk:
         exists = await asyncio.to_thread(r2_object_exists, sk)
         if exists:
@@ -474,6 +522,15 @@ async def ensure_upload_thumbnail_resident(
                 return None, sk
 
     if status not in THUMB_REPAIR_STATUSES:
+        return None, sk or None
+
+    # Queue zombies / cleaned R2: do not download-miss on every bootstrap poll.
+    if not await _any_video_key_in_r2(upload_row):
+        _mark_thumb_no_video(upload_id)
+        logger.debug(
+            "ensure_upload_thumbnail_resident skip upload_id=%s: video_not_in_storage",
+            upload_id,
+        )
         return None, sk or None
 
     try:
@@ -488,7 +545,20 @@ async def ensure_upload_thumbnail_resident(
         rk = out.get("r2_key")
         return out.get("thumbnail_url"), (str(rk) if rk else None)
     except Exception as e:
-        logger.warning("ensure_upload_thumbnail_resident failed upload_id=%s: %s", upload_id, e)
+        msg = str(e)
+        if msg in ("video_not_in_storage", "no_video_key"):
+            _mark_thumb_no_video(upload_id)
+            logger.debug(
+                "ensure_upload_thumbnail_resident failed upload_id=%s: %s",
+                upload_id,
+                e,
+            )
+        else:
+            logger.warning(
+                "ensure_upload_thumbnail_resident failed upload_id=%s: %s",
+                upload_id,
+                e,
+            )
         return None, sk or None
 
 

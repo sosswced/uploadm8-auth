@@ -10,7 +10,9 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,6 +51,11 @@ _EMPTY_GLOBAL_BASELINES: Dict[str, Any] = {
     "global_avg_shares": 0.0,
     "global_avg_engagement_rate_pct": 0.0,
 }
+
+# Process-local TTL cache — global 30d scan is shared across all /api/me/coach calls
+# (UPLOADM8-5S Slow DB Query).
+_GLOBAL_BASELINES_CACHE: Dict[str, Any] = {"at": 0.0, "data": None}
+_GLOBAL_BASELINES_TTL_S = float(os.environ.get("COACH_GLOBAL_BASELINES_TTL_S", "600"))
 
 
 def coach_endpoint_fallback(tier: Optional[Any] = None) -> Dict[str, Any]:
@@ -544,6 +551,11 @@ async def fetch_account_intelligence(
 
 
 async def _global_upload_baselines(conn) -> Dict[str, Any]:
+    now = time.monotonic()
+    cached = _GLOBAL_BASELINES_CACHE.get("data")
+    cached_at = float(_GLOBAL_BASELINES_CACHE.get("at") or 0.0)
+    if cached is not None and (now - cached_at) < _GLOBAL_BASELINES_TTL_S:
+        return dict(cached)
     try:
         row = await conn.fetchrow(
             """
@@ -567,7 +579,7 @@ async def _global_upload_baselines(conn) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("global upload baselines query failed (schema drift or DB error): %s", e)
         return dict(_EMPTY_GLOBAL_BASELINES)
-    return {
+    out = {
         "sample_uploads_30d": int(row["n"] or 0) if row else 0,
         "global_avg_views": float(row["avg_views"] or 0) if row else 0.0,
         "global_avg_likes": float(row["avg_likes"] or 0) if row else 0.0,
@@ -575,6 +587,9 @@ async def _global_upload_baselines(conn) -> Dict[str, Any]:
         "global_avg_shares": float(row["avg_shares"] or 0) if row else 0.0,
         "global_avg_engagement_rate_pct": float(row["avg_engagement_rate_pct"] or 0) if row else 0.0,
     }
+    _GLOBAL_BASELINES_CACHE["at"] = now
+    _GLOBAL_BASELINES_CACHE["data"] = dict(out)
+    return out
 
 
 async def fetch_user_engagement_snapshot(conn, user_id) -> Dict[str, Any]:

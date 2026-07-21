@@ -458,6 +458,8 @@ async def fetch_hashtag_traction(
     """
     lookback_days = max(14, min(int(lookback_days or 120), 730))
     min_uploads_per_tag = max(2, min(int(min_uploads_per_tag or 2), 20))
+    # Cap rows for /api/me/coach (UPLOADM8-5S) — hashtag aggregation does not need
+    # unbounded history; newest first uses idx_uploads_user_status_created_completed.
     rows = await conn.fetch(
         """
         SELECT id, views, likes, comments, shares, created_at, output_artifacts
@@ -465,6 +467,8 @@ async def fetch_hashtag_traction(
          WHERE user_id = $1::uuid
            AND status IN ('completed', 'succeeded', 'partial')
            AND created_at >= (NOW() - ($2::int || ' days')::interval)
+         ORDER BY created_at DESC
+         LIMIT 400
         """,
         user_id,
         lookback_days,

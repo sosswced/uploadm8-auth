@@ -142,22 +142,44 @@ async def _store_account_metric_event(
     account_id: str,
     metrics: Dict[str, Any],
 ) -> None:
+    await _store_account_metric_events_batch(
+        conn,
+        user_id=user_id,
+        rows=[(platform, token_row_id, account_id, metrics or {})],
+    )
+
+
+async def _store_account_metric_events_batch(
+    conn: asyncpg.Connection,
+    *,
+    user_id: str,
+    rows: list,
+) -> None:
+    """One round-trip for refresh-all account events (UPLOADM8-82 N+1)."""
+    if not rows:
+        return
+    payload = [
+        (
+            user_id,
+            token_row_id,
+            platform,
+            (account_id or None),
+            json.dumps(metrics or {}),
+        )
+        for platform, token_row_id, account_id, metrics in rows
+    ]
     try:
-        await conn.execute(
+        await conn.executemany(
             """
             INSERT INTO platform_account_metrics_events
                 (user_id, token_row_id, platform, account_id, metrics, fetched_at)
             VALUES
                 ($1, $2, $3, $4, $5::jsonb, NOW())
             """,
-            user_id,
-            token_row_id,
-            platform,
-            account_id or None,
-            json.dumps(metrics or {}),
+            payload,
         )
     except Exception as e:
-        logger.debug(f"[platform-metrics-job] account-event write skipped: {e}")
+        logger.debug(f"[platform-metrics-job] account-event batch write skipped: {e}")
 
 
 async def _upsert_user_rollup_daily(
@@ -393,15 +415,14 @@ async def refresh_platform_metrics_for_user(pool: asyncpg.Pool, user_id: Any) ->
 
     async with pool.acquire() as conn:
         await _store_platform_metrics_cache(conn, uid, output)
-        for plat, token_row_id, account_id, res in task_results:
-            await _store_account_metric_event(
-                conn,
-                user_id=uid,
-                token_row_id=token_row_id,
-                platform=plat,
-                account_id=account_id,
-                metrics=res or {},
-            )
+        await _store_account_metric_events_batch(
+            conn,
+            user_id=uid,
+            rows=[
+                (plat, token_row_id, account_id, res or {})
+                for plat, token_row_id, account_id, res in task_results
+            ],
+        )
         await _upsert_user_rollup_daily(
             conn,
             user_id=uid,

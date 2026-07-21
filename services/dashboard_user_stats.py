@@ -386,10 +386,43 @@ async def _dashboard_stats_on_conn(
             logger.warning("dashboard: platform_metrics_cache read failed: %s", e)
         return out
 
-    stats = await q_stats(conn)
-    scheduled = await q_scheduled(conn)
-    put_used_month = await q_put_used_month(conn)
-    uploads_used_month = await q_uploads_used_month(conn)
+    if light:
+        # One uploads scan for shell bootstrap (UPLOADM8-89 companion) instead of
+        # four sequential COUNT/SUM queries on the same table.
+        try:
+            light_row = await conn.fetchrow(
+                f"""
+                SELECT
+                    COUNT(*)::int AS total,
+                    SUM(CASE WHEN status IN {SUCCESSFUL_STATUS_SQL_IN} THEN 1 ELSE 0 END)::int AS completed,
+                    SUM(CASE WHEN status IN {_QUEUE_VIEW_SQL_LITERAL} THEN 1 ELSE 0 END)::int AS in_queue,
+                    COALESCE(SUM(views), 0)::bigint AS views,
+                    COALESCE(SUM(likes), 0)::bigint AS likes,
+                    COALESCE(SUM(CASE WHEN status IN {SUCCESSFUL_STATUS_SQL_IN}
+                        AND created_at >= date_trunc('month', CURRENT_DATE) THEN 1 ELSE 0 END), 0)::int AS successful_this_month,
+                    COALESCE(SUM(CASE WHEN status IN {SUCCESSFUL_STATUS_SQL_IN}
+                        AND created_at >= date_trunc('month', CURRENT_DATE) - interval '1 month'
+                        AND created_at < date_trunc('month', CURRENT_DATE) THEN 1 ELSE 0 END), 0)::int AS successful_last_month,
+                    SUM(CASE WHEN status IN {_SCHEDULED_SQL_LITERAL} THEN 1 ELSE 0 END)::int AS scheduled_count,
+                    COALESCE(SUM(CASE WHEN created_at >= date_trunc('month', CURRENT_DATE)
+                        THEN COALESCE(put_spent, 0) ELSE 0 END), 0)::int AS put_used_month,
+                    SUM(CASE WHEN created_at >= date_trunc('month', CURRENT_DATE) THEN 1 ELSE 0 END)::int AS uploads_used_month
+                FROM uploads WHERE user_id = $1
+                """,
+                uid,
+            )
+        except Exception:
+            logger.warning("dashboard light aggregate failed user=%s", uid, exc_info=True)
+            light_row = None
+        stats = light_row
+        scheduled = int(light_row["scheduled_count"] or 0) if light_row else 0
+        put_used_month = int(light_row["put_used_month"] or 0) if light_row else 0
+        uploads_used_month = int(light_row["uploads_used_month"] or 0) if light_row else 0
+    else:
+        stats = await q_stats(conn)
+        scheduled = await q_scheduled(conn)
+        put_used_month = await q_put_used_month(conn)
+        uploads_used_month = await q_uploads_used_month(conn)
     accounts = await q_accounts(conn)
     recent = await q_recent(conn)
 

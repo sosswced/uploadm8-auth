@@ -517,24 +517,33 @@ async def repair_upload_thumbnails_batch(
         "role": user_row["role"],
         "flex_enabled": user_row["flex_enabled"],
     }
+    # One SELECT for all ids — avoids shell/bootstrap N+1 (UPLOADM8-89).
+    rows_by_id: Dict[str, dict] = {}
+    try:
+        async with pool.acquire() as conn:
+            fetched = await conn.fetch(
+                """
+                SELECT id, status, thumbnail_r2_key, r2_key, processed_r2_key,
+                       platforms, title, caption, user_preferences, output_artifacts,
+                       platform_results
+                FROM uploads
+                WHERE user_id = $1 AND id = ANY($2::uuid[])
+                """,
+                user_id,
+                uids,
+            )
+        for row in fetched or []:
+            rows_by_id[str(row["id"])] = dict(row)
+    except Exception as e:
+        logger.warning("repair_upload_thumbnails_batch batch load failed: %s", e)
+        return
+
     repaired = 0
     for upload_id in uids:
         try:
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT id, status, thumbnail_r2_key, r2_key, processed_r2_key,
-                           platforms, title, caption, user_preferences, output_artifacts,
-                           platform_results
-                    FROM uploads
-                    WHERE id = $1 AND user_id = $2
-                    """,
-                    upload_id,
-                    user_id,
-                )
-            if not row:
+            d = rows_by_id.get(upload_id)
+            if not d:
                 continue
-            d = dict(row)
             sk = str(d.get("thumbnail_r2_key") or "").strip()
             if not sk:
                 continue

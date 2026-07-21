@@ -302,11 +302,18 @@ async def lifespan(app: FastAPI):
         logger.warning("pricing cache hydrate failed: %s", e)
 
     if BOOTSTRAP_ADMIN_EMAIL:
-        async with core.state.db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET role='master_admin', subscription_tier='master_admin' WHERE LOWER(email)=$1",
-                BOOTSTRAP_ADMIN_EMAIL,
-            )
+        # Use acquire_db so Neon recovery / cold start retries (UPLOADM8-5Z) instead of
+        # crashing lifespan during local pytest against a recovering database.
+        try:
+            from core.db_pool import acquire_db
+
+            async with acquire_db(core.state.db_pool) as conn:
+                await conn.execute(
+                    "UPDATE users SET role='master_admin', subscription_tier='master_admin' WHERE LOWER(email)=$1",
+                    BOOTSTRAP_ADMIN_EMAIL,
+                )
+        except Exception as e:
+            logger.warning("bootstrap admin role update skipped: %s", e)
 
     # Seed trill places for geo-targeting
     try:

@@ -531,6 +531,9 @@ async def randomize_schedule(upload_id: UUID, user: dict = Depends(get_current_u
     pool = core.state.db_pool
     if pool is None:
         raise HTTPException(503, "Database unavailable")
+    # Two-phase acquire (UPLOADM8-88 / UPLOADM8-8B): never hold one connection across
+    # long schedule generation + write — a mid-handler InterfaceError left the proxy
+    # [released] and the UPDATE then 503'd as "Database temporarily unavailable".
     async with acquire_db(pool) as conn:
         upload = await conn.fetchrow(
             """
@@ -542,24 +545,28 @@ async def randomize_schedule(upload_id: UUID, user: dict = Depends(get_current_u
             uid_str,
             user["id"],
         )
-        if not upload:
-            raise HTTPException(404, "Scheduled upload not found")
-        status = (upload.get("status") or "").lower()
-        if status not in SCHEDULED_PIPELINE_STATUSES:
-            raise HTTPException(400, "Cannot randomize schedule for an upload that is no longer editable")
+    if not upload:
+        raise HTTPException(404, "Scheduled upload not found")
+    status = (upload.get("status") or "").lower()
+    if status not in SCHEDULED_PIPELINE_STATUSES:
+        raise HTTPException(400, "Cannot randomize schedule for an upload that is no longer editable")
 
-        platforms = list(upload["platforms"] or [])
-        if not platforms:
-            raise HTTPException(400, "Upload has no platforms")
+    platforms = list(upload["platforms"] or [])
+    if not platforms:
+        raise HTTPException(400, "Upload has no platforms")
 
-        mode = (upload.get("schedule_mode") or "scheduled").lower()
-        num_days = (
-            _infer_smart_spread_days(upload.get("schedule_metadata"))
-            if mode == "smart"
-            else 14
-        )
-        from services.upload.schedule_guard import build_smart_schedule_for_upload
+    mode = (upload.get("schedule_mode") or "scheduled").lower()
+    # ready_to_publish rows often still say schedule_mode=immediate; treat as one-shot.
+    if mode == "immediate":
+        mode = "scheduled"
+    num_days = (
+        _infer_smart_spread_days(upload.get("schedule_metadata"))
+        if mode == "smart"
+        else 14
+    )
+    from services.upload.schedule_guard import build_smart_schedule_for_upload
 
+    async with acquire_db(pool) as conn:
         smart = await build_smart_schedule_for_upload(
             conn,
             bill_id,
@@ -568,17 +575,18 @@ async def randomize_schedule(upload_id: UUID, user: dict = Depends(get_current_u
             exclude_upload_id=uid_str,
             random_seed=str(uuid.uuid4()),
         )
-        if not smart:
-            raise HTTPException(
-                500,
-                detail={
-                    "code": "schedule_generation_failed",
-                    "message": "Could not generate a new random schedule time.",
-                },
-            )
+    if not smart:
+        raise HTTPException(
+            500,
+            detail={
+                "code": "schedule_generation_failed",
+                "message": "Could not generate a new random schedule time.",
+            },
+        )
 
-        if mode == "smart":
-            sm = {p: schedule_slot_iso(dt) for p, dt in smart.items()}
+    if mode == "smart":
+        sm = {p: schedule_slot_iso(dt) for p, dt in smart.items()}
+        async with acquire_db(pool) as conn:
             await _apply_smart_schedule(conn, uid_str, user["id"], sm)
             await conn.execute(
                 """
@@ -592,21 +600,27 @@ async def randomize_schedule(upload_id: UUID, user: dict = Depends(get_current_u
                 uid_str,
                 user["id"],
             )
-            scheduled_min = min(smart.values())
-            return {
-                "status": "updated",
-                "id": uid_str,
-                "mode": "smart",
-                "smart_schedule": sm,
-                "scheduled_time": scheduled_min.isoformat(),
-            }
+        scheduled_min = min(smart.values())
+        return {
+            "status": "updated",
+            "id": uid_str,
+            "mode": "smart",
+            "smart_schedule": sm,
+            "scheduled_time": scheduled_min.isoformat(),
+        }
 
-        # One-time / scheduled: single shared time = earliest generated slot.
-        scheduled_dt = min(smart.values())
+    # One-time / scheduled: single shared time = earliest generated slot.
+    scheduled_dt = min(smart.values())
+    async with acquire_db(pool) as conn:
         await conn.execute(
             """
             UPDATE uploads
             SET scheduled_time = $3,
+                schedule_mode = CASE
+                    WHEN LOWER(COALESCE(schedule_mode, '')) IN ('immediate', '')
+                    THEN 'scheduled'
+                    ELSE schedule_mode
+                END,
                 error_code = NULL,
                 error_detail = NULL,
                 cancel_requested = FALSE,
@@ -617,13 +631,13 @@ async def randomize_schedule(upload_id: UUID, user: dict = Depends(get_current_u
             user["id"],
             scheduled_dt,
         )
-        return {
-            "status": "updated",
-            "id": uid_str,
-            "mode": mode or "scheduled",
-            "smart_schedule": None,
-            "scheduled_time": scheduled_dt.isoformat(),
-        }
+    return {
+        "status": "updated",
+        "id": uid_str,
+        "mode": mode or "scheduled",
+        "smart_schedule": None,
+        "scheduled_time": scheduled_dt.isoformat(),
+    }
 
 
 # ------------------------------------------------------------------

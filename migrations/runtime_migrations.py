@@ -2066,6 +2066,19 @@ async def run_migrations(db_pool):
                 CREATE INDEX IF NOT EXISTS idx_thumbnail_recreate_jobs_user_status
                     ON thumbnail_recreate_jobs(user_id, status, created_at DESC);
             """),
+            # UPLOADM8-5P: thumbnail auth hits workspace_members by (user_id, workspace_id);
+            # existing idx is (user_id, status) only.
+            (1096, """
+                CREATE INDEX IF NOT EXISTS idx_workspace_members_user_workspace_active
+                    ON workspace_members (user_id, workspace_id)
+                    WHERE status = 'active';
+            """),
+            # UPLOADM8-5S: coach / content_insights scans completed uploads by user + time.
+            (1097, """
+                CREATE INDEX IF NOT EXISTS idx_uploads_user_status_created_completed
+                    ON uploads (user_id, created_at DESC)
+                    WHERE status IN ('completed', 'succeeded', 'partial');
+            """),
         ]
 
         for version, sql in sorted(migrations, key=lambda item: item[0]):

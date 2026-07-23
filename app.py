@@ -104,6 +104,7 @@ from routers.analytics import router as analytics_router
 from routers.admin import router as admin_router
 from routers.admin_catalog import router as admin_catalog_router
 from routers.admin_workers import router as admin_workers_router
+from routers.admin_generic_ban import router as admin_generic_ban_router
 from routers.admin_contract import (
     admin_compat_router,
     marketing_router as admin_marketing_contract_router,
@@ -641,6 +642,7 @@ app.include_router(analytics_router)
 app.include_router(admin_router)
 app.include_router(admin_catalog_router)
 app.include_router(admin_workers_router)
+app.include_router(admin_generic_ban_router)
 app.include_router(admin_marketing_contract_router)
 app.include_router(admin_ml_contract_router)
 app.include_router(admin_compat_router)

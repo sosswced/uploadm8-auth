@@ -2160,9 +2160,27 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         except Exception as sig_e:
             logger.warning(f"[{upload_id}] signal_hashtags merge failed (non-fatal): {sig_e}")
         try:
+            from services.generic_hard_ban import persist_learn_hits, refresh_from_db
             from services.hydration_enforcer import enforce_hydration
 
+            # Always load admin overlay BEFORE scrub so add/remove/unban apply
+            # even when M8 caption was skipped.
+            if db_pool is not None:
+                try:
+                    await refresh_from_db(db_pool)
+                except Exception as ref_e:
+                    logger.debug(f"[{upload_id}] generic_hard_ban refresh skipped: {ref_e}")
+
             enforce_hydration(ctx)
+            try:
+                hits = []
+                arts = getattr(ctx, "output_artifacts", None) or {}
+                if isinstance(arts, dict):
+                    hits = list(arts.get("hard_ban_learn_hits") or [])
+                if hits and db_pool is not None:
+                    await persist_learn_hits(db_pool, hits, source="hydration_scrub")
+            except Exception as ban_e:
+                logger.debug(f"[{upload_id}] generic_hard_ban learn skipped: {ban_e}")
             await _persist_diag_artifacts_now("hydration_report")
             try:
                 from services.metadata_quality import validate_metadata_quality
@@ -5158,6 +5176,62 @@ def _heartbeat_runtime_snapshot() -> dict:
     }
 
 
+async def _prime_worker_heartbeat() -> bool:
+    """Write the first heartbeat row so fleet start-notify can see this instance.
+
+    Returns True when the row was upserted. Safe to call before the heartbeat
+    loop starts; the loop's ON CONFLICT path refreshes the same row.
+    """
+    if not db_pool:
+        return False
+    await _ensure_worker_heartbeat_schema()
+    snap = _heartbeat_runtime_snapshot()
+    version = snap["inst"].get("git_commit") or (
+        os.environ.get("RENDER_GIT_COMMIT", "")[:12] or None
+    )
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO worker_heartbeat
+                    (worker_id, last_seen_at, started_at,
+                     worker_concurrency, publish_concurrency, version,
+                     worker_lane, service_name, region, hostname, git_commit,
+                     heavy_pipeline_slots, memory_limit_mb)
+                VALUES ($1, NOW(), NOW(), $2, $3, $4,
+                        $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (worker_id) DO UPDATE SET
+                    started_at          = NOW(),
+                    worker_concurrency  = EXCLUDED.worker_concurrency,
+                    publish_concurrency = EXCLUDED.publish_concurrency,
+                    version             = EXCLUDED.version,
+                    worker_lane         = EXCLUDED.worker_lane,
+                    service_name        = EXCLUDED.service_name,
+                    region              = EXCLUDED.region,
+                    hostname            = EXCLUDED.hostname,
+                    git_commit          = EXCLUDED.git_commit,
+                    heavy_pipeline_slots = EXCLUDED.heavy_pipeline_slots,
+                    memory_limit_mb     = EXCLUDED.memory_limit_mb,
+                    last_seen_at        = NOW()
+                """,
+                WORKER_ID,
+                WORKER_CONCURRENCY,
+                PUBLISH_CONCURRENCY,
+                version,
+                snap["cfg"]["worker_lane"],
+                snap["inst"].get("service_name"),
+                snap["inst"].get("region"),
+                snap["inst"].get("hostname"),
+                version,
+                snap["cfg"]["heavy_pipeline_slots"],
+                snap["mem"].get("limit_mb"),
+            )
+        return True
+    except Exception as e:
+        logger.warning(f"Heartbeat init failed: {e}")
+        return False
+
+
 async def run_heartbeat_loop() -> None:
     """
     Background loop: writes WORKER_ID + last_seen_at + concurrency snapshot
@@ -5165,56 +5239,11 @@ async def run_heartbeat_loop() -> None:
     FROM worker_heartbeat to see liveness (stale = NOW() - last_seen_at > 30s).
     """
     global shutdown_event
-    await _ensure_worker_heartbeat_schema()
+    await _prime_worker_heartbeat()
 
     snap = _heartbeat_runtime_snapshot()
-    version = snap["inst"].get("git_commit") or (
-        os.environ.get("RENDER_GIT_COMMIT", "")[:12] or None
-    )
     mem_warn_pct = float(os.environ.get("MEMORY_WARN_PCT", "85") or 85)
     last_mem_warn_at = 0.0
-
-    # Upsert started_at on first beat so admin can see worker uptime
-    if db_pool:
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO worker_heartbeat
-                        (worker_id, last_seen_at, started_at,
-                         worker_concurrency, publish_concurrency, version,
-                         worker_lane, service_name, region, hostname, git_commit,
-                         heavy_pipeline_slots, memory_limit_mb)
-                    VALUES ($1, NOW(), NOW(), $2, $3, $4,
-                            $5, $6, $7, $8, $9, $10, $11)
-                    ON CONFLICT (worker_id) DO UPDATE SET
-                        started_at          = NOW(),
-                        worker_concurrency  = EXCLUDED.worker_concurrency,
-                        publish_concurrency = EXCLUDED.publish_concurrency,
-                        version             = EXCLUDED.version,
-                        worker_lane         = EXCLUDED.worker_lane,
-                        service_name        = EXCLUDED.service_name,
-                        region              = EXCLUDED.region,
-                        hostname            = EXCLUDED.hostname,
-                        git_commit          = EXCLUDED.git_commit,
-                        heavy_pipeline_slots = EXCLUDED.heavy_pipeline_slots,
-                        memory_limit_mb     = EXCLUDED.memory_limit_mb,
-                        last_seen_at        = NOW()
-                    """,
-                    WORKER_ID,
-                    WORKER_CONCURRENCY,
-                    PUBLISH_CONCURRENCY,
-                    version,
-                    snap["cfg"]["worker_lane"],
-                    snap["inst"].get("service_name"),
-                    snap["inst"].get("region"),
-                    snap["inst"].get("hostname"),
-                    version,
-                    snap["cfg"]["heavy_pipeline_slots"],
-                    snap["mem"].get("limit_mb"),
-                )
-        except Exception as e:
-            logger.warning(f"Heartbeat init failed: {e}")
 
     logger.info(
         "Heartbeat loop started | worker_id=%s | interval=%ss | lane=%s | "
@@ -5474,6 +5503,15 @@ async def main() -> None:
     background_loops: List[Tuple[str, Any]] = [
         ("heartbeat", run_heartbeat_loop),
     ]
+    # Prime heartbeat row BEFORE supervised loops + start notify so cold DB
+    # latency cannot skip the fleet Discord edge (2s wait was racing ~3s init).
+    try:
+        primed = await _prime_worker_heartbeat()
+        if primed:
+            logger.info("Heartbeat row primed before supervisor start | worker_id=%s", WORKER_ID)
+    except Exception as e:
+        logger.warning("Heartbeat prime before supervisor failed: %s", e)
+
     if lane != "publish":
         background_loops.append(("process_jobs", process_jobs))
     if ASYNC_PUBLISH_QUEUE or lane == "publish":
@@ -5508,7 +5546,7 @@ async def main() -> None:
         for name, factory in background_loops
     ]
 
-    async def _wait_for_own_heartbeat(timeout_sec: float = 2.0) -> bool:
+    async def _wait_for_own_heartbeat(timeout_sec: float = 8.0) -> bool:
         """Ensure our heartbeat row exists before scale-up Discord counts the fleet."""
         import time as _time
 
@@ -5528,7 +5566,7 @@ async def main() -> None:
         return False
 
     try:
-        hb_ready = await _wait_for_own_heartbeat(2.0)
+        hb_ready = await _wait_for_own_heartbeat(8.0)
         if hb_ready:
             await notify_admin_worker_start(db_pool)
         else:

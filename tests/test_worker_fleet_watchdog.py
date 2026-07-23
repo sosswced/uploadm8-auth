@@ -130,6 +130,73 @@ def test_evaluate_ignores_historical_dead_when_alive():
     assert all(a.incident_type != "worker_instance_dead" for a in alerts)
 
 
+def test_evaluate_ignores_historical_only_fleet_down():
+    """Ancient churn rows with no recent_silent must not page fleet_down."""
+    alerts = evaluate_fleet_alerts(
+        {
+            "worker_count": 40,
+            "alive_count": 0,
+            "stale_count": 0,
+            "dead_count": 40,
+            "recent_dead_count": 0,
+            "workers_memory_warn": 0,
+        },
+        uploads={"processing": 0},
+        queues={"total_pending": 0},
+    )
+    assert all(a.incident_type != "worker_fleet_down" for a in alerts)
+
+
+def test_evaluate_recent_dead_copy_disambiguates_and_skips_ram_bs():
+    alerts = evaluate_fleet_alerts(
+        {
+            "worker_count": 6,
+            "alive_count": 2,
+            "stale_count": 0,
+            "dead_count": 4,
+            "recent_dead_count": 2,
+            "recent_dead_window_sec": 900,
+            "workers_memory_warn": 0,
+            "workers_hard_pressure": 0,
+            "process_capacity": 2,
+            "process_slots_free": 2,
+            "process_slots_in_use": 0,
+        },
+        uploads={"processing": 0},
+        queues={"total_pending": 0},
+    )
+    dead_alerts = [a for a in alerts if a.incident_type == "worker_instance_dead"]
+    assert len(dead_alerts) == 1
+    a = dead_alerts[0]
+    assert "historical_dead=4" in a.subject
+    assert "2 recent silent" in a.subject
+    assert "check RAM" not in a.body
+    assert "No live RAM pressure" in a.body
+
+
+def test_evaluate_recent_dead_mentions_ram_when_pressure():
+    alerts = evaluate_fleet_alerts(
+        {
+            "worker_count": 3,
+            "alive_count": 1,
+            "stale_count": 0,
+            "dead_count": 2,
+            "recent_dead_count": 1,
+            "recent_dead_window_sec": 900,
+            "workers_memory_warn": 1,
+            "workers_hard_pressure": 0,
+            "process_capacity": 1,
+            "process_slots_free": 1,
+            "process_slots_in_use": 0,
+        },
+        uploads={"processing": 0},
+        queues={"total_pending": 0},
+    )
+    dead_alerts = [a for a in alerts if a.incident_type == "worker_instance_dead"]
+    assert dead_alerts
+    assert "memory pressure" in dead_alerts[0].body.lower()
+
+
 def test_evaluate_memory_and_overload():
     alerts = evaluate_fleet_alerts(
         {
@@ -263,6 +330,28 @@ def test_render_monitor_legacy_fallback(monkeypatch):
     assert render_worker_service_id() == "srv_legacy"
 
 
+def test_watchdog_discord_fields_label_recent_vs_historical():
+    from services.ops_incidents import _watchdog_discord_fields
+
+    fields = _watchdog_discord_fields(
+        {
+            "fleet": {
+                "alive_count": 2,
+                "stale_count": 0,
+                "recent_dead_count": 2,
+                "dead_count": 4,
+                "process_slots_in_use": 0,
+                "process_capacity": 2,
+                "workers_memory_warn": 0,
+            }
+        },
+        "inc-abc",
+    )
+    fleet_field = next(f for f in fields if f["name"] == "Fleet")
+    assert "recent_silent=2" in fleet_field["value"]
+    assert "historical_dead=4" in fleet_field["value"]
+
+
 def test_run_fleet_watchdog_once_records_incident(monkeypatch):
     monkeypatch.setenv("WATCHDOG_RENDER_API_ENABLED", "0")
     monkeypatch.delenv("RENDER", raising=False)
@@ -273,6 +362,7 @@ def test_run_fleet_watchdog_once_records_incident(monkeypatch):
             "alive_count": 0,
             "stale_count": 0,
             "dead_count": 1,
+            "recent_dead_count": 1,
             "workers_memory_warn": 0,
             "process_capacity": 0,
             "process_slots_free": 0,
@@ -299,3 +389,4 @@ def test_run_fleet_watchdog_once_records_incident(monkeypatch):
         call_kw = rec.await_args.kwargs
         assert call_kw["source"] == "worker_fleet_watchdog"
         assert call_kw["incident_type"] == "worker_fleet_down"
+        assert call_kw["dedupe_key"].startswith("watchdog:worker_fleet_down:")

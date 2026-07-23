@@ -64,3 +64,48 @@ def test_long_transcode_still_active_under_default_stale_window(monkeypatch):
         )
         is True
     )
+
+
+def test_age_window_elapsed_is_reclaimable_even_with_stage():
+    """ACTIVE_PIPELINE age expiry still clears the age latch (heartbeat is additive)."""
+    old = datetime.now(timezone.utc) - timedelta(minutes=100)
+    assert (
+        upload_row_indicates_active_pipeline(
+            status="processing",
+            processing_stage="transcode",
+            updated_at=old,
+            stale_after_minutes=90,
+        )
+        is False
+    )
+
+
+def test_heartbeat_owner_concept_independent_of_age_latch():
+    """Document contract: live owners must skip even when age latch is false.
+
+    ``_upload_already_processing`` checks owning_worker_id before age; this
+    unit locks the age helper so long FFmpeg cannot look reclaimable by age alone.
+    """
+    from services.upload.orphan_processing import owning_worker_id, pipeline_row_looks_active
+
+    assert pipeline_row_looks_active(status="processing", processing_stage="transcode")
+    workers = [
+        {
+            "worker_id": "w1",
+            "status": "alive",
+            "active_process_jobs": [{"upload_id": "u-long", "stage": "transcode"}],
+            "active_publish_jobs": [],
+        }
+    ]
+    assert owning_worker_id("u-long", workers) == "w1"
+    # Age latch would say reclaimable after 100m — ownership still protects.
+    old = datetime.now(timezone.utc) - timedelta(minutes=100)
+    assert (
+        upload_row_indicates_active_pipeline(
+            status="processing",
+            processing_stage="transcode",
+            updated_at=old,
+            stale_after_minutes=90,
+        )
+        is False
+    )

@@ -28,6 +28,15 @@ admin_settings_cache: Dict[str, Any] = {
     "watermark_size_scale": 100,
     "watermark_opacity": 0.85,
     "watermark_position": "bottom-right",
+    # Dynamic weak-taxonomy hard-ban overlay (see services/generic_hard_ban.py).
+    "generic_hard_ban": {
+        "added": [],
+        "removed": [],
+        "learned": {},
+        "auto_promote_after": 2,
+        "updated_at": None,
+        "updated_by": None,
+    },
 }
 
 # Master-admin catalog overrides (merged with stages/entitlements TIER_CONFIG + TOPUP_PRODUCTS).

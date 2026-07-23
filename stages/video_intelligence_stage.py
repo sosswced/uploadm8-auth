@@ -188,6 +188,7 @@ def _parse_annotation_result(result: Any) -> Dict[str, Any]:
         "person_segments": [],
         "logos": [],
         "summary_text": "",
+        "machine_summary": "",
     }
     try:
         ar_list = getattr(result, "annotation_results", None) or []
@@ -382,7 +383,26 @@ def _parse_annotation_result(result: Any) -> Dict[str, Any]:
         )
     if out["person_segments"]:
         summary_bits.append(f"people: {len(out['person_segments'])} segment(s)")
-    out["summary_text"] = "Video Intelligence — " + " | ".join(summary_bits) if summary_bits else ""
+    # Admin / debug rollup only — never copy this string into titles/captions.
+    # Publish paths scrub "Video Intelligence" dumps; keep structured fields above.
+    out["machine_summary"] = (
+        "Video Intelligence — " + " | ".join(summary_bits) if summary_bits else ""
+    )
+    # Human-facing summary: logos + OCR only (no generic label/object lists).
+    human_bits: List[str] = []
+    if out["logos"]:
+        human_bits.append(
+            "logos: " + ", ".join(l["description"] for l in out["logos"][:5])
+        )
+    if out["on_screen_text"]:
+        human_bits.append(
+            "OCR: "
+            + ", ".join(
+                (t["text"][:40] + ("…" if len(t["text"]) > 40 else ""))
+                for t in out["on_screen_text"][:4]
+            )
+        )
+    out["summary_text"] = " | ".join(human_bits) if human_bits else ""
     return out
 
 
@@ -715,5 +735,6 @@ def _publish_recognition_to_ctx(ctx: JobContext, data: Dict[str, Any]) -> None:
         "logos": list(data.get("logos") or []),
         "shots": list(data.get("shots") or []),
         "summary_text": data.get("summary_text") or "",
+        "machine_summary": data.get("machine_summary") or "",
     }
     setattr(ctx, "video_intelligence", flat)

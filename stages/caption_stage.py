@@ -1070,10 +1070,43 @@ def _build_narrative_prompt(
     video_intel_block = ""
     vi_ctx = getattr(ctx, "video_intelligence_context", None) or {}
     if isinstance(vi_ctx, dict) and not vi_ctx.get("error"):
-        summary = (vi_ctx.get("summary_text") or "").strip()
-        if summary:
+        machine = (
+            vi_ctx.get("machine_summary") or vi_ctx.get("summary_text") or ""
+        ).strip()
+        # Prefer structured tracks over dump strings for the prompt.
+        label_bits: List[str] = []
+        for row in (vi_ctx.get("segment_labels") or [])[:12]:
+            if isinstance(row, dict) and row.get("description"):
+                label_bits.append(str(row["description"]))
+        logo_bits = [
+            str(l.get("description") or "")
+            for l in (vi_ctx.get("logos") or [])[:6]
+            if isinstance(l, dict) and l.get("description")
+        ]
+        ocr_bits = [
+            str(t.get("text") or "")[:40]
+            for t in (vi_ctx.get("on_screen_text") or [])[:4]
+            if isinstance(t, dict) and t.get("text")
+        ]
+        parts: List[str] = []
+        if logo_bits:
+            parts.append("Logos: " + ", ".join(logo_bits))
+        if ocr_bits:
+            parts.append("On-screen text: " + ", ".join(ocr_bits))
+        if label_bits:
+            parts.append(
+                "Detector labels (internal only — never paste into title/caption): "
+                + ", ".join(label_bits[:10])
+            )
+        if not parts and machine and "Video Intelligence" not in machine:
+            parts.append(machine[:800])
+        if parts:
             video_intel_block = (
-                f"\n━━ GOOGLE VIDEO INTELLIGENCE HYDRATION (always-on full clip labels) ━━\n{summary[:2200]}\n"
+                "\n━━ GOOGLE VIDEO INTELLIGENCE (evidence only — do NOT quote "
+                "'Video Intelligence', 'labels:', or 'objects:' in title/caption) ━━\n"
+                + "\n".join(parts)[:2200]
+                + "\nWrite specific, human titles/captions with depth — never generic "
+                "words like car/vehicle/highway/windshield alone.\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             )
 

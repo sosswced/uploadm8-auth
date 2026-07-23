@@ -27,14 +27,28 @@ GENERIC_VISION_LABEL_SLUGS: frozenset[str] = frozenset(
         "car",
         "transport",
         "transportation",
+        "modeoftransport",
         "asphalt",
         "road",
+        "roadway",
+        "street",
+        "boulevard",
         "tree",
         "trees",
         "plant",
         "grass",
         "land",
         "landscape",
+        "nature",
+        "scenery",
+        "scenic",
+        "horizon",
+        "atmosphere",
+        "environment",
+        "weather",
+        "daytime",
+        "nighttime",
+        "infrastructure",
         "cloud",
         "clouds",
         "person",
@@ -111,7 +125,145 @@ GENERIC_VISION_LABEL_SLUGS: frozenset[str] = frozenset(
         "shape",
         "circle",
         "rectangle",
+        # Colors — never discovery tags / never category titles
+        "yellow",
+        "orange",
+        "purple",
+        "pink",
+        "gray",
+        "grey",
+        "brown",
+        "cyan",
+        "magenta",
+        "beige",
+        "gold",
+        "golden",
+        "silver",
+        "navy",
+        "teal",
+        "maroon",
+        "violet",
+        "indigo",
+        "turquoise",
+        "coral",
+        "cream",
+        "ivory",
+        "crimson",
+        "scarlet",
+        "azure",
+        "amber",
+        "pastel",
+        "neon",
+        "monochrome",
+        "colorful",
+        "colourful",
+        "vibrant",
+        "multicolor",
+        "multicolour",
+        # Vague nature / scenery taxonomy
+        "flora",
+        "fauna",
+        "wildlife",
+        "wilderness",
+        "countryside",
+        "meadow",
+        "forest",
+        "woods",
+        "mountain",
+        "mountains",
+        "hill",
+        "hills",
+        "valley",
+        "field",
+        "fields",
+        "earth",
+        "planet",
+        "natural",
+        "naturalbeauty",
+        "mothernature",
+        "outdoorphotography",
+        "naturephotography",
+        "naturelovers",
+        "naturelover",
+        "getoutside",
+        "optoutside",
+        # Vague category / mood filler
+        "aesthetic",
+        "vibes",
+        "vibe",
+        "mood",
+        "ambiance",
+        "ambience",
+        "ambient",
+        "beautiful",
+        "beauty",
+        "amazing",
+        "awesome",
+        "cool",
+        "nice",
+        "pretty",
+        "epic",
+        "legendary",
+        "photography",
+        "photooftheday",
+        "nofilter",
+        "instagood",
+        "picoftheday",
+        "lifestyle",
+        "travel",
+        "wanderlust",
+        "adventure",
+        "explore",
+        "inspiration",
+        "motivational",
+        "background",
+        "foreground",
+        "perspective",
+        "composition",
+        "blur",
+        "bokeh",
+        "focus",
+        "motion",
+        "still",
+        "image",
+        "photo",
+        "picture",
+        "footage",
+        "clip",
+        "recording",
+        "category",
+        "general",
+        "misc",
+        "miscellaneous",
+        "other",
+        "unknown",
+        "unspecified",
     }
+)
+
+# Pure color slugs — always junk for hashtags even if somehow missing above.
+COLOR_HASHTAG_SLUGS: frozenset[str] = frozenset(
+    {
+        "red", "blue", "green", "yellow", "orange", "purple", "pink", "black",
+        "white", "gray", "grey", "brown", "cyan", "magenta", "beige", "gold",
+        "golden", "silver", "navy", "teal", "maroon", "violet", "indigo",
+        "turquoise", "coral", "cream", "ivory", "crimson", "scarlet", "azure",
+        "amber", "pastel", "neon", "color", "colour", "colorful", "colourful",
+        "vibrant", "multicolor", "multicolour", "monochrome",
+    }
+)
+
+# Filename / HUD OCR / taxonomy dumps that look specific but are useless discovery tags.
+_JUNK_HASHTAG_RE = re.compile(
+    r"(?ix)"
+    r"("
+    r"^\d{8,}"                          # timestamp / epoch dumps
+    r"|\d{6,}(?:am|pm)"                 # 20250303111931am…
+    r"|\d{1,3}[o0l]?\s*mph"             # 66mph / 7omph (OCR O/l confusion)
+    r"|mph[a-z]{2,}"                    # mphcwalker mashups
+    r"|(?:lat|lon|gps)\d"
+    r"|\d{2,3}\.\d{3,}"                 # coordinate fragments
+    r")"
 )
 
 # Always-on scene furniture for a profile — merged with GENERIC when profile is active.
@@ -499,8 +651,118 @@ def is_generic_vision_label(raw: Any, *, min_specific_len: int = 4) -> bool:
     slug = vision_label_slug(raw)
     if not slug or len(slug) < min_specific_len:
         return True
-    return slug in GENERIC_VISION_LABEL_SLUGS
+    if slug in GENERIC_VISION_LABEL_SLUGS:
+        return True
+    try:
+        from services.generic_hard_ban import is_hard_banned_slug
 
+        if is_hard_banned_slug(slug):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_junk_hashtag_body(raw: Any) -> bool:
+    """True for HUD OCR mashups, filename timestamps, or taxonomy filler tags.
+
+    Used as the last gate before publishing hashtags so M8 / OCR / VI never
+    ship half-assed discovery noise like ``66mphcwalker`` or ``modeoftransport``.
+    Colors, nature/scenery taxonomy, and vague category mood tags are always junk.
+    Dynamic admin hard-ban registry is consulted on every check.
+    """
+    text = str(raw or "").strip().lstrip("#")
+    if not text:
+        return True
+    slug = vision_label_slug(text)
+    if not slug:
+        return True
+    try:
+        from services.generic_hard_ban import is_hard_banned_slug
+
+        if is_hard_banned_slug(slug):
+            return True
+    except Exception:
+        if slug in GENERIC_VISION_LABEL_SLUGS or slug in COLOR_HASHTAG_SLUGS:
+            return True
+    if slug in GENERIC_VISION_LABEL_SLUGS or slug in COLOR_HASHTAG_SLUGS:
+        return True
+    # Color-* compounds (bluesky, greentrees, redcar) when the stem is a color.
+    for color in COLOR_HASHTAG_SLUGS:
+        if len(color) >= 3 and (slug.startswith(color) or slug.endswith(color)):
+            # Keep real brands that merely contain a color syllable (e.g. RedBull
+            # is a logo — logos are pushed before scrub; still allow known brands
+            # only when longer and mixed). Bare color+noun taxonomy stays junk.
+            if slug == color or slug in {
+                f"{color}sky",
+                f"{color}car",
+                f"{color}road",
+                f"{color}tree",
+                f"{color}trees",
+                f"{color}horizon",
+                f"{color}nature",
+                f"{color}scape",
+                f"{color}vibes",
+                f"{color}aesthetic",
+            }:
+                return True
+    if slug.endswith(("vibes", "aesthetic", "mood", "scenery", "landscape")):
+        return True
+    digit_n = sum(ch.isdigit() for ch in slug)
+    if digit_n >= 8:
+        return True
+    if _JUNK_HASHTAG_RE.search(slug) or _JUNK_HASHTAG_RE.search(text.replace(" ", "")):
+        return True
+    # Pure numeric / date-like bodies
+    if slug.isdigit() and len(slug) >= 6:
+        return True
+    return False
+
+
+def is_vague_taxonomy_copy(raw: Any) -> bool:
+    """True when title/caption is basically a Vision category label, not a story.
+
+    Catches publishable copy like ``Nature``, ``Horizon views``, ``Mode of transport``,
+    ``Blue skies`` — useless without place/speed/brand substance.
+    """
+    text = re.sub(r"\s+", " ", str(raw or "").strip())
+    if not text:
+        return True
+    core = text.rstrip(".!?…").strip()
+    if not core:
+        return True
+    words = re.findall(r"[A-Za-z0-9]+", core)
+    if not words:
+        return True
+    if len(words) <= 4:
+        slug = vision_label_slug(core)
+        if slug in GENERIC_VISION_LABEL_SLUGS or slug in COLOR_HASHTAG_SLUGS:
+            return True
+        try:
+            from services.generic_hard_ban import is_hard_banned_slug
+
+            if is_hard_banned_slug(slug):
+                return True
+        except Exception:
+            pass
+        if is_junk_hashtag_body(core):
+            return True
+        # Every token is weak taxonomy / color filler.
+        if all(
+            vision_label_slug(w) in GENERIC_VISION_LABEL_SLUGS
+            or vision_label_slug(w) in COLOR_HASHTAG_SLUGS
+            or is_junk_hashtag_body(w)
+            for w in words
+        ):
+            return True
+    if re.match(
+        r"(?i)^(nature|horizon|scenery|landscape|outdoors?|travel|adventure|"
+        r"lifestyle|automotive|vehicle|transport|mode of transport|beautiful|"
+        r"blue skies|green trees|open skies)\b",
+        core,
+    ) and len(words) <= 6 and not re.search(r"\d", core):
+        return True
+    return False
 
 def vision_labels_are_weak(
     labels: Optional[Iterable[Any]] = None,
@@ -741,18 +1003,24 @@ def evidence_pool_has_strong_hashtag_signals(pool: Any) -> bool:
         return True
     if getattr(pool, "vision_highways", None):
         return True
-    if getattr(pool, "vi_object_tracks", None) or getattr(pool, "vi_logos", None):
+    if getattr(pool, "vi_logos", None):
         return True
+    # Object tracks / detector label lists alone are NOT strong — those are the
+    # weak taxonomy path we want to suppress when geo/brands/music exist.
     if getattr(pool, "vi_text_detections", None):
-        return True
-    if getattr(pool, "video_labels", None):
-        return True
+        # Only count text detections that look brand/route-like, not HUD dumps.
+        for row in list(getattr(pool, "vi_text_detections", None) or [])[:8]:
+            txt = ""
+            if isinstance(row, dict):
+                txt = str(row.get("text") or "")
+            else:
+                txt = str(row or "")
+            if txt and not is_junk_hashtag_body(txt) and not is_generic_vision_label(txt):
+                return True
     for kind in ("places", "products", "organizations", "people"):
         ents = (getattr(pool, "transcript_entities", None) or {}).get(kind) or []
         if ents:
             return True
-    if getattr(pool, "transcript_topics", None) or getattr(pool, "transcript_nouns", None):
-        return True
     return False
 
 

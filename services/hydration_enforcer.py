@@ -52,7 +52,9 @@ from core.vision_labels import (
     evidence_pool_has_strong_hashtag_signals,
     filter_vision_labels_for_hashtags,
     is_generic_vision_label,
+    is_junk_hashtag_body,
     is_redundant_vision_label,
+    is_vague_taxonomy_copy,
     resolve_ambient_profiles,
     vision_label_slug,
 )
@@ -122,6 +124,15 @@ _GENERIC_CAPTION_PATTERNS: List[re.Pattern[str]] = [
         r"\bdashcam recording from inside\b",
         # Extremely short titles that are pure mood (no proper noun, no number)
         r"^(?:road|drive|journey|adventure|highway|moment|vibes?|cruise|escape)\.?$",
+        # Pure Vision taxonomy / color category titles (no place, speed, brand)
+        r"^(?:nature|horizon|scenery|landscape|outdoors?|transport|mode of transport|"
+        r"vehicle|car|highway|road|sky|clouds?|trees?|water|travel|lifestyle|"
+        r"automotive|beautiful|aesthetic|vibes?)\.?$",
+        r"^(?:blue|green|red|yellow|orange|purple|pink|black|white|gray|grey)\s+"
+        r"(?:sky|skies|trees?|horizon|nature|scenery|road|car|vibes?)\.?$",
+        r"\bmode of transport\b",
+        r"\bnature (?:views?|vibes?|scenes?|shots?|beauty)\b",
+        r"\b(?:blue|green|golden) (?:skies|horizons?)\b",
     )
 ]
 
@@ -137,8 +148,17 @@ _CATEGORY_SEED_TAGS = {
     "highwayjourney", "tranquildrive", "scenicroute", "ontheroad",
     "carride", "adventureawaits", "journeycaptured", "naturebeauty",
     "flowerfields", "desertdrive",
+    # weak taxonomy / colors / nature filler — never keep these
+    "nature", "horizon", "scenery", "scenic", "landscape", "outdoors",
+    "outdoor", "modeoftransport", "transport", "transportation", "vehicle",
+    "car", "road", "highway", "sky", "clouds", "tree", "trees", "water",
+    "blue", "green", "red", "yellow", "orange", "purple", "pink", "black",
+    "white", "gray", "grey", "color", "colour", "colorful", "aesthetic",
+    "vibes", "vibe", "mood", "beautiful", "beauty", "amazing", "awesome",
+    "photography", "photooftheday", "nofilter", "lifestyle", "wanderlust",
+    "inspiration", "wildlife", "wilderness", "forest", "mountain", "mountains",
     # generic travel/lifestyle
-    "travel", "travelgram", "traveltok", "wanderlust", "adventure",
+    "travel", "travelgram", "traveltok", "adventure",
     "solotravel", "travelvlog", "travelblogger", "vlog", "lifestylevlog",
     "morningroutine", "selfcare", "wellnesstok", "authenticlife",
     # platform-meta (already blocked elsewhere; mirror for safety)
@@ -415,6 +435,63 @@ def _clean_video_label(raw: Any) -> str:
     return text
 
 
+def _is_machine_label_dump(text: str) -> bool:
+    """True when text is a GCP Video Intelligence / detector dump, not copy."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    if "video intelligence" in low:
+        return True
+    if "video analysis detected" in low:
+        return True
+    if re.search(r"(?i)\blabels\s*:", t) and re.search(
+        r"(?i)\b(?:objects?|logos?|ocr)\s*:", t
+    ):
+        return True
+    if re.search(r"(?i)\b(?:labels|objects)\s*:\s*\w+", t) and (
+        "," in t or "|" in t
+    ):
+        return True
+    if re.search(r"(?i)\b\w+\s*\(\d+\s*[-–]\s*\d+\s*s\)", t):
+        return True
+    return False
+
+
+def scrub_machine_publish_dump(text: str) -> str:
+    """Strip Video Intelligence / label-list dumps from publishable title/caption."""
+    t = re.sub(r"\s+", " ", str(text or "").strip())
+    if not t:
+        return ""
+    # Cut at the machine-dump prefix (keep any human lead-in).
+    for pat in (
+        r"(?i)\bvideo\s+intelligence\b.*$",
+        r"(?i)\bvideo\s+analysis\s+detected\b.*$",
+        r"(?i)\s*\|\s*objects\s*:.*$",
+        r"(?i)(?:^|[.!?]\s+)labels\s*:.*$",
+        r"(?i)(?:^|[.!?]\s+)objects\s*:.*$",
+    ):
+        t = re.sub(pat, "", t).strip()
+    t = t.rstrip(" .,—–-|")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _publishable_closing(text: Optional[str]) -> Optional[str]:
+    """Return a closing fragment only when it is human-readable substance."""
+    if not text:
+        return None
+    cleaned = scrub_machine_publish_dump(str(text))
+    if not cleaned or _is_machine_label_dump(cleaned):
+        return None
+    # Reject closings that are mostly generic vision nouns.
+    tokens = [x.strip() for x in re.split(r"[,|/]", cleaned) if x.strip()]
+    if len(tokens) >= 3:
+        generic_n = sum(1 for tok in tokens if is_generic_vision_label(tok))
+        if generic_n >= max(2, len(tokens) // 2):
+            return None
+    return cleaned.rstrip(".!?")
+
+
 def _vision_ocr_peak_mph(ocr: str) -> float:
     """Best-effort peak speed from Vision OCR (fallback when .map and OSD lack HUD).
 
@@ -680,7 +757,9 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
                 break
         summary = vi.get("summary_text") or vi.get("summary") or ""
         if isinstance(summary, str) and summary.strip():
-            pool.video_summary_phrase = _first_sentence(summary, max_chars=160)
+            # Never promote machine label dumps into publishable anchors.
+            if not _is_machine_label_dump(summary):
+                pool.video_summary_phrase = _first_sentence(summary, max_chars=160)
         ot = vi.get("object_tracks") or []
         if isinstance(ot, list):
             pool.vi_object_tracks = [t for t in ot if isinstance(t, dict)][:12]
@@ -719,7 +798,7 @@ def collect_evidence(ctx: JobContext) -> EvidencePool:
                     break
         if not pool.video_summary_phrase:
             summary = vic.get("summary_text") or ""
-            if isinstance(summary, str) and summary.strip():
+            if isinstance(summary, str) and summary.strip() and not _is_machine_label_dump(summary):
                 pool.video_summary_phrase = _first_sentence(summary, max_chars=160)
 
     cat = str(getattr(ctx, "thumbnail_category", None) or "").strip().lower()
@@ -903,17 +982,31 @@ def build_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) ->
         bits.append(f"near {pool.vision_landmarks[0]}")
 
     # Closing sound or transcript phrase.
+    # Never append Video Intelligence label dumps / generic detector lists —
+    # those belong in admin traces, not publishable titles/captions.
     closing: Optional[str] = None
-    if pool.transcript_phrase:
-        closing = pool.transcript_phrase.rstrip(".!?")
-    elif pool.video_understanding_phrase:
-        closing = pool.video_understanding_phrase.rstrip(".!?")
-    elif pool.video_summary_phrase:
-        closing = pool.video_summary_phrase.rstrip(".!?")
-    elif pool.video_labels:
-        closing = "Video analysis detected " + ", ".join(pool.video_labels[:4])
-    elif pool.yamnet_top:
-        closing = f"ambient {pool.yamnet_top}"
+    if bits:
+        # When we already have speed/place/music substance, only allow speech
+        # or a real scene-understanding line as closing — never VI labels.
+        closing = _publishable_closing(pool.transcript_phrase) or _publishable_closing(
+            pool.video_understanding_phrase
+        )
+    else:
+        closing = (
+            _publishable_closing(pool.transcript_phrase)
+            or _publishable_closing(pool.video_understanding_phrase)
+            or _publishable_closing(pool.video_summary_phrase)
+        )
+        if not closing and pool.video_labels:
+            specific = [
+                lbl
+                for lbl in pool.video_labels[:6]
+                if not is_generic_vision_label(lbl)
+            ]
+            if specific:
+                closing = _publishable_closing(", ".join(specific[:3]))
+        if not closing and pool.yamnet_top:
+            closing = f"ambient {pool.yamnet_top}"
 
     if not bits and not closing:
         # No evidence at all → caller should skip rewrite.
@@ -931,21 +1024,53 @@ def build_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) ->
     return f"{head}."
 
 
+def build_title_anchor_phrase(pool: EvidencePool, ctx: Optional[JobContext] = None) -> str:
+    """Short title filler — depth/substance only; never telemetry or VI dumps.
+
+    Titles must not inherit the caption-style ``Captured at X MPH…`` hydration
+    sentence or Video Intelligence label lists. Prefer a scene-understanding
+    hook, then a landmark, then a tight place name.
+    """
+    scene = _publishable_closing(pool.video_understanding_phrase)
+    if scene and len(scene) >= 12:
+        return _sanitize_anchor_fragment(scene, max_chars=90)
+
+    if pool.vision_landmarks:
+        lm = str(pool.vision_landmarks[0]).strip()
+        if lm and not is_generic_vision_label(lm):
+            return _sanitize_anchor_fragment(lm, max_chars=90)
+
+    place = _format_place(pool)
+    if place:
+        return _sanitize_anchor_fragment(place, max_chars=90)
+
+    if pool.vision_logos:
+        logo = str(pool.vision_logos[0]).strip()
+        if logo and not is_generic_vision_label(logo):
+            return _sanitize_anchor_fragment(logo, max_chars=90)
+
+    # Thin filename/category only when we have nothing scenic — still no VI dump.
+    if ctx is not None:
+        fb = _base_file_anchor(ctx).rstrip(".").strip()
+        if fb and not _is_machine_label_dump(fb):
+            return _sanitize_anchor_fragment(fb, max_chars=90)
+    return ""
+
+
 def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[str]:
     """Deterministic, evidence-driven hashtag bodies (no leading '#').
 
     Priority encodes survival under maxHashtags truncation:
-      1. landmark name(s)
-      2. music artist + title
-      3. road / highway / route
-      4. gazetteer place + state composite
-      5. city / state
-      6. protected-area unit name
+      1. landmark / place-entity names
+      2. logos / brands (Vision + VI)
+      3. music artist + title
+      4. road / highway / route (+ place composites)
+      5. gazetteer place + state composite
+      6. city / state / protected area
       7. driver name (HUD)
-      8. trill bucket tags
-      9. speed bucket tags
-     10. vision label proper nouns (if not a known generic)
-     11. transcript proper nouns (filtered)
+      8. trill + speed bucket tags
+      9. transcript entities (places/products/orgs)
+     10. vision/VI labels ONLY when no stronger geo/brand signals
     """
     out: List[str] = []
     seen: set = set()
@@ -953,6 +1078,8 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
     def _push(raw: Any) -> bool:
         body = sanitize_hashtag_body(str(raw or ""), max_len=36)
         if not body or body in seen:
+            return False
+        if is_junk_hashtag_body(body):
             return False
         seen.add(body)
         out.append(body)
@@ -970,17 +1097,28 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
     for stad in list(getattr(pool, "place_stadiums", None) or [])[:2]:
         _push(stad)
 
+    # Brands early — high discovery value, beat trill fluff.
+    for logo in pool.vision_logos[:3]:
+        _push(logo)
+    for lg in pool.vi_logos[:4]:
+        if isinstance(lg, dict) and lg.get("description"):
+            _push(str(lg["description"]))
+
     if pool.music_artist:
         _push(pool.music_artist)
     if pool.music_title:
         _push(pool.music_title)
-    if pool.music_genre:
-        _push(pool.music_genre)
 
     if pool.road:
         _push(pool.road)
     for hwy in pool.vision_highways[:2]:
         _push(hwy)
+
+    # Dig deeper: route + place composites (i5tumwater / tumwaterwa already covered).
+    place_seed = pool.gazetteer_place or pool.city
+    if pool.road and place_seed:
+        _push(f"{pool.road}{place_seed}")
+        _push(f"{place_seed}{pool.road}")
 
     if pool.gazetteer_place:
         if pool.state_abbr:
@@ -1022,12 +1160,32 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
     elif pool.max_speed_mph >= 60:
         _push("FreewayDrive")
 
-    # Vision logo brands.
-    for logo in pool.vision_logos[:2]:
-        _push(logo)
+    # Transcript STRUCTURED entities before weak detector labels.
+    for kind in ("places", "products", "organizations", "people"):
+        for e in (pool.transcript_entities.get(kind) or [])[:3]:
+            _push(e)
+    for t in pool.transcript_topics[:2]:
+        if not is_generic_vision_label(t):
+            _push(t)
 
-    # Vision / VI segment labels: only when no stronger geo/VI text/landmark signals,
-    # and never generic / ambient-redundant detector slugs.
+    # Brand-like VI on-screen text (never raw HUD lines).
+    for row in pool.vi_text_detections[:8]:
+        txt = ""
+        if isinstance(row, dict):
+            txt = str(row.get("text") or "").strip()
+        else:
+            txt = str(row or "").strip()
+        if not txt or len(txt) < 3 or len(txt) > 28:
+            continue
+        if re.search(r"\d", txt):
+            continue
+        if is_junk_hashtag_body(txt) or is_generic_vision_label(txt):
+            continue
+        if re.search(r"(?i)\b(?:mph|escort|blackvue|viofo|gps|am|pm)\b", txt):
+            continue
+        _push(txt)
+
+    # Vision / VI segment labels: only when no stronger geo/brand signals.
     strong_signals = evidence_pool_has_strong_hashtag_signals(pool)
     ambient = tuple(pool.ambient_profiles or ())
     if not strong_signals:
@@ -1037,40 +1195,24 @@ def build_evidence_hashtags(pool: EvidencePool, *, max_extra: int = 14) -> List[
             ambient_profiles=ambient or None,
         ):
             _push(vision_label_slug(lbl) or lbl)
-
-    for lbl in pool.video_labels[:8]:
-        if is_redundant_vision_label(lbl, ambient_profiles=ambient or None):
-            continue
-        slug = vision_label_slug(lbl)
-        if slug:
-            _push(slug)
-
-    # Transcript STRUCTURED entities (people / places / products / orgs from GPT pass).
-    for kind in ("places", "products", "organizations", "people"):
-        for e in (pool.transcript_entities.get(kind) or [])[:3]:
-            _push(e)
-
-    # Transcript topics (compact noun phrases from GPT pass).
-    for t in pool.transcript_topics[:3]:
-        _push(t)
-
-    # Transcript proper-noun-ish tokens (regex fallback).
-    for n in pool.transcript_nouns[:4]:
-        _push(n)
-
-    # VI logos (Tesla, In-N-Out, etc.) – brand callouts beat generic labels.
-    for lg in pool.vi_logos[:3]:
-        if isinstance(lg, dict) and lg.get("description"):
-            _push(str(lg["description"]))
-
-    # VI object descriptions (Tesla Model 3, dog, bicycle, etc.) where
-    # confidence is reasonable. Skip very generic tracks ("Vehicle").
-    _GENERIC_VI = {"vehicle", "person", "object", "animal", "structure", "land vehicle"}
-    for ot in pool.vi_object_tracks[:5]:
-        if isinstance(ot, dict):
-            desc = str(ot.get("description") or "").strip()
-            if desc and desc.lower() not in _GENERIC_VI:
-                _push(desc)
+        for lbl in pool.video_labels[:6]:
+            if is_redundant_vision_label(lbl, ambient_profiles=ambient or None):
+                continue
+            if is_generic_vision_label(lbl) or is_junk_hashtag_body(lbl):
+                continue
+            slug = vision_label_slug(lbl)
+            if slug:
+                _push(slug)
+        for ot in pool.vi_object_tracks[:4]:
+            if isinstance(ot, dict):
+                desc = str(ot.get("description") or "").strip()
+                if (
+                    desc
+                    and not is_generic_vision_label(desc)
+                    and not is_junk_hashtag_body(desc)
+                    and not is_redundant_vision_label(desc, ambient_profiles=ambient or None)
+                ):
+                    _push(desc)
 
     if len(out) > max_extra:
         out = out[:max_extra]
@@ -1133,6 +1275,8 @@ def _caption_uses_evidence(caption: str, pool: EvidencePool) -> bool:
 def _is_generic_caption(caption: str) -> bool:
     if not caption or len(caption.strip()) < 12:
         return True
+    if is_vague_taxonomy_copy(caption):
+        return True
     for pat in _GENERIC_CAPTION_PATTERNS:
         if pat.search(caption):
             return True
@@ -1160,6 +1304,22 @@ def _hashtags_are_seed_only(tags: Iterable[str]) -> Tuple[bool, int, int]:
 # ---------------------------------------------------------------------------
 
 
+def _hydrate_title(title: str, anchor: str, *, max_chars: int = 100) -> str:
+    """Replace title with a *title* anchor when empty/generic. Never VI dumps."""
+    t = scrub_machine_publish_dump(title or "")
+    a = scrub_machine_publish_dump(anchor or "")
+    if not a:
+        return t[:max_chars]
+    if not t:
+        return a[:max_chars]
+    # Long or subtitle-style headlines must not be replaced by a thin anchor.
+    if len(t) >= 36 or (":" in t and len(t) >= 18):
+        return t[:max_chars]
+    if _is_generic_caption(t) or _is_machine_label_dump(title or ""):
+        return a[:max_chars]
+    return t[:max_chars]
+
+
 def _hydrate_caption(caption: str, anchor: str, *, max_chars: int = 520) -> str:
     """Append/insert anchor into a caption when it doesn't already cover it.
 
@@ -1169,36 +1329,17 @@ def _hydrate_caption(caption: str, anchor: str, *, max_chars: int = 520) -> str:
         non-generic clause from the original.
       * Else → append anchor as a new sentence (bounded to ``max_chars``).
     """
-    cap = (caption or "").strip()
-    a = (anchor or "").strip()
+    cap = scrub_machine_publish_dump(caption or "")
+    a = scrub_machine_publish_dump(anchor or "")
     if not a:
         return cap[:max_chars]
     if not cap:
         return a[:max_chars]
-    if _is_generic_caption(cap):
+    if _is_generic_caption(cap) or _is_machine_label_dump(caption or ""):
         return a[:max_chars]
     glue = " " if cap.endswith((".", "!", "?")) else ". "
     out = (cap + glue + a).strip()
     return out[:max_chars]
-
-
-def _hydrate_title(title: str, anchor: str, *, max_chars: int = 100) -> str:
-    """Replace title with anchor when it's empty or clearly generic. Keeps editorial titles."""
-    t = (title or "").strip()
-    a = (anchor or "").strip()
-    if not a:
-        return t[:max_chars]
-    if not t:
-        return a[:max_chars]
-    # Long or subtitle-style headlines must not be replaced by a raw speed+music
-    # anchor. ``_is_generic_caption`` is substring-based (e.g. ``open road`` matches
-    # inside ``…Through the Open Road``) and was clobbering good LLM titles with
-    # truncated anchors that pulled profanity from transcript-adjacent evidence.
-    if len(t) >= 36 or (":" in t and len(t) >= 18):
-        return t[:max_chars]
-    if _is_generic_caption(t):
-        return a[:max_chars]
-    return t[:max_chars]
 
 
 def _merge_hashtag_lists(*lists: Iterable[str], cap: Optional[int] = None) -> List[str]:
@@ -1323,18 +1464,54 @@ def _fallback_anchor_from_ctx(ctx: JobContext, category: Optional[str] = None) -
 
 
 def _scrub_leaked_junk_hashtags(tags: Iterable[str]) -> List[str]:
-    """Remove obvious QA/placeholder tokens from AI hashtag lists."""
+    """Remove QA placeholders, HUD OCR mashups, and taxonomy filler tags.
+
+    Returns kept tags. Dropped non-builtin weak tokens are recorded on the
+    module-level learn buffer for the pipeline to persist into the dynamic
+    hard-ban registry.
+    """
     from core.helpers import sanitize_hashtag_body
+    from services.generic_hard_ban import builtin_ban_slugs, normalize_ban_slug
 
     banned = frozenset({"tester", "qwe", "asdf", "foobar", "lorem", "ipsum"})
+    builtin = builtin_ban_slugs()
     out: List[str] = []
+    learned_hits: List[str] = []
     for raw in tags or []:
         body = sanitize_hashtag_body(str(raw).strip().lstrip("#"))
         if not body:
             continue
         if body.lower() in banned:
             continue
+        if is_junk_hashtag_body(body):
+            slug = normalize_ban_slug(body)
+            # Learn novel weak tokens the model invented (not already in seed).
+            if slug and slug not in builtin:
+                learned_hits.append(slug)
+            continue
         out.append(body)
+    if learned_hits:
+        buf = getattr(_scrub_leaked_junk_hashtags, "_learn_buffer", None)
+        if not isinstance(buf, list):
+            buf = []
+            setattr(_scrub_leaked_junk_hashtags, "_learn_buffer", buf)
+        buf.extend(learned_hits)
+    return out
+
+
+def drain_hashtag_learn_buffer() -> List[str]:
+    """Return and clear weak hashtags scrubbed since last drain (for DB learn)."""
+    buf = getattr(_scrub_leaked_junk_hashtags, "_learn_buffer", None)
+    setattr(_scrub_leaked_junk_hashtags, "_learn_buffer", [])
+    if not isinstance(buf, list):
+        return []
+    # Dedupe preserving order
+    seen: set = set()
+    out: List[str] = []
+    for s in buf:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
     return out
 
 
@@ -1370,14 +1547,23 @@ def enforce_hydration(
     pool = collect_evidence(ctx)
     has_evidence = pool.has_any_evidence()
     anchor = build_anchor_phrase(pool, ctx) if has_evidence else ""
+    title_anchor = build_title_anchor_phrase(pool, ctx) if has_evidence else ""
     fallback_anchor = ""
     used_fallback = False
     if not anchor:
         fallback_anchor = _fallback_anchor_from_ctx(ctx)
         anchor = fallback_anchor
         used_fallback = bool(fallback_anchor)
+    if not title_anchor and used_fallback:
+        # Filename/category is OK for empty titles; never the caption speed dump.
+        title_anchor = scrub_machine_publish_dump(fallback_anchor)[:90]
     if anchor and len(anchor) > max_anchor_chars:
-        anchor = anchor[: max_anchor_chars - 1].rstrip() + "…"
+        anchor = scrub_machine_publish_dump(anchor[: max_anchor_chars - 1].rstrip() + "…")
+    else:
+        anchor = scrub_machine_publish_dump(anchor)
+    title_anchor = scrub_machine_publish_dump(title_anchor)
+    if title_anchor and len(title_anchor) > 100:
+        title_anchor = title_anchor[:99].rstrip() + "…"
 
     evidence_tags = build_evidence_hashtags(pool, max_extra=max_extra_hashtags)
 
@@ -1389,6 +1575,7 @@ def enforce_hydration(
         "purged_seed_tags": 0,
         "added_evidence_tags": 0,
         "anchor": anchor,
+        "title_anchor": title_anchor,
         "hydration_story": build_hydration_story_text(ctx, max_chars=900),
         "evidence_tags": list(evidence_tags),
         "evidence": pool.to_report(),
@@ -1475,32 +1662,53 @@ def enforce_hydration(
 
         Evidence-rich anchor → APPEND when caption already non-generic, REPLACE when generic.
         Fallback (filename/category) anchor → only REPLACE when caption is generic.
-        Never append the thin fallback to good copy — that just adds noise.
+        Always scrub Video Intelligence / label-list dumps from publishable copy.
         """
+        raw = cap_str or ""
+        scrubbed = scrub_machine_publish_dump(raw)
+        if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
+            if anchor:
+                return _hydrate_caption("", anchor)
+            return scrubbed or None
+        working = scrubbed
         if not anchor:
-            return None
-        if _caption_uses_evidence(cap_str, pool):
-            return None
+            return working if working != raw.strip() else None
+        if _caption_uses_evidence(working, pool) and not _is_generic_caption(working):
+            return working if working != raw.strip() else None
         if used_fallback:
-            if not _is_generic_caption(cap_str):
-                return None
-            new = _hydrate_caption(cap_str, anchor)
-            return new if new and new != cap_str else None
-        new = _hydrate_caption(cap_str, anchor)
-        return new if new and new != cap_str else None
+            if not _is_generic_caption(working):
+                return working if working != raw.strip() else None
+            new = _hydrate_caption(working, anchor)
+            return new if new and new != raw.strip() else (
+                working if working != raw.strip() else None
+            )
+        new = _hydrate_caption(working, anchor)
+        return new if new and new != raw.strip() else (
+            working if working != raw.strip() else None
+        )
 
     def _maybe_rewrite_title(ttl_str: str) -> Optional[str]:
-        if not anchor:
-            return None
-        if _caption_uses_evidence(ttl_str, pool):
-            return None
+        """Titles never get caption-style Captured-at / VI dump anchors."""
+        raw = ttl_str or ""
+        scrubbed = scrub_machine_publish_dump(raw)
+        if _is_machine_label_dump(raw) or (raw.strip() and not scrubbed):
+            return title_anchor or scrubbed or None
+        working = scrubbed
+        if not title_anchor:
+            return working if working != raw.strip() else None
+        if _caption_uses_evidence(working, pool) and not _is_generic_caption(working):
+            return working if working != raw.strip() else None
         if used_fallback:
-            if not _is_generic_caption(ttl_str):
-                return None
-            new = _hydrate_title(ttl_str, anchor)
-            return new if new and new != ttl_str else None
-        new = _hydrate_title(ttl_str, anchor)
-        return new if new and new != ttl_str else None
+            if not _is_generic_caption(working) and working:
+                return working if working != raw.strip() else None
+            new = _hydrate_title(working, title_anchor)
+            return new if new and new != raw.strip() else (
+                working if working != raw.strip() else None
+            )
+        new = _hydrate_title(working, title_anchor)
+        return new if new and new != raw.strip() else (
+            working if working != raw.strip() else None
+        )
 
     if isinstance(m8_captions, dict):
         for pl, cap in list(m8_captions.items()):
@@ -1575,6 +1783,13 @@ def enforce_hydration(
     if qual:
         report["warnings"].extend(qual)
     report["metadata_quality"] = {"notes": qual}
+    learned = drain_hashtag_learn_buffer()
+    report["hard_ban_learn_hits"] = learned
+    if learned and isinstance(getattr(ctx, "output_artifacts", None), dict):
+        prev = list(ctx.output_artifacts.get("hard_ban_learn_hits") or [])
+        ctx.output_artifacts["hard_ban_learn_hits"] = list(
+            dict.fromkeys([*prev, *learned])
+        )[:48]
 
     try:
         from services.grounding_eval import score_ctx_grounding

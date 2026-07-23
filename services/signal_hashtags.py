@@ -54,7 +54,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from core.helpers import sanitize_hashtag_body
-from core.vision_labels import is_generic_vision_label, vision_label_slug
+from core.vision_labels import is_generic_vision_label, is_junk_hashtag_body, vision_label_slug
 from stages.context import JobContext
 
 logger = logging.getLogger("uploadm8-worker")
@@ -144,6 +144,8 @@ def _push(tags: List[str], seen: set, candidate: Any, *, max_len: int = 36) -> N
     """Append candidate slug if non-empty, not duplicate, not blocklisted."""
     body = _slug(candidate, max_len=max_len)
     if not body or body in seen or body in _BLOCKED_META:
+        return
+    if is_junk_hashtag_body(body):
         return
     seen.add(body)
     tags.append(body)
@@ -252,19 +254,40 @@ def build_signal_hashtags(ctx: JobContext, *, max_extra: int = 12) -> List[str]:
     _take(hwy_hits, 2)
 
     # ── Vision: logos (brands visible on screen) ─────────────────────────
-    _take(list(vc.get("logo_names") or []), 2)
+    _take(list(vc.get("logo_names") or []), 3)
 
-    # ── Video Intelligence on-screen text (signs, highway numbers) ───────
+    # ── Video Intelligence logos + selective on-screen text ──────────────
+    # Never slugify raw HUD lines (speed/GPS/timestamps) into hashtags.
     vi = getattr(ctx, "video_intelligence", None) or getattr(ctx, "video_intelligence_context", None) or {}
     if isinstance(vi, dict):
+        for lg in list(vi.get("logos") or [])[:4]:
+            if isinstance(lg, dict) and lg.get("description"):
+                _push(tags, seen, lg["description"])
         ost = list(vi.get("on_screen_text") or [])
-        for row in sorted(ost, key=lambda x: -float((x or {}).get("confidence") or 0) if isinstance(x, dict) else 0)[:4]:
+        for row in sorted(
+            ost,
+            key=lambda x: -float((x or {}).get("confidence") or 0) if isinstance(x, dict) else 0,
+        )[:8]:
             if isinstance(row, dict):
                 txt = str(row.get("text") or "").strip()
             else:
                 txt = str(row).strip()
-            if txt and len(txt) >= 3 and not is_generic_vision_label(txt):
-                _push(tags, seen, vision_label_slug(txt)[:36] or txt[:36])
+            if not txt or len(txt) < 3 or len(txt) > 28:
+                continue
+            # Prefer highway tokens from the line; skip digit-heavy HUD dumps.
+            hwy_from_line: List[str] = []
+            for pat in _HIGHWAY_PATTERNS:
+                hwy_from_line.extend(str(m) for m in pat.findall(txt))
+            if hwy_from_line:
+                _take(hwy_from_line, 1)
+                continue
+            if re.search(r"\d", txt):
+                continue
+            if is_junk_hashtag_body(txt) or is_generic_vision_label(txt):
+                continue
+            if re.search(r"(?i)\b(?:mph|escort|blackvue|viofo|gps|am|pm)\b", txt):
+                continue
+            _push(tags, seen, vision_label_slug(txt)[:36] or txt[:36])
 
     # ── Trill score bucket (driving energy) ──────────────────────────────
     tr = ctx.trill or ctx.trill_score

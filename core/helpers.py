@@ -23,9 +23,17 @@ logger = logging.getLogger("uploadm8-api")
 # ---------------------------------------------------------------------------
 # DB JSON CODECS (architectural cleanliness)
 # Forces asyncpg to decode json/jsonb into Python objects.
-# Keep _safe_json as a belt-and-suspenders fallback until schema is fully normalized.
+# Prefer stages.asyncpg_json_codecs.json_param_encoder (strings pass through)
+# so callers that already json.dumps() do not double-encode.
 # ---------------------------------------------------------------------------
 async def _init_asyncpg_codecs(conn):
+    try:
+        from stages.asyncpg_json_codecs import apply_asyncpg_json_codecs
+
+        await apply_asyncpg_json_codecs(conn)
+        return
+    except Exception:
+        pass
     try:
         await conn.set_type_codec(
             'json',

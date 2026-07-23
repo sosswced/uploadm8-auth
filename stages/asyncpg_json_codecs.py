@@ -20,7 +20,7 @@ def json_param_encoder(value: Any) -> str:
     """Encoder for asyncpg: strings pass through (caller may already have json.dumps'd)."""
     if isinstance(value, str):
         return value
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
 async def apply_asyncpg_json_codecs(conn, log: logging.Logger | None = None) -> None:

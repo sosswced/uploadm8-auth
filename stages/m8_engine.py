@@ -1041,6 +1041,15 @@ CAPTION EVIDENCE MATRIX (TikTok-style micro-captions, SAME frames + scene graph)
 
     hydration_contract_block = m8_hydration_contract_block(ctx, generate_hashtags=generate_hashtags)
     hydration_timeline_brief = _build_hydration_timeline_brief(scene_graph)
+    try:
+        from services.generic_hard_ban import m8_hard_ban_prompt_block
+
+        hard_ban_block = m8_hard_ban_prompt_block(limit=100)
+    except Exception:
+        hard_ban_block = (
+            "HARD-BAN: never use nature/horizon/modeoftransport/colors/vague category labels "
+            "as title, caption, or hashtag.\n"
+        )
 
     return f"""You are {M8_ENGINE_AI_DISPLAY} - UploadM8's M8_ENGINE multimodal publishing brain
 (version {M8_ENGINE_VERSION}). You combine evidence from the scene graph with M8_ENGINE AI priors when provided.
@@ -1089,6 +1098,7 @@ EFFECTIVE STRATEGY (policy/ML context — per-platform nuance only, NOT a licens
 {must_use_block}
 {claims_section}
 {hydration_contract_block}
+{hard_ban_block}
 {cluster_block}
 {pattern_block}
 {visual_memory_block}
@@ -1113,15 +1123,17 @@ Fields per variant:
 ANTI-GENERIC RULES:
 - Do not claim the creator wrote/performed an original song if transcript_role is third_party_lyrics or music is identified as a known track unless Scene Graph explicitly says otherwise.
 - Do not write in first person as the recording artist (no "I channel", "my vocals", "my track") when lyrics are third-party unless the visuals show a clear performance.
-- Prefer concrete nouns from labels/OCR/geo/telemetry over abstract hype.
+- Prefer concrete nouns from geo/OCR/telemetry/brands/landmarks over abstract hype.
+- NEVER use weak Vision taxonomy as title, caption, or hashtag: nature, horizon, scenery,
+  landscape, outdoors, mode of transport, vehicle, car, road, sky, clouds, trees, water,
+  or any color word (blue/green/red/yellow/…). Those are detector categories, not stories.
 - When scene_graph.vision.recognition_summary or recognition_flat is present, treat it as
-  the primary inventory of visible entities (vehicles with year/make, brands, food,
-  colors, products) and cite specific items from it in titles/captions/hashtags.
-- HASHTAGS: Prefer scene_graph.timeline beats, video_intelligence.on_screen_text, geo,
-  landmarks, logos, music artist/title, and VI object tracks. Do NOT use coarse Vision
-  detector labels (color, windshield, boat, motorvehicle, lensflare, driving) unless they
-  also appear in must_use tokens or on-screen text.
-- Hashtags must read like real community search terms, not platform metadata.
+  inventory of specific entities (year/make vehicles, brand logos, named products) — cite
+  those proper nouns only. Do NOT cite colors or coarse category labels.
+- HASHTAGS: Prefer scene_graph.timeline beats, video_intelligence logos / brand OCR, geo,
+  landmarks, music artist/title. Do NOT use coarse Vision detector labels (color, windshield,
+  boat, motorvehicle, lensflare, driving, nature, horizon, modeoftransport) ever.
+- Hashtags must read like real community search terms, not platform metadata or taxonomy.
 - Captions are prose-only: never paste JSON hashtag arrays or quoted hash-plus-bracket fragments into caption; use the hashtags array only.
 - No Unicode emojis or emoticons in any title or caption field.
 
@@ -2435,6 +2447,13 @@ async def run_m8_caption_engine(
     Full M8 caption pass: scene graph → OpenAI JSON → rank → ctx fields.
     Returns metadata dict for logging/cost.
     """
+    if db_pool is not None:
+        try:
+            from services.generic_hard_ban import refresh_from_db
+
+            await refresh_from_db(db_pool)
+        except Exception:
+            pass
     scene = build_scene_graph(ctx, category)
     ctx.m8_scene_graph = scene
     _trace_m8(ctx, str(ctx.upload_id), "scene_graph", {

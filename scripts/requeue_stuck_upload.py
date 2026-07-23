@@ -37,6 +37,7 @@ async def main() -> int:
     import asyncpg
     import redis.asyncio as aioredis
 
+    from stages.asyncpg_json_codecs import apply_asyncpg_json_codecs
     from core.upload_baseline_defaults import serialize_job_payload
     from worker import _build_process_job_payload, enqueue_process_lane_job
 
@@ -47,7 +48,9 @@ async def main() -> int:
         return 1
 
     upload_id = args.upload_id.strip()
-    pool = await asyncpg.create_pool(db_url, min_size=1, max_size=2)
+    pool = await asyncpg.create_pool(
+        db_url, min_size=1, max_size=2, init=apply_asyncpg_json_codecs
+    )
 
     import worker
 

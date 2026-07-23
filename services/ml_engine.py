@@ -135,7 +135,11 @@ async def _alert_ml_engine_failure(
     pool: Optional[asyncpg.Pool],
     result: Dict[str, Any],
 ) -> None:
-    """Ops incident when cycle fails for reasons other than blocked_on_data."""
+    """Ops incident when cycle fails for reasons other than blocked_on_data.
+
+    This loop runs on the **API web service**, not the upload worker. Alerts
+    must never be phrased as worker/fleet failures.
+    """
     if result.get("ok") or result.get("skipped"):
         return
     cycle_status = str(result.get("cycle_status") or result.get("status") or "")
@@ -152,20 +156,36 @@ async def _alert_ml_engine_failure(
         train = steps.get("train_local") or {}
         build_tail = _subprocess_detail(build)
         train_tail = _subprocess_detail(train) or str(result.get("train_detail") or "")[-600:]
+        seeded = bool(result.get("seeded"))
+        subject = "ML engine cycle failed (API service — not upload worker)"
+        if err == "local training failed":
+            subject = "ML local training failed (API service — not upload worker)"
+        body = (
+            "Lane: API web service ML engine (UM8_ML_ENGINE_*). "
+            "Does not affect upload worker health or publish capacity.\n"
+            f"error={err}\n"
+            f"seed_recovery_attempted={seeded}\n"
+            f"train_tail={train_tail}\n"
+            f"build_tail={build_tail}"
+        )
         await record_operational_incident(
             pool,
             source="ml_engine",
             incident_type="ml_engine_cycle_failed",
-            subject="ML engine cycle failed",
-            body=f"error={err}\ntrain_tail={train_tail}\nbuild_tail={build_tail}",
+            subject=subject,
+            body=body,
             details={
                 "cycle_status": cycle_status,
                 "error": err,
+                "service_lane": "api_ml_engine",
+                "affects_upload_worker": False,
+                "seeded": seeded,
                 "steps": list(steps.keys()),
                 "train_detail": train_tail[:800],
                 "build_detail": build_tail[:800],
                 "script_cmd_mode": (__import__("os").environ.get("UM8_ML_USE_UV") or "auto"),
                 "finished_at": result.get("finished_at"),
+                "severity": "warning",
             },
             dedupe_key="ml_engine:cycle_failed",
             dedupe_seconds=3600,

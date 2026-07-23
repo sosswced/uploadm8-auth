@@ -276,7 +276,8 @@ async def run_monthly_user_digest(
     pool: asyncpg.Pool, *, triggered_by: str = "manual"
 ) -> Dict[str, Any]:
     """Send a per-user 30-day KPI digest to everyone who:
-       - has email_notifications enabled
+       - has digest_emails enabled (Settings → Digest Emails)
+       - has email_notifications enabled (master email kill-switch / legacy opt-out)
        - is NOT a brand-new account (>= 30 days old)
        - hasn't received a digest in the last MONTHLY_DIGEST_MIN_INTERVAL_DAYS days
        - has at least one upload in the past 30 days (no point digesting nothing)
@@ -297,6 +298,7 @@ async def run_monthly_user_digest(
                   AND u.email IS NOT NULL AND u.email <> ''
                   AND u.created_at <= NOW() - INTERVAL '30 days'
                   AND COALESCE(up.email_notifications, TRUE) = TRUE
+                  AND COALESCE(up.digest_emails, TRUE) = TRUE
                   AND (
                         u.last_monthly_digest_sent_at IS NULL
                      OR u.last_monthly_digest_sent_at < NOW() - INTERVAL '{MONTHLY_DIGEST_MIN_INTERVAL_DAYS} days'
@@ -605,6 +607,7 @@ async def run_scheduled_publish_alerts(
                   AND u.scheduled_time IS NOT NULL
                   AND u.scheduled_time BETWEEN NOW() AND NOW() + INTERVAL '{UPCOMING_WINDOW_HOURS} hours'
                   AND COALESCE(up.email_notifications, TRUE) = TRUE
+                  AND COALESCE(up.scheduled_alert_emails, TRUE) = TRUE
                   AND us.status = 'active'
                   AND us.email IS NOT NULL AND us.email <> ''
                   AND COALESCE(u.output_artifacts->>'scheduled_alert_sent', '') = ''
@@ -650,6 +653,7 @@ async def run_scheduled_publish_alerts(
                   AND u.scheduled_time IS NOT NULL
                   AND u.scheduled_time < NOW() - INTERVAL '{STUCK_THRESHOLD_MINUTES} minutes'
                   AND COALESCE(up.email_notifications, TRUE) = TRUE
+                  AND COALESCE(up.scheduled_alert_emails, TRUE) = TRUE
                   AND us.status = 'active'
                   AND us.email IS NOT NULL AND us.email <> ''
                   AND COALESCE(u.output_artifacts->>'scheduled_stuck_alert_sent', '') = ''
@@ -696,6 +700,7 @@ async def run_scheduled_publish_alerts(
                   AND u.scheduled_time IS NOT NULL
                   AND u.scheduled_time < NOW() - INTERVAL '{STUCK_THRESHOLD_MINUTES} minutes'
                   AND COALESCE(up.email_notifications, TRUE) = TRUE
+                  AND COALESCE(up.scheduled_alert_emails, TRUE) = TRUE
                   AND us.status = 'active'
                   AND us.email IS NOT NULL AND us.email <> ''
                   AND COALESCE(u.output_artifacts->>'staged_stuck_alert_sent', '') = ''

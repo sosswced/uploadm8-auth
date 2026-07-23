@@ -65,10 +65,29 @@ def generate_trill_content(trill_metadata: dict, user_prefs: dict = None) -> dic
     )
 
     prefs = user_prefs or {}
-    model = prefs.get("trill_openai_model", "gpt-4o-mini")
+    model = (
+        prefs.get("trill_openai_model")
+        or prefs.get("trillOpenaiModel")
+        or prefs.get("openai_model")
+        or "gpt-4o-mini"
+    )
+    caption_style = str(
+        prefs.get("captionStyle") or prefs.get("caption_style") or "story"
+    ).strip().lower()
+    caption_tone = str(
+        prefs.get("captionTone") or prefs.get("caption_tone") or "authentic"
+    ).strip().lower()
+    caption_voice = str(
+        prefs.get("captionVoice") or prefs.get("caption_voice") or "default"
+    ).strip().lower()
 
     user_prompt = f"""Write title, caption, and hashtags for a driving clip using only these facts (do not invent
 scenes or stunts). Sound like a real person posting their footage — no emojis anywhere.
+
+WRITING PREFS (from UploadM8 Settings — honor these):
+- CAPTION STYLE: {caption_style}
+- CAPTION TONE: {caption_tone}
+- CAPTION VOICE / PERSONA: {caption_voice}
 
 TRILL SCORE: {score}/100 (higher = more thrilling)
 SPEED BUCKET: {bucket}

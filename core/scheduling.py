@@ -16,7 +16,7 @@ import hashlib
 import logging
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from core.helpers import _now_utc
@@ -143,6 +143,17 @@ def _apply_subsecond_jitter(
     return out
 
 
+def clamp_smart_schedule_days(num_days: Any, *, default: int = 14) -> int:
+    """Normalize Smart Schedule window to 1–730 days (never 0 / NaN)."""
+    try:
+        n = int(num_days)
+    except (TypeError, ValueError):
+        n = int(default)
+    if n < 1:
+        n = int(default) if int(default) >= 1 else 14
+    return max(1, min(730, n))
+
+
 def _pick_day_offset(
     now: datetime,
     platform: str,
@@ -151,6 +162,7 @@ def _pick_day_offset(
     blocked_days: Optional[set],
     rng: random.Random,
 ) -> int:
+    num_days = clamp_smart_schedule_days(num_days)
     optimal_days = PLATFORM_OPTIMAL_DAYS.get(platform, [0, 1, 2, 3, 4])
     available_days: list = []
     for day_offset in range(1, num_days + 1):
@@ -168,9 +180,23 @@ def _pick_day_offset(
             for d in range(1, num_days + 1)
             if d not in used_days and (blocked_days is None or d not in blocked_days)
         ]
-        if not pool:
-            return rng.randint(1, num_days)
-        return rng.choice(pool)
+        if pool:
+            return rng.choice(pool)
+        # Window exhausted (dense batch / short window): expand past num_days
+        # rather than colliding with blocked/used offsets.
+        expand_to = max(num_days + 1, min(730, num_days * 2))
+        for day_offset in range(num_days + 1, expand_to + 1):
+            if day_offset in used_days:
+                continue
+            if blocked_days and day_offset in blocked_days:
+                continue
+            return day_offset
+        # Last resort: unique offset beyond used set (still deterministic via rng).
+        for _ in range(64):
+            candidate = rng.randint(1, max(num_days, expand_to))
+            if candidate not in used_days:
+                return candidate
+        return num_days + 1 + len(used_days)
 
     available_days.sort(key=lambda x: (-x[1], rng.random()))
     return available_days[0][0]
@@ -192,6 +218,7 @@ def calculate_smart_schedule(
 
     ``random_seed``: when set (e.g. upload_id), preview and presign produce identical slots.
     """
+    num_days = clamp_smart_schedule_days(num_days)
     tz = _resolve_tz(user_timezone)
     rng = _rng_from_seed(random_seed)
     now = _now_utc()

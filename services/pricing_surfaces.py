@@ -136,7 +136,8 @@ def _build_copy(put: Dict[str, int], est: Dict[str, Any], pikzels: Dict[str, Dic
             f"Publishing credits (PUT) pay for goes-live work — base {base} per job, "
             f"plus {extra} per extra destination, +{pri} priority, +{thumb} per extra thumbnail. "
             f"AI credits (AIC) pay for the AI services you enable (captions, Vision, optional "
-            f"Whisper / Twelve Labs / Video Intelligence) and Thumbnail Studio / Pikzels. "
+            f"Twelve Labs / Video Intelligence, audio helpers) and Thumbnail Studio / Pikzels. "
+            f"Speech-to-text (Whisper) is included at no extra AIC when enabled. "
             f"Defaults stay light (~{lo}–{hi} AIC per short); heavy analyzers are opt-in "
             f"(~{flo}–{fhi} AIC full-smart). Studio recreate is about {rec} AIC per image. "
             f"Balances only move when work runs. Subscription credits renew each cycle; "
@@ -151,9 +152,10 @@ def _build_copy(put: Dict[str, int], est: Dict[str, Any], pikzels: Dict[str, Dic
             f"<strong>{base + 2 * extra} PUT</strong></em>"
         ),
         "settings_aic_blurb": (
-            f"Consumed by the AI services you enable (captions, thumbnails, vision, Whisper, "
-            f"Twelve Labs, etc.). Each service has a weight; longer clips cost more for "
-            f"minute-metered services. Defaults keep heavy analyzers off so a typical short "
+            f"Consumed by the AI services you enable (captions, thumbnails, Vision, optional "
+            f"Twelve Labs / Video Intelligence, audio helpers). Speech-to-text (Whisper) is "
+            f"included at no extra AIC. Each paid service has a weight; longer clips cost more "
+            f"for minute-metered tools. Defaults keep heavy analyzers off so a typical short "
             f"stays near ~{lo}–{hi} AIC; turning everything on lands near ~{flo}–{fhi} AIC "
             f"for a 60s clip.<br>"
             f"<em>Example: captions + thumbnails + Vision (defaults) → about "
@@ -161,15 +163,16 @@ def _build_copy(put: Dict[str, int], est: Dict[str, Any], pikzels: Dict[str, Dic
             f"separately (~{rec} AIC per image, ~2.5× provider cost).</em>"
         ),
         "guide_aic_desc": (
-            f"Used for the AI services you enable — captions, hashtags, Vision, optional Whisper, "
-            f"Twelve Labs, Video Intelligence, and Thumbnail Studio / Pikzels. Each service has a "
-            f"weight; longer clips cost more for minute-metered tools. Defaults keep heavy "
-            f"analyzers off (~{lo}–{hi} AIC for a typical short); full-smart is ~{flo}–{fhi} AIC. "
-            f"Studio recreate is priced separately (~{rec} AIC per image)."
+            f"Used for the AI services you enable — captions, hashtags, Vision, optional "
+            f"Twelve Labs / Video Intelligence, audio helpers, and Thumbnail Studio / Pikzels. "
+            f"Speech-to-text (Whisper) is included at no extra AIC when enabled. Each paid "
+            f"service has a weight; longer clips cost more for minute-metered tools. Defaults "
+            f"keep heavy analyzers off (~{lo}–{hi} AIC for a typical short); full-smart is "
+            f"~{flo}–{fhi} AIC. Studio recreate is priced separately (~{rec} AIC per image)."
         ),
         "whisper_note": (
-            "Speech-to-text (Whisper) is off by default and consumes AI credits scaled by "
-            "clip length when enabled."
+            "Speech-to-text (Whisper) is off by default and included at no extra AIC when "
+            "enabled — turn it on for talking-head and voiceover clips."
         ),
     }
 

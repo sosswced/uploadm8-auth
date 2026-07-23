@@ -1516,14 +1516,19 @@ async def notify_user_publish_confirmed(
 # ============================================================
 
 async def _get_admin_webhook(db_pool=None) -> str:
-    # Priority: explicit env override -> admin_settings saved webhook
+    # Priority: explicit env override -> admin_settings saved webhook.
+    # Always allowlist-check so a bad DB URL cannot SSRF ops Discord posts.
     if ADMIN_DISCORD_WEBHOOK_URL:
-        return ADMIN_DISCORD_WEBHOOK_URL
+        wh = ADMIN_DISCORD_WEBHOOK_URL.strip()
+        return wh if _is_allowed_discord_webhook_url(wh) else ""
     if db_pool is None:
         return ""
     try:
-        wh = await db_stage.load_admin_notification_webhook(db_pool)
-        return wh or ""
+        wh = (await db_stage.load_admin_notification_webhook(db_pool) or "").strip()
+        if wh and not _is_allowed_discord_webhook_url(wh):
+            logger.warning("ignoring invalid admin_webhook_url from admin_settings")
+            return ""
+        return wh
     except Exception:
         return ""
 
@@ -1759,20 +1764,35 @@ async def notify_admin_error(error_type: str, details: dict, db_pool=None):
     await _send_discord_webhook(webhook, embeds=[embed])
 
 
-async def _live_worker_count(db_pool=None) -> int:
+async def _fleet_alive_counts(db_pool=None) -> dict:
+    """Same alive/stale/dead windows as the fleet watchdog (not a separate 30s guess)."""
+    empty = {"alive": 0, "stale": 0, "dead": 0, "recent_dead": 0}
     if not db_pool:
-        return 0
+        return empty
     try:
-        async with db_pool.acquire() as conn:
-            n = await conn.fetchval(
-                """
-                SELECT COUNT(*)::int FROM worker_heartbeat
-                WHERE last_seen_at > NOW() - INTERVAL '30 seconds'
-                """
-            )
-            return int(n or 0)
+        from services.worker_fleet_snapshot import fetch_worker_heartbeat_rows, summarize_fleet
+
+        summary = summarize_fleet(await fetch_worker_heartbeat_rows(db_pool))
+        return {
+            "alive": int(summary.get("alive_count") or 0),
+            "stale": int(summary.get("stale_count") or 0),
+            "dead": int(summary.get("dead_count") or 0),
+            "recent_dead": int(summary.get("recent_dead_count") or 0),
+        }
     except Exception:
-        return 0
+        return empty
+
+
+def _worker_scale_discord_mode() -> str:
+    """all | edges (default) | off — edges = only first-up / last-down pages Discord."""
+    import os
+
+    raw = (os.environ.get("WORKER_SCALE_DISCORD_MODE") or "edges").strip().lower()
+    if raw in ("0", "false", "no", "off", "none"):
+        return "off"
+    if raw in ("1", "true", "yes", "on", "all", "verbose"):
+        return "all"
+    return "edges"
 
 
 def _worker_instance_context() -> dict:
@@ -1785,8 +1805,11 @@ def _worker_instance_context() -> dict:
 
 
 async def _worker_scale_embed(db_pool, event: str) -> dict:
+    """Build scale embed from *current* fleet counts (caller must clear heartbeat on stop first)."""
     ctx = _worker_instance_context()
-    live = await _live_worker_count(db_pool)
+    counts = await _fleet_alive_counts(db_pool)
+    alive = counts["alive"]
+    stale = counts["stale"]
     mem_line = "—"
     try:
         from core.process_stats import sample_memory_mb, worker_config_snapshot
@@ -1803,51 +1826,114 @@ async def _worker_scale_embed(db_pool, event: str) -> dict:
     except Exception:
         pass
     if event == "start":
-        projected = live + 1
-        headline = "🟢 UploadM8 Worker started"
-        if projected > 1:
-            headline = f"📈 Scale up — {projected} worker(s) active"
+        # Heartbeat should already include this instance — no +1 projection.
+        if alive <= 0:
+            headline = "Worker online — heartbeat not visible yet"
+            color = 0x64748B
+        elif alive == 1:
+            headline = "Worker online — fleet was empty"
+            color = 0x3B82F6
+        else:
+            headline = f"Worker online — {alive} active"
+            color = 0x3B82F6
     else:
-        projected = max(0, live - 1)
-        headline = "🔴 UploadM8 Worker stopped"
-        if live > 1:
-            headline = f"📉 Scale down — {projected} worker(s) remaining"
+        # Heartbeat for this instance should already be deleted — alive is remaining.
+        # Stale peers mean the fleet is not truly empty (watchdog still sees activeish).
+        if alive == 0 and stale == 0:
+            headline = "Last worker offline — fleet empty"
+            color = 0xF59E0B
+        elif alive == 0 and stale > 0:
+            headline = f"Worker left — 0 alive, {stale} stale (not empty)"
+            color = 0x64748B
+        else:
+            headline = f"Worker left — {alive} still active"
+            color = 0x64748B
     return {
         "content": headline,
+        "should_page": True,
+        "alive": alive,
+        "stale": stale,
         "embeds": [{
             "title": "Worker fleet",
-            "color": 0x22C55E if event == "start" else 0xEF4444,
+            "color": color,
             "fields": [
                 {"name": "Instance", "value": str(ctx["instance"])[:64], "inline": True},
                 {"name": "Service", "value": str(ctx["service"])[:64], "inline": True},
                 {"name": "Region", "value": str(ctx["region"])[:32], "inline": True},
                 {"name": "Memory", "value": mem_line[:64], "inline": False},
-                {"name": "Concurrency", "value": f"process={ctx.get('worker_concurrency', '?')} heavy={ctx.get('heavy_slots', '?')}", "inline": True},
-                {"name": "Live workers (30s)", "value": str(live), "inline": True},
-                {"name": "Projected", "value": str(projected), "inline": True},
+                {
+                    "name": "Concurrency",
+                    "value": (
+                        f"process={ctx.get('worker_concurrency', '?')} "
+                        f"heavy={ctx.get('heavy_slots', '?')}"
+                    ),
+                    "inline": True,
+                },
+                {"name": "Alive now", "value": str(alive), "inline": True},
+                {
+                    "name": "Fleet",
+                    "value": (
+                        f"stale={counts['stale']} recent_silent={counts['recent_dead']} "
+                        f"historical_dead={counts['dead']}"
+                    ),
+                    "inline": True,
+                },
             ],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }],
     }
 
 
+def _scale_should_discord(event: str, alive: int, *, stale: int = 0) -> bool:
+    mode = _worker_scale_discord_mode()
+    if mode == "off":
+        return False
+    if mode == "all":
+        # Still require a visible heartbeat on start so we never claim empty wrongly.
+        if event == "start":
+            return alive >= 1
+        return True
+    # edges: first worker with a real heartbeat, or truly empty (no alive/stale peers)
+    if event == "stop":
+        return alive == 0 and stale == 0
+    return alive == 1
+
+
 async def notify_admin_worker_start(db_pool=None):
-    """Notify admin that worker has started."""
+    """Notify admin that worker has started (Discord only on fleet edges by default)."""
+    payload = await _worker_scale_embed(db_pool, "start")
+    alive = int(payload.get("alive") or 0)
+    stale = int(payload.get("stale") or 0)
+    if not _scale_should_discord("start", alive, stale=stale):
+        logger.info(
+            "worker start scale notify suppressed (mode=%s alive=%s stale=%s)",
+            _worker_scale_discord_mode(),
+            alive,
+            stale,
+        )
+        return
     webhook = await _get_admin_webhook(db_pool)
     if not webhook:
         return
-
-    payload = await _worker_scale_embed(db_pool, "start")
     await _send_discord_webhook(webhook, content=payload.get("content"), embeds=payload.get("embeds"))
 
 
 async def notify_admin_worker_stop(db_pool=None):
-    """Notify admin that worker has stopped."""
+    """Notify admin that worker has stopped (Discord only on fleet edges by default)."""
+    payload = await _worker_scale_embed(db_pool, "stop")
+    alive = int(payload.get("alive") or 0)
+    stale = int(payload.get("stale") or 0)
+    if not _scale_should_discord("stop", alive, stale=stale):
+        logger.info(
+            "worker stop scale notify suppressed (mode=%s alive=%s stale=%s)",
+            _worker_scale_discord_mode(),
+            alive,
+            stale,
+        )
+        return
     webhook = await _get_admin_webhook(db_pool)
     if not webhook:
         return
-
-    payload = await _worker_scale_embed(db_pool, "stop")
     await _send_discord_webhook(webhook, content=payload.get("content"), embeds=payload.get("embeds"))
 
 

@@ -187,9 +187,14 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "captionFrameCount":"caption_frame_count",
                         "maxHashtags":      "max_hashtags",
                         "hashtagPosition":  "hashtag_position",
-                        "trillOpenaiModel": "openai_model",
+                        "trillOpenaiModel": "trill_openai_model",
+                        "trillMinScore": "trill_min_score",
+                        "trillAiEnhance": "trill_ai_enhance",
+                        "trillEnabled": "trill_enabled",
                         "useAudioContext":  "use_audio_context",
                         "audioTranscription": "audio_transcription",
+                        "youtubeShortsCopyrightTrim": "youtube_shorts_copyright_trim",
+                        "tiktokBurnStyledCover": "tiktok_burn_styled_cover",
                         "thumbnailStudioEnabled": "thumbnail_studio_enabled",
                         "thumbnailStudioEngineEnabled": "thumbnail_studio_engine_enabled",
                         "thumbnailPikzelsEnabled": "thumbnail_pikzels_enabled",
@@ -207,6 +212,9 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "thumbnailPikzelsStrict": "thumbnail_pikzels_strict",
                         "thumbnailSelectionMode": "thumbnail_selection_mode",
                         "thumbnailRenderPipeline": "thumbnail_render_pipeline",
+                        "thumbnailApplyMode": "thumbnail_apply_mode",
+                        "thumbnailRefPersonaMode": "thumbnail_ref_persona_mode",
+                        "thumbnailStudioDefaultStrategy": "thumbnail_studio_default_strategy",
                         "aiServiceTelemetry": "ai_service_telemetry",
                         "aiServiceDashcamOSD": "ai_service_dashcam_osd",
                         "aiServiceAudioSignals": "ai_service_audio_signals",
@@ -217,11 +225,19 @@ async def load_user_settings(pool: asyncpg.Pool, user_id: str) -> dict:
                         "aiServiceThumbnailDesigner": "ai_service_thumbnail_designer",
                         "aiServiceSpeechToText": "ai_service_speech_to_text",
                         "aiServiceSceneUnderstanding": "ai_service_scene_understanding",
+                        "aiServiceFrameInspector": "ai_service_frame_inspector",
+                        "aiServiceVideoAnalyzer": "ai_service_video_analyzer",
                         # Settings UI saves webhook under discordWebhook in users.preferences;
                         # user_settings row may still carry discord_webhook=NULL, which would
                         # block the generic "if k not in result" merge from copying camelCase.
                         "discordWebhook": "discord_webhook",
                     }
+                    # Keep legacy openai_model alias in sync for older readers.
+                    if result.get("trill_openai_model") and not result.get("openai_model"):
+                        result["openai_model"] = result["trill_openai_model"]
+                    elif result.get("openai_model") and not result.get("trill_openai_model"):
+                        result["trill_openai_model"] = result["openai_model"]
+                        result.setdefault("trillOpenaiModel", result["openai_model"])
                     for camel, snake in FIELD_MAP.items():
                         val = prefs.get(camel)
                         if val is None:

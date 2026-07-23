@@ -34,7 +34,6 @@ from stages.emails import (
     send_signup_confirmation_email,
     send_post_verification_welcome_email,
     send_password_reset_email,
-    send_password_changed_email,
 )
 from services.auth_credentials import (
     login_user,
@@ -310,9 +309,16 @@ async def reset_password(payload: ResetPasswordRequest, background: BackgroundTa
 
         # Fetch email+name for the security confirmation email
         _u = await conn.fetchrow("SELECT email, name FROM users WHERE id = $1", pr["user_id"])
+        if _u:
+            from services.notification_prefs import maybe_queue_password_changed_email
 
-    if _u:
-        background.add_task(send_password_changed_email, _u["email"], _u["name"] or "there")
+            await maybe_queue_password_changed_email(
+                background,
+                conn=conn,
+                user_id=pr["user_id"],
+                email=_u["email"],
+                name=_u["name"] or "there",
+            )
 
     resp = JSONResponse(content={"ok": True})
     clear_auth_cookies(resp, request)
@@ -342,8 +348,17 @@ async def change_password(data: PasswordChange, background: BackgroundTasks, req
         # Optionally invalidate other sessions (refresh tokens)
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
 
+        from services.notification_prefs import maybe_queue_password_changed_email
+
+        await maybe_queue_password_changed_email(
+            background,
+            conn=conn,
+            user_id=user["id"],
+            email=user.get("email"),
+            name=user.get("name") or "there",
+        )
+
     logger.info(f"Password changed for user {user['id']}")
-    background.add_task(send_password_changed_email, user["email"], user.get("name") or "there")
     resp = JSONResponse(content={"status": "password_changed"})
     clear_auth_cookies(resp, request)
     return resp

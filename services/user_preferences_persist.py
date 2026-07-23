@@ -66,9 +66,13 @@ _CAMEL_TO_SNAKE: dict[str, str] = {
     "aiServiceFrameInspector": "ai_service_frame_inspector",
     "aiServiceVideoAnalyzer": "ai_service_video_analyzer",
     "tiktokBurnStyledCover": "tiktok_burn_styled_cover",
-    "authSecurityAlerts": "auth_security_alerts",
-    "digestEmails": "digest_emails",
-    "scheduledAlertEmails": "scheduled_alert_emails",
+    "thumbnailStudioEnabled": "thumbnail_studio_enabled",
+    "thumbnailStudioEngineEnabled": "thumbnail_studio_engine_enabled",
+    "thumbnailStudioStrict": "thumbnail_studio_strict",
+    "thumbnailPersonaEnabled": "thumbnail_persona_enabled",
+    "thumbnailDefaultPersonaId": "thumbnail_default_persona_id",
+    "thumbnailPersonaStrength": "thumbnail_persona_strength",
+    "thumbnailStudioDefaultStrategy": "thumbnail_studio_default_strategy",
 }
 
 

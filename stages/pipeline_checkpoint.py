@@ -387,6 +387,63 @@ async def save_post_audio_checkpoint(pool, ctx: JobContext) -> None:
     logger.info(f"[{upload_id}] Checkpoint promoted: post_audio")
 
 
+async def refresh_transcode_checkpoint_platform(
+    pool,
+    ctx: JobContext,
+    platform: str,
+) -> bool:
+    """
+    Re-upload one platform deliverable into the existing checkpoint R2 map.
+
+    Used after YouTube copyright Shorts trim so resume does not restore the
+    full-length youtube file.
+    """
+    from stages import db as db_stage
+
+    pl = str(platform or "").strip().lower()
+    if not pl:
+        return False
+    pv = getattr(ctx, "platform_videos", None) or {}
+    video_path = pv.get(pl) or pv.get(platform)
+    if not video_path:
+        return False
+    p = Path(video_path)
+    if not p.exists():
+        return False
+
+    upload_id = str(ctx.upload_id or "")
+    user_id = str(ctx.user_id or "")
+    if not upload_id or not user_id:
+        return False
+
+    ur = await db_stage.load_upload_record(pool, upload_id)
+    resume = load_resume(ur or {})
+    if not resume:
+        return False
+    transcode_r2 = dict(resume.get("transcode_r2") or {})
+    r2_key = (
+        str(transcode_r2.get(pl) or transcode_r2.get(platform) or "").strip()
+        or f"checkpoints/{user_id}/{upload_id}/transcoded/{pl}.mp4"
+    )
+    try:
+        await r2_stage.upload_file(p, r2_key, "video/mp4")
+    except Exception as e:
+        logger.warning("[%s] checkpoint refresh upload failed [%s]: %s", upload_id, pl, e)
+        return False
+
+    # Keep both snake keys normalized to lowercase platform id.
+    for k in list(transcode_r2.keys()):
+        if str(k).strip().lower() == pl:
+            del transcode_r2[k]
+    transcode_r2[pl] = r2_key
+    resume = dict(resume)
+    resume["transcode_r2"] = transcode_r2
+    resume["saved_at_transcode_refresh"] = datetime.now(timezone.utc).isoformat()
+    await merge_output_artifacts_patch(pool, upload_id, {RESUME_KEY: resume})
+    logger.info("[%s] Checkpoint refreshed transcode [%s]", upload_id, pl)
+    return True
+
+
 def _platforms_covered_transcode(transcode_r2: Dict[str, str], platforms: List[str]) -> bool:
     keys_lower = {str(k).strip().lower() for k in transcode_r2.keys()}
     for p in platforms:

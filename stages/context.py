@@ -935,8 +935,8 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
         raw_tt = uprefs.get("tiktok_post_settings") or uprefs.get("tiktokPostSettings")
         if isinstance(raw_tt, dict):
             ctx.tiktok_post_settings = raw_tt
-        # Overlay full thumbnail snapshot from this upload so Studio/Upload toggles
-        # (engine, persona, strength, default strategy) beat account defaults.
+        # Overlay upload-frozen prefs so Studio/Upload toggles (and Settings
+        # snapshot at presign) beat live account defaults for this job.
         for key in (
             "thumbnail_pikzels_enabled",
             "thumbnailPikzelsEnabled",
@@ -944,6 +944,8 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
             "thumbnailStudioEngineEnabled",
             "thumbnail_studio_enabled",
             "thumbnailStudioEnabled",
+            "thumbnail_studio_strict",
+            "thumbnailStudioStrict",
             "thumbnail_persona_enabled",
             "thumbnailPersonaEnabled",
             "thumbnail_default_persona_id",
@@ -954,10 +956,45 @@ def create_context(job_data: dict, upload_record: dict, user_settings: dict, ent
             "thumbnailStudioDefaultStrategy",
             "thumbnail_render_pipeline",
             "thumbnailRenderPipeline",
+            "thumbnail_selection_mode",
+            "thumbnailSelectionMode",
+            "thumbnail_apply_mode",
+            "thumbnailApplyMode",
+            "thumbnail_ref_persona_mode",
+            "thumbnailRefPersonaMode",
+            "thumbnail_source_job_id",
+            "thumbnailSourceJobId",
+            "thumbnail_source_variant_id",
+            "thumbnailSourceVariantId",
             "auto_thumbnails",
             "autoThumbnails",
             "styled_thumbnails",
             "styledThumbnails",
+            # Settings → Audio / TikTok burn — frozen on the upload row at presign
+            "tiktok_burn_styled_cover",
+            "tiktokBurnStyledCover",
+            "youtube_shorts_copyright_trim",
+            "youtubeShortsCopyrightTrim",
+            "use_audio_context",
+            "useAudioContext",
+            "ai_service_music_detection",
+            "aiServiceMusicDetection",
+            "caption_style",
+            "captionStyle",
+            "caption_tone",
+            "captionTone",
+            "caption_voice",
+            "captionVoice",
+            "caption_frame_count",
+            "captionFrameCount",
+            "trill_min_score",
+            "trillMinScore",
+            "trill_ai_enhance",
+            "trillAiEnhance",
+            "trill_openai_model",
+            "trillOpenaiModel",
+            "speeding_mph",
+            "euphoria_mph",
         ):
             if key in uprefs and uprefs[key] is not None:
                 ctx.user_settings[key] = uprefs[key]

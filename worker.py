@@ -1677,6 +1677,19 @@ async def run_processing_pipeline(job_data: dict) -> bool:
         await maybe_cancel(ctx, "audio")
         await maybe_cancel(ctx, "vision")
 
+        # ACR catalogue + YouTube ≥60s: persist rights notice; optionally trim YouTube only.
+        # Must run even on resume_stage=post_audio (audio skipped, ACR restored from checkpoint).
+        try:
+            from stages.youtube_copyright_shorts import apply_youtube_copyright_shorts_after_audio
+
+            await apply_youtube_copyright_shorts_after_audio(ctx, db_pool)
+        except Exception as _yt_copy_e:
+            logger.warning(
+                "[%s] youtube copyright shorts step skipped: %s",
+                upload_id,
+                _yt_copy_e,
+            )
+
         if resume_stage in (None, "post_telemetry", "post_transcode"):
             try:
                 await pipeline_checkpoint.save_post_audio_checkpoint(db_pool, ctx)
@@ -5495,8 +5508,36 @@ async def main() -> None:
         for name, factory in background_loops
     ]
 
+    async def _wait_for_own_heartbeat(timeout_sec: float = 2.0) -> bool:
+        """Ensure our heartbeat row exists before scale-up Discord counts the fleet."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout_sec
+        while _time.monotonic() < deadline:
+            try:
+                async with db_pool.acquire() as conn:
+                    row = await conn.fetchval(
+                        "SELECT 1 FROM worker_heartbeat WHERE worker_id = $1",
+                        WORKER_ID,
+                    )
+                if row:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+        return False
+
     try:
-        await notify_admin_worker_start(db_pool)
+        hb_ready = await _wait_for_own_heartbeat(2.0)
+        if hb_ready:
+            await notify_admin_worker_start(db_pool)
+        else:
+            # Do not Discord "fleet was empty" when our own row never landed —
+            # edges mode treats alive=0 as a first-up edge and would lie.
+            logger.warning(
+                "worker start notify skipped — heartbeat row for %s not ready in time",
+                WORKER_ID,
+            )
         # Wait until shutdown is signaled (SIGTERM/SIGINT). Supervised loops
         # restart themselves on failure; only an explicit shutdown ends them.
         await shutdown_event.wait()
@@ -5508,6 +5549,20 @@ async def main() -> None:
             shutdown_event.set()
         except Exception:
             pass
+        # Stop heartbeat writer before clearing the row (avoid race re-upsert).
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # Clear heartbeat BEFORE stop notify so "alive now" is accurate and
+        # the fleet watchdog does not treat graceful scale-down as recent_dead.
+        try:
+            from services.worker_fleet_snapshot import clear_worker_heartbeat
+
+            await clear_worker_heartbeat(db_pool, WORKER_ID)
+        except Exception as e:
+            logger.warning("clear_worker_heartbeat on stop: %s", e)
         try:
             await notify_admin_worker_stop(db_pool)
         except Exception:

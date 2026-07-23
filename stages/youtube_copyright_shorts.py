@@ -131,6 +131,10 @@ async def apply_youtube_copyright_shorts_after_audio(ctx: JobContext, db_pool) -
 
     from stages.pipeline_checkpoint import merge_output_artifacts_patch
 
+    # Preserve prior trim success across resume (retrim no-ops when file already ≤60s).
+    prior_notice = get_youtube_copyright_notice(ctx)
+    prior_trim_applied = bool(prior_notice and prior_notice.get("trim_applied"))
+
     trim_pref = _trim_pref_enabled(ctx)
     dur = _source_duration_sec(ctx)
     ac = getattr(ctx, "audio_context", None) or {}
@@ -160,6 +164,16 @@ async def apply_youtube_copyright_shorts_after_audio(ctx: JobContext, db_pool) -
             "You can also use royalty-free audio, shorten the clip yourself, or resolve claims in YouTube Studio."
         )
 
+    def _mark_trim_applied(out_dur: Optional[float] = None) -> None:
+        notice["trim_applied"] = True
+        if out_dur is not None:
+            notice["youtube_output_duration_sec"] = out_dur
+        notice["message"] = (
+            "UploadM8 detected recognized music (ACR) and **trimmed the YouTube file to the first ~60 seconds** "
+            "because you enabled **Trim YouTube to 60s** — this keeps Shorts-style delivery safer when a catalogue "
+            "match is present. TikTok / Instagram / Facebook files were not shortened."
+        )
+
     ctx.output_artifacts["youtube_copyright_shorts"] = json.dumps(notice)
     try:
         await merge_output_artifacts_patch(db_pool, str(ctx.upload_id), {"youtube_copyright_shorts": notice})
@@ -169,16 +183,46 @@ async def apply_youtube_copyright_shorts_after_audio(ctx: JobContext, db_pool) -
     if trim_pref:
         try:
             if await _retrim_youtube_deliverable(ctx, db_pool):
-                notice["trim_applied"] = True
                 yp = (getattr(ctx, "platform_videos", None) or {}).get("youtube")
+                out_dur = None
                 if yp and Path(yp).exists():
-                    notice["youtube_output_duration_sec"] = (await get_video_info(Path(yp))).duration
-                notice["message"] = (
-                    "UploadM8 detected recognized music (ACR) and **trimmed the YouTube file to the first ~60 seconds** "
-                    "because you enabled **Trim YouTube to 60s** — this keeps Shorts-style delivery safer when a catalogue "
-                    "match is present. TikTok / Instagram / Facebook files were not shortened."
-                )
+                    out_dur = (await get_video_info(Path(yp))).duration
+                _mark_trim_applied(out_dur)
                 ctx.output_artifacts["youtube_copyright_shorts"] = json.dumps(notice)
                 await merge_output_artifacts_patch(db_pool, str(ctx.upload_id), {"youtube_copyright_shorts": notice})
+                # Keep checkpoint R2 youtube in sync so resume does not restore full length.
+                try:
+                    from stages.pipeline_checkpoint import refresh_transcode_checkpoint_platform
+
+                    await refresh_transcode_checkpoint_platform(db_pool, ctx, "youtube")
+                except Exception as refresh_e:
+                    logger.warning(
+                        "[%s] YouTube copyright trim checkpoint refresh skipped: %s",
+                        ctx.upload_id,
+                        refresh_e,
+                    )
+            else:
+                # Resume / already-short: only trust trim_applied when the file is ≤60s now.
+                # prior_trim_applied alone is not enough if checkpoint restore left a long file.
+                yp = (getattr(ctx, "platform_videos", None) or {}).get("youtube")
+                out_dur = None
+                already_short = False
+                if yp and Path(yp).exists():
+                    out_dur = (await get_video_info(Path(yp))).duration
+                    already_short = out_dur is not None and out_dur <= COPYRIGHT_SHORTS_MAX_SEC
+                if already_short:
+                    _mark_trim_applied(out_dur)
+                    ctx.output_artifacts["youtube_copyright_shorts"] = json.dumps(notice)
+                    await merge_output_artifacts_patch(
+                        db_pool, str(ctx.upload_id), {"youtube_copyright_shorts": notice}
+                    )
+                elif prior_trim_applied:
+                    logger.warning(
+                        "[%s] YouTube copyright trim: prior trim_applied but deliverable not ≤%ss "
+                        "(duration=%s) — leaving trim_applied false",
+                        ctx.upload_id,
+                        int(COPYRIGHT_SHORTS_MAX_SEC),
+                        out_dur,
+                    )
         except Exception as e:
             logger.warning("[%s] YouTube copyright trim failed (continuing with full-length YouTube file): %s", ctx.upload_id, e)

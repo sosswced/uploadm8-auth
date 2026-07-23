@@ -1,4 +1,10 @@
-"""GET /api/dashboard/stats body — DB + canonical engagement rollup (rolling 30d UTC)."""
+"""GET /api/dashboard/stats body — DB + canonical engagement rollup (rolling 30d UTC).
+
+Upload counts:
+  - uploads.total — lifetime COUNT(*) on uploads (all statuses), not 30d
+  - quota.uploads_used — calendar-month COUNT(*) (date_trunc month)
+  - engagement — rolling 30d UTC (separate from upload counts)
+"""
 from __future__ import annotations
 
 import json
@@ -83,9 +89,13 @@ def _assemble_dashboard_stats(
     live_v = int(dash_live.get("views") or 0)
     live_l = int(dash_live.get("likes") or 0)
 
+    # uploads.total = lifetime row count (all statuses). Not rolling 30d.
+    # quota.uploads_used = calendar month (date_trunc month), all statuses.
+    # successful_*_month = calendar month, completed/succeeded/partial only.
     return {
         "uploads": {
             "total": total,
+            "total_scope": "all_time",
             "completed": completed,
             "in_queue": stats["in_queue"] if stats else 0,
             "successful_this_month": succ_cm,

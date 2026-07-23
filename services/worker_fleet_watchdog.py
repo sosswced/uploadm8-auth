@@ -62,7 +62,6 @@ def evaluate_fleet_alerts(
     )
 
     alerts: List[FleetAlert] = []
-    worker_count = int(fleet.get("worker_count") or 0)
     alive = int(fleet.get("alive_count") or 0)
     stale = int(fleet.get("stale_count") or 0)
     dead = int(fleet.get("dead_count") or 0)
@@ -74,17 +73,21 @@ def evaluate_fleet_alerts(
     pending = int(queues.get("total_pending") or 0)
     processing = int(uploads.get("processing") or 0)
 
-    # Fleet-down only when nothing is alive/stale — ignore ancient dead rows.
+    # Fleet-down only when nothing is alive/stale AND something went silent
+    # recently. Ancient autoscale churn rows (historical_dead only) must not page.
     activeish = alive + stale
-    if activeish == 0 and (worker_count > 0 or recent_dead > 0):
+    mem_hard = int(fleet.get("workers_hard_pressure") or 0)
+    window = int(fleet.get("recent_dead_window_sec") or 900)
+    if activeish == 0 and recent_dead > 0:
         alerts.append(
             FleetAlert(
                 incident_type="worker_fleet_down",
                 subject="Render worker fleet DOWN — no alive heartbeats",
                 body=(
-                    f"No alive/stale workers (recent_dead={recent_dead}, "
-                    f"historical_dead={dead}). Likely OOM kill or crash; "
-                    f"uploads processing={processing}, redis pending={pending}."
+                    f"No alive/stale workers; {recent_dead} recent silent "
+                    f"(window={window}s, historical_dead={dead}). "
+                    f"Likely OOM kill or crash; uploads processing={processing}, "
+                    f"redis pending={pending}."
                 ),
                 details={
                     "fleet": fleet,
@@ -95,14 +98,29 @@ def evaluate_fleet_alerts(
             )
         )
     elif recent_dead > 0 and alive > 0:
+        # Graceful scale-down deletes its heartbeat; remaining recent_dead rows
+        # are crash/SIGKILL/OOM. Only mention RAM when live instances show pressure.
+        if mem_warn > 0 or mem_hard > 0:
+            advice = (
+                f"Live fleet shows memory pressure (mem_warn={mem_warn}, "
+                f"hard={mem_hard}) — check RENDER_MEMORY_LIMIT_MB / WORKER_CONCURRENCY."
+            )
+        else:
+            advice = (
+                "No live RAM pressure signal — likely abrupt kill, deploy replace, "
+                "or SIGKILL (graceful scale-down clears heartbeats and would not page)."
+            )
         alerts.append(
             FleetAlert(
                 incident_type="worker_instance_dead",
-                subject=f"Render worker instance dead ({recent_dead}) while {alive} alive",
+                subject=(
+                    f"{recent_dead} recent silent worker(s); {alive} alive "
+                    f"(historical_dead={dead})"
+                ),
                 body=(
-                    f"{recent_dead} worker heartbeat(s) went silent recently "
-                    f"(window={fleet.get('recent_dead_window_sec', 900)}s); "
-                    f"{alive} still alive. Autoscaling may be recovering; check RAM."
+                    f"{recent_dead} heartbeat(s) went silent within {window}s "
+                    f"(not the same as historical_dead={dead}); {alive} still alive. "
+                    f"{advice}"
                 ),
                 details={"fleet": fleet, "uploads": uploads},
                 severity="warning",
@@ -309,6 +327,14 @@ async def run_fleet_watchdog_once(db_pool, redis_client=None) -> Dict[str, Any]:
             "WATCHDOG_ALERT_DEDUPE_SECONDS",
             600 if alert.severity == "critical" else 900,
         )
+        # Bucket counts so a worse fleet state can re-page inside the window,
+        # but 2↔3 oscillation does not spam a unique key each tick.
+        af = alert.details.get("fleet") if isinstance(alert.details.get("fleet"), dict) else fleet
+        alive_n = int(af.get("alive_count") or 0)
+        rd_n = int(af.get("recent_dead_count") or 0)
+        a_bucket = "0" if alive_n == 0 else ("1" if alive_n == 1 else "2p")
+        rd_bucket = "0" if rd_n == 0 else ("1" if rd_n == 1 else "2p")
+        dedupe_key = f"watchdog:{alert.incident_type}:a{a_bucket}:rd{rd_bucket}"
         inc_id = await record_operational_incident(
             db_pool,
             source="worker_fleet_watchdog",
@@ -324,7 +350,7 @@ async def run_fleet_watchdog_once(db_pool, redis_client=None) -> Dict[str, Any]:
             alert_email=True,
             alert_discord=True,
             dedupe_seconds=dedupe,
-            dedupe_key=f"watchdog:{alert.incident_type}",
+            dedupe_key=dedupe_key,
         )
         if inc_id:
             recorded.append(inc_id)

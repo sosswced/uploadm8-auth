@@ -32,7 +32,41 @@ _LOCAL_ALERT_BUCKET: Dict[str, float] = {}
 
 
 def _discord_url() -> str:
+    """Env webhook only. Callers that need DB-saved webhook should resolve first."""
     return (ERROR_DISCORD_WEBHOOK_URL or ADMIN_DISCORD_WEBHOOK_URL or "").strip()
+
+
+def _allowed_ops_discord_webhook(url: str) -> str:
+    """Return URL only if it is an official Discord webhook (blocks SSRF/exfil)."""
+    wh = (url or "").strip()
+    if not wh:
+        return ""
+    try:
+        from stages.notify_stage import _is_allowed_discord_webhook_url
+
+        if _is_allowed_discord_webhook_url(wh):
+            return wh
+    except Exception:
+        return ""
+    logger.warning("ops_incidents: rejecting non-Discord webhook URL")
+    return ""
+
+
+async def resolve_admin_discord_webhook(db_pool=None) -> str:
+    """Unify webhook resolution with notify_stage: env first, then admin_settings."""
+    wh = _allowed_ops_discord_webhook(_discord_url())
+    if wh:
+        return wh
+    if db_pool is None:
+        return ""
+    try:
+        from stages import db as db_stage
+
+        return _allowed_ops_discord_webhook(
+            await db_stage.load_admin_notification_webhook(db_pool) or ""
+        )
+    except Exception:
+        return ""
 
 
 async def _send_discord_embed(
@@ -43,7 +77,7 @@ async def _send_discord_embed(
     fields: Optional[List[Dict[str, Any]]] = None,
     footer: Optional[str] = None,
 ) -> None:
-    wh = _discord_url()
+    wh = _allowed_ops_discord_webhook(_discord_url())
     if not wh:
         return
     embed: Dict[str, Any] = {
@@ -90,7 +124,8 @@ def _watchdog_discord_fields(details: Dict[str, Any], incident_id: Any) -> List[
                 "value": (
                     f"alive={fleet.get('alive_count', '?')} "
                     f"stale={fleet.get('stale_count', '?')} "
-                    f"dead={fleet.get('dead_count', '?')}"
+                    f"recent_silent={fleet.get('recent_dead_count', '?')} "
+                    f"historical_dead={fleet.get('dead_count', '?')}"
                 ),
                 "inline": True,
             }
@@ -299,33 +334,60 @@ async def record_operational_incident(
             email_ok = True
         except Exception:
             pass
-    if alert_discord and _discord_url():
+    if alert_discord:
         try:
-            severity = str(det.get("severity") or ("critical" if "fail" in itype else "warning"))
-            color = _severity_color(severity)
-            fields = None
-            footer = None
-            if src == "worker_fleet_watchdog" or itype.startswith("render_event_"):
-                fields = _watchdog_discord_fields(det, new_id)
-                frontend = (os.environ.get("FRONTEND_URL") or "https://app.uploadm8.com").rstrip("/")
-                footer = f"{frontend}/admin-incidents.html?incident_id={new_id}"
-                await _send_discord_embed(
-                    f"🛡 Fleet: {itype}",
-                    f"**{subj}**\n{(bod or '')[:400]}",
-                    color=color,
-                    fields=fields,
-                    footer=footer,
-                )
-            else:
-                await _send_discord_embed(
-                    f"Ops: {itype}",
-                    f"**{subj}**\n```json\n{json.dumps(det, indent=2, default=str)[:1200]}\n```\n`{new_id}`\n"
-                    f"_Further '{itype}' alerts suppressed for {ttl}s._",
-                    color=color,
-                )
-            discord_ok = True
-        except Exception:
-            pass
+            # Always allowlist (env override must not bypass Discord host checks).
+            wh = await resolve_admin_discord_webhook(pool)
+            if wh:
+                # Temporarily prefer resolved URL for this send when env is empty.
+                severity = str(det.get("severity") or ("critical" if "fail" in itype else "warning"))
+                color = _severity_color(severity)
+                fields = None
+                footer = None
+                title: str
+                description: str
+                if src == "worker_fleet_watchdog" or itype.startswith("render_event_"):
+                    fields = _watchdog_discord_fields(det, new_id)
+                    frontend = (os.environ.get("FRONTEND_URL") or "https://app.uploadm8.com").rstrip("/")
+                    footer = f"{frontend}/admin-incidents.html?incident_id={new_id}"
+                    title = f"🛡 Fleet: {itype}"
+                    description = f"**{subj}**\n{(bod or '')[:400]}"
+                elif src == "ml_engine":
+                    title = f"🧠 ML (API): {itype}"
+                    description = (
+                        f"**{subj}**\n{(bod or '')[:600]}\n"
+                        f"`{new_id}`\n_Runs on the API web service — not the upload worker._"
+                    )
+                else:
+                    title = f"Ops: {itype}"
+                    description = (
+                        f"**{subj}**\n```json\n{json.dumps(det, indent=2, default=str)[:1200]}\n```\n"
+                        f"`{new_id}`\n_Further '{itype}' alerts suppressed for {ttl}s._"
+                    )
+                # Inline send so DB-saved webhook works even when env vars are unset.
+                embed: Dict[str, Any] = {
+                    "title": title[:256],
+                    "color": color,
+                    "description": description[:1800],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                if fields:
+                    embed["fields"] = [
+                        {
+                            "name": str(f.get("name") or "")[:256],
+                            "value": str(f.get("value") or "")[:1024],
+                            "inline": bool(f.get("inline", True)),
+                        }
+                        for f in fields[:25]
+                        if f
+                    ]
+                if footer:
+                    embed["footer"] = {"text": str(footer)[:2048]}
+                async with httpx.AsyncClient(timeout=15) as client:
+                    await client.post(wh, json={"embeds": [embed]})
+                discord_ok = True
+        except Exception as e:
+            logger.warning("ops_incidents discord send: %s", e)
 
     try:
         async with pool.acquire() as conn:

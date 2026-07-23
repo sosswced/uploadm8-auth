@@ -169,6 +169,9 @@ async def build_smart_schedule_for_upload(
     if not plats:
         return {}
 
+    from core.scheduling import clamp_smart_schedule_days
+
+    num_days = clamp_smart_schedule_days(num_days)
     tz = user_timezone or await _user_timezone(conn, user_id)
     blocked = await get_existing_scheduled_days(
         conn, user_id, num_days, exclude_upload_id=exclude_upload_id
@@ -257,6 +260,28 @@ def validate_presign_schedule(data: Any) -> None:
                     "message": UPLOAD_ERROR_MESSAGES[ERROR_SCHEDULE_NO_PLATFORMS],
                 },
             )
+        from core.scheduling import clamp_smart_schedule_days
+
+        raw_days = getattr(data, "smart_schedule_days", 14)
+        try:
+            days_i = int(raw_days)
+        except (TypeError, ValueError):
+            days_i = -1
+        if days_i < 1 or days_i > 730:
+            # Pydantic also enforces ge/le; this catches raw dict / repair callers.
+            clamped = clamp_smart_schedule_days(raw_days)
+            try:
+                setattr(data, "smart_schedule_days", clamped)
+            except Exception:
+                pass
+    elif mode not in ("immediate", "scheduled", "smart"):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_schedule_mode",
+                "message": "schedule_mode must be immediate, scheduled, or smart.",
+            },
+        )
 
 
 def upload_has_schedule(upload_row: dict) -> bool:

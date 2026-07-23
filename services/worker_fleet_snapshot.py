@@ -211,6 +211,29 @@ def summarize_fleet(workers: List[dict]) -> dict:
     }
 
 
+async def clear_worker_heartbeat(db_pool, worker_id: str) -> bool:
+    """Remove this instance's heartbeat on graceful shutdown.
+
+    Without this, a normal Render scale-down leaves a row that ages into
+    ``recent_dead`` and falsely pages ``worker_instance_dead``. Crash/OOM
+    kills skip this path and still surface as recent_dead (correct).
+    """
+    wid = (worker_id or "").strip()
+    if not db_pool or not wid:
+        return False
+    try:
+        async with db_pool.acquire() as conn:
+            tag = await conn.execute(
+                "DELETE FROM worker_heartbeat WHERE worker_id = $1",
+                wid,
+            )
+        parts = str(tag or "").split()
+        return bool(parts and parts[-1].isdigit() and int(parts[-1]) > 0)
+    except Exception as e:
+        logger.warning("clear_worker_heartbeat: %s", e)
+        return False
+
+
 async def prune_stale_worker_heartbeats(db_pool, *, older_than_hours: Optional[int] = None) -> int:
     """Delete ancient heartbeat rows left by Render autoscale churn (noise for dead_count)."""
     if not db_pool:

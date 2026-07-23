@@ -225,8 +225,11 @@ def _hydrate_snake_camel_mirror(result: dict) -> None:
         ("trill_min_score", "trillMinScore"),
         ("trill_ai_enhance", "trillAiEnhance"),
         ("trill_openai_model", "trillOpenaiModel"),
+        ("trill_leaderboard_opt_in", "trillLeaderboardOptIn"),
+        ("trill_map_sharing_opt_in", "trillMapSharingOptIn"),
         ("use_audio_context", "useAudioContext"),
         ("youtube_shorts_copyright_trim", "youtubeShortsCopyrightTrim"),
+        ("tiktok_burn_styled_cover", "tiktokBurnStyledCover"),
         ("audio_transcription", "audioTranscription"),
         ("ai_service_telemetry", "aiServiceTelemetry"),
         ("ai_service_dashcam_osd", "aiServiceDashcamOSD"),
@@ -238,9 +241,24 @@ def _hydrate_snake_camel_mirror(result: dict) -> None:
         ("ai_service_thumbnail_designer", "aiServiceThumbnailDesigner"),
         ("ai_service_speech_to_text", "aiServiceSpeechToText"),
         ("ai_service_scene_understanding", "aiServiceSceneUnderstanding"),
+        ("ai_service_frame_inspector", "aiServiceFrameInspector"),
+        ("ai_service_video_analyzer", "aiServiceVideoAnalyzer"),
         ("thumbnail_studio_enabled", "thumbnailStudioEnabled"),
         ("thumbnail_studio_engine_enabled", "thumbnailStudioEngineEnabled"),
+        ("thumbnail_studio_strict", "thumbnailStudioStrict"),
         ("thumbnail_persona_enabled", "thumbnailPersonaEnabled"),
+        ("thumbnail_default_persona_id", "thumbnailDefaultPersonaId"),
+        ("thumbnail_persona_strength", "thumbnailPersonaStrength"),
+        ("thumbnail_selection_mode", "thumbnailSelectionMode"),
+        ("thumbnail_render_pipeline", "thumbnailRenderPipeline"),
+        ("thumbnail_apply_mode", "thumbnailApplyMode"),
+        ("thumbnail_ref_persona_mode", "thumbnailRefPersonaMode"),
+        ("caption_style", "captionStyle"),
+        ("caption_tone", "captionTone"),
+        ("caption_voice", "captionVoice"),
+        ("caption_frame_count", "captionFrameCount"),
+        ("speeding_mph", "speedingMph"),
+        ("euphoria_mph", "euphoriaMph"),
     ]
     for snake, camel in pairs:
         if snake in result and result[snake] is not None:
@@ -348,11 +366,16 @@ def _overlay_upload_ai_audio_studio_prefs(result: dict, up: dict) -> None:
 
 async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
     """Helper to fetch user preferences for upload processing.
-    Merges user_preferences table + users.preferences + user_settings so:
-    - PUT /api/me/preferences (users.preferences) wins for hashtag/caption fields
-    - POST /api/settings/preferences (user_preferences) provides defaults
+
+    Merges:
+      1. ``user_preferences`` columns (Settings POST)
+      2. ``users.preferences`` JSONB (Settings PUT /me — captions, trim, burn, studio)
+      3. ``user_settings`` row (speeding/euphoria mph, discord, telemetry_enabled)
+
+    So the UJ snapshot at presign carries everything Trill / upload / Thumbnail Studio need.
     """
     result = {}
+    tier = None
     # Read from user_preferences table
     prefs_row = await conn.fetchrow(
         "SELECT * FROM user_preferences WHERE user_id = $1",
@@ -379,13 +402,46 @@ async def get_user_prefs_for_upload(conn, user_id: int) -> dict:
         _hydrate_snake_camel_mirror(result)
 
     # Overlay users.preferences (PUT /api/me/preferences writes here) -- full overlay
-    users_prefs_row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user_id)
-    up = _parse_users_preferences(users_prefs_row["preferences"] if users_prefs_row else None)
+    users_prefs_row = await conn.fetchrow(
+        "SELECT preferences, subscription_tier FROM users WHERE id = $1",
+        user_id,
+    )
+    if users_prefs_row:
+        tier = users_prefs_row.get("subscription_tier")
+        up = _parse_users_preferences(users_prefs_row["preferences"])
+    else:
+        up = {}
     _overlay_users_prefs_on_result(result, up)
+
+    # Overlay user_settings (mph thresholds, discord, telemetry master)
+    try:
+        us_row = await conn.fetchrow(
+            """
+            SELECT speeding_mph, euphoria_mph, telemetry_enabled, discord_webhook
+            FROM user_settings WHERE user_id = $1
+            """,
+            user_id,
+        )
+    except Exception:
+        us_row = None
+    if us_row:
+        usd = dict(us_row)
+        if usd.get("speeding_mph") is not None:
+            result["speeding_mph"] = result["speedingMph"] = int(usd["speeding_mph"])
+        if usd.get("euphoria_mph") is not None:
+            result["euphoria_mph"] = result["euphoriaMph"] = int(usd["euphoria_mph"])
+        if usd.get("telemetry_enabled") is not None:
+            result["telemetry_enabled"] = bool(usd["telemetry_enabled"])
+            # Keep Trill master in sync when Settings Drive Analysis is the source.
+            result.setdefault("trill_enabled", bool(usd["telemetry_enabled"]))
+            result.setdefault("trillEnabled", bool(usd["telemetry_enabled"]))
+        wh = (usd.get("discord_webhook") or "").strip()
+        if wh:
+            result["discord_webhook"] = result["discordWebhook"] = wh
 
     if result:
         _hydrate_snake_camel_mirror(result)
-        apply_upload_baseline_defaults(result)
+        apply_upload_baseline_defaults(result, tier=tier)
         return result
 
     # Fallback: Try legacy JSONB locations

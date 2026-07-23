@@ -2860,6 +2860,15 @@ async def get_notification_settings(user: dict = Depends(require_admin)):
 @router.put("/notification-settings")
 async def update_notification_settings(settings: NotificationSettings, user: dict = Depends(require_admin)):
     """Update Discord notification settings"""
+    from stages.notify_stage import _is_allowed_discord_webhook_url
+
+    admin_wh = (settings.admin_webhook_url or "").strip()
+    if admin_wh and not _is_allowed_discord_webhook_url(admin_wh):
+        raise HTTPException(
+            400,
+            "admin_webhook_url must be an https Discord webhook "
+            "(discord.com / discordapp.com / canary|ptb.discord.com /api/webhooks/...)",
+        )
     notif_settings = {
         "notify_mrr_charge": settings.notify_mrr_charge,
         "notify_topup": settings.notify_topup,
@@ -2877,7 +2886,7 @@ async def update_notification_settings(settings: NotificationSettings, user: dic
         "stripe_payout_day": settings.stripe_payout_day,
         "cloud_billing_day": settings.cloud_billing_day,
         "render_renewal_day": settings.render_renewal_day,
-        "admin_webhook_url": settings.admin_webhook_url,
+        "admin_webhook_url": admin_wh,
     }
     core.state.admin_settings_cache["notifications"] = notif_settings
     async with core.state.db_pool.acquire() as conn:
@@ -2888,10 +2897,12 @@ async def update_notification_settings(settings: NotificationSettings, user: dic
 @router.post("/test-webhook")
 async def test_webhook(data: dict, user: dict = Depends(require_admin)):
     """Send a test message to the provided Discord webhook"""
+    from stages.notify_stage import _is_allowed_discord_webhook_url
+
     webhook_url = data.get("webhook_url", "").strip()
     if not webhook_url:
         raise HTTPException(400, "Webhook URL required")
-    if not webhook_url.startswith("https://discord.com/api/webhooks/"):
+    if not _is_allowed_discord_webhook_url(webhook_url):
         raise HTTPException(400, "Invalid Discord webhook URL")
     test_embed = {
         "title": "\U0001f514 UploadM8 Webhook Test",

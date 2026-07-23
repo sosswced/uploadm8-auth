@@ -56,7 +56,7 @@ from core.models import (
 )
 from pydantic import BaseModel, Field
 from core.oauth import _revoke_platform_token
-from stages.emails import send_account_deleted_email, send_password_changed_email
+from stages.emails import send_account_deleted_email
 from stages.entitlements import get_effective_topup_products
 from services.me_profile import (
     apply_me_profile_update,
@@ -479,8 +479,17 @@ async def update_preferences_legacy(data: PreferencesUpdate, user: dict = Depend
 
 
 @router.put("/api/settings/password")
-async def update_password_settings(data: PasswordChange, request: Request, user: dict = Depends(get_current_user)):
-    """Change user password (settings endpoint version)"""
+async def update_password_settings(
+    data: PasswordChange,
+    request: Request,
+    background: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    """Change user password (settings endpoint version).
+
+    Same security receipt as ``POST /api/auth/change-password`` — respects
+    Settings → Security Alert Emails (``auth_security_alerts``).
+    """
     async with core.state.db_pool.acquire() as conn:
         # Verify current password
         user_row = await conn.fetchrow("SELECT password_hash FROM users WHERE id = $1", user["id"])
@@ -499,8 +508,18 @@ async def update_password_settings(data: PasswordChange, request: Request, user:
             user["id"],
         )
 
-        # Optionally invalidate other sessions (refresh tokens)
+        # Invalidate other sessions (refresh tokens)
         await conn.execute("DELETE FROM refresh_tokens WHERE user_id = $1", user["id"])
+
+        from services.notification_prefs import maybe_queue_password_changed_email
+
+        await maybe_queue_password_changed_email(
+            background,
+            conn=conn,
+            user_id=user["id"],
+            email=user.get("email"),
+            name=user.get("name") or "there",
+        )
 
     logger.info(f"Password changed via settings for user {user['id']}")
     resp = JSONResponse(content={"status": "success", "message": "Password changed successfully"})

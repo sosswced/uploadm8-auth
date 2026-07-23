@@ -231,9 +231,32 @@ async def process_telemetry(conn, upload_id: str, user_id: str, video_path: str,
             except Exception as e:
                 logger.debug("Trill PADUS DB enrichment skipped: %s", e)
 
-        # Check if score meets minimum threshold
+        # Check if score meets minimum threshold (Settings → Min Trill Score)
         trill_score = trill_data.get("trill_score", 0)
-        min_score = user_prefs.get("trill_min_score", 60)
+        try:
+            min_score = int(
+                user_prefs.get("trill_min_score")
+                if user_prefs.get("trill_min_score") is not None
+                else user_prefs.get("trillMinScore", 60)
+            )
+        except (TypeError, ValueError):
+            min_score = 60
+
+        # Surface Settings mph thresholds on the metadata (worker scoring uses these;
+        # HTTP analyze path records them for parity / debugging).
+        try:
+            trill_data["speeding_mph"] = int(
+                user_prefs.get("speeding_mph")
+                if user_prefs.get("speeding_mph") is not None
+                else user_prefs.get("speedingMph", 80)
+            )
+            trill_data["euphoria_mph"] = int(
+                user_prefs.get("euphoria_mph")
+                if user_prefs.get("euphoria_mph") is not None
+                else user_prefs.get("euphoriaMph", 100)
+            )
+        except (TypeError, ValueError):
+            pass
 
         # Enrich with nearby trill place if available
         if mid_lat is not None and mid_lon is not None:
@@ -244,7 +267,12 @@ async def process_telemetry(conn, upload_id: str, user_id: str, video_path: str,
 
         # Generate AI content if enabled and score is high enough
         ai_content = None
-        if user_prefs.get("trill_ai_enhance", True) and trill_score >= min_score:
+        _ai_on = user_prefs.get("trill_ai_enhance")
+        if _ai_on is None:
+            _ai_on = user_prefs.get("trillAiEnhance", True)
+        if isinstance(_ai_on, str):
+            _ai_on = _ai_on.lower() not in ("false", "0", "no", "off", "")
+        if bool(_ai_on) and trill_score >= min_score:
             try:
                 ai_content = generate_trill_content(trill_data, user_prefs)
             except Exception as e:
@@ -333,12 +361,11 @@ async def analyze_telemetry(upload_id: str, user: dict = Depends(get_current_use
             map_path = tf.name
 
         try:
-            # Get user preferences
-            prefs = await conn.fetchrow(
-                "SELECT * FROM user_preferences WHERE user_id = $1",
-                user["id"]
-            )
-            user_prefs = dict(prefs) if prefs else {}
+            # Full Settings merge (UP + users.preferences + mph from user_settings)
+            # so Trill analyze honors caption voice, model, min score, and thresholds.
+            from routers.preferences import get_user_prefs_for_upload
+
+            user_prefs = await get_user_prefs_for_upload(conn, user["id"])
 
             # Process
             result = await process_telemetry(

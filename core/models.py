@@ -113,7 +113,12 @@ class UploadInit(BaseModel):
     schedule_mode: str = "immediate"  # immediate | scheduled | smart
     has_telemetry: bool = False
     use_ai: bool = False
-    smart_schedule_days: int = 14  # How many days to spread uploads across
+    smart_schedule_days: int = Field(
+        14,
+        ge=1,
+        le=730,
+        description="Days to spread Smart Schedule across (1–730)",
+    )
     smart_schedule_seed: Optional[str] = Field(
         None,
         description="Client seed so pre-presign preview matches final smart slots",

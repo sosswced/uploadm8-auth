@@ -164,8 +164,12 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
 
     smart_schedule = None
     schedule_mode = (getattr(data, "schedule_mode", None) or "immediate").strip().lower()
+    if schedule_mode not in ("immediate", "scheduled", "smart"):
+        schedule_mode = "immediate"
     if schedule_mode == "smart":
-        days = getattr(data, "smart_schedule_days", 14)
+        from core.scheduling import clamp_smart_schedule_days
+
+        days = clamp_smart_schedule_days(getattr(data, "smart_schedule_days", 14))
         smart_schedule = await build_smart_schedule_for_upload(
             conn,
             bill_id,
@@ -229,7 +233,7 @@ async def presign_create_upload(conn, data: UploadInit, user: dict) -> dict:
         data.hashtags,
         data.privacy,
         scheduled_time,
-        data.schedule_mode,
+        schedule_mode,
         put_cost,
         aic_cost,
         json.dumps(billing_breakdown, default=str),

@@ -149,19 +149,24 @@ async def shell_bootstrap_payload(
 
     if context == "dashboard":
         # Light stats: quota/counts first; engagement rollup fills in after paint.
+        # Per-field failures must not drop quota — uploads/platforms can be null.
         stats_coro = dashboard_stats_for_user(pool, user, plan, wallet, light=True)
-        try:
-            dashboard_stats, uploads_payload, platforms_payload = await asyncio.gather(
-                stats_coro, uploads_coro, platforms_coro
+        results = await asyncio.gather(
+            stats_coro, uploads_coro, platforms_coro, return_exceptions=True
+        )
+        dashboard_stats = _ok(results[0])
+        uploads_payload = _ok(results[1])
+        platforms_payload = _ok(results[2])
+        if dashboard_stats is None:
+            logger.warning(
+                "shell_bootstrap dashboard_stats failed user=%s — frontend will fall back",
+                uid,
             )
-        except Exception:
-            logger.exception("shell_bootstrap dashboard gather failed user=%s", uid)
-            raise
         return {
             "context": "dashboard",
             "dashboard_stats": dashboard_stats,
             "queue_stats": None,
-            "uploads": uploads_payload,
+            "uploads": uploads_payload if uploads_payload is not None else [],
             "platforms": platforms_payload,
             "schedule_repair": None,
         }

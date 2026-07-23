@@ -304,7 +304,10 @@ async def get_catalog_content(
 
 @router.get("/api/catalog/aggregate")
 async def get_catalog_aggregate_endpoint(
-    period: Optional[str] = Query(None, description="Time window: '7d','30d','7h','24h','90m','all'. Overrides days."),
+    period: Optional[str] = Query(
+        None,
+        description="Time window: '7d','30d','1y','7h','24h','90m','all'. Overrides days. Default 30d when omitted.",
+    ),
     days: Optional[int] = Query(None, description="Legacy: last N days (use period instead)"),
     platform: Optional[str] = Query(None),
     source: Optional[str] = Query(None, description="external|uploadm8|linked"),
@@ -321,7 +324,9 @@ async def get_catalog_aggregate_endpoint(
       period=7d   → last 7 days
       period=7h   → last 7 hours
       period=30m  → last 30 minutes
-      period=all  → all time (default when omitted)
+      period=1y   → last 365 days
+      period=all  → all time
+      (omitted)   → last 30 days (matches CatalogAgg default)
 
     Custom absolute window: pass `start` and `end` (half-open [start, end)) — overrides period/days.
 

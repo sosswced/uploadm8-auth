@@ -1257,7 +1257,9 @@ async def test_user_discord_webhook(data: dict, user: dict = Depends(get_current
             webhook_url = (row["url"] or "").strip() if row else ""
     if not webhook_url:
         raise HTTPException(400, "Webhook URL required. Save your webhook in Settings first, or pass webhookUrl in the request.")
-    if not webhook_url.startswith("https://discord.com/api/webhooks/"):
+    from stages.notify_stage import _is_allowed_discord_webhook_url
+
+    if not _is_allowed_discord_webhook_url(webhook_url):
         raise HTTPException(400, "Invalid Discord webhook URL")
     test_embed = {
         "title": "\U0001f514 UploadM8 Webhook Test",

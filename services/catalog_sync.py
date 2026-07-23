@@ -1244,6 +1244,11 @@ def _parse_period_to_sql_interval(period: Optional[str]) -> Optional[str]:
     if not period or str(period).lower() in ("all", "0", ""):
         return None
     p = str(period).strip().lower()
+    # UI aliases
+    if p in ("1y", "year", "365d"):
+        return "365 days"
+    if p in ("month",):
+        return "30 days"
     # bare integer → days
     if _re.fullmatch(r"\d+", p):
         return f"{int(p)} days"
@@ -1264,6 +1269,22 @@ def _parse_period_to_sql_interval(period: Optional[str]) -> Optional[str]:
         return f"{v} minutes" if v != int(v) else f"{int(v)} minutes"
     # Unrecognised — treat as "30 days" safe fallback
     return "30 days"
+
+
+def _normalize_period_key(period: Optional[str], *, days: Optional[int] = None) -> str:
+    """Canonical period label returned in API JSON (matches CatalogAgg dropdown values)."""
+    if not period and days and days > 0:
+        return f"{int(days)}d"
+    if not period:
+        return "30d"
+    p = str(period).strip().lower()
+    if p in ("all", "0", ""):
+        return "all"
+    if p in ("1y", "year", "365d"):
+        return "1y"
+    if p in ("month", "30"):
+        return "30d"
+    return p
 
 
 async def get_catalog_aggregate(
@@ -1307,13 +1328,15 @@ async def get_catalog_aggregate(
             params.append(window_end_exclusive)
         conditions.append(f"{eff_ts} IS NOT NULL")
     else:
-        # Resolve interval: period string wins over bare days int
+        # Resolve interval: period string wins over bare days int.
+        # Default (omitted period/days) = last 30 days — matches CatalogAgg UI default.
         if period:
             interval = _parse_period_to_sql_interval(period)
         elif days and days > 0:
             interval = f"{days} days"
         else:
-            interval = None
+            period = "30d"
+            interval = "30 days"
 
         if interval:
             conditions.append(f"{eff_ts} >= NOW() - INTERVAL '{interval}'")
@@ -1463,12 +1486,8 @@ async def get_catalog_aggregate(
 
     if explicit_window:
         period_out = "explicit_utc"
-    elif period:
-        period_out = str(period).strip().lower()
-    elif days and days > 0:
-        period_out = f"{int(days)}d"
     else:
-        period_out = "all"
+        period_out = _normalize_period_key(period, days=days)
 
     out: Dict[str, Any] = {
         "total_videos": int(total_row["total_videos"] or 0),

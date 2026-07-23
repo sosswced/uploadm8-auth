@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -134,8 +135,16 @@ async def fetch_worker_heartbeat_rows(db_pool) -> List[dict]:
     return out
 
 
+def _recent_dead_window_sec() -> int:
+    """Heartbeats that went silent within this window count as 'recent dead' for alerts."""
+    try:
+        return max(180, int(os.environ.get("WATCHDOG_RECENT_DEAD_SEC", "900") or 900))
+    except ValueError:
+        return 900
+
+
 def summarize_fleet(workers: List[dict]) -> dict:
-    alive = stale = dead = 0
+    alive = stale = dead = recent_dead = 0
     total_proc_cap = total_pub_cap = 0
     proc_in_use = pub_in_use = 0
     max_rss = 0.0
@@ -143,14 +152,23 @@ def summarize_fleet(workers: List[dict]) -> dict:
     admission_blocked = 0
     hard_pressure = 0
     max_load = 0.0
+    recent_window = _recent_dead_window_sec()
     for w in workers:
         st = w.get("status") or "unknown"
+        sec = w.get("seconds_since_last_beat")
+        try:
+            sec_i = int(sec) if sec is not None else None
+        except (TypeError, ValueError):
+            sec_i = None
         if st == "alive":
             alive += 1
         elif st == "stale":
             stale += 1
         else:
             dead += 1
+            # Only freshly silent instances (not months of autoscale churn rows).
+            if sec_i is not None and 120 <= sec_i <= recent_window:
+                recent_dead += 1
         if st in ("alive", "stale"):
             total_proc_cap += int(w.get("worker_concurrency") or 0)
             total_pub_cap += int(w.get("publish_concurrency") or 0)
@@ -177,6 +195,8 @@ def summarize_fleet(workers: List[dict]) -> dict:
         "alive_count": alive,
         "stale_count": stale,
         "dead_count": dead,
+        "recent_dead_count": recent_dead,
+        "recent_dead_window_sec": recent_window,
         "process_capacity": total_proc_cap,
         "process_slots_in_use": proc_in_use,
         "process_slots_free": max(0, total_proc_cap - proc_in_use),
@@ -189,6 +209,34 @@ def summarize_fleet(workers: List[dict]) -> dict:
         "workers_hard_pressure": hard_pressure,
         "max_load_1m": round(max_load, 2) if max_load else None,
     }
+
+
+async def prune_stale_worker_heartbeats(db_pool, *, older_than_hours: Optional[int] = None) -> int:
+    """Delete ancient heartbeat rows left by Render autoscale churn (noise for dead_count)."""
+    if not db_pool:
+        return 0
+    try:
+        hours = older_than_hours
+        if hours is None:
+            hours = int(os.environ.get("WORKER_HEARTBEAT_PRUNE_HOURS", "6") or 6)
+        hours = max(1, int(hours))
+    except ValueError:
+        hours = 6
+    try:
+        async with db_pool.acquire() as conn:
+            tag = await conn.execute(
+                """
+                DELETE FROM worker_heartbeat
+                WHERE last_seen_at < NOW() - ($1::text || ' hours')::interval
+                """,
+                str(hours),
+            )
+        # asyncpg returns e.g. "DELETE 101"
+        parts = str(tag or "").split()
+        return int(parts[-1]) if parts and parts[-1].isdigit() else 0
+    except Exception as e:
+        logger.warning("prune_stale_worker_heartbeats: %s", e)
+        return 0
 
 
 async def fetch_redis_queue_snapshot(redis_client) -> dict:

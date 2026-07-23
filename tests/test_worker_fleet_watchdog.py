@@ -95,13 +95,39 @@ def test_build_observability_health_healthy():
 
 def test_evaluate_fleet_down():
     alerts = evaluate_fleet_alerts(
-        {"worker_count": 2, "alive_count": 0, "stale_count": 0, "dead_count": 2, "workers_memory_warn": 0},
+        {
+            "worker_count": 2,
+            "alive_count": 0,
+            "stale_count": 0,
+            "dead_count": 2,
+            "recent_dead_count": 2,
+            "workers_memory_warn": 0,
+        },
         uploads={"processing": 3},
         queues={"total_pending": 4},
     )
     types = [a.incident_type for a in alerts]
     assert "worker_fleet_down" in types
     assert alerts[0].severity == "critical"
+
+
+def test_evaluate_ignores_historical_dead_when_alive():
+    alerts = evaluate_fleet_alerts(
+        {
+            "worker_count": 103,
+            "alive_count": 2,
+            "stale_count": 0,
+            "dead_count": 101,
+            "recent_dead_count": 0,
+            "workers_memory_warn": 0,
+            "process_capacity": 2,
+            "process_slots_free": 2,
+            "process_slots_in_use": 0,
+        },
+        uploads={"processing": 0},
+        queues={"total_pending": 0},
+    )
+    assert all(a.incident_type != "worker_instance_dead" for a in alerts)
 
 
 def test_evaluate_memory_and_overload():
@@ -144,15 +170,32 @@ def test_evaluate_no_alerts_when_healthy():
 
 
 def test_evaluate_render_event_alerts_dedupes_type():
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     alerts = evaluate_render_event_alerts(
         [
-            {"type": "server_failed", "severity": "critical", "timestamp": "t1"},
-            {"type": "server_failed", "severity": "critical", "timestamp": "t2"},
-            {"type": "autoscaling_started", "severity": "info"},
+            {"type": "server_failed", "severity": "critical", "timestamp": now},
+            {"type": "server_failed", "severity": "critical", "timestamp": now},
+            {"type": "autoscaling_started", "severity": "info", "timestamp": now},
         ]
     )
     assert len(alerts) == 1
     assert alerts[0].incident_type == "render_event_server_failed"
+
+
+def test_evaluate_render_event_alerts_ignores_stale():
+    alerts = evaluate_render_event_alerts(
+        [
+            {
+                "type": "server_failed",
+                "severity": "critical",
+                "timestamp": "2026-07-22T12:34:56.422235Z",
+            }
+        ],
+        max_age_sec=1200,
+    )
+    assert alerts == []
 
 
 def test_dangerous_concurrency_warnings(monkeypatch):

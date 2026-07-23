@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("uploadm8.worker_fleet_watchdog")
@@ -65,6 +66,7 @@ def evaluate_fleet_alerts(
     alive = int(fleet.get("alive_count") or 0)
     stale = int(fleet.get("stale_count") or 0)
     dead = int(fleet.get("dead_count") or 0)
+    recent_dead = int(fleet.get("recent_dead_count") or 0)
     mem_warn = int(fleet.get("workers_memory_warn") or 0)
     proc_cap = int(fleet.get("process_capacity") or 0)
     proc_free = int(fleet.get("process_slots_free") or 0)
@@ -72,14 +74,16 @@ def evaluate_fleet_alerts(
     pending = int(queues.get("total_pending") or 0)
     processing = int(uploads.get("processing") or 0)
 
-    if worker_count > 0 and alive == 0:
+    # Fleet-down only when nothing is alive/stale — ignore ancient dead rows.
+    activeish = alive + stale
+    if activeish == 0 and (worker_count > 0 or recent_dead > 0):
         alerts.append(
             FleetAlert(
                 incident_type="worker_fleet_down",
                 subject="Render worker fleet DOWN — no alive heartbeats",
                 body=(
-                    f"All {worker_count} worker heartbeat row(s) are stale/dead "
-                    f"(stale={stale}, dead={dead}). Likely OOM kill or crash; "
+                    f"No alive/stale workers (recent_dead={recent_dead}, "
+                    f"historical_dead={dead}). Likely OOM kill or crash; "
                     f"uploads processing={processing}, redis pending={pending}."
                 ),
                 details={
@@ -90,14 +94,15 @@ def evaluate_fleet_alerts(
                 severity="critical",
             )
         )
-    elif dead > 0 and alive > 0:
+    elif recent_dead > 0 and alive > 0:
         alerts.append(
             FleetAlert(
                 incident_type="worker_instance_dead",
-                subject=f"Render worker instance dead ({dead}) while {alive} alive",
+                subject=f"Render worker instance dead ({recent_dead}) while {alive} alive",
                 body=(
-                    f"{dead} worker heartbeat(s) marked dead; {alive} still alive. "
-                    f"Autoscaling may be recovering; check Render events + RAM."
+                    f"{recent_dead} worker heartbeat(s) went silent recently "
+                    f"(window={fleet.get('recent_dead_window_sec', 900)}s); "
+                    f"{alive} still alive. Autoscaling may be recovering; check RAM."
                 ),
                 details={"fleet": fleet, "uploads": uploads},
                 severity="warning",
@@ -145,12 +150,40 @@ def evaluate_fleet_alerts(
     return alerts
 
 
-def evaluate_render_event_alerts(events: List[dict]) -> List[FleetAlert]:
-    """Turn recent critical Render platform events into FleetAlerts."""
+def _event_age_seconds(timestamp: Any) -> Optional[float]:
+    if not timestamp:
+        return None
+    try:
+        raw = str(timestamp).strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        ts = datetime.fromisoformat(raw)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception:
+        return None
+
+
+def evaluate_render_event_alerts(
+    events: List[dict],
+    *,
+    max_age_sec: Optional[int] = None,
+) -> List[FleetAlert]:
+    """Turn *fresh* critical Render platform events into FleetAlerts.
+
+    Ignores historical ``server_failed`` rows still returned by the API so we
+    do not re-page Discord every dedupe window for an event from hours ago.
+    """
+    if max_age_sec is None:
+        max_age_sec = _env_int("WATCHDOG_RENDER_EVENT_MAX_AGE_SEC", 1200)
     alerts: List[FleetAlert] = []
     seen_types: set = set()
     for ev in events or []:
         if (ev.get("severity") or "") != "critical":
+            continue
+        age = _event_age_seconds(ev.get("timestamp"))
+        if age is None or age > max_age_sec or age < -120:
             continue
         et = str(ev.get("type") or "server_failed")
         if et in seen_types:
@@ -161,10 +194,10 @@ def evaluate_render_event_alerts(events: List[dict]) -> List[FleetAlert]:
                 incident_type=f"render_event_{et}"[:120],
                 subject=f"Render platform event: {et}",
                 body=(
-                    f"Live Render API reported ``{et}`` at {ev.get('timestamp')}. "
-                    f"This is an early signal — do not wait for the crash email."
+                    f"Live Render API reported ``{et}`` at {ev.get('timestamp')} "
+                    f"({int(age)}s ago). Early signal — do not wait for the crash email."
                 ),
-                details={"event": ev},
+                details={"event": ev, "age_sec": int(age)},
                 severity="critical",
             )
         )
@@ -206,7 +239,18 @@ def dangerous_concurrency_warnings() -> List[str]:
 async def run_fleet_watchdog_once(db_pool, redis_client=None) -> Dict[str, Any]:
     """Single watchdog tick: evaluate fleet (+ Render events) and record incidents."""
     from services.ops_incidents import record_operational_incident
-    from services.worker_fleet_snapshot import build_worker_fleet_snapshot
+    from services.worker_fleet_snapshot import (
+        build_worker_fleet_snapshot,
+        prune_stale_worker_heartbeats,
+    )
+
+    pruned = 0
+    try:
+        pruned = await prune_stale_worker_heartbeats(db_pool)
+        if pruned:
+            logger.info("pruned %s stale worker_heartbeat row(s)", pruned)
+    except Exception as e:
+        logger.debug("heartbeat prune skipped: %s", e)
 
     snap = await build_worker_fleet_snapshot(db_pool, redis_client)
     fleet = snap.get("fleet") or {}
@@ -221,7 +265,12 @@ async def run_fleet_watchdog_once(db_pool, redis_client=None) -> Dict[str, Any]:
             from services.render_platform import build_render_live_snapshot, render_api_configured
 
             if render_api_configured():
-                render_live = await build_render_live_snapshot(event_limit=15)
+                render_live = await build_render_live_snapshot(
+                    event_limit=15,
+                    include_logs=False,
+                    use_cache=True,
+                    event_lookback_minutes=_env_int("WATCHDOG_RENDER_LOOKBACK_MIN", 30),
+                )
                 alerts.extend(evaluate_render_event_alerts(render_live.get("events") or []))
         except Exception as e:
             logger.warning("watchdog render live fetch: %s", e)

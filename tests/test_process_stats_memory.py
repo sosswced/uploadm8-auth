@@ -74,10 +74,22 @@ def test_fleet_summary_includes_pressure_fields():
                 "memory_pressure": "hard",
                 "admission_blocked": True,
                 "load_1m": 2.5,
-            }
+            },
+            {
+                "status": "dead",
+                "seconds_since_last_beat": 500,
+                "worker_concurrency": 1,
+            },
+            {
+                "status": "dead",
+                "seconds_since_last_beat": 86400,
+                "worker_concurrency": 1,
+            },
         ]
     )
     assert s["workers_memory_warn"] == 1
     assert s["workers_hard_pressure"] == 1
     assert s["workers_admission_blocked"] == 1
     assert s["max_load_1m"] == 2.5
+    assert s["dead_count"] == 2
+    assert s["recent_dead_count"] == 1

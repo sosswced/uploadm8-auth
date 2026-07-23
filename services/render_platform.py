@@ -557,6 +557,7 @@ async def build_render_live_snapshot(
     include_logs: bool = True,
     include_metrics: bool = True,
     use_cache: bool = True,
+    event_lookback_minutes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Full live observability bundle for admin/ops (TTL-cached to avoid Render rate limits)."""
     import time as _time
@@ -581,7 +582,19 @@ async def build_render_live_snapshot(
         }
 
     sid = (service_id or render_worker_service_id()).strip()
-    cache_key = f"{sid}:{event_limit}:{int(include_logs)}:{int(include_metrics)}"
+    try:
+        lookback = int(
+            event_lookback_minutes
+            if event_lookback_minutes is not None
+            else (os.environ.get("WATCHDOG_RENDER_LOOKBACK_MIN") or 30)
+        )
+    except ValueError:
+        lookback = 30
+    lookback = max(5, min(180, lookback))
+    event_start = (
+        datetime.now(timezone.utc) - timedelta(minutes=lookback)
+    ).isoformat().replace("+00:00", "Z")
+    cache_key = f"{sid}:{event_limit}:{int(include_logs)}:{int(include_metrics)}:{lookback}"
     now = _time.time()
     if (
         use_cache
@@ -596,7 +609,9 @@ async def build_render_live_snapshot(
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             service_task = _get_json(client, f"/services/{sid}")
-            events_task = fetch_service_events(sid, limit=event_limit, client=client)
+            events_task = fetch_service_events(
+                sid, limit=event_limit, start_time=event_start, client=client
+            )
             deploys_task = fetch_deploys(sid, limit=5, client=client)
             instances_task = fetch_instances(sid, client=client)
             metrics_task = (
